@@ -198,6 +198,7 @@ jobs:
           ansible-playbook -i inventory/localhost.yml tests/test_sgx_registration.yml
           ansible-playbook -i inventory/localhost.yml tests/test_stubs.yml
           ansible-playbook -i inventory/localhost.yml tests/test_repo_app_pristine.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_reboot_teardown_gate.yml
 
       # The maintenance profile must REACH verify on a host that has a CVM.
       # Asserts positively on reaching verify: an abort in the guard pre_tasks

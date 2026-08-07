@@ -46,11 +46,20 @@ expect_state() {
 }
 
 # A synthetic /proc so process detection can be tested on any machine.
+# The stat line is written to REAL field widths, not a short stand-in. The guard
+# reads num_threads at field 18 and utime+stime at 12 and 13, all counted after
+# the parenthesised comm; a six-field line makes every one of them read as the
+# absent-value default, so a fixture would agree with a guard that had stopped
+# collecting them at all.
 make_proc() {
   local root="$1" pid="$2" comm="$3" state="$4" cmdline="$5"
+  local threads="${6:-1}" utime="${7:-0}" stime="${8:-0}"
   mkdir -p "$root/$pid"
   printf '%s\n' "$comm" >"$root/$pid/comm"
-  printf '%s (%s) %s 1 1 1\n' "$pid" "$comm" "$state" >"$root/$pid/stat"
+  # state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt
+  #   utime stime cutime cstime priority nice num_threads
+  printf '%s (%s) %s 1 1 1 0 -1 0 0 0 0 0 %s %s 0 0 20 0 %s\n' \
+    "$pid" "$comm" "$state" "$utime" "$stime" "$threads" >"$root/$pid/stat"
   printf '%s' "$cmdline" | tr ' ' '\0' >"$root/$pid/cmdline"
 }
 
@@ -369,6 +378,64 @@ fi
 # A clean host, with nothing anywhere.
 expect_state "(clean) nothing anywhere" CLEAN \
   env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$FIX/clean_root" LIUM_REPO_PATH=/nonexistent
+
+# --- the reboot advice, and the mode the reboot gate polls --------------------
+#
+# A production host was wedged by an operator following this script's own
+# recovery text, which used to end "If those threads do not exit, a host reboot
+# is the only thing that frees it." A soft reboot during a TDX teardown left the
+# old kernel alive on the network for fourteen minutes without ever resetting,
+# and took a datacentre power-cycle to clear. The text is the defect, so the
+# text is asserted.
+rm -rf "${PROC:?}"/*
+make_proc "$PROC" 1008 "qemu-system-x86" Z "" 2 51234 9876
+
+zadvice="$(env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent \
+               LIUM_REPO_PATH=/nonexistent "$GUARD" --recovery)"
+
+CASES=$((CASES + 1))
+case "$zadvice" in *"reboot is the only thing"*) _bad=1 ;; *) _bad=0 ;; esac
+case "$zadvice" in *"DO NOT REBOOT"*) _warn=1 ;; *) _warn=0 ;; esac
+case "$zadvice" in *"OUT-OF-BAND"*) _oob=1 ;; *) _oob=0 ;; esac
+if [ "$_bad" -eq 0 ] && [ "$_warn" -eq 1 ] && [ "$_oob" -eq 1 ]; then
+  pass "(zombie) the recovery warns against a soft reboot and names the power-cycle"
+else
+  fail "(zombie) reboot advice wrong: old_advice=$_bad warns=$_warn out_of_band=$_oob"
+fi
+
+# Threads and cpu ticks are what let an operator tell a teardown that is
+# GRINDING from one that is WEDGED. Without them the only visible signal is
+# memory, which sits flat for twenty minutes at a time and proves nothing.
+CASES=$((CASES + 1))
+case "$zadvice" in *"threads 2, cpu ticks 61110"*) _diag=1 ;; *) _diag=0 ;; esac
+if [ "$_diag" -eq 1 ]; then
+  pass "(zombie) the recovery reports thread count and cpu ticks for the wait"
+else
+  fail "(zombie) the recovery omits the progress signal the operator needs"
+fi
+
+# --qemu-procs is what roles/kernel/tasks/wait_for_teardown.yml polls, so its
+# contract is asserted here rather than only through the playbook.
+CASES=$((CASES + 1))
+qp="$(env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent \
+          LIUM_REPO_PATH=/nonexistent "$GUARD" --qemu-procs)" && qp_rc=0 || qp_rc=$?
+if [ "$qp" = "1008 Z 2 61110" ] && [ "$qp_rc" -eq 1 ]; then
+  pass "(qemu-procs) emits 'pid state threads ticks' and exits with the count"
+else
+  fail "(qemu-procs) expected '1008 Z 2 61110' rc 1, got '$qp' rc $qp_rc"
+fi
+
+# The gate polls this every few seconds for up to 90 minutes, so it must not pay
+# for the disk sweep. Asserted through behaviour: a DORMANT disk that would make
+# every other mode report state and recovery must produce no output here.
+CASES=$((CASES + 1))
+qp_empty="$(env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$DORMANT_ROOT" \
+                LIUM_REPO_PATH=/nonexistent "$GUARD" --qemu-procs)" && qp_erc=0 || qp_erc=$?
+if [ -z "$qp_empty" ] && [ "$qp_erc" -eq 0 ]; then
+  pass "(qemu-procs) reports only processes, and exits 0 when there are none"
+else
+  fail "(qemu-procs) on a process-free host expected empty rc 0, got '$qp_empty' rc $qp_erc"
+fi
 
 # Every state except CLEAN must block. Asserted as data, so a new state added
 # later without a decision about it cannot quietly default to "allowed".

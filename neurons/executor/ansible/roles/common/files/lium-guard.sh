@@ -68,7 +68,7 @@ MODE="json"
 
 usage() {
   cat <<'USAGE'
-Usage: lium-guard.sh [--json|--state|--reason|--recovery|--unreadable|--print-default-roots]
+Usage: lium-guard.sh [--json|--state|--reason|--recovery|--unreadable|--qemu-procs|--print-default-roots]
                      [--roots a,b,c] [--repo-path PATH] [--proc-root PATH]
 
   --json                 full fact + derivation object (default)
@@ -76,6 +76,8 @@ Usage: lium-guard.sh [--json|--state|--reason|--recovery|--unreadable|--print-de
   --reason               one-line explanation of the state
   --recovery             the fact-composed recovery procedure
   --unreadable           newline-separated list of roots that exist but cannot be read
+  --qemu-procs           one line per qemu-system process: "pid state threads cpu_ticks".
+                         Skips the filesystem sweep, so it is cheap enough to poll.
   --print-default-roots  the built-in search roots, comma separated (tests assert on this)
 USAGE
 }
@@ -87,6 +89,7 @@ while [ $# -gt 0 ]; do
     --reason) MODE="reason" ;;
     --recovery) MODE="recovery" ;;
     --unreadable) MODE="unreadable" ;;
+    --qemu-procs) MODE="qemu-procs" ;;
     --print-default-roots) printf '%s\n' "$DEFAULT_SEARCH_ROOTS"; exit 0 ;;
     --roots) SEARCH_ROOTS="${2:?--roots needs a value}"; shift ;;
     --repo-path) REPO_PATH="${2:?--repo-path needs a value}"; shift ;;
@@ -163,14 +166,25 @@ collect_hda_under() {
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_CHECKOUT="$(cd -- "${SELF_DIR}/../../../../../.." 2>/dev/null && pwd || printf '')"
 
-collect_hda_under "${REPO_PATH}/${DSTACKTEE_SUBPATH}"
-if [ -n "$LOCAL_CHECKOUT" ]; then
-  collect_hda_under "${LOCAL_CHECKOUT}/${DSTACKTEE_SUBPATH}"
-fi
+# `--qemu-procs` answers one question — is a QEMU still on this host — and its
+# caller is a POLL LOOP that asks every few seconds for up to an hour while a
+# TDX teardown drains. The disk sweep costs seconds per call and cannot change
+# that answer, so it is skipped. Every other mode still pays for it, because
+# every other mode reports a state, and a state derived without the disk facts
+# would be CLEAN on a host holding a renter's encrypted disk.
+SKIP_HDA_SCAN="false"
+[ "$MODE" = "qemu-procs" ] && SKIP_HDA_SCAN="true"
+
 IFS=',' read -r -a _roots <<<"$SEARCH_ROOTS"
-for _root in "${_roots[@]}"; do
-  [ -n "$_root" ] && collect_hda_under "$_root"
-done
+if [ "$SKIP_HDA_SCAN" = "false" ]; then
+  collect_hda_under "${REPO_PATH}/${DSTACKTEE_SUBPATH}"
+  if [ -n "$LOCAL_CHECKOUT" ]; then
+    collect_hda_under "${LOCAL_CHECKOUT}/${DSTACKTEE_SUBPATH}"
+  fi
+  for _root in "${_roots[@]}"; do
+    [ -n "$_root" ] && collect_hda_under "$_root"
+  done
+fi
 
 # --- fact 1b: every locally mounted filesystem --------------------------------
 # The static roots are the CONVENTIONAL locations, and conventions are not where
@@ -201,7 +215,7 @@ binfmt_misc autofs nsfs rpc_pipefs selinuxfs overlay squashfs vfat
 nfs nfs4 cifs smb3 smbfs ceph glusterfs afs 9p fuse.sshfs fuse.s3fs"
 
 MOUNT_ROOTS=()
-if [ -r "$MOUNTS_PATH" ]; then
+if [ "$SKIP_HDA_SCAN" = "false" ] && [ -r "$MOUNTS_PATH" ]; then
   while read -r _dev _mnt _fstype _rest; do
     [ -n "${_mnt:-}" ] || continue
     case " $DENY_FS_TYPES " in *" $_fstype "*) continue ;; esac
@@ -246,6 +260,8 @@ PROC_PPIDS=()
 PROC_OURS=()
 PROC_ARGV_READABLE=()
 PROC_CMDHEADS=()
+PROC_THREADS=()
+PROC_CPU_TICKS=()
 
 for _procdir in "$PROC_ROOT"/[0-9]*; do
   [ -d "$_procdir" ] || continue
@@ -265,17 +281,39 @@ for _procdir in "$PROC_ROOT"/[0-9]*; do
   # Everything after the parenthesised comm is "state ppid pgrp ...", so both
   # fields come from one read. The ppid matters for a zombie: the recovery turns
   # on whether there is still a parent left to kill.
+  # Threads and CPU time come from the same read, because together they are the
+  # only way to tell a teardown that is GRINDING from one that is WEDGED, and
+  # that distinction is what decides whether waiting is the right move.
+  #
+  # A TDX guest's memory is handed back in STEPS, one per memory-backend-ram
+  # object — a 1.13 TB guest sat at a dead-flat `free` for 22 minutes, jumped by
+  # half, sat flat another 21, then finished. So a flat memory reading proves
+  # nothing. The surviving thread's utime+stime climbing at roughly one core is
+  # what proves progress.
   _state="?"
   _ppid="0"
+  _threads="0"
+  _cpu_ticks="0"
   if [ -r "$_procdir/stat" ]; then
+    # Everything after the parenthesised comm. The comm itself may contain
+    # spaces and parentheses, so the split is on the LAST ') ', not the first.
     _rest="$(sed -e 's/^.*) //' "$_procdir/stat" 2>/dev/null || printf '')"
     if [ -n "$_rest" ]; then
-      _state="${_rest%% *}"
-      _rest="${_rest#* }"
-      _ppid="${_rest%% *}"
+      # Field numbers within _rest: 1 state, 2 ppid, 12 utime, 13 stime,
+      # 18 num_threads. A fixture with a short stat line yields empty, which
+      # awk prints as the 0 default rather than an empty string that would
+      # then fail the numeric guards below.
+      read -r _state _ppid _cpu_ticks _threads <<<"$(printf '%s\n' "$_rest" | awk '{
+        printf "%s %s %s %s\n", ($1 == "" ? "?" : $1), ($2 == "" ? 0 : $2),
+                                (($12 == "" ? 0 : $12) + ($13 == "" ? 0 : $13)),
+                                ($18 == "" ? 0 : $18)
+      }')"
     fi
   fi
   case "$_ppid" in ''|*[!0-9]*) _ppid="0" ;; esac
+  case "$_threads" in ''|*[!0-9]*) _threads="0" ;; esac
+  case "$_cpu_ticks" in ''|*[!0-9]*) _cpu_ticks="0" ;; esac
+  [ -n "${_state:-}" ] || _state="?"
 
   # A ZOMBIE'S ARGV IS ALWAYS EMPTY. The kernel frees it when the process exits,
   # so /proc/<pid>/cmdline reads as 0 bytes while the entry still exists. Reading
@@ -303,7 +341,23 @@ for _procdir in "$PROC_ROOT"/[0-9]*; do
   PROC_OURS+=("$_ours")
   PROC_ARGV_READABLE+=("$_argv_readable")
   PROC_CMDHEADS+=("$(printf '%.160s' "$_cmdline")")
+  PROC_THREADS+=("$_threads")
+  PROC_CPU_TICKS+=("$_cpu_ticks")
 done
+
+# Answered before the derivation, because the derivation needs the disk facts
+# this mode deliberately skipped. Exit status is the count, capped at 250, so a
+# poll loop can branch on it without parsing: 0 means the host is free of QEMU.
+if [ "$MODE" = "qemu-procs" ]; then
+  for _i in "${!PROC_PIDS[@]}"; do
+    printf '%s %s %s %s\n' \
+      "${PROC_PIDS[$_i]}" "${PROC_STATES[$_i]}" \
+      "${PROC_THREADS[$_i]}" "${PROC_CPU_TICKS[$_i]}"
+  done
+  _n="${#PROC_PIDS[@]}"
+  [ "$_n" -gt 250 ] && _n=250
+  exit "$_n"
+fi
 
 # --- fact 3: incidental context ----------------------------------------------
 TMUX_LIUM_CVM="false"
@@ -392,27 +446,52 @@ if [ "${#HDA_IMAGES[@]}" -gt 0 ]; then
 fi
 
 if [ "$ANY_ZOMBIE" = "true" ]; then
-  RECOVERY_LINES+=("A zombie qemu-system process still holds guest memory. It is not reaped while")
-  RECOVERY_LINES+=("any of its threads are alive, so polling for it never returns.")
+  RECOVERY_LINES+=("A zombie qemu-system process is TEARING DOWN A TDX GUEST. It still holds that")
+  RECOVERY_LINES+=("guest's memory, and it is not reaped until its last thread exits.")
+  _first_zombie_pid=""
   for _i in "${!PROC_PIDS[@]}"; do
     [ "${PROC_STATES[$_i]}" = "Z" ] || continue
-    RECOVERY_LINES+=("  pid ${PROC_PIDS[$_i]}, parent pid ${PROC_PPIDS[$_i]}")
+    [ -n "$_first_zombie_pid" ] || _first_zombie_pid="${PROC_PIDS[$_i]}"
+    RECOVERY_LINES+=("  pid ${PROC_PIDS[$_i]}, parent pid ${PROC_PPIDS[$_i]}, threads ${PROC_THREADS[$_i]}, cpu ticks ${PROC_CPU_TICKS[$_i]}")
   done
+  RECOVERY_LINES+=("")
+  RECOVERY_LINES+=("DO NOT REBOOT THIS HOST TO CLEAR IT. A soft reboot asks the running kernel to")
+  RECOVERY_LINES+=("finish the very teardown it would then be waiting on, and to shut down the")
+  RECOVERY_LINES+=("same GPUs that teardown is still unmapping. On a production host this left")
+  RECOVERY_LINES+=("the old kernel wedged for over fourteen minutes WITH THE NETWORK STILL UP —")
+  RECOVERY_LINES+=("ping answered, port 22 accepted the connection and never sent a banner — and")
+  RECOVERY_LINES+=("it took a datacentre power-cycle to recover. Rebooting turns a wait into an")
+  RECOVERY_LINES+=("outage plus a support ticket.")
+  RECOVERY_LINES+=("")
+  RECOVERY_LINES+=("WAIT INSTEAD. It reaps itself. How long scales with the guest's memory:")
+  RECOVERY_LINES+=("about a minute for a near-empty guest, and 43 minutes measured for 1.13 TB.")
+  # No backticks in these strings: they are inside double quotes, so a backtick
+  # pair is command substitution and the host would run whatever it wrapped.
+  RECOVERY_LINES+=("Memory comes back in STEPS, one per memory-backend-ram object, so a free(1)")
+  RECOVERY_LINES+=("reading that sits flat for twenty minutes is the normal shape, not a hang.")
+  RECOVERY_LINES+=("To prove it is still working, watch the cpu ticks climb — roughly 100 per")
+  RECOVERY_LINES+=("second is one full core of page reclaim:")
+  RECOVERY_LINES+=("  watch -n5 ./lium-guard.sh --qemu-procs")
+  RECOVERY_LINES+=("If the ticks stop climbing for many minutes, the host needs an OUT-OF-BAND")
+  RECOVERY_LINES+=("power-cycle from the datacentre — never a soft reboot from inside.")
   # Which instruction is correct depends on facts already collected, so it is
   # chosen from them. The unconditional `tmux kill-session -t lium-cvm` named a
   # session this host did not have and a parent that was already init.
   if [ "$TMUX_LIUM_CVM" = "true" ]; then
-    RECOVERY_LINES+=("The lium-cvm tmux session is its parent. Killing that reaps it:")
+    RECOVERY_LINES+=("")
+    RECOVERY_LINES+=("The lium-cvm tmux session is its parent, so once the teardown finishes,")
+    RECOVERY_LINES+=("killing that session reaps the entry:")
     RECOVERY_LINES+=("  sudo tmux kill-session -t lium-cvm")
   elif [ "$ANY_ZOMBIE_ORPHANED" = "true" ]; then
+    RECOVERY_LINES+=("")
     RECOVERY_LINES+=("Its parent is already init (pid 1), so there is no parent left to kill, and")
-    RECOVERY_LINES+=("kill -9 does nothing to a process that has already exited. The guest memory")
-    RECOVERY_LINES+=("stays reserved until its last thread exits. See what is still running:")
-    RECOVERY_LINES+=("  ls /proc/<pid>/task")
-    RECOVERY_LINES+=("If those threads do not exit, a host reboot is the only thing that frees it.")
+    RECOVERY_LINES+=("kill -9 does nothing to a process that has already exited. Init will reap it")
+    RECOVERY_LINES+=("the moment the last thread is gone. See what is still running:")
+    RECOVERY_LINES+=("  ls /proc/${_first_zombie_pid:-<pid>}/task")
   else
-    RECOVERY_LINES+=("Kill the parent pid shown above: a zombie is reaped when its parent exits or")
-    RECOVERY_LINES+=("reaps it, and not before.")
+    RECOVERY_LINES+=("")
+    RECOVERY_LINES+=("Once the teardown finishes, the parent pid shown above reaps it: a zombie is")
+    RECOVERY_LINES+=("cleared when its parent exits or reaps it, and not before.")
   fi
 fi
 
@@ -461,6 +540,8 @@ for _i in "${!PROC_PIDS[@]}"; do
   procs_json="${procs_json}, \"comm\": \"$(json_escape "${PROC_COMMS[$_i]}")\""
   procs_json="${procs_json}, \"proc_state\": \"$(json_escape "${PROC_STATES[$_i]}")\""
   procs_json="${procs_json}, \"ppid\": ${PROC_PPIDS[$_i]}"
+  procs_json="${procs_json}, \"threads\": ${PROC_THREADS[$_i]}"
+  procs_json="${procs_json}, \"cpu_ticks\": ${PROC_CPU_TICKS[$_i]}"
   procs_json="${procs_json}, \"ours\": ${PROC_OURS[$_i]}"
   procs_json="${procs_json}, \"argv_readable\": ${PROC_ARGV_READABLE[$_i]}"
   procs_json="${procs_json}, \"cmdline_head\": \"$(json_escape "${PROC_CMDHEADS[$_i]}")\"}"

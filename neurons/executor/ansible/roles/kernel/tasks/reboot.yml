@@ -66,6 +66,12 @@
   ansible.builtin.meta: end_play
   when: (lium_converge_reboots | int) >= (lium_max_converge_reboots | int)
 
+# BEFORE the confirmation and before the budget is spent. Fail-fast on a running
+# guest costs the operator nothing, and a run that is going to end_play on an
+# exhausted budget should not first wait an hour for a teardown it will not use.
+- name: Refuse to reboot into a live or draining TDX guest
+  ansible.builtin.include_tasks: wait_for_teardown.yml
+
 - name: Confirm the reboot with the operator
   ansible.builtin.pause:
     prompt: |
