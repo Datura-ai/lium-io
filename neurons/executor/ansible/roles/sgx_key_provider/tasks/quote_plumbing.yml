@@ -58,20 +58,35 @@
 # Signature: `[QCNL] CURL error: (60) SSL peer certificate ... was not OK`,
 # `[QPL] Failed to get quote config. Error code is 0xb033`, then
 # `vsock failure: failed to fill whole buffer`.
-- name: Accept the local PCCS certificate
-  ansible.builtin.lineinfile:
+#
+# The file is WRITTEN, not line-edited. Two `lineinfile` tasks used to do this
+# and they corrupted Intel's shipped config into invalid JSON — the template
+# header explains exactly how. Keep the pristine copy first: it is the only
+# record of what the platform shipped with.
+- name: Look for an existing system QPL configuration
+  ansible.builtin.stat:
     path: "{{ lium_system_qcnl_path }}"
-    regexp: '^\s*"use_secure_cert"\s*:'
-    line: '  "use_secure_cert": false,'
-    create: false
-    mode: "0644"
-  notify: Restart qgsd
+  register: lium_system_qcnl_stat
 
-- name: Point the system QPL at the PCCS
-  ansible.builtin.lineinfile:
-    path: "{{ lium_system_qcnl_path }}"
-    regexp: '^\s*"pccs_url"\s*:'
-    line: '  "pccs_url": "{{ lium_pccs_url }}",'
-    create: false
+# force: false, so the backup is taken ONCE. Re-running must not overwrite the
+# pristine copy with the managed one — that would destroy the only record of
+# what the platform shipped with, on the second converge, silently.
+- name: Preserve the pristine system QPL configuration
+  ansible.builtin.copy:
+    src: "{{ lium_system_qcnl_path }}"
+    dest: "{{ lium_system_qcnl_path }}.pre-lium-cvm"
+    remote_src: true
+    force: false
     mode: "0644"
+  when: lium_system_qcnl_stat.stat.exists | default(false)
+
+- name: Write the system QPL configuration
+  ansible.builtin.template:
+    src: sgx_default_qcnl.conf.j2
+    dest: "{{ lium_system_qcnl_path }}"
+    mode: "0644"
+    # Refuse to install a file the QPL cannot read. Without this the corruption
+    # is silent on the host and only surfaces as a CVM that reboots at ~160s,
+    # three layers away, long after the converge reported success.
+    validate: "python3 -c \"import json,sys; json.load(open(sys.argv[1]))\" %s"
   notify: Restart qgsd

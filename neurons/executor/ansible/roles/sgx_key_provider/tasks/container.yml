@@ -28,6 +28,25 @@
     create: false
     mode: "0644"
 
+# The two edits above are safe TODAY only because the checked-in file is plain,
+# strict, comma-trailing JSON, so both regexps match. lineinfile APPENDS when a
+# regexp matches nothing, so the day that file is reformatted — reordered, given
+# comments, or switched to Intel's leading-comma house style — these tasks stop
+# matching and silently write their line after the closing brace instead. That is
+# exactly what happened to the SYSTEM copy, and nothing on the host said so: the
+# QPL just failed to parse its config, quote generation returned a DCAP error,
+# the key provider refused the guest, and the CVM rebooted at ~160s while the
+# converge reported success. Checked here so the damage cannot leave this role.
+- name: Confirm the key provider's QPL configuration is still valid JSON
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c "import json,sys; json.load(open(sys.argv[1]))"
+      {{ lium_repo_path }}/{{ lium_kp_qcnl_relpath }}
+  changed_when: false
+  register: lium_kp_qcnl_valid
+  failed_when: lium_kp_qcnl_valid.rc != 0
+  check_mode: false
+
 - name: Start the sealing-key provider
   ansible.builtin.command:
     cmd: docker compose up -d --build

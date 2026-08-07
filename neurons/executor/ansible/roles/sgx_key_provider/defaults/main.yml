@@ -15,6 +15,16 @@ lium_sgx_packages:
 
 lium_system_qcnl_path: /etc/sgx_default_qcnl.conf
 
+# The system QPL configuration is written whole from a template rather than
+# line-edited, so its values are named here. Intel's own defaults, except
+# use_secure_cert: a local PCCS serves a self-signed certificate, and leaving
+# this true fails the whole quote chain with CURL error 60.
+lium_qcnl_use_secure_cert: false
+lium_qcnl_retry_times: 6
+lium_qcnl_retry_delay: 10
+lium_qcnl_pck_cache_expire_hours: 168
+lium_qcnl_collateral_cache_expire_hours: 168
+
 # Assertions that only make sense on real SGX hardware. The fixture tests set
 # these false so the templating and package-list logic can be exercised anywhere.
 # Installing Intel's packages needs root and network. The maintenance-profile
