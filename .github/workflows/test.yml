@@ -171,6 +171,12 @@ jobs:
       - name: Bootstrap accepts the flags the tree recommends
         run: bash tests/test_bootstrap_args.sh
 
+      # Ordering invariants that are silent when broken: every task present and
+      # individually correct, only the sequence wrong. Both cases it guards were
+      # found by running the playbook on real hardware, not by any check here.
+      - name: Task ordering invariants
+        run: bash tests/test_task_ordering.sh
+
       # Repeated deliberately. The defect it guards is a race, so a single run
       # of the collector passed while roughly a quarter of runs on real hardware
       # derived the wrong vfio-pci.ids= value.
@@ -331,7 +337,8 @@ jobs:
         run: |
           for t in test_forbidden_strings test_seam_gate test_guard \
                    test_resume_guard test_verify_schema test_docs_pointer \
-                   test_cmdline_resolution test_bootstrap_args; do
+                   test_cmdline_resolution test_bootstrap_args \
+                   test_task_ordering; do
             bash "tests/$t.sh"
           done
 

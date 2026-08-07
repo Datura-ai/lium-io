@@ -30,30 +30,24 @@
   ansible.builtin.meta: end_role
   when: (lium.gpu_bdfs | default([]) | length) == 0
 
-# Tri-state. Never flip a mode we could not read: the flip resets the GPU, and a
-# query that failed is not the same as a query that said "off".
-- name: Refuse to act on an unreadable CC mode
-  ansible.builtin.fail:
-    msg: |
-      REFUSING: the confidential-compute mode of {{ lium_unreadable_cc | length }}
-      GPU(s) could not be read, and flipping a mode we cannot read resets a GPU
-      for no reason we can justify.
-
-      {% for bdf, entry in lium.gpu_cc_mode.items() %}
-      {% if not entry.readable %}
-        {{ bdf }}: {{ entry.reason }}
-      {% endif %}
-      {% endfor %}
-
-      Install or repair nvtrust first, then re-run.
-  vars:
-    lium_unreadable_cc: >-
-      {{ lium.gpu_cc_mode | dict2items | rejectattr('value.readable') | list }}
-  when: lium_unreadable_cc | length > 0
-
+# INSTALL BEFORE THE READABILITY GATE.
+#
+# The gate below refuses when CC mode cannot be read. A host that has never run
+# this playbook cannot read it — because the tool that reads it is nvtrust, and
+# nvtrust is what these two tasks install. Ordered the other way round, the role
+# refused with "Install or repair nvtrust first, then re-run" while the very next
+# task was the one that installs nvtrust, and re-running changed nothing. That
+# aborted the converge on every host without a pre-existing /opt/nvtrust, which
+# is every fresh host — the only kind this playbook exists for. Observed on au11.
+#
 # Cloned to /opt and symlinked to /root/nvtrust, because the cvm-provision
 # skill's preflight.sh:78 and fix-host.sh:159 hardcode
 # /root/nvtrust/host_tools/python/nvidia_gpu_tools.py. Both keep working.
+- name: Note whether CC mode was readable before nvtrust was installed
+  ansible.builtin.set_fact:
+    lium_cc_unreadable_at_entry: >-
+      {{ lium.gpu_cc_mode | dict2items | rejectattr('value.readable') | list }}
+
 - name: Install nvtrust at the pinned tag
   ansible.builtin.git:
     repo: "{{ lium_nvtrust_repo }}"
@@ -69,6 +63,44 @@
     dest: /root/nvtrust
     state: link
     force: true
+
+# `lium.gpu_cc_mode` was collected in play 1, BEFORE the clone above existed, so
+# it still records "nvtrust tool is not available" for every device. Judging the
+# gate on that snapshot would refuse for a reason this role has just fixed.
+#
+# Re-collecting rather than patching one key: the collector is the single source
+# of the fact, and a hand-patched bundle would drift from it. Conditional,
+# because the sweep is not free and a host that could already read CC mode has
+# nothing to refresh. The verify play re-runs `common` for the same reason.
+- name: Re-read the host facts now that nvtrust is installed
+  ansible.builtin.include_role:
+    name: common
+  when: lium_cc_unreadable_at_entry | length > 0
+
+# Tri-state. Never flip a mode we could not read: the flip resets the GPU, and a
+# query that failed is not the same as a query that said "off".
+- name: Refuse to act on an unreadable CC mode
+  ansible.builtin.fail:
+    msg: |
+      REFUSING: the confidential-compute mode of {{ lium_unreadable_cc | length }}
+      GPU(s) could not be read, and flipping a mode we cannot read resets a GPU
+      for no reason we can justify.
+
+      {% for bdf, entry in lium.gpu_cc_mode.items() %}
+      {% if not entry.readable %}
+        {{ bdf }}: {{ entry.reason }}
+      {% endif %}
+      {% endfor %}
+
+      nvtrust is installed at {{ lium_nvtrust_dir }} by this role, so a missing
+      tool is not the cause unless that clone failed. Check the reasons above:
+      run the query by hand to see what it says.
+
+          python3 {{ lium_nvtrust_tool }} --gpu-bdf=<bdf> --query-cc-mode
+  vars:
+    lium_unreadable_cc: >-
+      {{ lium.gpu_cc_mode | dict2items | rejectattr('value.readable') | list }}
+  when: lium_unreadable_cc | length > 0
 
 - name: Flip confidential-compute mode where it is off
   ansible.builtin.include_tasks: flip_cc.yml
