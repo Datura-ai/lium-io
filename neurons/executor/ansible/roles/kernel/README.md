@@ -117,6 +117,62 @@ Never `modprobe vfio_iommu_type1 vfio-pci`. The second argument is read as a
 module **parameter**, and the kernel quietly logs `unknown parameter 'vfio-pci'
 ignored` while doing nothing.
 
+## How the reboot is issued, and why not `ansible.builtin.reboot`
+
+That module refuses a local connection outright:
+
+```
+Running ansible.builtin.reboot with local connection would reboot the control node.
+```
+
+`inventory/localhost.yml` sets `ansible_connection: local` by design — a provider
+runs this on the host it is provisioning — so the module failed on **every** run
+that reached it, and the day-zero converge could never apply a kernel command
+line unattended. Its model does not fit: it reboots and then reconnects to carry
+on, and here the control node **is** the host.
+
+`lium_reboot_cmd` schedules a detached `systemd-run --on-active` timer instead,
+and then the play **holds** until the shutdown kills it. The hold is not a
+formality. `meta: end_play` ends only the current play, so Ansible would walk
+straight into the `gpu` play — flipping CC mode across eight GPUs and rebinding
+them — with seconds to live. Everything past this point is redone by the resume
+unit after the boot, so there is nothing to gain by starting it. Surviving the
+hold means the reboot never fired, which fails loudly.
+
+## The teardown gate: `wait_for_teardown.yml`
+
+Runs immediately before the reboot, reading `/proc` **fresh** rather than the
+guard snapshot taken in play 1.
+
+- A qemu-system process that is **running** → refuse at once. It will never
+  drain on its own, so waiting would burn the whole budget to reach the same
+  answer.
+- A qemu-system process that is a **zombie** → a TDX teardown is in flight;
+  wait for it (`lium_reboot_drain_timeout_sec`, default 5400).
+
+**A soft reboot during a TDX teardown does not complete.** The kernel has to
+reclaim the guest's private pages — one SEAMCALL each — and unmap DMA for every
+VFIO device before it can shut down, and then shut down the same GPUs that
+teardown is still unmapping. On a production host this left the old kernel alive
+on the network for over fourteen minutes: ping answered, port 22 completed the
+TCP handshake and never sent a banner, and platform reset never arrived. Only a
+datacentre power-cycle recovered it.
+
+**There is no override, and that is deliberate.** The gate sits *below*
+`lium_force_reboot`, which authorises destroying a drained encrypted disk — a
+trade an operator can rationally make. Wedging the host is not that trade: it
+costs an outage and a support ticket and buys nothing. The only knob is how long
+to wait. When waiting genuinely is not an option the answer is an out-of-band
+power-cycle, which needs nothing from the old kernel and cold-resets the GPUs.
+
+Watch progress with the mode the gate itself polls — memory is handed back in
+steps, one per `memory-backend-ram` object, so a flat `free` proves nothing
+while climbing cpu ticks prove the reclaim is running:
+
+```
+watch -n5 roles/common/files/lium-guard.sh --qemu-procs   # pid state threads cpu_ticks
+```
+
 ## The reboot budget
 
 `/var/lib/lium-cvm/converge_reboots`, capped at `lium_max_converge_reboots`
