@@ -83,6 +83,11 @@ lium_reset_reboot_budget: false
 lium_reboot_drain_timeout_sec: 5400
 lium_reboot_drain_poll_sec: 15
 
+# How long the play holds after scheduling the reboot, waiting to be killed by
+# the shutdown. Generous: it is not a deadline for the reboot, it is the point
+# at which "the host is still here" becomes evidence the reboot never fired.
+lium_reboot_shutdown_grace_sec: 300
+
 # Start timeout for the post-reboot resume unit. Type=oneshot has none by
 # default, so without this a blocked resume leaves the host at boot forever with
 # provisioning half done. Generous, because the resume legitimately installs

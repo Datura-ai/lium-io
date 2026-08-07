@@ -96,7 +96,46 @@
 - name: Arm the post-reboot continuation
   ansible.builtin.include_tasks: arm_resume.yml
 
-- name: Reboot
-  ansible.builtin.reboot:
-    msg: "Rebooting for the CVM host kernel command line (DAH-2544)"
-    reboot_timeout: 900
+# A DETACHED TIMER, then a deliberate hold. Not ansible.builtin.reboot — that
+# module refuses a local connection, and this tree is localhost-only, so it
+# failed 100% of the time on the one path it existed for. See
+# group_vars/all/commands.yml.
+#
+# The hold is what stops the REST of site.yml running in the seconds before the
+# host goes down. Without it the play ends here and Ansible walks straight into
+# the gpu play — which flips CC mode on eight GPUs and rebinds them — and the
+# shutdown kills it partway through. Everything after this point is redone by
+# lium-cvm-resume.service after the boot anyway, so there is nothing to gain by
+# starting it and a wedged GPU to lose.
+- name: Schedule the reboot
+  ansible.builtin.command:
+    cmd: "{{ lium_reboot_cmd }}"
+  changed_when: true
+
+- name: Hold the run while the host goes down
+  ansible.builtin.wait_for:
+    timeout: "{{ lium_reboot_shutdown_grace_sec | int }}"
+
+# Reached only if the host was still up long after the timer should have fired,
+# which means the reboot never happened. Silence here would let the run carry on
+# into the gpu play believing the new kernel command line is active when it is
+# not, and the resume unit stays armed for a reboot nobody scheduled.
+- name: The scheduled reboot never happened
+  ansible.builtin.fail:
+    msg: |
+      The host is still running {{ lium_reboot_shutdown_grace_sec }}s after a
+      reboot was scheduled for {{ lium_reboot_delay_sec }}s from now.
+
+      Check the timer and the unit it was supposed to start:
+
+          systemctl status {{ lium_reboot_systemd_unit }}.timer
+          systemctl status {{ lium_reboot_systemd_unit }}.service
+          journalctl -u {{ lium_reboot_systemd_unit }}
+
+      lium-cvm-resume.service is armed and will continue the converge on the
+      next boot, so the safe manual step is a reboot:
+
+          sudo systemctl reboot
+
+      Do NOT do that if a CVM is running or tearing down — see
+      roles/kernel/tasks/wait_for_teardown.yml.

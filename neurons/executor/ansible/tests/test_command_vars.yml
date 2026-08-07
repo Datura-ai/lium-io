@@ -44,6 +44,12 @@
         systemd-run --unit=qemu-dstack-build --collect --setenv=HOME=/root
         /usr/local/lib/lium-cvm/build-qemu.sh
 
+      # --on-active, not a bare reboot: the timer lets the task return and the
+      # log flush instead of the shutdown SIGTERMing Ansible mid-task.
+      lium_reboot_cmd: >-
+        systemd-run --unit=lium-converge-reboot --collect --on-active=5
+        /sbin/reboot
+
       lium_pckid_tool_cmd: >-
         /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool
         -f /var/lib/lium-cvm/pckid.csv

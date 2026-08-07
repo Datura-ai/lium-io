@@ -56,6 +56,28 @@ lium_modprobe_cmds:
 
 lium_update_grub_cmd: update-grub
 
+# --- reboot ------------------------------------------------------------------
+# ansible.builtin.reboot CANNOT be used in this tree. It refuses a local
+# connection outright — "Running ansible.builtin.reboot with local connection
+# would reboot the control node" — and inventory/localhost.yml sets
+# ansible_connection: local because a provider runs this ON the host it is
+# provisioning. There is no remote transport here, so the module's whole model
+# (reboot, then reconnect and carry on) does not apply: the control node IS the
+# host, and nothing survives to reconnect with. That is what lium-cvm-resume
+# .service is for.
+#
+# --on-active is what makes it detachable. A bare `reboot` starts the shutdown
+# immediately, and systemd then SIGTERMs the ansible process that called it
+# mid-task, so the log ends in the middle of a line and bootstrap.sh's exit code
+# is whatever the signal made it. The timer lets the task return, the play hold,
+# and the log flush before the host goes down.
+lium_reboot_systemd_unit: lium-converge-reboot
+lium_reboot_delay_sec: 5
+lium_reboot_cmd: >-
+  systemd-run --unit={{ lium_reboot_systemd_unit }} --collect
+  --on-active={{ lium_reboot_delay_sec }}
+  /sbin/reboot
+
 # --- repo --------------------------------------------------------------------
 # Run with chdir into the dstacktee checkout. A variable rather than a literal
 # for the usual reason — check mode never sees a command task — and so the
