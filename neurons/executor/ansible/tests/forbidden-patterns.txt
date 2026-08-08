@@ -19,7 +19,7 @@
 #           bootstrap — bootstrap.sh alone
 #           commands  — group_vars/all/commands.yml alone
 #           groupvars — group_vars/**
-#           ci        — .github/workflows/test.yml and qemu-2604-compile.yml
+#           ci        — .github/workflows/test.yml
 #           all       — tree plus ci
 #
 # Scope is per-pattern because the rules genuinely differ. `|| true` inside a

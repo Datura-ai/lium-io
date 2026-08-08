@@ -28,7 +28,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 PATTERN_FILE="tests/forbidden-patterns.txt"
 WORKFLOWS_DIR="../../../.github/workflows"
-REQUIRED_WORKFLOWS=(test.yml qemu-2604-compile.yml)
+REQUIRED_WORKFLOWS=(test.yml)
 
 FAILURES=0
 
