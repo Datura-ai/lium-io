@@ -331,14 +331,14 @@
       "title": "CVM state on this host"
     },
     {
-      "evidence_source": "group_vars",
-      "expected": "implemented in DAH-2575",
-      "id": "cvmd.stub_status",
-      "observed": "not configured",
-      "remediation": "cvmd ships as a variable interface only. Leave lium_cvmd_package_url unset until DAH-2575 lands.",
+      "evidence_source": "systemctl is-active cvmd.service",
+      "expected": "active whenever lium_cvmd_package_url is set",
+      "id": "cvmd.service_state",
+      "observed": "not requested",
+      "remediation": "cvmd is optional. Set lium_cvmd_package_url, lium_cvmd_package_sha256 and lium_cvmd_authorized_clients to install the control daemon.",
       "severity": "info",
       "status": "SKIPPED",
-      "title": "cvmd interface"
+      "title": "cvmd control daemon"
     },
     {
       "evidence_source": "group_vars",

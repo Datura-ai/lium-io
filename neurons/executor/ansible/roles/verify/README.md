@@ -234,9 +234,13 @@ The derived CVM state — `CLEAN`, `LIVE`, `DORMANT`, `FOREIGN`, `ZOMBIE` or
 `UNKNOWN`. Its `remediation` carries the fact-composed recovery procedure, so
 the report itself explains which roles were withheld and why.
 
-### cvmd.stub_status
-Always `SKIPPED`. cvmd ships as a variable interface only; the implementation
-lands in DAH-2575.
+### cvmd.service_state
+Whether the cvmd control daemon is running. `SKIPPED` when
+`lium_cvmd_package_url` is unset — cvmd is optional per host. Once it is set
+this is a **blocker**: a host whose control daemon is down accepts no CVM
+lifecycle call, and the failure is silent from outside because the port simply
+refuses to connect. `observed` carries the first 12 characters of the installed
+package checksum, so the report says *which* build is running.
 
 ### catalog.stub_status
 Always `SKIPPED`. Same shape; the implementation lands in DAH-2576 / DAH-2578.

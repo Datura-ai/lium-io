@@ -1,19 +1,23 @@
 ---
-# cvmd ships as a VARIABLE INTERFACE, not an implementation.
+# cvmd — the CVM host control daemon (DAH-2575).
 #
-# The point is that day-zero does not wait on the cvmd build. The interface is
-# fixed here so the roles that will consume it can be written against something
-# real, and so a host provisioned today needs no re-plumbing later.
+# LOUD IN BOTH DIRECTIONS, which is what the DAH-2544 stub established and this
+# keeps. Unset, the role says cvmd was not requested and ends. Set, it either
+# produces a daemon answering /health or fails the run. There is no path that
+# leaves a half-configured host looking finished.
 #
-# It must be LOUD IN BOTH DIRECTIONS. A stub that silently does nothing when set
-# is worse than no stub: it makes a half-configured host look finished.
+# Everything the daemon refuses to start on is refused HERE first — a missing
+# checksum, an empty client list, an unknown scope, a duplicate hotkey. cvmd is
+# fail-closed on all of them, so skipping these checks would still be safe; it
+# would just report the problem as "systemd unit entered failed state" instead
+# of naming the variable the operator got wrong.
 
-- name: Report that cvmd is not installed
+- name: Report that cvmd was not requested
   ansible.builtin.debug:
     msg: >-
-      cvmd not installed — waiting on the cvmd build (DAH-2575).
-      Set lium_cvmd_package_url, lium_cvmd_package_sha256 and
-      lium_cvmd_authorized_client_keys to enable it.
+      cvmd not installed — lium_cvmd_package_url is unset. Set it together with
+      lium_cvmd_package_sha256 and lium_cvmd_authorized_clients to install the
+      CVM host control daemon.
   when: lium_cvmd_package_url | length == 0
 
 - name: End the role while cvmd is unset
@@ -24,17 +28,93 @@
   ansible.builtin.assert:
     that:
       - lium_cvmd_package_sha256 | length > 0
-      - lium_cvmd_authorized_client_keys | length > 0
+      - lium_cvmd_authorized_clients | length > 0
     fail_msg: >-
       lium_cvmd_package_url is set, but lium_cvmd_package_sha256 and
-      lium_cvmd_authorized_client_keys are both required with it. A package
+      lium_cvmd_authorized_clients are both required with it. A package
       installed without a checksum, or a daemon with no authorised clients, is
-      not a working configuration.
+      not a working configuration — cvmd refuses to start on an empty client
+      list, so the second is a dead service rather than an open one.
     quiet: true
 
-- name: Stop, because cvmd installation is not implemented here
-  ansible.builtin.fail:
-    msg: >-
-      cvmd installation is not implemented in DAH-2544. The variable interface is
-      defined here; the implementation lands in DAH-2575. Unset
-      lium_cvmd_package_url to continue without it.
+- name: Every authorised client is a hotkey paired with a scope
+  ansible.builtin.assert:
+    that:
+      - item.hotkey is defined
+      - item.hotkey is string
+      - item.hotkey | length > 0
+      - item.scope is defined
+      - item.scope in cvmd_valid_scopes
+    fail_msg: >-
+      lium_cvmd_authorized_clients[{{ index }}] is not a {hotkey, scope} object
+      with scope in {{ cvmd_valid_scopes | join(', ') }}: {{ item | to_json }}.
+      This is the shape cvmd reads — a bare key string, or an SSH public key,
+      authorises nobody.
+    quiet: true
+  loop: "{{ lium_cvmd_authorized_clients }}"
+  loop_control:
+    index_var: index
+    label: "{{ item.hotkey | default(item) | string | truncate(16, true, '…') }}"
+
+# Format only. The base58 checksum is decoded by bittensor at daemon startup
+# (cvmd/src/cvmd/auth/clients.py:_validate_ss58), and nothing in Ansible can do
+# that without a new dependency. This catches the ordinary mistakes — an SSH
+# key, a coldkey file path, a truncated paste — and says so rather than pretending
+# to have verified the address.
+- name: Each hotkey looks like an ss58 address
+  ansible.builtin.assert:
+    that:
+      - item.hotkey is match('^5[1-9A-HJ-NP-Za-km-z]{46,47}$')
+    fail_msg: >-
+      lium_cvmd_authorized_clients[{{ index }}].hotkey is not shaped like a
+      bittensor ss58 address (48 base58 characters starting with 5):
+      {{ item.hotkey | to_json }}. Only the format is checked here; the checksum
+      is verified by cvmd at startup.
+    quiet: true
+  loop: "{{ lium_cvmd_authorized_clients }}"
+  loop_control:
+    index_var: index
+    label: "{{ item.hotkey | truncate(16, true, '…') }}"
+
+# A hotkey listed twice is ambiguous — one of the two scopes silently wins.
+# cvmd refuses the file outright; refusing here names the offending address.
+#
+# Counted per entry rather than comparing the list length against its unique
+# length. Both detect a duplicate, but only this one can say WHICH — `difference`
+# is a set difference, so subtracting the unique list from the full one is empty
+# whether or not a duplicate exists.
+- name: No hotkey is authorised twice
+  ansible.builtin.assert:
+    that:
+      - (cvmd_hotkeys | select('equalto', item.hotkey) | list | length) == 1
+    fail_msg: >-
+      {{ item.hotkey }} is authorised
+      {{ cvmd_hotkeys | select('equalto', item.hotkey) | list | length }} times in
+      lium_cvmd_authorized_clients, so one of its scopes would silently win.
+    quiet: true
+  loop: "{{ lium_cvmd_authorized_clients }}"
+  vars:
+    cvmd_hotkeys: "{{ lium_cvmd_authorized_clients | map(attribute='hotkey') | list }}"
+  loop_control:
+    label: "{{ item.hotkey | truncate(16, true, '…') }}"
+
+- name: Read the host Python version
+  ansible.builtin.command: python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'
+  register: cvmd_python_version
+  changed_when: false
+
+- name: Require a Python new enough for cvmd
+  ansible.builtin.assert:
+    that:
+      - cvmd_python_version.stdout is version(cvmd_min_python, '>=')
+    fail_msg: >-
+      cvmd requires Python >= {{ cvmd_min_python }}; this host has
+      {{ cvmd_python_version.stdout }}. The floor comes from bittensor 11.x,
+      which is what cvmd verifies signatures with. Ubuntu 25.10 ships 3.13.
+    quiet: true
+
+- name: Install the cvmd package
+  ansible.builtin.include_tasks: install.yml
+
+- name: Configure and start cvmd
+  ansible.builtin.include_tasks: configure.yml

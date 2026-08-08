@@ -210,10 +210,50 @@ lium_seam_defaults:
   lium_state_dir: /var/lib/lium-cvm
   lium_mounts_path: /proc/mounts
 
-# cvmd / catalog variable interfaces. Unset => the stub says what it is waiting
-# on. Set => the stub asserts its companions then fails "not implemented".
+# cvmd — the CVM host control daemon (DAH-2575).
+#
+# Unset URL => the role reports that cvmd was not requested and ends. Set => the
+# tarball is fetched against its checksum, installed, configured and started,
+# and the run fails if /health never answers.
 lium_cvmd_package_url: ""
 lium_cvmd_package_sha256: ""
-lium_cvmd_authorized_client_keys: []
+
+# Who may call cvmd, and in which scope. A list of {hotkey, scope} objects,
+# rendered verbatim into /etc/cvmd/authorized_clients.json:
+#
+#   lium_cvmd_authorized_clients:
+#     - hotkey: 5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX
+#       scope: validation
+#     - hotkey: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+#       scope: renter
+#
+# NOT a list of SSH public keys. cvmd authenticates a signed request against a
+# bittensor hotkey, so an ss58 address paired with a scope is the only thing it
+# can act on. The two scopes are disjoint by design — see roles/cvmd/README.md.
+lium_cvmd_authorized_clients: []
+
+# Where cvmd listens. 0.0.0.0 is the packaged default because the validator and
+# the connector both reach it across the network; a host that only needs local
+# callers should set 127.0.0.1 rather than rely on a firewall it does not own.
+lium_cvmd_bind_address: 0.0.0.0
+lium_cvmd_port: 8443
+
+# How long to wait for /health after starting the unit, as retries x delay
+# seconds. The first start builds nothing — the venv was already installed — so
+# this covers process start and TLS listener setup, not a build.
+lium_cvmd_health_retries: 30
+lium_cvmd_health_delay: 2
+
+# How far a request timestamp may sit from the host clock, in seconds. Widening
+# it widens the window a captured signature can be replayed in, bounded by the
+# nonce store; narrowing it starts rejecting clients whose clock drifts.
+lium_cvmd_skew_seconds: 60
+
+# The request-body cap, enforced before the body is buffered. Real bodies are a
+# `kind` plus three hashes — hundreds of bytes.
+lium_cvmd_max_body_bytes: 65536
+
+# catalog variable interface. Unset => the stub says what it is waiting on.
+# Set => the stub asserts its companion then fails "not implemented".
 lium_catalog_manifest_url: ""
 lium_catalog_manifest_sha256: ""
