@@ -10,7 +10,13 @@ import time
 import pytest
 from conftest import sign_headers, signed_request
 from cvmd.app import create_app
-from cvmd.auth.replay import FLOOR_FILENAME, NONCES_FILENAME, ReplayRejected, ReplayStore
+from cvmd.auth.replay import (
+    FLOOR_FILENAME,
+    NANOSECONDS_PER_SECOND,
+    NONCES_FILENAME,
+    ReplayRejected,
+    ReplayStore,
+)
 from fastapi.testclient import TestClient
 
 STATE_PATH = "/v1/state"
@@ -140,6 +146,39 @@ class TestRestartDurability:
 
         with self._restart(config) as restarted:
             assert signed_request(restarted, validator_key, "GET", STATE_PATH).status_code == 200
+
+    def test_an_in_skew_future_timestamp_holds_the_floor_ahead_of_wall_clock(
+        self, client, config, validator_key
+    ):
+        """A future-dated request refuses every caller after a restart until now catches up.
+
+        The skew window is two-sided, so a timestamp up to skew_seconds ahead is valid and, once
+        accepted, becomes the persisted high-water mark. The next start reads it as the floor —
+        which is now in the future — and refuses present-time requests until wall-clock passes it.
+
+        Bounded by skew_seconds and self-healing, but real: found on hardware during the DAH-2575
+        acceptance run, where a request 5s ahead made the daemon refuse everything for 5s after a
+        restart. Pinned so that changing it is a decision rather than an accident. See the
+        module docstring in auth/replay.py for why the floor cannot simply be clamped to `now`.
+        """
+        ahead_ns = time.time_ns() + 30 * NANOSECONDS_PER_SECOND
+        assert (
+            signed_request(
+                client, validator_key, "GET", STATE_PATH, timestamp_ns=ahead_ns
+            ).status_code
+            == 200
+        )
+
+        with self._restart(config) as restarted:
+            # Present-time sits below the floor the previous life recorded.
+            assert signed_request(restarted, validator_key, "GET", STATE_PATH).status_code == 401
+            # Above it still passes, so this is the floor refusing — not a wedged daemon.
+            assert (
+                signed_request(
+                    restarted, validator_key, "GET", STATE_PATH, timestamp_ns=ahead_ns + 1
+                ).status_code
+                == 200
+            )
 
 
 class _ExplodingStore:

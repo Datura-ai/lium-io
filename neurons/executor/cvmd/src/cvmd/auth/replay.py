@@ -22,6 +22,20 @@ which asserts the availability property directly.
 The two records live in separate files on purpose. If the nonce set is lost or corrupt, the floor
 alone still refuses every request the previous life accepted; losing both is a root-only action,
 i.e. the host owner, who is outside this layer's threat model by design (arch doc §03).
+
+**The floor can sit ahead of wall-clock time, and that is not a bug.** The skew window is
+two-sided, so a timestamp up to `skew_seconds` in the future is valid; accepting one makes it the
+high-water mark, and the next start refuses present-time requests until wall-clock passes it —
+up to `skew_seconds` of refusal after a restart, self-healing, no intervention. Measured on
+hardware during the DAH-2575 acceptance run and pinned by
+test_replay.py::TestRestartDurability::test_an_in_skew_future_timestamp_holds_the_floor_ahead_of_wall_clock.
+
+Clamping the recorded floor to `now` would remove that window and is the obvious fix, but it
+also republishes the accepted future-dated request: after a restart its timestamp is above the
+floor again, leaving only the nonce set to refuse it — and the floor exists precisely to be the
+backstop for a lost or corrupt nonce set. Narrowing the window to one side instead would start
+rejecting any client whose clock runs fast. Both are protocol changes affecting the DAH-2576 and
+DAH-2580 clients, so the behaviour is documented and pinned here rather than changed in passing.
 """
 
 import asyncio
