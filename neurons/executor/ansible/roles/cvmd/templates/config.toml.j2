@@ -27,3 +27,37 @@ skew_seconds = {{ lium_cvmd_skew_seconds }}
 # Real bodies are a `kind` plus three hashes. The cap is enforced before the
 # body is buffered.
 max_body_bytes = {{ lium_cvmd_max_body_bytes }}
+
+# --- the launch path (DAH-2576) ---------------------------------------------
+#
+# Emitted only when the host has been given a scripts directory. An absent
+# setting is refused per-launch, naming itself; an empty string here would be a
+# path cvmd would try and fail to import.
+{% if lium_cvmd_dstack_scripts_dir %}
+dstack_scripts_dir = "{{ lium_cvmd_dstack_scripts_dir }}"
+catalog_path = "{{ cvmd_catalog_path }}"
+run_dir = "{{ lium_cvmd_run_dir }}"
+key_provider_port = {{ lium_cvmd_key_provider_port }}
+launch_timeout_seconds = {{ lium_cvmd_launch_timeout_seconds }}
+
+# CVM sizing — provider configuration, never sent in a request.
+{% if lium_cvm_vcpus %}
+cvm_vcpus = {{ lium_cvm_vcpus }}
+{% endif %}
+{% if lium_cvm_memory %}
+cvm_memory = "{{ lium_cvm_memory }}"
+{% endif %}
+{% if lium_cvm_disk %}
+cvm_disk = "{{ lium_cvm_disk }}"
+{% endif %}
+cvm_gpus = {{ lium_cvm_gpus | to_json }}
+cvm_ports = {{ lium_cvm_ports | to_json }}
+{% if lium_cvm_env_file %}
+cvm_env_file = "{{ lium_cvm_env_file }}"
+{% endif %}
+{% if lium_cvm_ssh_guest_port %}
+cvm_ssh_guest_port = {{ lium_cvm_ssh_guest_port }}
+{% endif %}
+cvm_pin_numa = {{ lium_cvm_pin_numa | lower }}
+cvm_hugepages = {{ lium_cvm_hugepages | lower }}
+{% endif %}

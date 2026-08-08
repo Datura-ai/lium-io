@@ -98,6 +98,69 @@
   loop_control:
     label: "{{ item.hotkey | truncate(16, true, '…') }}"
 
+# --- the launch path (DAH-2576) ---------------------------------------------
+#
+# Optional as a whole: cvmd serves /health and /v1/state without any of it, and
+# refuses a launch naming the setting it lacks. But a host that has been given
+# HALF a launch configuration is a different thing — it looks configured and
+# refuses every launch at the first request, which is the worst moment to find
+# out. So the scripts directory is what switches these checks on.
+
+- name: A host configured to launch CVMs has what a launch needs
+  ansible.builtin.assert:
+    that:
+      - lium_cvmd_run_dir | length > 0
+      - lium_cvm_vcpus | int > 0
+      - lium_cvm_memory | length > 0
+      - lium_cvm_disk | length > 0
+      - lium_cvm_ports | length > 0
+      - lium_cvmd_catalog | length > 0
+    fail_msg: >-
+      lium_cvmd_dstack_scripts_dir is set, so this host is meant to launch CVMs,
+      but it is missing one of lium_cvmd_run_dir, lium_cvm_vcpus,
+      lium_cvm_memory, lium_cvm_disk, lium_cvm_ports or lium_cvmd_catalog. cvmd
+      would start and then refuse every launch. Sizing is deliberately provider
+      configuration and never part of a request, so there is nothing a caller
+      could supply to fill the gap.
+    quiet: true
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
+- name: The dstack launcher is where the host says it is
+  ansible.builtin.stat:
+    path: "{{ lium_cvmd_dstack_scripts_dir }}/dstack.py"
+  register: cvmd_dstack_script
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
+# cvmd imports dstack.py rather than shelling out to it, and that import also
+# needs host_api.py beside it. Checking here names the wrong directory; checking
+# at launch time reports it as "this host cannot run the dstack launcher".
+- name: The dstack launcher is importable as a library
+  ansible.builtin.assert:
+    that:
+      - cvmd_dstack_script.stat.exists
+    fail_msg: >-
+      lium_cvmd_dstack_scripts_dir is {{ lium_cvmd_dstack_scripts_dir }}, and
+      there is no dstack.py in it. This must be the dstacktee `scripts`
+      directory — cvmd imports dstack.py from it as a library, so a path to the
+      repository root or to lium-cvm.sh will not do.
+    quiet: true
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
+# Every mapping must be bindable at launch time; a duplicate host port is the
+# one collision that is knowable now, and cvmd refuses the whole config for it.
+- name: Each forwarded port is protocol[:address]:host:guest
+  ansible.builtin.assert:
+    that:
+      - item is match('^(tcp|udp):([^:]+:)?[0-9]{1,5}:[0-9]{1,5}$')
+    fail_msg: >-
+      lium_cvm_ports[{{ index }}] is {{ item | to_json }}, which is not
+      'protocol[:address]:host_port:guest_port'. dstack parses these into QEMU
+      hostfwd rules, so a malformed one becomes a CVM with no way in.
+    quiet: true
+  loop: "{{ lium_cvm_ports }}"
+  loop_control:
+    index_var: index
+
 - name: Read the host Python version
   ansible.builtin.command: python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'
   register: cvmd_python_version

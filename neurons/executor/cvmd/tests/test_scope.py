@@ -1,11 +1,31 @@
-"""The full 2-key x 5-endpoint-class scope matrix, plus single-parse enforcement."""
+"""The full 2-key x 5-endpoint-class scope matrix, plus single-parse enforcement.
+
+The `client` fixture's host has no launch configuration, which is what makes the authorized
+cells readable: an authorized create answers **503** ("this host has no launch configuration
+for ..."), a code only the handler can produce. Reaching a 503 therefore proves the request
+cleared auth and scope, exactly as the 501 did before DAH-2576 filled the handlers in.
+Launching for real is `test_launch.py`'s job; this file is about who may ask.
+"""
 
 import json
 
 import pytest
 from conftest import signed_request
 
-VALIDATION_CREATE = ("POST", "/v1/cvm", {"kind": "validation"})
+HASH_A = "a" * 64
+HASH_B = "b" * 64
+
+# The triple is required on a validation create, so the matrix has to send a complete body —
+# otherwise an authorized cell would fail model validation and report 422, which the scope
+# layer also produces, and the cell would stop distinguishing anything.
+VALIDATION_BODY = {
+    "kind": "validation",
+    "qemu": "10.1.0",
+    "os_image_hash": HASH_A,
+    "compose_hash": HASH_B,
+}
+
+VALIDATION_CREATE = ("POST", "/v1/cvm", VALIDATION_BODY)
 RENTER_CREATE = ("POST", "/v1/cvm", {"kind": "renter"})
 RENTER_DESTROY = ("DELETE", "/v1/cvm", None)
 STATE_READ = ("GET", "/v1/state", None)
@@ -13,16 +33,16 @@ HEALTH = ("GET", "/health", None)
 
 # Every cell of {validator, platform} x {the five endpoint classes}.
 #
-# 501 means the request was fully authorized and reached a handler that DAH-2576 will fill in;
-# it is a pass, not a gap. 403 is a scope violation on an otherwise valid request.
+# 403 is a scope violation on an otherwise valid request. 501 is the renter create, whose body
+# DAH-2580 defines. 503 and 200 are handlers that ran.
 MATRIX = [
-    ("validator", VALIDATION_CREATE, 501),
+    ("validator", VALIDATION_CREATE, 503),
     ("validator", RENTER_CREATE, 403),
     ("validator", RENTER_DESTROY, 403),
     ("validator", STATE_READ, 200),
     ("platform", VALIDATION_CREATE, 403),
     ("platform", RENTER_CREATE, 501),
-    ("platform", RENTER_DESTROY, 501),
+    ("platform", RENTER_DESTROY, 200),
     ("platform", STATE_READ, 200),
 ]
 
@@ -91,18 +111,27 @@ class TestSingleParse:
     parsers keep the first.
     """
 
-    DUPLICATE_KIND = b'{"kind":"renter","kind":"validation"}'
+    DUPLICATE_KIND = (
+        b'{"kind":"renter","kind":"validation","qemu":"10.1.0",'
+        b'"os_image_hash":"' + HASH_A.encode() + b'",'
+        b'"compose_hash":"' + HASH_B.encode() + b'"}'
+    )
 
     def test_scope_follows_the_last_duplicate(self, client, validator_key):
-        """cvmd's parse resolves `kind` to `validation`, so the validator key is the one allowed."""
+        """cvmd's parse resolves `kind` to `validation`, so the validator key is the one allowed.
+
+        503 rather than 501 is the tell: the request reached the *validation* handler. Had any
+        layer read `renter` — the first value — it would have been 501 instead.
+        """
         response = signed_request(
             client, validator_key, "POST", "/v1/cvm", body=self.DUPLICATE_KIND
         )
-        assert response.status_code == 501
+        assert response.status_code == 503
 
     def test_the_other_key_is_refused_on_the_same_bytes(self, client, platform_key):
         """The mirror of the above. If any part of the stack read `renter` — the *first* value —
-        this would be a 501 and the two halves would be disagreeing about the same request.
+        this would have reached a handler and the two halves would be disagreeing about the
+        same request.
         """
         response = signed_request(client, platform_key, "POST", "/v1/cvm", body=self.DUPLICATE_KIND)
         assert response.status_code == 403
@@ -110,8 +139,9 @@ class TestSingleParse:
     def test_handler_reads_state_not_the_stream(self, client, platform_key):
         """The middleware consumes the request stream to enforce the size cap.
 
-        A handler that re-read the body would find it spent, so a successful create here is
-        positive evidence that the handler is using the object the middleware passed forward.
+        A handler that re-read the body would find it spent, so reaching the renter handler's
+        501 here is positive evidence that the handler is using the object the middleware
+        passed forward.
         """
         body = json.dumps({"kind": "renter", "image": "sha256:abc"}).encode()
         response = signed_request(client, platform_key, "POST", "/v1/cvm", body=body)

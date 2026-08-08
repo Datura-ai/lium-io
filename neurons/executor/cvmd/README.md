@@ -1,24 +1,90 @@
 # cvmd — CVM host daemon
 
 The control-plane daemon that runs on a CVM host. It exposes a signed HTTPS API with two
-authorized clients holding disjoint scopes, and it holds the node's state machine.
-
-**DAH-2575 ships the skeleton only.** The mutating endpoints are registered with full auth and
-scope enforcement but return `501` — the CVM operations behind them land in DAH-2576. That split
-is deliberate: the scope matrix is testable end-to-end today, so 2576 fills in handlers rather
-than also wiring auth.
+authorized clients holding disjoint scopes, holds the node's state machine, and launches and
+stops the node's CVM.
 
 ## API
 
 | Route | Auth | Now |
 |---|---|---|
 | `GET /health` | none | `200 {"version": ...}` |
-| `GET /v1/state` | either key | the persisted state document |
-| `POST /v1/cvm` | validator key for `kind=validation`, platform key for `kind=renter` | `501` |
-| `DELETE /v1/cvm` | platform key | `501` |
+| `GET /v1/state` | either key | the state document plus the running CVM |
+| `POST /v1/cvm` `kind=validation` | validator key | launches the validation CVM (DAH-2576) |
+| `POST /v1/cvm` `kind=renter` | platform key | `501` — DAH-2580 |
+| `DELETE /v1/cvm` | platform key | tears the CVM down |
 
 A scope violation on an otherwise valid request is `403`. Everything else that fails auth is
 `401`. A validly signed body that is not usable is `422`, never a scope bypass.
+
+`DELETE` is platform-scoped even for a validation CVM. It carries no `kind`, so a validator
+holding that right could destroy a *renter's* CVM — the platform owns the node's lifecycle and
+the validator only asks for a validation CVM.
+
+## Launching a CVM
+
+```
+POST /v1/cvm
+{"kind": "validation",
+ "qemu": "10.1.0",
+ "os_image_hash": "<64 lowercase hex>",
+ "compose_hash":  "<64 lowercase hex>"}
+```
+
+The body names **which software stack to run** and nothing else. Sizing — vCPUs, memory, disk,
+GPUs, forwarded ports — is provider configuration read from `/etc/cvmd/config.toml`: the caller
+says what to run, the host says how big it is.
+
+The three hashes are a *pinned triple*, and they are the entire input to the CVM's measurements.
+cvmd resolves them against the local catalog (`/etc/cvmd/catalog.json`), and a triple the
+catalog does not carry is refused naming the component that was not approved. That is what lets
+a validator detect a host serving a stack other than the one it expects to attest.
+
+The request returns when the CVM is up, with the launch report — instance id, forwarded ports,
+and the guest's SSH host-key fingerprint. Meanwhile `/v1/state` moves
+`RECONCILING → LAUNCHING → VALIDATION_RUNNING`.
+
+### The measurement gate
+
+cvmd imports `dstacktee/scripts/dstack.py` **as a library** and calls the same functions its CLI
+calls, so the bytes it measures are produced by the same code `lium-cvm.sh` produces them with.
+`tests/test_dstack_library.py` prepares one CVM both ways and compares every file.
+
+Calling the same code makes identical measurements likely; the gate makes them checked. Between
+`setup_instance` writing the VM directory and QEMU starting, cvmd measures what it just built:
+
+| Component | Read from |
+|---|---|
+| `compose_hash` | `sha256(<vm_dir>/shared/app-compose.json)` — the same digest dstack's own `app_compose_hash()` takes |
+| `os_image_hash` | `<image_path>/digest.txt` |
+| `qemu` | `get_qemu_version_string()`, which is what lands in the attested `vm_config` |
+
+Any difference from the requested triple and the launch does not happen — the VM directory is
+removed and the node is left exactly where it was. Configuration says what was *intended*; only
+the files say what was *built*.
+
+### One CVM per node
+
+GPU passthrough is exclusive, so a node holds one CVM. The check reads `/proc` for a running TDX
+guest rather than cvmd's own records — during the CVM v2 rollout the CVM already on a host is
+most likely one `lium-cvm.sh` started, and cvmd's records cannot see those. A stopped CVM's
+directory blocks a launch too: it still owns the node until `DELETE` removes it.
+
+### The supervisor
+
+`run_instance` blocks for the VM's whole life and the host API server has to stay up beside it,
+so cvmd spawns `python -m cvmd.dstack.child` in its own session. The CVM therefore survives a
+cvmd restart, and `RECONCILING` is how the daemon comes back under a guest it did not start.
+
+`console.log` in the VM directory is the guest's serial console plus the full QEMU command line
+`run_instance` prints before exec — the primary evidence for what was launched and how it booted.
+
+Teardown asks the guest to power off through dstack's own path, then signals the supervisor's
+**process group**. dstack's own `--force` kills the pid in `runtime.json`, which is the
+supervisor's — QEMU is its child, so killing that pid alone leaves a running VM holding the
+guest's RAM and the GPUs while every layer above reports success. Confirming the group is gone
+is the floor; the four-condition predicate (VFIO descriptors closed, RAM returned, ports
+bindable) is DAH-2577.
 
 ## Signing a request
 

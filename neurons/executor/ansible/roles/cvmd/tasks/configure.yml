@@ -45,6 +45,33 @@
       load_authorized_clients(pathlib.Path(sys.argv[1]))' %s
   notify: Restart cvmd
 
+# Validated by cvmd's own loader too, for the same reason as the clients file:
+# load_catalog is what refuses at launch time, and it does the hex-digit check,
+# the duplicate-triple check and the version check. A catalog that would make
+# every launch fail never replaces a working one.
+- name: Render the artifact catalog
+  ansible.builtin.template:
+    src: catalog.json.j2
+    dest: "{{ cvmd_catalog_path }}"
+    owner: root
+    group: root
+    mode: "0640"
+    validate: >-
+      {{ cvmd_prefix }}/venv/bin/python -c
+      'import sys, pathlib; from cvmd.catalog import load_catalog;
+      load_catalog(pathlib.Path(sys.argv[1]))' %s
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+  notify: Restart cvmd
+
+- name: Ensure the CVM run directory exists
+  ansible.builtin.file:
+    path: "{{ lium_cvmd_run_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
 - name: Enable cvmd and start it
   ansible.builtin.systemd_service:
     name: cvmd.service
