@@ -19,6 +19,15 @@ DEFAULT_SKEW_SECONDS = 60
 # held for the whole window (see LaunchConfig).
 DEFAULT_LAUNCH_TIMEOUT_SECONDS = 900
 
+# How long a graceful poweroff is given before cvmd signals the process group.
+#
+# A large-memory TDX guest returns its RAM to the host as it exits, and that is slow — 43
+# minutes was measured for a 1.13 TB guest on this fleet. So this is a floor for ordinary
+# sizes, not a budget for the largest ones; setting it too low turns a legitimate slow exit
+# into a SIGKILL partway through. Per-hardware-class budgets are DAH-2577's open item, which
+# is why this is a setting rather than a constant.
+DEFAULT_TEARDOWN_TIMEOUT_SECONDS = 600
+
 # dstack's default key-provider port. lium-cvm.sh relies on the same default.
 DEFAULT_KEY_PROVIDER_PORT = 3443
 
@@ -50,6 +59,7 @@ class LaunchConfig:
     run_dir: Path | None = None
     key_provider_port: int = DEFAULT_KEY_PROVIDER_PORT
     launch_timeout_seconds: int = DEFAULT_LAUNCH_TIMEOUT_SECONDS
+    teardown_timeout_seconds: int = DEFAULT_TEARDOWN_TIMEOUT_SECONDS
 
     vcpus: int | None = None
     memory: str | None = None
@@ -185,6 +195,10 @@ def _load_launch(table: dict) -> LaunchConfig:
             _get(table, "launch_timeout_seconds", DEFAULT_LAUNCH_TIMEOUT_SECONDS),
             "launch_timeout_seconds",
         ),
+        teardown_timeout_seconds=_as_int(
+            _get(table, "teardown_timeout_seconds", DEFAULT_TEARDOWN_TIMEOUT_SECONDS),
+            "teardown_timeout_seconds",
+        ),
         vcpus=_as_optional_int(_get(table, "cvm_vcpus"), "cvm_vcpus"),
         memory=_as_optional_str(_get(table, "cvm_memory")),
         disk=_as_optional_str(_get(table, "cvm_disk")),
@@ -201,6 +215,8 @@ def _load_launch(table: dict) -> LaunchConfig:
         raise ConfigError("`key_provider_port` must be positive")
     if launch.launch_timeout_seconds <= 0:
         raise ConfigError("`launch_timeout_seconds` must be positive")
+    if launch.teardown_timeout_seconds <= 0:
+        raise ConfigError("`teardown_timeout_seconds` must be positive")
     return launch
 
 

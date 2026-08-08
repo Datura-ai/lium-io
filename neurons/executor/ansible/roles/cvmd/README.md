@@ -36,6 +36,7 @@ request.
 | `lium_cvmd_catalog` | The approved artifacts — see below. |
 | `lium_cvmd_key_provider_port` | dstack's key-provider port. `3443`. |
 | `lium_cvmd_launch_timeout_seconds` | How long a launch waits for the guest before failing the node. |
+| `lium_cvmd_teardown_timeout_seconds` | The graceful-poweroff window before cvmd signals the process group. |
 | `lium_cvm_vcpus`, `lium_cvm_memory`, `lium_cvm_disk` | CVM sizing. |
 | `lium_cvm_gpus` | PCI slots to pass through, `["all"]`, or `[]` for none. |
 | `lium_cvm_ports` | Forwarded ports, `protocol[:address]:host:guest`. |

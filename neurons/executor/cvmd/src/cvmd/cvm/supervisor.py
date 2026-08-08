@@ -1,13 +1,22 @@
 """Start, recognise and stop the process that holds a CVM.
 
-The supervisor is `cvmd.dstack.child` in its own session. Everything here is about the two
-questions cvmd has to answer honestly about it: *is it still ours*, and *is it really gone*.
+The supervisor is `cvmd.dstack.child`, detached into its own session with init as its parent.
+Everything here is about the two questions cvmd has to answer honestly about it: *is it still
+ours*, and *is it really gone*.
 
 Measured on au11 (2026-08-08): `run/vms/my-executor/runtime.json` still named pid 56920 hours
 after that process died, because `lium-cvm.sh stop` gave up waiting and left the file behind.
 So a recorded pid is a claim, never evidence. `is_supervisor` reads `/proc/<pid>/cmdline` and
 requires both the child module name and this CVM's directory, which also rules out a recycled
 pid — a real risk on a host that has been up for weeks.
+
+Also measured on au11, and the reason the supervisor **double-forks**: when cvmd was the
+supervisor's parent, a stopped supervisor stayed a zombie until something else called `wait()`.
+A zombie is still a process-group member, so `killpg(pgid, 0)` kept succeeding and every
+teardown burned the full signal ladder — 260s, ending in a SIGKILL and the message "still
+present after SIGKILL", while the guest had in fact powered off gracefully. `os.kill(pid, 0)`
+has the same blind spot, and that is what `shutdown_instance` waits on. Orphaning the
+supervisor to init makes it reaped the moment it exits, so both checks tell the truth.
 """
 
 import logging
@@ -23,6 +32,16 @@ logger = logging.getLogger(__name__)
 
 CHILD_MODULE = "cvmd.dstack.child"
 CONSOLE_LOG = "console.log"
+
+# Written by the supervisor after it has detached, so its appearance means "fully independent
+# of cvmd", not merely "started". cvmd cannot learn the pid from Popen: Popen sees the
+# short-lived process that forks and exits, never the grandchild that holds the VM.
+PID_FILE = "supervisor.pid"
+
+# How long to wait for the fork-and-exit, and then for the pid file. Both are microseconds of
+# work; the budget is for a loaded host, not for anything that can legitimately take seconds.
+DETACH_TIMEOUT_SECONDS = 30
+PID_FILE_POLL_SECONDS = 0.05
 
 # How long a signalled process group gets before the next signal. A TDX guest returns its
 # memory to the host as it exits and that is not instant, but this is the *post-signal* wait —
@@ -124,15 +143,35 @@ def runtime_pid(vm_dir: Path) -> int | None:
         return None
 
 
-def spawn(*, scripts_dir: Path, vm_dir: Path, kp_port: int) -> int:
-    """Start the supervisor detached from cvmd and return its pid.
+def _await_pid_file(vm_dir: Path, deadline: float) -> int:
+    path = vm_dir / PID_FILE
+    while time.monotonic() < deadline:
+        try:
+            return int(path.read_text().strip())
+        except (OSError, ValueError):
+            time.sleep(PID_FILE_POLL_SECONDS)
+    raise SupervisorError(
+        f"the supervisor did not report its pid in {path}; see {console_log_path(vm_dir)}"
+    )
 
-    `start_new_session=True` puts it in its own session and process group, so it survives a
-    cvmd restart and never receives a signal aimed at the daemon. Both streams go to
-    `console.log`: QEMU runs `-nographic` with its serial line on stdio, so that file is the
-    guest's boot console, and `run_instance` prints the full QEMU command line into it first.
-    A pipe would be worse than useless here — nothing would drain it, and the guest would block
-    on a full buffer partway through booting.
+
+def spawn(*, scripts_dir: Path, vm_dir: Path, kp_port: int) -> int:
+    """Start the supervisor, detached from cvmd, and return the pid that holds the VM.
+
+    Both streams go to `console.log`: QEMU runs `-nographic` with its serial line on stdio, so
+    that file is the guest's boot console, and `run_instance` prints the full QEMU command line
+    into it first. A pipe would be worse than useless — nothing would drain it, and the guest
+    would block on a full buffer partway through booting.
+
+    `-u` because Python block-buffers stdout when it is a file. Without it the command line sits
+    in the child's buffer for the VM's entire life while QEMU writes past it through the same
+    descriptor, so the one line that says what was launched is missing from the log for exactly
+    as long as anyone would want to read it.
+
+    The process Popen starts is not the supervisor. It forks, exits, and the grandchild is the
+    one that holds the VM — see the module docstring for what being cvmd's child cost. `wait()`
+    reaps the intermediate; the real pid comes from the file the grandchild writes once it has
+    detached.
     """
     log_path = console_log_path(vm_dir)
     try:
@@ -143,7 +182,15 @@ def spawn(*, scripts_dir: Path, vm_dir: Path, kp_port: int) -> int:
     try:
         with open(os.devnull, "rb") as devnull:
             process = subprocess.Popen(  # noqa: S603 - argv is built here, never from a request
-                [sys.executable, "-m", CHILD_MODULE, str(scripts_dir), str(vm_dir), str(kp_port)],
+                [
+                    sys.executable,
+                    "-u",
+                    "-m",
+                    CHILD_MODULE,
+                    str(scripts_dir),
+                    str(vm_dir),
+                    str(kp_port),
+                ],
                 stdin=devnull,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
@@ -157,8 +204,20 @@ def spawn(*, scripts_dir: Path, vm_dir: Path, kp_port: int) -> int:
         # pin the file after a teardown removed it.
         log_handle.close()
 
-    logger.info("supervisor for %s started as pid %d", vm_dir, process.pid)
-    return process.pid
+    deadline = time.monotonic() + DETACH_TIMEOUT_SECONDS
+    try:
+        exit_code = process.wait(timeout=DETACH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        raise SupervisorError(
+            f"the supervisor did not detach within {DETACH_TIMEOUT_SECONDS}s; see {log_path}"
+        ) from exc
+    if exit_code != 0:
+        raise SupervisorError(f"the supervisor exited {exit_code} before detaching; see {log_path}")
+
+    pid = _await_pid_file(vm_dir, deadline)
+    logger.info("supervisor for %s detached as pid %d", vm_dir, pid)
+    return pid
 
 
 def _process_group_gone(pid: int) -> bool:
@@ -199,7 +258,12 @@ def shutdown(dstack: ModuleType, vm_dir: Path, pid: int, *, timeout: int) -> str
     because a reaped QEMU is necessary for those and nowhere near sufficient.
     """
     dstack.shutdown_instance(str(vm_dir), timeout=timeout, force=False)
-    if _wait_for_group(pid, timeout):
+
+    # `shutdown_instance` has already waited up to `timeout` for the supervisor to exit, and the
+    # supervisor only exits once QEMU has. So this is a confirmation that the group drained, not
+    # a second full wait — repeating the long one here would double the worst case for no
+    # information.
+    if _wait_for_group(pid, TERMINATION_GRACE_SECONDS):
         return "guest powered off on request"
 
     logger.warning(

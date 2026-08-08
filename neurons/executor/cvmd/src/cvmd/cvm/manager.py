@@ -39,7 +39,6 @@ RUNNING_STATE = {
 }
 
 READINESS_POLL_SECONDS = 5
-DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 120
 
 # Probing localhost, not the mapping's bind address: 0.0.0.0 is not a destination, and a
 # forward bound to a public address is still reachable from the host it runs on.
@@ -496,14 +495,14 @@ class CvmManager:
                 # ours to signal — refusing to stop would be worse than stopping abruptly.
                 logger.warning("%s; falling back to signalling the process group", exc.reason)
                 detail = supervisor.shutdown_by_signal(
-                    instance.supervisor_pid, timeout=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+                    instance.supervisor_pid, timeout=self._config.teardown_timeout_seconds
                 )
             else:
                 detail = supervisor.shutdown(
                     dstack,
                     vm_dir,
                     instance.supervisor_pid,
-                    timeout=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+                    timeout=self._config.teardown_timeout_seconds,
                 )
 
         still_there = supervisor.is_supervisor(instance.supervisor_pid, vm_dir)

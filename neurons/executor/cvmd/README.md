@@ -73,18 +73,32 @@ directory blocks a launch too: it still owns the node until `DELETE` removes it.
 ### The supervisor
 
 `run_instance` blocks for the VM's whole life and the host API server has to stay up beside it,
-so cvmd spawns `python -m cvmd.dstack.child` in its own session. The CVM therefore survives a
-cvmd restart, and `RECONCILING` is how the daemon comes back under a guest it did not start.
+so cvmd spawns `python -u -m cvmd.dstack.child`. That process **double-forks**: the survivor has
+init as its parent and leads its own session and process group.
+
+Three separate things have to hold for the CVM to outlive cvmd, and each was learned by
+restarting the daemon on a real host:
+
+| | |
+|---|---|
+| Its own session | so a signal aimed at cvmd's process group misses it |
+| init as its parent | so it is reaped the instant it exits. As cvmd's child it lingered as a **zombie**, and a zombie is still a process-group member — `killpg(pgid, 0)` kept succeeding, so every teardown ran the full signal ladder (260s) and then reported "still present after SIGKILL" about a guest that had powered off gracefully. `os.kill(pid, 0)` has the same blind spot, and that is what `shutdown_instance` waits on |
+| `KillMode=process` in the unit | because systemd kills by **cgroup**, and detaching does not leave one. With the default, `systemctl restart cvmd` logged `Killing process ... (qemu-system-x86) with signal SIGKILL` and the node came back FAILED holding a CVM directory and no CVM |
+
+`RECONCILING` is how the daemon comes back under a guest it did not start.
 
 `console.log` in the VM directory is the guest's serial console plus the full QEMU command line
 `run_instance` prints before exec — the primary evidence for what was launched and how it booted.
+The child runs with `-u` because Python block-buffers stdout to a file, and without it that one
+line stays in the buffer for the VM's whole life while QEMU writes past it.
 
 Teardown asks the guest to power off through dstack's own path, then signals the supervisor's
 **process group**. dstack's own `--force` kills the pid in `runtime.json`, which is the
 supervisor's — QEMU is its child, so killing that pid alone leaves a running VM holding the
 guest's RAM and the GPUs while every layer above reports success. Confirming the group is gone
 is the floor; the four-condition predicate (VFIO descriptors closed, RAM returned, ports
-bindable) is DAH-2577.
+bindable) is DAH-2577, as is the per-hardware-class value for `teardown_timeout_seconds` — a
+1.13 TB guest was measured taking 43 minutes to return its memory.
 
 ## Signing a request
 

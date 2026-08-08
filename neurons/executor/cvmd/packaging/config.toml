@@ -43,6 +43,11 @@ max_body_bytes = 65536
 # key_provider_port = 3443
 # launch_timeout_seconds = 900
 #
+# The graceful-poweroff window before cvmd signals the process group. A large-memory TDX guest
+# returns its RAM to the host as it exits and that is slow — 43 minutes was measured for a
+# 1.13 TB guest. Per-hardware-class budgets are DAH-2577's open item.
+# teardown_timeout_seconds = 600
+#
 # CVM sizing is PROVIDER configuration and is never sent in a request: a caller names which
 # software stack to run, and the host decides how big it is.
 # cvm_vcpus = 16

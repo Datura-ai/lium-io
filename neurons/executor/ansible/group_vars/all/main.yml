@@ -306,6 +306,13 @@ lium_cvmd_key_provider_port: 3443
 # the VM.
 lium_cvmd_launch_timeout_seconds: 900
 
+# How long a graceful poweroff is given before cvmd signals the process group.
+# A large-memory TDX guest returns its RAM to the host as it exits, and that is
+# slow — 43 minutes was measured for a 1.13 TB guest on this fleet. Too low and
+# a legitimate slow exit is cut short by a SIGKILL. Per-hardware-class budgets
+# are DAH-2577's open item.
+lium_cvmd_teardown_timeout_seconds: 600
+
 # --- CVM sizing: PROVIDER configuration, never an API field ------------------
 #
 # A cvmd request names which software stack to run; the host decides how big it
