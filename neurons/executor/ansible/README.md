@@ -51,7 +51,8 @@ datacenter port ACLs, and running or supervising the CVM itself.
 | `qemu` | The dstack QEMU 9.2.1 build and `/etc/dstack/client.conf`. | **yes** |
 | `repo` | The lium-io checkout and the CVM OS image. | no |
 | `sgx_key_provider` | Intel DCAP packages, PCCS, platform registration, quote plumbing, the key-provider container. | no |
-| `cvmd`, `catalog` | Variable interfaces only — see [Not implemented yet](#not-implemented-yet). | no |
+| `cvmd` | The CVM host control daemon: package, config, authorised clients, service. Optional — see [cvmd](#cvmd). | no |
+| `catalog` | Variable interface only — see [Not implemented yet](#not-implemented-yet). | no |
 | `verify` | Writes the machine-readable report and sets the exit code. | no |
 
 ## The tag model
@@ -184,16 +185,35 @@ Pass overrides with `-e`, or put them in a file and use
 | `lium_repo_path` | `/opt/lium-io` | Where the lium-io checkout lives. |
 | `lium_repo_ref` | `main` | Release tag to check out. |
 
+### cvmd
+
+The CVM host control daemon is **optional per host**. Leave
+`lium_cvmd_package_url` unset and the role says so and ends; set it and the
+package is fetched against its checksum, installed, configured and started, and
+the run fails if `/health` never answers.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `lium_cvmd_package_url` | `""` | Release tarball from `cvmd/packaging/build.sh`. |
+| `lium_cvmd_package_sha256` | `""` | Required with the URL. |
+| `lium_cvmd_authorized_clients` | `[]` | `[{hotkey, scope}]` — ss58 addresses, scope `validation` or `renter`. |
+| `lium_cvmd_bind_address` | `0.0.0.0` | Listen address. |
+| `lium_cvmd_port` | `8443` | Listen port. |
+
+Authorised clients are **bittensor hotkeys, not SSH keys** — cvmd authenticates
+a signed request against an ss58 address. Full detail in
+[`roles/cvmd/README.md`](roles/cvmd/README.md).
+
+Run it alone with `--tags cvmd`.
+
 ### Not implemented yet
 
-`cvmd` and `catalog` ship as variable interfaces so the rest of day-zero does not
-wait on them. Leave them unset and each prints one line saying what it is waiting
-on. Set them and the run stops with "not implemented" — they never silently do
-nothing.
+`catalog` ships as a variable interface so the rest of day-zero does not wait on
+it. Leave it unset and it prints one line saying what it is waiting on. Set it
+and the run stops with "not implemented" — it never silently does nothing.
 
 | Variable | Lands in |
 |---|---|
-| `lium_cvmd_package_url`, `lium_cvmd_package_sha256`, `lium_cvmd_authorized_client_keys` | DAH-2575 |
 | `lium_catalog_manifest_url`, `lium_catalog_manifest_sha256` | DAH-2576 / DAH-2578 |
 
 ## Where things are written

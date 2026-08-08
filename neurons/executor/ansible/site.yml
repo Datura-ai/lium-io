@@ -13,8 +13,11 @@
 #                         carry it: the three roles that can change a
 #                         measurement or reset a GPU. The maintenance profile is
 #                         `--skip-tags destructive`, so preflight, docker, repo,
-#                         sgx_key_provider, the stubs and verify all still
-#                         converge on a host that already has a CVM.
+#                         sgx_key_provider, cvmd, catalog and verify all still
+#                         converge on a host that already has a CVM. cvmd in
+#                         particular MUST stay non-destructive: it restarts one
+#                         userspace daemon, and a host with a live CVM is
+#                         exactly where its control plane needs updating.
 #
 # EVERY TAG SET BELOW IS DECLARED AT PLAY LEVEL, NEVER ON THE ROLE ENTRY.
 # Play-level tags are inherited by that play's pre_tasks; role-entry tags are
@@ -126,13 +129,20 @@
   roles:
     - sgx_key_provider
 
-- name: Stubs — cvmd and catalog variable interfaces
+- name: The cvmd control daemon
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [cvmd, converge]
+  roles:
+    - cvmd
+
+- name: Stubs — the catalog variable interface
   hosts: localhost
   gather_facts: false
   become: true
   tags: [stubs, converge]
   roles:
-    - cvmd
     - catalog
 
 # `common` runs AGAIN here, and that is the point.

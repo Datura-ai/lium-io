@@ -1,20 +1,109 @@
-# `cvmd` (stub)
+# `cvmd`
 
-A variable interface, not an implementation. The daemon itself lands in
-**DAH-2575**; this exists so day-zero provisioning does not wait on it, and so a
-host provisioned today needs no re-plumbing when it arrives.
+Installs and configures **cvmd**, the CVM host control daemon. The daemon itself
+lives in [`neurons/executor/cvmd/`](../../cvmd/); this role is how it reaches a
+host.
+
+## Variables
 
 | Variable | Meaning |
 |---|---|
-| `lium_cvmd_package_url` | Where to fetch the cvmd package from. |
-| `lium_cvmd_package_sha256` | Required whenever the URL is set. |
-| `lium_cvmd_authorized_client_keys` | Public keys allowed to talk to the daemon. |
+| `lium_cvmd_package_url` | Where to fetch the release tarball from. Unset ⇒ the role reports that and ends. |
+| `lium_cvmd_package_sha256` | Required whenever the URL is set. Verified on download. |
+| `lium_cvmd_authorized_clients` | `[{hotkey, scope}]` — who may call cvmd, and in which scope. |
+| `lium_cvmd_bind_address` | Listen address. `0.0.0.0` by default. |
+| `lium_cvmd_port` | Listen port. `8443` by default. |
+| `lium_cvmd_skew_seconds` | How far a request timestamp may sit from the host clock. |
+| `lium_cvmd_max_body_bytes` | Request-body cap, enforced before the body is buffered. |
+| `lium_cvmd_health_retries`, `lium_cvmd_health_delay` | How long to wait for `/health` before failing the run. |
+
+Produce the tarball and its checksum with
+[`cvmd/packaging/build.sh`](../../cvmd/packaging/build.sh), which prints exactly
+the sha256 this role expects.
+
+### Authorised clients are hotkeys, not SSH keys
+
+cvmd authenticates a **signed request** against a bittensor hotkey, so the only
+thing it can act on is an ss58 address paired with a scope:
+
+```yaml
+lium_cvmd_authorized_clients:
+  - hotkey: 5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX
+    scope: validation
+  - hotkey: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+    scope: renter
+```
+
+The two scopes are disjoint. `validation` may create a validation CVM and read
+state; `renter` may create and destroy a renter CVM. Neither can act in the
+other's scope — the full matrix is asserted in
+[`cvmd/tests/test_scope.py`](../../cvmd/tests/test_scope.py).
+
+The DAH-2544 stub called this `lium_cvmd_authorized_client_keys` and its fixture
+held an SSH public key. Nothing consumed it — setting it always failed the run
+with "not implemented" — so the name and the shape both changed here rather
+than keeping an interface the daemon cannot read.
 
 ## Loud in both directions
 
-- **Unset** — one line saying what it is waiting on, then the role ends.
-- **Set** — the companion variables are asserted, then the run *fails* with
-  "not implemented".
+- **Unset** — one line saying cvmd was not requested, then the role ends.
+- **Set** — the package is installed, the service is started, and the run
+  **fails if `/health` never answers**.
 
-A stub that silently did nothing when set would be worse than no stub at all: it
-would make a half-configured host look finished.
+There is no path that leaves a half-configured host looking finished. That was
+the stub's property and it is kept.
+
+## What it refuses, and where
+
+cvmd is fail-closed on all of these by itself. The role refuses them first so
+the failure names the variable the operator got wrong instead of reading
+`systemd unit entered failed state`.
+
+| Refused | Checked by |
+|---|---|
+| URL set without a checksum, or without any client | role assert |
+| An entry that is not `{hotkey, scope}`, or a scope outside `{validation, renter}` | role assert |
+| A hotkey that is not shaped like an ss58 address | role assert (format only) |
+| The same hotkey listed twice | role assert |
+| Host Python older than 3.13 | role assert, and again in `install.sh` |
+| A tarball whose sha256 does not match | `get_url` |
+| A tarball that matches but is not a cvmd release | role assert on the unpacked payload |
+| **A hotkey whose base58 checksum is wrong** | `validate:` — see below |
+
+### The authorized-clients file is validated by cvmd's own loader
+
+`template:` renders the candidate file to a temporary path and installs it only
+if `validate:` exits 0 — and the validate command is
+`load_authorized_clients()`, the very function that refuses at daemon startup.
+It does the real ss58 checksum, the scope enum and the duplicate check, so a
+file that would leave cvmd unstartable never replaces the working one.
+
+Both files are rendered **whole from a template**, never line-edited.
+`lineinfile` appends when its regexp does not match, which is how a structured
+config silently becomes invalid while the run still reports success.
+
+## Idempotence
+
+The install step records the package sha256 in `/opt/cvmd/.installed-sha256`
+and is skipped while that matches *and* `/opt/cvmd/venv/bin/cvmd` exists.
+Configuration is applied on every run regardless, so a changed client list takes
+effect without a reinstall. The stamp is written only after `install.sh`
+returns 0 — a stamp written first would mark a failed install as complete and
+the next run would skip repairing it.
+
+## Paths
+
+`install.sh` hardcodes these, so the role's copies in `defaults/main.yml` are
+names for one list rather than settings; changing one alone would move where
+Ansible looks without moving where the installer writes.
+
+| Path | Holds |
+|---|---|
+| `/opt/cvmd/venv` | The virtualenv and the `cvmd` entry point |
+| `/etc/cvmd/config.toml` | Rendered by this role |
+| `/etc/cvmd/authorized_clients.json` | Rendered by this role |
+| `/etc/cvmd/tls/` | Self-signed pair, generated by `install.sh` if absent |
+| `/var/lib/cvmd/` | `state.json` and the replay nonce store |
+
+`/var/lib/cvmd` is **state, not cache**: losing it resets the replay startup
+floor.
