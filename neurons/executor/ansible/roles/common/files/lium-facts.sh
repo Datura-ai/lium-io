@@ -41,6 +41,9 @@ NVSWITCH_IDS="${LIUM_NVSWITCH_PCI_IDS:-10de:22a3}"
 INTEL_API_HOST="${LIUM_INTEL_API_HOST:-api.trustedservices.intel.com}"
 INTEL_API_PORT="${LIUM_INTEL_API_PORT:-443}"
 DSTACKTEE="${REPO_PATH}/neurons/executor/dstacktee"
+# Hardcoded by cvmd/packaging/install.sh; overridable here only so a test can
+# point the probe at a fixture prefix.
+CVMD_PREFIX="${LIUM_CVMD_PREFIX:-/opt/cvmd}"
 
 json_escape() {
   printf '%s' "$1" | LC_ALL=C sed \
@@ -454,6 +457,21 @@ done
 plain_str os_image_digest "$_os_digest"
 plain_str env_runner_digest "$(grep -hs '^EXECUTOR_RUNNER_IMAGE_DIGEST=' "$DSTACKTEE/.env" 2>/dev/null | cut -d= -f2 || printf '')"
 plain_str env_external_port "$(grep -hs '^EXTERNAL_PORT=' "$DSTACKTEE/.env" 2>/dev/null | cut -d= -f2 | awk '{print $1}' || printf '')"
+
+# --- cvmd --------------------------------------------------------------------
+# `systemctl is-active` exits non-zero for every state except active, so the
+# status word is taken from stdout and the exit code is discarded. An absent
+# unit prints "inactive" on some systemd versions and nothing at all on others —
+# the empty case is reported as "unknown" rather than being folded into
+# "inactive", because "no such unit" and "installed but stopped" need different
+# remediations.
+_cvmd_state="$(systemctl is-active cvmd.service 2>/dev/null || true)"
+[ -n "$_cvmd_state" ] || _cvmd_state="unknown"
+plain_str cvmd_unit_state "$_cvmd_state"
+
+_cvmd_stamp=""
+[ -r "${CVMD_PREFIX}/.installed-sha256" ] && _cvmd_stamp="$(head -1 "${CVMD_PREFIX}/.installed-sha256" | tr -d '[:space:]')"
+plain_str cvmd_installed_sha256 "$_cvmd_stamp"
 
 # --- disk headroom -----------------------------------------------------------
 # Reported against the nearest EXISTING ancestor, because on a fresh host
