@@ -89,7 +89,12 @@ distinct_values() {
         "$key") printf '%s\n' "$key" ;;
       esac
     done
-  } | sort -u | grep -c . || true
+  # `grep -c ''`, not `grep -c .`. `.` requires one character, so it silently
+  # dropped the EMPTY value — and `key=value key=` is exactly the pair worth
+  # naming: the kernel takes the last occurrence, so the empty one wins and
+  # wipes the setting. Counted with `.` that collapsed to a single distinct
+  # value and never reached conflicting_keys.
+  } | sort -u | grep -c '' || true
 }
 
 key_of_token() {
@@ -120,8 +125,17 @@ read_grub_vars() {
       # shellcheck source=/dev/null
       . "$default_file"
     fi
+    # `*.cfg`, NOT `*`. grub-mkconfig globs
+    # `${sysconfdir}/default/grub.d/*.cfg` (grub-mkconfig:164), so a file
+    # without that suffix is invisible to the bootloader. Sourcing `*` modelled
+    # an effective command line GRUB never produces: a conffile upgrade leaves
+    # 50-cloudimg-settings.cfg.dpkg-old or .dpkg-dist beside the real file, and
+    # an operator edit leaves a .bak. If the stale copy still carried the
+    # required tokens, missing_tokens came back empty, the reboot was skipped,
+    # and the host booted without them — which reads as healthy and fails
+    # attestation.
     if [ -n "$dropin_dir" ] && [ -d "$dropin_dir" ]; then
-      for f in "$dropin_dir"/*; do
+      for f in "$dropin_dir"/*.cfg; do
         [ -r "$f" ] || continue
         if [ -n "$exclude" ] && [ "$f" = "$exclude" ]; then
           continue
@@ -132,6 +146,7 @@ read_grub_vars() {
     fi
     printf 'LINUX\t%s\n' "$GRUB_CMDLINE_LINUX"
     printf 'DEFAULT\t%s\n' "$GRUB_CMDLINE_LINUX_DEFAULT"
+    printf 'GRUBDEFAULT\t%s\n' "${GRUB_DEFAULT:-0}"
   )
 }
 
@@ -162,13 +177,33 @@ cmd_analyze() {
     shift
   done
 
-  local linux_line="" default_line="" line key value
+  local linux_line="" default_line="" grub_default_entry="0" line key value
   while IFS=$'\t' read -r key value; do
     case "$key" in
       LINUX) linux_line="$value" ;;
       DEFAULT) default_line="$value" ;;
+      GRUBDEFAULT) grub_default_entry="$value" ;;
     esac
   done < <(read_grub_vars "$grub_default" "$dropin_dir" "$exclude_dropin")
+
+  # grubcfg_linux_line reads the FIRST menu entry. That is the entry GRUB boots
+  # only when GRUB_DEFAULT selects it — 0, or the empty value that means 0. With
+  # `saved`, a title, a `>`-joined submenu path, or any other index, the entry
+  # this analysis describes is NOT the one the host will boot, and the grub.cfg
+  # assertion in kernel/tasks/grub.yml would pass on a menu entry nobody uses.
+  #
+  # Reported rather than resolved: following GRUB_DEFAULT properly means parsing
+  # menuentry/submenu nesting and grubenv, and a checker that silently guesses at
+  # that is worse than one that says it cannot answer. The caller decides.
+  #
+  # `saved` is real here, not hypothetical — /etc/default/grub.d/99-tdx-kernel.cfg
+  # on an existing fleet host sets it, and is only overridden because another
+  # drop-in sorts later.
+  local grubcfg_is_default="true"
+  case "$grub_default_entry" in
+    0|"") ;;
+    *) grubcfg_is_default="false" ;;
+  esac
 
   # The union, in 10_linux's own order: LINUX first, DEFAULT last, so our
   # appended tokens win.
@@ -308,6 +343,8 @@ cmd_analyze() {
   "proc_cmdline": "$(json_escape "$proc_line")",
   "grubcfg_linux_line": "$(json_escape "$cfg_line")",
   "grubcfg_present": $( [ -n "$cfg_line" ] && printf 'true' || printf 'false' ),
+  "grub_default_entry": "$(json_escape "$grub_default_entry")",
+  "grubcfg_line_is_default_entry": ${grubcfg_is_default},
   "missing_tokens": $(json_array_of_strings ${missing[@]+"${missing[@]}"}),
   "grubcfg_missing_tokens": $(json_array_of_strings ${cfg_missing[@]+"${cfg_missing[@]}"}),
   "drift_tokens": $(json_array_of_strings ${drift[@]+"${drift[@]}"}),

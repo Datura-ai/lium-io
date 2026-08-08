@@ -223,8 +223,8 @@
   'status': 'UNKNOWN' if not (lium_verify_cmdline_ok | bool) else ('OK' if (lium_verify_cmdline.conflicting_keys | default([]) | length) == 0 else 'WARN'),
   'observed': ((lium_verify_cmdline.conflicting_keys | default([]) | join(', ')) if (lium_verify_cmdline.conflicting_keys | default([]) | length) > 0 else 'none'),
   'expected': 'each parameter appears once',
-  'remediation': 'These keys appear more than once with different values. Ours win, because 10_linux emits GRUB_CMDLINE_LINUX before GRUB_CMDLINE_LINUX_DEFAULT and the kernel takes the last occurrence — but relying on that ordering forever is fragile. Remove the stale copies from /etc/default/grub.',
-  'evidence_source': '/etc/default/grub',
+  'remediation': 'These keys appear more than once with different values. Ours win, because 10_linux emits GRUB_CMDLINE_LINUX before GRUB_CMDLINE_LINUX_DEFAULT and the kernel takes the last occurrence — but relying on that ordering forever is fragile. Find the stale copy with: grep -n "kvm_intel\\|intel_iommu\\|vfio-pci.ids\\|iommu=pt\\|nohibernate" /etc/default/grub /etc/default/grub.d/*.cfg — it is usually in a vendor drop-in under /etc/default/grub.d/, not in /etc/default/grub itself. Do not edit 99-lium-cvm.cfg; this playbook rewrites it.',
+  'evidence_source': '/etc/default/grub and /etc/default/grub.d/*.cfg',
   'severity': 'degraded'}) %}
 
 {#- ---- QEMU ---- #}

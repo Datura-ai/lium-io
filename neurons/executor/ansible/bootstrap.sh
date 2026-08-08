@@ -42,6 +42,13 @@ LOCK_DIR="$LIUM_STATE_DIR"
 # a CI step's environment — that is why this is a flag and not a variable.
 EXPECTED_PREFLIGHT_RC=2
 
+# DUPLICATED FROM group_vars/all/main.yml's lium_os_matrix, and it has to be:
+# this gate runs before ansible-core is installed, so nothing here can read a
+# group_vars file. tests/test_bootstrap_args.sh asserts the two lists agree via
+# --print-supported-releases, exactly as tests/test_guard.sh does for the
+# guard's search roots. Without that assertion, adding a release to the matrix
+# leaves this entry point rejecting the host at section 3 with a message
+# claiming it is unsupported while preflight would have passed it.
 SUPPORTED_VERSIONS=("25.10" "26.04")
 # 2.18, not 2.16. `meta: end_role` is used by four roles and only exists from
 # 2.18; `systemd_service` needs 2.17. An older core already on PATH passes the
@@ -72,6 +79,9 @@ Usage: sudo ./bootstrap.sh [options]
   --resume               internal: continuation after a reboot
   --print-expected-preflight-rc
                          print the exit code a preflight failure produces, then exit
+  --print-supported-releases
+                         print the Ubuntu releases this script accepts, then exit
+                         (tests assert these match group_vars' lium_os_matrix)
 
 --force-converge only restores the destructive ROLES. It does not authorise the
 damage. Each role is still blocked by its own variable:
@@ -83,7 +93,7 @@ USAGE
 REPO_REF=""; REPO_URL=""; REPO_PATH=""; VARS_FILE=""
 CHECK_MODE=0; TAGS=""; SKIP_TAGS=""; NO_CLONE=0; ASSUME_YES=0
 EXTRA_VARS=()
-FORCE_CONVERGE=0; RESUME=0; PRINT_RC=0
+FORCE_CONVERGE=0; RESUME=0; PRINT_RC=0; PRINT_RELEASES=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -104,6 +114,7 @@ while [ $# -gt 0 ]; do
     --force-converge) FORCE_CONVERGE=1 ;;
     --resume) RESUME=1 ;;
     --print-expected-preflight-rc) PRINT_RC=1 ;;
+    --print-supported-releases) PRINT_RELEASES=1 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'Unknown flag: %s\n' "$1" >&2; usage >&2; exit 64 ;;
   esac
@@ -117,6 +128,13 @@ done
 # would otherwise satisfy on its own, making it self-satisfying.
 if [ "$PRINT_RC" -eq 1 ]; then
   printf '%s\n' "$EXPECTED_PREFLIGHT_RC"
+  exit 0
+fi
+
+# One release per line, in declaration order. Same contract as the guard's
+# --print-default-roots, and pure for the same reasons.
+if [ "$PRINT_RELEASES" -eq 1 ]; then
+  printf '%s\n' "${SUPPORTED_VERSIONS[@]}"
   exit 0
 fi
 
@@ -305,7 +323,10 @@ if [ "$FORCE_CONVERGE" -eq 1 ]; then
 fi
 
 # --- 8. Build and run the playbook command. ----------------------------------
-RUN_DIR="${LIUM_LOG_DIR}/run-$(date +%s)"
+# Captured once, and used both to name the run directory and to decide in
+# section 9 whether the report on disk belongs to THIS run.
+RUN_STARTED_EPOCH="$(date +%s)"
+RUN_DIR="${LIUM_LOG_DIR}/run-${RUN_STARTED_EPOCH}"
 
 PLAY_ARGS=(-i "${SCRIPT_DIR}/inventory/localhost.yml" "${SCRIPT_DIR}/site.yml" --diff)
 
@@ -380,8 +401,36 @@ PLAY_RC=0
 
 # --- 9. Report, then exit with the playbook's status. ------------------------
 REPORT="${LIUM_STATE_DIR}/verify-report.json"
+
+# A report older than this run belongs to a PREVIOUS one, and printing it as the
+# current reading of the host is a lie the operator cannot see through.
+#
+# Observed on au11: a play that failed after the reboot but before `verify`
+# printed the pre-reboot report's "5 tokens missing" while /proc/cmdline already
+# carried them — sending the operator to debug something that had just been
+# fixed. The old `else` branch could never catch it, because it only fires when
+# the file is ABSENT, and any host that has converged once already has one.
+#
+# mtime against the run's start, not the boot id: a second failed run on the
+# same boot leaves a same-boot report that is still stale. `if cmd` rather than a
+# bare assignment, so a missing or unreadable file is answered here instead of
+# tripping the ERR trap.
+REPORT_MTIME=0
+if REPORT_MTIME_RAW="$("${SUDO[@]}" stat -c %Y "$REPORT" 2>/dev/null)"; then
+  REPORT_MTIME="$REPORT_MTIME_RAW"
+fi
+REPORT_IS_CURRENT=0
+if [ "$REPORT_MTIME" -ge "$RUN_STARTED_EPOCH" ]; then
+  REPORT_IS_CURRENT=1
+fi
+
 printf '\n'
-if [ -r "$REPORT" ]; then
+if [ -r "$REPORT" ] && [ "$REPORT_IS_CURRENT" -eq 0 ]; then
+  warn "The verify report at ${REPORT} is from an EARLIER run, so it is not shown."
+  warn "This run ended before the verify role rewrote it. Its contents describe the"
+  warn "host as it was at $(date -d "@${REPORT_MTIME}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'an earlier time'), not as it is now."
+  warn "Fix what the playbook output above reports, then re-run to get a current report."
+elif [ -r "$REPORT" ]; then
   log "Verify report: ${REPORT}"
   if command -v python3 >/dev/null 2>&1; then
     "${SUDO[@]}" python3 - "$REPORT" <<'PYSUM'

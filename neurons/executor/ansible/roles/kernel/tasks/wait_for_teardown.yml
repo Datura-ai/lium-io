@@ -53,6 +53,45 @@
   changed_when: false
   check_mode: false
 
+# THE PROBE MUST PROVE IT RAN.
+#
+# Without this the gate fails OPEN, which is the one direction it must never
+# fail. `failed_when: false` turns every error into a silent success, and the
+# classification below reads only stdout — so a probe that died (missing or
+# non-executable script, a wrong lium_common_files, a fork that failed under the
+# memory pressure a 1.5 TB teardown itself creates) yields empty stdout, both
+# lists come back empty, all three refusals are skipped by their `length > 0`
+# conditions, and reboot.yml walks straight into the reboot this file exists to
+# stop.
+#
+# The check needs no new script contract: `--qemu-procs` exits with the number of
+# lines it printed, capped at 250. So rc == line count is a self-proving
+# invariant, and any bash or usage error (1, 2, 64, 126, 127) breaks it against a
+# stdout that is empty. The `>= 250` arm keeps the cap from reading as a failure.
+- name: The teardown probe must have actually run
+  ansible.builtin.fail:
+    msg: |
+      REFUSING to reboot: the pre-reboot QEMU probe did not run correctly, so
+      whether a TDX guest is still on this host is UNKNOWN.
+
+      command  : {{ lium_common_files }}/lium-guard.sh --qemu-procs
+      exit code : {{ lium_teardown_probe.rc | default('none') }}
+      stdout lines : {{ lium_teardown_probe.stdout_lines | default([]) | length }}
+      stderr   : {{ lium_teardown_probe.stderr | default('') | trim }}
+
+      This gate fails CLOSED on purpose. Rebooting on an unanswered question is
+      what wedges a host: the kernel would have to finish a teardown it cannot
+      see before it could shut down, and the failure looks like a host that
+      answers ping and accepts TCP on port 22 while never sending an SSH banner.
+
+      Run the probe by hand to see what it says, then re-run:
+
+          sudo {{ lium_common_files }}/lium-guard.sh --qemu-procs; echo "rc=$?"
+  when: >-
+    (lium_teardown_probe.rc | default(-1) | int) != (lium_teardown_probe.stdout_lines | default([]) | length)
+    and not ((lium_teardown_probe.rc | default(-1) | int) == 250
+             and (lium_teardown_probe.stdout_lines | default([]) | length) >= 250)
+
 # Split on the process state, because the two cases need opposite handling and
 # conflating them wastes an hour. A zombie is a teardown in flight: it finishes
 # on its own, so waiting works. A live QEMU is a running guest: it will never
@@ -115,7 +154,15 @@
   failed_when: false
   changed_when: false
   check_mode: false
-  until: (lium_teardown_drain.stdout | trim) == ''
+  # rc AND stdout, not stdout alone. Empty stdout on its own also describes a
+  # probe that CRASHED, and treating that as "the teardown finished" ends the
+  # wait early and reboots into a live teardown — the same fail-open the task
+  # above closes, reached through a transient failure instead of a permanent
+  # one. A successful probe on a drained host exits 0 with no output, so
+  # requiring both costs nothing and is only satisfiable by a real answer.
+  until:
+    - (lium_teardown_drain.rc | int) == 0
+    - (lium_teardown_drain.stdout | trim) == ''
   retries: "{{ [1, ((lium_reboot_drain_timeout_sec | int) // (lium_reboot_drain_poll_sec | int))] | max }}"
   delay: "{{ lium_reboot_drain_poll_sec | int }}"
   when: lium_reboot_dying_qemu | length > 0
@@ -151,6 +198,12 @@
       stuck. Ask the datacentre for an OUT-OF-BAND power-cycle: it needs nothing
       from the running kernel and cold-resets the GPUs. There is deliberately no
       variable in this playbook that reboots past this point.
+  # The negation of the `until` above, not just "stdout is non-empty". Gated on
+  # stdout alone this refusal is SKIPPED when the poll ended because the probe
+  # kept crashing — empty stdout, non-zero rc — and the run then falls through to
+  # the reboot having never established that the host is clear.
   when:
     - lium_reboot_dying_qemu | length > 0
-    - (lium_teardown_drain.stdout | default('') | trim) != ''
+    - >-
+      (lium_teardown_drain.rc | default(-1) | int) != 0
+      or (lium_teardown_drain.stdout | default('') | trim) != ''

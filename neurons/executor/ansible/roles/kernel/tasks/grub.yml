@@ -215,15 +215,31 @@
       # reboots into a configuration nobody verified.
       - lium_cmdline.grubcfg_present | bool
       - lium_cmdline.grubcfg_missing_tokens | length == 0
+      # The analysis reads the FIRST menu entry, which is the booting one only
+      # when GRUB_DEFAULT selects it. Under `saved`, a title, or any other index
+      # the two lines above describe an entry this host will not use, and the
+      # check passes while the tokens never reach the running kernel. Asserted
+      # rather than warned: a check that silently answers a different question
+      # than the one asked is the failure this whole task guards against.
+      - lium_cmdline.grubcfg_line_is_default_entry | bool
     fail_msg: |
       The generated bootloader configuration does NOT resolve every required token,
-      or could not be read at all. Refusing to reboot into it.
+      could not be read at all, or does not boot the entry that was analysed.
+      Refusing to reboot into it.
 
       grub.cfg readable     : {{ lium_cmdline.grubcfg_present }}
       Missing or overridden : {{ lium_cmdline.grubcfg_missing_tokens | join(', ') }}
+      GRUB_DEFAULT          : {{ lium_cmdline.grub_default_entry }}{{
+        '  <-- not 0, so the analysed first menu entry is NOT the one that boots'
+        if not (lium_cmdline.grubcfg_line_is_default_entry | bool) else '' }}
       grub.cfg linux line   : {{ lium_cmdline.grubcfg_linux_line }}
       GRUB_CMDLINE_LINUX    : {{ lium_cmdline.grub_cmdline_linux }}
       ..._LINUX_DEFAULT     : {{ lium_cmdline.grub_cmdline_linux_default }}
+
+      If GRUB_DEFAULT is not 0, set it to 0 (or apply the kernel parameters by
+      hand and re-run with --skip-tags kernel). Following `saved` and submenu
+      paths correctly needs grubenv and menuentry parsing, and guessing at it
+      would put this check back to answering a question nobody asked.
 
       Nothing has rebooted, so this is still easy to undo:
           sudo cp {{ lium_grub_default_path }}.bak.pre-lium-cvm {{ lium_grub_default_path }}
@@ -242,8 +258,16 @@
 
       Our values win, because /etc/grub.d/10_linux emits GRUB_CMDLINE_LINUX before
       GRUB_CMDLINE_LINUX_DEFAULT and the kernel takes the last occurrence. But
-      relying on that ordering forever is fragile — remove the stale copies from
-      {{ lium_grub_default_path }}.
+      relying on that ordering forever is fragile — remove the stale copies.
+
+      They are usually in a VENDOR DROP-IN, not in {{ lium_grub_default_path }}
+      itself, so search both:
+
+          grep -n 'kvm_intel\|intel_iommu\|vfio-pci.ids\|iommu=pt\|nohibernate' \
+            {{ lium_grub_default_path }} {{ lium_grub_dropin_path | dirname }}/*.cfg
+
+      Do not edit {{ lium_grub_dropin_path | basename }} — this playbook owns it
+      and rewrites it on every run.
   when: lium_cmdline.conflicting_keys | length > 0
 
 - name: Report tokens the provider kept only in GRUB_CMDLINE_LINUX

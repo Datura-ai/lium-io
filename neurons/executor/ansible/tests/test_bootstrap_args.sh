@@ -104,6 +104,44 @@ $bad"
   fi
 fi
 
+# --- the supported-release list is duplicated, so pin the duplication ---------
+#
+# bootstrap.sh gates the OS before ansible-core exists, so it cannot read
+# group_vars and has to carry its own copy. Same shape as the guard's search
+# roots in test_guard.sh: the duplication is legitimate, the DRIFT is not.
+#
+# Adding a release to lium_os_matrix without adding it here leaves the entry
+# point rejecting a host it is meant to support, with a message that contradicts
+# preflight — and the run dies before any playbook output exists to explain it.
+CASES=$((CASES + 1))
+mapfile -t script_releases < <("$BOOTSTRAP" --print-supported-releases)
+
+# The keys of lium_os_matrix: quoted, two-space-indented mapping names directly
+# under it. Anchored on the indent so a nested key can never be read as a
+# release, and range-limited so a later block's keys cannot leak in.
+#
+# sed, not awk. Ubuntu's default awk is mawk, and the three-argument match()
+# with a capture array that this wants is a gawk extension — it would fail
+# on the very container the supported-OS CI job runs in.
+mapfile -t gv_releases < <(
+  sed -n '/^lium_os_matrix:/,/^[^[:space:]#]/ s/^  "\([^"]*\)":.*/\1/p' \
+    group_vars/all/main.yml | sort
+)
+
+mapfile -t script_sorted < <(printf '%s\n' "${script_releases[@]}" | sort)
+
+if [ "${#gv_releases[@]}" -eq 0 ]; then
+  fail "found no releases under lium_os_matrix in group_vars/all/main.yml — the parser has stopped matching"
+elif [ "${script_sorted[*]}" = "${gv_releases[*]}" ]; then
+  pass "bootstrap.sh and lium_os_matrix agree on the supported releases (${script_sorted[*]})"
+else
+  fail "supported-release drift:
+    bootstrap.sh SUPPORTED_VERSIONS : ${script_sorted[*]}
+    group_vars lium_os_matrix       : ${gv_releases[*]}
+  Both must list the same releases. bootstrap.sh gates before ansible-core is
+  installed, so it cannot read group_vars and must carry its own copy."
+fi
+
 printf '\n'
 if [ "$FAILURES" -gt 0 ]; then
   printf 'FAIL test_bootstrap_args.sh — %s of %s checks failed.\n' "$FAILURES" "$CASES" >&2

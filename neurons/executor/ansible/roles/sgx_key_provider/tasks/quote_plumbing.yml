@@ -11,6 +11,50 @@
 # 10a. qgsd ships with `#port = 4050` COMMENTED OUT, so it serves over a unix
 # socket, reports `active`, and never answers the guest.
 # Signature: `vsock failure: Connection reset by peer (os error 104)`.
+#
+# THE REGEXP MUST MATCH SOMETHING FIRST.
+#
+# `lineinfile` APPENDS when its regexp matches nothing — that is the mechanism
+# that corrupted Intel's QPL config into invalid JSON and rebooted every CVM this
+# playbook produced at ~160 s (see 10b below). qgs.conf is flat key=value today,
+# so an append happens to land in the right place, but that is a property of the
+# file the current package ships, not of the edit. A future qgsd that renames the
+# key, sections the file, or drops the line entirely would get a silent append
+# and a config nobody asked for.
+#
+# Asserting the regexp matches converts that into a refusal that names the file.
+- name: Read the shipped qgsd configuration
+  ansible.builtin.stat:
+    path: /etc/qgs.conf
+  register: lium_qgs_stat
+
+- name: Refuse when qgsd shipped no configuration at all
+  ansible.builtin.fail:
+    msg: |
+      /etc/qgs.conf does not exist, so qgsd is not installed the way this role
+      expects and the guest will never get a TD quote.
+
+      Check that the DCAP packages installed:  dpkg -l | grep -i qgs
+  when: not (lium_qgs_stat.stat.exists | default(false))
+
+- name: Read the current qgsd configuration
+  ansible.builtin.slurp:
+    src: /etc/qgs.conf
+  register: lium_qgs_shipped
+
+- name: Refuse to blind-append to an unrecognised qgsd configuration
+  ansible.builtin.assert:
+    that:
+      - (lium_qgs_shipped.content | b64decode) is search('(?m)^\s*#?\s*port\s*=')
+    fail_msg: >-
+      /etc/qgs.conf has no `port =` line, commented or otherwise, so this
+      package does not ship the configuration this role knows how to edit.
+      Editing anyway would APPEND `port = 4050` to the end of a file whose
+      shape is unknown — the same silent-append that corrupted the QPL config.
+      Inspect /etc/qgs.conf and update roles/sgx_key_provider/tasks/quote_plumbing.yml
+      to match what the package now ships.
+    quiet: true
+
 - name: Serve TD quotes over vsock
   ansible.builtin.lineinfile:
     path: /etc/qgs.conf

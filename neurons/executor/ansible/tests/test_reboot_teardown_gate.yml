@@ -189,6 +189,41 @@
           Message was: {{ gate_case3_msg | default('(no message captured)') }}
         quiet: true
 
+    # --- case 4: a probe that cannot run is refused, not waved through --------
+    # The direction this gate must never fail. `failed_when: false` makes every
+    # error look like success, and the classification reads only stdout — so
+    # before the rc check, a probe that died produced two empty lists, skipped
+    # all three refusals, and let the reboot proceed. Case 3 and a crashed probe
+    # were indistinguishable, which is why cases 1-3 could not catch it.
+    - name: Case 4 — run the gate with a probe that cannot execute
+      block:
+        - name: Include the gate with the guard script missing
+          ansible.builtin.include_tasks: "{{ gate_tasks }}"
+          vars:
+            lium_proc_root: "{{ gate_fixtures }}/clean"
+            lium_common_files: "{{ gate_fixtures }}/no-such-dir"
+
+        - name: Case 4 reached the end of the gate
+          ansible.builtin.set_fact:
+            gate_case4_passed_through: true
+      rescue:
+        - name: Capture why case 4 was refused
+          ansible.builtin.set_fact:
+            gate_case4_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: The gate refuses when it cannot tell whether a guest is running
+      ansible.builtin.assert:
+        that:
+          - gate_case4_passed_through is not defined
+          - gate_case4_msg is defined
+          - gate_case4_msg is search('UNKNOWN')
+        fail_msg: >-
+          The gate let a reboot proceed after its own probe failed to run. It
+          cannot distinguish "no QEMU on this host" from "I could not look",
+          and it must fail closed on the second. Message was:
+          {{ gate_case4_msg | default('(the gate did not fail)') }}
+        quiet: true
+
     - name: Clean up the fixtures
       ansible.builtin.file:
         path: "{{ gate_fixtures }}"
@@ -198,4 +233,5 @@
       ansible.builtin.debug:
         msg: >-
           PASS reboot teardown gate — refused a running guest, refused an
-          unfinished teardown with power-cycle instructions, allowed a clean host.
+          unfinished teardown with power-cycle instructions, allowed a clean
+          host, and refused when its own probe could not run.
