@@ -1,0 +1,23 @@
+---
+# Kept compatible with ansible-lint's own yamllint requirements, so `ansible-lint
+# --fix` stays available and CI does not print a config-incompatibility warning.
+extends: default
+
+ignore: |
+  tests/fixtures/
+
+rules:
+  line-length:
+    max: 120
+    level: warning
+  comments-indentation: false
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false

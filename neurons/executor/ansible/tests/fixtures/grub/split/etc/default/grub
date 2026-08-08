@@ -1,0 +1,4 @@
+# Fixture: arguments split across both variables.
+GRUB_DEFAULT=0
+GRUB_CMDLINE_LINUX="kvm_intel.tdx=on intel_iommu=on"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet iommu=pt nohibernate"

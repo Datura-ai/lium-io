@@ -1,0 +1,96 @@
+---
+# The second arm of the regeneration condition, which nothing else reaches.
+#
+# `when: lium_grub_dropin.changed or not (lium_grubcfg_stat.stat.exists ...)`.
+# On a first run the drop-in ALWAYS changes, so the `changed` arm fires and
+# carries every other case — including the ones that converge twice, because
+# their second pass has a grub.cfg sitting there from the first. Deleting the
+# `not exists` arm therefore leaves the whole suite green.
+#
+# The host that needs it: a run where the drop-in is already byte-correct but a
+# previous regeneration never succeeded — a full /boot, an interrupted run, a
+# restored backup. Gating on `changed` alone would never retry, the grub.cfg
+# assertion downstream would have nothing to read, and the host would be told
+# its bootloader could not be verified on every subsequent run.
+
+- name: Create the regeneration work tree
+  ansible.builtin.file:
+    path: "{{ grub_root }}/regenerate/etc/default/grub.d"
+    state: directory
+    mode: "0755"
+
+- name: Copy a plain fixture in
+  ansible.builtin.copy:
+    src: fixtures/grub/default_only/etc/default/grub
+    dest: "{{ grub_root }}/regenerate/etc/default/grub"
+    mode: "0644"
+
+- name: Converge once to establish the drop-in and a grub.cfg
+  ansible.builtin.include_role:
+    name: kernel
+  vars: &regenerate_vars
+    lium_kernel_fixture_mode: true
+    lium_kernel_reboot_enabled: false
+    lium_grub_default_path: "{{ grub_root }}/regenerate/etc/default/grub"
+    lium_grub_dropin_path: "{{ grub_root }}/regenerate/etc/default/grub.d/99-lium-cvm.cfg"
+    lium_grubcfg_path: "{{ grub_root }}/regenerate/boot/grub/grub.cfg"
+    lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/cmdline_complete"
+    lium_modprobe_conf_path: "{{ grub_root }}/regenerate/etc/modprobe.d/vfio-dma.conf"
+    lium_modules_load_path: "{{ grub_root }}/regenerate/etc/modules-load.d/vfio.conf"
+    lium_update_grub_cmd: >-
+      {{ playbook_dir }}/fake-update-grub.sh
+      {{ grub_root }}/regenerate/etc/default/grub
+      {{ grub_root }}/regenerate/etc/default/grub.d
+      {{ grub_root }}/regenerate/boot/grub/grub.cfg
+
+- name: Remove the generated grub.cfg, leaving the drop-in correct
+  ansible.builtin.file:
+    path: "{{ grub_root }}/regenerate/boot/grub/grub.cfg"
+    state: absent
+
+- name: Converge again with nothing left to change
+  block:
+    - name: "Converge: regenerate (pass 2)"
+      ansible.builtin.include_role:
+        name: kernel
+      vars: *regenerate_vars
+
+    - name: Record that pass 2 completed
+      ansible.builtin.set_fact:
+        regenerate_failed: false
+        regenerate_msg: ""
+  rescue:
+    - name: Record the failure
+      ansible.builtin.set_fact:
+        regenerate_failed: true
+        regenerate_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: The drop-in did not change on pass 2
+  ansible.builtin.assert:
+    that:
+      - not (lium_grub_dropin.changed | bool)
+    fail_msg: >-
+      The drop-in changed on pass 2, so the `changed` arm fired and this case
+      proves nothing about the absent-grub.cfg arm it exists to cover.
+    quiet: true
+
+- name: An absent grub.cfg was regenerated anyway
+  ansible.builtin.stat:
+    path: "{{ grub_root }}/regenerate/boot/grub/grub.cfg"
+  register: regenerate_cfg
+
+- name: The bootloader configuration came back
+  ansible.builtin.assert:
+    that:
+      - not (regenerate_failed | bool)
+      - regenerate_cfg.stat.exists
+    fail_msg: >-
+      grub.cfg was absent and an unchanged drop-in did not trigger a
+      regeneration, so the run either failed its own grub.cfg assertion or would
+      have rebooted into a bootloader configuration that does not exist.
+      failed={{ regenerate_failed }} msg={{ regenerate_msg }}
+    quiet: true
+
+- name: PASS regenerate
+  ansible.builtin.debug:
+    msg: "PASS regenerate — an unchanged drop-in still rebuilt an absent grub.cfg"

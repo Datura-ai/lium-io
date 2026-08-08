@@ -1,0 +1,125 @@
+---
+# The lium-io checkout and the CVM OS image.
+#
+# NOT destructive-tagged, so this role DOES run in maintenance mode — which is
+# exactly why it must never move the checkout ref on a host that still has a
+# CVM. app/ is the measured surface; moving the ref rewrites it.
+#
+# That is not a safety defect on its own (measurements are fixed at launch, and
+# the documented upgrade flow does move the ref deliberately), but it collides
+# with "a re-run with a CVM present performs zero destructive actions". So on a
+# non-CLEAN host the role reports and leaves it alone.
+
+- name: Ensure the checkout directory's parent exists
+  ansible.builtin.file:
+    path: "{{ lium_repo_path | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Clone the repository when it is absent
+  ansible.builtin.git:
+    repo: "{{ lium_repo_url }}"
+    dest: "{{ lium_repo_path }}"
+    version: "{{ lium_repo_ref }}"
+    update: false
+  register: lium_repo_cloned
+  when:
+    - lium_repo_clone | bool
+    - not (lium.repo_present | bool)
+
+# Narrowly, and only the file we own. The sgx role rewrites its two lines later
+# in this same run, so nothing is lost — but leaving the edit in place makes the
+# git task below fail outright on every converge after the first, in a role that
+# has nothing to do with the cause. Any OTHER tracked modification still stops
+# the update, which is the property worth keeping.
+#
+# `command` rather than the git module on purpose: ansible.builtin.git operates
+# on the whole checkout, and its only lever here is force, which would discard
+# every local modification instead of the one file we own.
+- name: Restore the QPL config this playbook manages  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: git checkout -- {{ lium_kp_qcnl_relpath | quote }}
+    chdir: "{{ lium_repo_path }}"
+  register: lium_repo_qcnl_restore
+  changed_when: lium_repo_qcnl_restore.rc == 0
+  failed_when: false
+  when:
+    - lium_repo_clone | bool
+    - lium.repo_present | bool
+    - lium.guard.state == 'CLEAN'
+
+# Only on a CLEAN host.
+- name: Move the checkout to the requested ref
+  ansible.builtin.git:
+    repo: "{{ lium_repo_url }}"
+    dest: "{{ lium_repo_path }}"
+    version: "{{ lium_repo_ref }}"
+    update: true
+  when:
+    - lium_repo_clone | bool
+    - lium.repo_present | bool
+    - lium.guard.state == 'CLEAN'
+
+- name: Leave the checkout alone while a CVM exists
+  ansible.builtin.debug:
+    msg: |
+      Not moving the checkout: the guard reports {{ lium.guard.state }}, so this
+      host still holds CVM state.
+
+      Current HEAD : {{ lium.repo_head | default('unknown') }}
+      Requested ref: {{ lium_repo_ref }}
+
+      neurons/executor/dstacktee/app/ is the measured surface — the compose files
+      and launch scripts there are hashed into what the validator whitelists — so
+      moving the ref rewrites it. Upgrading a host that has a CVM is a deliberate
+      procedure, not a side effect of a maintenance run: see
+      docs/host-setup.md section 6.
+  when:
+    - lium.repo_present | bool
+    - lium.guard.state != 'CLEAN'
+
+# The hard one. Any local edit under app/ changes the compose hash, and the
+# validator then rejects the attestation.
+- name: Refuse to proceed with a modified measured surface
+  ansible.builtin.fail:
+    msg: |
+      REFUSING: neurons/executor/dstacktee/app/ has local modifications.
+
+      {% for entry in lium.app_dirty_files %}
+        {{ entry }}
+      {% endfor %}
+
+      Everything under app/ — docker-compose*.yml, pre_launch_script.sh,
+      init_script.sh — is hashed into the compose the validator whitelists. Any
+      edit, however small, produces a hash nobody has whitelisted, and every
+      attestation fails.
+
+      Restore it:
+
+          git -C {{ lium_repo_path }} checkout -- neurons/executor/dstacktee/app
+
+      Do not work around this by copying another host's files.
+  when: lium.app_dirty_files | length > 0
+
+# `lium.repo_present` is a SNAPSHOT taken in the common play, before this role
+# ran, so on a fresh host it is false even after the clone above succeeded. On
+# its own it would skip the download on the one run that most needs it, and the
+# provider would have to notice and run the playbook a second time. The clone's
+# own result is the only thing that knows the checkout exists now.
+- name: Download the CVM OS image
+  ansible.builtin.command:
+    cmd: "{{ lium_os_image_download_cmd }}"
+    chdir: "{{ lium_repo_path }}/neurons/executor/dstacktee"
+  register: lium_image_download
+  changed_when: true
+  when:
+    - lium.repo_present | bool or (lium_repo_cloned.changed | default(false))
+    - lium.os_image_digest | length == 0
+
+- name: Report the recorded image and runner digests
+  ansible.builtin.debug:
+    msg: >-
+      OS image digest: {{ lium.os_image_digest | default('none') }}.
+      Runner digest in .env: {{ lium.env_runner_digest | default('not set') }}.
+      External port: {{ lium.env_external_port | default('not set') }}.
+      Per-executor .env stays manual — see docs/host-setup.md section 5.

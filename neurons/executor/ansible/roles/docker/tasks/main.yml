@@ -1,0 +1,85 @@
+---
+# Docker Engine from Docker's own repository.
+#
+# The suite comes from lium_os_matrix and is `noble` for both supported
+# releases: Ubuntu 25.10 has no Docker repo of its own, and 26.04's is
+# unverified. Using the release's own codename gets you a 404 and a failed apt
+# transaction.
+
+- name: Skip Docker when it is already installed
+  ansible.builtin.debug:
+    msg: "Docker {{ lium.docker_version }} is already installed."
+  when: lium.docker_version | length > 0
+
+- name: End the role when Docker is present
+  ansible.builtin.meta: end_role
+  when: lium.docker_version | length > 0
+
+- name: Install the packages needed to add an apt repository
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure the apt keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Install Docker's apt key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+# deb822, not apt_repository: that module is deprecated and removed in
+# ansible-core 2.25, and --syntax-check already warns about it on every run.
+# This also matches how the SGX repository is added, so both look the same.
+- name: Add Docker's apt repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/docker.sources
+    mode: "0644"
+    content: |
+      # Managed by the Lium CVM host playbook (DAH-2544).
+      # The suite is `noble` for both supported releases: Ubuntu 25.10 has no
+      # Docker repository of its own, and using the host's own codename returns
+      # a 404 that fails the whole apt transaction.
+      Types: deb
+      URIs: https://download.docker.com/linux/ubuntu
+      Suites: {{ lium_os_matrix[lium.os_version_id].docker_suite }}
+      Components: stable
+      Architectures: {{ lium_docker_arch }}
+      Signed-By: /etc/apt/keyrings/docker.asc
+  register: lium_docker_repo
+
+- name: Refresh apt after adding the Docker repository
+  ansible.builtin.apt:
+    update_cache: true
+  when: lium_docker_repo.changed
+
+- name: Install Docker Engine
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+
+- name: Enable and start Docker
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Add the invoking user to the docker group
+  ansible.builtin.user:
+    name: "{{ lium_docker_user }}"
+    groups: docker
+    append: true
+  when: lium_docker_user | length > 0

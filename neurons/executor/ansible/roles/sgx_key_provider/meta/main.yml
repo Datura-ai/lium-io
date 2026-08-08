@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  role_name: sgx_key_provider
+  author: Lium
+  description: DAH-2544 CVM day-zero host provisioning — sgx_key_provider
+  company: Datura
+  license: MIT
+  min_ansible_version: "2.18"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - questing
+        - resolute
+  galaxy_tags: []
+dependencies: []

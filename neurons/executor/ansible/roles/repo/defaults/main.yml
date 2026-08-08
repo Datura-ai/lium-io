@@ -1,0 +1,3 @@
+---
+# Everything this role needs lives in group_vars/all/main.yml, in the shared
+# lium_ namespace: lium_repo_url, lium_repo_path, lium_repo_ref, lium_repo_clone.

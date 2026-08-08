@@ -1,0 +1,70 @@
+---
+# The dstack QEMU 9.2.1 build. DESTRUCTIVE — replacing QEMU changes RTMR0 and
+# makes any existing hda.img undecryptable.
+
+- name: Guard against converging over an existing CVM
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: assert_no_cvm
+  vars:
+    common_guard_reason: replacing QEMU changes RTMR0 and invalidates any existing hda.img
+    common_guard_override_var: lium_force_qemu_rebuild
+
+# Tri-state: "not installed" and "cannot tell what is installed" are different
+# answers, and only the second one blocks.
+- name: Refuse to replace a QEMU whose identity is unknown
+  ansible.builtin.fail:
+    msg: |
+      REFUSING: cannot determine what QEMU is currently installed.
+
+      version : {{ lium.qemu_version.reason }}
+      sha256  : {{ lium.qemu_sha256.reason }}
+
+      Replacing a binary whose identity is unknown means we cannot say whether
+      RTMR0 is about to change. Repair or remove {{ lium_qemu_prefix }} and re-run.
+  when: >-
+    not (lium.qemu_version.readable | bool)
+    or not (lium.qemu_sha256.readable | bool)
+
+- name: Install from a prebuilt tarball
+  ansible.builtin.include_tasks: tarball.yml
+  when:
+    - lium_qemu_tarball_url | length > 0
+    - lium.qemu_version.value != lium_qemu_version
+
+- name: Build from source
+  ansible.builtin.include_tasks: build.yml
+  when:
+    - lium_qemu_tarball_url | length == 0
+    - lium.qemu_version.value != lium_qemu_version
+
+# One copy, after both arms. The two install paths are mutually exclusive and
+# each used to end with its own byte-identical copy of this, so the
+# lium_state_dir/qemu.sha256 contract — which checks.json.j2 reads — lived in
+# two places and a path change in one arm would have silently degraded
+# qemu.fingerprint to SKIPPED.
+#
+# `stat` + `copy` rather than a shell redirect, so the fingerprint is still
+# recorded under --check, where command and shell tasks are skipped entirely.
+- name: Fingerprint the installed binary
+  ansible.builtin.stat:
+    path: "{{ lium_qemu_prefix }}/bin/qemu-system-x86_64"
+    checksum_algorithm: sha256
+  register: lium_qemu_binary
+
+- name: Record the installed binary's fingerprint
+  ansible.builtin.copy:
+    dest: "{{ lium_state_dir }}/qemu.sha256"
+    content: "{{ lium_qemu_binary.stat.checksum }}\n"
+    mode: "0644"
+  when: lium_qemu_binary.stat.exists
+
+- name: Report that QEMU is already at the pinned version
+  ansible.builtin.debug:
+    msg: "QEMU {{ lium.qemu_version.value }} is already installed; nothing to build."
+  when: lium.qemu_version.value == lium_qemu_version
+
+# Always. The launcher reads client.conf, so this is what actually points dstack
+# at the right binary — independent of whether anything was built this run.
+- name: Point dstack at this QEMU
+  ansible.builtin.include_tasks: client_conf.yml

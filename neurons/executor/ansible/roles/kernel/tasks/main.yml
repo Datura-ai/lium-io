@@ -1,0 +1,82 @@
+---
+# Runtime first, persistence second, GRUB third, reboot last.
+#
+# The order matters: the runtime dma_entry_limit write takes effect immediately
+# and costs nothing, so a host gets the fix even if the run later stops at the
+# reboot confirmation.
+
+- name: Guard against converging over an existing CVM
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: assert_no_cvm
+  vars:
+    common_guard_reason: kernel command-line change requiring a reboot
+    common_guard_override_var: lium_force_reboot
+
+# --- runtime ------------------------------------------------------------------
+- name: Apply the vfio DMA entry limit at runtime
+  ansible.builtin.copy:
+    dest: /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+    content: "{{ lium_dma_entry_limit }}"
+    unsafe_writes: true
+    mode: "0644"
+  when:
+    - lium.dma_entry_limit.readable | bool
+    - (lium.dma_entry_limit.value | int) != (lium_dma_entry_limit | int)
+    - not lium_kernel_fixture_mode | bool
+
+# --- persistence --------------------------------------------------------------
+# Both exist on a stock Ubuntu host; creating them is idempotent there and is
+# what lets the fixture tests exercise this half against a work tree.
+- name: Ensure the module configuration directories exist
+  ansible.builtin.file:
+    path: "{{ item | dirname }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ lium_modprobe_conf_path }}"
+    - "{{ lium_modules_load_path }}"
+
+- name: Persist the vfio DMA entry limit
+  ansible.builtin.template:
+    src: vfio-dma.conf.j2
+    dest: "{{ lium_modprobe_conf_path }}"
+    mode: "0644"
+
+# Separate lines, deliberately. `modprobe vfio_iommu_type1 vfio-pci` reads the
+# second argument as a module PARAMETER and silently does nothing:
+#     dmesg: unknown parameter 'vfio-pci' ignored
+- name: Load the vfio modules at boot
+  ansible.builtin.copy:
+    dest: "{{ lium_modules_load_path }}"
+    mode: "0644"
+    # `ansible_managed` is injected only by the template module, never into a
+    # copy `content:`, so the banner is written out literally here.
+    content: |
+      # Managed by the Lium CVM host playbook (DAH-2544).
+      # One module per line, deliberately. Passing both to a single modprobe
+      # call makes the second argument a module PARAMETER, and the kernel
+      # silently logs "unknown parameter 'vfio-pci' ignored".
+      vfio_pci
+      vfio_iommu_type1
+
+- name: Load the vfio modules now
+  ansible.builtin.command:
+    cmd: "{{ item }}"
+  loop: "{{ lium_modprobe_cmds }}"
+  register: lium_modprobe_result
+  changed_when: false
+  failed_when: false
+  when: not lium_kernel_fixture_mode | bool
+
+# --- GRUB ---------------------------------------------------------------------
+- name: Converge the kernel command line
+  ansible.builtin.include_tasks: grub.yml
+
+# --- reboot -------------------------------------------------------------------
+# Only when the running kernel actually lacks what we just persisted.
+- name: Reboot to pick up the new kernel command line
+  ansible.builtin.include_tasks: reboot.yml
+  when:
+    - lium_kernel_drift | length > 0
+    - lium_kernel_reboot_enabled | bool

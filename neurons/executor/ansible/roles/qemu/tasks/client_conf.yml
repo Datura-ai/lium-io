@@ -1,0 +1,33 @@
+---
+# Point dstack at the QEMU we installed.
+#
+# This runs on EVERY converge, whether or not anything was built. client.conf is
+# what the launcher actually reads, and a host with a correct binary and no
+# client.conf falls back to the distro QEMU — which can never reproduce RTMR0.
+
+- name: Ensure /etc/dstack exists
+  ansible.builtin.file:
+    path: /etc/dstack
+    state: directory
+    mode: "0755"
+
+- name: Write the dstack client configuration
+  ansible.builtin.copy:
+    dest: /etc/dstack/client.conf
+    mode: "0644"
+    content: |
+      # Managed by the Lium CVM host playbook (DAH-2544).
+      [qemu]
+      path = {{ lium_qemu_prefix }}/bin/qemu-system-x86_64
+
+# Benign-noise fix, not a functional one. `lium-cvm.sh check` looks for
+# qemu-system-x86_64 on PATH (lium-cvm.sh:145) while the launcher uses
+# client.conf, so without this symlink `check` reports QEMU MISSING on a host
+# that is configured perfectly. The symlink makes the two agree.
+- name: Symlink the binary onto PATH so the launcher check agrees
+  ansible.builtin.file:
+    src: "{{ lium_qemu_prefix }}/bin/qemu-system-x86_64"
+    dest: /usr/local/bin/qemu-system-x86_64
+    state: link
+    force: true
+  when: lium_qemu_symlink_path | bool

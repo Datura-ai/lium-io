@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+# Intel SGX DCAP repository, deb822 format.
+#
+# The suite is `noble` for every release in lium_os_matrix: Intel publishes no
+# `questing` or `resolute` suite, and using the host's own codename gets a 404
+# that fails the whole apt transaction.
+Types: deb
+URIs: https://download.01.org/intel-sgx/sgx_repo/ubuntu
+Suites: {{ lium_os_matrix[lium.os_version_id].sgx_suite }}
+Components: main
+Signed-By: /etc/apt/keyrings/intel-sgx.asc

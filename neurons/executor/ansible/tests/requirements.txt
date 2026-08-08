@@ -1,0 +1,6 @@
+# Exact pins. CI installs from this file only — no floating specifiers anywhere,
+# so a lint or schema-validator release can never turn a green PR red on its own.
+# Resolved and verified on 2026-08-05; bump deliberately, in its own commit.
+ansible-core==2.21.2
+ansible-lint==26.6.0
+check-jsonschema==0.37.4

@@ -1,0 +1,61 @@
+---
+# The SGX DCAP stack, platform registration, quote plumbing, and the sealing-key
+# provider container.
+#
+# TWO PATHS, because the Intel PCS API subscription key has no distribution
+# channel today — it is copied by hand from a peer host's config/default.json.
+# An all-or-nothing role would be unrunnable for a provider who does not have
+# one, so:
+#
+#   key SET   -> full path: install and configure PCCS locally, run in-band
+#                registration, point both QPL configs at the local PCCS.
+#
+#   key UNSET -> degraded path: no PCCS install, no registration; both QPL
+#                configs point at lium_pccs_url, which may name a REMOTE PCCS.
+#                The in-tree precedent is already there — key-provider's own
+#                sgx_default_qcnl.conf ships a Phala PCCS URL. `verify` reports
+#                sgx.registration_pck_certs as SKIPPED with the remediation.
+#
+# Loud, documented, and re-runnable the moment the key arrives.
+
+- name: Install the host DCAP packages
+  ansible.builtin.include_tasks: host_dcap.yml
+  when: lium_sgx_install | bool
+
+- name: Report that the DCAP install was skipped
+  ansible.builtin.debug:
+    msg: "lium_sgx_install is false, so the DCAP packages were not installed."
+  when: not (lium_sgx_install | bool)
+
+- name: Register this platform with Intel
+  ansible.builtin.include_tasks: registration.yml
+  when:
+    - lium_intel_api_key | length > 0
+    - lium.pck_cert_count.readable | bool
+    - (lium.pck_cert_count.value | int) == 0
+
+- name: Report why registration was skipped
+  ansible.builtin.debug:
+    msg: >-
+      Skipping in-band SGX registration.
+      {% if lium_intel_api_key | length == 0 %}
+      lium_intel_api_key is not set, so this host takes the degraded path: DCAP
+      collateral comes from {{ lium_pccs_url }} instead of a local PCCS.
+      {% elif not (lium.pck_cert_count.readable | bool) %}
+      The PCK certificate count could not be read ({{ lium.pck_cert_count.reason }}).
+      Registration flips an efivar irreversibly, so it never runs off an unknown.
+      {% else %}
+      This platform already has {{ lium.pck_cert_count.value }} PCK certificate(s).
+      {% endif %}
+  when: >-
+    lium_intel_api_key | length == 0
+    or not (lium.pck_cert_count.readable | bool)
+    or (lium.pck_cert_count.value | int) > 0
+
+- name: Plumb TD quote generation
+  ansible.builtin.include_tasks: quote_plumbing.yml
+  when: lium_sgx_install | bool
+
+- name: Start the sealing-key provider
+  ansible.builtin.include_tasks: container.yml
+  when: lium_start_key_provider | bool

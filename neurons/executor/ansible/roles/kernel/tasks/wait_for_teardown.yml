@@ -1,0 +1,209 @@
+---
+# The last thing between this playbook and a wedged host.
+#
+# WHAT WENT WRONG, ONCE, ON A PRODUCTION HOST
+# -------------------------------------------
+# A 1.5 TB TDX guest was sent SIGTERM. Tearing a TD down reclaims its private
+# pages one at a time through SEAMCALLs — about 82 million of them for the 313 GB
+# that guest had resident — and unmaps DMA for twelve VFIO devices. Eight and a
+# half minutes in, with the teardown still grinding, the host was rebooted to
+# "clear" the leftover zombie.
+#
+# Shutdown started: sshd died. Then nothing. The old kernel stayed alive on the
+# network for over fourteen minutes — ping answered, port 22 completed the TCP
+# handshake and never sent a banner — and platform reset never arrived. It took
+# a datacentre power-cycle. The same kernel and the same grub.cfg then booted
+# cleanly in forty seconds, so nothing was wrong with the host: the reboot asked
+# the running kernel to finish the very teardown it would then be blocked
+# behind, and to shut down the same GPUs that teardown was still unmapping.
+#
+# WHY A GATE AND NOT A WARNING
+# ----------------------------
+# The guard in assert_no_cvm.yml already blocks non-CLEAN states — but it is
+# waivable, by design, with `-e lium_force_reboot=true`. That variable exists to
+# authorise ONE specific kind of damage: destroying an encrypted data disk whose
+# rentals have been drained. It was never meant to authorise wedging the host,
+# and the two are not the same decision. Destroying a drained disk is a trade
+# somebody can rationally make. Wedging the host trades nothing for an outage
+# and a support ticket; there is no state of the world in which it is what the
+# operator wanted.
+#
+# So this gate sits BELOW the waiver, runs FRESH immediately before the reboot
+# rather than off the play-1 guard snapshot, and has no override of its own. The
+# only knob is how long it waits.
+#
+# WHY NO OVERRIDE
+# ---------------
+# Any `-e lium_reboot_anyway=true` would be reached by exactly the person this
+# gate exists to stop: someone in a hurry, staring at a host that will not go
+# CLEAN, who has just been told a reboot would fix it. That is the ar6 incident
+# with one extra step. When waiting genuinely is not an option the correct
+# action is an OUT-OF-BAND power-cycle, which needs nothing from the old kernel
+# and cold-resets the GPUs — and which Ansible cannot and should not perform.
+
+- name: Look for a QEMU that this reboot would have to tear down
+  ansible.builtin.command:
+    cmd: "{{ lium_common_files }}/lium-guard.sh --qemu-procs"
+  environment:
+    LIUM_PROC_ROOT: "{{ lium_proc_root }}"
+  register: lium_teardown_probe
+  # The exit status is the process count, so a non-zero exit is the normal
+  # "something is still running" answer, not an error.
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+# THE PROBE MUST PROVE IT RAN.
+#
+# Without this the gate fails OPEN, which is the one direction it must never
+# fail. `failed_when: false` turns every error into a silent success, and the
+# classification below reads only stdout — so a probe that died (missing or
+# non-executable script, a wrong lium_common_files, a fork that failed under the
+# memory pressure a 1.5 TB teardown itself creates) yields empty stdout, both
+# lists come back empty, all three refusals are skipped by their `length > 0`
+# conditions, and reboot.yml walks straight into the reboot this file exists to
+# stop.
+#
+# The check needs no new script contract: `--qemu-procs` exits with the number of
+# lines it printed, capped at 250. So rc == line count is a self-proving
+# invariant, and any bash or usage error (1, 2, 64, 126, 127) breaks it against a
+# stdout that is empty. The `>= 250` arm keeps the cap from reading as a failure.
+- name: The teardown probe must have actually run
+  ansible.builtin.fail:
+    msg: |
+      REFUSING to reboot: the pre-reboot QEMU probe did not run correctly, so
+      whether a TDX guest is still on this host is UNKNOWN.
+
+      command  : {{ lium_common_files }}/lium-guard.sh --qemu-procs
+      exit code : {{ lium_teardown_probe.rc | default('none') }}
+      stdout lines : {{ lium_teardown_probe.stdout_lines | default([]) | length }}
+      stderr   : {{ lium_teardown_probe.stderr | default('') | trim }}
+
+      This gate fails CLOSED on purpose. Rebooting on an unanswered question is
+      what wedges a host: the kernel would have to finish a teardown it cannot
+      see before it could shut down, and the failure looks like a host that
+      answers ping and accepts TCP on port 22 while never sending an SSH banner.
+
+      Run the probe by hand to see what it says, then re-run:
+
+          sudo {{ lium_common_files }}/lium-guard.sh --qemu-procs; echo "rc=$?"
+  when: >-
+    (lium_teardown_probe.rc | default(-1) | int) != (lium_teardown_probe.stdout_lines | default([]) | length)
+    and not ((lium_teardown_probe.rc | default(-1) | int) == 250
+             and (lium_teardown_probe.stdout_lines | default([]) | length) >= 250)
+
+# Split on the process state, because the two cases need opposite handling and
+# conflating them wastes an hour. A zombie is a teardown in flight: it finishes
+# on its own, so waiting works. A live QEMU is a running guest: it will never
+# exit by itself, so polling it for ninety minutes achieves nothing and the
+# operator needs to hear that immediately.
+- name: Classify what is still running
+  ansible.builtin.set_fact:
+    lium_reboot_live_qemu: "{{ lium_teardown_probe.stdout_lines | select('match', '^[0-9]+ [^Z]') | list }}"
+    lium_reboot_dying_qemu: "{{ lium_teardown_probe.stdout_lines | select('match', '^[0-9]+ Z') | list }}"
+
+- name: Refuse to reboot out from under a running guest
+  ansible.builtin.fail:
+    msg: |
+      REFUSING to reboot: a qemu-system process is still RUNNING on this host.
+
+      Still running (pid, state, threads, cpu ticks):
+      {{ lium_reboot_live_qemu | join('
+      ') }}
+
+      Rebooting now kills that guest the hard way. Worse, shutdown sends it
+      SIGTERM and then waits for the same TDX teardown this playbook refuses to
+      reboot into — which is how a host ends up wedged with its network still
+      answering and needing a datacentre power-cycle.
+
+      Stop it cleanly first, then re-run:
+
+          sudo ./lium-cvm.sh stop <name>
+
+      If it is not ours, it is a tenant's bare-metal rental. Drain the rental
+      before converging anything that needs a reboot.
+  when: lium_reboot_live_qemu | length > 0
+
+- name: Report the teardown this reboot is waiting on
+  ansible.builtin.debug:
+    msg: |
+      A TDX guest teardown is in flight. Waiting for it to finish before
+      rebooting — up to {{ (lium_reboot_drain_timeout_sec | int) // 60 }}m{{
+      (lium_reboot_drain_timeout_sec | int) % 60 }}s, polling every
+      {{ lium_reboot_drain_poll_sec }}s.
+
+      Tearing down (pid, state, threads, cpu ticks):
+      {{ lium_reboot_dying_qemu | join('
+      ') }}
+
+      This is a wait, not a hang. Memory is handed back in steps, one per
+      memory-backend-ram object, so free(1) sits flat for long stretches and
+      then jumps. Roughly 100 cpu ticks per second is one core of page reclaim.
+  when: lium_reboot_dying_qemu | length > 0
+
+# `until` re-runs the command, so each poll is a fresh read of /proc rather than
+# a re-test of a stale register. retries is floored at 1: a timeout smaller than
+# the poll interval would otherwise compute to 0 retries and silently degrade
+# this into a single-shot check that always fails.
+- name: Wait for the teardown to drain
+  ansible.builtin.command:
+    cmd: "{{ lium_common_files }}/lium-guard.sh --qemu-procs"
+  environment:
+    LIUM_PROC_ROOT: "{{ lium_proc_root }}"
+  register: lium_teardown_drain
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  # rc AND stdout, not stdout alone. Empty stdout on its own also describes a
+  # probe that CRASHED, and treating that as "the teardown finished" ends the
+  # wait early and reboots into a live teardown — the same fail-open the task
+  # above closes, reached through a transient failure instead of a permanent
+  # one. A successful probe on a drained host exits 0 with no output, so
+  # requiring both costs nothing and is only satisfiable by a real answer.
+  until:
+    - (lium_teardown_drain.rc | int) == 0
+    - (lium_teardown_drain.stdout | trim) == ''
+  retries: "{{ [1, ((lium_reboot_drain_timeout_sec | int) // (lium_reboot_drain_poll_sec | int))] | max }}"
+  delay: "{{ lium_reboot_drain_poll_sec | int }}"
+  when: lium_reboot_dying_qemu | length > 0
+
+# Reached only when the teardown outlasted the budget. Do NOT turn this into a
+# warning that proceeds: proceeding is the failure mode.
+- name: Refuse to reboot into an unfinished teardown
+  ansible.builtin.fail:
+    msg: |
+      REFUSING to reboot: a TDX guest teardown has not finished after
+      {{ (lium_reboot_drain_timeout_sec | int) // 60 }}m{{ (lium_reboot_drain_timeout_sec | int) % 60 }}s.
+
+      Still tearing down (pid, state, threads, cpu ticks):
+      {{ lium_teardown_drain.stdout_lines | join('
+      ') }}
+
+      Do NOT reboot this host from inside. That is what wedges it: the kernel
+      would have to finish this teardown before it could shut down, and the
+      failure looks like a host that answers ping and accepts TCP on port 22
+      while never sending an SSH banner. Recovery is a datacentre power-cycle.
+
+      Check whether it is still making progress — cpu ticks climbing by roughly
+      100 per second is one full core of page reclaim:
+
+          watch -n5 {{ lium_common_files }}/lium-guard.sh --qemu-procs
+
+      If the ticks are still climbing it is working and simply needs longer.
+      Raise the budget and re-run:
+
+          sudo ./bootstrap.sh -e lium_reboot_drain_timeout_sec=10800
+
+      If the ticks have been static for many minutes, the teardown really is
+      stuck. Ask the datacentre for an OUT-OF-BAND power-cycle: it needs nothing
+      from the running kernel and cold-resets the GPUs. There is deliberately no
+      variable in this playbook that reboots past this point.
+  # The negation of the `until` above, not just "stdout is non-empty". Gated on
+  # stdout alone this refusal is SKIPPED when the poll ended because the probe
+  # kept crashing — empty stdout, non-zero rc — and the run then falls through to
+  # the reboot having never established that the host is clear.
+  when:
+    - lium_reboot_dying_qemu | length > 0
+    - >-
+      (lium_teardown_drain.rc | default(-1) | int) != 0
+      or (lium_teardown_drain.stdout | default('') | trim) != ''

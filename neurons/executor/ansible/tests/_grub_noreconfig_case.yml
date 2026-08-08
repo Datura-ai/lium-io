@@ -1,0 +1,65 @@
+---
+# The pre-reboot assertion must FAIL when grub.cfg cannot be read at all.
+#
+# This is pre-mortem #1 variant B: /boot is full, update-grub writes nothing, no
+# linux line can be parsed. The assertion once carried `when: grubcfg_present`,
+# so in exactly that case it was SKIPPED — while drift was still non-empty, so
+# the role went on to offer a reboot into a configuration nobody had verified.
+#
+# update-grub is replaced with /bin/true, which is a faithful stand-in: it
+# succeeds and writes nothing, which is what a full /boot looks like.
+
+- name: Create the no-reconfigure work tree
+  ansible.builtin.file:
+    path: "{{ grub_root }}/noreconfig/etc/default/grub.d"
+    state: directory
+    mode: "0755"
+
+- name: Copy a fixture in
+  ansible.builtin.copy:
+    src: fixtures/grub/default_only/etc/default/grub
+    dest: "{{ grub_root }}/noreconfig/etc/default/grub"
+    mode: "0644"
+
+- name: Run the kernel role with an update-grub that writes nothing
+  block:
+    - name: Converge against a bootloader that never regenerates
+      ansible.builtin.include_role:
+        name: kernel
+      vars:
+        lium_kernel_fixture_mode: true
+        lium_kernel_reboot_enabled: false
+        lium_grub_default_path: "{{ grub_root }}/noreconfig/etc/default/grub"
+        lium_grub_dropin_path: "{{ grub_root }}/noreconfig/etc/default/grub.d/99-lium-cvm.cfg"
+        lium_grubcfg_path: "{{ grub_root }}/noreconfig/boot/grub/grub.cfg"
+        lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/cmdline_missing_tdx"
+        lium_modprobe_conf_path: "{{ grub_root }}/noreconfig/etc/modprobe.d/vfio-dma.conf"
+        lium_modules_load_path: "{{ grub_root }}/noreconfig/etc/modules-load.d/vfio.conf"
+        lium_update_grub_cmd: /bin/true
+
+    - name: Record that the role did NOT refuse
+      ansible.builtin.set_fact:
+        noreconfig_refused: false
+        noreconfig_msg: ""
+  rescue:
+    - name: Record the refusal
+      ansible.builtin.set_fact:
+        noreconfig_refused: true
+        noreconfig_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: An unreadable grub.cfg must stop the run before any reboot is offered
+  ansible.builtin.assert:
+    that:
+      - noreconfig_refused | bool
+      - "'Refusing to reboot into it' in noreconfig_msg"
+    fail_msg: >-
+      update-grub wrote nothing, so the generated bootloader configuration could
+      not be read — and the role did not refuse. That is the fail-open path: drift
+      is still non-empty, so the next thing it does is offer a reboot into a
+      configuration nothing verified. refused={{ noreconfig_refused }}
+      msg={{ noreconfig_msg }}
+    quiet: true
+
+- name: PASS no-reconfigure
+  ansible.builtin.debug:
+    msg: "PASS noreconfig — an unreadable grub.cfg refuses instead of rebooting"

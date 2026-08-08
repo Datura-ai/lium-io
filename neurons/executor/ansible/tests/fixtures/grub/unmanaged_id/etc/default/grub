@@ -1,0 +1,17 @@
+# Fixture: the provider also passes a non-GPU device through vfio-pci — here an
+# SR-IOV NIC (15b3:1017, Mellanox). Normal on a virtualization host, and nothing
+# this playbook manages: 15b3:1017 is not in lium_cc_gpu_pci_ids or
+# lium_nvswitch_pci_ids, so it can never appear in present_pci_ids and can never
+# be verified against lspci.
+#
+# The managed ids are also written in UPPER CASE here, deliberately. vfio-pci
+# parses them with %x, so `10DE:2335` is a working configuration a provider can
+# and does type — and an exact-string comparison reads every one of them as an
+# id that vanished, refusing on a host where nothing is wrong at all.
+#
+# It is NOT a narrowing. The role must converge, and must carry the id into the
+# list it writes — `vfio-pci.ids=` is a module parameter whose last occurrence
+# wins, so a drop-in listing only the ids we discovered would unbind the NIC.
+GRUB_DEFAULT=0
+GRUB_CMDLINE_LINUX="kvm_intel.tdx=on vfio-pci.ids=10DE:2335,10DE:22A3,15b3:1017"
+GRUB_CMDLINE_LINUX_DEFAULT="intel_iommu=on iommu=pt nohibernate"

@@ -1,0 +1,7 @@
+---
+lium_docker_arch: amd64
+
+# The human who invoked sudo, so they can run docker without it afterwards.
+# Empty when the playbook was started as root directly, in which case there is
+# nobody to add.
+lium_docker_user: "{{ lookup('env', 'SUDO_USER') | default('', true) }}"

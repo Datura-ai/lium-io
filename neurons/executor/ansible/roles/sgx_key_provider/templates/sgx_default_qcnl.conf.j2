@@ -1,0 +1,70 @@
+{#
+  DAH-2544 — the system QPL (Quote Provider Library) configuration.
+
+  THE WHOLE FILE, NOT TWO EDITED LINES.
+
+  This was two `lineinfile` tasks, and they corrupted Intel's shipped config
+  into something the QPL could not parse. Intel writes the file in
+  LEADING-COMMA style — the first key is bare, every later key is prefixed
+  with a comma:
+
+      {
+        "pccs_url": "https://localhost:8081/sgx/certification/v4/"
+        ,"use_secure_cert": true
+        ,"retry_times": 6
+      }
+
+  Against that file:
+
+  - `regexp: '^\s*"use_secure_cert"\s*:'` never matched `,"use_secure_cert"`,
+    because of the leading comma. lineinfile's documented behaviour when a
+    regexp matches nothing is to APPEND, so the line landed after the closing
+    brace and the file stopped being JSON.
+  - `"pccs_url"` did match, and was replaced with a version carrying a TRAILING
+    comma — which, followed by the next key's LEADING comma, produced a double
+    comma.
+
+  Either one alone is fatal, and the failure is silent on the host: it surfaces
+  three layers away as a CVM that reboots at about 160 seconds. The QPL cannot
+  read its config, quote generation returns a DCAP error, the sealing-key
+  provider refuses the guest, and dstack-prepare cannot unseal the data disk —
+  while the converge reports 0 MUST_FIX. Observed on au11.
+
+  Writing the file removes the class of defect rather than the instance: no
+  regexp to fail to match, no house style to guess.
+
+  THE TWO VALUES THAT MATTER
+
+  use_secure_cert — a local PCCS serves a SELF-SIGNED certificate. Left at
+  Intel's shipped `true`, the QCNL fails with
+  `CURL error: (60) SSL peer certificate ... was not OK`, then
+  `[QPL] Failed to get quote config. Error code is 0xb033`.
+
+  local_cache_only — false, so the QPL may fetch from the PCCS. true would
+  require an administrator to pre-populate the cache by hand on every platform.
+
+  THREE CONSTRAINTS ON THIS TEMPLATE ITSELF
+
+  No `ansible_managed` banner. The output must be strict JSON, JSON has no
+  comment syntax, and the task that writes this validates with `json.load`, so
+  a banner fails the converge. Intel's own copy uses `//` comments, which their
+  parser tolerates and `json.load` does not.
+
+  No Jinja comments below this block. Ansible renders templates with
+  trim_blocks on, which eats the newline after a closing comment tag, so an
+  inline comment silently joins the next key onto the previous line.
+
+  Nothing in this block may contain a closing comment tag, even inside prose or
+  a code sample: it ends the comment early and every remaining line is written
+  into the file. That is why the sequence is described in words above rather
+  than shown.
+#}
+{
+  "pccs_url": "{{ lium_pccs_url }}",
+  "use_secure_cert": {{ lium_qcnl_use_secure_cert | bool | lower }},
+  "retry_times": {{ lium_qcnl_retry_times }},
+  "retry_delay": {{ lium_qcnl_retry_delay }},
+  "pck_cache_expire_hours": {{ lium_qcnl_pck_cache_expire_hours }},
+  "verify_collateral_cache_expire_hours": {{ lium_qcnl_collateral_cache_expire_hours }},
+  "local_cache_only": false
+}
