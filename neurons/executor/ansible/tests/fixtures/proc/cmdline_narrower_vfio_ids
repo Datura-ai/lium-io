@@ -1,0 +1,1 @@
+BOOT_IMAGE=/vmlinuz root=/dev/sda1 ro quiet kvm_intel.tdx=on intel_iommu=on iommu=pt nohibernate vfio-pci.ids=10de:2335 vfio_iommu_type1.dma_entry_limit=16777216

@@ -85,3 +85,276 @@ jobs:
 
       - name: Run tests
         run: mkdir -p tmp && pdm run pytest tests/ -v --tb=short
+
+  # ---------------------------------------------------------------------------
+  # DAH-2544 — CVM host provisioning playbook.
+  #
+  # No `paths:` entry is added: the workflow's existing `neurons/executor/**`
+  # already matches neurons/executor/ansible/**.
+  #
+  # TWO JOBS, because they can prove different things:
+  #
+  #   ansible               ubuntu-24.04, an UNSUPPORTED release for this
+  #                         playbook. OS-agnostic tests only.
+  #
+  #   ansible-supported-os  a ubuntu:26.04 container — a genuinely supported
+  #                         release with no TDX, no SGX, no NVIDIA and no GRUB.
+  #                         The only place the OS-gated paths can fire for the
+  #                         right reason.
+  #
+  # Nowhere in either job is there a `|| true` or a `!`-inverted assertion.
+  # Under GitHub Actions' default `bash -e {0}` shell, POSIX says `set -e` is
+  # ignored for a command preceded by `!`, so `! grep -q ...` is silently inert.
+  # Every negative assertion below is an explicit `if ...; then exit 1; fi`.
+  # ---------------------------------------------------------------------------
+  ansible:
+    name: Ansible (lint, fixtures, shell units)
+    # Pinned, not ubuntu-latest. A future promotion of `latest` to 26.04 would
+    # silently invert the runner/container distinction these two jobs rest on.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: neurons/executor/ansible
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned tooling
+        run: pip install -r tests/requirements.txt
+
+      - name: Lint
+        run: ansible-lint
+
+      - name: Syntax check
+        run: ansible-playbook --syntax-check -i inventory/localhost.yml site.yml
+
+      - name: Render templated shell scripts
+        env:
+          ANSIBLE_LIUM_TEST: '1'
+        run: ansible-playbook -i inventory/localhost.yml tests/render_scripts.yml
+
+      # nullglob so an unmatched glob does not red the job for the wrong reason,
+      # and a minimum count so an empty match set cannot pass silently.
+      - name: Shellcheck every shell file, including the rendered templates
+        run: |
+          shopt -s nullglob
+          files=(bootstrap.sh roles/*/files/*.sh tests/*.sh /tmp/lium-rendered/*.sh)
+          if [ "${#files[@]}" -lt 5 ]; then
+            echo "FAIL: expected at least 5 shell files to check, found ${#files[@]}: ${files[*]}"
+            exit 1
+          fi
+          shellcheck "${files[@]}"
+
+      - name: Forbidden and required strings
+        run: bash tests/test_forbidden_strings.sh
+
+      - name: Test seams are unreachable in production
+        run: bash tests/test_seam_gate.sh
+
+      - name: Kernel command-line resolution
+        run: bash tests/test_cmdline_resolution.sh
+
+      - name: Destructive-action guard
+        run: bash tests/test_guard.sh
+
+      # Asserts that every `bootstrap.sh -e <var>=<value>` this tree prints at an
+      # operator is a command bootstrap.sh actually accepts. Two of them were
+      # rejected with exit 64 and a usage dump.
+      - name: Bootstrap accepts the flags the tree recommends
+        run: bash tests/test_bootstrap_args.sh
+
+      # Ordering invariants that are silent when broken: every task present and
+      # individually correct, only the sequence wrong. Both cases it guards were
+      # found by running the playbook on real hardware, not by any check here.
+      - name: Task ordering invariants
+        run: bash tests/test_task_ordering.sh
+
+      # Repeated deliberately. The defect it guards is a race, so a single run
+      # of the collector passed while roughly a quarter of runs on real hardware
+      # derived the wrong vfio-pci.ids= value.
+      - name: Fact collector is deterministic
+        run: bash tests/test_facts_determinism.sh
+
+      - name: Reboot resume guard
+        run: bash tests/test_resume_guard.sh
+
+      - name: Verify report schema, README and golden example agree
+        run: bash tests/test_verify_schema.sh
+
+      - name: Docs were edited as claimed
+        run: bash tests/test_docs_pointer.sh
+
+      - name: Golden verify report validates
+        run: >-
+          check-jsonschema --schemafile schemas/verify-report.schema.json
+          tests/fixtures/verify-report.example.json
+
+      # The job-level env below is only HALF the seam gate. Each playbook
+      # additionally sets `lium_test_mode: true` in its own `vars:`; a test that
+      # sets only one of the two fails closed, which is correct.
+      - name: Fixture playbooks
+        env:
+          ANSIBLE_LIUM_TEST: '1'
+        run: |
+          ansible-playbook -i inventory/localhost.yml tests/test_command_vars.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_grub_fixtures.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_kernel_idempotence.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_sgx_registration.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_stubs.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_repo_app_pristine.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_reboot_teardown_gate.yml
+
+      # The maintenance profile must REACH verify on a host that has a CVM.
+      # Asserts positively on reaching verify: an abort in the guard pre_tasks
+      # and a correct run are both non-zero here, and only the report tells them
+      # apart. Without this the whole `destructive`-tag design is prose.
+      - name: Maintenance profile routes rather than aborts
+        env:
+          ANSIBLE_LIUM_TEST: '1'
+        run: ansible-playbook -i inventory/localhost.yml tests/test_maintenance_profile.yml
+
+  ansible-supported-os:
+    name: Ansible (supported-OS integration)
+    # Pinned for the same reason as above. The CONTAINER is what supplies the
+    # supported OS; the runner only hosts it.
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: neurons/executor/ansible
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # CI installs ONLY what CI itself needs. ansible-core is deliberately
+      # ABSENT — proving bootstrap.sh installs it is the point of this job.
+      # pciutils and iproute2 are here so a failed GPU check means "no device"
+      # rather than "no lspci": conflating those would let a missing tool
+      # masquerade as missing hardware and pass for the wrong reason.
+      - name: Install only what CI needs
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq sudo python3 python3-pip git curl ca-certificates pciutils iproute2
+
+      - name: Install the schema validator
+        run: pip install --break-system-packages check-jsonschema
+
+      - name: ansible-core must NOT be present yet
+        run: |
+          if command -v ansible-playbook >/dev/null 2>&1; then
+            echo "FAIL: ansible-playbook is present before bootstrap.sh ran;"
+            echo "      the install step this job exists to prove would be a no-op."
+            exit 1
+          fi
+
+      # The state directories must be ABSENT before anything runs, so the
+      # assertion further down proves the BOOTSTRAP RUN created them — and not
+      # the --print query, which is specified as a pure query that creates
+      # nothing. This asserts that contract rather than assuming it.
+      - name: The state directories must not exist yet
+        run: |
+          for d in /var/lib/lium-cvm /var/log/lium-cvm; do
+            if [ -e "$d" ]; then
+              echo "FAIL: $d already exists before the run — the assertion below"
+              echo "      would then be self-satisfying."
+              exit 1
+            fi
+          done
+
+      # The expected exit code comes FROM the script, so the two cannot drift.
+      # A constant assigned inside bootstrap.sh would never reach this step's
+      # environment; a flag does.
+      - name: Bootstrap end to end, expecting a preflight refusal
+        run: |
+          set -o pipefail
+          EXPECTED="$(./bootstrap.sh --print-expected-preflight-rc)"
+          rc=0
+          ./bootstrap.sh --no-clone --yes 2>&1 | tee /tmp/bs.log || rc=$?
+          if [ "$rc" -ne "$EXPECTED" ]; then
+            echo "FAIL: expected exit code $EXPECTED, got $rc"
+            exit 1
+          fi
+          grep -q 'BIOS: enable Intel TDX' /tmp/bs.log
+          grep -q 'BIOS: enable Intel SGX' /tmp/bs.log
+          grep -q 'BIOS: enable VT-d'      /tmp/bs.log
+          grep -q 'Searched PCI ids'       /tmp/bs.log
+          grep -q 'does not boot via GRUB' /tmp/bs.log
+          # The one assertion proving this job is not a false positive. If the
+          # OS gate fired, every BIOS assertion above it never executed.
+          if grep -q 'os.supported' /tmp/bs.log; then
+            echo "FAIL: preflight rejected the OS. This job must run on a SUPPORTED"
+            echo "      release, otherwise the BIOS-knob assertions above never run."
+            exit 1
+          fi
+
+      # Positive branch first, so there is no `!` even inside an if condition.
+      - name: ansible-core must be present now, installed by the bootstrap itself
+        run: |
+          if command -v ansible-playbook >/dev/null 2>&1; then
+            ansible-playbook --version | head -1
+          else
+            echo "FAIL: bootstrap.sh did not install ansible-core"
+            exit 1
+          fi
+
+      - name: The bootstrap created its own state and log directories
+        run: |
+          for d in /var/lib/lium-cvm /var/log/lium-cvm; do
+            if [ ! -d "$d" ]; then
+              echo "FAIL: $d was not created before it was used"
+              exit 1
+            fi
+          done
+
+      - name: Preflight names every missing BIOS knob
+        env:
+          ANSIBLE_LIUM_TEST: '1'
+        run: ansible-playbook -i inventory/localhost.yml tests/test_preflight_messages.yml
+
+      # Deliberately the same scripts the job above already runs, and NOT
+      # redundant: a bare container leaves LANG unset, so grep falls back to
+      # byte semantics. A `.` wildcard standing in for a multi-byte character
+      # then matches on every developer machine and on the runner, and fails
+      # only here — an assertion whose answer comes from the environment rather
+      # than from the file it checks. That shipped once and this step is what
+      # found it.
+      #
+      # Only the pure-shell tests. The fixture playbooks are left to the job
+      # above: ansible-core refuses to start without a UTF-8 locale, so running
+      # them here would prove nothing this step does not already prove.
+      - name: Shell units again, in the container's own locale
+        run: |
+          for t in test_forbidden_strings test_seam_gate test_guard \
+                   test_resume_guard test_verify_schema test_docs_pointer \
+                   test_cmdline_resolution test_bootstrap_args \
+                   test_task_ordering; do
+            bash "tests/$t.sh"
+          done
+
+      # Reaches `common` (tags: always) plus `verify`, and nothing else — which
+      # works precisely BECAUSE preflight is not `tags: always`. With `always`
+      # it would hard-fail here by design and abort the play before verify ever
+      # emitted a report.
+      - name: Verify emits a schema-valid report and exits non-zero
+        run: |
+          set -o pipefail
+          rc=0
+          ansible-playbook -i inventory/localhost.yml site.yml --tags verify 2>&1 \
+            | tee /tmp/verify.log || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: verify exited 0 on a host where nearly every check is MUST_FIX"
+            exit 1
+          fi
+          check-jsonschema --schemafile schemas/verify-report.schema.json \
+            /var/lib/lium-cvm/verify-report.json

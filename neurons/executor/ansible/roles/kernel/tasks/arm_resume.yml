@@ -1,0 +1,48 @@
+---
+# Arm the one-shot continuation.
+#
+# tmux does not survive a reboot, and neither does a transient `systemd-run`
+# unit — its fragment lives on tmpfs. A permanent unit in /etc/systemd/system is
+# the only thing that does.
+
+- name: Ensure the helper directory exists
+  ansible.builtin.file:
+    path: "{{ lium_helper_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Install the resume scripts
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ lium_helper_dir }}/{{ item }}"
+    mode: "0755"
+  loop:
+    - lium-resume-guard.sh
+    - lium-resume.sh
+
+- name: Install the resume unit
+  ansible.builtin.template:
+    src: lium-cvm-resume.service.j2
+    dest: /etc/systemd/system/lium-cvm-resume.service
+    mode: "0644"
+
+# Written LAST, because the unit's ConditionPathExists points at it: the unit
+# cannot fire before everything it needs is in place.
+- name: Arm the resume state
+  ansible.builtin.copy:
+    dest: "{{ lium_state_dir }}/resume.state"
+    mode: "0600"
+    content: |
+      {
+        "armed_boot_id": "{{ lium.boot_id.value }}",
+        "armed_at": "{{ ansible_date_time.iso8601 | default('unknown') }}",
+        "attempts": 0,
+        "playbook_args": "{{ lium_resume_playbook_args }}",
+        "bootstrap_path": "{{ lium_bootstrap_path }}"
+      }
+
+- name: Enable the resume unit
+  ansible.builtin.systemd_service:
+    name: lium-cvm-resume.service
+    enabled: true
+    daemon_reload: true

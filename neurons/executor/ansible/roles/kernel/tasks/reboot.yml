@@ -1,0 +1,141 @@
+---
+# The reboot, and the budget that stops it looping.
+#
+# THE BUDGET IS SESSION-SCOPED, NOT LIFETIME-SCOPED.
+#
+# "Exactly once per arming" and "bounded across converges" are different
+# properties. The resume unit gives the first; this counter gives the second.
+# If /boot is full, update-grub writes nothing, /proc/cmdline never gains the
+# tokens, drift is detected on every converge, and the host reboots forever —
+# with "exactly once per arming" satisfied every single time.
+#
+# But it must reset on a clean converge, and `verify` owns that reset. A
+# lifetime counter would brick a HEALTHY host: this role's own superset rule
+# guarantees legitimate changes (add a GPU -> vfio-pci.ids= changes -> drift ->
+# reboot), so two legitimate GRUB changes would exhaust it and a third would be
+# refused forever behind an obscure escape variable.
+#
+# Loop protection is fully preserved, because a genuine loop never reaches a
+# clean verify.
+
+- name: Clear the reboot budget on request
+  ansible.builtin.copy:
+    dest: "{{ lium_state_dir }}/converge_reboots"
+    content: "0\n"
+    mode: "0644"
+  when: lium_reset_reboot_budget | bool
+
+- name: Read the reboot budget
+  ansible.builtin.slurp:
+    src: "{{ lium_state_dir }}/converge_reboots"
+  register: lium_budget_raw
+  failed_when: false
+  changed_when: false
+
+- name: Interpret the reboot budget
+  ansible.builtin.set_fact:
+    lium_converge_reboots: >-
+      {{ (lium_budget_raw.content | default('') | b64decode | trim | int)
+         if (lium_budget_raw.content is defined) else 0 }}
+
+# Warn and continue rather than hard-fail: reaching `verify` means the provider
+# gets a report naming the tokens that never took, instead of a stack trace and
+# no report. Loop protection is unaffected — verify's reset predicate is false
+# either way, so the counter stays at the cap.
+- name: Refuse to reboot again, and say what to do by hand
+  ansible.builtin.debug:
+    msg: |
+      REFUSING to reboot: this converge has already spent
+      {{ lium_converge_reboots }} of {{ lium_max_converge_reboots }} reboots and the
+      kernel command line still has not taken.
+
+      Still missing from the running kernel : {{ lium_kernel_drift | join(', ') }}
+      Generated grub.cfg linux line         : {{ lium_cmdline.grubcfg_linux_line }}
+
+      Rebooting again would loop. Check by hand, in this order:
+        1. Is /boot full?            df -h /boot
+        2. Does this host boot GRUB?  ls -l /boot/grub/grub.cfg
+        3. Run it manually:           sudo update-grub && sudo reboot
+      Then re-run. To clear the counter deliberately:
+           sudo ./bootstrap.sh -e lium_reset_reboot_budget=true
+
+      The run continues so that `verify` still produces a report.
+  when: (lium_converge_reboots | int) >= (lium_max_converge_reboots | int)
+
+- name: Stop here when the reboot budget is exhausted
+  ansible.builtin.meta: end_play
+  when: (lium_converge_reboots | int) >= (lium_max_converge_reboots | int)
+
+# BEFORE the confirmation and before the budget is spent. Fail-fast on a running
+# guest costs the operator nothing, and a run that is going to end_play on an
+# exhausted budget should not first wait an hour for a teardown it will not use.
+- name: Refuse to reboot into a live or draining TDX guest
+  ansible.builtin.include_tasks: wait_for_teardown.yml
+
+- name: Confirm the reboot with the operator
+  ansible.builtin.pause:
+    prompt: |
+      The kernel command line has changed and this host must reboot to pick it up.
+
+      Missing from the running kernel: {{ lium_kernel_drift | join(', ') }}
+
+      A one-shot systemd unit will continue the run automatically after the
+      reboot, exactly once, and then disable itself.
+
+      Press RETURN to reboot now, or Ctrl-C to stop.
+  when: not (lium_assume_yes | bool)
+
+# Incremented BEFORE arming, so a crash between here and the reboot still costs
+# a reboot from the budget. Under-counting is the dangerous direction.
+- name: Spend one reboot from the budget
+  ansible.builtin.copy:
+    dest: "{{ lium_state_dir }}/converge_reboots"
+    content: "{{ (lium_converge_reboots | int) + 1 }}\n"
+    mode: "0644"
+
+- name: Arm the post-reboot continuation
+  ansible.builtin.include_tasks: arm_resume.yml
+
+# A DETACHED TIMER, then a deliberate hold. Not ansible.builtin.reboot — that
+# module refuses a local connection, and this tree is localhost-only, so it
+# failed 100% of the time on the one path it existed for. See
+# group_vars/all/commands.yml.
+#
+# The hold is what stops the REST of site.yml running in the seconds before the
+# host goes down. Without it the play ends here and Ansible walks straight into
+# the gpu play — which flips CC mode on eight GPUs and rebinds them — and the
+# shutdown kills it partway through. Everything after this point is redone by
+# lium-cvm-resume.service after the boot anyway, so there is nothing to gain by
+# starting it and a wedged GPU to lose.
+- name: Schedule the reboot
+  ansible.builtin.command:
+    cmd: "{{ lium_reboot_cmd }}"
+  changed_when: true
+
+- name: Hold the run while the host goes down
+  ansible.builtin.wait_for:
+    timeout: "{{ lium_reboot_shutdown_grace_sec | int }}"
+
+# Reached only if the host was still up long after the timer should have fired,
+# which means the reboot never happened. Silence here would let the run carry on
+# into the gpu play believing the new kernel command line is active when it is
+# not, and the resume unit stays armed for a reboot nobody scheduled.
+- name: The scheduled reboot never happened
+  ansible.builtin.fail:
+    msg: |
+      The host is still running {{ lium_reboot_shutdown_grace_sec }}s after a
+      reboot was scheduled for {{ lium_reboot_delay_sec }}s from now.
+
+      Check the timer and the unit it was supposed to start:
+
+          systemctl status {{ lium_reboot_systemd_unit }}.timer
+          systemctl status {{ lium_reboot_systemd_unit }}.service
+          journalctl -u {{ lium_reboot_systemd_unit }}
+
+      lium-cvm-resume.service is armed and will continue the converge on the
+      next boot, so the safe manual step is a reboot:
+
+          sudo systemctl reboot
+
+      Do NOT do that if a CVM is running or tearing down — see
+      roles/kernel/tasks/wait_for_teardown.yml.

@@ -1,96 +1,81 @@
 # CVM host setup — dstack-nvidia-0.5.11
 
-Provider guide for taking a TDX host from bare metal to an attested Lium CVM executor. The quick start in [../README.md](../README.md) assumes the host is already prepared; this document covers that preparation. Almost everything here is **one-time per host** — the per-executor work is one `.env` file and two `lium-cvm.sh` commands.
+Provider guide for taking a TDX host from bare metal to an attested Lium CVM executor. The quick start in [../README.md](../README.md) assumes the host is already prepared; this document covers that preparation. Almost everything here is **one-time per host**, and §1–4 is now a single command — the per-executor work is one `.env` file and two `lium-cvm.sh` commands.
 
 | Phase | Frequency | Hands-on time |
 |---|---|---|
-| §1–§4 host bring-up (BIOS, kernel, QEMU, key provider) | once per host | ~1–2 h (dominated by BIOS + QEMU build) |
+| §1–4 host bring-up — one command | once per host | ~1–2 h, mostly unattended (BIOS by hand, then the QEMU build) |
 | §5 executor deployment | once per executor | ~15 min |
 | §6 upgrades | per release | ~10 min |
 
-## 1. Hardware and firmware
+## 1–4. Host bring-up — automated
 
-- **CPU**: Intel Xeon with TDX **and** SGX — Sapphire Rapids (XCC/MCC SKUs only), Emerald Rapids, or Granite Rapids. SGX is not optional: the sealing-key provider runs in an SGX enclave.
-- **GPU**: NVIDIA Confidential-Computing capable — Hopper (H100/H200) or Blackwell (B200/B300). Enable CC mode with [gpu-admin-tools](https://github.com/NVIDIA/gpu-admin-tools) (`--set-cc-mode=on`, after `--set-ppcie-mode=off`; both reset the GPU).
-- **BIOS**: latest vendor BIOS; enable TDX, SGX, VT-x/VT-d. After boot, `/dev/sgx_enclave` and `/dev/sgx_provision` must exist.
-
-## 2. Kernel and boot parameters
-
-Any kernel with KVM TDX support works: Canonical's Intel-optimized kernel (`6.14.0-1009-intel` tested) or mainline **≥ 6.16** (KVM TDX merged upstream; 6.17 is what the full attestation chain was validated on).
-
-`GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub` must include:
-
-```
-kvm_intel.tdx=on intel_iommu=on iommu=pt nohibernate \
-vfio-pci.ids=<your GPU/NVSwitch PCI IDs, e.g. 10de:2335> \
-vfio_iommu_type1.dma_entry_limit=16777216
-```
-
-- `vfio_iommu_type1.dma_entry_limit=16777216` is **required**, not tuning. The launcher passes GPUs through via the legacy type1 VFIO container (see §3), and TDX shared↔private page conversions exhaust the default 65 535 DMA mappings — QEMU dies mid-boot with `VFIO_MAP_DMA failed: No space left on device`. To apply without a reboot: `echo 16777216 | sudo tee /sys/module/vfio_iommu_type1/parameters/dma_entry_limit` (runtime-only; the GRUB entry is what persists).
-- `vfio-pci.ids=` must cover the GPUs **and** any NVSwitches being passed through.
-
-Then `sudo update-grub && sudo reboot`, and verify:
+One command takes a fresh Ubuntu **25.10** or **26.04 LTS** TDX host from bare OS
+to CVM-ready:
 
 ```bash
-cat /sys/module/kvm_intel/parameters/tdx     # Y
-lspci -nnk -s <gpu-addr>                      # Kernel driver in use: vfio-pci
+cd neurons/executor/ansible
+sudo ./bootstrap.sh
 ```
 
-## 3. QEMU — the dstack 9.2.1 build (required for attestation)
+It is safe to re-run. Every run converges from wherever the host already is, and
+it refuses anything that would damage a CVM that already exists.
 
-**Why this specific QEMU:** the validator's dstack-verifier reconstructs RTMR0 using an ACPI oracle built from the dstack QEMU 9.2.1 tree. RTMR0 only reproduces when the guest actually runs under that same QEMU. A host on distro QEMU ≥ 10.x can **never** pass — the oracle cannot forward-emulate newer ACPI. Once attestation enforcement is enabled on validators, a wrong host QEMU means failed attestation and a zero score.
+See [../../ansible/README.md](../../ansible/README.md) for the flags, the
+variables, how to read the report, and what a re-run will and will not touch.
 
-**How often:** install **once per host**. Rebuild only when a release note says the verifier's QEMU changed — never per executor, per reboot, or per runner release. (A prebuilt tarball per supported Ubuntu release is planned; until then, build from source.)
+### What it does
 
-```bash
-sudo apt-get install -y --no-install-recommends build-essential git ninja-build pkg-config \
-    python3-pip python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev flex bison
+- **Kernel and boot** — `dma_entry_limit`, the vfio modules, and the GRUB
+  parameters (`kvm_intel.tdx=on`, `intel_iommu=on`, `iommu=pt`, `nohibernate`,
+  `vfio-pci.ids=`). It appends to `GRUB_CMDLINE_LINUX_DEFAULT` and never
+  overwrites your existing `GRUB_CMDLINE_LINUX`.
+- **GPUs** — installs nvtrust, turns confidential-compute mode on where it is
+  off, and binds every GPU *and NVSwitch* to `vfio-pci`.
+- **QEMU** — builds the pinned dstack 9.2.1 fork and writes
+  `/etc/dstack/client.conf`. This is the long step, 10–40 minutes.
+- **Docker** — Docker Engine from Docker's own repository.
+- **SGX** — the Intel DCAP packages, PCCS, platform registration, TD quote
+  plumbing, and the sealing-key provider.
+- **Repository** — the lium-io checkout and the CVM OS image.
+- **Report** — `/var/lib/lium-cvm/verify-report.json`, with a stable id, a
+  status and a remediation for every check.
 
-git clone https://github.com/kvinwang/qemu-tdx.git --depth 1 \
-    --branch dstack-qemu-9.2.1 --single-branch qemu-tdx-src
-cd qemu-tdx-src
-git fetch --depth 1 origin dbcec07c0854bf873d346a09e87e4c993ccf2633
-git checkout dbcec07c0854bf873d346a09e87e4c993ccf2633   # pin: the exact tree the verifier oracle is built from
+It may need **one reboot** to pick up the new kernel parameters. It asks first,
+then continues by itself afterwards — exactly once.
 
-mkdir build && cd build
-../configure --prefix=/opt/qemu-dstack --target-list=x86_64-softmmu \
-    --disable-werror --enable-kvm --enable-slirp
-make -j"$(nproc)"
-sudo make install
+### What it does NOT do
 
-/opt/qemu-dstack/bin/qemu-system-x86_64 --version   # QEMU emulator version 9.2.1
-```
+**BIOS settings.** Firmware cannot be changed from inside the OS. If one of
+these is off, the run stops and names it:
 
-This is a plain build — do **not** add the `DUMP_ACPI_TABLES` define (that variant is only for the verifier's oracle binary and cannot run VMs).
+| Setting | Where |
+|---|---|
+| Intel **TDX** (and TME / TME-MT) | CPU security menu |
+| Intel **SGX**, PRMRR size ≥ 64M | CPU security menu; an SGX Factory Reset may be required |
+| **VT-d** / Virtualization Technology for Directed I/O | chipset / IO menu |
 
-Point the launcher at it via `/etc/dstack/client.conf`:
+Your kernel must also be a Canonical `intel` kernel or mainline ≥ 6.16.
 
-```ini
-[qemu]
-path = /opt/qemu-dstack/bin/qemu-system-x86_64
-```
+Also not automated, by design: the per-executor `.env` (§5 below), datacenter
+port ACLs, and running or supervising the CVM itself.
 
-(`dstack.py` merges `/etc/dstack/client.conf`, `~/.config/dstack/client.conf`, and any `.dstack/client.conf` at or above the working directory, later files overriding earlier ones. `/etc/dstack/client.conf` is recommended because `lium-cvm.sh` runs under sudo.)
+### If a run refuses
 
-Optionally symlink it so `lium-cvm.sh check` finds a QEMU on PATH:
+The playbook will not change anything measured while an encrypted CVM data disk
+exists on the host — doing so makes that disk permanently undecryptable. On such
+a host it automatically switches to a maintenance profile, converges everything
+safe, and prints the recovery procedure. §6 below is the deliberate upgrade path.
 
-```bash
-sudo ln -s /opt/qemu-dstack/bin/qemu-system-x86_64 /usr/local/bin/qemu-system-x86_64
-```
+### Hardware
 
-The launcher handles everything else automatically: it stamps `qemu_version` and `ovmf_variant` into the measured vm_config, and uses the legacy type1 VFIO backend for QEMU < 10 (this build's iommufd binding fails with EINVAL on modern kernels — expected, handled).
+| | |
+|---|---|
+| CPU | Intel Xeon with TDX (Emerald Rapids or newer) |
+| GPU | NVIDIA Hopper-class with confidential compute — H100 / H200 |
+| Disk | ≥ 40 GB free: ~10 GB for the QEMU build, ~30 GB for the OS image and data disk |
+| OS | Ubuntu 25.10 or 26.04 LTS |
 
-## 4. Key provider and PCCS
-
-The sealing-key provider must run on the host before any CVM boots (`lium-cvm.sh run` auto-starts it, but starting manually first surfaces build errors early):
-
-```bash
-cd key-provider && docker compose up --build -d
-docker compose logs -f gramine-sealing-key-provider   # watch first start
-curl -k https://localhost:3443                        # endpoint reachable
-```
-
-Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-sealing-key-provider` (`127.0.0.1:3443`). DCAP collateral comes from the PCCS configured in [`key-provider/sgx_default_qcnl.conf`](../key-provider/sgx_default_qcnl.conf) — the default is Phala's public PCCS and works out of the box; point `pccs_url` at your own PCCS if you run one.
 
 ## 5. Per-executor deployment
 

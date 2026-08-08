@@ -1,0 +1,112 @@
+---
+# One GRUB fixture, driven end to end:
+#   render -> union -> write drop-in -> regenerate -> grub.cfg assertion -> drift
+#
+# Included once per fixture by test_grub_fixtures.yml.
+
+# No deletion here: test_grub_fixtures.yml clears the root once, and each case
+# owns a directory nothing else touches.
+- name: "Create the work tree: {{ grub_case.name }}"
+  ansible.builtin.file:
+    path: "{{ grub_work }}/etc/default/grub.d"
+    state: directory
+    mode: "0755"
+
+- name: "Copy the fixture in: {{ grub_case.name }}"
+  ansible.builtin.copy:
+    src: "fixtures/grub/{{ grub_case.name }}/etc/default/grub"
+    dest: "{{ grub_work }}/etc/default/grub"
+    mode: "0644"
+
+- name: "Run the kernel role's non-reboot half: {{ grub_case.name }}"
+  ansible.builtin.include_role:
+    name: kernel
+  vars:
+    lium_kernel_fixture_mode: true
+    lium_kernel_reboot_enabled: false
+    lium_grub_default_path: "{{ grub_work }}/etc/default/grub"
+    lium_grub_dropin_path: "{{ grub_work }}/etc/default/grub.d/99-lium-cvm.cfg"
+    lium_grubcfg_path: "{{ grub_work }}/boot/grub/grub.cfg"
+    lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/{{ grub_case.proc }}"
+    lium_modprobe_conf_path: "{{ grub_work }}/etc/modprobe.d/vfio-dma.conf"
+    lium_modules_load_path: "{{ grub_work }}/etc/modules-load.d/vfio.conf"
+    lium_update_grub_cmd: >-
+      {{ playbook_dir }}/fake-update-grub.sh
+      {{ grub_work }}/etc/default/grub
+      {{ grub_work }}/etc/default/grub.d
+      {{ grub_work }}/boot/grub/grub.cfg
+
+- name: "Read back the drop-in: {{ grub_case.name }}"
+  ansible.builtin.slurp:
+    src: "{{ grub_work }}/etc/default/grub.d/99-lium-cvm.cfg"
+  register: grub_dropin_content
+
+- name: "The drop-in appends and never assigns GRUB_CMDLINE_LINUX: {{ grub_case.name }}"
+  ansible.builtin.assert:
+    that:
+      - "'${GRUB_CMDLINE_LINUX_DEFAULT:-}' in grub_dropin_text"
+      - "'GRUB_CMDLINE_LINUX=' not in grub_dropin_text"
+    fail_msg: >-
+      The drop-in must append to GRUB_CMDLINE_LINUX_DEFAULT and must never assign
+      GRUB_CMDLINE_LINUX. Got:
+      {{ grub_dropin_text }}
+    quiet: true
+  vars:
+    grub_dropin_text: "{{ grub_dropin_content.content | b64decode }}"
+
+- name: "Every required token wins in the generated grub.cfg: {{ grub_case.name }}"
+  ansible.builtin.assert:
+    that:
+      - lium_cmdline.grubcfg_present | bool
+      - lium_cmdline.grubcfg_missing_tokens | length == 0
+    fail_msg: >-
+      Tokens that do not win in the generated grub.cfg:
+      {{ lium_cmdline.grubcfg_missing_tokens | join(', ') }}
+      -- linux line was: {{ lium_cmdline.grubcfg_linux_line }}
+    quiet: true
+
+- name: "The provider's pre-existing tokens survived: {{ grub_case.name }}"
+  ansible.builtin.assert:
+    that:
+      - item in lium_cmdline.grubcfg_linux_line
+    fail_msg: >-
+      "{{ item }}" was in the fixture but is missing from the generated grub.cfg —
+      the drop-in clobbered a value it should have preserved.
+    quiet: true
+  loop: "{{ grub_case.must_survive }}"
+
+- name: "Drift matches what the /proc/cmdline fixture says: {{ grub_case.name }}"
+  ansible.builtin.assert:
+    that:
+      - (lium_cmdline.drift_tokens | select('search', item) | list | length) > 0
+    fail_msg: >-
+      Expected "{{ item }}" to be reported as drift against
+      fixtures/proc/{{ grub_case.proc }}, but drift was
+      {{ lium_cmdline.drift_tokens | join(', ') }}
+    quiet: true
+  loop: "{{ grub_case.expect_drift }}"
+
+- name: "Conflicting stale tokens are named: {{ grub_case.name }}"
+  ansible.builtin.assert:
+    that:
+      - item in lium_cmdline.conflicting_keys
+    fail_msg: >-
+      Expected "{{ item }}" to be reported as a conflicting key, but
+      conflicting_keys was {{ lium_cmdline.conflicting_keys | join(', ') }}
+    quiet: true
+  loop: "{{ grub_case.expect_conflicting }}"
+
+- name: "Tokens present only in GRUB_CMDLINE_LINUX are reported: {{ grub_case.name }}"
+  ansible.builtin.assert:
+    that:
+      - (lium_cmdline_before.found_only_in_grub_cmdline_linux | length) > 0
+    fail_msg: >-
+      This is the au2 shape: the TDX arguments live in GRUB_CMDLINE_LINUX and
+      GRUB_CMDLINE_LINUX_DEFAULT is empty. It must be reported, because editing
+      the wrong variable is what silently drops kvm_intel.tdx.
+    quiet: true
+  when: grub_case.expect_only_in_linux | bool
+
+- name: "PASS: {{ grub_case.name }}"
+  ansible.builtin.debug:
+    msg: "PASS {{ grub_case.name }}"

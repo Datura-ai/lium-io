@@ -1,0 +1,32 @@
+---
+# catalog ships as a VARIABLE INTERFACE, not an implementation. Same shape and
+# same reasoning as the cvmd stub: loud when unset, loud when set, never
+# silently a no-op.
+
+- name: Report that the catalog is not installed
+  ansible.builtin.debug:
+    msg: >-
+      catalog not installed — waiting on the catalog work (DAH-2576 / DAH-2578).
+      Set lium_catalog_manifest_url and lium_catalog_manifest_sha256 to enable it.
+  when: lium_catalog_manifest_url | length == 0
+
+- name: End the role while the catalog is unset
+  ansible.builtin.meta: end_role
+  when: lium_catalog_manifest_url | length == 0
+
+- name: Require the companion variable
+  ansible.builtin.assert:
+    that:
+      - lium_catalog_manifest_sha256 | length > 0
+    fail_msg: >-
+      lium_catalog_manifest_url is set, but lium_catalog_manifest_sha256 is
+      required with it. The catalog manifest decides what a host will run; one
+      fetched without a checksum is not a working configuration.
+    quiet: true
+
+- name: Stop, because catalog installation is not implemented here
+  ansible.builtin.fail:
+    msg: >-
+      catalog installation is not implemented in DAH-2544. The variable interface
+      is defined here; the implementation lands in DAH-2576 / DAH-2578. Unset
+      lium_catalog_manifest_url to continue without it.

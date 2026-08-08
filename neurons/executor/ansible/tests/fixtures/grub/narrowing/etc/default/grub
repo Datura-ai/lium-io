@@ -1,0 +1,11 @@
+# Fixture: GRUB already carries a MANAGED GPU id that lspci no longer reports
+# (10de:2330 — an H100 this playbook knows about), i.e. a hot-removed or wedged
+# device. Writing the freshly discovered — shorter — list would unbind it on the
+# next boot, so the role must REFUSE.
+#
+# The id has to be one of lium_cc_gpu_pci_ids / lium_nvswitch_pci_ids. An id
+# outside that set is never looked for in lspci, so its absence proves nothing
+# and is not a narrowing at all — see the unmanaged_id fixture.
+GRUB_DEFAULT=0
+GRUB_CMDLINE_LINUX="kvm_intel.tdx=on vfio-pci.ids=10de:2335,10de:22a3,10de:2330"
+GRUB_CMDLINE_LINUX_DEFAULT="intel_iommu=on iommu=pt nohibernate"

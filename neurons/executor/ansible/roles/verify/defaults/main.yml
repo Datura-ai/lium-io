@@ -1,0 +1,6 @@
+---
+lium_report_schema_version: "1.0.0"
+
+# ansible_date_time comes from fact gathering. The fixture tests run with
+# gather_facts: false, so the report still needs a timestamp there.
+lium_generated_at_fallback: "1970-01-01T00:00:00Z"

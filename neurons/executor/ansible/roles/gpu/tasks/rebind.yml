@@ -1,0 +1,21 @@
+---
+# Bind one device to vfio-pci.
+#
+# Idempotent by construction: if it is already bound, both writes are no-ops and
+# the role reports zero changes. Never unbind "just to be safe" — that is a
+# gratuitous reset of a device that was already correct.
+
+- name: "Check the current driver: {{ lium_gpu_bdf }}"
+  ansible.builtin.stat:
+    path: "/sys/bus/pci/devices/{{ lium_gpu_bdf }}/driver"
+    follow: false
+  register: lium_dev_driver
+
+- name: "Bind to vfio-pci: {{ lium_gpu_bdf }}"
+  ansible.builtin.command:
+    cmd: "{{ lium_gpu_rebind_cmd }}"
+  register: lium_rebind_result
+  changed_when: true
+  when: >-
+    not lium_dev_driver.stat.exists
+    or (lium_dev_driver.stat.lnk_target | default('') | basename) != 'vfio-pci'

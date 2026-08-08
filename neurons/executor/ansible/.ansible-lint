@@ -1,0 +1,34 @@
+---
+# `moderate` plus two rules from stricter profiles, decided rather than deferred.
+#
+# `production` was rejected on purpose. It front-loads maximum lint friction onto
+# the single highest-risk PR in this area, and its `ignore-errors` rule collides
+# with preflight's deliberate collect-all-failures-then-aggregate pattern — which
+# pushes an implementer toward either weakening the aggregate reporting or
+# sprinkling `changed_when: false` where it is untrue. That is exactly how
+# idempotence becomes a lie.
+#
+# The two rules enabled below are the ones that actually matter here: honest
+# change reporting, and sane file modes on a tree that writes to /etc and /var.
+profile: moderate
+
+enable_list:
+  - no-changed-when
+  - risky-file-permissions
+
+skip_list:
+  # This tree uses ONE variable namespace, `lium_`, shared across every role on
+  # purpose. The rule wants role-scoped prefixes (`kernel_grubcfg_path`,
+  # `common_state_dir`), which exists to stop two roles colliding — but here the
+  # sharing IS the design: `lium_state_dir`, `lium_proc_cmdline_path` and the
+  # rest of the seams are read by common, kernel and verify alike, and renaming
+  # them per role would mean three names for one thing.
+  #
+  # Note what is NOT skipped: `var-naming` itself stays on, so the `lium_`
+  # prefix and casing are still enforced everywhere. Genuine role parameters do
+  # carry their role's prefix — see `common_guard_reason` and
+  # `common_guard_override_var` in site.yml.
+  - var-naming[no-role-prefix]
+
+exclude_paths:
+  - tests/fixtures/

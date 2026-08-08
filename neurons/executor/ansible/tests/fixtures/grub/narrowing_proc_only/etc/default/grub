@@ -1,0 +1,8 @@
+# Fixture: the GRUB files carry NO vfio-pci.ids at all, but the host was BOOTED
+# with one (see fixtures/proc/cmdline_booted_extra_vfio_id). That is a host whose
+# GRUB files were cleaned or reverted after boot. Reading only the GRUB files
+# would show an empty existing set, the difference would be empty, and the
+# shorter list would be written — unbinding a device on the next boot.
+GRUB_DEFAULT=0
+GRUB_CMDLINE_LINUX="kvm_intel.tdx=on"
+GRUB_CMDLINE_LINUX_DEFAULT="intel_iommu=on iommu=pt nohibernate"

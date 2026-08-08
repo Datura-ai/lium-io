@@ -1,0 +1,82 @@
+---
+# Order matters. The seam gate is FIRST so a misconfigured run cannot reach the
+# collector, and the collector runs before anything derives a decision from it.
+
+- name: Refuse unsanctioned test seams
+  ansible.builtin.assert:
+    that:
+      - >-
+        lookup('vars', item.key, default=item.value) == item.value
+        or (lium_test_mode | bool and lookup('env', 'ANSIBLE_LIUM_TEST') == '1')
+    fail_msg: >-
+      Test seam '{{ item.key }}' is set to a non-production value, but the test
+      gates are not both open.
+      Expected {{ item.value | to_json }};
+      got {{ lookup('vars', item.key, default=item.value) | to_json }}.
+      A seam requires BOTH `lium_test_mode: true` AND the environment variable
+      ANSIBLE_LIUM_TEST=1. Currently lium_test_mode={{ lium_test_mode }} and
+      ANSIBLE_LIUM_TEST={{ lookup('env', 'ANSIBLE_LIUM_TEST') | to_json }}.
+      Seams exist so the roles can be tested without TDX hardware; they must be
+      unreachable in production, because every one of them redirects a decision
+      away from the real host.
+    quiet: true
+  loop: "{{ lium_seam_defaults | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Ensure the state and log directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ lium_state_dir }}"
+    - "{{ lium_log_dir }}"
+
+# check_mode: false + changed_when: false so a `--check` run still produces
+# facts. Without it every downstream `when:` sees an undefined `lium` and the
+# whole check run reports nothing useful.
+- name: Collect host facts
+  ansible.builtin.command:
+    cmd: "{{ role_path }}/files/lium-facts.sh"
+  environment:
+    LIUM_PROC_CMDLINE_PATH: "{{ lium_proc_cmdline_path }}"
+    LIUM_GRUB_DEFAULT_PATH: "{{ lium_grub_default_path }}"
+    LIUM_GRUB_DROPIN_DIR: "{{ lium_grub_dropin_path | dirname }}"
+    LIUM_STATE_DIR: "{{ lium_state_dir }}"
+    LIUM_REPO_PATH: "{{ lium_repo_path }}"
+    LIUM_LSPCI_OUTPUT: "{{ lium_lspci_output }}"
+    LIUM_NVTRUST_TOOL: "{{ lium_nvtrust_tool }}"
+    LIUM_QEMU_PREFIX: "{{ lium_qemu_prefix }}"
+    LIUM_CC_GPU_PCI_IDS: "{{ lium_cc_gpu_pci_ids | join(',') }}"
+    LIUM_NVSWITCH_PCI_IDS: "{{ lium_nvswitch_pci_ids | join(',') }}"
+    LIUM_INTEL_API_HOST: "{{ lium_intel_api_host }}"
+    LIUM_INTEL_API_PORT: "{{ lium_intel_api_port }}"
+  register: lium_facts_raw
+  changed_when: false
+  check_mode: false
+
+- name: Derive the CVM guard state
+  ansible.builtin.command:
+    cmd: "{{ role_path }}/files/lium-guard.sh --json"
+  environment:
+    LIUM_HDA_SEARCH_ROOTS: "{{ lium_hda_search_roots | join(',') }}"
+    LIUM_REPO_PATH: "{{ lium_repo_path }}"
+    LIUM_PROC_ROOT: "{{ lium_proc_root }}"
+    LIUM_MOUNTS_PATH: "{{ lium_mounts_path }}"
+  register: lium_guard_raw
+  changed_when: false
+  check_mode: false
+
+- name: Publish the fact bundle
+  ansible.builtin.set_fact:
+    lium: >-
+      {{
+        lium_facts_raw.stdout | from_json
+        | combine({'guard': lium_guard_raw.stdout | from_json})
+      }}
+
+- name: Report the derived guard state
+  ansible.builtin.debug:
+    msg: >-
+      Guard state: {{ lium.guard.state }} — {{ lium.guard.reason }}

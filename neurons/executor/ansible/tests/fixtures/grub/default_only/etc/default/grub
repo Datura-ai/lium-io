@@ -1,0 +1,5 @@
+# Fixture: every TDX argument already lives in GRUB_CMDLINE_LINUX_DEFAULT.
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_CMDLINE_LINUX=""
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash kvm_intel.tdx=on intel_iommu=on iommu=pt nohibernate"

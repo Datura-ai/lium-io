@@ -1,0 +1,26 @@
+---
+lium_modprobe_conf_path: /etc/modprobe.d/vfio-dma.conf
+lium_modules_load_path: /etc/modules-load.d/vfio.conf
+lium_helper_dir: /usr/local/lib/lium-cvm
+
+# Resolved from role_path, not playbook_dir, so the role works identically when
+# driven by site.yml at the tree root and by a test playbook under tests/.
+lium_common_files: "{{ role_path }}/../common/files"
+lium_bootstrap_path: "{{ role_path }}/../../bootstrap.sh"
+
+# The resume is unattended by definition, so it never waits for a confirmation
+# nobody is there to give.
+lium_resume_playbook_args: "--yes"
+
+# Set false by the fixture tests to run the role's non-reboot half in isolation.
+# This is a SCOPE control, not a test seam: it never redirects a decision to a
+# fake path, it only stops the play short of rebooting the machine running it.
+lium_kernel_reboot_enabled: true
+
+# Suppresses the two tasks that write to real /sys and load real modules, so the
+# fixture tests can exercise the GRUB chain on any machine.
+lium_kernel_fixture_mode: false
+
+# Overwritten by grub.yml. Declared so main.yml's `when:` is evaluable even if
+# grub.yml was skipped.
+lium_kernel_drift: []

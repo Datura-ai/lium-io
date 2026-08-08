@@ -1,0 +1,136 @@
+---
+# The two fresh-install defaults that each make a CVM reboot at ~160-190 seconds
+# instead of booting.
+#
+# The guest fetches its TD report via TSM, sends it over vhost-vsock to the host
+# to be turned into a quote, presents that to the key provider for the sealing
+# key, and unseals its data disk. Any failure in that chain fails
+# dstack-prepare, and the guest reboots. A GPU-clean boot that still reboots is
+# almost always one of these two.
+
+# 10a. qgsd ships with `#port = 4050` COMMENTED OUT, so it serves over a unix
+# socket, reports `active`, and never answers the guest.
+# Signature: `vsock failure: Connection reset by peer (os error 104)`.
+#
+# THE REGEXP MUST MATCH SOMETHING FIRST.
+#
+# `lineinfile` APPENDS when its regexp matches nothing — that is the mechanism
+# that corrupted Intel's QPL config into invalid JSON and rebooted every CVM this
+# playbook produced at ~160 s (see 10b below). qgs.conf is flat key=value today,
+# so an append happens to land in the right place, but that is a property of the
+# file the current package ships, not of the edit. A future qgsd that renames the
+# key, sections the file, or drops the line entirely would get a silent append
+# and a config nobody asked for.
+#
+# Asserting the regexp matches converts that into a refusal that names the file.
+- name: Read the shipped qgsd configuration
+  ansible.builtin.stat:
+    path: /etc/qgs.conf
+  register: lium_qgs_stat
+
+- name: Refuse when qgsd shipped no configuration at all
+  ansible.builtin.fail:
+    msg: |
+      /etc/qgs.conf does not exist, so qgsd is not installed the way this role
+      expects and the guest will never get a TD quote.
+
+      Check that the DCAP packages installed:  dpkg -l | grep -i qgs
+  when: not (lium_qgs_stat.stat.exists | default(false))
+
+- name: Read the current qgsd configuration
+  ansible.builtin.slurp:
+    src: /etc/qgs.conf
+  register: lium_qgs_shipped
+
+- name: Refuse to blind-append to an unrecognised qgsd configuration
+  ansible.builtin.assert:
+    that:
+      - (lium_qgs_shipped.content | b64decode) is search('(?m)^\s*#?\s*port\s*=')
+    fail_msg: >-
+      /etc/qgs.conf has no `port =` line, commented or otherwise, so this
+      package does not ship the configuration this role knows how to edit.
+      Editing anyway would APPEND `port = 4050` to the end of a file whose
+      shape is unknown — the same silent-append that corrupted the QPL config.
+      Inspect /etc/qgs.conf and update roles/sgx_key_provider/tasks/quote_plumbing.yml
+      to match what the package now ships.
+    quiet: true
+
+- name: Serve TD quotes over vsock
+  ansible.builtin.lineinfile:
+    path: /etc/qgs.conf
+    regexp: '^\s*#?\s*port\s*='
+    line: "port = 4050"
+    create: false
+    mode: "0644"
+  register: lium_qgs_conf
+  notify: Restart qgsd
+
+- name: Apply the qgsd change now
+  ansible.builtin.meta: flush_handlers
+
+- name: Confirm qgsd is listening on vsock 4050
+  ansible.builtin.command:
+    cmd: ss -a --vsock
+  register: lium_vsock
+  changed_when: false
+  failed_when: false
+  # Reading a listener list changes nothing, and check mode skips command tasks
+  # unconditionally — which would leave this register with no stdout at all.
+  check_mode: false
+
+- name: Assert the vsock listener exists
+  ansible.builtin.assert:
+    that:
+      - "'4050' in lium_vsock.stdout"
+    fail_msg: >-
+      qgsd is not listening on vsock port 4050, so the guest cannot get a TD
+      quote and will reboot at around 160 seconds with
+      "vsock failure: Connection reset by peer (os error 104)".
+      Check `systemctl status qgsd` and /etc/qgs.conf.
+    quiet: true
+  when:
+    - lium_assert_vsock | bool
+    # A check run never applied the `port = 4050` line above and never fired the
+    # qgsd restart, so a failure here would only describe the host as it was
+    # BEFORE the fix this very run is proposing. On a healthy host it aborted
+    # `--check` outright — killing the run before the verify report exists,
+    # which is the one artefact a report-only run is for.
+    - not ansible_check_mode
+
+# 10b. The system QPL config ships "use_secure_cert": true, which verifies the
+# PCCS TLS certificate — and a local PCCS uses a self-signed one.
+# Signature: `[QCNL] CURL error: (60) SSL peer certificate ... was not OK`,
+# `[QPL] Failed to get quote config. Error code is 0xb033`, then
+# `vsock failure: failed to fill whole buffer`.
+#
+# The file is WRITTEN, not line-edited. Two `lineinfile` tasks used to do this
+# and they corrupted Intel's shipped config into invalid JSON — the template
+# header explains exactly how. Keep the pristine copy first: it is the only
+# record of what the platform shipped with.
+- name: Look for an existing system QPL configuration
+  ansible.builtin.stat:
+    path: "{{ lium_system_qcnl_path }}"
+  register: lium_system_qcnl_stat
+
+# force: false, so the backup is taken ONCE. Re-running must not overwrite the
+# pristine copy with the managed one — that would destroy the only record of
+# what the platform shipped with, on the second converge, silently.
+- name: Preserve the pristine system QPL configuration
+  ansible.builtin.copy:
+    src: "{{ lium_system_qcnl_path }}"
+    dest: "{{ lium_system_qcnl_path }}.pre-lium-cvm"
+    remote_src: true
+    force: false
+    mode: "0644"
+  when: lium_system_qcnl_stat.stat.exists | default(false)
+
+- name: Write the system QPL configuration
+  ansible.builtin.template:
+    src: sgx_default_qcnl.conf.j2
+    dest: "{{ lium_system_qcnl_path }}"
+    mode: "0644"
+    # Refuse to install a file the QPL cannot read. Without this the corruption
+    # is silent on the host and only surfaces as a CVM that reboots at ~160s,
+    # three layers away, long after the converge reported success.
+    validate: "python3 -c \"import json,sys; json.load(open(sys.argv[1]))\" %s"
+  notify: Restart qgsd
