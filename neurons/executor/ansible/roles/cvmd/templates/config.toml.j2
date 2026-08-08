@@ -1,0 +1,29 @@
+{# Rendered by the cvmd role. packaging/config.toml is the same file with the
+   packaged defaults, installed by install.sh for a manual install; on an
+   Ansible-managed host this template is the one that wins, so the role knows
+   the port it must health-check. #}
+# Managed by Ansible (roles/cvmd) — edits here are overwritten on the next run.
+#
+# Every setting can be overridden by an environment variable named CVMD_<KEY>
+# (uppercase), which is how the tests reach it.
+
+authorized_clients = "{{ cvmd_authorized_clients_path }}"
+state_dir = "{{ cvmd_state_dir }}"
+
+host = "{{ lium_cvmd_bind_address }}"
+port = {{ lium_cvmd_port }}
+
+# HTTPS. install.sh generates a self-signed pair here if none exists. A
+# self-signed certificate that no client pins gives confidentiality against a
+# passive listener and no server authentication — client-side pinning is
+# DAH-2580.
+tls_cert = "{{ cvmd_tls_dir }}/cert.pem"
+tls_key = "{{ cvmd_tls_dir }}/key.pem"
+
+# The freshness window a request timestamp must fall inside, in seconds. It
+# rests on the host clock, which cvmd does not control.
+skew_seconds = {{ lium_cvmd_skew_seconds }}
+
+# Real bodies are a `kind` plus three hashes. The cap is enforced before the
+# body is buffered.
+max_body_bytes = {{ lium_cvmd_max_body_bytes }}

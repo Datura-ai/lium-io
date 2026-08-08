@@ -1,0 +1,246 @@
+---
+# The cvmd role's refusals, and the shape of the file it renders.
+#
+# Every case here stops at an assert, BEFORE the role reaches install.yml — so
+# the whole playbook runs unprivileged, with no package fetched and no service
+# touched. The install and service paths cannot be proved without a real host;
+# they are covered by the hardware acceptance run recorded on the PR.
+#
+# block/rescue rather than `ignore_errors` on the include: ignore_errors does
+# not cover a failure raised by a task INSIDE an included role, so the play
+# would abort before any assertion ran.
+
+- name: The cvmd role ends cleanly when it is not requested
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+  roles:
+    - cvmd
+  tasks:
+    - name: Reaching here means the role ended rather than failing
+      ansible.builtin.debug:
+        msg: "ok  cvmd no-ops cleanly when lium_cvmd_package_url is unset"
+
+- name: The cvmd role refuses every configuration it cannot honour
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    # //Alice under prefix 42 — the same well-known key the daemon's own suite
+    # signs with.
+    cvmd_alice: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+
+  tasks:
+    # --- a URL with no checksum ------------------------------------------
+    - name: Run cvmd with a URL but nothing else
+      block:
+        - name: Include cvmd with only a URL
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvmd_package_url: file:///nonexistent/cvmd.tar.gz
+
+        - name: Record that cvmd accepted a partial configuration
+          ansible.builtin.set_fact:
+            partial_refused: false
+            partial_msg: ""
+      rescue:
+        - name: Record the partial-configuration refusal
+          ansible.builtin.set_fact:
+            partial_refused: true
+            partial_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A package URL without a checksum is refused, by name
+      ansible.builtin.assert:
+        that:
+          - partial_refused | bool
+          - "'sha256' in (partial_msg | lower)"
+        fail_msg: >-
+          cvmd accepted a package URL with no checksum and no authorised
+          clients, or refused for some other reason.
+          refused={{ partial_refused }} msg={{ partial_msg }}
+        quiet: true
+
+    # --- an SSH key where a hotkey belongs -------------------------------
+    # The DAH-2544 stub's own fixture was `["ssh-ed25519 AAAA fixture"]`, so
+    # this is the exact mistake the interface change had to make impossible.
+    - name: Run cvmd with an SSH public key as a client
+      block:
+        - name: Include cvmd with an SSH key
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvmd_package_url: file:///nonexistent/cvmd.tar.gz
+            lium_cvmd_package_sha256: "{{ '0' * 64 }}"
+            lium_cvmd_authorized_clients: ["ssh-ed25519 AAAA fixture"]
+
+        - name: Record that cvmd accepted an SSH key
+          ansible.builtin.set_fact:
+            sshkey_refused: false
+      rescue:
+        - name: Record the SSH-key refusal
+          ansible.builtin.set_fact:
+            sshkey_refused: true
+
+    - name: A bare string is not an authorised client
+      ansible.builtin.assert:
+        that:
+          - sshkey_refused | bool
+        fail_msg: >-
+          cvmd accepted a flat list of key strings. Authorised clients are
+          {hotkey, scope} objects; a bare string authorises nobody.
+        quiet: true
+
+    # --- a scope cvmd does not have --------------------------------------
+    - name: Run cvmd with an unknown scope
+      block:
+        - name: Include cvmd with scope "admin"
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvmd_package_url: file:///nonexistent/cvmd.tar.gz
+            lium_cvmd_package_sha256: "{{ '0' * 64 }}"
+            lium_cvmd_authorized_clients:
+              - hotkey: "{{ cvmd_alice }}"
+                scope: admin
+
+        - name: Record that cvmd accepted an unknown scope
+          ansible.builtin.set_fact:
+            scope_refused: false
+            scope_msg: ""
+      rescue:
+        - name: Record the unknown-scope refusal
+          ansible.builtin.set_fact:
+            scope_refused: true
+            scope_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: An unknown scope is refused, and the legal ones are named
+      ansible.builtin.assert:
+        that:
+          - scope_refused | bool
+          - "'validation' in scope_msg"
+          - "'renter' in scope_msg"
+        fail_msg: >-
+          cvmd accepted a scope outside {validation, renter}, or refused
+          without naming the ones it does accept.
+          refused={{ scope_refused }} msg={{ scope_msg }}
+        quiet: true
+
+    # --- a hotkey that is not an address ---------------------------------
+    - name: Run cvmd with a truncated hotkey
+      block:
+        - name: Include cvmd with a malformed address
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvmd_package_url: file:///nonexistent/cvmd.tar.gz
+            lium_cvmd_package_sha256: "{{ '0' * 64 }}"
+            lium_cvmd_authorized_clients:
+              - hotkey: 5Grwva
+                scope: validation
+
+        - name: Record that cvmd accepted a malformed address
+          ansible.builtin.set_fact:
+            ss58_refused: false
+      rescue:
+        - name: Record the malformed-address refusal
+          ansible.builtin.set_fact:
+            ss58_refused: true
+
+    - name: A malformed ss58 address is refused
+      ansible.builtin.assert:
+        that:
+          - ss58_refused | bool
+        fail_msg: >-
+          cvmd accepted a hotkey that is not shaped like an ss58 address.
+        quiet: true
+
+    # --- the same hotkey twice -------------------------------------------
+    - name: Run cvmd with one hotkey in both scopes
+      block:
+        - name: Include cvmd with a duplicated hotkey
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvmd_package_url: file:///nonexistent/cvmd.tar.gz
+            lium_cvmd_package_sha256: "{{ '0' * 64 }}"
+            lium_cvmd_authorized_clients:
+              - hotkey: "{{ cvmd_alice }}"
+                scope: validation
+              - hotkey: "{{ cvmd_alice }}"
+                scope: renter
+
+        - name: Record that cvmd accepted a duplicate
+          ansible.builtin.set_fact:
+            dup_refused: false
+            dup_msg: ""
+      rescue:
+        - name: Record the duplicate refusal
+          ansible.builtin.set_fact:
+            dup_refused: true
+            dup_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A hotkey in two scopes is refused, and the duplicate is named
+      ansible.builtin.assert:
+        that:
+          - dup_refused | bool
+          - cvmd_alice in dup_msg
+        fail_msg: >-
+          cvmd accepted the same hotkey in two scopes, so one would silently
+          win. refused={{ dup_refused }} msg={{ dup_msg }}
+        quiet: true
+
+- name: The rendered authorized-clients file is what cvmd reads
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    cvmd_render_path: /tmp/lium-cvmd-authorized-clients.json
+    lium_cvmd_authorized_clients:
+      - hotkey: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+        scope: validation
+        # Not part of the interface. cvmd's loader is strict about the two keys
+        # it knows, so an operator's note must not ride along into the file.
+        note: the validator
+
+  tasks:
+    - name: Render the template directly
+      ansible.builtin.template:
+        src: ../roles/cvmd/templates/authorized_clients.json.j2
+        dest: "{{ cvmd_render_path }}"
+        mode: "0600"
+
+    - name: Read it back
+      ansible.builtin.slurp:
+        src: "{{ cvmd_render_path }}"
+      register: rendered
+
+    - name: It is a list of exactly {hotkey, scope} objects
+      ansible.builtin.assert:
+        that:
+          - parsed | length == 1
+          - parsed[0].hotkey == '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY'
+          - parsed[0].scope == 'validation'
+          - parsed[0].keys() | list | sort == ['hotkey', 'scope']
+        fail_msg: >-
+          The rendered file is not the shape cvmd's loader accepts:
+          {{ rendered.content | b64decode }}
+        quiet: true
+      vars:
+        parsed: "{{ rendered.content | b64decode | from_json }}"
+
+    - name: Remove the rendered file
+      ansible.builtin.file:
+        path: "{{ cvmd_render_path }}"
+        state: absent
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: "PASS cvmd refuses every configuration it cannot honour, and renders what the daemon reads."

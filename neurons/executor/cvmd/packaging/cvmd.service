@@ -1,0 +1,20 @@
+[Unit]
+Description=cvmd — CVM host control daemon
+Documentation=https://github.com/Datura-ai/lium-io/tree/main/neurons/executor/cvmd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cvmd/venv/bin/cvmd
+Environment=CVMD_CONFIG_PATH=/etc/cvmd/config.toml
+
+# /var/lib/cvmd — the state machine's state.json and the replay store live here. Losing this
+# directory resets the startup floor, so it is state, not cache.
+StateDirectory=cvmd
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

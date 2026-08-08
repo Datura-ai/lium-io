@@ -1,0 +1,23 @@
+# cvmd default config. Installed to /etc/cvmd/config.toml if no config is already there —
+# install.sh never overwrites an existing one.
+#
+# Every setting can be overridden by an environment variable named CVMD_<KEY> (uppercase).
+
+authorized_clients = "/etc/cvmd/authorized_clients.json"
+state_dir = "/var/lib/cvmd"
+
+host = "0.0.0.0"
+port = 8443
+
+# HTTPS. install.sh generates a self-signed pair here if none exists. A self-signed certificate
+# that no client pins gives confidentiality against a passive listener and no server
+# authentication — client-side pinning is DAH-2580.
+tls_cert = "/etc/cvmd/tls/cert.pem"
+tls_key = "/etc/cvmd/tls/key.pem"
+
+# The freshness window a request timestamp must fall inside, in seconds. It rests on the host
+# clock, which cvmd does not control.
+skew_seconds = 60
+
+# Real bodies are a `kind` plus three hashes. The cap is enforced before the body is buffered.
+max_body_bytes = 65536

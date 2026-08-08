@@ -1,0 +1,133 @@
+---
+# Fetch and install the cvmd release tarball.
+#
+# The whole step is skipped while the install stamp already records this exact
+# package sha256. Without that, every converge rebuilds the venv and reinstalls
+# the wheel — minutes of work reported as `changed` on a host where nothing
+# differs, which trains an operator to ignore the run's change count.
+
+- name: Read the currently installed package checksum
+  ansible.builtin.slurp:
+    src: "{{ cvmd_install_stamp }}"
+  register: cvmd_stamp
+  failed_when: false
+
+- name: Look for the installed entry point
+  ansible.builtin.stat:
+    path: "{{ cvmd_prefix }}/venv/bin/cvmd"
+  register: cvmd_venv_entry_point
+
+- name: Decide whether this package is already installed
+  ansible.builtin.set_fact:
+    # A stamp is only believed alongside the venv it describes. Deleting
+    # /opt/cvmd/venv by hand and leaving the stamp behind is exactly the state
+    # where trusting the stamp alone would skip the reinstall and then fail at
+    # the health check with nothing pointing at the cause.
+    cvmd_already_installed: >-
+      {{ (cvmd_stamp.content is defined)
+         and ((cvmd_stamp.content | b64decode | trim) == lium_cvmd_package_sha256)
+         and (cvmd_venv_entry_point.stat.exists | bool) }}
+
+- name: Report that the installed package is already current
+  ansible.builtin.debug:
+    msg: >-
+      cvmd {{ lium_cvmd_package_sha256[:12] }} is already installed — skipping
+      the download and the venv rebuild. Configuration is still applied below.
+  when: cvmd_already_installed | bool
+
+- name: Install the cvmd package
+  when: not (cvmd_already_installed | bool)
+  block:
+    # install.sh needs both: `python3 -m venv` to build the environment, and
+    # openssl to generate the self-signed TLS pair on first install.
+    - name: Ensure the packages install.sh depends on are present
+      ansible.builtin.apt:
+        name:
+          - python3-venv
+          - openssl
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure the staging directory exists
+      ansible.builtin.file:
+        path: "{{ cvmd_staging_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    # The checksum is the point of the whole step: cvmd holds the platform's
+    # authorisation list and drives CVM lifecycle, so a package whose contents
+    # were never verified is a package that decides who may rent this host.
+    # get_url fails the task on a mismatch — that is the refusal, not a warning.
+    - name: Download the cvmd release tarball
+      ansible.builtin.get_url:
+        url: "{{ lium_cvmd_package_url }}"
+        dest: "{{ cvmd_staging_dir }}/cvmd.tar.gz"
+        checksum: "sha256:{{ lium_cvmd_package_sha256 }}"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Unpack it
+      ansible.builtin.unarchive:
+        src: "{{ cvmd_staging_dir }}/cvmd.tar.gz"
+        dest: "{{ cvmd_staging_dir }}"
+        remote_src: true
+        owner: root
+        group: root
+
+    - name: Check the unpacked tarball is a cvmd release
+      ansible.builtin.stat:
+        path: "{{ cvmd_staging_dir }}/{{ item }}"
+      register: cvmd_payload
+      loop:
+        - install.sh
+        - requirements.lock
+        - cvmd.service
+        - config.toml
+
+    - name: Refuse a tarball that is not a cvmd release
+      ansible.builtin.assert:
+        that:
+          - cvmd_payload.results | selectattr('stat.exists') | list | length == 4
+        fail_msg: >-
+          {{ lium_cvmd_package_url }} unpacked without
+          {{ cvmd_payload.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}.
+          Its sha256 matched, so this is the wrong artefact rather than a
+          corrupted one — check that the URL serves the output of
+          cvmd/packaging/build.sh.
+        quiet: true
+
+    # install.sh is idempotent on its own, but it is only reached when the stamp
+    # says this package is not the installed one, so it runs on a real change.
+    #
+    # The restart is NOT optional. install.sh replaces the wheel inside a venv
+    # that systemd is already running from; without a restart the host serves the
+    # previous build while the health check passes and the run reports the new
+    # version installed. Nothing downstream can tell the difference.
+    - name: Run install.sh
+      ansible.builtin.command:
+        cmd: ./install.sh
+        chdir: "{{ cvmd_staging_dir }}"
+      register: cvmd_install
+      changed_when: true
+      notify: Restart cvmd
+
+    # Written only after install.sh returns 0. A stamp written first would mark
+    # a failed install as complete, and the next run would skip repairing it.
+    - name: Record the installed package checksum
+      ansible.builtin.copy:
+        content: "{{ lium_cvmd_package_sha256 }}\n"
+        dest: "{{ cvmd_install_stamp }}"
+        owner: root
+        group: root
+        mode: "0640"
+
+    # The tarball and the unpacked wheel are build inputs, not runtime state.
+    # Leaving them means every installed version accumulates under /opt/cvmd.
+    - name: Remove the staging directory
+      ansible.builtin.file:
+        path: "{{ cvmd_staging_dir }}"
+        state: absent

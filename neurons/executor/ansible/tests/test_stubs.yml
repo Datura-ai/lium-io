@@ -1,97 +1,38 @@
 ---
-# The stubs must be loud in BOTH directions.
+# The catalog stub must be loud in BOTH directions.
 #
-# Unset, each says what it is waiting on and ends. Set, each asserts its
-# companion variables and then fails with "not implemented". A stub that
-# silently did nothing when configured would be worse than no stub at all: it
-# would make a half-configured host look finished.
+# Unset, it says what it is waiting on and ends. Set, it asserts its companion
+# variable and then fails with "not implemented". A stub that silently did
+# nothing when configured would be worse than no stub at all: it would make a
+# half-configured host look finished.
+#
+# cvmd was the other stub here until DAH-2575 implemented it. Its refusals moved
+# to tests/test_cvmd.yml, which asserts the same property against a role that
+# now does the work.
 #
 # block/rescue rather than `ignore_errors` on the include: ignore_errors does
 # not cover a failure raised by a task INSIDE an included role, so the play
 # would abort before any assertion ran.
 
-- name: Stubs are loud when unset
+- name: The catalog stub is loud when unset
   hosts: localhost
   gather_facts: false
   vars:
     lium_test_mode: true
   roles:
-    - cvmd
     - catalog
   tasks:
-    - name: Reaching here means both stubs ended cleanly
+    - name: Reaching here means the stub ended cleanly
       ansible.builtin.debug:
-        msg: "ok  both stubs no-op cleanly when unset"
+        msg: "ok  the catalog stub no-ops cleanly when unset"
 
-- name: Stubs are loud when set
+- name: The catalog stub is loud when set
   hosts: localhost
   gather_facts: false
   vars:
     lium_test_mode: true
 
   tasks:
-    # --- cvmd, fully configured: must refuse, and name its ticket -------------
-    - name: Run the cvmd stub with everything set
-      block:
-        - name: Include cvmd with a full configuration
-          ansible.builtin.include_role:
-            name: cvmd
-          vars:
-            lium_cvmd_package_url: https://example.invalid/cvmd.tar.gz
-            lium_cvmd_package_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-            lium_cvmd_authorized_client_keys: ["ssh-ed25519 AAAA fixture"]
-
-        - name: Record that cvmd did not refuse
-          ansible.builtin.set_fact:
-            cvmd_refused: false
-            cvmd_msg: ""
-      rescue:
-        - name: Record the cvmd refusal
-          ansible.builtin.set_fact:
-            cvmd_refused: true
-            cvmd_msg: "{{ ansible_failed_result.msg | default('') }}"
-
-    - name: A fully configured cvmd must refuse and name DAH-2575
-      ansible.builtin.assert:
-        that:
-          - cvmd_refused | bool
-          - "'DAH-2575' in cvmd_msg"
-        fail_msg: >-
-          The cvmd stub must fail with "not implemented" and name the ticket that
-          implements it. refused={{ cvmd_refused }} msg={{ cvmd_msg }}
-        quiet: true
-
-    # --- cvmd, partially configured: must refuse for the RIGHT reason ---------
-    - name: Run the cvmd stub with a URL but no checksum
-      block:
-        - name: Include cvmd with only a URL
-          ansible.builtin.include_role:
-            name: cvmd
-          vars:
-            lium_cvmd_package_url: https://example.invalid/cvmd.tar.gz
-
-        - name: Record that cvmd accepted a partial configuration
-          ansible.builtin.set_fact:
-            cvmd_partial_refused: false
-            cvmd_partial_msg: ""
-      rescue:
-        - name: Record the partial-configuration refusal
-          ansible.builtin.set_fact:
-            cvmd_partial_refused: true
-            cvmd_partial_msg: "{{ ansible_failed_result.msg | default('') }}"
-
-    - name: A package URL without a checksum is refused, by name
-      ansible.builtin.assert:
-        that:
-          - cvmd_partial_refused | bool
-          - "'sha256' in (cvmd_partial_msg | lower)"
-        fail_msg: >-
-          cvmd accepted a package URL with no checksum and no authorised client
-          keys, or refused for some other reason. refused={{ cvmd_partial_refused }}
-          msg={{ cvmd_partial_msg }}
-        quiet: true
-
-    # --- catalog, fully configured -------------------------------------------
     - name: Run the catalog stub with everything set
       block:
         - name: Include catalog with a full configuration
@@ -121,6 +62,36 @@
           that implements it. refused={{ catalog_refused }} msg={{ catalog_msg }}
         quiet: true
 
+    # --- partially configured: must refuse for the RIGHT reason --------------
+    - name: Run the catalog stub with a URL but no checksum
+      block:
+        - name: Include catalog with only a URL
+          ansible.builtin.include_role:
+            name: catalog
+          vars:
+            lium_catalog_manifest_url: https://example.invalid/catalog.json
+
+        - name: Record that catalog accepted a partial configuration
+          ansible.builtin.set_fact:
+            catalog_partial_refused: false
+            catalog_partial_msg: ""
+      rescue:
+        - name: Record the partial-configuration refusal
+          ansible.builtin.set_fact:
+            catalog_partial_refused: true
+            catalog_partial_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: A manifest URL without a checksum is refused, by name
+      ansible.builtin.assert:
+        that:
+          - catalog_partial_refused | bool
+          - "'sha256' in (catalog_partial_msg | lower)"
+        fail_msg: >-
+          catalog accepted a manifest URL with no checksum, or refused for some
+          other reason. refused={{ catalog_partial_refused }}
+          msg={{ catalog_partial_msg }}
+        quiet: true
+
     - name: PASS
       ansible.builtin.debug:
-        msg: "PASS both stubs are loud when unset and when set."
+        msg: "PASS the catalog stub is loud when unset and when set."

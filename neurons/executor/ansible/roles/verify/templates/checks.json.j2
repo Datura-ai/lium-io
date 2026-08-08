@@ -351,15 +351,26 @@
   'evidence_source': 'lium-guard.sh',
   'severity': 'info'}) %}
 
+{# cvmd is optional per host, so "not requested" is SKIPPED rather than a
+   finding. Once requested it is a blocker: a host whose control daemon is down
+   accepts no CVM lifecycle call at all, and the failure is silent from the
+   outside — the port simply refuses to connect. #}
+{% set cvmd_requested = (lium_cvmd_package_url | length) > 0 %}
 {% set _ = checks.append({
-  'id': 'cvmd.stub_status',
-  'title': 'cvmd interface',
-  'status': 'SKIPPED',
-  'observed': 'configured' if (lium_cvmd_package_url | length) > 0 else 'not configured',
-  'expected': 'implemented in DAH-2575',
-  'remediation': 'cvmd ships as a variable interface only. Leave lium_cvmd_package_url unset until DAH-2575 lands.',
-  'evidence_source': 'group_vars',
-  'severity': 'info'}) %}
+  'id': 'cvmd.service_state',
+  'title': 'cvmd control daemon',
+  'status': 'SKIPPED' if not cvmd_requested else ('OK' if lium.cvmd_unit_state == 'active' else 'MUST_FIX'),
+  'observed': 'not requested'
+              if not cvmd_requested
+              else ('active, package ' ~ (lium.cvmd_installed_sha256[:12] if (lium.cvmd_installed_sha256 | length) > 0 else 'unstamped')
+                    if lium.cvmd_unit_state == 'active'
+                    else 'cvmd.service is ' ~ lium.cvmd_unit_state),
+  'expected': 'active whenever lium_cvmd_package_url is set',
+  'remediation': 'cvmd is optional. Set lium_cvmd_package_url, lium_cvmd_package_sha256 and lium_cvmd_authorized_clients to install the control daemon.'
+                 if not cvmd_requested
+                 else 'Read `journalctl -u cvmd`. cvmd refuses to start on a config or authorized-clients file it cannot load exactly as written, so the message names the entry at fault; re-run `--tags cvmd` to re-render both.',
+  'evidence_source': 'systemctl is-active cvmd.service',
+  'severity': 'info' if not cvmd_requested else 'blocker'}) %}
 
 {% set _ = checks.append({
   'id': 'catalog.stub_status',

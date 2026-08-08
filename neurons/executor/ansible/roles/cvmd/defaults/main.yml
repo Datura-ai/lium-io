@@ -1,2 +1,36 @@
 ---
-# The variable interface lives in group_vars/all/main.yml.
+# The provider-facing variable interface lives in group_vars/all/main.yml.
+#
+# The paths below are NOT settings. packaging/install.sh hardcodes every one of
+# them, so changing a value here alone would move where Ansible looks without
+# moving where the installer writes — a host that reports configured and is not.
+# They are named rather than inlined so the tasks read against one list, and so
+# a future install.sh change has a single place to land.
+cvmd_prefix: /opt/cvmd
+cvmd_config_dir: /etc/cvmd
+cvmd_config_path: /etc/cvmd/config.toml
+cvmd_authorized_clients_path: /etc/cvmd/authorized_clients.json
+cvmd_tls_dir: /etc/cvmd/tls
+cvmd_state_dir: /var/lib/cvmd
+cvmd_unit_path: /etc/systemd/system/cvmd.service
+
+# Unpack and staging directory. Under the prefix rather than /tmp so a partially
+# unpacked release cannot be handed to install.sh by a tmpfiles sweep mid-run.
+cvmd_staging_dir: /opt/cvmd/staging
+
+# Records the sha256 of the package that produced the current install. The
+# install step is skipped while it matches, which is what makes a re-run a no-op
+# instead of a venv rebuild on every converge.
+cvmd_install_stamp: /opt/cvmd/.installed-sha256
+
+# cvmd declares >= 3.13 (bittensor 11.x on the host's system Python). Asserted
+# here as well as in install.sh so the failure names the host and the version it
+# actually has, instead of surfacing from inside a shell script.
+cvmd_min_python: "3.13"
+
+# The scopes cvmd will accept in authorized_clients.json. Kept in step with
+# cvmd/src/cvmd/auth/clients.py:Scope — a value outside this set is refused at
+# daemon startup, so refusing it here turns a dead service into a named failure.
+cvmd_valid_scopes:
+  - validation
+  - renter
