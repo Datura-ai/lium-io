@@ -86,6 +86,38 @@ jobs:
       - name: Run tests
         run: mkdir -p tmp && pdm run pytest tests/ -v --tb=short
 
+  cvmd:
+    name: cvmd Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: neurons/executor/cvmd
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 3.13 on purpose: cvmd runs on the CVM host's system Python (Ubuntu 25.10/26.04), not on
+      # the executor's 3.11.11. See neurons/executor/cvmd/README.md.
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install pdm
+        uses: pdm-project/setup-pdm@v4
+        with:
+          cache: true
+          cache-dependency-path: neurons/executor/cvmd/pdm.lock
+
+      - name: Install dependencies
+        run: pdm install
+
+      - name: Run tests
+        run: pdm run pytest tests/ -v --tb=short --strict-markers
+
   # ---------------------------------------------------------------------------
   # DAH-2544 — CVM host provisioning playbook.
   #
