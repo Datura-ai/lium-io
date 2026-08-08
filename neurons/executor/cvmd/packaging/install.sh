@@ -47,8 +47,13 @@ echo "==> installing dependencies"
 "${VENV}/bin/pip" install --disable-pip-version-check --no-input \
     --require-hashes -r "${here}/requirements.lock"
 
+# --force-reinstall because pip resolves by VERSION, not by contents: a rebuilt wheel that keeps
+# the same version string is "already satisfied" and silently not installed, so the venv keeps
+# running the previous build while every layer above reports a successful upgrade. Measured on
+# hardware during the DAH-2575 acceptance run. --no-deps keeps it to the one wheel, so the
+# hash-pinned dependency install above is not redone.
 echo "==> installing cvmd"
-"${VENV}/bin/pip" install --disable-pip-version-check --no-input --no-deps \
+"${VENV}/bin/pip" install --disable-pip-version-check --no-input --no-deps --force-reinstall \
     "${here}"/cvmd-*.whl
 
 echo "==> laying down ${CONFIG_DIR}"
