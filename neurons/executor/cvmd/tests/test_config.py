@@ -144,6 +144,37 @@ class TestConfig:
         with pytest.raises(ConfigError, match="positive"):
             load_config(path)
 
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            "tcp:12200",  # no guest side
+            "tcp:0.0.0.0:0:22",  # port 0 — well-formed TOML, refused by the parser
+            "tcp:0.0.0.0:70000:22",  # above 65535
+            "sftp:0.0.0.0:2200:2200:2200",  # too many fields
+        ],
+    )
+    def test_an_unusable_port_mapping_refuses(self, tmp_path, mapping):
+        """Malformed is fatal at startup — absent and wrong are different problems.
+
+        Left to the launch path, one of these makes a host that looks configured and refuses
+        every launch at the first request, which is the state nobody discovers until a
+        validator does.
+        """
+        path = tmp_path / "config.toml"
+        path.write_text(
+            f'authorized_clients = "/a.json"\nstate_dir = "/b"\ncvm_ports = ["{mapping}"]\n'
+        )
+        with pytest.raises(ConfigError, match="cvm_ports"):
+            load_config(path)
+
+    def test_a_usable_port_mapping_loads(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'authorized_clients = "/a.json"\nstate_dir = "/b"\n'
+            'cvm_ports = ["tcp:0.0.0.0:12200:2200", "udp:65535:1"]\n'
+        )
+        assert load_config(path).launch.ports == ("tcp:0.0.0.0:12200:2200", "udp:65535:1")
+
     def test_env_overrides_the_file(self, tmp_path, monkeypatch):
         path = tmp_path / "config.toml"
         path.write_text('authorized_clients = "/a.json"\nstate_dir = "/b"\nport = 9443\n')

@@ -253,6 +253,104 @@ lium_cvmd_skew_seconds: 60
 # `kind` plus three hashes — hundreds of bytes.
 lium_cvmd_max_body_bytes: 65536
 
+# --- the launch path (DAH-2576) ---------------------------------------------
+#
+# All of the below is optional. cvmd starts and serves /health and /v1/state
+# without it; a launch request on a host that lacks a setting is refused naming
+# that setting. That split is deliberate — a mistyped size should not take the
+# node's state reporting down with it.
+
+# Where dstack.py and host_api.py live on this host. cvmd imports dstack.py as a
+# library rather than shelling out, so this is a directory, not an executable.
+# Typically <repo>/neurons/executor/dstacktee/scripts.
+lium_cvmd_dstack_scripts_dir: ""
+
+# Where cvmd keeps the VM directories it creates. Deliberately NOT dstacktee's
+# own run/vms: a legacy CVM launched by lium-cvm.sh must stay untouched by cvmd
+# during the rollout, and separate directories are what guarantee that.
+lium_cvmd_run_dir: /var/lib/cvmd/vms
+
+# The approved artifact catalog: which software stacks this host may launch.
+# Each entry pins a triple (QEMU build + OS image hash + compose hash) and the
+# local paths that produce it. A request naming a triple that is not here is
+# refused, which is what lets a validator detect a host serving a stack other
+# than the one it expects to attest.
+#
+#   lium_cvmd_catalog:
+#     - id: validation-v3
+#       kind: validation
+#       qemu: "10.1.0"
+#       os_image_hash: a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02
+#       compose_hash: ab4d14336f0762c0d8ec7631a69148246661de84ceead7a215f8a33b74fd43e6
+#       os_image_path: /opt/lium-io/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11
+#       compose_path: /etc/cvmd/composes/validation-v3.yml
+#       init_script: /opt/lium-io/neurons/executor/dstacktee/app/init_script.sh
+#       pre_launch_script: /opt/lium-io/neurons/executor/dstacktee/app/pre_launch_script.sh
+#
+# Hashes must be 64 lowercase hex digits — no `sha256:` prefix, no uppercase.
+# cvmd compares them against values it computes itself, so any other spelling
+# would never match and the launch would fail as "not approved", which sends an
+# operator looking at the wrong thing.
+#
+# This is the DAH-2576 stub. DAH-2578 replaces it with the backend's signed
+# manifest, at which point this list stops being the source of truth.
+lium_cvmd_catalog: []
+
+# dstack's key-provider port, which the guest reaches for its sealing key. The
+# same default lium-cvm.sh relies on.
+lium_cvmd_key_provider_port: 3443
+
+# How long a launch waits for the guest to answer before giving up and failing
+# the node. Generous because a TDX guest with a large memory backing boots
+# slowly; the CVM is left running on timeout, so this bounds the request, not
+# the VM.
+lium_cvmd_launch_timeout_seconds: 900
+
+# How long a graceful poweroff is given before cvmd signals the process group.
+# A large-memory TDX guest returns its RAM to the host as it exits, and that is
+# slow — 43 minutes was measured for a 1.13 TB guest on this fleet. Too low and
+# a legitimate slow exit is cut short by a SIGKILL. Per-hardware-class budgets
+# are DAH-2577's open item.
+lium_cvmd_teardown_timeout_seconds: 600
+
+# --- CVM sizing: PROVIDER configuration, never an API field ------------------
+#
+# A cvmd request names which software stack to run; the host decides how big it
+# is. Settled while reviewing DAH-2575. Everything here is the CVM's shape, so
+# these are the CVM_* values from dstacktee/.env, moved to where the daemon can
+# read them.
+lium_cvm_vcpus: 0
+lium_cvm_memory: ""
+lium_cvm_disk: ""
+
+# PCI slots to pass through, e.g. ["19:00.0", "3b:00.0"], or the single entry
+# ["all"]. An empty list is a legal CVM with no passthrough — so it does not
+# block a launch the way a missing size does.
+lium_cvm_gpus: []
+
+# Forwarded ports as "protocol[:address]:host_port:guest_port". Every one must
+# be bindable before QEMU starts, so a mapping that collides with a CVM already
+# on this host refuses the launch instead of producing two guests fighting over
+# an address.
+lium_cvm_ports: []
+
+# Passed to dstack as --env-file. It lands in the guest's .user-config, which is
+# OUTSIDE app-compose.json — so its contents do not change the compose hash, and
+# two hosts with different env still measure identically.
+lium_cvm_env_file: ""
+
+# The guest-side port carrying SSH. When set, cvmd reads the guest's host key
+# through the matching forward and reports its fingerprint; that read is also
+# what proves the CVM is up, since a TCP accept only proves QEMU is listening.
+# Unset => readiness falls back to a TCP accept and the fingerprint is null.
+lium_cvm_ssh_guest_port: 0
+
+# Both left at what lium-cvm.sh leaves them at: it passes neither flag, so
+# argparse defaults them to false. They change the QEMU command line and
+# therefore the measurements — do not enable one on a single host.
+lium_cvm_pin_numa: false
+lium_cvm_hugepages: false
+
 # catalog variable interface. Unset => the stub says what it is waiting on.
 # Set => the stub asserts its companion then fails "not implemented".
 lium_catalog_manifest_url: ""

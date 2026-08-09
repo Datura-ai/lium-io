@@ -72,6 +72,74 @@ def config(clients_file: Path, state_dir: Path) -> Config:
     return Config(authorized_clients=clients_file, state_dir=state_dir)
 
 
+# --------------------------------------------------------------------------- DAH-2576
+
+# The real launcher, in this repo. The launch tests import it rather than a stub: the whole
+# claim of DAH-2576 is that cvmd calls *this file*, and a stub would pass while the claim was
+# false. It needs nothing but the standard library, so importing it here costs nothing.
+DSTACK_SCRIPTS = Path(__file__).resolve().parents[2] / "dstacktee" / "scripts"
+
+
+@pytest.fixture
+def dstack_scripts() -> Path:
+    if not (DSTACK_SCRIPTS / "dstack.py").is_file():
+        pytest.skip(f"no dstack.py at {DSTACK_SCRIPTS}")
+    return DSTACK_SCRIPTS
+
+
+@pytest.fixture
+def dstack(dstack_scripts: Path):
+    from cvmd.dstack.loader import load_dstack
+
+    return load_dstack(dstack_scripts)
+
+
+@pytest.fixture
+def compose_file(tmp_path: Path) -> Path:
+    """A compose file with no unresolved placeholders.
+
+    `lium-cvm.sh` substitutes `${EXECUTOR_RUNNER_IMAGE_DIGEST}` *before* dstack measures the
+    file. Under cvmd the catalog points at an already-resolved compose, and the compose-hash
+    gate is what catches it if that ever stops being true.
+    """
+    path = tmp_path / "docker-compose.yml"
+    path.write_text(
+        "services:\n"
+        "  executor-runner:\n"
+        "    image: daturaai/compute-subnet-executor-runner@sha256:" + ("c" * 64) + "\n"
+    )
+    return path
+
+
+@pytest.fixture
+def guest_scripts(tmp_path: Path) -> tuple[Path, Path]:
+    init = tmp_path / "init_script.sh"
+    init.write_text("#!/bin/sh\necho init\n")
+    pre_launch = tmp_path / "pre_launch_script.sh"
+    pre_launch.write_text("#!/bin/sh\necho pre-launch\n")
+    return init, pre_launch
+
+
+@pytest.fixture
+def env_file(tmp_path: Path) -> Path:
+    path = tmp_path / "cvm.env"
+    path.write_text("EXTERNAL_PORT=8001\nSSH_PORT=2200\n")
+    return path
+
+
+@pytest.fixture
+def image_dir(tmp_path: Path) -> Path:
+    """An OS image directory with the one file cvmd measures.
+
+    `setup_instance` only records the image path; `digest.txt` is read at measurement time and
+    by `run_instance`, so this is enough for everything short of an actual boot.
+    """
+    path = tmp_path / "images" / "dstack-nvidia-0.5.11"
+    path.mkdir(parents=True)
+    (path / "digest.txt").write_text("d" * 64 + "\n")
+    return path
+
+
 @pytest.fixture
 def app(config: Config):
     return create_app(config)

@@ -13,6 +13,25 @@ Environment=CVMD_CONFIG_PATH=/etc/cvmd/config.toml
 # directory resets the startup floor, so it is state, not cache.
 StateDirectory=cvmd
 
+# The CVM must outlive cvmd. A daemon upgrade that took the node's guest with it would be worse
+# than the outage it was fixing, which is why the supervisor detaches into its own session and
+# why RECONCILING exists at all.
+#
+# The default, control-group, kills EVERY process in the unit's cgroup on stop. A session is
+# not a cgroup, so detaching is not enough on its own: measured on au11, `systemctl restart
+# cvmd` logged
+#
+#     cvmd.service: Killing process 218807 (qemu-system-x86) with signal SIGKILL
+#
+# and the node came back FAILED with a CVM directory and no CVM. `process` stops the main
+# process only and leaves the supervisor — and the guest under it — running, for cvmd to adopt
+# on its next start.
+#
+# The consequence is deliberate: `systemctl stop cvmd` stops the control plane, not the CVM.
+# `systemctl kill cvmd` still reaches everything, which is the escape hatch for an operator who
+# means it.
+KillMode=process
+
 Restart=on-failure
 RestartSec=5
 

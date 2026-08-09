@@ -21,6 +21,68 @@ Produce the tarball and its checksum with
 [`cvmd/packaging/build.sh`](../../cvmd/packaging/build.sh), which prints exactly
 the sha256 this role expects.
 
+### The launch path (DAH-2576)
+
+Optional as a whole — cvmd serves `/health` and `/v1/state` without any of it and
+refuses a launch naming the setting it lacks. `lium_cvmd_dstack_scripts_dir` is
+the switch: set it and the role requires the rest, because a host with HALF a
+launch configuration looks configured and refuses every launch at the first
+request.
+
+| Variable | Meaning |
+|---|---|
+| `lium_cvmd_dstack_scripts_dir` | The dstacktee `scripts` directory. cvmd **imports** `dstack.py` from it as a library, so a path to the repo root will not do. |
+| `lium_cvmd_run_dir` | Where cvmd keeps the VM directories it creates. Deliberately not dstacktee's own `run/vms`. |
+| `lium_cvmd_catalog` | The approved artifacts — see below. |
+| `lium_cvmd_key_provider_port` | dstack's key-provider port. `3443`. |
+| `lium_cvmd_launch_timeout_seconds` | How long a launch waits for the guest before failing the node. |
+| `lium_cvmd_teardown_timeout_seconds` | The graceful-poweroff window before cvmd signals the process group. |
+| `lium_cvm_vcpus`, `lium_cvm_memory`, `lium_cvm_disk` | CVM sizing. |
+| `lium_cvm_gpus` | PCI slots to pass through, `["all"]`, or `[]` for none. |
+| `lium_cvm_ports` | Forwarded ports, `protocol[:address]:host:guest`. |
+| `lium_cvm_env_file` | Passed as `--env-file`. Lands outside `app-compose.json`, so it does not change the compose hash. |
+| `lium_cvm_ssh_guest_port` | The guest-side SSH port. Set ⇒ cvmd reports the host-key fingerprint and uses reading it as proof the CVM is up. Must be the guest side (the last field) of one `lium_cvm_ports` entry — the role refuses a value nothing forwards, since there would be nothing to read it through. |
+| `lium_cvm_pin_numa`, `lium_cvm_hugepages` | Both change the QEMU command line and therefore the measurements. `lium-cvm.sh` passes neither. |
+
+**Sizing is provider configuration, never an API field.** A cvmd request names
+which software stack to run; the host decides how big it is. So there is nothing
+a caller could send to fill a gap here — a host missing a size refuses every
+launch, which is why the role refuses first.
+
+### The catalog pins a triple
+
+`lium_cvmd_catalog` is a list of approved artifacts, rendered to
+`/etc/cvmd/catalog.json`. Each entry pins the **triple** — QEMU build, OS image
+hash, compose hash — that this host is allowed to produce, plus the local paths
+that produce it:
+
+```yaml
+lium_cvmd_catalog:
+  - id: validation-v3
+    kind: validation
+    qemu: "10.1.0"
+    os_image_hash: a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02
+    compose_hash: ab4d14336f0762c0d8ec7631a69148246661de84ceead7a215f8a33b74fd43e6
+    os_image_path: /opt/lium-io/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11
+    compose_path: /etc/cvmd/composes/validation-v3.yml
+    init_script: /opt/lium-io/neurons/executor/dstacktee/app/init_script.sh
+    pre_launch_script: /opt/lium-io/neurons/executor/dstacktee/app/pre_launch_script.sh
+```
+
+Hashes must be 64 lowercase hex digits — no `sha256:` prefix, no uppercase. cvmd
+compares them against values it computes itself, so any other spelling would
+never match and the launch would fail as "not approved", sending an operator
+looking at the wrong thing. `load_catalog` refuses those spellings outright, and
+the role runs it against the rendered file before it replaces the working one.
+
+`compose_path` must point at an **already-resolved** compose. `lium-cvm.sh`
+substitutes `${EXECUTOR_RUNNER_IMAGE_DIGEST}` before dstack measures the file;
+under cvmd the catalog carries the resolved copy, and the compose-hash gate is
+what catches it if that ever stops being true.
+
+This is the DAH-2576 stub. DAH-2578 replaces it with the backend's signed
+manifest, at which point this list stops being the source of truth.
+
 ### Authorised clients are hotkeys, not SSH keys
 
 cvmd authenticates a **signed request** against a bittensor hotkey, so the only
