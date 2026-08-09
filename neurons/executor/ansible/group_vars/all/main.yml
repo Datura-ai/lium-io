@@ -309,9 +309,25 @@ lium_cvmd_launch_timeout_seconds: 900
 # How long a graceful poweroff is given before cvmd signals the process group.
 # A large-memory TDX guest returns its RAM to the host as it exits, and that is
 # slow — 43 minutes was measured for a 1.13 TB guest on this fleet. Too low and
-# a legitimate slow exit is cut short by a SIGKILL. Per-hardware-class budgets
-# are DAH-2577's open item.
+# a legitimate slow exit is cut short by a SIGKILL.
 lium_cvmd_teardown_timeout_seconds: 600
+
+# How long the node's hardware then gets to come back: QEMU reaped with no
+# zombie, every /dev/vfio descriptor closed, the guest's memory returned and the
+# forwarded ports bindable. A teardown that runs out of this budget fails the
+# node naming the condition that did not hold, rather than reporting a success
+# the next launch would discover was false.
+#
+# A separate budget from the one above because it measures a different thing —
+# that one bounds how long the GUEST is given to power itself off, this one
+# bounds how long the HOST takes to get its hardware back afterwards. The two
+# are not proportional. See roles/cvmd/README.md for the measured values.
+lium_cvmd_teardown_verify_timeout_seconds: 1800
+
+# How much of the guest's configured memory must be back before the node counts
+# as free. Below 1.0 because MemAvailable is the kernel's own estimate and reads
+# a little short even on a host holding nothing.
+lium_cvmd_teardown_memory_tolerance: 0.9
 
 # --- CVM sizing: PROVIDER configuration, never an API field ------------------
 #

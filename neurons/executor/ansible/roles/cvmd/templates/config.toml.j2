@@ -39,7 +39,13 @@ catalog_path = "{{ cvmd_catalog_path }}"
 run_dir = "{{ lium_cvmd_run_dir }}"
 key_provider_port = {{ lium_cvmd_key_provider_port }}
 launch_timeout_seconds = {{ lium_cvmd_launch_timeout_seconds }}
+
+# Two teardown budgets, because they measure two different things: how long the
+# guest is given to power itself off, and how long the host then takes to get
+# its hardware back.
 teardown_timeout_seconds = {{ lium_cvmd_teardown_timeout_seconds }}
+teardown_verify_timeout_seconds = {{ lium_cvmd_teardown_verify_timeout_seconds }}
+teardown_memory_tolerance = {{ lium_cvmd_teardown_memory_tolerance }}
 
 # CVM sizing — provider configuration, never sent in a request.
 {% if lium_cvm_vcpus %}

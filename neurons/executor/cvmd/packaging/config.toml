@@ -45,8 +45,18 @@ max_body_bytes = 65536
 #
 # The graceful-poweroff window before cvmd signals the process group. A large-memory TDX guest
 # returns its RAM to the host as it exits and that is slow — 43 minutes was measured for a
-# 1.13 TB guest. Per-hardware-class budgets are DAH-2577's open item.
+# 1.13 TB guest.
 # teardown_timeout_seconds = 600
+#
+# How long the node's hardware then gets to come back — QEMU reaped, VFIO descriptors closed,
+# the guest's memory returned, the forwarded ports bindable. A separate budget because it
+# measures a different thing: a guest that exits in seconds can leave its memory draining for
+# tens of minutes. See roles/cvmd/README.md for the measured per-hardware-class values.
+# teardown_verify_timeout_seconds = 1800
+#
+# How much of the guest's configured memory must be back before the node counts as free. Below
+# 1.0 because MemAvailable is the kernel's own estimate.
+# teardown_memory_tolerance = 0.9
 #
 # CVM sizing is PROVIDER configuration and is never sent in a request: a caller names which
 # software stack to run, and the host decides how big it is.

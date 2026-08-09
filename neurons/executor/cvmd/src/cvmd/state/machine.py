@@ -1,11 +1,16 @@
 """The node state machine.
 
-Names come from the CVM v2 architecture doc §04. The backend's "SWITCHING" is its surface word
-for any non-terminal transition, not a state cvmd holds.
+Names come from the CVM v2 architecture doc §04. Every transition is driven by a fact about the
+host — a process observed in `/proc`, a descriptor observed open, a port observed bindable — not
+by what cvmd last recorded.
 
-DAH-2575 ships the machine and its persistence only. Nothing here drives a transition from real
-host facts — reconciling against QEMU/VFIO is DAH-2576's job, and until then RECONCILING is just
-the initial state.
+`TEARDOWN` and `SWITCHING` split the crossing between validation and rented (FR-C5, FR-C7) at the
+moment the two halves stop being the same question. In `TEARDOWN` cvmd is still stopping the CVM:
+asking the guest to power off, then escalating. In `SWITCHING` the process is gone and the node is
+still not free — the GPUs, the guest's memory and the forwarded ports come back to the host after
+the process does, and on a large-memory TDX guest that tail is the slowest part of the whole
+crossing. Both are the window FR-C7 calls "switching": neither rentable nor reachable, and not
+offline either.
 """
 
 from enum import StrEnum
@@ -17,6 +22,7 @@ class NodeState(StrEnum):
     VALIDATION_RUNNING = "VALIDATION_RUNNING"
     RENTER_RUNNING = "RENTER_RUNNING"
     TEARDOWN = "TEARDOWN"
+    SWITCHING = "SWITCHING"
     FAILED = "FAILED"
 
 
@@ -41,7 +47,13 @@ LEGAL_TRANSITIONS: dict[NodeState, frozenset[NodeState]] = {
     ),
     NodeState.VALIDATION_RUNNING: frozenset({NodeState.TEARDOWN, NodeState.FAILED}),
     NodeState.RENTER_RUNNING: frozenset({NodeState.TEARDOWN, NodeState.FAILED}),
-    NodeState.TEARDOWN: frozenset({NodeState.RECONCILING, NodeState.FAILED}),
+    # RECONCILING as well as SWITCHING, because a teardown call that found nothing to stop has
+    # no process to wait for and no resources to reclaim.
+    NodeState.TEARDOWN: frozenset({NodeState.SWITCHING, NodeState.RECONCILING, NodeState.FAILED}),
+    # Deliberately NOT to LAUNCHING. FR-C6 forbids starting the next CVM before the last one's
+    # resources are actually free, and leaving that edge out is what enforces it structurally
+    # rather than by remembering to check.
+    NodeState.SWITCHING: frozenset({NodeState.RECONCILING, NodeState.FAILED}),
     # Recovery is deliberate, not automatic: FAILED goes back through reconciliation so the
     # daemon re-derives the host's real state instead of assuming the failure cleared.
     NodeState.FAILED: frozenset({NodeState.RECONCILING}),
