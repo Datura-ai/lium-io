@@ -242,6 +242,7 @@ jobs:
           ansible-playbook -i inventory/localhost.yml tests/test_sgx_registration.yml
           ansible-playbook -i inventory/localhost.yml tests/test_stubs.yml
           ansible-playbook -i inventory/localhost.yml tests/test_cvmd.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_cvmd_launch.yml
           ansible-playbook -i inventory/localhost.yml tests/test_repo_app_pristine.yml
           ansible-playbook -i inventory/localhost.yml tests/test_reboot_teardown_gate.yml
 

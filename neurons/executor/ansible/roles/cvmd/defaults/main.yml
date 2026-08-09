@@ -10,6 +10,7 @@ cvmd_prefix: /opt/cvmd
 cvmd_config_dir: /etc/cvmd
 cvmd_config_path: /etc/cvmd/config.toml
 cvmd_authorized_clients_path: /etc/cvmd/authorized_clients.json
+cvmd_catalog_path: /etc/cvmd/catalog.json
 cvmd_tls_dir: /etc/cvmd/tls
 cvmd_state_dir: /var/lib/cvmd
 cvmd_unit_path: /etc/systemd/system/cvmd.service

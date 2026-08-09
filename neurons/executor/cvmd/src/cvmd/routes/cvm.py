@@ -5,33 +5,84 @@ parsed and the scope check already evaluated. They never re-read the raw bytes: 
 only has to disagree with the first once for the scope check and the handler to act on different
 values.
 
-The two mutating routes are registered with full auth and scope enforcement but return 501. That
-is deliberate: the scope matrix is testable end-to-end today, and DAH-2576 only fills in handlers
-rather than also wiring auth.
+`POST {kind: "validation"}` and `DELETE` do real work as of DAH-2576. `POST {kind: "renter"}`
+still answers 501: the renter body is DAH-2580's to define, and validating it against a
+validation-shaped model now would be inventing its contract.
+
+Both mutating handlers run the manager on a worker thread. A launch waits minutes for a guest
+to boot, and holding the event loop for that would make `/v1/state` unanswerable for exactly
+the period during which someone wants to read it.
 """
+
+import asyncio
+import logging
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from cvmd import __version__
+from cvmd.catalog import HEX64
+from cvmd.cvm.manager import KIND_RENTER, KIND_VALIDATION, CvmManager, LaunchFailure, Triple
 from cvmd.state.store import StateStore
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-NOT_IMPLEMENTED = "not implemented in DAH-2575 — CVM operations land in DAH-2576"
+RENTER_NOT_IMPLEMENTED = "renter CVM provisioning lands in DAH-2580"
 
 
 class CreateCvmRequest(BaseModel):
-    """The create body. `kind` is what the middleware resolved the scope from; the pinned triple
-    is carried through unvalidated here because DAH-2576 owns what a valid triple is.
+    """The create body: which stack to run, never how big to make it.
+
+    The pinned triple is required, not defaulted. A host that chose the stack itself would give
+    the validator no way to tell "the CVM I asked for" from "whatever this host felt like
+    running" — and detecting exactly that is why the triple is attested at all.
+
+    Sizing (vCPUs, memory, disk, GPUs) is absent by design: it is provider configuration read
+    from `/etc/cvmd/config.toml`, settled while reviewing DAH-2575.
     """
 
     kind: str
+    qemu: str = Field(min_length=1)
+    os_image_hash: str = Field(pattern=HEX64)
+    compose_hash: str = Field(pattern=HEX64)
 
 
 def _store(request: Request) -> StateStore:
     return request.app.state.store
+
+
+def _manager(request: Request) -> CvmManager:
+    return request.app.state.cvm
+
+
+def _failure(exc: LaunchFailure) -> JSONResponse:
+    return JSONResponse(status_code=exc.status, content={"detail": exc.reason})
+
+
+async def _exclusively(request: Request, operation, *, success: int) -> JSONResponse:
+    """Run one CVM operation on a worker thread, at most one at a time.
+
+    The lock is non-blocking on purpose: a second operation arriving mid-launch is refused, not
+    queued. Queueing would leave the caller waiting on a node that is already committed, and the
+    answer it needs — "not here, not now" — is available immediately.
+    """
+    lock = request.app.state.cvm_lock
+    if not lock.acquire(blocking=False):
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "another CVM operation is already in progress on this node"},
+        )
+    try:
+        report = await asyncio.to_thread(operation)
+    except LaunchFailure as exc:
+        logger.warning("CVM operation refused (%d): %s", exc.status, exc.reason)
+        return _failure(exc)
+    finally:
+        lock.release()
+    return JSONResponse(status_code=success, content=report)
 
 
 @router.get("/health")
@@ -41,18 +92,36 @@ async def health() -> dict:
 
 @router.get("/v1/state")
 async def get_state(request: Request) -> dict:
-    return _store(request).document.to_json()
+    return {**_store(request).document.to_json(), "cvm": _manager(request).describe()}
 
 
 @router.post("/v1/cvm")
 async def create_cvm(request: Request) -> JSONResponse:
+    body = request.state.parsed_body
+
+    # Checked before the model so the renter path keeps answering 501 rather than 422 for a
+    # body whose required fields DAH-2580 has not defined yet.
+    if isinstance(body, dict) and body.get("kind") == KIND_RENTER:
+        return JSONResponse(status_code=501, content={"detail": RENTER_NOT_IMPLEMENTED})
+
     try:
-        CreateCvmRequest.model_validate(request.state.parsed_body)
+        parsed = CreateCvmRequest.model_validate(body)
     except ValidationError as exc:
         return JSONResponse(status_code=422, content={"detail": exc.errors(include_url=False)})
-    return JSONResponse(status_code=501, content={"detail": NOT_IMPLEMENTED})
+
+    triple = Triple(
+        qemu=parsed.qemu,
+        os_image_hash=parsed.os_image_hash,
+        compose_hash=parsed.compose_hash,
+    )
+    manager = _manager(request)
+    return await _exclusively(
+        request,
+        lambda: manager.create(kind=KIND_VALIDATION, triple=triple),
+        success=201,
+    )
 
 
 @router.delete("/v1/cvm")
 async def destroy_cvm(request: Request) -> JSONResponse:
-    return JSONResponse(status_code=501, content={"detail": NOT_IMPLEMENTED})
+    return await _exclusively(request, _manager(request).destroy, success=200)
