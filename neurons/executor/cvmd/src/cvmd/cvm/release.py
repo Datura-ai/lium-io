@@ -44,6 +44,14 @@ VFIO_PREFIX = "/dev/vfio/"
 # sleep, so a node that is already free answers immediately; this only paces the waiting.
 POLL_SECONDS = 2
 
+# How often a wait that is still going says what it is waiting for.
+#
+# Not decoration. A teardown on au11 once held for 161s on `ports_free` while everything else
+# had settled in 0.2s, and the journal recorded nothing until it finished — by which time the
+# condition was satisfied and its `detail` no longer named what had been held. A long switch
+# window is the thing FR-I3 budgets for, so it has to be diagnosable while it is happening.
+PROGRESS_SECONDS = 30
+
 PROCESS_REAPED = "process_reaped"
 VFIO_RELEASED = "vfio_released"
 MEMORY_RETURNED = "memory_returned"
@@ -414,6 +422,7 @@ def verify_released(
     """
     started = now()
     deadline = started + timeout
+    reported = started
     report = ReleaseReport(timings={name: Timing() for name in CONDITION_NAMES})
 
     while True:
@@ -439,4 +448,12 @@ def verify_released(
                 "the node was not released in %.0fs: %s", elapsed, report.why_incomplete()
             )
             return report
+
+        if now() - reported >= PROGRESS_SECONDS:
+            reported = now()
+            logger.info(
+                "%.0fs after the stop this node is still held by %s",
+                elapsed,
+                report.why_incomplete(),
+            )
         sleep(min(poll, max(deadline - now(), 0)))

@@ -347,6 +347,24 @@ class TestTheWait:
         assert "vfio_released" in report.why_incomplete()
         assert "memory_returned" in report.why_incomplete()
 
+    def test_a_long_wait_says_what_it_is_waiting_for_while_it_waits(self, caplog):
+        """A switch window that takes minutes has to be diagnosable before it ends. Once it
+        ends, the satisfied condition's own detail no longer says what had been holding it."""
+        now, sleep = virtual_clock()
+
+        with caplog.at_level("INFO", logger="cvmd.cvm.release"):
+            release.verify_released(
+                Fake((True, False, True, True)),
+                timeout=release.PROGRESS_SECONDS * 2,
+                poll=release.PROGRESS_SECONDS,
+                now=now,
+                sleep=sleep,
+            )
+
+        progress = [r.getMessage() for r in caplog.records if "still held by" in r.getMessage()]
+        assert progress, "a wait past the progress interval logged nothing"
+        assert "vfio_released" in progress[0]
+
     def test_the_report_carries_all_four_conditions_whatever_the_outcome(self):
         now, sleep = virtual_clock()
 

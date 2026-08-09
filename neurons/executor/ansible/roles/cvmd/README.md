@@ -69,15 +69,29 @@ draining for tens of minutes, because that work happens in the kernel after the
 process is gone — which is exactly why confirming the process group is empty was
 never enough.
 
-Measured switch windows, for setting the budget per hardware class:
+Measured switch windows, for setting the budget per hardware class. The two
+columns are what the two budgets bound, so read them against the settings above.
 
-| Host | Guest | Process reaped | Node fully released |
-|---|---|---|---|
-| au11 (Intel TDX, dstack-nvidia-0.5.11) | 16 GiB, no GPU passthrough | _measured during acceptance_ | _measured during acceptance_ |
-| — | 1.13 TB | — | ~43 min (observed under `lium-cvm.sh`, DAH-2544) |
+| Host | Guest | Guest powered off | Hardware back afterwards | `DELETE` end to end |
+|---|---|---|---|---|
+| au11 — Intel TDX, QEMU 9.2.1, `dstack-nvidia-0.5.11` | 8 vCPU, 16 GiB, no GPU passthrough | ~5 s | **0.2 s** | **5–6 s** |
+| the same fleet, under `lium-cvm.sh` | 1.13 TB | — | ~43 min | — |
 
-The default of 1800 s is sized for the ordinary case with room, not for the
-largest guests on the fleet. A host running 1 TB-class CVMs needs its own value.
+On a small guest the hardware is back before the first evaluation finishes: the
+process, the VFIO groups, the memory and the ports were all released 0.2 s after
+the stop, across three runs. The 43-minute figure is the other end of the range
+and the reason the default is 1800 s rather than a minute — it is sized for the
+ordinary case with room, not for the largest guests on the fleet. **A host
+running TB-class CVMs needs its own value**, and the measurement to set it from
+is the `memory_returned` timing in its own `last_switch` report.
+
+One outlier is worth knowing about: a single au11 teardown held on `ports_free`
+for 161 s while the other three conditions settled in 0.2 s. It did not recur in
+three later runs of the same shape, and a probe of the forwarded ports across a
+teardown showed them bindable 2 s after the guest stopped — with and without
+`SO_REUSEADDR`, so it was not `TIME_WAIT`. It is recorded rather than explained.
+`verify_released` now logs what it is still waiting for every 30 s, which is what
+was missing to diagnose it at the time.
 
 ### The catalog pins a triple
 
