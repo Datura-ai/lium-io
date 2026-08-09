@@ -5,6 +5,9 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from bittensor.sp_core import Keypair
+
+from cvmd.catalog import CatalogConfig
 from cvmd.cvm import ports
 
 DEFAULT_CONFIG_PATH = Path("/etc/cvmd/config.toml")
@@ -48,6 +51,13 @@ DEFAULT_TEARDOWN_MEMORY_TOLERANCE = 0.9
 # dstack's default key-provider port. lium-cvm.sh relies on the same default.
 DEFAULT_KEY_PROVIDER_PORT = 3443
 
+# How often the host asks the backend for the current catalog. It is the upper bound on how long
+# a revocation takes to reach a node that nobody pushes to, so it is minutes rather than hours;
+# the platform can also make it immediate with `POST /v1/catalog/refresh`.
+DEFAULT_CATALOG_REFRESH_SECONDS = 300
+
+DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS = 30
+
 
 class ConfigError(Exception):
     """Raised when the config file is missing, malformed, or internally inconsistent.
@@ -72,7 +82,6 @@ class LaunchConfig:
     """
 
     dstack_scripts_dir: Path | None = None
-    catalog_path: Path | None = None
     run_dir: Path | None = None
     key_provider_port: int = DEFAULT_KEY_PROVIDER_PORT
     launch_timeout_seconds: int = DEFAULT_LAUNCH_TIMEOUT_SECONDS
@@ -97,9 +106,12 @@ class LaunchConfig:
     # Required for a launch. `gpus` is deliberately absent: a CVM with no GPUs is a legal
     # configuration, so an empty list cannot be distinguished from an unset one and must not
     # block a launch.
+    # The catalog is deliberately absent: it is no longer a host setting but a signed document
+    # from the platform, so "this host has no catalog" is a `CatalogError` naming which of the
+    # catalog settings or which manifest is missing — a far more specific answer than a list of
+    # unset keys. See `catalog/store.py:CatalogConfig.missing`.
     _REQUIRED = (
         "dstack_scripts_dir",
-        "catalog_path",
         "run_dir",
         "vcpus",
         "memory",
@@ -123,6 +135,7 @@ class Config:
     skew_seconds: int = DEFAULT_SKEW_SECONDS
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     launch: LaunchConfig = LaunchConfig()
+    catalog: CatalogConfig = CatalogConfig()
 
     @property
     def tls_enabled(self) -> bool:
@@ -212,7 +225,6 @@ def _load_launch(table: dict) -> LaunchConfig:
     """Read the DAH-2576 launch settings. Absent is fine; malformed is fatal."""
     launch = LaunchConfig(
         dstack_scripts_dir=_as_path(_get(table, "dstack_scripts_dir")),
-        catalog_path=_as_path(_get(table, "catalog_path")),
         run_dir=_as_path(_get(table, "run_dir")),
         key_provider_port=_as_int(
             _get(table, "key_provider_port", DEFAULT_KEY_PROVIDER_PORT), "key_provider_port"
@@ -277,6 +289,59 @@ def _load_launch(table: dict) -> LaunchConfig:
     return launch
 
 
+def _load_catalog(table: dict, state_dir: Path) -> CatalogConfig:
+    """Read the DAH-2578 catalog settings.
+
+    Two of the four paths default off `state_dir` rather than being required: they are
+    daemon-owned working files, so a host that names its state directory has already said where
+    they go, and two more settings in every config.toml would be two more chances to write one
+    of them somewhere Ansible also manages.
+
+    `signer` and `images_dir` have no defaults on purpose. A guessed signer is a trusted key
+    nobody chose, and a guessed image directory is a path whose contents decide what a node
+    attests as. Unset means this host launches nothing, and says which setting is why.
+    """
+    signer = _as_optional_str(_get(table, "catalog_signer"))
+    catalog = CatalogConfig(
+        cache_path=_as_path(_get(table, "catalog_cache_path"))
+        or state_dir / "catalog" / "manifest.json",
+        seed_path=_as_path(_get(table, "catalog_seed_path")),
+        signer=signer,
+        images_dir=_as_path(_get(table, "catalog_images_dir")),
+        materialize_dir=_as_path(_get(table, "catalog_materialize_dir"))
+        or state_dir / "catalog" / "artifacts",
+        manifest_url=_as_optional_str(_get(table, "catalog_manifest_url")),
+        refresh_seconds=_as_int(
+            _get(table, "catalog_refresh_seconds", DEFAULT_CATALOG_REFRESH_SECONDS),
+            "catalog_refresh_seconds",
+        ),
+        fetch_timeout_seconds=_as_int(
+            _get(table, "catalog_fetch_timeout_seconds", DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS),
+            "catalog_fetch_timeout_seconds",
+        ),
+    )
+
+    # Checked at startup rather than at the first fetch. A mistyped ss58 in config.toml would
+    # otherwise sit there looking configured and refuse every manifest the backend sends,
+    # reported as a signature failure — which reads as an attack, not as a typo.
+    if signer is not None:
+        try:
+            Keypair(ss58_address=signer)
+        except (ValueError, TypeError) as exc:
+            raise ConfigError(f"`catalog_signer` is not a valid ss58 address: {exc}") from exc
+
+    if catalog.manifest_url is not None and signer is None:
+        raise ConfigError(
+            "`catalog_manifest_url` is set but `catalog_signer` is not; a manifest this host "
+            "cannot check the signature of is not a catalog"
+        )
+    if catalog.refresh_seconds <= 0:
+        raise ConfigError("`catalog_refresh_seconds` must be positive")
+    if catalog.fetch_timeout_seconds <= 0:
+        raise ConfigError("`catalog_fetch_timeout_seconds` must be positive")
+    return catalog
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load the daemon config. Any problem here is fatal — see ConfigError."""
     path = path or Path(_env_override("config_path") or DEFAULT_CONFIG_PATH)
@@ -320,4 +385,5 @@ def load_config(path: Path | None = None) -> Config:
         skew_seconds=skew_seconds,
         max_body_bytes=max_body_bytes,
         launch=_load_launch(table),
+        catalog=_load_catalog(table, state_dir),
     )

@@ -1,8 +1,0 @@
-{# The approved artifact catalog — DAH-2576's stub for the signed manifest that
-   DAH-2578 will fetch from the backend.
-
-   Rendered from `lium_cvmd_catalog` through `to_json`, so an operator's extra
-   keys are carried verbatim and cvmd's loader is what decides whether the file
-   is usable. The role validates the result with that same loader before it
-   replaces the working copy. #}
-{{ {"version": 1, "artifacts": lium_cvmd_catalog} | to_nice_json }}
