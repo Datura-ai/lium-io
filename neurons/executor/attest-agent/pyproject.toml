@@ -1,0 +1,47 @@
+[project]
+name = "attest-agent"
+version = "0.1.0"
+description = "The renter CVM's trust-check agent — nonce-bound TDX quotes and GPU evidence over TLS (DAH-2579)"
+authors = [
+    {name = "waris", email = "waris0609@outlook.com"},
+]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "pydantic>=2.9.0",
+    # The TLS identity is generated inside the guest, so the agent needs a key/cert
+    # implementation of its own — there is nothing to hand it one.
+    "cryptography>=43.0.0",
+    # The dstack guest SDK and the NVIDIA attestation stack are NOT declared here.
+    #
+    # Both are present only inside a CVM and both drag fragile native trees; declaring them
+    # would make the agent uninstallable anywhere else, including in the test environment
+    # that checks what it does when they are absent. `evidence.py` imports them at the point
+    # of use and reports their absence rather than crashing, so the container build adds
+    # them and the unit suite exercises the degraded path honestly.
+]
+requires-python = ">=3.11,<3.15"
+readme = "README.md"
+license = {text = "MIT"}
+
+[project.scripts]
+attest-agent = "attest_agent.__main__:main"
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.pdm]
+distribution = true
+
+[tool.pdm.build]
+package-dir = "src"
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "httpx>=0.27.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
