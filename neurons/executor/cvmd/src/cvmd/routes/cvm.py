@@ -9,9 +9,14 @@ values.
 still answers 501: the renter body is DAH-2580's to define, and validating it against a
 validation-shaped model now would be inventing its contract.
 
-Both mutating handlers run the manager on a worker thread. A launch waits minutes for a guest
-to boot, and holding the event loop for that would make `/v1/state` unanswerable for exactly
-the period during which someone wants to read it.
+Both mutating handlers run the manager on a worker thread, and both are slow on purpose. A
+launch waits for the guest to boot; a `DELETE` waits for the node's hardware to actually come
+back, which on a large-memory guest is longer still. Holding the event loop for either would
+make `/v1/state` unanswerable for exactly the period during which someone wants to read it.
+
+`DELETE` is the FRD's teardown endpoint. Its 200 means the four conditions in `cvm/release.py`
+held together; a teardown that stopped the CVM but left the node holding hardware answers 504
+naming the conditions that did not.
 """
 
 import asyncio
@@ -92,7 +97,14 @@ async def health() -> dict:
 
 @router.get("/v1/state")
 async def get_state(request: Request) -> dict:
-    return {**_store(request).document.to_json(), "cvm": _manager(request).describe()}
+    manager = _manager(request)
+    return {
+        **_store(request).document.to_json(),
+        "cvm": manager.describe(),
+        # The node's last crossing between modes, with the per-condition timings a caller needs
+        # to tell "still switching" from "offline" (FR-I3). Present whether or not a CVM is.
+        "last_switch": manager.last_switch(),
+    }
 
 
 @router.post("/v1/cvm")

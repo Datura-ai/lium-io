@@ -189,6 +189,29 @@
     - lium_cvmd_dstack_scripts_dir | length > 0
     - lium_cvm_ssh_guest_port | int > 0
 
+# The same bounds cvmd's own loader enforces (config.py:_load_launch), named here
+# so the offending variable is reported instead of a daemon that will not start.
+# A tolerance above 1.0 is the one that matters: it would demand more memory back
+# than the guest was ever given, so no teardown on this host could ever complete
+# and every node would end up FAILED holding a CVM that had already stopped.
+- name: The teardown budgets are usable
+  ansible.builtin.assert:
+    that:
+      - lium_cvmd_teardown_timeout_seconds | int > 0
+      - lium_cvmd_teardown_verify_timeout_seconds | int > 0
+      - lium_cvmd_teardown_memory_tolerance | float > 0
+      - lium_cvmd_teardown_memory_tolerance | float <= 1
+    fail_msg: >-
+      The teardown settings are not usable: teardown_timeout_seconds
+      {{ lium_cvmd_teardown_timeout_seconds }}, teardown_verify_timeout_seconds
+      {{ lium_cvmd_teardown_verify_timeout_seconds }},
+      teardown_memory_tolerance {{ lium_cvmd_teardown_memory_tolerance }}. Both
+      timeouts must be positive and the tolerance must be in (0, 1] — above 1 it
+      asks for more memory back than the guest ever had, which no teardown on
+      this host could satisfy.
+    quiet: true
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
 - name: Read the host Python version
   ansible.builtin.command: python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'
   register: cvmd_python_version

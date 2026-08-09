@@ -37,6 +37,8 @@ request.
 | `lium_cvmd_key_provider_port` | dstack's key-provider port. `3443`. |
 | `lium_cvmd_launch_timeout_seconds` | How long a launch waits for the guest before failing the node. |
 | `lium_cvmd_teardown_timeout_seconds` | The graceful-poweroff window before cvmd signals the process group. |
+| `lium_cvmd_teardown_verify_timeout_seconds` | How long the node's hardware then gets to come back — see below. |
+| `lium_cvmd_teardown_memory_tolerance` | How much of the guest's configured memory must be back before the node counts as free. |
 | `lium_cvm_vcpus`, `lium_cvm_memory`, `lium_cvm_disk` | CVM sizing. |
 | `lium_cvm_gpus` | PCI slots to pass through, `["all"]`, or `[]` for none. |
 | `lium_cvm_ports` | Forwarded ports, `protocol[:address]:host:guest`. |
@@ -48,6 +50,34 @@ request.
 which software stack to run; the host decides how big it is. So there is nothing
 a caller could send to fill a gap here — a host missing a size refuses every
 launch, which is why the role refuses first.
+
+### The two teardown budgets
+
+They measure different things, which is why there are two.
+
+`lium_cvmd_teardown_timeout_seconds` bounds how long the **guest** is given to
+power itself off before cvmd signals its process group.
+`lium_cvmd_teardown_verify_timeout_seconds` bounds how long the **host** then
+takes to get its hardware back: QEMU reaped with no zombie left in the group,
+every `/dev/vfio` descriptor closed, the guest's memory returned, and the
+forwarded ports bindable again. A teardown reports success only when all four
+hold together; running out of the second budget fails the node naming the
+condition that did not.
+
+The two are not proportional. A guest that exits in seconds can leave its memory
+draining for tens of minutes, because that work happens in the kernel after the
+process is gone — which is exactly why confirming the process group is empty was
+never enough.
+
+Measured switch windows, for setting the budget per hardware class:
+
+| Host | Guest | Process reaped | Node fully released |
+|---|---|---|---|
+| au11 (Intel TDX, dstack-nvidia-0.5.11) | 16 GiB, no GPU passthrough | _measured during acceptance_ | _measured during acceptance_ |
+| — | 1.13 TB | — | ~43 min (observed under `lium-cvm.sh`, DAH-2544) |
+
+The default of 1800 s is sized for the ordinary case with room, not for the
+largest guests on the fleet. A host running 1 TB-class CVMs needs its own value.
 
 ### The catalog pins a triple
 

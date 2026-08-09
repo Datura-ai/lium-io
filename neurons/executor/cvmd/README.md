@@ -12,7 +12,7 @@ stops the node's CVM.
 | `GET /v1/state` | either key | the state document plus the running CVM |
 | `POST /v1/cvm` `kind=validation` | validator key | launches the validation CVM (DAH-2576) |
 | `POST /v1/cvm` `kind=renter` | platform key | `501` — DAH-2580 |
-| `DELETE /v1/cvm` | platform key | tears the CVM down |
+| `DELETE /v1/cvm` | platform key | tears the CVM down and waits for the node's hardware to actually come back (DAH-2577) |
 
 A scope violation on an otherwise valid request is `403`. Everything else that fails auth is
 `401`. A validly signed body that is not usable is `422`, never a scope bypass.
@@ -102,10 +102,57 @@ line stays in the buffer for the VM's whole life while QEMU writes past it.
 Teardown asks the guest to power off through dstack's own path, then signals the supervisor's
 **process group**. dstack's own `--force` kills the pid in `runtime.json`, which is the
 supervisor's — QEMU is its child, so killing that pid alone leaves a running VM holding the
-guest's RAM and the GPUs while every layer above reports success. Confirming the group is gone
-is the floor; the four-condition predicate (VFIO descriptors closed, RAM returned, ports
-bindable) is DAH-2577, as is the per-hardware-class value for `teardown_timeout_seconds` — a
-1.13 TB guest was measured taking 43 minutes to return its memory.
+guest's RAM and the GPUs while every layer above reports success.
+
+## Tearing a CVM down
+
+`DELETE /v1/cvm` returns `200` only when this node's hardware is **verifiably** free. That is
+the point of the endpoint. `lium-cvm.sh stop` reports success when its wait loop gives up, and
+QEMU is still holding the guest's memory afterwards — a stopped process is the start of a
+teardown, not the end of one.
+
+So "destroyed" is four conditions read off the host, not cvmd's own records
+(`cvm/release.py`):
+
+| | |
+|---|---|
+| `process_reaped` | the supervisor's process group has no members left, **zombies included**, and no TDX guest is running anywhere on this host |
+| `vfio_released` | nothing holds a descriptor under `/dev/vfio`, so the next guest can claim the GPUs. A device stays bound to `vfio-pci` across a teardown by design, so the driver says nothing; the open descriptor does |
+| `memory_returned` | the host has the guest's RAM back, and its hugepages are back in the pool |
+| `ports_free` | every port this CVM forwarded can be bound again |
+
+All four are re-evaluated together every couple of seconds, and the teardown completes on one
+evaluation in which all four hold — a condition that held a minute ago is not evidence now. The
+first moment each one holds is recorded, so the report says *which* part was slow rather than
+just how long the whole thing took:
+
+```
+DELETE /v1/cvm  ->  200
+{"torn_down": true, "instance_id": "...", "detail": "guest powered off on request",
+ "switch": {"outcome": "released", "complete": true, "duration_seconds": 41.2,
+            "conditions": {"process_reaped":  {"satisfied_after_seconds": 12.4, ...},
+                           "memory_returned": {"satisfied_after_seconds": 38.9, ...}, ...}}}
+```
+
+A teardown that stops the CVM but leaves the node holding hardware answers **504** naming the
+conditions that did not hold, fails the node, and **keeps the VM directory** — which is what
+`_assert_node_is_free` reads, so the next launch is refused rather than merely discouraged. The
+call is idempotent: a repeat continues the switch already in flight instead of opening a new
+one, because the memory baseline is only meaningful taken while the guest was still running.
+
+Meanwhile `/v1/state` moves `VALIDATION_RUNNING → TEARDOWN → SWITCHING → RECONCILING`.
+`TEARDOWN` is cvmd still stopping the CVM; `SWITCHING` is the process gone and the hardware not
+back yet. Both are the window FR-C7 calls "switching" — neither rentable nor reachable, and not
+offline either — and `/v1/state` reports the last one under `last_switch` so availability
+accounting can tell the two apart. `SWITCHING` has no edge to `LAUNCHING`: FR-C6 forbids
+starting the next CVM before the last one's resources are free, and leaving the edge out is what
+enforces it.
+
+The budgets are `teardown_timeout_seconds` (how long the guest gets to power itself off) and
+`teardown_verify_timeout_seconds` (how long the host then gets to return the hardware). They are
+not proportional — a guest that exits in seconds can leave its memory draining for tens of
+minutes, and a 1.13 TB guest was measured taking 43 minutes. Per-hardware-class values are in
+`ansible/roles/cvmd/README.md`.
 
 ## Signing a request
 
