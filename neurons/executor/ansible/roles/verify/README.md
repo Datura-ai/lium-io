@@ -242,5 +242,14 @@ lifecycle call, and the failure is silent from outside because the port simply
 refuses to connect. `observed` carries the first 12 characters of the installed
 package checksum, so the report says *which* build is running.
 
-### catalog.stub_status
-Always `SKIPPED`. Same shape; the implementation lands in DAH-2576 / DAH-2578.
+### catalog.manifest
+`SKIPPED` while cvmd was not requested — a host with no control daemon has no
+catalog to have. Once requested it is a **blocker**, for the same reason
+`cvmd.service_state` is: a host with no usable catalog launches nothing, and
+says so only to whoever calls it.
+
+Read through cvmd's own verifier against cvmd's own configured signer, so the
+check reports what the daemon will do rather than what a file looks like.
+`observed` is one of `usable`, `expired`, `none` or `error`, with the reason —
+and for a usable one, the serial and the expiry, which is what tells an operator
+whether a revocation has reached this host yet.

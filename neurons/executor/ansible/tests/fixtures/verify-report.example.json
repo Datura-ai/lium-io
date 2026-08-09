@@ -341,14 +341,14 @@
       "title": "cvmd control daemon"
     },
     {
-      "evidence_source": "group_vars",
-      "expected": "implemented in DAH-2576 / DAH-2578",
-      "id": "catalog.stub_status",
-      "observed": "not configured",
-      "remediation": "catalog ships as a variable interface only. Leave lium_catalog_manifest_url unset until DAH-2576 / DAH-2578 land.",
+      "evidence_source": "cvmd.catalog.CatalogStore.describe()",
+      "expected": "a signed manifest, in date, from lium_catalog_signer",
+      "id": "catalog.manifest",
+      "observed": "not requested",
+      "remediation": "The catalog arrives with cvmd. Set lium_cvmd_package_url to install it.",
       "severity": "info",
       "status": "SKIPPED",
-      "title": "catalog interface"
+      "title": "approved artifact catalog"
     }
   ],
   "generated_at": "2026-08-05T09:14:22Z",

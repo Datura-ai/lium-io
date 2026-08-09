@@ -33,7 +33,10 @@ request.
 |---|---|
 | `lium_cvmd_dstack_scripts_dir` | The dstacktee `scripts` directory. cvmd **imports** `dstack.py` from it as a library, so a path to the repo root will not do. |
 | `lium_cvmd_run_dir` | Where cvmd keeps the VM directories it creates. Deliberately not dstacktee's own `run/vms`. |
-| `lium_cvmd_catalog` | The approved artifacts — see below. |
+| `lium_catalog_signer` | The ss58 whose signature makes a manifest this host's catalog — see below. Required for a host that launches anything. |
+| `lium_catalog_manifest_url` | Where cvmd polls for the current manifest. |
+| `lium_catalog_images_dir` | Where day-zero staged the approved OS images. |
+| `lium_catalog_refresh_seconds` | How often cvmd polls. The upper bound on how long a revocation takes to reach a node nobody pushes to. |
 | `lium_cvmd_key_provider_port` | dstack's key-provider port. `3443`. |
 | `lium_cvmd_launch_timeout_seconds` | How long a launch waits for the guest before failing the node. |
 | `lium_cvmd_teardown_timeout_seconds` | The graceful-poweroff window before cvmd signals the process group. |
@@ -93,39 +96,60 @@ teardown showed them bindable 2 s after the guest stopped — with and without
 `verify_released` now logs what it is still waiting for every 30 s, which is what
 was missing to diagnose it at the time.
 
-### The catalog pins a triple
+### The catalog is a signed manifest, not a list in this file
 
-`lium_cvmd_catalog` is a list of approved artifacts, rendered to
-`/etc/cvmd/catalog.json`. Each entry pins the **triple** — QEMU build, OS image
-hash, compose hash — that this host is allowed to produce, plus the local paths
-that produce it:
+Three settings, and only one of them is required:
 
 ```yaml
-lium_cvmd_catalog:
-  - id: validation-v3
-    kind: validation
-    qemu: "10.1.0"
-    os_image_hash: a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02
-    compose_hash: ab4d14336f0762c0d8ec7631a69148246661de84ceead7a215f8a33b74fd43e6
-    os_image_path: /opt/lium-io/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11
-    compose_path: /etc/cvmd/composes/validation-v3.yml
-    init_script: /opt/lium-io/neurons/executor/dstacktee/app/init_script.sh
-    pre_launch_script: /opt/lium-io/neurons/executor/dstacktee/app/pre_launch_script.sh
+lium_catalog_signer: 5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX
+lium_catalog_manifest_url: https://celiumcompute.ai/api/v1/cvm-catalog/manifest
+lium_catalog_images_dir: /opt/lium-io/neurons/executor/dstacktee/run/images
 ```
 
-Hashes must be 64 lowercase hex digits — no `sha256:` prefix, no uppercase. cvmd
-compares them against values it computes itself, so any other spelling would
-never match and the launch would fail as "not approved", sending an operator
-looking at the wrong thing. `load_catalog` refuses those spellings outright, and
-the role runs it against the rendered file before it replaces the working one.
+The signer is what makes the whole thing work: cvmd verifies a manifest against
+**this** ss58, never against the `signer` field inside the document. A manifest
+checked against its own claimed signer proves only that somebody owns a key.
+Unset, this host holds no catalog and refuses every launch, saying which setting
+is why.
 
-`compose_path` must point at an **already-resolved** compose. `lium-cvm.sh`
-substitutes `${EXECUTOR_RUNNER_IMAGE_DIGEST}` before dstack measures the file;
-under cvmd the catalog carries the resolved copy, and the compose-hash gate is
-what catches it if that ever stops being true.
+Each manifest entry pins the **triple** — QEMU build, OS image hash, compose
+hash — that this host is allowed to produce, and carries the compose and both
+guest scripts as *content*. cvmd writes them under
+`/var/lib/cvmd/catalog/artifacts/<id>/` on every launch, so a compose edited on
+the host is put back before it can be measured. The OS image is the exception:
+it is gigabytes, so the entry names a directory under `lium_catalog_images_dir`
+and `cvm/measure.py` checks that directory's own `digest.txt` against the pinned
+hash before QEMU starts.
 
-This is the DAH-2576 stub. DAH-2578 replaces it with the backend's signed
-manifest, at which point this list stops being the source of truth.
+The manifest's compose is an **already-resolved** one. `lium-cvm.sh` substitutes
+`${EXECUTOR_RUNNER_IMAGE_DIGEST}` before dstack measures the file; the platform
+resolves it before signing, and the compose-hash gate is what catches it if that
+ever stops being true.
+
+Two files, deliberately:
+
+| | |
+|---|---|
+| `/etc/cvmd/manifest.json` | The **seed**, staged by the `catalog` role. Ansible owns it, cvmd only reads it. |
+| `/var/lib/cvmd/catalog/manifest.json` | The **working copy**. cvmd owns it and replaces it on every successful fetch. |
+
+They are separate so neither overwrites the other's on a converge. cvmd adopts
+the seed at startup and on every refresh, but only when it is *newer*: a seed
+left behind after the platform published a revocation is refused as a rollback,
+which is exactly what should happen to it.
+
+### Revocation, and why it needs an expiry
+
+A manifest carries a `serial` and an `expires_at`, and cvmd enforces both. The
+serial only goes up, so a validly signed *older* manifest — from a stale cache,
+a rewound replica, anything that can serve bytes to this host — cannot put a
+revoked artifact back in the catalog. The expiry is the other half: without it,
+a revocation could be defeated by simply never delivering the next manifest, and
+the host would keep launching the revoked stack forever while looking healthy.
+
+The cost is that a host which cannot reach the backend eventually stops
+launching. That is the intended trade: `catalog.manifest` in the verify report
+goes `MUST_FIX` with the expiry in `observed` before it happens.
 
 ### Authorised clients are hotkeys, not SSH keys
 

@@ -114,14 +114,16 @@
       - lium_cvm_memory | length > 0
       - lium_cvm_disk | length > 0
       - lium_cvm_ports | length > 0
-      - lium_cvmd_catalog | length > 0
+      - lium_catalog_signer | length > 0
     fail_msg: >-
       lium_cvmd_dstack_scripts_dir is set, so this host is meant to launch CVMs,
       but it is missing one of lium_cvmd_run_dir, lium_cvm_vcpus,
-      lium_cvm_memory, lium_cvm_disk, lium_cvm_ports or lium_cvmd_catalog. cvmd
-      would start and then refuse every launch. Sizing is deliberately provider
-      configuration and never part of a request, so there is nothing a caller
-      could supply to fill the gap.
+      lium_cvm_memory, lium_cvm_disk, lium_cvm_ports or lium_catalog_signer.
+      cvmd would start and then refuse every launch. Sizing is deliberately
+      provider configuration and never part of a request, so there is nothing a
+      caller could supply to fill the gap — and without a signer there is no
+      manifest this host can trust, so its catalog is empty whatever else is
+      configured.
     quiet: true
   when: lium_cvmd_dstack_scripts_dir | length > 0
 

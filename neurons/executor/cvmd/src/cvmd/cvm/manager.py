@@ -81,11 +81,13 @@ class CvmManager:
         self,
         *,
         config: LaunchConfig,
+        catalog_store: catalog.CatalogStore,
         store: StateStore,
         instances: InstanceStore,
         switches: SwitchStore,
     ) -> None:
         self._config = config
+        self._catalog = catalog_store
         self._store = store
         self._instances = instances
         self._switches = switches
@@ -271,8 +273,15 @@ class CvmManager:
             raise LaunchFailure(503, f"this host cannot run the dstack launcher: {exc}") from exc
 
     def _resolve(self, kind: str, triple: Triple) -> catalog.Artifact:
+        """Match the request against the signed catalog, re-verified on this very call.
+
+        503 and 422 say different things and a caller acts on both: 503 means this host has no
+        catalog it can trust right now — no manifest, an expired one, a signature that no longer
+        checks out — and retrying later may work. 422 means the catalog is fine and does not
+        contain what was asked for, which retrying never fixes.
+        """
         try:
-            artifacts = catalog.load_catalog(self._config.catalog_path)
+            artifacts = self._catalog.artifacts()
         except catalog.CatalogError as exc:
             raise LaunchFailure(503, str(exc)) from exc
         try:

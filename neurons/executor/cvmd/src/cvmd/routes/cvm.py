@@ -17,6 +17,10 @@ make `/v1/state` unanswerable for exactly the period during which someone wants 
 `DELETE` is the FRD's teardown endpoint. Its 200 means the four conditions in `cvm/release.py`
 held together; a teardown that stopped the CVM but left the node holding hardware answers 504
 naming the conditions that did not.
+
+The two `/v1/catalog` routes are DAH-2578's. Both are open to either authorized key, because
+neither decides what this host may run — the platform's signature does, and it is checked on
+every read of the cached manifest.
 """
 
 import asyncio
@@ -27,7 +31,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from cvmd import __version__
-from cvmd.catalog import HEX64
+from cvmd.catalog import HEX64, CatalogStore, refresh_once
 from cvmd.cvm.manager import KIND_RENTER, KIND_VALIDATION, CvmManager, LaunchFailure, Triple
 from cvmd.state.store import StateStore
 
@@ -61,6 +65,10 @@ def _store(request: Request) -> StateStore:
 
 def _manager(request: Request) -> CvmManager:
     return request.app.state.cvm
+
+
+def _catalog(request: Request) -> CatalogStore:
+    return request.app.state.catalog
 
 
 def _failure(exc: LaunchFailure) -> JSONResponse:
@@ -137,3 +145,35 @@ async def create_cvm(request: Request) -> JSONResponse:
 @router.delete("/v1/cvm")
 async def destroy_cvm(request: Request) -> JSONResponse:
     return await _exclusively(request, _manager(request).destroy, success=200)
+
+
+@router.get("/v1/catalog")
+async def get_catalog(request: Request) -> dict:
+    """What this host is approved to launch, and where that answer came from.
+
+    A read, so either authorized key may make it. It answers 200 even when the catalog is
+    unusable, carrying `usable: false` and the reason — a node that will not launch is exactly
+    when someone needs to know *why*, and a 503 here would only tell them that something is
+    wrong with a daemon that is plainly answering.
+    """
+    return _catalog(request).describe()
+
+
+@router.post("/v1/catalog/refresh")
+async def refresh_catalog(request: Request) -> JSONResponse:
+    """Fetch the manifest now instead of waiting for the timer.
+
+    This is how a revocation propagates in seconds rather than in `catalog_refresh_seconds`.
+    Triggering it grants no authority over *what* the host will run: the fetched bytes go
+    through exactly the same checks as the timer's, so the worst a caller can do is make the
+    host re-read the platform's own catalog.
+
+    On a worker thread for the same reason the CVM operations are — the fetch and the signature
+    check both block, and `/v1/state` has to stay answerable.
+    """
+    store = _catalog(request)
+    manifest = await asyncio.to_thread(refresh_once, store)
+    return JSONResponse(
+        status_code=200,
+        content={"fetched": manifest is not None, "catalog": store.describe()},
+    )
