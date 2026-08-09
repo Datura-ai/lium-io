@@ -41,7 +41,7 @@ request.
 | `lium_cvm_gpus` | PCI slots to pass through, `["all"]`, or `[]` for none. |
 | `lium_cvm_ports` | Forwarded ports, `protocol[:address]:host:guest`. |
 | `lium_cvm_env_file` | Passed as `--env-file`. Lands outside `app-compose.json`, so it does not change the compose hash. |
-| `lium_cvm_ssh_guest_port` | The guest-side SSH port. Set ⇒ cvmd reports the host-key fingerprint and uses reading it as proof the CVM is up. |
+| `lium_cvm_ssh_guest_port` | The guest-side SSH port. Set ⇒ cvmd reports the host-key fingerprint and uses reading it as proof the CVM is up. Must be the guest side (the last field) of one `lium_cvm_ports` entry — the role refuses a value nothing forwards, since there would be nothing to read it through. |
 | `lium_cvm_pin_numa`, `lium_cvm_hugepages` | Both change the QEMU command line and therefore the measurements. `lium-cvm.sh` passes neither. |
 
 **Sizing is provider configuration, never an API field.** A cvmd request names

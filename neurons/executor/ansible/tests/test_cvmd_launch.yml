@@ -166,6 +166,108 @@
           with no way in. refused={{ port_refused }} msg={{ port_msg }}
         quiet: true
 
+    # --- a port in range for the regex but not for cvmd -------------------
+    # The shape is right and every field is a number, so a shape-only check
+    # passes it — and then cvm/ports.py rejects it and the daemon will not
+    # start. The role's job is to name the variable before that happens.
+    - name: Run cvmd with a port number outside 1-65535
+      block:
+        - name: Include cvmd with an out-of-range host port
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ports: ["tcp:0.0.0.0:70000:2200"]
+
+        - name: Record that cvmd accepted an unbindable port
+          ansible.builtin.set_fact:
+            range_refused: false
+            range_msg: ""
+      rescue:
+        - name: Record the range refusal
+          ansible.builtin.set_fact:
+            range_refused: true
+            range_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A port outside 1-65535 is refused with the same rule cvmd applies
+      ansible.builtin.assert:
+        that:
+          - range_refused | bool
+          - "'1-65535' in range_msg"
+        fail_msg: >-
+          cvmd accepted a port number its own parser rejects, so the daemon
+          would refuse to start on a config this run reported as good.
+          refused={{ range_refused }} msg={{ range_msg }}
+        quiet: true
+
+    # --- an SSH guest port nothing forwards -------------------------------
+    # The guest port is the LAST field, so 2200:22 forwards 22 and not 2200.
+    # cvmd reads the host key through that forward and uses the read as its
+    # readiness signal, so with no match the launch has neither.
+    - name: Run cvmd with an SSH guest port that no mapping carries
+      block:
+        - name: Include cvmd with the guest side one field out
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ports: ["tcp:0.0.0.0:12200:22"]
+            lium_cvm_ssh_guest_port: 2200
+
+        - name: Record that cvmd accepted an unprobeable SSH port
+          ansible.builtin.set_fact:
+            ssh_refused: false
+            ssh_msg: ""
+      rescue:
+        - name: Record the SSH-port refusal
+          ansible.builtin.set_fact:
+            ssh_refused: true
+            ssh_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: An SSH guest port nothing forwards is refused, and the variable is named
+      ansible.builtin.assert:
+        that:
+          - ssh_refused | bool
+          - "'lium_cvm_ssh_guest_port' in ssh_msg"
+        fail_msg: >-
+          cvmd accepted a host whose SSH guest port no forward carries. The
+          launch would have no readiness signal and report a null fingerprint.
+          refused={{ ssh_refused }} msg={{ ssh_msg }}
+        quiet: true
+
+    # The matching case, so the assert cannot pass by refusing everything.
+    - name: Run cvmd with an SSH guest port that is forwarded
+      block:
+        - name: Include cvmd with a matching guest port
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ports: ["tcp:0.0.0.0:12200:2200"]
+            lium_cvm_ssh_guest_port: 2200
+
+        - name: Record that the launch checks passed
+          ansible.builtin.set_fact:
+            ssh_match_refused: false
+            ssh_match_msg: ""
+      rescue:
+        - name: Record where the matching case stopped
+          ansible.builtin.set_fact:
+            ssh_match_refused: true
+            ssh_match_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A forwarded SSH guest port passes the launch checks
+      ansible.builtin.assert:
+        that:
+          - not (ssh_match_refused | bool) or 'lium_cvm_ssh_guest_port' not in ssh_match_msg
+        fail_msg: >-
+          cvmd refused an SSH guest port that IS forwarded, so the check rejects
+          valid configuration. msg={{ ssh_match_msg }}
+        quiet: true
+
 - name: The rendered catalog is what cvmd's loader reads
   hosts: localhost
   gather_facts: false

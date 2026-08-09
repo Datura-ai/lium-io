@@ -60,6 +60,11 @@ class LaunchFailure(Exception):
         self.reason = reason
 
 
+def _describe(running: list[tuple[int, str]]) -> str:
+    """How a refusal names the guests `supervisor.running_cvms()` found."""
+    return ", ".join(f"pid {pid} ({name})" for pid, name in running)
+
+
 @dataclass(frozen=True)
 class Triple:
     qemu: str
@@ -184,7 +189,13 @@ class CvmManager:
                     NodeState.FAILED,
                     last_error=f"reconciliation found {state} while the node was {current}",
                 )
+            # From the staging point the edge is legal, so ask again from there. Recursing
+            # rather than transitioning straight away is what keeps RECONCILING working as a
+            # destination as well as a waypoint: the equality branch above is then the one that
+            # answers, instead of this line requesting the RECONCILING -> RECONCILING self-edge
+            # the machine does not have.
             self._store.transition(NodeState.RECONCILING)
+            return self._settle(state)
         return self._store.transition(state).state
 
     def _fail(self, reason: str) -> NodeState:
@@ -208,6 +219,8 @@ class CvmManager:
         dstack = self._load_dstack()
         artifact = self._resolve(kind, triple)
         mappings = self._parse_ports()
+
+        self._assert_ssh_port_is_forwarded(mappings)
 
         self._assert_node_is_free()
         try:
@@ -267,6 +280,28 @@ class CvmManager:
         except ports.PortError as exc:
             raise LaunchFailure(503, f"this host's cvm_ports setting is unusable: {exc}") from exc
 
+    def _assert_ssh_port_is_forwarded(self, mappings: list[ports.PortMapping]) -> None:
+        """A configured SSH guest port that nothing forwards is a refusal, not a degradation.
+
+        Readiness and the report's fingerprint both come from reading the guest's host key
+        through that forward. With no mapping to read it through there is no readiness check
+        left at all, and answering 201 VALIDATION_RUNNING milliseconds after spawning QEMU
+        would tell the caller the CVM is up before the guest has booted. Refusing here names
+        the setting that is wrong, before anything is prepared or started.
+
+        Asked through `_readiness_port`, so this is the same lookup the readiness loop will
+        make rather than a second copy of the matching rule.
+        """
+        if self._config.ssh_guest_port is None or self._readiness_port(mappings) is not None:
+            return
+        forwarded = ", ".join(str(mapping) for mapping in mappings) or "(none)"
+        raise LaunchFailure(
+            503,
+            f"this host's cvm_ssh_guest_port is {self._config.ssh_guest_port}, which none of "
+            f"its cvm_ports forwards ({forwarded}); readiness and the launch report's SSH "
+            f"fingerprint are both read through that forward, so there is nothing to probe",
+        )
+
     def _assert_node_is_free(self) -> None:
         """One CVM per node, checked against the host rather than against cvmd's own records.
 
@@ -276,11 +311,10 @@ class CvmManager:
         """
         running = supervisor.running_cvms()
         if running:
-            listed = ", ".join(f"pid {pid} ({name})" for pid, name in running)
             raise LaunchFailure(
                 409,
-                f"a confidential guest is already running on this host ({listed}); GPU "
-                f"passthrough is exclusive, so this node can hold only one",
+                f"a confidential guest is already running on this host ({_describe(running)}); "
+                f"GPU passthrough is exclusive, so this node can hold only one",
             )
 
         instance = self._instances.current
@@ -409,6 +443,19 @@ class CvmManager:
         probe = self._readiness_port(mappings)
         deadline = time.monotonic() + self._config.launch_timeout_seconds
         want_fingerprint = self._config.ssh_guest_port is not None and probe is not None
+        weak_note = "port accepts connections; no SSH probe configured"
+        if want_fingerprint and not sshkey.keyscan_available():
+            # Asked once, here, rather than discovered inside the loop. `read_host_key` returns
+            # None when ssh-keyscan is absent, which is indistinguishable from "the guest is not
+            # up yet" — so without this the loop would poll for the whole launch timeout, then
+            # fail a node whose CVM had booted fine.
+            logger.warning(
+                "ssh-keyscan is not installed, so no SSH host-key fingerprint can be reported "
+                "for this launch; readiness falls back to a TCP accept on port %d",
+                probe.host_port,
+            )
+            want_fingerprint = False
+            weak_note = "port accepts connections; ssh-keyscan is not installed on this host"
 
         while time.monotonic() < deadline:
             if not supervisor.is_supervisor(instance.supervisor_pid, vm_dir):
@@ -428,9 +475,7 @@ class CvmManager:
                     instance = self._instances.update(ssh_fingerprint=fingerprint)
                     return self._running(instance)
             elif sshkey.accepts_connection(PROBE_HOST, probe.host_port):
-                return self._running(
-                    instance, note="port accepts connections; no SSH probe configured"
-                )
+                return self._running(instance, note=weak_note)
 
             time.sleep(READINESS_POLL_SECONDS)
 
@@ -472,6 +517,23 @@ class CvmManager:
             stray = self._stray_directories()
             if not stray:
                 return {"torn_down": False, "reason": "this node is running no CVM"}
+
+            # A directory cvmd has no record of may still have a guest under it — that is what
+            # "no record" usually means. Removing the disk from a live QEMU would report a
+            # teardown that did not happen and leave the node's GPUs and forwarded ports held
+            # by a process nothing can find, since the record that named its pid is what went
+            # missing. The `/proc` scan is the only evidence available here, so it decides.
+            running = supervisor.running_cvms()
+            if running:
+                reason = (
+                    f"{', '.join(str(path) for path in stray)} holds a CVM cvmd has no record "
+                    f"of and a confidential guest is still running ({_describe(running)}); its "
+                    f"disk was left in place and it must be stopped by hand before this node "
+                    f"is free"
+                )
+                self._fail(reason)
+                raise LaunchFailure(409, reason)
+
             for path in stray:
                 self._discard(path)
             self._settle(NodeState.RECONCILING)

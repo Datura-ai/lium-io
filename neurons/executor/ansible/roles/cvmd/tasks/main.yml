@@ -146,20 +146,48 @@
     quiet: true
   when: lium_cvmd_dstack_scripts_dir | length > 0
 
-# Every mapping must be bindable at launch time; a duplicate host port is the
-# one collision that is knowable now, and cvmd refuses the whole config for it.
-- name: Each forwarded port is protocol[:address]:host:guest
+# A cheap first pass that names the offending variable and index. The
+# authoritative check is cvmd's own parser, run against the rendered config by
+# configure.yml — but that needs the venv, which install.yml has not created
+# yet, and failing before a download beats failing after one.
+#
+# The range half is not decoration: `[0-9]{1,5}` alone accepts 0 and 70000, both
+# of which cvm/ports.py rejects, so without it this passes a host the daemon
+# then refuses to start on.
+- name: Each forwarded port is protocol[:address]:host:guest, with ports in 1-65535
   ansible.builtin.assert:
     that:
       - item is match('^(tcp|udp):([^:]+:)?[0-9]{1,5}:[0-9]{1,5}$')
+      - item.split(':')[-2:] | map('int') | select('lt', 1) | list | length == 0
+      - item.split(':')[-2:] | map('int') | select('gt', 65535) | list | length == 0
     fail_msg: >-
       lium_cvm_ports[{{ index }}] is {{ item | to_json }}, which is not
-      'protocol[:address]:host_port:guest_port'. dstack parses these into QEMU
-      hostfwd rules, so a malformed one becomes a CVM with no way in.
+      'protocol[:address]:host_port:guest_port' with both ports in 1-65535.
+      dstack parses these into QEMU hostfwd rules, so a malformed one becomes a
+      CVM with no way in.
     quiet: true
   loop: "{{ lium_cvm_ports }}"
   loop_control:
     index_var: index
+
+# cvmd reads the guest's SSH host key through this forward, and that read is
+# also what proves the CVM is up. A guest port nothing forwards leaves the
+# launch with no readiness signal and no fingerprint, so cvmd refuses it — the
+# same refusal, named here instead of at the first request.
+- name: The SSH guest port is one of the forwarded ports
+  ansible.builtin.assert:
+    that:
+      - lium_cvm_ports | select('search', ':' ~ lium_cvm_ssh_guest_port ~ '$') | list | length > 0
+    fail_msg: >-
+      lium_cvm_ssh_guest_port is {{ lium_cvm_ssh_guest_port }}, and none of
+      lium_cvm_ports forwards it: {{ lium_cvm_ports | to_json }}. The guest port
+      is the LAST field of each mapping. cvmd reads the host key through that
+      forward, so with no match there is nothing to probe and the launch report
+      would carry no fingerprint.
+    quiet: true
+  when:
+    - lium_cvmd_dstack_scripts_dir | length > 0
+    - lium_cvm_ssh_guest_port | int > 0
 
 - name: Read the host Python version
   ansible.builtin.command: python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'

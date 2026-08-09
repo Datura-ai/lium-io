@@ -11,6 +11,7 @@ exactly the paths where a bug would leave a node in a state someone has to clean
 
 import json
 import socket
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -262,6 +263,31 @@ class TestRefusals:
         assert "left-behind" in raised.value.reason
         assert not spawned
 
+    def test_an_ssh_guest_port_that_nothing_forwards(
+        self, state_dir, launch_config, approved, spawned, monkeypatch
+    ):
+        """A one-character config slip must not become "running, fingerprint null".
+
+        With no mapping to read the host key through there is no readiness check left, so the
+        launch would report VALIDATION_RUNNING milliseconds after spawning QEMU — before the
+        guest had booted. Refused before anything is prepared instead.
+        """
+        monkeypatch.setattr(
+            "cvmd.cvm.measure.qemu_version", lambda _dstack: QEMU_FALLBACK, raising=True
+        )
+        mismatched = replace(launch_config, ssh_guest_port=2201)
+        manager = CvmManager(
+            config=mismatched, store=StateStore(state_dir), instances=InstanceStore(state_dir)
+        )
+
+        with pytest.raises(LaunchFailure) as raised:
+            manager.create(kind="validation", triple=approved)
+
+        assert raised.value.status == 503
+        assert "cvm_ssh_guest_port" in raised.value.reason
+        assert not spawned
+        assert not mismatched.run_dir.exists()
+
 
 class TestTheMeasurementGate:
     def test_a_prepared_cvm_that_would_measure_differently_is_not_launched(
@@ -373,6 +399,30 @@ class TestReconciliation:
 
         assert manager.reconcile() is NodeState.FAILED
         assert "unreadable or malformed" in manager._store.document.last_error
+
+
+class TestSettling:
+    """`_settle` is the recovery path, so it must not raise the error it exists to avoid."""
+
+    @pytest.mark.parametrize(
+        "running",
+        [NodeState.LAUNCHING, NodeState.VALIDATION_RUNNING, NodeState.RENTER_RUNNING],
+    )
+    def test_settling_to_reconciling_from_a_running_state(self, manager, running):
+        """RECONCILING is the staging point *and* the destination here.
+
+        Reaching it is the whole move; asking for it again is RECONCILING -> RECONCILING, which
+        the machine rejects.
+        """
+        manager._store.transition(running)
+
+        assert manager._settle(NodeState.RECONCILING) is NodeState.RECONCILING
+        assert manager._store.state is NodeState.RECONCILING
+
+    def test_settling_to_a_running_state_still_goes_the_long_way(self, manager):
+        manager._store.transition(NodeState.FAILED)
+
+        assert manager._settle(NodeState.VALIDATION_RUNNING) is NodeState.VALIDATION_RUNNING
 
 
 class TestOverHttp:
@@ -498,6 +548,42 @@ class TestOverHttp:
         assert "already in progress" in response.json()["detail"]
 
 
+class TestReadinessWithoutKeyscan:
+    """A host with no `ssh-keyscan` still finishes its launch.
+
+    `read_host_key` returns None both when the tool is missing and when the guest is not up
+    yet, so a loop that cannot tell them apart polls for the whole launch timeout and then
+    fails a node whose CVM booted fine. The tool is looked up once, before the loop.
+    """
+
+    @pytest.fixture
+    def no_keyscan(self, monkeypatch):
+        monkeypatch.setattr("cvmd.cvm.sshkey.keyscan_available", lambda: False)
+
+        def unreachable(host, port):
+            raise AssertionError("ssh-keyscan is absent; read_host_key must not be polled")
+
+        monkeypatch.setattr("cvmd.cvm.sshkey.read_host_key", unreachable)
+        monkeypatch.setattr("cvmd.cvm.sshkey.accepts_connection", lambda host, port: True)
+
+    def test_it_falls_back_to_a_tcp_accept(self, manager, approved, spawned, no_keyscan):
+        report = manager.create(kind="validation", triple=approved)
+
+        assert report["state"] == "VALIDATION_RUNNING"
+        assert report["ssh_host_key_fingerprint"] is None
+        assert "ssh-keyscan" in report["note"]
+
+    def test_the_launch_does_not_burn_its_whole_timeout(
+        self, manager, approved, spawned, no_keyscan, monkeypatch
+    ):
+        """Sleeping at all here means the loop is waiting for a fingerprint that cannot come."""
+        monkeypatch.setattr(
+            "cvmd.cvm.manager.time.sleep",
+            lambda _s: (_ for _ in ()).throw(AssertionError("polled instead of falling back")),
+        )
+        assert manager.create(kind="validation", triple=approved)["state"] == "VALIDATION_RUNNING"
+
+
 class TestTeardown:
     def test_tearing_down_a_running_cvm_frees_the_node(
         self, manager, approved, spawned, guest_is_up, launch_config, monkeypatch
@@ -529,6 +615,64 @@ class TestTeardown:
         """A platform that timed out mid-teardown has to be able to repeat the call."""
         result = manager.destroy()
         assert result == {"torn_down": False, "reason": "this node is running no CVM"}
+
+    def test_a_stray_directory_with_a_live_guest_is_not_removed(
+        self, manager, launch_config, monkeypatch
+    ):
+        """ "No record" usually means "the record went missing", not "nothing is running".
+
+        Removing the disk from under a live QEMU would report a teardown that did not happen
+        and leave the node's GPUs held by a process nothing can name — the record that carried
+        its pid is exactly what is gone.
+        """
+        stray = launch_config.run_dir / "unrecorded"
+        stray.mkdir(parents=True)
+        (stray / supervisor.DISK_IMAGE).write_bytes(b"")
+        monkeypatch.setattr(supervisor, "running_cvms", lambda: [(4242, "qemu-system-x86_64")])
+
+        with pytest.raises(LaunchFailure) as raised:
+            manager.destroy()
+
+        assert raised.value.status == 409
+        assert "4242" in raised.value.reason
+        assert (stray / supervisor.DISK_IMAGE).exists()
+        assert manager._store.state is NodeState.FAILED
+
+    def test_a_stray_directory_with_no_guest_is_removed(self, manager, launch_config, monkeypatch):
+        stray = launch_config.run_dir / "unrecorded"
+        stray.mkdir(parents=True)
+        (stray / supervisor.DISK_IMAGE).write_bytes(b"")
+        monkeypatch.setattr(supervisor, "running_cvms", list)
+
+        result = manager.destroy()
+
+        assert result["torn_down"] is True
+        assert not stray.exists()
+        assert manager._store.state is NodeState.RECONCILING
+
+    def test_a_graceful_shutdown_that_raises_still_signals_the_group(self, monkeypatch):
+        """dstack reads runtime.json outside its own try block, so it can raise here.
+
+        Letting that propagate would skip the signal ladder entirely — the guest would never be
+        signalled at all, which is the one outcome `shutdown` exists to prevent.
+        """
+        signalled: list[int] = []
+
+        class Raising:
+            @staticmethod
+            def shutdown_instance(vm_dir, timeout, force):
+                raise KeyError("cid")
+
+        monkeypatch.setattr(
+            supervisor,
+            "shutdown_by_signal",
+            lambda pid, *, timeout: signalled.append(pid) or "process group stopped by SIGTERM",
+        )
+
+        detail = supervisor.shutdown(Raising, Path("/nonexistent"), 4242, timeout=1)
+
+        assert signalled == [4242]
+        assert detail == "process group stopped by SIGTERM"
 
     def test_a_cvm_that_will_not_stop_fails_the_node(
         self, manager, approved, spawned, guest_is_up, monkeypatch

@@ -16,10 +16,16 @@ verifies a signature, so the file's integrity rests on its filesystem permission
 """
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+
+# What a hash looks like on both sides of the gate: the catalog's pinned values and the request
+# body's. Owned here, where the values are compared against digests cvmd computes itself, and
+# imported by the request model so the two cannot drift into accepting different spellings.
+HEX64 = r"^[0-9a-f]{64}$"
 
 
 class CatalogError(Exception):
@@ -99,7 +105,7 @@ def _decode_artifact(raw, index: int) -> Artifact:
     # would read as "this stack is not approved" — refuse it here, where the cause is legible.
     for field in ("os_image_hash", "compose_hash"):
         value = getattr(artifact, field)
-        if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        if not re.fullmatch(HEX64, value):
             raise CatalogError(f"{where}: `{field}` must be 64 lowercase hex digits, got {value!r}")
     return artifact
 

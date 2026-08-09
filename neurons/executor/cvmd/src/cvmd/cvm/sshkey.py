@@ -14,6 +14,7 @@ prints, and cvmd's dependencies stay deliberately small.
 import base64
 import hashlib
 import logging
+import shutil
 import socket
 import subprocess
 
@@ -21,6 +22,16 @@ logger = logging.getLogger(__name__)
 
 KEYSCAN = "ssh-keyscan"
 KEYSCAN_TIMEOUT_SECONDS = 10
+
+
+def keyscan_available() -> bool:
+    """Is `ssh-keyscan` on this host's PATH?
+
+    Asked once, before the readiness loop starts, because the answer decides which signal the
+    loop can use at all. Discovering it inside the loop would mean polling for a fingerprint
+    that can never arrive until the launch times out.
+    """
+    return shutil.which(KEYSCAN) is not None
 
 
 def fingerprint_of(base64_key: str) -> str:

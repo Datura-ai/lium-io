@@ -5,6 +5,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from cvmd.cvm import ports
+
 DEFAULT_CONFIG_PATH = Path("/etc/cvmd/config.toml")
 
 # Real request bodies are a `kind` plus three hashes — hundreds of bytes. The cap exists so an
@@ -209,6 +211,16 @@ def _load_launch(table: dict) -> LaunchConfig:
         pin_numa=_as_bool(_get(table, "cvm_pin_numa"), "cvm_pin_numa"),
         hugepages=_as_bool(_get(table, "cvm_hugepages"), "cvm_hugepages"),
     )
+    # Parsed with the launch path's own parser, not re-described here. Without this a mapping
+    # like "tcp:0.0.0.0:0:22" is well-formed TOML, so the daemon starts looking configured and
+    # refuses every launch at the first request — the failure mode the whole fail-at-startup
+    # rule exists to avoid. It is also what lets Ansible check the rendered file by running
+    # `load_config` against it, the same way it checks the catalog with `load_catalog`.
+    try:
+        ports.parse_all(launch.ports)
+    except ports.PortError as exc:
+        raise ConfigError(f"`cvm_ports`: {exc}") from exc
+
     if launch.vcpus is not None and launch.vcpus <= 0:
         raise ConfigError("`cvm_vcpus` must be positive")
     if launch.key_provider_port <= 0:

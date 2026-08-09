@@ -44,13 +44,6 @@ class Measurements:
     os_image_hash: str
     compose_hash: str
 
-    def as_dict(self) -> dict:
-        return {
-            "qemu": self.qemu,
-            "os_image_hash": self.os_image_hash,
-            "compose_hash": self.compose_hash,
-        }
-
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()

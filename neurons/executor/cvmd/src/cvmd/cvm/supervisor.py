@@ -53,10 +53,6 @@ TERMINATION_GRACE_SECONDS = 10
 # it — which is the only way "one CVM per node" can hold while both launch paths exist.
 TDX_GUEST_MARKER = "tdx-guest"
 
-# `run_instance` writes this when the VM is about to start and removes it when QEMU exits, so
-# its presence is dstack's own liveness marker. cvmd reads it, but never trusts it alone.
-RUNTIME_FILE = "runtime.json"
-
 # The file dstack creates for the guest's disk. Its existence is the fail-closed "a CVM lives
 # in this directory" predicate: a stopped CVM still owns the node's GPUs and ports until its
 # directory is removed, so a launch must not step over one just because no process is running.
@@ -128,19 +124,6 @@ def vm_directories(run_dir: Path) -> list[Path]:
     if not run_dir.is_dir():
         return []
     return sorted(child for child in run_dir.iterdir() if (child / DISK_IMAGE).exists())
-
-
-def runtime_pid(vm_dir: Path) -> int | None:
-    """The pid dstack recorded for this VM, if it recorded one. A claim, not evidence."""
-    from cvmd.atomic import read_json
-
-    raw = read_json(vm_dir / RUNTIME_FILE)
-    if not isinstance(raw, dict):
-        return None
-    try:
-        return int(raw["pid"])
-    except (KeyError, TypeError, ValueError):
-        return None
 
 
 def _await_pid_file(vm_dir: Path, deadline: float) -> int:
@@ -257,7 +240,21 @@ def shutdown(dstack: ModuleType, vm_dir: Path, pid: int, *, timeout: int) -> str
     predicate — VFIO file descriptors closed, guest RAM returned, forwarded ports bindable —
     because a reaped QEMU is necessary for those and nowhere near sufficient.
     """
-    dstack.shutdown_instance(str(vm_dir), timeout=timeout, force=False)
+    try:
+        dstack.shutdown_instance(str(vm_dir), timeout=timeout, force=False)
+    except Exception as exc:  # noqa: BLE001 - the ladder below is what must not be skipped
+        # `shutdown_instance` reads `runtime.json` and indexes `cid` outside its own try block,
+        # and `run_instance` writes that file with a plain open() rather than atomically. A host
+        # that crashed mid-write therefore leaves a JSONDecodeError or a KeyError here. Letting
+        # it propagate would skip the signal ladder entirely — the guest would never be
+        # signalled at all, which is the one outcome this function exists to prevent.
+        logger.warning(
+            "dstack's graceful shutdown of %s raised %s; falling back to signalling the "
+            "process group",
+            vm_dir,
+            exc,
+        )
+        return shutdown_by_signal(pid, timeout=timeout)
 
     # `shutdown_instance` has already waited up to `timeout` for the supervisor to exit, and the
     # supervisor only exits once QEMU has. So this is a confirmation that the group drained, not

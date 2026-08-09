@@ -16,13 +16,13 @@ the period during which someone wants to read it.
 
 import asyncio
 import logging
-import threading
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from cvmd import __version__
+from cvmd.catalog import HEX64
 from cvmd.cvm.manager import KIND_RENTER, KIND_VALIDATION, CvmManager, LaunchFailure, Triple
 from cvmd.state.store import StateStore
 
@@ -31,8 +31,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 RENTER_NOT_IMPLEMENTED = "renter CVM provisioning lands in DAH-2580"
-
-HEX64 = r"^[0-9a-f]{64}$"
 
 
 class CreateCvmRequest(BaseModel):
@@ -60,12 +58,31 @@ def _manager(request: Request) -> CvmManager:
     return request.app.state.cvm
 
 
-def _lock(request: Request) -> threading.Lock:
-    return request.app.state.cvm_lock
-
-
 def _failure(exc: LaunchFailure) -> JSONResponse:
     return JSONResponse(status_code=exc.status, content={"detail": exc.reason})
+
+
+async def _exclusively(request: Request, operation, *, success: int) -> JSONResponse:
+    """Run one CVM operation on a worker thread, at most one at a time.
+
+    The lock is non-blocking on purpose: a second operation arriving mid-launch is refused, not
+    queued. Queueing would leave the caller waiting on a node that is already committed, and the
+    answer it needs — "not here, not now" — is available immediately.
+    """
+    lock = request.app.state.cvm_lock
+    if not lock.acquire(blocking=False):
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "another CVM operation is already in progress on this node"},
+        )
+    try:
+        report = await asyncio.to_thread(operation)
+    except LaunchFailure as exc:
+        logger.warning("CVM operation refused (%d): %s", exc.status, exc.reason)
+        return _failure(exc)
+    finally:
+        lock.release()
+    return JSONResponse(status_code=success, content=report)
 
 
 @router.get("/health")
@@ -92,45 +109,19 @@ async def create_cvm(request: Request) -> JSONResponse:
     except ValidationError as exc:
         return JSONResponse(status_code=422, content={"detail": exc.errors(include_url=False)})
 
+    triple = Triple(
+        qemu=parsed.qemu,
+        os_image_hash=parsed.os_image_hash,
+        compose_hash=parsed.compose_hash,
+    )
     manager = _manager(request)
-    lock = _lock(request)
-    # Non-blocking on purpose: a second launch arriving mid-launch is refused, not queued.
-    # Queueing would leave the caller waiting on a node that is already committed, and the
-    # answer it needs — "not here, not now" — is available immediately.
-    if not lock.acquire(blocking=False):
-        return JSONResponse(
-            status_code=409,
-            content={"detail": "another CVM operation is already in progress on this node"},
-        )
-    try:
-        triple = Triple(
-            qemu=parsed.qemu,
-            os_image_hash=parsed.os_image_hash,
-            compose_hash=parsed.compose_hash,
-        )
-        report = await asyncio.to_thread(manager.create, kind=KIND_VALIDATION, triple=triple)
-    except LaunchFailure as exc:
-        logger.warning("launch refused (%d): %s", exc.status, exc.reason)
-        return _failure(exc)
-    finally:
-        lock.release()
-    return JSONResponse(status_code=201, content=report)
+    return await _exclusively(
+        request,
+        lambda: manager.create(kind=KIND_VALIDATION, triple=triple),
+        success=201,
+    )
 
 
 @router.delete("/v1/cvm")
 async def destroy_cvm(request: Request) -> JSONResponse:
-    manager = _manager(request)
-    lock = _lock(request)
-    if not lock.acquire(blocking=False):
-        return JSONResponse(
-            status_code=409,
-            content={"detail": "another CVM operation is already in progress on this node"},
-        )
-    try:
-        report = await asyncio.to_thread(manager.destroy)
-    except LaunchFailure as exc:
-        logger.error("teardown failed (%d): %s", exc.status, exc.reason)
-        return _failure(exc)
-    finally:
-        lock.release()
-    return JSONResponse(status_code=200, content=report)
+    return await _exclusively(request, _manager(request).destroy, success=200)

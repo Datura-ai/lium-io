@@ -21,10 +21,16 @@
     owner: root
     group: root
     mode: "0640"
-    # Parsed by the same library cvmd parses it with. A TOML error caught here
-    # leaves the previous config in place; caught at startup it leaves no
-    # working daemon.
-    validate: python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' %s
+    # Loaded by cvmd's OWN loader, not merely parsed as TOML. load_config is
+    # what refuses at startup — the TOML syntax, the required keys, the paired
+    # TLS settings, the port mappings dstack has to turn into hostfwd rules — so
+    # running it against the candidate file makes an unstartable daemon
+    # impossible to install. Caught here it leaves the previous config in place;
+    # caught at startup it leaves no working daemon.
+    validate: >-
+      {{ cvmd_prefix }}/venv/bin/python -c
+      'import sys, pathlib; from cvmd.config import load_config;
+      load_config(pathlib.Path(sys.argv[1]))' %s
   notify: Restart cvmd
 
 # Validated by cvmd's OWN loader, not by a JSON parse. load_authorized_clients

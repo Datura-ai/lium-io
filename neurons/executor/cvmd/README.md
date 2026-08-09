@@ -44,6 +44,13 @@ The request returns when the CVM is up, with the launch report — instance id, 
 and the guest's SSH host-key fingerprint. Meanwhile `/v1/state` moves
 `RECONCILING → LAUNCHING → VALIDATION_RUNNING`.
 
+Readiness is that fingerprint read: a host key can only be collected once sshd inside the guest
+answers through the forward, which is far later and far more meaningful than QEMU accepting a
+connection. So `cvm_ssh_guest_port` must name the guest side of one `cvm_ports` entry — a value
+nothing forwards is refused up front, because it would leave the launch with no readiness check
+at all. On a host with no `ssh-keyscan` installed, readiness degrades to a TCP accept and the
+report's fingerprint is null; the note in the report says which happened.
+
 ### The measurement gate
 
 cvmd imports `dstacktee/scripts/dstack.py` **as a library** and calls the same functions its CLI
