@@ -268,6 +268,77 @@
           valid configuration. msg={{ ssh_match_msg }}
         quiet: true
 
+    # --- teardown budgets (DAH-2577) --------------------------------------
+    #
+    # A tolerance above 1.0 asks for more memory back than the guest was ever
+    # given, so NO teardown on the host could ever satisfy it: every node would
+    # end up FAILED holding a CVM that had already stopped. cvmd's own loader
+    # refuses it too, but only once the config has been rendered — and by then
+    # the previous, working config is what is being replaced.
+    - name: Run cvmd with a memory tolerance above 1
+      block:
+        - name: Include cvmd with an unsatisfiable tolerance
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ssh_guest_port: 2200
+            lium_cvmd_teardown_memory_tolerance: 1.5
+
+        - name: Record that cvmd accepted an unsatisfiable teardown budget
+          ansible.builtin.set_fact:
+            tolerance_refused: false
+            tolerance_msg: ""
+      rescue:
+        - name: Record the tolerance refusal
+          ansible.builtin.set_fact:
+            tolerance_refused: true
+            tolerance_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A teardown budget no host could meet is refused before install
+      ansible.builtin.assert:
+        that:
+          - tolerance_refused | bool
+          - "'teardown_memory_tolerance' in tolerance_msg"
+        fail_msg: >-
+          cvmd accepted teardown_memory_tolerance above 1. No teardown on this
+          host could complete, so every node would end up FAILED holding a CVM
+          that had already stopped.
+          refused={{ tolerance_refused }} msg={{ tolerance_msg }}
+        quiet: true
+
+    # The matching case, so the assert cannot pass by refusing everything.
+    - name: Run cvmd with the default teardown budgets
+      block:
+        - name: Include cvmd with a usable tolerance
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ssh_guest_port: 2200
+            lium_cvmd_teardown_memory_tolerance: 0.9
+
+        - name: Record that the teardown checks passed
+          ansible.builtin.set_fact:
+            tolerance_ok_refused: false
+            tolerance_ok_msg: ""
+      rescue:
+        - name: Record where the matching case stopped
+          ansible.builtin.set_fact:
+            tolerance_ok_refused: true
+            tolerance_ok_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A usable teardown budget passes the launch checks
+      ansible.builtin.assert:
+        that:
+          - not (tolerance_ok_refused | bool) or 'teardown' not in tolerance_ok_msg
+        fail_msg: >-
+          cvmd refused a teardown budget that is inside its own loader's bounds,
+          so the check rejects valid configuration. msg={{ tolerance_ok_msg }}
+        quiet: true
+
 - name: The rendered catalog is what cvmd's loader reads
   hosts: localhost
   gather_facts: false

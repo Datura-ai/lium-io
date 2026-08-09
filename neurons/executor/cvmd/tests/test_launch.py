@@ -16,9 +16,10 @@ from pathlib import Path
 
 import pytest
 from cvmd.config import Config, LaunchConfig
-from cvmd.cvm import measure, supervisor
+from cvmd.cvm import measure, release, supervisor
 from cvmd.cvm.instance import InstanceStore
 from cvmd.cvm.manager import CvmManager, LaunchFailure, Triple
+from cvmd.cvm.switching import SwitchStore
 from cvmd.state.machine import NodeState
 from cvmd.state.store import StateStore
 
@@ -116,6 +117,7 @@ def launch_config(tmp_path, dstack_scripts, catalog_file, env_file, free_ports) 
         env_file=env_file,
         ssh_guest_port=2200,
         launch_timeout_seconds=2,
+        teardown_verify_timeout_seconds=2,
     )
 
 
@@ -127,8 +129,26 @@ def manager(state_dir, launch_config, monkeypatch) -> CvmManager:
         "cvmd.cvm.measure.qemu_version", lambda _dstack: QEMU_FALLBACK, raising=True
     )
     return CvmManager(
-        config=launch_config, store=StateStore(state_dir), instances=InstanceStore(state_dir)
+        config=launch_config,
+        store=StateStore(state_dir),
+        instances=InstanceStore(state_dir),
+        switches=SwitchStore(state_dir),
     )
+
+
+@pytest.fixture
+def host_is_free(monkeypatch):
+    """Report the host's hardware as released, which on a test machine it is not.
+
+    The four release conditions read this machine's `/proc` and `/proc/meminfo`, where the
+    supervisor pid is invented and the memory belongs to whatever else is running. Each fact is
+    replaced by what it would read on a node whose CVM has fully gone, so a teardown test
+    exercises the path it names; a test about a condition NOT holding overrides that one fact
+    on top.
+    """
+    monkeypatch.setattr(release, "group_members", lambda pgid, **kwargs: [])
+    monkeypatch.setattr(release, "vfio_holders", lambda **kwargs: ([], []))
+    monkeypatch.setattr(release, "meminfo", lambda **kwargs: {"MemAvailable": 64 * 1024 * 1024})
 
 
 @pytest.fixture
@@ -242,7 +262,10 @@ class TestRefusals:
 
     def test_a_host_with_no_launch_configuration(self, state_dir, approved):
         manager = CvmManager(
-            config=LaunchConfig(), store=StateStore(state_dir), instances=InstanceStore(state_dir)
+            config=LaunchConfig(),
+            store=StateStore(state_dir),
+            instances=InstanceStore(state_dir),
+            switches=SwitchStore(state_dir),
         )
         with pytest.raises(LaunchFailure) as raised:
             manager.create(kind="validation", triple=approved)
@@ -277,7 +300,10 @@ class TestRefusals:
         )
         mismatched = replace(launch_config, ssh_guest_port=2201)
         manager = CvmManager(
-            config=mismatched, store=StateStore(state_dir), instances=InstanceStore(state_dir)
+            config=mismatched,
+            store=StateStore(state_dir),
+            instances=InstanceStore(state_dir),
+            switches=SwitchStore(state_dir),
         )
 
         with pytest.raises(LaunchFailure) as raised:
@@ -343,6 +369,7 @@ class TestReconciliation:
             config=launch_config,
             store=StateStore(state_dir),
             instances=InstanceStore(state_dir),
+            switches=SwitchStore(state_dir),
         )
         assert restarted.reconcile() is NodeState.VALIDATION_RUNNING
 
@@ -361,6 +388,7 @@ class TestReconciliation:
             config=launch_config,
             store=StateStore(state_dir),
             instances=InstanceStore(state_dir),
+            switches=SwitchStore(state_dir),
         )
         assert restarted.reconcile() is NodeState.FAILED
         assert "is gone but its directory" in restarted._store.document.last_error
@@ -386,7 +414,12 @@ class TestReconciliation:
         """cvmd installed before its catalog exists must not re-derive a state it cannot see."""
         store = StateStore(state_dir)
         store.transition(NodeState.LAUNCHING)
-        manager = CvmManager(config=LaunchConfig(), store=store, instances=InstanceStore(state_dir))
+        manager = CvmManager(
+            config=LaunchConfig(),
+            store=store,
+            instances=InstanceStore(state_dir),
+            switches=SwitchStore(state_dir),
+        )
 
         assert manager.reconcile() is NodeState.LAUNCHING
 
@@ -394,7 +427,10 @@ class TestReconciliation:
         """Never "no record, therefore idle" — a CVM cvmd forgot may still be running."""
         (state_dir / "instance.json").write_text("{ truncated")
         manager = CvmManager(
-            config=launch_config, store=StateStore(state_dir), instances=InstanceStore(state_dir)
+            config=launch_config,
+            store=StateStore(state_dir),
+            instances=InstanceStore(state_dir),
+            switches=SwitchStore(state_dir),
         )
 
         assert manager.reconcile() is NodeState.FAILED
@@ -513,7 +549,7 @@ class TestOverHttp:
         )
 
     def test_the_platform_key_tears_the_cvm_down(
-        self, launching_client, validator_key, platform_key, approved, monkeypatch
+        self, launching_client, validator_key, platform_key, approved, host_is_free, monkeypatch
     ):
         """DELETE carries no `kind`, so it is renter-scoped: letting the validation key call it
         would let a validator destroy a renter's CVM."""
@@ -586,7 +622,7 @@ class TestReadinessWithoutKeyscan:
 
 class TestTeardown:
     def test_tearing_down_a_running_cvm_frees_the_node(
-        self, manager, approved, spawned, guest_is_up, launch_config, monkeypatch
+        self, manager, approved, spawned, guest_is_up, host_is_free, launch_config, monkeypatch
     ):
         report = manager.create(kind="validation", triple=approved)
         monkeypatch.setattr(supervisor, "shutdown", lambda *a, **k: "guest powered off on request")
@@ -600,7 +636,7 @@ class TestTeardown:
         assert supervisor.vm_directories(launch_config.run_dir) == []
 
     def test_a_relaunch_after_teardown_succeeds(
-        self, manager, approved, spawned, guest_is_up, monkeypatch
+        self, manager, approved, spawned, guest_is_up, host_is_free, monkeypatch
     ):
         """The point of removing the directory: the node is reusable without hand-cleanup."""
         manager.create(kind="validation", triple=approved)
@@ -675,14 +711,201 @@ class TestTeardown:
         assert detail == "process group stopped by SIGTERM"
 
     def test_a_cvm_that_will_not_stop_fails_the_node(
-        self, manager, approved, spawned, guest_is_up, monkeypatch
+        self, manager, approved, spawned, guest_is_up, host_is_free, launch_config, monkeypatch
     ):
         """Never report a teardown that did not happen — that is the DAH-2577 acceptance bar."""
         manager.create(kind="validation", triple=approved)
+        vm_dir = Path(manager._instances.current.vm_dir)
         monkeypatch.setattr(supervisor, "shutdown", lambda *a, **k: "still present after SIGKILL")
+        monkeypatch.setattr(
+            release, "group_members", lambda pgid, **kwargs: [f"pid {pgid} (qemu-system-x86_64)"]
+        )
 
         with pytest.raises(LaunchFailure) as raised:
             manager.destroy()
 
-        assert raised.value.status == 500
+        assert raised.value.status == 504
+        assert "process_reaped" in raised.value.reason
         assert manager._store.state is NodeState.FAILED
+        # The directory and the record both stay. They are what `_assert_node_is_free` reads, so
+        # a node that never released its hardware refuses the next launch rather than merely
+        # being marked FAILED.
+        assert vm_dir.exists()
+        assert manager._instances.current is not None
+
+
+class TestVerifiedRelease:
+    """DAH-2577: a teardown reports complete only when the node's hardware is actually free.
+
+    The four conditions read the host, so each test here replaces one host fact and asserts the
+    teardown's answer to it. What cannot be reached from a test process — a real TDX guest
+    holding a real VFIO group while its memory drains — is the hardware run's job.
+    """
+
+    def _record_transitions(self, manager, monkeypatch) -> list[NodeState]:
+        seen: list[NodeState] = []
+        original = manager._store.transition
+
+        def recording(requested, **kwargs):
+            seen.append(requested)
+            return original(requested, **kwargs)
+
+        monkeypatch.setattr(manager._store, "transition", recording)
+        return seen
+
+    def _stopped(self, monkeypatch) -> None:
+        monkeypatch.setattr(supervisor, "shutdown", lambda *a, **k: "guest powered off on request")
+        monkeypatch.setattr(supervisor, "is_supervisor", lambda pid, vm_dir: False)
+
+    def test_the_node_passes_through_switching_on_its_way_to_free(
+        self, manager, approved, spawned, guest_is_up, host_is_free, monkeypatch
+    ):
+        """TEARDOWN is stopping the CVM; SWITCHING is waiting for the hardware to come back.
+
+        They are separate states because they are separate questions, and because FR-C7 needs a
+        node that is neither running nor available to read as switching rather than as offline.
+        """
+        manager.create(kind="validation", triple=approved)
+        self._stopped(monkeypatch)
+        seen = self._record_transitions(manager, monkeypatch)
+
+        manager.destroy()
+
+        assert seen == [NodeState.TEARDOWN, NodeState.SWITCHING, NodeState.RECONCILING]
+
+    def test_the_teardown_report_times_every_condition(
+        self, manager, approved, spawned, guest_is_up, host_is_free, monkeypatch
+    ):
+        """One total says nothing about which hardware class is slow; four numbers do."""
+        manager.create(kind="validation", triple=approved)
+        self._stopped(monkeypatch)
+
+        switch = manager.destroy()["switch"]
+
+        assert switch["complete"] is True
+        assert switch["outcome"] == "released"
+        assert set(switch["conditions"]) == set(release.CONDITION_NAMES)
+        assert all(
+            condition["satisfied_after_seconds"] is not None
+            for condition in switch["conditions"].values()
+        )
+        assert switch["duration_seconds"] >= 0
+
+    def test_a_held_vfio_descriptor_is_not_a_free_node(
+        self, manager, approved, spawned, guest_is_up, host_is_free, launch_config, monkeypatch
+    ):
+        """The GPUs are the point of the node. A descriptor still open means the next CVM
+        cannot have them, whatever the process table says."""
+        manager.create(kind="validation", triple=approved)
+        vm_dir = Path(manager._instances.current.vm_dir)
+        self._stopped(monkeypatch)
+        monkeypatch.setattr(
+            release, "vfio_holders", lambda **kwargs: (["pid 9 (qemu) holds /dev/vfio/42"], [])
+        )
+
+        with pytest.raises(LaunchFailure) as raised:
+            manager.destroy()
+
+        assert raised.value.status == 504
+        assert "vfio_released" in raised.value.reason
+        assert "/dev/vfio/42" in raised.value.reason
+        assert manager._store.state is NodeState.FAILED
+        assert vm_dir.exists()
+
+    def test_memory_still_out_with_the_guest_is_not_a_free_node(
+        self, manager, approved, spawned, guest_is_up, host_is_free, monkeypatch
+    ):
+        """The fleet's standing bug, stated as a condition: QEMU is gone and the RAM is not
+        back yet, so the node cannot host the CVM the platform is about to send it."""
+        manager.create(kind="validation", triple=approved)
+        self._stopped(monkeypatch)
+        # The guest is 2G and nothing like that is available.
+        monkeypatch.setattr(release, "meminfo", lambda **kwargs: {"MemAvailable": 64 * 1024})
+
+        with pytest.raises(LaunchFailure) as raised:
+            manager.destroy()
+
+        assert raised.value.status == 504
+        assert "memory_returned" in raised.value.reason
+        assert manager._store.state is NodeState.FAILED
+
+    def test_hugepages_still_out_of_the_pool_are_not_a_free_node(
+        self, state_dir, launch_config, approved, spawned, guest_is_up, host_is_free, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "cvmd.cvm.measure.qemu_version", lambda _dstack: QEMU_FALLBACK, raising=True
+        )
+        manager = CvmManager(
+            config=replace(launch_config, hugepages=True),
+            store=StateStore(state_dir),
+            instances=InstanceStore(state_dir),
+            switches=SwitchStore(state_dir),
+        )
+        manager.create(kind="validation", triple=approved)
+        self._stopped(monkeypatch)
+        monkeypatch.setattr(
+            release,
+            "meminfo",
+            lambda **kwargs: {
+                "MemAvailable": 64 * 1024 * 1024,
+                "HugePages_Total": 100,
+                "HugePages_Free": 40,
+            },
+        )
+
+        with pytest.raises(LaunchFailure) as raised:
+            manager.destroy()
+
+        assert "60 of 100 hugepages are still out of the pool" in raised.value.reason
+
+    def test_a_repeat_teardown_continues_the_switch_it_finds_in_flight(
+        self, manager, approved, spawned, guest_is_up, host_is_free, monkeypatch
+    ):
+        """The baseline is only meaningful taken while the guest was running, and the window
+        FR-I3 budgets for began at the platform's first call, not at the retry that worked."""
+        manager.create(kind="validation", triple=approved)
+        self._stopped(monkeypatch)
+        monkeypatch.setattr(
+            release, "vfio_holders", lambda **kwargs: (["pid 9 (qemu) holds /dev/vfio/42"], [])
+        )
+        with pytest.raises(LaunchFailure):
+            manager.destroy()
+        first = manager._switches.current
+
+        monkeypatch.setattr(release, "vfio_holders", lambda **kwargs: ([], []))
+        manager.destroy()
+
+        second = manager._switches.current
+        assert second.started_at == first.started_at
+        assert second.baseline_mem_available_kib == first.baseline_mem_available_kib
+        assert second.outcome == "released"
+
+    def test_a_node_that_never_released_refuses_the_next_launch(
+        self, manager, approved, spawned, guest_is_up, host_is_free, monkeypatch
+    ):
+        """FR-C6 in one assertion: do not start the next CVM on hardware the last one holds."""
+        manager.create(kind="validation", triple=approved)
+        self._stopped(monkeypatch)
+        monkeypatch.setattr(
+            release, "vfio_holders", lambda **kwargs: (["pid 9 (qemu) holds /dev/vfio/42"], [])
+        )
+        with pytest.raises(LaunchFailure):
+            manager.destroy()
+
+        with pytest.raises(LaunchFailure) as raised:
+            manager.create(kind="validation", triple=approved)
+
+        assert raised.value.status == 409
+
+    def test_the_last_switch_is_reported_after_the_cvm_is_gone(
+        self, manager, approved, spawned, guest_is_up, host_is_free, monkeypatch
+    ):
+        """`/v1/state` has to answer "how long has this node been switching" when there is no
+        instance left to describe — that is exactly when FR-I3 needs the number."""
+        assert manager.last_switch() is None
+        manager.create(kind="validation", triple=approved)
+        self._stopped(monkeypatch)
+        manager.destroy()
+
+        assert manager.describe() is None
+        assert manager.last_switch()["outcome"] == "released"

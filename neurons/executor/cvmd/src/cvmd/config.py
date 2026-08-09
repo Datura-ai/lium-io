@@ -26,9 +26,24 @@ DEFAULT_LAUNCH_TIMEOUT_SECONDS = 900
 # A large-memory TDX guest returns its RAM to the host as it exits, and that is slow — 43
 # minutes was measured for a 1.13 TB guest on this fleet. So this is a floor for ordinary
 # sizes, not a budget for the largest ones; setting it too low turns a legitimate slow exit
-# into a SIGKILL partway through. Per-hardware-class budgets are DAH-2577's open item, which
-# is why this is a setting rather than a constant.
+# into a SIGKILL partway through. See roles/cvmd/README.md for the measured per-hardware-class
+# values these two defaults come from.
 DEFAULT_TEARDOWN_TIMEOUT_SECONDS = 600
+
+# How long the four release conditions get, counted from the moment the CVM was asked to stop.
+#
+# A separate budget from the one above because it measures a different thing: that one bounds
+# how long the guest is given to power itself off, this one bounds how long the *host* takes to
+# get its hardware back afterwards. The two are not proportional — a guest that exits in seconds
+# can leave its memory draining for tens of minutes.
+DEFAULT_TEARDOWN_VERIFY_TIMEOUT_SECONDS = 1800
+
+# How much of the guest's configured memory must be back before the node counts as free.
+#
+# Below 1.0 because MemAvailable is the kernel's own estimate and a host reads a little short of
+# a round number even when nothing is held. It is a tolerance on a measurement, not a licence to
+# launch into memory that has not come back — see `cvm/release.py:memory_returned`.
+DEFAULT_TEARDOWN_MEMORY_TOLERANCE = 0.9
 
 # dstack's default key-provider port. lium-cvm.sh relies on the same default.
 DEFAULT_KEY_PROVIDER_PORT = 3443
@@ -62,6 +77,8 @@ class LaunchConfig:
     key_provider_port: int = DEFAULT_KEY_PROVIDER_PORT
     launch_timeout_seconds: int = DEFAULT_LAUNCH_TIMEOUT_SECONDS
     teardown_timeout_seconds: int = DEFAULT_TEARDOWN_TIMEOUT_SECONDS
+    teardown_verify_timeout_seconds: int = DEFAULT_TEARDOWN_VERIFY_TIMEOUT_SECONDS
+    teardown_memory_tolerance: float = DEFAULT_TEARDOWN_MEMORY_TOLERANCE
 
     vcpus: int | None = None
     memory: str | None = None
@@ -143,6 +160,13 @@ def _as_optional_int(value, key: str) -> int | None:
     return _as_int(value, key)
 
 
+def _as_float(value, key: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{key} must be a number, got {value!r}") from exc
+
+
 def _as_optional_str(value) -> str | None:
     if value is None:
         return None
@@ -201,6 +225,18 @@ def _load_launch(table: dict) -> LaunchConfig:
             _get(table, "teardown_timeout_seconds", DEFAULT_TEARDOWN_TIMEOUT_SECONDS),
             "teardown_timeout_seconds",
         ),
+        teardown_verify_timeout_seconds=_as_int(
+            _get(
+                table,
+                "teardown_verify_timeout_seconds",
+                DEFAULT_TEARDOWN_VERIFY_TIMEOUT_SECONDS,
+            ),
+            "teardown_verify_timeout_seconds",
+        ),
+        teardown_memory_tolerance=_as_float(
+            _get(table, "teardown_memory_tolerance", DEFAULT_TEARDOWN_MEMORY_TOLERANCE),
+            "teardown_memory_tolerance",
+        ),
         vcpus=_as_optional_int(_get(table, "cvm_vcpus"), "cvm_vcpus"),
         memory=_as_optional_str(_get(table, "cvm_memory")),
         disk=_as_optional_str(_get(table, "cvm_disk")),
@@ -229,6 +265,15 @@ def _load_launch(table: dict) -> LaunchConfig:
         raise ConfigError("`launch_timeout_seconds` must be positive")
     if launch.teardown_timeout_seconds <= 0:
         raise ConfigError("`teardown_timeout_seconds` must be positive")
+    if launch.teardown_verify_timeout_seconds <= 0:
+        raise ConfigError("`teardown_verify_timeout_seconds` must be positive")
+    # Above 1.0 would demand more memory back than the guest was ever given, so no teardown on
+    # this host could ever complete — a value that turns every node FAILED, accepted at startup.
+    if not 0 < launch.teardown_memory_tolerance <= 1:
+        raise ConfigError(
+            "`teardown_memory_tolerance` must be greater than 0 and at most 1, got "
+            f"{launch.teardown_memory_tolerance}"
+        )
     return launch
 
 

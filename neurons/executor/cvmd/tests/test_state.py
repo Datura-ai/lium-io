@@ -45,6 +45,18 @@ class TestTransitions:
     def test_failed_recovers_only_through_reconciling(self):
         assert LEGAL_TRANSITIONS[NodeState.FAILED] == frozenset({NodeState.RECONCILING})
 
+    def test_a_stopped_cvm_leaves_the_node_switching_not_free(self):
+        """Stopping the CVM ends TEARDOWN, not the crossing: the GPUs, the guest's memory and
+        the forwarded ports come back to the host after the process does."""
+        assert NodeState.SWITCHING in LEGAL_TRANSITIONS[NodeState.TEARDOWN]
+
+    def test_switching_cannot_reach_launching(self):
+        """FR-C6 enforced by the machine rather than by remembering to check it. A node whose
+        last CVM's memory is still draining has no edge to LAUNCHING to take."""
+        assert LEGAL_TRANSITIONS[NodeState.SWITCHING] == frozenset(
+            {NodeState.RECONCILING, NodeState.FAILED}
+        )
+
     def test_illegal_transition_names_what_was_allowed(self, state_dir):
         """The error has to be actionable — 'illegal transition' alone is not."""
         store = StateStore(state_dir)  # starts in RECONCILING; the self-edge is illegal

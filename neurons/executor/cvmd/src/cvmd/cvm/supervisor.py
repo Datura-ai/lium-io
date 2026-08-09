@@ -236,9 +236,10 @@ def shutdown(dstack: ModuleType, vm_dir: Path, pid: int, *, timeout: int) -> str
        `spawn` started a new session.
     3. SIGKILL the group.
 
-    Confirming the process group is gone is the floor, not the ceiling. DAH-2577 adds the real
-    predicate — VFIO file descriptors closed, guest RAM returned, forwarded ports bindable —
-    because a reaped QEMU is necessary for those and nowhere near sufficient.
+    Returning does not mean the node is free. This function's job ends when the process is
+    gone; `cvm/release.py` answers the question that matters — VFIO descriptors closed, guest
+    RAM returned, forwarded ports bindable — because a reaped QEMU is necessary for those and
+    nowhere near sufficient.
     """
     try:
         dstack.shutdown_instance(str(vm_dir), timeout=timeout, force=False)

@@ -21,8 +21,9 @@ from pathlib import Path
 
 from cvmd import catalog
 from cvmd.config import LaunchConfig
-from cvmd.cvm import measure, ports, sshkey, supervisor
+from cvmd.cvm import measure, ports, release, sshkey, supervisor
 from cvmd.cvm.instance import Instance, InstanceStore, PortReport, now_iso
+from cvmd.cvm.switching import RELEASED, TIMED_OUT, SwitchRecord, SwitchStore
 from cvmd.dstack.loader import DStackUnavailable, load_dstack
 from cvmd.dstack.plan import setup_namespace
 from cvmd.state.machine import NodeState, is_legal
@@ -77,13 +78,24 @@ class Triple:
 
 class CvmManager:
     def __init__(
-        self, *, config: LaunchConfig, store: StateStore, instances: InstanceStore
+        self,
+        *,
+        config: LaunchConfig,
+        store: StateStore,
+        instances: InstanceStore,
+        switches: SwitchStore,
     ) -> None:
         self._config = config
         self._store = store
         self._instances = instances
+        self._switches = switches
 
     # ------------------------------------------------------------------ reporting
+
+    def last_switch(self) -> dict | None:
+        """What `/v1/state` reports about the node's last mode change, if it has had one."""
+        record = self._switches.current
+        return record.report() if record is not None else None
 
     def describe(self) -> dict | None:
         """What `/v1/state` reports about the CVM, if there is one."""
@@ -334,14 +346,18 @@ class CvmManager:
             )
 
     def _enter_launching(self) -> None:
-        # FAILED reaches LAUNCHING only through RECONCILING — recovery is deliberate, so the
-        # daemon re-derives the host's real state instead of assuming the failure cleared.
-        if self._store.state == NodeState.FAILED:
+        # Neither FAILED nor SWITCHING reaches LAUNCHING directly, and for the same reason:
+        # recovery is deliberate, so the daemon re-derives the host's real state instead of
+        # assuming the condition cleared. SWITCHING only survives a crash mid-teardown — every
+        # other path leaves it before returning — but a launch into a node whose last CVM's
+        # memory is still draining is precisely what FR-C6 forbids.
+        if self._store.state in (NodeState.FAILED, NodeState.SWITCHING):
+            blocked = self._store.state
             self.reconcile()
-            if self._store.state == NodeState.FAILED:
+            if self._store.state in (NodeState.FAILED, NodeState.SWITCHING):
                 raise LaunchFailure(
                     409,
-                    f"this node is FAILED and reconciliation did not clear it: "
+                    f"this node is {blocked} and reconciliation did not clear it: "
                     f"{self._store.document.last_error}",
                 )
         self._store.transition(NodeState.LAUNCHING)
@@ -502,15 +518,24 @@ class CvmManager:
     # ------------------------------------------------------------------ destroy
 
     def destroy(self) -> dict:
-        """Stop the CVM and free the node. Safe to call when nothing is running.
+        """Stop the CVM and hold until this node's hardware is verifiably free.
 
-        Idempotent on purpose: a platform that timed out mid-teardown has to be able to repeat
-        the call, and answering "there was nothing here" is more useful to it than an error it
-        has to special-case.
+        Returns only when all four conditions in `cvm/release.py` hold together, which is what
+        makes a 200 here mean the node can take the next CVM. The fleet's standing bug is the
+        opposite of that: `lium-cvm.sh stop` reports success when its wait loop gives up, and
+        QEMU is still holding the guest's memory afterwards. A stopped process is the start of
+        a teardown, not the end of one.
 
-        The VM directory is removed, disk included. A CVM's disk is not durable state — the
-        validation CVM must measure identically on every launch, and a renter's is gone with
-        the rental — and leaving it behind would block the next launch on this node.
+        Idempotent on purpose: a platform whose teardown timed out has to be able to repeat the
+        call, and answering "there was nothing here" is more useful to it than an error it has
+        to special-case. A repeat continues the switch already in flight rather than starting a
+        new one — see `_begin_switch`.
+
+        The VM directory is removed once the node is verified free, disk included. A CVM's disk
+        is not durable state — the validation CVM must measure identically on every launch, and
+        a renter's is gone with the rental — and leaving it behind would block the next launch.
+        A teardown that did NOT verify keeps the directory, which is what stops the node
+        accepting a launch it cannot honour.
         """
         instance = self._instances.current
         if instance is None:
@@ -543,38 +568,139 @@ class CvmManager:
             }
 
         vm_dir = Path(instance.vm_dir)
+        # Written before the first signal. cvmd is restartable by design, and the baseline the
+        # memory condition compares against is only meaningful if it was read while the guest
+        # was still running — a daemon that came back afterwards could never take it again.
+        record = self._begin_switch(instance)
+
         if self._store.state == NodeState.FAILED:
             self._store.transition(NodeState.RECONCILING)
         if self._store.state != NodeState.TEARDOWN:
             self._store.transition(NodeState.TEARDOWN)
 
-        detail = "the supervisor was already gone"
-        if supervisor.is_supervisor(instance.supervisor_pid, vm_dir):
-            try:
-                dstack = self._load_dstack()
-            except LaunchFailure as exc:
-                # Without dstack there is no graceful path, but the process group is still
-                # ours to signal — refusing to stop would be worse than stopping abruptly.
-                logger.warning("%s; falling back to signalling the process group", exc.reason)
-                detail = supervisor.shutdown_by_signal(
-                    instance.supervisor_pid, timeout=self._config.teardown_timeout_seconds
-                )
-            else:
-                detail = supervisor.shutdown(
-                    dstack,
-                    vm_dir,
-                    instance.supervisor_pid,
-                    timeout=self._config.teardown_timeout_seconds,
-                )
+        detail = self._stop(instance, vm_dir)
 
-        still_there = supervisor.is_supervisor(instance.supervisor_pid, vm_dir)
+        self._store.transition(NodeState.SWITCHING)
+        report = release.verify_released(
+            self._release_checks(record),
+            timeout=self._config.teardown_verify_timeout_seconds,
+        )
+
+        if not report.complete:
+            reason = (
+                f"CVM {instance.instance_id} was stopped ({detail}) but this node's hardware is "
+                f"still held {report.duration_seconds:.0f}s later — {report.why_incomplete()}"
+            )
+            # The directory stays. It is the fail-closed record that this node still owes
+            # something to a CVM that is gone, and `_assert_node_is_free` reads it, so a launch
+            # into half-released hardware is refused rather than merely discouraged.
+            self._switches.finish(outcome=TIMED_OUT, detail=detail, release=report.to_json())
+            self._store.transition(NodeState.FAILED, last_error=reason)
+            raise LaunchFailure(504, reason)
+
         self._discard(vm_dir)
         self._instances.clear()
-
-        if still_there:
-            reason = f"CVM {instance.instance_id} did not stop: {detail}"
-            self._store.transition(NodeState.FAILED, last_error=reason)
-            raise LaunchFailure(500, reason)
-
+        finished = self._switches.finish(outcome=RELEASED, detail=detail, release=report.to_json())
         self._store.transition(NodeState.RECONCILING)
-        return {"torn_down": True, "instance_id": instance.instance_id, "detail": detail}
+        logger.info(
+            "CVM %s released this node in %.0fs (%s)",
+            instance.instance_id,
+            report.duration_seconds,
+            detail,
+        )
+        return {
+            "torn_down": True,
+            "instance_id": instance.instance_id,
+            "detail": detail,
+            "switch": finished.report(),
+        }
+
+    def _stop(self, instance: Instance, vm_dir: Path) -> str:
+        """Ask the CVM to stop, escalating as far as it takes. Reports; never raises."""
+        if not supervisor.is_supervisor(instance.supervisor_pid, vm_dir):
+            return "the supervisor was already gone"
+        try:
+            dstack = self._load_dstack()
+        except LaunchFailure as exc:
+            # Without dstack there is no graceful path, but the process group is still ours to
+            # signal — refusing to stop would be worse than stopping abruptly.
+            logger.warning("%s; falling back to signalling the process group", exc.reason)
+            return supervisor.shutdown_by_signal(
+                instance.supervisor_pid, timeout=self._config.teardown_timeout_seconds
+            )
+        return supervisor.shutdown(
+            dstack,
+            vm_dir,
+            instance.supervisor_pid,
+            timeout=self._config.teardown_timeout_seconds,
+        )
+
+    def _begin_switch(self, instance: Instance) -> SwitchRecord:
+        """Start — or resume — the record of this node's crossing between modes.
+
+        A repeat teardown continues the switch it finds in flight instead of opening a new one.
+        Two reasons, and both are about honesty rather than tidiness: the memory baseline has to
+        be a reading from while the guest was running, and the window FR-I3 budgets for began at
+        the platform's first call, not at whichever retry happened to succeed.
+        """
+        unfinished = self._switches.unfinished
+        if unfinished is not None and unfinished.instance_id == instance.instance_id:
+            return unfinished
+        return self._switches.begin(
+            SwitchRecord(
+                instance_id=instance.instance_id,
+                kind=instance.kind,
+                vm_dir=instance.vm_dir,
+                supervisor_pid=instance.supervisor_pid,
+                started_at=now_iso(),
+                guest_memory_kib=self._guest_memory_kib(),
+                baseline_mem_available_kib=self._mem_available(),
+                ports=list(instance.ports),
+            )
+        )
+
+    def _guest_memory_kib(self) -> int | None:
+        """How much memory this host gives a guest, in KiB, or None if it cannot be read.
+
+        Degrades rather than refuses. A teardown is the wrong moment to discover a malformed
+        size — the launch that used it already succeeded — and the memory condition says plainly
+        that it has nothing to compare against.
+        """
+        if self._config.memory is None:
+            return None
+        try:
+            return release.memory_kib(self._config.memory)
+        except release.MemoryUnreadable as exc:
+            logger.warning("this teardown cannot check the guest's memory: %s", exc)
+            return None
+
+    def _mem_available(self) -> int | None:
+        try:
+            return release.mem_available_kib()
+        except release.MemoryUnreadable as exc:
+            logger.warning("this teardown has no memory baseline: %s", exc)
+            return None
+
+    def _release_checks(self, record: SwitchRecord) -> release.ReleaseChecks:
+        """The four conditions, bound to the CVM being torn down.
+
+        Ports come from the instance record rather than from the config: those are the mappings
+        QEMU was actually started with, and a config edited since the launch would have this
+        check probing addresses no guest ever held.
+        """
+        return release.ReleaseChecks(
+            supervisor_pid=record.supervisor_pid,
+            mappings=[
+                ports.PortMapping(
+                    protocol=port.protocol,
+                    address=port.address,
+                    host_port=port.host_port,
+                    guest_port=port.guest_port,
+                )
+                for port in record.ports
+            ],
+            guest_memory_kib=record.guest_memory_kib,
+            baseline_mem_available_kib=record.baseline_mem_available_kib,
+            memory_tolerance=self._config.teardown_memory_tolerance,
+            hugepages=self._config.hugepages,
+        )

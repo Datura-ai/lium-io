@@ -16,6 +16,7 @@ from cvmd.auth.replay import ReplayStore
 from cvmd.config import Config
 from cvmd.cvm.instance import InstanceStore
 from cvmd.cvm.manager import CvmManager
+from cvmd.cvm.switching import SwitchStore
 from cvmd.routes.cvm import router
 from cvmd.state.store import StateStore
 
@@ -29,7 +30,8 @@ def create_app(config: Config) -> FastAPI:
     store = StateStore(config.state_dir)
     replay = ReplayStore(config.state_dir, skew_seconds=config.skew_seconds)
     instances = InstanceStore(config.state_dir)
-    manager = CvmManager(config=config.launch, store=store, instances=instances)
+    switches = SwitchStore(config.state_dir)
+    manager = CvmManager(config=config.launch, store=store, instances=instances, switches=switches)
 
     app = FastAPI(title="cvmd", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.config = config
@@ -37,6 +39,7 @@ def create_app(config: Config) -> FastAPI:
     app.state.replay = replay
     app.state.clients = clients
     app.state.instances = instances
+    app.state.switches = switches
     app.state.cvm = manager
     # One CVM operation at a time. Held by the route rather than inside the manager so a second
     # request is refused immediately instead of blocking a worker thread for the whole launch.
