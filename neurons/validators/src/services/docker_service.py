@@ -78,6 +78,7 @@ from services.gpu_power_limit import (
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
+from services.cluster_fabric import cluster_env_and_ports
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
@@ -893,6 +894,16 @@ class DockerService:
         }
         environment["NVIDIA_DRIVER_CAPABILITIES"] = "all"
 
+        # DAH-2620: a node of a multi-node group rental gets its WireGuard overlay config injected and
+        # the WireGuard UDP port published, so NCCL's socket bootstrap can reach the other nodes; the
+        # tensors still travel over InfiniBand. Absent on an ordinary rental.
+        cluster_udp_ports: tuple[int, ...] = ()
+        if payload.cluster_membership is not None:
+            cluster_env, cluster_udp_ports = cluster_env_and_ports(
+                payload.cluster_membership.wireguard_conf
+            )
+            environment.update(cluster_env)
+
         volume_target = _LIUM_CIPHER_MOUNT if encrypted_local_volume else local_volume_path
         volumes = [VolumeMount(source=local_volume, target=volume_target)]
         occupied_targets = {volume_target}
@@ -913,9 +924,15 @@ class DockerService:
             name=container_name,
             command=build_container_command_argv(custom_options.startup_commands),
             environment=environment,
-            ports=tuple(
-                PortBinding(container_port=docker_port, host_port=internal_port)
-                for docker_port, internal_port, _ in port_maps
+            ports=(
+                *(
+                    PortBinding(container_port=docker_port, host_port=internal_port)
+                    for docker_port, internal_port, _ in port_maps
+                ),
+                *(
+                    PortBinding(container_port=udp_port, host_port=udp_port, protocol="udp")
+                    for udp_port in cluster_udp_ports
+                ),
             ),
             volumes=tuple(volumes),
             restart_policy="unless-stopped",

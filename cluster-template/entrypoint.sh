@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# DAH-2620: raise the cluster overlay, point NCCL at it, then hand off to the workload.
+#
+# The validator injects LIUM_WIREGUARD_CONF_B64 (this node's wg-quick config, base64) into every pod
+# of a group rental. A single-node rental has no such variable, so this whole block is skipped and
+# the pod behaves exactly like an ordinary one.
+set -euo pipefail
+
+raise_cluster_overlay() {
+    local conf_b64="${LIUM_WIREGUARD_CONF_B64:-}"
+    if [[ -z "$conf_b64" ]]; then
+        echo "lium-cluster: no cluster config injected, running as a standalone node" >&2
+        return 0
+    fi
+
+    mkdir -p /etc/wireguard
+    # wg reads the private key from this file, so it must not be world-readable.
+    umask 077
+    echo "$conf_b64" | base64 -d > /etc/wireguard/wg0.conf
+
+    # wg-quick needs NET_ADMIN, which a group-rental pod is given; if it is missing we surface it
+    # rather than letting NCCL silently fall back to the unreachable bridge address later.
+    if ! wg-quick up wg0; then
+        echo "lium-cluster: failed to bring up wg0 — the node cannot join the cluster" >&2
+        exit 1
+    fi
+
+    # The one contract with the workload: the overlay is always called wg0. NCCL and gloo do not
+    # pick a second interface on their own, so we name it for them here and the renter never has to.
+    export NCCL_SOCKET_IFNAME=wg0
+    export GLOO_SOCKET_IFNAME=wg0
+    # Bootstrap rides one flow otherwise; these fan it across the wire (measured 7.3x on our fabric).
+    export NCCL_SOCKET_NTHREADS=4
+    export NCCL_NSOCKS_PERTHREAD=8
+
+    echo "lium-cluster: wg0 up at $(wg show wg0 2>/dev/null | awk '/interface/{print}')" >&2
+}
+
+raise_cluster_overlay
+exec "$@"
