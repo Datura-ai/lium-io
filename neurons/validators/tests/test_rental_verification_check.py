@@ -1,20 +1,19 @@
 from datetime import datetime, timedelta
+from unittest.mock import Mock, patch
 
 import asyncssh
 import pytest
-from unittest.mock import Mock, patch
-
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     GPU_RUNTIME_DEVICE_FAULT_REASON,
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     ExecutorHealthCheckResponse,
     FillerRunActiveResponse,
 )
-from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
 from neurons.validators.src.services.task.pipeline import CheckResult, Context
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
 from tests.helpers import build_services, build_state
 
@@ -47,6 +46,7 @@ class DummyBackendClient:
         container_port: int,
         executor_id: str | None = None,
         rental_in_progress: bool = False,
+        gpu_uuids: list[str] | None = None,
     ):
         self.called_with = {
             "miner_address": miner_address,
@@ -55,6 +55,7 @@ class DummyBackendClient:
             "container_port": container_port,
             "executor_id": executor_id,
             "rental_in_progress": rental_in_progress,
+            "gpu_uuids": gpu_uuids,
         }
         return self.response
 
@@ -153,6 +154,7 @@ async def test_rental_verification_success():
         "container_port": 8080,  # First verified port
         "executor_id": "executor-123",
         "rental_in_progress": False,  # no customer rental in this state
+        "gpu_uuids": [],  # this state carries no scraped gpu details
     }
 
 
@@ -859,3 +861,96 @@ async def test_unreachable_bundle_does_not_mask_a_kill_behind_it():
         Msg.FILLER_TRANSPORT_UNREACHABLE.reason,
         Msg.FILLER_KILLED.reason,
     ]
+
+
+# ---------------------------------------------------------------------------
+# DAH-2614: the backend's probe must name the cards this cycle's scrape saw,
+# instead of `--gpus all`, which never names one.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_sends_scraped_gpu_uuids():
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={
+            "verified_ports": [9001],
+            "gpu": {
+                "count": 2,
+                "details": [
+                    {"uuid": "GPU-f2bfa67f-5281-aabc-aa90-c91764f90d17", "name": "B200"},
+                    {"uuid": "GPU-f2bfa67f-5281-aabc-aa90-c91764f90d18", "name": "B200"},
+                ],
+            },
+        }
+    )
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert backend_client.called_with["gpu_uuids"] == [
+        "GPU-f2bfa67f-5281-aabc-aa90-c91764f90d17",
+        "GPU-f2bfa67f-5281-aabc-aa90-c91764f90d18",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_sends_empty_list_when_the_scrape_has_no_gpu_details():
+    # The backend falls back to `--gpus all`, i.e. exactly the behaviour before this change.
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [9001]})
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert backend_client.called_with["gpu_uuids"] == []
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_skips_gpu_details_without_a_uuid():
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={
+            "verified_ports": [9001],
+            "gpu": {
+                "count": 3,
+                "details": [
+                    {"uuid": "GPU-f2bfa67f-5281-aabc-aa90-c91764f90d17"},
+                    {"uuid": ""},
+                    {"name": "B200"},
+                ],
+            },
+        }
+    )
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert backend_client.called_with["gpu_uuids"] == ["GPU-f2bfa67f-5281-aabc-aa90-c91764f90d17"]
