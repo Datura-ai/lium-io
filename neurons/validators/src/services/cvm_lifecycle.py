@@ -269,6 +269,17 @@ class CvmLifecycleService:
         except Exception:  # noqa: BLE001 - no Redis, no cooldown; the in-process set still guards
             pass
 
+        # Refresh before reading the catalog. The sweep path runs inside a validation cycle,
+        # which already refreshes via attestation — but the switch-back trigger runs in the
+        # connector process (compute_client), which never runs attestation, so its catalog
+        # would otherwise be perpetually None and every immediate relaunch would fail-closed
+        # with "no signed catalog entry". refresh() is itself fail-closed (a network error
+        # leaves the held manifest untouched) and is_due-gated, so this is safe on both paths.
+        try:
+            await self.whitelist_source.refresh()
+        except Exception:  # noqa: BLE001 - refresh never raises, but the launch must not depend on that
+            pass
+
         catalog = self.whitelist_source.current()
         entry = catalog.newest_validation_entry() if catalog else None
         if entry is None:

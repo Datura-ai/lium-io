@@ -212,6 +212,7 @@ def make_lifecycle(catalog_entry, *, cooldown_active=False):
     catalog = MagicMock()
     catalog.newest_validation_entry = MagicMock(return_value=catalog_entry)
     whitelist.current = MagicMock(return_value=catalog if catalog_entry is not None else None)
+    whitelist.refresh = AsyncMock()
     service = CvmLifecycleService(redis, whitelist, Keypair.create_from_uri("//Alice"))
     service.client = MagicMock()
     return service
@@ -282,6 +283,29 @@ class TestEnsureValidationCvm:
 
         assert await service.ensure_validation_cvm(HOST, assessment=IDLE) is False
         service.client.launch_validation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_it_refreshes_the_catalog_before_reading_it(self, monkeypatch):
+        """The switch-back trigger runs in the connector process, which never runs an
+        attestation cycle — so without a refresh here its catalog is perpetually None and
+        every immediate relaunch fails-closed. Model that: current() is empty until refresh
+        populates it."""
+        monkeypatch.setattr(settings, "ENABLE_CVM_LIFECYCLE", True, raising=False)
+        service = make_lifecycle(catalog_entry())
+        catalog = service.whitelist_source.current.return_value
+        service.whitelist_source.current = MagicMock(side_effect=[None, catalog])
+
+        async def _populate():
+            service.whitelist_source.current = MagicMock(return_value=catalog)
+
+        service.whitelist_source.refresh = AsyncMock(side_effect=_populate)
+        service.client.launch_validation = AsyncMock(
+            return_value=RelayResult(status=201, body=launch_report())
+        )
+
+        assert await service.ensure_validation_cvm(HOST, assessment=IDLE) is True
+        service.whitelist_source.refresh.assert_awaited_once()
+        service.client.launch_validation.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_a_host_that_is_not_idle_and_empty_is_left_alone(self, monkeypatch):
