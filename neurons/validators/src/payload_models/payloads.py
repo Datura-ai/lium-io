@@ -192,6 +192,9 @@ class ContainerRequestType(enum.Enum):
     BackupContainerRequest = "BackupContainerRequest"
     RestoreContainerRequest = "RestoreContainerRequest"
     InstallJupyterServer = "InstallJupyterServer"
+    # DAH-2580 — renter CVM provisioning. Both carry a call the platform already signed.
+    CvmProvisionRequest = "CvmProvisionRequest"
+    CvmTeardownRequest = "CvmTeardownRequest"
 
 
 class WorkloadKind(enum.Enum):
@@ -428,12 +431,63 @@ class ContainerResponseType(enum.Enum):
     SshPubKeyRemoved = "SshPubKeyRemoved"
     JupyterServerInstalled = "JupyterServerInstalled"
     JupyterInstallationFailed = "JupyterInstallationFailed"
+    CvmProvisioned = "CvmProvisioned"
+    CvmTornDown = "CvmTornDown"
+    FailedCvmRequest = "FailedCvmRequest"
 
 
 class BaseValidatorResponse(BaseRequest):
     message_type: ContainerResponseType
     miner_hotkey: str
     executor_id: str
+
+
+class SignedCvmdCall(BaseModel):
+    """One cvmd call the platform has already signed, for this validator to forward verbatim.
+
+    The signature covers the method, the request target and these exact body bytes, so nothing
+    here may be re-serialized on the way through: a relay that parsed `body` and re-emitted the
+    same object with different spacing would produce a request the host refuses.
+
+    This validator cannot mint one. cvmd grants the `renter` scope to the platform key alone
+    (`cvmd/auth/scope.py`), so a call signed with the validator hotkey is answered 403 before
+    its body is read. That is the mechanism behind "the validator never triggers renter
+    provisioning and never destroys CVMs" — not a rule it is trusted to follow, a key it does
+    not have.
+    """
+
+    method: str
+    path: str
+    body: str = ""
+    headers: dict[str, str]
+
+
+class CvmProvisionRequest(ContainerBaseRequest):
+    """Launch this rental's CVM on the node's cvmd. The validator is transport, nothing more.
+
+    `expectations` is what the same order will measure as. It is carried so the verification
+    side can check the node afterwards without a second round trip to the backend, and it is
+    never shown to the host — a host told what it is expected to measure learns nothing it did
+    not already have, but it also gains a value to echo instead of one to produce.
+    """
+
+    message_type: ContainerRequestType = ContainerRequestType.CvmProvisionRequest
+    cvmd_url: str
+    call: SignedCvmdCall
+    expectations: dict = {}
+
+
+class CvmTeardownRequest(ContainerBaseRequest):
+    """Destroy the CVM on this node and wait for its hardware to come back.
+
+    Slow on the host side by design — the verified-teardown predicate holds until the node is
+    actually free, which on a large-memory guest is tens of minutes — so this is relayed with a
+    long timeout rather than retried into a teardown already in progress.
+    """
+
+    message_type: ContainerRequestType = ContainerRequestType.CvmTeardownRequest
+    cvmd_url: str
+    call: SignedCvmdCall
 
 
 class ContainerWarningCode(enum.Enum):
@@ -450,6 +504,38 @@ class VolumeEncryptionStatus(str, enum.Enum):
 class ContainerBaseResponse(BaseValidatorResponse):
     pod_id: str
     workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
+
+class CvmProvisioned(ContainerBaseResponse):
+    """The host's launch report, passed back unchanged.
+
+    Unchanged on purpose: the backend compares the measurements in it against what it derived
+    for the order, and a validator that summarized or normalized them would be standing between
+    two parties who are checking each other.
+    """
+
+    message_type: ContainerResponseType = ContainerResponseType.CvmProvisioned
+    report: dict
+
+
+class CvmTornDown(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.CvmTornDown
+    report: dict
+
+
+class FailedCvmRequest(ContainerBaseResponse):
+    """A relay that did not produce a launch, and why.
+
+    `status` is the host's HTTP status when there was one, and None when the host was never
+    reached. The two are different problems — 422 means the host refused what was asked, no
+    status means the request never got there — and telling them apart is the difference between
+    an operator looking at the order and one looking at the network.
+    """
+
+    message_type: ContainerResponseType = ContainerResponseType.FailedCvmRequest
+    msg: str
+    status: int | None = None
+    detail: str | None = None
+
 
 class ProfilerStepName(str, enum.Enum):
     """Stable identifiers for each deploy-profiling step (DAH-1524).
@@ -619,6 +705,10 @@ class FailedContainerErrorCodes(enum.Enum):
     RentingInProgress = "RentingInProgress"
     NoJupyterPortMapping = "NoJupyterPortMapping"
     AttestationError = "AttestationError"
+    # DAH-2580: this node runs its renter workload as a CVM, so there is no container to
+    # create over SSH. Its own code because the backend has to be able to tell "the rental
+    # failed" from "the rental was sent down the wrong path".
+    CvmNodeNotContainerRentable = "CvmNodeNotContainerRentable"
 
 
 class FailedContainerErrorTypes(enum.Enum):

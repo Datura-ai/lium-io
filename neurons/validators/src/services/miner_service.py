@@ -59,7 +59,7 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.attestation_service import AttestationService
+from services.attestation_service import TDX_ATTESTED_EXECUTOR_SET, AttestationService
 from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
@@ -838,8 +838,69 @@ class MinerService:
                 error_code=error_code,
             )
 
+    async def _refuse_if_cvm_node(self, payload: ContainerBaseRequest):
+        """Refuse a container rental on a node whose renter workload is a CVM (DAH-2580).
+
+        A CVM node's customer workload runs inside a confidential guest launched through cvmd,
+        not in a docker container this validator creates over SSH. Serving both paths would not
+        just be redundant — creating the container means opening an SSH session and a docker
+        API call against the very node the customer has been told we never enter, and it would
+        do so *while* their CVM is running on it.
+
+        So the two paths are made exclusive here, at the one place every container request goes
+        through, rather than left to whoever builds the request to remember.
+
+        The test is the minimal-G5 ratchet: has this executor ever presented a valid TDX quote?
+        It is deliberately one-way. An executor that has attested once and now claims not to be
+        a CVM is either lying or broken, and both answers are "do not open a shell on it".
+
+        Redis being unavailable returns None — unknown, not "no". The caller decides, and it
+        decides to continue: a Redis outage must not stop every ordinary rental in the fleet.
+        Nothing about a CVM node's confidentiality depends on this check alone; the CVM itself
+        is what the customer verifies.
+        """
+        if not isinstance(payload, ContainerCreateRequest):
+            return None
+        if self.redis_service is None:
+            return None
+        try:
+            is_cvm = await self.redis_service.is_elem_exists_in_set(
+                TDX_ATTESTED_EXECUTOR_SET, str(payload.executor_id)
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Could not check whether this executor is a CVM node; continuing",
+                    extra=get_extra_info({
+                        "executor_id": str(payload.executor_id),
+                        "error": str(exc),
+                    }),
+                )
+            )
+            return None
+        if not is_cvm:
+            return None
+
+        return self._handle_container_error(
+            payload,
+            _m(
+                "Refusing a container rental on a CVM node",
+                extra=get_extra_info({
+                    "miner_hotkey": payload.miner_hotkey,
+                    "executor_id": str(payload.executor_id),
+                    "pod_id": payload.pod_id,
+                    "reason": "cvm_node_not_container_rentable",
+                }),
+            ),
+            FailedContainerErrorCodes.CvmNodeNotContainerRentable,
+        )
+
     async def handle_container(self, payload: ContainerBaseRequest):
         """Handle container request - uses REST API if configured, otherwise WebSocket."""
+        refusal = await self._refuse_if_cvm_node(payload)
+        if refusal is not None:
+            return refusal
+
         if settings.USE_REST_API:
             logger.info(
                 _m(
