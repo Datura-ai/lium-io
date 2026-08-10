@@ -392,6 +392,66 @@ class Settings(BaseSettings):
         env="ATTESTED_IDENTITY_TTL_SECONDS", default=21600
     )
 
+    # ------------------------------------------------------------------ DAH-2629 / DAH-2630
+    #
+    # Same flag family, same posture: default-off, per-environment turn-on.
+
+    # This validator brings validation CVMs up itself via cvmd — on a host with no CVM, and
+    # back up after a renter teardown — instead of providers running lium-cvm.sh by hand.
+    ENABLE_CVM_LIFECYCLE: bool = Field(env="ENABLE_CVM_LIFECYCLE", default=False)
+
+    # Where a node's cvmd listens. The port is fleet configuration; the address is the node's own.
+    CVMD_PORT: int = Field(env="CVMD_PORT", default=8443)
+
+    # Test-only: the local E2E harness reaches one host's cvmd through an SSH tunnel, so every
+    # cvmd call goes to this URL instead of https://<node address>:CVMD_PORT. Empty in real
+    # deployments.
+    CVMD_URL_OVERRIDE: str = Field(env="CVMD_URL_OVERRIDE", default="")
+
+    # Minimum seconds between validation-CVM launch attempts on one host. A launch takes minutes
+    # and a failing one should be read, not hammered.
+    CVM_LAUNCH_COOLDOWN_SECONDS: int = Field(env="CVM_LAUNCH_COOLDOWN_SECONDS", default=600)
+
+    # How long a cvmd host stays in this validator's registry without being re-seen. The registry
+    # is what the lifecycle sweep and the switch-grace synthesis iterate — an entry that never
+    # ages out would keep probing a decommissioned node forever.
+    CVMD_HOST_REGISTRY_TTL_SECONDS: int = Field(
+        env="CVMD_HOST_REGISTRY_TTL_SECONDS", default=7 * 24 * 3600
+    )
+
+    # DAH-2630 — FR-I3: the RENTED↔UNRENTED switch is availability-accounted. A node inside its
+    # budgeted switch window is neither rentable nor probeable BY DESIGN, so it is exempt from
+    # downtime penalties; a switch that exceeds its budget is a real signal and is flagged.
+    # Off = observe: the sweep logs what it would have graced and changes no score.
+    ENABLE_SWITCHING_GRACE: bool = Field(env="ENABLE_SWITCHING_GRACE", default=False)
+
+    # The default budget, and per-hardware-class overrides as a JSON object keyed by GPU model
+    # (e.g. '{"NVIDIA H200": 600}'). The dominant switch cost is guest RAM return, which grows
+    # with CVM memory — au11 (no GPUs, small guest) measured 5–6 s; large-memory hosts take
+    # minutes. Budgets are deliberately generous: the flag for a genuinely stuck node matters
+    # more than shaving seconds off a grace nobody abuses.
+    CVM_SWITCH_BUDGET_SECONDS_DEFAULT: int = Field(
+        env="CVM_SWITCH_BUDGET_SECONDS_DEFAULT", default=300
+    )
+    CVM_SWITCH_BUDGET_SECONDS_BY_GPU_MODEL: str = Field(
+        env="CVM_SWITCH_BUDGET_SECONDS_BY_GPU_MODEL", default=""
+    )
+
+    def get_cvm_switch_budget_seconds(self, gpu_model: str | None) -> int:
+        """The switch budget for one hardware class. Unparseable config falls back to the
+        default rather than failing the cycle — a bad JSON here must not zero a fleet."""
+        if gpu_model and self.CVM_SWITCH_BUDGET_SECONDS_BY_GPU_MODEL:
+            try:
+                import json as _json
+
+                overrides = _json.loads(self.CVM_SWITCH_BUDGET_SECONDS_BY_GPU_MODEL)
+                value = overrides.get(gpu_model)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    return value
+            except (ValueError, AttributeError):
+                pass
+        return self.CVM_SWITCH_BUDGET_SECONDS_DEFAULT
+
     def get_report_data_recipes(self) -> list[str]:
         """The accepted recipes, in the order they are tried. Always at least v1."""
         recipes = [r.strip().lower() for r in self.TDX_REPORT_DATA_RECIPES.split(",") if r.strip()]

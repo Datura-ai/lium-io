@@ -56,6 +56,31 @@ class CvmCatalogError(Exception):
 
 
 @dataclass(frozen=True)
+class CvmCatalogEntry:
+    """One launchable stack, as the manifest published it (DAH-2629).
+
+    Retained so this validator can *launch* from the catalog, not only check against it: a
+    validation-CVM launch must name a pinned triple, and the triple has to come from the
+    same signed document the measurement check reads — two sources would drift.
+    """
+
+    id: str
+    kind: str
+    qemu: str
+    os_image_hash: str
+    compose_hash: str
+    versions: dict[str, int] = field(default_factory=dict)
+
+    def version_key(self) -> tuple[int, int, int]:
+        """Orders entries newest-first the way the backend ratchets them."""
+        return (
+            self.versions.get("compose", 0),
+            self.versions.get("os_image", 0),
+            self.versions.get("qemu", 0),
+        )
+
+
+@dataclass(frozen=True)
 class CvmCatalog:
     """One verified manifest: the approved set, and when it stops being usable."""
 
@@ -65,6 +90,9 @@ class CvmCatalog:
     compose_hashes: frozenset[str]
     # Keyed by kind, so a renter compose cannot satisfy a validation check or the reverse.
     compose_hashes_by_kind: dict[str, frozenset[str]] = field(default_factory=dict)
+    # The full stack entries, for choosing what to launch (DAH-2629). Empty for a manifest
+    # that predates the fields — checking still works, launching refuses.
+    entries: tuple[CvmCatalogEntry, ...] = ()
 
     def is_expired(self, now: datetime | None = None) -> bool:
         return (now or datetime.now(UTC)) >= self.expires_at
@@ -75,6 +103,18 @@ class CvmCatalog:
         if kind is None:
             return compose_hash in self.compose_hashes
         return compose_hash in self.compose_hashes_by_kind.get(kind, frozenset())
+
+    def newest_validation_entry(self) -> CvmCatalogEntry | None:
+        """The stack a validation-CVM launch should pin: newest approved, validation kind.
+
+        "Newest approved" and "what the platform currently stands behind" are the same set
+        by construction — the floors are how an old version is withdrawn — so there is no
+        version choice to make here, only the newest to find.
+        """
+        candidates = [entry for entry in self.entries if entry.kind == "validation"]
+        if not candidates:
+            return None
+        return max(candidates, key=CvmCatalogEntry.version_key)
 
 
 def parse_manifest(raw: bytes, *, signer: str, now: datetime | None = None) -> CvmCatalog:
@@ -157,6 +197,7 @@ def _decode_payload(payload: str, *, now: datetime) -> CvmCatalog:
     os_images: set[str] = set()
     composes: set[str] = set()
     by_kind: dict[str, set[str]] = {}
+    entries: list[CvmCatalogEntry] = []
     for entry in artifacts:
         if not isinstance(entry, dict):
             raise CvmCatalogError("a manifest artifact is not an object")
@@ -170,12 +211,34 @@ def _decode_payload(payload: str, *, now: datetime) -> CvmCatalog:
         if isinstance(kind, str):
             by_kind.setdefault(kind, set()).add(compose_hash)
 
+        # DAH-2629: keep the full stack row when it carries what a launch needs. Tolerant of
+        # absence — an older manifest still checks measurements; it just cannot be launched
+        # from, and `newest_validation_entry` answers None rather than guessing a qemu.
+        qemu = entry.get("qemu")
+        versions = entry.get("versions")
+        if isinstance(kind, str) and isinstance(qemu, str) and qemu:
+            entries.append(
+                CvmCatalogEntry(
+                    id=str(entry.get("id") or ""),
+                    kind=kind,
+                    qemu=qemu,
+                    os_image_hash=os_image_hash,
+                    compose_hash=compose_hash,
+                    versions={
+                        component: value
+                        for component, value in (versions or {}).items()
+                        if isinstance(value, int) and not isinstance(value, bool)
+                    },
+                )
+            )
+
     return CvmCatalog(
         serial=serial,
         expires_at=expires_at,
         os_image_hashes=frozenset(os_images),
         compose_hashes=frozenset(composes),
         compose_hashes_by_kind={k: frozenset(v) for k, v in by_kind.items()},
+        entries=tuple(entries),
     )
 
 

@@ -758,6 +758,45 @@ class ComputeClient:
         miner = await self.subtensor_client.get_miner(hotkey)
         return miner.axon_info
 
+    def _schedule_validation_cvm_return(self, job_request, logging_extra: dict) -> None:
+        """After a renter teardown, put the validation CVM back (DAH-2629). Never raises."""
+        try:
+            from core.config import settings as _settings
+
+            if not _settings.ENABLE_CVM_LIFECYCLE:
+                return
+
+            async def _return_validation_cvm():
+                from urllib.parse import urlparse
+
+                from services.cvm_lifecycle import CvmdHost
+
+                lifecycle = self.miner_service._cvm_lifecycle()
+                host = None
+                for registered in await lifecycle.hosts_for_miner(job_request.miner_hotkey):
+                    if registered.executor_uuid == str(job_request.executor_id):
+                        host = registered
+                        break
+                if host is None:
+                    # Not registered yet (e.g. first rental before any attested cycle) —
+                    # the cvmd_url this very relay used is authoritative for reachability.
+                    address = urlparse(job_request.cvmd_url).hostname or ""
+                    host = CvmdHost(
+                        executor_uuid=str(job_request.executor_id),
+                        address=address,
+                        miner_hotkey=job_request.miner_hotkey,
+                    )
+                await lifecycle.ensure_validation_cvm(host)
+
+            asyncio.create_task(_return_validation_cvm())
+        except Exception as exc:  # noqa: BLE001 - the relay's answer must reach the backend regardless
+            logger.warning(
+                _m(
+                    "Could not schedule the validation-CVM return",
+                    extra=get_extra_info({**logging_extra, "error": str(exc)}),
+                )
+            )
+
     async def cvm_driver(self, job_request: CvmProvisionRequest | CvmTeardownRequest):
         """Replay one platform-signed cvmd call and hand the host's answer straight back.
 
@@ -819,6 +858,12 @@ class ComputeClient:
                         extra=get_extra_info({**logging_extra, "status": result.status}),
                     )
                 )
+                if not provisioning:
+                    # DAH-2629 — the switch back: a verified teardown means the node is free
+                    # RIGHT NOW, so the validation CVM goes back up without waiting for the
+                    # next cycle's sweep to notice. Best-effort and fire-and-forget; the
+                    # sweep remains the safety net.
+                    self._schedule_validation_cvm_return(job_request, logging_extra)
             else:
                 response = FailedCvmRequest(
                     miner_hotkey=job_request.miner_hotkey,
