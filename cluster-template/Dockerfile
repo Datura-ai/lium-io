@@ -1,5 +1,9 @@
 # DAH-2620: the customer-facing multi-node cluster image.
 #
+# Build and push as `daturaai/lium-cluster:<tag>`. That name is load-bearing: the backend refuses a
+# cluster rental whose image does not start with it (CLUSTER_TEMPLATE_IMAGE_PREFIX), because only
+# this entrypoint reads the injected config and raises wg0.
+#
 # A renter who takes a group of IB nodes gets this image on every pod. The validator injects one
 # env var per pod — LIUM_WIREGUARD_CONF_B64, the node's wg-quick config — and the entrypoint below
 # raises wg0 from it and points NCCL at the overlay. The renter runs `torchrun --nnodes=N ...` and
