@@ -15,7 +15,7 @@ PHASE_FILE=/var/lib/lium-cvm/vm-test-phase
 DO_REBOOT=0
 DO_IDEMPOTENCE=0
 DO_ARTIFACTS=0
-SAFE_TAGS="preflight,gpu,qemu,sgx,repo,stubs"
+SAFE_TAGS="preflight,gpu,qemu,sgx,repo,catalog"
 
 while [ $# -gt 0 ]; do
   case "$1" in

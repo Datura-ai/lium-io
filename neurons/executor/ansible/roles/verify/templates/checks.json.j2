@@ -372,14 +372,24 @@
   'evidence_source': 'systemctl is-active cvmd.service',
   'severity': 'info' if not cvmd_requested else 'blocker'}) %}
 
+{# The catalog decides what this host may launch, so a host without a usable one
+   launches nothing — the same blocker as a dead cvmd, and just as silent from
+   the outside. Read through cvmd's OWN verifier against its OWN configured
+   signer, so this reports what the daemon will do rather than what a file looks
+   like. SKIPPED while cvmd was not requested: a host with no control daemon has
+   no catalog to have. #}
 {% set _ = checks.append({
-  'id': 'catalog.stub_status',
-  'title': 'catalog interface',
-  'status': 'SKIPPED',
-  'observed': 'configured' if (lium_catalog_manifest_url | length) > 0 else 'not configured',
-  'expected': 'implemented in DAH-2576 / DAH-2578',
-  'remediation': 'catalog ships as a variable interface only. Leave lium_catalog_manifest_url unset until DAH-2576 / DAH-2578 land.',
-  'evidence_source': 'group_vars',
-  'severity': 'info'}) %}
+  'id': 'catalog.manifest',
+  'title': 'approved artifact catalog',
+  'status': 'SKIPPED' if not cvmd_requested else ('OK' if lium.cvmd_catalog_state == 'usable' else 'MUST_FIX'),
+  'observed': 'not requested' if not cvmd_requested else (lium.cvmd_catalog_state ~ ' — ' ~ lium.cvmd_catalog_detail),
+  'expected': 'a signed manifest, in date, from lium_catalog_signer',
+  'remediation': 'The catalog arrives with cvmd. Set lium_cvmd_package_url to install it.'
+                 if not cvmd_requested
+                 else ('Set lium_catalog_signer and either lium_catalog_manifest_url (cvmd polls it) or lium_catalog_manifest_src (staged from the controller), then re-run `--tags catalog`. Without one this host refuses every launch.'
+                       if lium.cvmd_catalog_state in ['none', 'error']
+                       else 'The manifest is past its expiry, so cvmd refuses to launch from it. Check that lium_catalog_manifest_url is reachable from this host — `journalctl -u cvmd | grep catalog` names the fetch failure — or stage a current one.'),
+  'evidence_source': 'cvmd.catalog.CatalogStore.describe()',
+  'severity': 'info' if not cvmd_requested else 'blocker'}) %}
 
 {{ checks | to_json }}

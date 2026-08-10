@@ -41,7 +41,7 @@ Preflight is what stops a plain VM, so run the kernel role directly to reach the
 reboot:
 
 ```bash
-sudo ./bootstrap.sh --yes --skip-tags preflight,gpu,qemu,sgx,repo,stubs
+sudo ./bootstrap.sh --yes --skip-tags preflight,gpu,qemu,sgx,repo,catalog
 ```
 
 **Expect:**
@@ -92,7 +92,7 @@ Force drift the playbook cannot fix, so the converge never comes out clean:
 ```bash
 sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=""/' /etc/default/grub
 sudo rm -f /etc/default/grub.d/99-lium-cvm.cfg
-sudo ./bootstrap.sh --yes --skip-tags preflight,gpu,qemu,sgx,repo,stubs   # reboot 2
+sudo ./bootstrap.sh --yes --skip-tags preflight,gpu,qemu,sgx,repo,catalog   # reboot 2
 # after it returns, do it again                                            # refused
 ```
 
@@ -106,7 +106,7 @@ sudo ./bootstrap.sh -e lium_reset_reboot_budget=true --tags verify
 ## 4. Idempotence over the whole playbook
 
 ```bash
-sudo ./bootstrap.sh --yes --skip-tags preflight,gpu,qemu,sgx,repo,stubs
+sudo ./bootstrap.sh --yes --skip-tags preflight,gpu,qemu,sgx,repo,catalog
 ```
 
 **Expect:** `changed=0` in the play recap. A second full converge on a host that

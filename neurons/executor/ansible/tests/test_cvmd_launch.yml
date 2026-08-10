@@ -29,14 +29,7 @@
     lium_cvm_memory: 64G
     lium_cvm_disk: 200G
     lium_cvm_ports: ["tcp:0.0.0.0:12200:2200"]
-    lium_cvmd_catalog:
-      - id: validation-v1
-        kind: validation
-        qemu: "10.1.0"
-        os_image_hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-        compose_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-        os_image_path: /opt/images/dstack-nvidia-0.5.11
-        compose_path: /etc/cvmd/composes/validation-v1.yml
+    lium_catalog_signer: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
 
   tasks:
     # --- sizing missing ---------------------------------------------------
@@ -72,14 +65,19 @@
           refused={{ sizing_refused }} msg={{ sizing_msg }}
         quiet: true
 
-    # --- catalog missing --------------------------------------------------
-    - name: Run cvmd with no catalog
+    # --- no signer, so no catalog -----------------------------------------
+    #
+    # DAH-2578 moved the catalog out of this file and behind a signature, so
+    # "approves nothing" is now spelled "trusts nobody": with no signer there is
+    # no manifest this host can verify, and its catalog is empty whatever else
+    # is configured.
+    - name: Run cvmd with no catalog signer
       block:
-        - name: Include cvmd with an empty catalog
+        - name: Include cvmd with no signer
           ansible.builtin.include_role:
             name: cvmd
           vars:
-            lium_cvmd_catalog: []
+            lium_catalog_signer: ""
 
         - name: Record that cvmd accepted a host with nothing approved
           ansible.builtin.set_fact:
@@ -93,11 +91,11 @@
               {{ ansible_failed_result.msg | default('') }}
               {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
 
-    - name: A launch host with an empty catalog is refused
+    - name: A launch host that trusts no signer is refused
       ansible.builtin.assert:
         that:
           - catalog_refused | bool
-          - "'lium_cvmd_catalog' in catalog_msg"
+          - "'lium_catalog_signer' in catalog_msg"
         fail_msg: >-
           cvmd accepted a launch host whose catalog approves nothing.
           refused={{ catalog_refused }} msg={{ catalog_msg }}
@@ -339,52 +337,84 @@
           so the check rejects valid configuration. msg={{ tolerance_ok_msg }}
         quiet: true
 
-- name: The rendered catalog is what cvmd's loader reads
+- name: The rendered config carries the catalog settings cvmd reads
   hosts: localhost
   gather_facts: false
   vars:
     lium_test_mode: true
-    cvmd_catalog_render_path: /tmp/lium-cvmd-catalog.json
-    lium_cvmd_catalog:
-      - id: validation-v1
-        kind: validation
-        qemu: "10.1.0"
-        os_image_hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-        compose_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-        os_image_path: /opt/images/dstack-nvidia-0.5.11
-        compose_path: /etc/cvmd/composes/validation-v1.yml
+    cvmd_config_render_path: /tmp/lium-cvmd-config.toml
+    lium_cvmd_dstack_scripts_dir: /opt/lium-io/neurons/executor/dstacktee/scripts
+    lium_catalog_signer: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+    lium_catalog_manifest_url: https://example.invalid/v1/cvm-catalog/manifest
+    lium_catalog_images_dir: /opt/images
 
   tasks:
-    - name: Render the catalog template directly
+    # The template reads the role's path defaults, and a bare `template` task
+    # has none of them in scope. Loaded from the role's own file rather than
+    # restated here, so the fixture cannot drift from the paths install.sh
+    # hardcodes.
+    - name: Load the cvmd role's defaults
+      ansible.builtin.include_vars:
+        file: ../roles/cvmd/defaults/main.yml
+
+    - name: Render the config template directly
       ansible.builtin.template:
-        src: ../roles/cvmd/templates/catalog.json.j2
-        dest: "{{ cvmd_catalog_render_path }}"
+        src: ../roles/cvmd/templates/config.toml.j2
+        dest: "{{ cvmd_config_render_path }}"
         mode: "0600"
 
     - name: Read it back
       ansible.builtin.slurp:
-        src: "{{ cvmd_catalog_render_path }}"
-      register: rendered_catalog
+        src: "{{ cvmd_config_render_path }}"
+      register: rendered_config
 
-    - name: It carries the version cvmd's loader requires and the pinned triple
+    # The two daemon-owned paths must NOT be here: cvmd derives them from
+    # state_dir, and a config that also named them would be a file Ansible and
+    # the daemon both write.
+    - name: It names the signer, the URL and the image directory, and nothing daemon-owned
       ansible.builtin.assert:
         that:
-          - parsed.version == 1
-          - parsed.artifacts | length == 1
-          - parsed.artifacts[0].id == 'validation-v1'
-          - parsed.artifacts[0].compose_hash == 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+          - "'catalog_signer = \"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY\"' in toml"
+          - "'catalog_manifest_url = \"https://example.invalid/v1/cvm-catalog/manifest\"' in toml"
+          - "'catalog_images_dir = \"/opt/images\"' in toml"
+          - "'catalog_seed_path = \"/etc/cvmd/manifest.json\"' in toml"
+          - "'catalog_cache_path' not in toml"
+          - "'catalog_materialize_dir' not in toml"
         fail_msg: >-
-          The rendered catalog is not the shape cvmd's loader accepts:
-          {{ rendered_catalog.content | b64decode }}
+          The rendered config does not carry the catalog settings cvmd reads:
+          {{ toml }}
         quiet: true
       vars:
-        parsed: "{{ rendered_catalog.content | b64decode | from_json }}"
+        toml: "{{ rendered_config.content | b64decode }}"
 
-    - name: Remove the rendered catalog
+    - name: A host with no signer gets no catalog settings at all
+      ansible.builtin.template:
+        src: ../roles/cvmd/templates/config.toml.j2
+        dest: "{{ cvmd_config_render_path }}"
+        mode: "0600"
+      vars:
+        lium_catalog_signer: ""
+
+    - name: Read the signerless render back
+      ansible.builtin.slurp:
+        src: "{{ cvmd_config_render_path }}"
+      register: rendered_unsigned
+
+    - name: An empty signer is omitted, never written as an empty string
+      ansible.builtin.assert:
+        that:
+          - "'catalog_signer' not in (rendered_unsigned.content | b64decode)"
+        fail_msg: >-
+          The config carries a catalog_signer on a host that has none. An empty
+          string is not the same as absent: cvmd reports absent as "this host
+          has no catalog configuration", which is the truth.
+        quiet: true
+
+    - name: Remove the rendered config
       ansible.builtin.file:
-        path: "{{ cvmd_catalog_render_path }}"
+        path: "{{ cvmd_config_render_path }}"
         state: absent
 
     - name: PASS
       ansible.builtin.debug:
-        msg: "PASS cvmd refuses a half-configured launch host, and renders a catalog its loader reads."
+        msg: "PASS cvmd refuses a half-configured launch host, and renders the catalog settings its loader reads."

@@ -473,6 +473,60 @@ _cvmd_stamp=""
 [ -r "${CVMD_PREFIX}/.installed-sha256" ] && _cvmd_stamp="$(head -1 "${CVMD_PREFIX}/.installed-sha256" | tr -d '[:space:]')"
 plain_str cvmd_installed_sha256 "$_cvmd_stamp"
 
+# The catalog in force, read through cvmd's own verifier (DAH-2578).
+#
+# The WORKING copy under state_dir, not the seed Ansible staged: the seed is
+# what was offered, the working copy is what the daemon will actually launch
+# from, and after the first successful fetch they are routinely different.
+#
+# Reported as one word plus a detail so `verify` can render it without parsing:
+# "usable"/"expired"/"none"/"error", and the reason. The signer comes from the
+# daemon's own config so the fact cannot check against a different key than the
+# daemon does.
+_cvmd_catalog_state="none"
+_cvmd_catalog_detail="cvmd is not installed"
+if [ -x "${CVMD_PREFIX}/venv/bin/python" ]; then
+  _cvmd_catalog_out="$("${CVMD_PREFIX}/venv/bin/python" - <<'PY' 2>/dev/null || true
+import sys
+try:
+    from cvmd.catalog import CatalogError, CatalogStore
+    from cvmd.config import load_config
+except Exception as exc:  # a cvmd too old to have a catalog at all
+    print(f"error\tthis cvmd cannot report a catalog: {exc}")
+    sys.exit(0)
+try:
+    store = CatalogStore(load_config().catalog)
+    described = store.describe()
+except CatalogError as exc:
+    print(f"error\t{exc}")
+    sys.exit(0)
+except Exception as exc:
+    print(f"error\t{exc}")
+    sys.exit(0)
+if described.get("manifest") is None:
+    print(f"none\t{described.get('error', 'no manifest')}")
+elif described.get("expired"):
+    manifest = described["manifest"]
+    print(f"expired\tserial {manifest['serial']} expired at {manifest['expires_at']}")
+else:
+    manifest = described["manifest"]
+    print(
+        f"usable\tserial {manifest['serial']}, {len(manifest['entries'])} artifact(s), "
+        f"expires {manifest['expires_at']}"
+    )
+PY
+)"
+  if [ -n "$_cvmd_catalog_out" ]; then
+    _cvmd_catalog_state="${_cvmd_catalog_out%%	*}"
+    _cvmd_catalog_detail="${_cvmd_catalog_out#*	}"
+  else
+    _cvmd_catalog_state="error"
+    _cvmd_catalog_detail="cvmd's catalog reader produced no output"
+  fi
+fi
+plain_str cvmd_catalog_state "$_cvmd_catalog_state"
+plain_str cvmd_catalog_detail "$_cvmd_catalog_detail"
+
 # --- disk headroom -----------------------------------------------------------
 # Reported against the nearest EXISTING ancestor, because on a fresh host
 # neither the build directory nor the repo path exists yet and `df` on a missing

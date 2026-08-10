@@ -78,7 +78,7 @@ profile by itself and tells you it did:
 
 That withholds exactly three roles — **`kernel`, `gpu`, `qemu`** — the only ones
 that can change a measurement or reset a GPU. Everything else still converges:
-`preflight`, `docker`, `repo`, `sgx_key_provider`, the stubs and `verify`,
+`preflight`, `docker`, `repo`, `sgx_key_provider`, `catalog` and `verify`,
 including the check that `dstacktee/app/` is unmodified. In this mode preflight
 *records* a flipped BIOS knob into the report instead of aborting, so a host that
 lost a setting after a firmware update produces a report naming it.
@@ -206,15 +206,20 @@ a signed request against an ss58 address. Full detail in
 
 Run it alone with `--tags cvmd`.
 
-### Not implemented yet
+### The approved artifact catalog
 
-`catalog` ships as a variable interface so the rest of day-zero does not wait on
-it. Leave it unset and it prints one line saying what it is waiting on. Set it
-and the run stops with "not implemented" — it never silently does nothing.
+`catalog` stages the signed manifest cvmd starts from. It runs in the same play
+as `cvmd` and after it, because the seed is cvmd configuration: written into
+cvmd's config directory, verified through cvmd's own venv, and applied by
+restarting cvmd. See [`roles/catalog/README.md`](roles/catalog/README.md).
 
-| Variable | Lands in |
+| Variable | Meaning |
 |---|---|
-| `lium_catalog_manifest_url`, `lium_catalog_manifest_sha256` | DAH-2576 / DAH-2578 |
+| `lium_catalog_signer` | The ss58 this host trusts. Required to have a catalog at all. |
+| `lium_catalog_manifest_url` | Where the seed is fetched from, and where cvmd polls. |
+| `lium_catalog_manifest_src` | Or a signed manifest from the controller. |
+| `lium_catalog_manifest_sha256` | Optional extra pin on the fetched seed. |
+| `lium_catalog_images_dir` | Where day-zero staged the approved OS images. |
 
 ## Where things are written
 
