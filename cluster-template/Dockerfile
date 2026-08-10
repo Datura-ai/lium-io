@@ -5,20 +5,15 @@
 # raises wg0 from it and points NCCL at the overlay. The renter runs `torchrun --nnodes=N ...` and
 # the InfiniBand transport engages on its own; nothing here has to be configured by hand.
 #
-# Built on the CUDA base so the card, the userspace RDMA libs and nvidia-smi are already present.
-FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+# daturaai/pytorch is the fleet's recommended image: PyTorch (so torchrun is present), CUDA, the
+# userspace RDMA libs and nvidia-smi are all baked in. The renter runs their own torchrun on top.
+FROM daturaai/pytorch:latest
 
-# wireguard-tools brings wg + wg-quick; the rest are what an unaddressed base image lacks and a
-# distributed job needs (ibverbs for the RDMA path, iproute2 for the interface, openssh so the pod
-# is reachable the usual way).
+# wireguard-tools brings wg + wg-quick, iproute2 the `ip` this entrypoint needs. Everything else a
+# distributed job wants (torch, CUDA, ibverbs, sshd) is already in the base.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         wireguard-tools \
         iproute2 \
-        libibverbs1 \
-        ibverbs-providers \
-        rdma-core \
-        openssh-server \
-        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /usr/local/bin/lium-cluster-entrypoint
