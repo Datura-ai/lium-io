@@ -94,6 +94,10 @@ class HostPolicyResult:
     instance_id: str | None = None
     device_id: str | None = None
     gpu_ueids: list[str] = field(default_factory=list)
+    # The SSH host key the quote's report_data is bound to. Two executors presenting the same
+    # one are the same sshd, and therefore the same machine — the cheapest of the four checks
+    # and the only one that works on a node whose GPU evidence never arrived.
+    pinned_host_key: str | None = None
 
     @property
     def attestation_passed(self) -> bool:
@@ -110,6 +114,7 @@ class HostPolicyResult:
             "cvm_instance_id": [self.instance_id] if self.instance_id else [],
             "cvm_device_id": [self.device_id] if self.device_id else [],
             "gpu_ueid": list(self.gpu_ueids),
+            "pinned_host_key": [self.pinned_host_key] if self.pinned_host_key else [],
         }
 
 
@@ -936,7 +941,11 @@ class AttestationService:
     async def _reject_omitted_quote_if_ratcheted(self, executor: ExecutorSSHInfo) -> None:
         """Minimal-G5 fail-closed: a previously attested executor cannot silently
         drop its quote to skip verification (host-key-only bypass)."""
-        if not (self.enabled and settings.ENABLE_TCB_ENFORCEMENT):
+        # DAH-2582 gives this its own flag. It was previously reachable only under
+        # ENABLE_TCB_ENFORCEMENT, which bundles it with a much broader posture change — so a
+        # fleet that wanted "a CVM may not stop being one" had to also take every TCB and
+        # advisory rejection at the same time. Either flag now arms it.
+        if not (self.enabled and (settings.ENABLE_TCB_ENFORCEMENT or settings.ENABLE_CVM_QUOTE_REQUIRED)):
             return
         if executor.tdx_quote or self.redis_service is None:
             return
@@ -1062,4 +1071,7 @@ class AttestationService:
             instance_id=facts.get("instance_id"),
             device_id=facts.get("device_id"),
             gpu_ueids=gpu_ueids,
+            # Only meaningful once a quote verified. Before that the host key is merely what the
+            # node claimed; after it, it is what the hardware signed over.
+            pinned_host_key=executor.ssh_host_key if attestation_digest else None,
         )

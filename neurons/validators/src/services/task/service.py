@@ -73,6 +73,7 @@ class TaskService:
         tee_type = None
         attestation_passed = False
         gpu_attestation_passed = None
+        attested_identities: dict[str, list[str]] = {}
 
         try:
             # Decrypt private key
@@ -96,6 +97,10 @@ class TaskService:
                 attestation_digest = host_policy.attestation_digest
                 tee_type = host_policy.tee_type
                 gpu_attestation_passed = host_policy.gpu_attestation_passed
+                # DAH-2582 — carried into the pipeline so the uniqueness check compares the
+                # identities this very attestation produced, rather than re-deriving them from
+                # anything the node could have changed since.
+                attested_identities = host_policy.identities()
                 # G1 invariant: a verified-bad GPU can never surface as passed
                 # (HostPolicyResult.attestation_passed requires tdx ∧ gpu-not-False).
                 attestation_passed = host_policy.attestation_passed
@@ -132,6 +137,7 @@ class TaskService:
                     default_docker_image_digests=default_docker_image_digests,
                     tdx_attestation_passed=attestation_passed,
                     gpu_attestation_passed=gpu_attestation_passed,
+                    attested_identities=attested_identities,
                 )
 
                 # Build and run validation pipeline

@@ -33,6 +33,7 @@ from .checks import (
     CapabilityCheck,
     CollateralCheck,
     CustomBuildOrphanSweepCheck,
+    AttestedIdentityUniqueCheck,
     DuplicateExecutorCheck,
     FinalizeCheck,
     GpuCountCheck,
@@ -134,6 +135,7 @@ class PipelineFactory:
         default_docker_image_digests: dict[str, str],
         tdx_attestation_passed: bool = False,
         gpu_attestation_passed: bool | None = None,
+        attested_identities: dict[str, list[str]] | None = None,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -147,6 +149,8 @@ class PipelineFactory:
             encrypted_files: Encrypted validation files
             tdx_attestation_passed: Whether TDX attestation passed
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
+            attested_identities: hardware-bound identities this attestation established
+                (DAH-2582), by class; empty for a node that is not a CVM
 
         Returns:
             Configured Context ready for pipeline execution
@@ -229,6 +233,7 @@ class PipelineFactory:
             state=ContextState(
                 upload_local_dir=encrypted_files.tmp_directory,
                 rented_data=rented_data,
+                attested_identities=attested_identities or {},
             ),
             is_rental_succeed=is_rental_succeed,
             tdx_attestation_passed=tdx_attestation_passed,
@@ -261,6 +266,10 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
+                # DAH-2582: the same-miner duplicate above catches a repeated UUID; this catches
+                # one machine registered as several executors under *different* miners, which is
+                # what challenge forwarding looks like from the outside.
+                AttestedIdentityUniqueCheck(),
                 CollateralCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
@@ -330,6 +339,10 @@ class PipelineFactory:
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
+                # DAH-2582: the same-miner duplicate above catches a repeated UUID; this catches
+                # one machine registered as several executors under *different* miners, which is
+                # what challenge forwarding looks like from the outside.
+                AttestedIdentityUniqueCheck(),
                 CollateralCheck(),
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),

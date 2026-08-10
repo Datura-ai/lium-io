@@ -212,7 +212,10 @@ class Settings(BaseSettings):
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
-    DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
+    # DAH-2582 graduates this from dry run. The check has been observing since it shipped and
+    # the behaviour it detects — one miner registering the same executor UUID more than once —
+    # has no legitimate form, so continuing to only watch it is a standing invitation.
+    DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=False, description="Observe mode: detect duplicate executors but don't penalize")
 
     # DAH-2272: when on, raise the asyncssh logger to DEBUG (debug level 2) so the
     # SSH handshake (banner / key exchange / auth) is logged per connection, and
@@ -367,6 +370,26 @@ class Settings(BaseSettings):
     # a proof it gave once at launch.
     TDX_RENTAL_REATTEST_INTERVAL_SECONDS: int = Field(
         env="TDX_RENTAL_REATTEST_INTERVAL_SECONDS", default=900
+    )
+
+    # ------------------------------------------------------------------ DAH-2582
+
+    # Fail a CVM-class node that stops presenting a quote, without also taking the whole TCB
+    # posture change. Previously this was reachable only under ENABLE_TCB_ENFORCEMENT.
+    ENABLE_CVM_QUOTE_REQUIRED: bool = Field(env="ENABLE_CVM_QUOTE_REQUIRED", default=False)
+
+    # Fail every executor claiming a hardware-bound identity that another executor also claims.
+    # Default-off is the task's own acceptance path: 48 h of observation over the fleet showing
+    # zero collisions among genuinely distinct hosts comes first, because an identifier that is
+    # less unique than assumed would otherwise fail the whole fleet on the day this ships.
+    ENABLE_ATTESTED_IDENTITY_UNIQUENESS: bool = Field(
+        env="ENABLE_ATTESTED_IDENTITY_UNIQUENESS", default=False
+    )
+    # How long a claimed identity is remembered. Long enough to span several validation cycles,
+    # short enough that a node legitimately re-registering after a rebuild stops colliding with
+    # its own past.
+    ATTESTED_IDENTITY_TTL_SECONDS: int = Field(
+        env="ATTESTED_IDENTITY_TTL_SECONDS", default=21600
     )
 
     def get_report_data_recipes(self) -> list[str]:
