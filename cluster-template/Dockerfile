@@ -11,7 +11,7 @@
 #
 # daturaai/pytorch is the fleet's recommended image: PyTorch (so torchrun is present), CUDA, the
 # userspace RDMA libs and nvidia-smi are all baked in. The renter runs their own torchrun on top.
-FROM daturaai/pytorch:latest
+FROM daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind
 
 # wireguard-tools brings wg + wg-quick, iproute2 the `ip` this entrypoint needs. Everything else a
 # distributed job wants (torch, CUDA, ibverbs, sshd) is already in the base.
