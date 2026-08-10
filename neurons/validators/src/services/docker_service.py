@@ -78,7 +78,7 @@ from services.gpu_power_limit import (
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
-from services.cluster_fabric import cluster_env_and_ports
+from services.cluster_fabric import cluster_pod_networking
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
@@ -159,6 +159,27 @@ S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
 
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
+
+
+def _published_ports(
+    port_maps: list[tuple[int, int, int]],
+    cluster_udp_ports: tuple[int, ...],
+) -> tuple[PortBinding, ...]:
+    """The rental's own TCP ports, plus the UDP ports a cluster node needs on top.
+
+    WireGuard's handshake is UDP and the fleet publishes only TCP by default, so a cluster node that
+    got no UDP port here would raise its interface and never complete a handshake (DAH-2620).
+    """
+    return (
+        *(
+            PortBinding(container_port=docker_port, host_port=internal_port)
+            for docker_port, internal_port, _ in port_maps
+        ),
+        *(
+            PortBinding(container_port=udp_port, host_port=udp_port, protocol="udp")
+            for udp_port in cluster_udp_ports
+        ),
+    )
 
 
 def _s3fs_plugin_alias(volume_name: str) -> str:
@@ -899,10 +920,9 @@ class DockerService:
         # tensors still travel over InfiniBand. Absent on an ordinary rental.
         cluster_udp_ports: tuple[int, ...] = ()
         if payload.cluster_membership is not None:
-            cluster_env, cluster_udp_ports = cluster_env_and_ports(
-                payload.cluster_membership.wireguard_conf
-            )
-            environment.update(cluster_env)
+            cluster_networking = cluster_pod_networking(payload.cluster_membership.wireguard_conf)
+            environment.update(cluster_networking.environment)
+            cluster_udp_ports = cluster_networking.published_udp_ports
 
         volume_target = _LIUM_CIPHER_MOUNT if encrypted_local_volume else local_volume_path
         volumes = [VolumeMount(source=local_volume, target=volume_target)]
@@ -924,16 +944,7 @@ class DockerService:
             name=container_name,
             command=build_container_command_argv(custom_options.startup_commands),
             environment=environment,
-            ports=(
-                *(
-                    PortBinding(container_port=docker_port, host_port=internal_port)
-                    for docker_port, internal_port, _ in port_maps
-                ),
-                *(
-                    PortBinding(container_port=udp_port, host_port=udp_port, protocol="udp")
-                    for udp_port in cluster_udp_ports
-                ),
-            ),
+            ports=_published_ports(port_maps, cluster_udp_ports),
             volumes=tuple(volumes),
             restart_policy="unless-stopped",
             runtime="sysbox-runc" if payload.is_sysbox else None,
