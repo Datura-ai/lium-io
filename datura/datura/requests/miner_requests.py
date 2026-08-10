@@ -56,6 +56,14 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # {"nonce": <hex>, "arch": <str>, "evidence_list": [...]} — collected in-CVM
     # only and bound to the same nonce as the TDX quote when one was issued.
     nvidia_payload: str | None = None
+    # DAH-2581 — sha256 of this CVM's sorted, comma-joined GPU UUIDs, as hex.
+    #
+    # Folded into the identity half of report_data under recipe v2, so which GPUs the CVM
+    # holds becomes something the hardware signs rather than something software asserts.
+    # Supplied by the node, and therefore never trusted on its own: the validator recomputes
+    # it from the GPU UUIDs it scraped and rejects a quote bound to any other set. Optional
+    # so a fleet still producing v1 keeps verifying.
+    gpu_uuid_digest: str | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

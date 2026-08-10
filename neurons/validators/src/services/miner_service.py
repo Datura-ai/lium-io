@@ -195,6 +195,25 @@ class MinerService:
         pubkey = self._normalize_public_key(public_key)
         return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce)).hex()}"
 
+    @staticmethod
+    def _miner_holds_a_rental(
+        payload: MinerJobRequestPayload, rented_data: RentedExecutorsResponse | None
+    ) -> bool:
+        """Does this miner currently hold a rented executor? (DAH-2581)
+
+        Decides which re-attestation cadence applies. Per miner rather than per executor
+        because the nonce is minted once per miner and fans out to all of its executors — so a
+        miner with one rented node and ten idle ones gets the rental cadence for all of them.
+        That is the safe direction: it over-attests idle nodes rather than under-attesting a
+        rented one.
+        """
+        if rented_data is None:
+            return False
+        return any(
+            executor.miner_hotkey == payload.miner_hotkey and executor.pods
+            for executor in rented_data.executors.values()
+        )
+
     async def request_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
@@ -256,7 +275,8 @@ class MinerService:
                 # must echo in TDX report_data[32:64] / GPU evidence. The nonce is
                 # covered by validator_signature so it cannot be stripped or swapped.
                 attestation_nonce = await self.attestation_service.maybe_issue_nonce(
-                    payload.miner_hotkey
+                    payload.miner_hotkey,
+                    rented=self._miner_holds_a_rental(payload, rented_data),
                 )
                 nonce_hex = attestation_nonce.value_hex if attestation_nonce else None
 
@@ -1795,7 +1815,8 @@ class MinerService:
 
             # G3 — attestation event (REST path); see the WebSocket path for details.
             attestation_nonce = await self.attestation_service.maybe_issue_nonce(
-                payload.miner_hotkey
+                payload.miner_hotkey,
+                rented=self._miner_holds_a_rental(payload, rented_data),
             )
             nonce_hex = attestation_nonce.value_hex if attestation_nonce else None
 

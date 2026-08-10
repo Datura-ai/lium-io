@@ -80,9 +80,17 @@ class TaskService:
 
             # Prepare attestation host policy before SSH connection
             try:
+                # DAH-2581: a rented CVM is checked against what was actually sold — the
+                # compose hash the backend derived for that customer's order, and the GPUs
+                # they paid for. Absent for every node that is not one, and for a backend
+                # that predates the field, which leaves the check with nothing to compare
+                # rather than failing a node over a missing input.
+                expectations = (rented_data.cvm_expectations or {}).get(executor_info.uuid)
                 host_policy = await self.attestation_service.prepare_host_policy(
                     executor_info,
                     nonce=attestation_nonce,
+                    expectations=expectations,
+                    kind="renter" if expectations is not None else "validation",
                 )
                 known_hosts_policy = host_policy.known_hosts
                 attestation_digest = host_policy.attestation_digest
