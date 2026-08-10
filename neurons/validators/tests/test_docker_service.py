@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import shutil
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from uuid import uuid4, UUID
 from datetime import datetime
 
+import asyncssh
 from docker.errors import APIError
 import pytest
 import pytest_asyncio
@@ -2490,6 +2492,9 @@ async def test_start_container_remounts_when_container_state_is_encrypted(docker
             "executor_ssh_username": "root",
             "executor_ssh_port": 2200,
         },
+        # an existing container's volume was initialised at create time: a missing gocryptfs.conf
+        # here means the ciphertext is gone, and re-initialising would hide that
+        allow_init=False,
     )
 
 
@@ -5672,3 +5677,439 @@ def test_gocryptfs_setup_script_xor_material_no_stdin():
     assert "-passfile" in script
     rc, stdout, stderr = _run_gocryptfs_setup_script_in_sandbox(script)
     assert rc == 0, f"stdout={stdout!r} stderr={stderr!r}"
+
+
+_STALE_MOUNT_ERROR = (
+    "error while mounting volume '': VolumeDriver.Mount: cannot create mount point dir "
+    "'/mnt/volume_pod-1': mkdir /mnt/volume_pod-1: file exists"
+)
+
+
+def _asyncssh_timeout_error() -> asyncssh.TimeoutError:
+    # what ssh_client.run(timeout=...) raises: it subclasses both asyncssh.Error and OSError, so
+    # every caller that treats those two as "transport died" also swallows a plain command timeout.
+    return asyncssh.TimeoutError(None, None, None, None, None, None, "", "")
+
+
+def _recovery_ssh_client(
+    volume_names: str = "volume_pod-1\n",
+    mount_destinations: str = "/root\n",
+) -> AsyncMock:
+    # the recovery path inspects the container for where its volumes are mounted (an encrypted pod
+    # shows /lium-cipher) and for their names.
+    async def run(command, *_args, **_kwargs):
+        if ".Destination" in command:
+            stdout = mount_destinations
+        else:
+            stdout = volume_names
+        return _make_ssh_command_result(stdout=stdout)
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    return ssh_client
+
+
+async def _attempt_stale_mount_recovery(
+    docker_service: DockerService,
+    container_error: str | None,
+    ssh_client: AsyncMock | None = None,
+    local_volume_path: str | None = None,
+) -> bool:
+    return await docker_service.recover_pod_after_stale_vloopback_mount(
+        ssh_client=ssh_client if ssh_client is not None else _recovery_ssh_client(),
+        executor_info=_executor_without_host_key("executor-1"),
+        miner_hotkey="miner-1",
+        private_key="key",
+        container_name="pod_pod-1",
+        pod_id="pod-1",
+        container_error=container_error,
+        local_volume_path=local_volume_path,
+        default_extra={},
+    )
+
+
+@pytest.mark.parametrize(
+    "container_error",
+    [
+        pytest.param(None, id="stopped_on_purpose_leaves_no_error"),
+        pytest.param("OCI runtime create failed: exec: no such file", id="unrelated_error"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_declines_without_stale_mount_signature(
+    docker_service, monkeypatch, container_error
+):
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, container_error)
+
+    assert recovered is False
+    repair_mountpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_does_not_start_when_repair_fails(docker_service, monkeypatch):
+    monkeypatch.setattr(
+        docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=False)
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR)
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
+    docker_service, monkeypatch
+):
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR)
+
+    assert recovered is True
+    assert repair_mountpoint.await_args.args[1] == "volume_pod-1"
+    start_kwargs = start_existing_container.await_args.kwargs
+    assert start_kwargs["container_name"] == "pod_pod-1"
+    assert start_kwargs["pod_id"] == "pod-1"
+    # recovery does not know the pod's plaintext path, and an unencrypted pod does not need one
+    assert start_kwargs["local_volume_path"] is None
+
+
+@pytest.mark.parametrize(
+    "local_volume_path",
+    [
+        pytest.param(None, id="path_absent"),
+        pytest.param("", id="path_empty_string"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_declines_an_encrypted_volume_without_a_plaintext_path(
+    docker_service, monkeypatch, local_volume_path
+):
+    # the plaintext path of an encrypted volume is recorded nowhere on the host, and remounting
+    # gocryptfs at the /root default would write a custom path out in the clear
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, local_volume_path
+    )
+
+    assert recovered is False
+    repair_mountpoint.assert_not_awaited()
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_an_encrypted_volume_without_the_master_secret(
+    docker_service, monkeypatch
+):
+    # the passphrase is derived from VOLUME_MASTER_SECRET; without it the remount can only fail
+    # after the container is already up, leaving the pod flapping once a cycle
+    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", None)
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is False
+    repair_mountpoint.assert_not_awaited()
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_remounts_an_encrypted_volume_at_the_path_the_backend_supplied(
+    docker_service, monkeypatch
+):
+    # DAH-2545: with the plaintext path in hand the encrypted pod is recoverable, and the path is
+    # handed on untouched — a guessed one would write the customer's data out in the clear
+    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is True
+    assert start_existing_container.await_args.kwargs["local_volume_path"] == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_an_encrypted_volume_when_the_kill_switch_is_off(
+    docker_service, monkeypatch
+):
+    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", False)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "local_volume_path",
+    [
+        pytest.param("/lium-cipher", id="the_ciphertext_mount_itself"),
+        pytest.param("/lium-cipher/data", id="inside_the_ciphertext_mount"),
+        pytest.param("/workspace/../../etc", id="path_escaping_upwards"),
+        pytest.param("/..", id="nothing_but_a_parent_segment"),
+        pytest.param("/workspace/./data", id="unnormalised"),
+        pytest.param("relative/path", id="not_absolute"),
+        pytest.param("/", id="root"),
+        pytest.param("/work space", id="whitespace"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_declines_an_unusable_plaintext_path(
+    docker_service, monkeypatch, local_volume_path
+):
+    # the path is a customer-authored template field and the backend accepts anything with a
+    # leading slash, so this gate is the only thing keeping a traversal out of the mount command.
+    # Asserted on the gate directly as well as on the outcome: the outcome alone would stay green
+    # for any of the other reasons recovery can decline.
+    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    assert docker_service_module._can_remount_encrypted_volume(local_volume_path) is False
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, local_volume_path
+    )
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "local_volume_path",
+    [
+        pytest.param("/root", id="the_default"),
+        pytest.param("/workspace/data", id="nested"),
+        pytest.param("/data.v2/my-vol_1", id="punctuation_that_is_still_a_plain_name"),
+    ],
+)
+def test_a_plain_absolute_plaintext_path_is_accepted(monkeypatch, local_volume_path):
+    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+
+    assert docker_service_module._can_remount_encrypted_volume(local_volume_path) is True
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_when_the_volume_state_cannot_be_read(
+    docker_service, monkeypatch
+):
+    # an inspect that does not answer leaves us unable to tell an encrypted pod from a plain one:
+    # starting it on the strength of a path we cannot match to a volume is not safe
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout="", exit_status=1))
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_stops_the_container_when_the_start_is_cancelled(
+    docker_service, monkeypatch
+):
+    # the check runs under an outer timeout, so cancellation can land after `docker start` but
+    # before gocryptfs is remounted, leaving the customer a running pod whose plaintext path is an
+    # ordinary container dir writing to the miner's disk. The stop has to survive the cancellation.
+    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    monkeypatch.setattr(
+        docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    monkeypatch.setattr(
+        docker_service,
+        "start_existing_container",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    with pytest.raises(asyncio.CancelledError):
+        await _attempt_stale_mount_recovery(
+            docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+        )
+
+    assert any(
+        call.args[0] == "/usr/bin/docker stop pod_pod-1"
+        for call in ssh_client.run.await_args_list
+    )
+
+
+def test_gocryptfs_script_refuses_to_reinitialise_on_recovery():
+    # a missing gocryptfs.conf on an existing rental means the ciphertext is gone; re-initialising
+    # would hand the customer an empty volume and log the recovery as a success
+    script = docker_service_module._build_gocryptfs_setup_and_mount_script(
+        "/workspace",
+        pad_hex="00",
+        wrapped_hex="00",
+        pad_var="_a",
+        wrapped_var="_b",
+        passfile_path="/tmp/pf",
+        allow_init=False,
+    )
+
+    assert "gocryptfs -init" not in script
+    assert "exit 1" in script
+
+
+def test_gocryptfs_script_still_initialises_at_create_time():
+    script = docker_service_module._build_gocryptfs_setup_and_mount_script(
+        "/workspace",
+        pad_hex="00",
+        wrapped_hex="00",
+        pad_var="_a",
+        wrapped_var="_b",
+        passfile_path="/tmp/pf",
+    )
+
+    assert "gocryptfs -init /lium-cipher" in script
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_when_the_container_inspect_fails(docker_service, monkeypatch):
+    # an inspect that does not answer cannot rule out an encrypted volume, so recovery stands down
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout="", exit_status=1))
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client
+    )
+
+    assert recovered is False
+    repair_mountpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_when_a_repair_command_times_out(docker_service, monkeypatch):
+    # a timed-out command must not surface as a dead SSH transport: the check has to keep its
+    # POD_NOT_RUNNING verdict instead of turning it into EXECUTOR_TRANSPORT_UNREACHABLE
+    monkeypatch.setattr(
+        docker_service,
+        "repair_stale_vloopback_mountpoint",
+        AsyncMock(side_effect=_asyncssh_timeout_error()),
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR)
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_repairs_the_volume_the_container_actually_mounts(
+    docker_service, monkeypatch
+):
+    # an edit-path pod carries a backend-supplied volume name that pod_id does not derive
+    repair_mountpoint = AsyncMock(side_effect=lambda _ssh, volume, _extra: volume == "custom-vol")
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    monkeypatch.setattr(docker_service, "start_existing_container", AsyncMock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    ssh_client = _recovery_ssh_client("some-other-vol\ncustom-vol\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client
+    )
+
+    assert recovered is True
+    assert [call.args[1] for call in repair_mountpoint.await_args_list] == [
+        "some-other-vol",
+        "custom-vol",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_reports_failure_when_start_raises(docker_service, monkeypatch):
+    monkeypatch.setattr(
+        docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    monkeypatch.setattr(
+        docker_service,
+        "start_existing_container",
+        AsyncMock(side_effect=RuntimeError("start failed")),
+    )
+    ssh_client = _recovery_ssh_client()
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client
+    )
+
+    assert recovered is False
+    # the container may already be up with no plaintext mount, and no later cycle revisits a
+    # running pod — put it back down so POD_NOT_RUNNING keeps matching what the customer sees
+    assert "docker stop pod_pod-1" in ssh_client.run.await_args.args[0]

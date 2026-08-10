@@ -94,6 +94,13 @@ class GpuDockerConfig:
 
 
 @dataclass(slots=True)
+class ContainerUlimit:
+    name: str
+    soft: int
+    hard: int
+
+
+@dataclass(slots=True)
 class ContainerRunSpec:
     image: str
     name: str
@@ -105,6 +112,7 @@ class ContainerRunSpec:
     runtime: str | None = None
     cap_add: tuple[str, ...] = ()
     sysctls: dict[str, str] = field(default_factory=dict)
+    ulimits: tuple[ContainerUlimit, ...] = ()
     devices: tuple[DeviceMount, ...] = ()
     device_requests: tuple[GpuDeviceRequest, ...] = ()
     cpu_count: int | None = None
@@ -498,11 +506,16 @@ class RentalDockerSdkClient:
 
     def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
         stdin_data = _encode_exec_stdin(spec.stdin)
+        # Every spec routed here is rental bootstrap writing to /root or /etc, so
+        # it must not inherit a non-root image USER (DAH-2534). Numeric uid, so no
+        # root entry in the image's /etc/passwd is required. The renter's own
+        # workload still runs as the image's USER — only these execs are pinned.
         exec_create_result = self._api_client.exec_create(
             container=spec.container_name,
             cmd=list(spec.argv),
             stdin=stdin_data is not None,
             environment=spec.environment or None,
+            user="0",
         )
         exec_id = exec_create_result["Id"]
 
@@ -786,6 +799,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "runtime": spec.runtime,
         "cap_add": list(spec.cap_add) or None,
         "sysctls": spec.sysctls or None,
+        "ulimits": _ulimits(spec.ulimits),
         "devices": _devices(spec.devices),
         "device_requests": _device_requests(spec.device_requests),
         "nano_cpus": spec.cpu_count * 1_000_000_000 if spec.cpu_count else None,
@@ -798,6 +812,14 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "shm_size": spec.shm_size,
     }
     return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def _ulimits(ulimits: tuple[ContainerUlimit, ...]) -> list | None:
+    if not ulimits:
+        return None
+    from docker.types import Ulimit
+
+    return [Ulimit(name=ulimit.name, soft=ulimit.soft, hard=ulimit.hard) for ulimit in ulimits]
 
 
 def _container_ports(ports: tuple[PortBinding, ...]) -> list[tuple[int, str]]:

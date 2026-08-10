@@ -386,6 +386,24 @@ class BannedGpuMessages:
     )
 
 
+class BannedProviderMessages:
+    PROVIDER_BANNED = MessageTemplate(
+        event="Provider banned for network abuse",
+        reason="PROVIDER_BANNED",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0; verification and active rentals retained",
+        remediation="Contact Lium support to appeal the provider ban.",
+    )
+    PROVIDER_ALLOWED = MessageTemplate(
+        event="Provider allowed",
+        reason="PROVIDER_BANNED_CHECK_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class SysboxRequiredMessages:
     SYSBOX_MISSING = MessageTemplate(
         event="Sysbox required for unrented executor",
@@ -983,6 +1001,17 @@ class RentalVerificationMessages:
         remediation=(
             "Reconcile the NVIDIA driver, libnvidia-ml.so.1, NVIDIA Container "
             "Toolkit, and Docker runtime. Then reboot the host with `sudo reboot`."
+        ),
+    )
+    GPU_RUNTIME_DEVICE_FAULT = MessageTemplate(
+        event="GPU runtime health check failed",
+        reason="GPU_RUNTIME_DEVICE_FAULT",
+        severity="error",
+        category="runtime",
+        impact="New rentals are disabled because the GPU is not addressable on this host.",
+        remediation=(
+            "The GPU has entered a fatal state and needs a hard reset. Reboot the host with "
+            "`sudo reboot`, then check `nvidia-smi` and `dmesg` for Xid errors."
         ),
     )
     API_ERROR = MessageTemplate(

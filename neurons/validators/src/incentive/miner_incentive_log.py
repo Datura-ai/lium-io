@@ -9,6 +9,7 @@ WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
 HOW A NODE PICKS A POOL:
   rented?                                              -> mining pool (always earns)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
+       AND (not flagship-8x OR NCU/split/attested-CVM offered)
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
@@ -23,12 +24,16 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
      total disk below 1.5x total GPU VRAM (add disk to earn),
+     8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
+       attestation (offer any of the three to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
-     rental_incentive_calculated, mining_score_missing (internal-error case)
+     rental_incentive_calculated, mining_score_missing (internal-error case),
+     unrented_bucket_reassigned (DAH-2528: node rated against its split tier
+     because its own GPU-count tier was over capacity)
 
 The scoring code (rental_price.py / default.py) detects each condition where its
 data naturally lives (some per-executor upfront, some only after cohort aggregation),
@@ -48,7 +53,7 @@ from pydantic import BaseModel, Field
 from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
-    from incentive.rental_price import InsufficientDisk
+    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability
     from services.task_service import JobResult
 
 
@@ -60,6 +65,7 @@ class ZeroIncentiveReason(StrEnum):
     """
 
     # Group A: excluded from BOTH pools
+    BANNED_NETWORK_ABUSE = "banned_network_abuse"
     SPOT_TIER = "spot_tier"
     PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
     NEW_RENTALS_PAUSED = "new_rentals_paused"
@@ -71,6 +77,7 @@ class ZeroIncentiveReason(StrEnum):
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
+    FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
 
 
 class IncentiveReason(BaseModel):
@@ -164,6 +171,15 @@ class MinerLogLine(BaseModel):
         )
 
     # ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─
+
+    @staticmethod
+    def no_payout_because_banned_network_abuse(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.BANNED_NETWORK_ABUSE,
+            message="Banned for network abuse. Ineligible for scoring and rentals",
+            internal_message="Executor excluded from both pools - banned for network abuse",
+        )
 
     @staticmethod
     def no_payout_because_spot_tier(result: JobResult) -> MinerLogLine:
@@ -322,6 +338,30 @@ class MinerLogLine(BaseModel):
             extra_fields={"sysbox_runtime": result.sysbox_runtime},
         )
 
+    @staticmethod
+    def no_payout_because_flagship_without_ncu_or_split(
+        result: JobResult, missing: MissingFlagshipCapability
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+            message=(
+                f"No unrented incentive: an idle {result.gpu_count}x {result.gpu_model} must offer "
+                "NCU profiling, GPU splitting or confidential computing. Either open the host "
+                "profiling counters (NVreg_RestrictProfilingToAdminUsers=0, then reboot), which "
+                "also makes the node rentable only as a whole host, or set a minimum GPU count "
+                "below the full node in the Miner Portal on a host that supports docker storage "
+                "limits, or run the executor inside a confidential VM whose TDX attestation "
+                "passes, or rent it out to earn."
+            ),
+            extra_fields={
+                "ncu_profiling_access": missing.ncu_profiling_access,
+                "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
+                "supports_gpu_splitting": result.supports_gpu_splitting,
+                "gpu_splitting_min_count": result.gpu_splitting_min_count,
+            },
+        )
+
     # ── Calculation reports: the per-cycle lines every scored node gets ───────
 
     @staticmethod
@@ -396,6 +436,29 @@ class MinerLogLine(BaseModel):
                 "burn_share": result.burn_share,
                 "incentive": result.incentive,
                 "total_rental_cost": result.total_rental_cost,
+            },
+        )
+
+    @staticmethod
+    def unrented_bucket_reassigned(result: JobResult) -> MinerLogLine:
+        # DAH-2528 report line, not a zero reason: the node is paid, in a better bucket.
+        return MinerLogLine(
+            message=(
+                f"Unrented incentive: the {result.bucket_reassigned_from}x "
+                f"{result.gpu_model} tier was over its capacity when this executor "
+                f"was placed, so it is rated against its {result.count_bucket}x "
+                f"split tier, which had free capacity and pays a better rate."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "unrented_bucket_reassigned",
+                "bucket_reassigned_from": result.bucket_reassigned_from,
+                "bucket_reassigned_from_multiplier": result.bucket_reassigned_from_multiplier,
+                "count_bucket": result.count_bucket,
+                "max_cap": result.max_cap,
+                "unrented_cap_multiplier": result.unrented_cap_multiplier,
             },
         )
 

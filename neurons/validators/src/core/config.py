@@ -60,6 +60,10 @@ class VerifyXSettings(BaseSettings):
         default=50.0,
         description="Minimum required network download speed in Mbps"
     )
+    ENABLE_XET_CHALLENGE: bool = Field(
+        default=True,
+        description="Include HuggingFace Xet download challenge in VerifyX",
+    )
 
 
 class DebugSettings(BaseSettings):
@@ -165,6 +169,31 @@ class Settings(BaseSettings):
     }
     ENABLE_NEW_BURN_LOGIC: bool = True
 
+    # DAH-2251 — referral incentive paid via emission, to referrer hotkeys weighted by
+    # the backend's epoch-stable EMA feed. There is no funding wallet, so unlike the
+    # earlier carve-out design this has no UID/coldkey knobs.
+    #
+    # The pool is `min(share * cycle total, residual burn)` and is drawn ONLY from burn
+    # hotkeys — a share OF the total, but never taken FROM the miners. Every non-burn
+    # miner's score is left exactly as it was, so referral emission moves value from
+    # burn to referrers and never dilutes mining. See `_apply_referral_pool`.
+    #
+    # REFERRAL_EMISSION_SHARE is env-tunable and defaults to INERT (0.0): nothing is
+    # redirected until ops sets a non-zero share at launch (coordinated with the backend
+    # referral rail).
+    REFERRAL_EMISSION_SHARE: float = Field(env="REFERRAL_EMISSION_SHARE", default=0.0)
+
+    # DAH-2251 — fail-closed feed of epoch-stable referral EMA weights, served by the
+    # backend at `<COMPUTE_REST_API_URL>/v1/referral-weights`. Left unset it is DERIVED
+    # from COMPUTE_REST_API_URL (see `get_referral_feed_url`) so a staging validator
+    # reads the staging feed; set REFERRAL_FEED_URL only to host the feed elsewhere.
+    REFERRAL_FEED_URL: str | None = Field(env="REFERRAL_FEED_URL", default=None)
+    # Max age (in epochs) a feed response may lag behind the validator's current epoch
+    # before it's treated as stale and rejected (fail-closed → no referral emission).
+    REFERRAL_FEED_MAX_STALENESS_EPOCHS: int = Field(
+        env="REFERRAL_FEED_MAX_STALENESS_EPOCHS", default=3
+    )
+
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
     ENABLE_INSPECTOR: bool = True
@@ -201,12 +230,25 @@ class Settings(BaseSettings):
     # rental incentive while staying active. When False, the breach is only logged
     # (shadow mode) so prod impact can be observed before enforcing.
     ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)
+    # DAH-2571. Off until a RoCEv2 queue pair from inside a container is shown to reach a neighbour
+    # on the same segment, or not to. RDMA bypasses the host network stack entirely — no iptables,
+    # no conntrack, no rate limit on a link the provider also uses for storage — so on the 21 prod
+    # hosts sharing an IPv4-mapped segment this would be a new, unfiltered path to a neighbour.
+    # Turning it on later costs nothing; taking it back after machines are sold does.
+    ENABLE_RDMA_DEVICE_PASSTHROUGH: bool = Field(env="ENABLE_RDMA_DEVICE_PASSTHROUGH", default=False)
 
     # DAH-2520 — unrented VRAM/disk sanity gate. When True, an unrented executor whose
     # total GPU VRAM exceeds the machine's total disk loses the unrented rental incentive
     # while staying active. When False, the breach is only logged (shadow mode) so prod
     # impact can be observed before enforcing.
     ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT: bool = Field(env="ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", default=False)
+
+    # DAH-2546 — flagship capability gate. When True, an unrented 8x H200/B200/B300 executor
+    # with no NCU profiling counters open, no real GPU splitting enabled and no verified TDX
+    # quote (DAH-2594) loses the unrented rental incentive while staying active.
+    # When False, the breach is only logged
+    # (shadow mode) so prod impact can be observed before enforcing.
+    ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT: bool = Field(env="ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", default=False)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
@@ -339,6 +381,13 @@ class Settings(BaseSettings):
     
     ENABLE_VOLUME_ENCRYPTION: bool = Field(env="ENABLE_VOLUME_ENCRYPTION", default=True)
     VOLUME_MASTER_SECRET: str | None = Field(env="VOLUME_MASTER_SECRET", default=None)
+    # DAH-2545 switch, off until the plaintext window is closed. A restarted container runs its own
+    # entrypoint and startup_commands before gocryptfs can be mounted into it, so writes to the
+    # plaintext path in that window land unencrypted in the container's upper layer on the miner's
+    # disk. The same window exists on the pod-creation path today; until it is closed for both,
+    # encrypted pods keep the pre-DAH-2545 behaviour — skipped, and the miner keeps the
+    # POD_NOT_RUNNING verdict.
+    RECOVER_ENCRYPTED_VOLUMES: bool = Field(env="RECOVER_ENCRYPTED_VOLUMES", default=False)
 
     DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 
@@ -375,6 +424,20 @@ class Settings(BaseSettings):
 
     def get_latest_contract_version(self) -> str:
         return max(self.CONTRACT_VERSIONS.keys())
+
+    def get_referral_feed_url(self) -> str:
+        """Referral-weights feed URL, derived from COMPUTE_REST_API_URL unless overridden.
+
+        Derived rather than defaulted to a literal so the feed follows the deployment:
+        a hardcoded prod URL silently pointed staging validators at prod referral data.
+        Returns "" when neither is set, which the fail-closed client turns into no
+        referral emission for the cycle (DAH-2251).
+        """
+        if self.REFERRAL_FEED_URL:
+            return self.REFERRAL_FEED_URL
+        if not self.COMPUTE_REST_API_URL:
+            return ""
+        return f"{self.COMPUTE_REST_API_URL.rstrip('/')}/v1/referral-weights"
 
     def get_bittensor_config(self) -> bittensor.Config:
         # bittensor >=10.3.2 ignores argparse defaults (BT_NO_PARSE_CLI_ARGS is on by

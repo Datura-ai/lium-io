@@ -123,6 +123,23 @@ ORIGINAL_KEYS = {
     'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
     'data_storage_limit_supported': "storage_limit_supported",
     'data_storage_limit_scrape_error': "storage_limit_scrape_error",
+    'data_ncu_profiling_access': "ncu_profiling_access",
+    'data_ncu_profiling_scrape_error': "ncu_profiling_scrape_error",
+    'data_infiniband_ports': "infiniband_ports",
+    'data_infiniband_scrape_error': "infiniband_scrape_error",
+    'ib_device': "device",
+    'ib_port': "port",
+    'ib_node_guid': "node_guid",
+    'ib_link_layer': "link_layer",
+    'ib_state': "state",
+    'ib_phys_state': "phys_state",
+    'ib_rate': "rate",
+    'ib_lid': "lid",
+    'ib_sm_lid': "sm_lid",
+    'ib_sys_image_guid': "sys_image_guid",
+    'ib_pkey': "pkey",
+    'ib_gids': "gids",
+    'data_boot_id': "boot_id",
 }
 
 
@@ -184,6 +201,8 @@ class FileEncryptService:
         return "_" + "".join(random.choices(string.ascii_letters, k=length))
 
     def generate_key_mappings(self):
+        # Order is load-bearing: ecrypt_miner_job_files() substitutes these keys with a sequential
+        # str.replace in dict order, so no key may be a strict prefix of a LATER one.
         all_keys = {
             "gpu.name": "",
             "gpu.uuid": "",
@@ -275,6 +294,23 @@ class FileEncryptService:
             'data_sysbox_runtime': "",
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
+            'data_ncu_profiling_scrape_error': "",
+            'data_ncu_profiling_access': "",
+            'data_infiniband_ports': "",
+            'data_infiniband_scrape_error': "",
+            'ib_device': "",
+            'ib_port': "",
+            'ib_node_guid': "",
+            'ib_link_layer': "",
+            'ib_state': "",
+            'ib_phys_state': "",
+            'ib_rate': "",
+            'ib_lid': "",
+            'ib_sm_lid': "",
+            'ib_sys_image_guid': "",
+            'ib_pkey': "",
+            'ib_gids': "",
+            'data_boot_id': "",
         }
 
         # Generate dictionary key mapping on validator side

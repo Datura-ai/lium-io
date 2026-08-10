@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Protocol, Tuple
+from typing import Any, Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
 import asyncssh
 from pydantic import BaseModel, Field
@@ -23,6 +23,27 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
 
+@runtime_checkable
+class PodRecoverer(Protocol):
+    # The slice of DockerService the rented-machine check needs. Declared here because
+    # docker_service imports this package, so naming the class itself would be an import
+    # cycle — and Context is a pydantic model, so a TYPE_CHECKING-only name would leave it
+    # unbuildable and every validation cycle would raise instead of running.
+
+    async def recover_pod_after_stale_vloopback_mount(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        container_error: str | None,
+        default_extra: dict[str, Any],
+    ) -> bool: ...
+
+
 @dataclass(frozen=True)
 class ContextServices:
     ssh: SSHService
@@ -36,6 +57,7 @@ class ContextServices:
     score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
     backend: BackendClient
     container_cleanup: ContainerCleanup
+    pod_recovery: PodRecoverer
 
 
 @dataclass(frozen=True)
@@ -106,6 +128,7 @@ class Context(BaseModel):
     pipeline_id: str
     executor: ExecutorSSHInfo
     miner_hotkey: str
+    miner_coldkey: str | None = None
     miner_address: str
     miner_port: int
     ssh: asyncssh.SSHClientConnection
@@ -113,6 +136,9 @@ class Context(BaseModel):
     verified: dict = {}
     settings: dict = {}
     encrypt_key: str | None = None
+    # Already decrypted: pod recovery re-runs the rental start path, which opens its own
+    # connection to the host rather than reusing `ssh`.
+    executor_ssh_private_key: str | None = None
     default_extra: dict[str, Any] = {}
     services: ContextServices
     config: ContextConfig
@@ -133,6 +159,7 @@ class Context(BaseModel):
     log_status: str = "info"
     log_text: str | None = None
     success: bool = False
+    is_provider_banned: bool = False
     tdx_attestation_passed: bool = False
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).

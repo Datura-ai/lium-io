@@ -1,19 +1,42 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
-
-from core.config import settings
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from protocol.vc_protocol.compute_requests import (
+    GPU_RUNTIME_DEVICE_FAULT_REASON,
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     FillerRunActiveResponse,
 )
 
+from core.config import settings
+
 from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
-from ..messages import RentalVerificationMessages as Msg, render_message
+from ..messages import MessageTemplate, render_message
+from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
+
+
+@dataclass(frozen=True)
+class GpuRuntimeQuarantine:
+    message: MessageTemplate
+    score_warning: str
+
+
+# Backend verdicts that quarantine the host: the GPU runtime is broken in a way no rental survives,
+# so the score is zeroed and the verified job cleared. The host returns on the next clean check.
+_GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
+    GPU_RUNTIME_NVML_MISMATCH_REASON: GpuRuntimeQuarantine(
+        message=Msg.GPU_RUNTIME_NVML_MISMATCH,
+        score_warning="GPU runtime NVML driver/library mismatch",
+    ),
+    GPU_RUNTIME_DEVICE_FAULT_REASON: GpuRuntimeQuarantine(
+        message=Msg.GPU_RUNTIME_DEVICE_FAULT,
+        score_warning="GPU is not addressable and needs a host reset",
+    ),
+}
 
 # How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
 # bundle but the pipeline emits a single event, so the node must be judged by its worst container:
@@ -122,6 +145,13 @@ class RentalVerificationCheck:
         # Use the first verified port
         container_port = verified_ports[0]
 
+        # The UUIDs this cycle's scrape saw. The backend probes for exactly these instead of
+        # `--gpus all`, so a host advertising cards it cannot hand over fails here rather than in a
+        # customer's rental (DAH-2614). Sent from the scrape, not read from the backend's stored
+        # specs: those lag a cycle and do not exist at all on an executor's first pass.
+        gpu_details = ctx.state.gpu_details or (ctx.state.specs or {}).get("gpu", {}).get("details", [])
+        gpu_uuids = [detail["uuid"] for detail in gpu_details if isinstance(detail, dict) and detail.get("uuid")]
+
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
             # already sees an active customer rental, the backend skips the container-creating check
@@ -133,6 +163,7 @@ class RentalVerificationCheck:
                 container_port=container_port,
                 executor_id=executor.uuid,
                 rental_in_progress=has_customer_rental,
+                gpu_uuids=gpu_uuids,
             )
 
             # Handle API failure (None response) - fail this executor
@@ -169,11 +200,12 @@ class RentalVerificationCheck:
                     event=event,
                     updates={},
                 )
-            elif response.reason_code == GPU_RUNTIME_NVML_MISMATCH_REASON:
+            elif response.reason_code in _GPU_RUNTIME_QUARANTINE:
+                quarantine = _GPU_RUNTIME_QUARANTINE[response.reason_code]
                 details = response.details or {}
                 stderr = details.get("docker_stderr") or response.error
                 event = render_message(
-                    Msg.GPU_RUNTIME_NVML_MISMATCH,
+                    quarantine.message,
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
@@ -192,7 +224,7 @@ class RentalVerificationCheck:
                     updates={
                         "score": 0.0,
                         "job_score": 0.0,
-                        "score_warning": "GPU runtime NVML driver/library mismatch",
+                        "score_warning": quarantine.score_warning,
                         "clear_verified_job_info": True,
                     },
                 )

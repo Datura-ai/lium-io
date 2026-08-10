@@ -1,8 +1,12 @@
+import logging
 from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any
 
 import asyncssh
 
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
+from core.utils import _m, get_extra_info
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ...const import (
@@ -12,6 +16,8 @@ from ...const import (
 from ..messages import TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+logger = logging.getLogger(__name__)
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
@@ -78,6 +84,16 @@ def _gpu_usage_violation_details(
     }
 
 
+@dataclass
+class _DownedPodOutcome:
+    """What the check does with a rented pod that was found not running."""
+
+    # None means the pod is up again and the loop moves on to the next pod.
+    failure: CheckResult | None
+    # keys of the recovered container, reported instead of the ones read before it went down.
+    ssh_pub_keys: list[str]
+
+
 class TenantEnforcementCheck:
     """Handle the specialised flow when the executor is already rented to a tenant.
 
@@ -88,6 +104,11 @@ class TenantEnforcementCheck:
 
     check_id = "executor.validate.rented_state"
     fatal = True
+
+    def __init__(self, recover_stale_pods: bool = True):
+        # A dry run reports a pod as down but must not touch the executor: the DAH-2306 recovery
+        # rmdirs a host path and starts a customer's container.
+        self.recover_stale_pods = recover_stale_pods
 
     async def run(self, ctx: Context) -> CheckResult:
         # NOTE: stale-container cleanup now runs earlier, in StaleContainerCleanupCheck
@@ -137,26 +158,13 @@ class TenantEnforcementCheck:
             try:
                 pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_container_name)
             except (asyncssh.Error, OSError) as exc:
-                # SSH transport died mid-cycle. Pod state is unknown; do NOT set
-                # clear_verified_job_*: that path triggers immediate executor flip
-                # in compute-app and would punish honest miners for a network blip.
-                # Persistent unreachability is handled by the stale-executor sweep.
-                event = render_message(
-                    Msg.EXECUTOR_TRANSPORT_UNREACHABLE,
+                return _executor_transport_unreachable_result(
                     ctx=ctx,
                     check_id=self.check_id,
-                    what={
-                        "pod_id": pod_id,
-                        "container_name": pod_container_name,
-                        "executor_uuid": ctx.executor.uuid,
-                        "transport_error": repr(exc),
-                    },
+                    container_name=pod_container_name,
+                    pod_id=pod_id,
+                    transport_error=exc,
                     extra=extra,
-                )
-                return CheckResult(
-                    passed=False,
-                    event=event,
-                    updates={"default_extra": extra},
                 )
             if not pod_running:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
@@ -189,28 +197,18 @@ class TenantEnforcementCheck:
                         },
                     )
 
-                event = render_message(
-                    Msg.POD_NOT_RUNNING,
+                outcome = await self._recover_downed_pod(
                     ctx=ctx,
-                    check_id=self.check_id,
-                    remediation=f"Start container {pod_container_name} and ensure it stays healthy.",
-                    what={
-                        "pod_id": pod_id,
-                        "container_name": pod_container_name,
-                        "executor_uuid": ctx.executor.uuid,
-                        "diagnostics": diagnostics,
-                    },
+                    container_name=pod_container_name,
+                    pod_id=pod_id,
+                    diagnostics=diagnostics,
+                    local_volume_path=rental_active.local_volume_path if rental_active else None,
                     extra=extra,
                 )
-                return CheckResult(
-                    passed=False,
-                    event=event,
-                    updates={
-                        "default_extra": extra,
-                        "clear_verified_job_info": True,
-                        "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
-                    },
-                )
+                if outcome.failure:
+                    return outcome.failure
+                ssh_pub_keys = outcome.ssh_pub_keys
+                continue
 
         container_names = [pod.container_name for pod in rented_pods]
         if filler_container:
@@ -276,6 +274,172 @@ class TenantEnforcementCheck:
             halt=True,
         )
 
+    async def _recover_downed_pod(
+        self,
+        *,
+        ctx: Context,
+        container_name: str,
+        pod_id: str,
+        diagnostics: dict[str, object],
+        local_volume_path: str | None,
+        extra: dict[str, Any],
+    ) -> _DownedPodOutcome:
+        # a rented pod found not running: heal it when it carries the DAH-2306 reboot signature,
+        # and report POD_NOT_RUNNING only if it is still down afterwards.
+        pod_running = False
+        ssh_pub_keys: list[str] = []
+        if self.recover_stale_pods:
+            try:
+                if await _recover_pod_after_stale_vloopback_mount(
+                    ctx, container_name, pod_id, diagnostics, local_volume_path
+                ):
+                    # Re-read the pod, so the recovered container's own SSH keys are what gets
+                    # reported and a start that did not stick still lands on POD_NOT_RUNNING.
+                    pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
+                    container_finished_at = diagnostics.get("container_finished_at")
+                    if pod_running and isinstance(container_finished_at, str):
+                        await _report_host_reboot_recovery(ctx, pod_id, container_finished_at)
+            except (asyncssh.Error, OSError) as exc:
+                # Recovery adds SSH round-trips to the executor inside the DAH-2055 window, so
+                # losing the transport here means pod state is unknown, not "pod down".
+                return _DownedPodOutcome(
+                    failure=_executor_transport_unreachable_result(
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        container_name=container_name,
+                        pod_id=pod_id,
+                        transport_error=exc,
+                        extra=extra,
+                    ),
+                    ssh_pub_keys=[],
+                )
+
+        if pod_running:
+            extra.setdefault("recovered_pods", []).append(container_name)
+            return _DownedPodOutcome(failure=None, ssh_pub_keys=ssh_pub_keys)
+
+        event = render_message(
+            Msg.POD_NOT_RUNNING,
+            ctx=ctx,
+            check_id=self.check_id,
+            remediation=f"Start container {container_name} and ensure it stays healthy.",
+            what={
+                "pod_id": pod_id,
+                "container_name": container_name,
+                "executor_uuid": ctx.executor.uuid,
+                "diagnostics": diagnostics,
+            },
+            extra=extra,
+        )
+        return _DownedPodOutcome(
+            failure=CheckResult(
+                passed=False,
+                event=event,
+                updates={
+                    "default_extra": extra,
+                    "clear_verified_job_info": True,
+                    "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
+                },
+            ),
+            ssh_pub_keys=[],
+        )
+
+
+def _executor_transport_unreachable_result(
+    *,
+    ctx: Context,
+    check_id: str,
+    container_name: str,
+    pod_id: str,
+    transport_error: BaseException,
+    extra: dict[str, Any],
+) -> CheckResult:
+    # SSH transport died mid-cycle. Pod state is unknown; do NOT set clear_verified_job_*: that
+    # path triggers immediate executor flip in compute-app and would punish honest miners for a
+    # network blip. Persistent unreachability is handled by the stale-executor sweep.
+    event = render_message(
+        Msg.EXECUTOR_TRANSPORT_UNREACHABLE,
+        ctx=ctx,
+        check_id=check_id,
+        what={
+            "pod_id": pod_id,
+            "container_name": container_name,
+            "executor_uuid": ctx.executor.uuid,
+            "transport_error": repr(transport_error),
+        },
+        extra=extra,
+    )
+    return CheckResult(passed=False, event=event, updates={"default_extra": extra})
+
+
+async def _report_host_reboot_recovery(
+    ctx: Context,
+    pod_id: str,
+    container_finished_at: str | None,
+) -> None:
+    # DAH-2545: tell the backend the pod is back, so the renter can be told their pod went down
+    # because the provider's host restarted. Never fatal: the rental has already been saved by the
+    # time this runs, and a backend that is down or too old must not turn that into a failure.
+    # An unknown exit time is nothing to report: it is the key the backend deduplicates on.
+    if not container_finished_at:
+        return
+    try:
+        await ctx.services.backend.report_pod_host_reboot_recovered(
+            pod_id, container_finished_at
+        )
+    except Exception:
+        logger.warning(
+            _m(
+                "POD_STALE_MOUNT_RECOVERY_REPORT_FAILED",
+                extra=get_extra_info({**ctx.default_extra, "pod_id": pod_id}),
+            ),
+            exc_info=True,
+        )
+
+
+async def _recover_pod_after_stale_vloopback_mount(
+    ctx: Context,
+    container_name: str,
+    pod_id: str,
+    diagnostics: dict[str, object],
+    local_volume_path: str | None,
+) -> bool:
+    # DAH-2306: heal a still-rented pod the host could not auto-restart after a reboot, before the
+    # miner is penalised for it. Best effort in every direction — a recovery that cannot run, or
+    # fails, simply leaves the POD_NOT_RUNNING verdict untouched. The one exception is a dead SSH
+    # transport, which propagates: the repair runs over ctx.ssh, so DAH-2055 applies here too.
+    if not ctx.executor_ssh_private_key:
+        return False
+
+    container_error = diagnostics.get("container_error")
+    try:
+        return await ctx.services.pod_recovery.recover_pod_after_stale_vloopback_mount(
+            ssh_client=ctx.ssh,
+            executor_info=ctx.executor,
+            miner_hotkey=ctx.miner_hotkey,
+            private_key=ctx.executor_ssh_private_key,
+            container_name=container_name,
+            pod_id=pod_id,
+            container_error=container_error if isinstance(container_error, str) else None,
+            local_volume_path=local_volume_path,
+            default_extra=ctx.default_extra,
+        )
+    except (asyncssh.Error, OSError):
+        raise
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "POD_STALE_MOUNT_RECOVERY_FAILED",
+                extra=get_extra_info({
+                    **ctx.default_extra,
+                    "container_name": container_name,
+                    "pod_id": pod_id,
+                    "error": str(exc),
+                }),
+            )
+        )
+        return False
+
 
 async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str]]:
     # asyncssh.Error / OSError mean the SSH session itself is dead -> caller must
@@ -290,8 +454,9 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
         pod_running = False
 
     try:
+        # Literal path, not ~: injection writes this exact file (DAH-2534).
         keys_result = await ssh_client.run(
-            DockerCommand.exec_command(container_name, 'cat ~/.ssh/authorized_keys')
+            DockerCommand.exec_command(container_name, "cat /root/.ssh/authorized_keys")
         )
         ssh_keys = keys_result.stdout.strip().split("\n") if keys_result.stdout else []
     except (asyncssh.Error, OSError):

@@ -1,4 +1,7 @@
-"""NVIDIA device-node discovery for `docker run --device` flags.
+"""Host device-node discovery for `docker run --device` flags.
+
+Named for NVIDIA because that is why it was written; it now also resolves the RDMA verbs nodes a
+rental container needs to use an InfiniBand or RoCE card (DAH-2571).
 
 Why this module exists
 ----------------------
@@ -39,6 +42,7 @@ from collections.abc import Sequence
 
 import asyncssh
 
+from core.config import settings
 from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
 
 logger = logging.getLogger(__name__)
@@ -95,12 +99,12 @@ async def build_gpu_docker_config_for_executor(
             per_gpu = await _query_all_gpu_nodes(ssh_client)
             is_partial_rental = False
 
-        # On partial rentals (some-but-not-all GPUs on the host), skip /dev/nvidia-caps/*.
-        # Caps are per-GPU/per-MIG control nodes; forwarding all of them lets a tenant
-        # peek at or manipulate MIG state of another tenant's GPU on the same host.
-        # We don't sell MIG slices today, but stripping caps under partial rental
-        # closes the leak before that ever ships.
-        shared = await _query_shared_nodes(ssh_client, include_caps=not is_partial_rental)
+        # On partial rentals (some-but-not-all GPUs on the host), withhold every host-wide node:
+        # /dev/nvidia-caps/* are per-GPU/per-MIG control nodes that would let a tenant peek at or
+        # manipulate another tenant's GPU, and the RDMA verbs devices belong to cards the other
+        # tenant may be renting (DAH-2571). We don't sell MIG slices today, but stripping both
+        # under partial rental closes the leak before either ever ships.
+        shared = await _query_shared_nodes(ssh_client, is_whole_host_rental=not is_partial_rental)
         return build_gpu_docker_config(gpu_uuids, device_nodes=(*per_gpu, *shared))
     except Exception:
         logger.warning(
@@ -164,7 +168,10 @@ async def _query_gpu_nodes_for_uuids(
             f"visible: {sorted(uuid_to_minor)}"
         )
 
-    per_gpu = tuple(f"/dev/nvidia{uuid_to_minor[uuid]}" for uuid in gpu_uuids)
+    # Deduplicated, request order kept: the caller compares this length against the host GPU count
+    # to decide whether the rental covers the whole host, so a UUID repeated N times would pass a
+    # single-GPU rental off as whole-host and hand it every host-wide device.
+    per_gpu = tuple(dict.fromkeys(f"/dev/nvidia{uuid_to_minor[uuid]}" for uuid in gpu_uuids))
     return per_gpu, len(uuid_to_minor)
 
 
@@ -199,22 +206,34 @@ async def _query_gpu_minor_map_from_nvidia_smi_xml(
 async def _query_shared_nodes(
     ssh: asyncssh.SSHClientConnection,
     *,
-    include_caps: bool = True,
+    is_whole_host_rental: bool = True,
 ) -> tuple[str, ...]:
-    """Enumerate shared NVIDIA control nodes that exist on the host.
+    """Enumerate shared NVIDIA control nodes, and the RDMA verbs nodes, that exist on the host.
 
-    `include_caps=False` skips /dev/nvidia-caps/* and IMEX channel nodes — used
-    for partial-host rentals so we don't leak per-GPU MIG/IMEX caps belonging
-    to neighbouring tenants on the same host.
+    On a partial-host rental this skips /dev/nvidia-caps/*, the IMEX channel nodes and every RDMA
+    device — all three belong to the host as a whole, and forwarding them would hand a tenant
+    control nodes of a GPU or a card another tenant is renting on the same box.
+
+    RDMA is additionally behind ENABLE_RDMA_DEVICE_PASSTHROUGH, off by default: the path skips the
+    host network stack, so on a shared RoCE segment it reaches a neighbour with no iptables,
+    conntrack or rate limit in the way. Only the `uverbs*` nodes and `rdma_cm` are ever forwarded,
+    never the /dev/infiniband directory:
+    that also carries `issm*`, the subnet-manager interface, and `umad*`, raw MAD access. A renter
+    holding `issm` can interfere with the fabric every other tenant on it depends on (DAH-2571).
     """
-    cmd = (
-        "for p in /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
+    globs = (
+        "/dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
         "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
-        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*; do "
+        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
+    )
+    if is_whole_host_rental and settings.ENABLE_RDMA_DEVICE_PASSTHROUGH:
+        globs += " /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
+    cmd = (
+        f"for p in {globs}; do "
         '[ -e "$p" ] && printf "%s\\n" "$p"; '
         "done"
     )
-    if include_caps:
+    if is_whole_host_rental:
         cmd += (
             "; find /dev/nvidia-caps /dev/nvidia-caps-imex-channels "
             "-mindepth 1 -maxdepth 1 -print 2>/dev/null || true"

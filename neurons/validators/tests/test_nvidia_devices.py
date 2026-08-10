@@ -173,23 +173,27 @@ async def test_host_without_optional_shared_nodes_has_empty_shared():
 
 
 @pytest.mark.asyncio
-async def test_query_shared_nodes_skips_caps_when_include_caps_false():
+async def test_query_shared_nodes_skips_host_wide_nodes_on_a_partial_rental():
     ssh = fake_ssh(FakeRun(""))
-    await _query_shared_nodes(ssh, include_caps=False)
+    await _query_shared_nodes(ssh, is_whole_host_rental=False)
 
     cmd = ssh.run.call_args.args[0]
     assert "/dev/nvidia-caps" not in cmd
     assert "/dev/nvidia-caps-imex-channels" not in cmd
+    # RDMA cards belong to the host too — see DAH-2571
+    assert "/dev/infiniband" not in cmd
 
 
 @pytest.mark.asyncio
-async def test_query_shared_nodes_includes_caps_by_default():
+async def test_query_shared_nodes_includes_host_wide_nodes_by_default():
     ssh = fake_ssh(FakeRun(""))
     await _query_shared_nodes(ssh)
 
     cmd = ssh.run.call_args.args[0]
     assert "/dev/nvidia-caps" in cmd
     assert "/dev/nvidia-caps-imex-channels" in cmd
+    # RDMA needs the whole-host branch AND its own flag — see test_infiniband_passthrough.py
+    assert "/dev/infiniband" not in cmd
 
 
 # ---------------------------- build_gpu_flags ----------------------------

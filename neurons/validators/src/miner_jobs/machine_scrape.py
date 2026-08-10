@@ -1037,6 +1037,193 @@ def check_storage_limit_ability() -> tuple[bool, str]:
         return False, f"An unexpected error occurred: {e}"
 
 
+NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
+# Enough of the GID table to carry both the link-local entries and the IPv4-mapped one. Its index
+# is driver-specific - mlx5 puts it at 2-3, Intel irdma at 1 - so consumers must match on the
+# IPV4_MAPPED_GID_PREFIX below, never on a position.
+GID_TABLE_ENTRIES_READ = 4
+IPV4_MAPPED_GID_PREFIX = "0000:0000:0000:0000:0000:ffff:"
+
+
+class NcuProfilingObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, access: str, scrape_error: str) -> None:
+        self.access = access
+        self.scrape_error = scrape_error
+
+
+def check_ncu_profiling_access() -> NcuProfilingObservation:
+    # Host driver flag RmProfilingAdminOnly: 0 -> GPU performance counters open to every workload
+    # on the host ("unrestricted"), 1 -> admin-only ("restricted"). Anything unreadable stays
+    # "unknown" - the backend fails closed on it; never guess a value.
+    try:
+        with open(NVIDIA_PARAMS_PATH) as params_file:
+            params_content = params_file.read()
+    except Exception as e:
+        return NcuProfilingObservation("unknown", f"Cannot read {NVIDIA_PARAMS_PATH}: {e}")
+
+    match = re.search(r"^RmProfilingAdminOnly:\s*(\d+)\s*$", params_content, re.M)
+    if match is None:
+        return NcuProfilingObservation(
+            "unknown", "RmProfilingAdminOnly not present in nvidia driver params"
+        )
+
+    flag_value = match.group(1)
+    if flag_value == "0":
+        return NcuProfilingObservation("unrestricted", "")
+    if flag_value == "1":
+        return NcuProfilingObservation("restricted", "")
+    return NcuProfilingObservation(
+        "unknown", f"Unexpected RmProfilingAdminOnly value: {flag_value}"
+    )
+
+
+def get_host_boot_id() -> str:
+    # Reboot marker: the profiling flag only changes on a driver reload/reboot, so a changed
+    # boot_id tells the backend a stale observation may have flipped (DAH-2182).
+    try:
+        with open(BOOT_ID_PATH) as boot_id_file:
+            return boot_id_file.read().strip()
+    except Exception:
+        return ""
+
+
+def read_sysfs_value(path: str) -> str:
+    try:
+        with open(path) as sysfs_file:
+            return sysfs_file.read().strip()
+    except Exception:
+        return ""
+
+
+class InfinibandPort:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(
+        self,
+        device: str,
+        port: str,
+        node_guid: str,
+        sys_image_guid: str,
+        link_layer: str,
+        state: str,
+        phys_state: str,
+        rate: str,
+        lid: str,
+        sm_lid: str,
+        pkey: str,
+        gids: list[str],
+    ) -> None:
+        self.device = device
+        self.port = port
+        self.node_guid = node_guid
+        self.sys_image_guid = sys_image_guid
+        self.link_layer = link_layer
+        self.state = state
+        self.phys_state = phys_state
+        self.rate = rate
+        self.lid = lid
+        self.sm_lid = sm_lid
+        self.pkey = pkey
+        self.gids = gids
+
+    def as_payload(self) -> dict[str, str | list[str]]:
+        return {
+            "ib_device": self.device,
+            "ib_port": self.port,
+            "ib_node_guid": self.node_guid,
+            "ib_sys_image_guid": self.sys_image_guid,
+            "ib_link_layer": self.link_layer,
+            "ib_state": self.state,
+            "ib_phys_state": self.phys_state,
+            "ib_rate": self.rate,
+            "ib_lid": self.lid,
+            "ib_sm_lid": self.sm_lid,
+            "ib_pkey": self.pkey,
+            "ib_gids": self.gids,
+        }
+
+
+def read_infiniband_port(
+    device_path: str, node_guid: str, sys_image_guid: str, port_path: str
+) -> InfinibandPort:
+    # Whole GID table, not just gids/0: every prod port carries the default fe80:: prefix, so the
+    # prefix alone identifies nothing. The IPv4-mapped entry is the one that tells two Ethernet
+    # ports they share a segment - find it by IPV4_MAPPED_GID_PREFIX, its index moves by driver.
+    gids = [read_sysfs_value(f"{port_path}/gids/{index}") for index in range(GID_TABLE_ENTRIES_READ)]
+    # POSITIONAL ON PURPOSE: obfuscator.py renames __init__ parameters but leaves keyword names at
+    # the call site, so a keyword call raises TypeError in the packaged scrape and nowhere else.
+    # That is what made the first prod rollout return an empty list on every host (DAH-2571).
+    return InfinibandPort(
+        os.path.basename(device_path),
+        os.path.basename(port_path),
+        node_guid,
+        sys_image_guid,
+        read_sysfs_value(f"{port_path}/link_layer"),
+        read_sysfs_value(f"{port_path}/state"),
+        read_sysfs_value(f"{port_path}/phys_state"),
+        read_sysfs_value(f"{port_path}/rate"),
+        read_sysfs_value(f"{port_path}/lid"),
+        read_sysfs_value(f"{port_path}/sm_lid"),
+        read_sysfs_value(f"{port_path}/pkeys/0"),
+        [gid for gid in gids if gid],
+    )
+
+
+class InfinibandObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, ports: list[InfinibandPort], scrape_error: str) -> None:
+        self.ports = ports
+        self.scrape_error = scrape_error
+
+
+def get_infiniband_ports() -> InfinibandObservation:
+    """Every RDMA port the host exposes, as reported by the kernel (DAH-2571).
+
+    Facts only - which ports are usable and which fabric each one sits on. Deciding whether two
+    machines are on the same fabric is the backend's job: it needs both hosts, this sees one.
+
+    An empty port list has three different causes and they must stay distinguishable: the host has
+    no RDMA hardware, the scrape cannot see the sysfs tree from where it runs, or the walk itself
+    failed. Reporting [] for all three is what made the first prod rollout unreadable - every
+    executor came back empty, including hosts known to carry 24 mlx5 devices, with no way to tell
+    which case it was.
+    """
+    if not os.path.isdir(INFINIBAND_SYSFS_PATH):
+        return InfinibandObservation([], f"{INFINIBAND_SYSFS_PATH} does not exist")
+
+    ports: list[InfinibandPort] = []
+    try:
+        # os.listdir, not glob: glob swallows EACCES/EIO and returns [], which would be reported as
+        # "lists no devices" - the same kind of silent nothing this function exists to stop.
+        device_names = sorted(os.listdir(INFINIBAND_SYSFS_PATH))
+        for device_name in device_names:
+            device_path = f"{INFINIBAND_SYSFS_PATH}/{device_name}"
+            node_guid = read_sysfs_value(f"{device_path}/node_guid")
+            sys_image_guid = read_sysfs_value(f"{device_path}/sys_image_guid")
+            ports_path = f"{device_path}/ports"
+            if not os.path.isdir(ports_path):
+                continue
+            for port_name in sorted(os.listdir(ports_path)):
+                ports.append(
+                    read_infiniband_port(device_path, node_guid, sys_image_guid, f"{ports_path}/{port_name}")
+                )
+    except Exception as e:
+        # An interconnect reading is never worth failing the whole machine scrape over, but the
+        # reason has to travel with the empty result.
+        return InfinibandObservation(ports, f"Error walking {INFINIBAND_SYSFS_PATH}: {e}")
+
+    if not device_names:
+        return InfinibandObservation([], f"{INFINIBAND_SYSFS_PATH} lists no devices")
+    if not ports:
+        return InfinibandObservation([], f"{len(device_names)} device(s) present, none exposing a port")
+    return InfinibandObservation(ports, "")
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -1151,6 +1338,16 @@ def get_machine_specs():
     data["data_storage_limit_supported"] = is_supported
     if not is_supported:
         data["data_storage_limit_scrape_error"] = log_text
+
+    ncu_profiling = check_ncu_profiling_access()
+    data["data_ncu_profiling_access"] = ncu_profiling.access
+    if ncu_profiling.scrape_error:
+        data["data_ncu_profiling_scrape_error"] = ncu_profiling.scrape_error
+    data["data_boot_id"] = get_host_boot_id()
+    infiniband = get_infiniband_ports()
+    data["data_infiniband_ports"] = [port.as_payload() for port in infiniband.ports]
+    if infiniband.scrape_error:
+        data["data_infiniband_scrape_error"] = infiniband.scrape_error
 
     try:
         lscpu_output = run_cmd("lscpu")

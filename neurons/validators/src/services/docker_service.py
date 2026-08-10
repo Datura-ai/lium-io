@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import enum
 import ipaddress
 import logging
 import math
@@ -90,6 +91,7 @@ from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     ContainerExecSpec,
     ContainerRunSpec,
+    ContainerUlimit,
     DeviceMount,
     PortBinding,
     RentalDockerConnectionError,
@@ -197,6 +199,17 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
+# the path comes from a customer-authored template and the backend only requires a leading slash,
+# so anything that is not a plain absolute path is refused here rather than mounted over
+_PLAINTEXT_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
+
+
+class _VolumeEncryptionState(enum.Enum):
+    ENCRYPTED = "encrypted"
+    PLAIN = "plain"
+    UNKNOWN = "unknown"
+
+
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
 HOST_KEY_REQUIRED_EXTRA = {
@@ -346,9 +359,10 @@ def _is_docker_container_removal_in_progress_error(exc: Exception) -> bool:
     )
 
 
-def _is_stale_vloopback_mountpoint_error(exc: Exception) -> bool:
-    text = str(exc)
-    return all(phrase in text for phrase in _VLOOPBACK_MOUNT_ERROR_PHRASES)
+def _is_stale_vloopback_mountpoint_error(error_text: str) -> bool:
+    # Takes raw text so it serves both sources: a create-time exception, and the State.Error of a
+    # container the host already tried to auto-restart.
+    return all(phrase in error_text for phrase in _VLOOPBACK_MOUNT_ERROR_PHRASES)
 
 
 def _is_safe_docker_volume_name(volume_name: str) -> bool:
@@ -414,7 +428,7 @@ def _should_repair_stale_mountpoint(
     return (
         bool(local_volume)
         and not already_repaired
-        and _is_stale_vloopback_mountpoint_error(exc)
+        and _is_stale_vloopback_mountpoint_error(str(exc))
     )
 
 def _should_encrypt_local_volume(
@@ -443,6 +457,37 @@ def _xor_wrap_passphrase(passphrase: str) -> tuple[str, str]:
     return pad.hex(), wrapped.hex()
 
 
+def _can_remount_encrypted_volume(local_volume_path: str | None) -> bool:
+    # whether recovery has everything it needs to put a gocryptfs volume back the way the customer
+    # had it. Checked before the container is started, because the remount only happens after
+    # `docker start`: a missing piece would leave the pod flapping up and down once a cycle.
+    # VOLUME_MASTER_SECRET must be the one the volume was created with — another validator's secret
+    # derives a passphrase that simply will not mount. A plaintext path at or under the ciphertext
+    # mount is refused as well: mounting the plaintext view inside the ciphertext it is decrypting
+    # is not something recovery should attempt on customer data.
+    if not (
+        settings.RECOVER_ENCRYPTED_VOLUMES
+        and settings.VOLUME_MASTER_SECRET
+        and local_volume_path
+    ):
+        return False
+    if local_volume_path == _LIUM_CIPHER_MOUNT or local_volume_path.startswith(
+        f"{_LIUM_CIPHER_MOUNT}/"
+    ):
+        return False
+    return _PLAINTEXT_PATH_RE.fullmatch(local_volume_path) is not None
+
+
+def _shell_branch_when_gocryptfs_config_missing(allow_init: bool) -> str:
+    if allow_init:
+        return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"'
+    return (
+        f'  echo "gocryptfs.conf missing under {_LIUM_CIPHER_MOUNT};'
+        ' refusing to re-initialise an existing rental volume" >&2\n'
+        "  exit 1"
+    )
+
+
 def _build_gocryptfs_setup_and_mount_script(
     plaintext_path: str,
     *,
@@ -451,7 +496,13 @@ def _build_gocryptfs_setup_and_mount_script(
     pad_var: str,
     wrapped_var: str,
     passfile_path: str,
+    allow_init: bool = True,
 ) -> str:
+    # allow_init=False belongs to every start of a container that already exists — stale-mount
+    # recovery and the backend's own start_container alike: such a volume was initialised at create
+    # time, so a missing gocryptfs.conf means the ciphertext is gone. Re-initialising it there would
+    # hand the customer an empty volume, report the start as a success and spare the miner the
+    # penalty for data they destroyed. Only pod creation initialises.
     plaintext = shlex.quote(plaintext_path)
     passfile = shlex.quote(passfile_path)
     mount_check = (
@@ -480,7 +531,7 @@ chmod 600 "$_pf"
 unset _esc _x _y {pad_var} {wrapped_var}
 mkdir -p {_LIUM_CIPHER_MOUNT} {plaintext}
 if [ ! -f {_LIUM_CIPHER_MOUNT}/gocryptfs.conf ]; then
-  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"
+{_shell_branch_when_gocryptfs_config_missing(allow_init)}
 fi
 if ! {mount_check}; then
   gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
@@ -871,6 +922,7 @@ class DockerService:
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=("NET_ADMIN",),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
+            ulimits=self._memlock_ulimit_for(devices, payload.memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
             cpu_count=cpu_count,
@@ -879,6 +931,29 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
         )
+
+    @staticmethod
+    def _memlock_ulimit_for(
+        devices: tuple[DeviceMount, ...], memory_gb: int | None
+    ) -> tuple[ContainerUlimit, ...]:
+        """Unlimited memlock, for a container that got RDMA devices AND a memory limit.
+
+        RDMA pins the memory it registers and the default 64 KB is far below one queue pair, so the
+        forwarded verbs devices are unusable without this (DAH-2571).
+
+        Both conditions matter, though the limit is a bound, not safety. Locked pages are charged to
+        the container's memory cgroup, so the tenant can pin at most `memory_gb` — but on a
+        whole-host rental that is the machine: `ram_total` is host RAM less ~2 GiB. What the cgroup
+        buys is a ceiling the kernel enforces and the OOM killer can act on. Without one —
+        `mem_limit` is skipped for a falsy `memory_gb`, and a pod's `ram_total` defaults to 0 —
+        there is no ceiling at all, and mlocked pages never reclaim.
+        """
+        forwards_rdma = any(
+            device.path_on_host.startswith("/dev/infiniband/") for device in devices
+        )
+        if not forwards_rdma or not memory_gb:
+            return ()
+        return (ContainerUlimit(name="memlock", soft=-1, hard=-1),)
 
     async def _remove_failed_container_for_retry(
         self,
@@ -1967,6 +2042,7 @@ class DockerService:
         pod_id: str,
         log_tag: str,
         log_extra: dict,
+        allow_init: bool = True,
     ) -> None:
         passphrase = VolumeKeyDeriver.from_settings(settings).material(pod_id).passphrase
 
@@ -1981,7 +2057,7 @@ class DockerService:
 
         async def wipe_tmp_files() -> None:
             await ssh_client.run(
-                f"/usr/bin/docker exec {container_q} rm -f "
+                f"/usr/bin/docker exec -u 0 {container_q} rm -f "
                 f"{shlex.quote(passfile_path)} {shlex.quote(setup_script_path)}",
                 check=False,
             )
@@ -2038,10 +2114,11 @@ class DockerService:
             pad_var=pad_var,
             wrapped_var=wrapped_var,
             passfile_path=passfile_path,
+            allow_init=allow_init,
         )
         setup_heredoc = f"__SETUP_{uuid4().hex}__"
         upload_cmd = (
-            f"/usr/bin/docker exec -i {container_q} sh -c "
+            f"/usr/bin/docker exec -u 0 -i {container_q} sh -c "
             f"\"cat > {setup_script_path}\" "
             f"<< '{setup_heredoc}'\n"
             f"{setup_script}\n"
@@ -2069,7 +2146,7 @@ class DockerService:
             )
         )
         mount_result = await ssh_client.run(
-            f"/usr/bin/docker exec {container_q} sh {shlex.quote(setup_script_path)}",
+            f"/usr/bin/docker exec -u 0 {container_q} sh {shlex.quote(setup_script_path)}",
         )
         await wipe_tmp_files()
         if mount_result.exit_status != 0:
@@ -2095,7 +2172,7 @@ class DockerService:
             )
         )
         verify_result = await ssh_client.run(
-            f"/usr/bin/docker exec {container_q} sh -lc {shlex.quote(verify_mount_script)}"
+            f"/usr/bin/docker exec -u 0 {container_q} sh -lc {shlex.quote(verify_mount_script)}"
         )
         if verify_result.exit_status != 0:
             diagnostic_script = (
@@ -2105,7 +2182,7 @@ class DockerService:
                 'ps aux | grep [g]ocryptfs || true'
             )
             diagnostic_result = await ssh_client.run(
-                f"/usr/bin/docker exec {container_q} sh -lc "
+                f"/usr/bin/docker exec -u 0 {container_q} sh -lc "
                 f"{shlex.quote(diagnostic_script)}",
                 check=False,
             )
@@ -2114,6 +2191,18 @@ class DockerService:
                 "gocryptfs mount did not become visible inside container",
                 diagnostic_result,
             )
+
+        # The mount is created by root, so on an image whose USER is not root the
+        # renter's own workload would own nothing inside its workspace and could
+        # not write there (allow_other grants traversal, not permission).
+        unwritable_workspace_error: str | None = await self._grant_workspace_to_container_user(
+            ssh_client=ssh_client,
+            container_q=container_q,
+            plaintext_path=plaintext_path,
+            log_extra={**log_extra, "container_name": container_name, "pod_id": pod_id},
+        )
+        if unwritable_workspace_error:
+            await fail_step("chown_workspace", unwritable_workspace_error)
 
         await self.stream_log("Encrypted local volume mounted", "success", log_tag)
 
@@ -2130,6 +2219,81 @@ class DockerService:
                 }),
             ),
         )
+
+    async def _grant_workspace_to_container_user(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_q: str,
+        plaintext_path: str,
+        log_extra: dict,
+    ) -> str | None:
+        """Hand the freshly mounted workspace to the image's own user.
+
+        The mount is created by root, so on an image whose USER is not root the
+        renter would own nothing inside its own workspace. No-op for a root
+        image. Returns an error message when the workspace is still not writable,
+        so the caller fails the rental rather than billing for a pod whose
+        encrypted volume the renter cannot use.
+
+        The verdict is a real write probe run as the image's user, not a
+        permission calculation: chown-ing the mountpoint says nothing about
+        whether every parent directory on the way to it is traversable (a mount
+        at ``/root/workspace`` under a 0700 ``/root`` is chown-ed and still
+        unreachable).
+        """
+        # `docker inspect` on the host, not `id` in the container: a renter image
+        # is not guaranteed to ship coreutils, and a probe we cannot run must not
+        # be mistaken for a probe that passed.
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}",
+            check=False,
+        )
+        if inspect_result.exit_status != 0:
+            return (
+                f"could not read the image USER of the rental container "
+                f"(docker inspect exit={inspect_result.exit_status}, "
+                f"stderr={(inspect_result.stderr or '')[-300:]!r})"
+            )
+
+        image_user: str = (inspect_result.stdout or "").strip()
+        if image_user in ("", "0", "root", "0:0", "root:root"):
+            return None
+
+        user_q: str = shlex.quote(image_user)
+        plaintext_q: str = shlex.quote(plaintext_path)
+        chown_result = await ssh_client.run(
+            f"/usr/bin/docker exec -u 0 {container_q} "
+            f"sh -c {shlex.quote(f'chown {user_q} {plaintext_q}')}",
+            check=False,
+        )
+        if chown_result.exit_status != 0:
+            logger.warning(
+                _m(
+                    "Failed to chown encrypted workspace; probing writability anyway",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "image_user": image_user,
+                        "stderr": (chown_result.stderr or "")[-500:],
+                    }),
+                )
+            )
+
+        # Unique name: the workspace may already hold renter data on a remount, and
+        # a fixed probe path would delete a same-named file of theirs.
+        probe_path_q: str = shlex.quote(f"{plaintext_path}/.lium-write-probe-{uuid4().hex}")
+        probe_script: str = f"touch {probe_path_q} && rm -f {probe_path_q}"
+        probe_result = await ssh_client.run(
+            f"/usr/bin/docker exec -u {user_q} {container_q} sh -c {shlex.quote(probe_script)}",
+            check=False,
+        )
+        if probe_result.exit_status != 0:
+            return (
+                f"encrypted workspace at {plaintext_path} is not writable by the image user "
+                f"{image_user} (probe exit={probe_result.exit_status}, "
+                f"stderr={(probe_result.stderr or '')[-300:]!r})"
+            )
+        return None
 
     async def install_open_ssh_server_and_start_ssh_service(
         self,
@@ -2698,9 +2862,13 @@ class DockerService:
                     raise_exception=False,
                 )
 
+            # local_volume_path comes from the renter's template, so it reaches the
+            # host shell only through shlex.quote — same as the branch below.
+            container_q = shlex.quote(container_name)
+            script_q = shlex.quote(f"{local_volume_path}/run_jupyter.sh")
             command = (
-                f"/usr/bin/docker exec {container_name} "
-                f"sh -c 'chmod +x {local_volume_path}/run_jupyter.sh'"
+                f"/usr/bin/docker exec -u 0 {container_q} "
+                f"sh -c {shlex.quote(f'chmod +x {script_q}')}"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2712,8 +2880,8 @@ class DockerService:
             )
 
             command = (
-                f"/usr/bin/docker exec {container_name} sh -c "
-                f"'{local_volume_path}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+                f"/usr/bin/docker exec -u 0 {container_q} sh -c "
+                f"{shlex.quote(f'{script_q} --password={jupyter_token} --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2728,7 +2896,7 @@ class DockerService:
             container_q = shlex.quote(container_name)
             target_q = shlex.quote(target_path)
             command = (
-                f"/usr/bin/docker exec {container_q} "
+                f"/usr/bin/docker exec -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
             )
             await self.execute_and_stream_logs(
@@ -2752,7 +2920,7 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec {container_q} "
+                f"/usr/bin/docker exec -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
@@ -2764,7 +2932,7 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec {container_q} sh -c "
+                f"/usr/bin/docker exec -u 0 {container_q} sh -c "
                 f"{shlex.quote(f'{target_q}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
@@ -4790,7 +4958,6 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
         known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
@@ -4831,60 +4998,15 @@ class DockerService:
             )
 
         try:
-            async with self.rental_docker_client_factory.connect(
+            await self.start_existing_container(
                 executor_info=executor_info,
                 private_key=private_key,
-            ) as docker_client:
-                await run_logged_rental_docker_sdk_operation(
-                    operation="start_container",
-                    log_extra=default_extra,
-                    call=lambda: docker_client.start(container_name=payload.container_name),
-                    container_name=payload.container_name,
-                )
-                async with asyncssh.connect(
-                    host=executor_info.address,
-                    port=executor_info.ssh_port,
-                    username=executor_info.ssh_username,
-                    client_keys=[pkey],
-                    known_hosts=known_hosts_policy,
-                ) as ssh_client:
-                    encrypted_volume_name = await self._encrypted_local_volume_name(
-                        docker_client,
-                        payload.container_name,
-                    )
-                    if encrypted_volume_name:
-                        await self.setup_encrypted_local_volume(
-                            ssh_client=ssh_client,
-                            container_name=payload.container_name,
-                            plaintext_path=payload.local_volume_path,
-                            volume_name=encrypted_volume_name,
-                            pod_id=payload.pod_id,
-                            log_tag=f"start_container_{payload.pod_id}",
-                            log_extra=default_extra,
-                        )
-                ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
-                    docker_client=docker_client,
-                    container_name=payload.container_name,
-                    log_tag=f"start_container_{payload.pod_id}",
-                    log_extra=default_extra,
-                )
-                if not ssh_bootstrap_ok:
-                    logger.warning(
-                        _m(
-                            "Docker container started but SSH bootstrap did not complete cleanly",
-                            extra=get_extra_info(
-                                {**default_extra, "container_name": payload.container_name}
-                            ),
-                        )
-                    )
-                logger.info(
-                    _m(
-                        "Started Docker Container",
-                        extra=get_extra_info(
-                            {**default_extra, "container_name": payload.container_name}
-                        ),
-                    ),
-                )
+                known_hosts_policy=known_hosts_policy,
+                container_name=payload.container_name,
+                local_volume_path=payload.local_volume_path,
+                pod_id=payload.pod_id,
+                default_extra=default_extra,
+            )
         except Exception as exc:
             log_text = _m(
                 "Failed start_container",
@@ -4906,6 +5028,275 @@ class DockerService:
                 error_type=FailedContainerErrorTypes.ContainerStartFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
+
+    async def start_existing_container(
+        self,
+        *,
+        executor_info: ExecutorSSHInfo,
+        private_key: str,
+        known_hosts_policy: asyncssh.SSHKnownHosts | None,
+        container_name: str,
+        local_volume_path: str | None,
+        pod_id: str,
+        default_extra: dict[str, Any],
+    ) -> None:
+        # start a container that already exists and restore the two things a bare `docker start`
+        # drops: the gocryptfs plaintext mount of an encrypted rental volume, and the sshd the
+        # customer connects through. A failed remount raises and the caller decides how to report
+        # it; a failed sshd bootstrap only warns, because the pod itself is up either way.
+        # A falsy local_volume_path means the caller does not know the plaintext path, which is only
+        # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
+        # leave the customer's real path an ordinary container dir, writing plaintext to the host.
+        pkey = asyncssh.import_private_key(private_key)
+        async with self.rental_docker_client_factory.connect(
+            executor_info=executor_info,
+            private_key=private_key,
+        ) as docker_client:
+            await run_logged_rental_docker_sdk_operation(
+                operation="start_container",
+                log_extra=default_extra,
+                call=lambda: docker_client.start(container_name=container_name),
+                container_name=container_name,
+            )
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=known_hosts_policy,
+            ) as ssh_client:
+                encrypted_volume_name = await self._encrypted_local_volume_name(
+                    docker_client,
+                    container_name,
+                )
+                if encrypted_volume_name:
+                    if not local_volume_path:
+                        raise RuntimeError(
+                            f"{container_name} holds an encrypted volume but no plaintext path "
+                            "was supplied; refusing to remount it at a guessed path"
+                        )
+                    await self.setup_encrypted_local_volume(
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        plaintext_path=local_volume_path,
+                        volume_name=encrypted_volume_name,
+                        pod_id=pod_id,
+                        log_tag=f"start_container_{pod_id}",
+                        log_extra=default_extra,
+                        allow_init=False,
+                    )
+            ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+                docker_client=docker_client,
+                container_name=container_name,
+                log_tag=f"start_container_{pod_id}",
+                log_extra=default_extra,
+            )
+            if not ssh_bootstrap_ok:
+                logger.warning(
+                    _m(
+                        "Docker container started but SSH bootstrap did not complete cleanly",
+                        extra=get_extra_info(
+                            {**default_extra, "container_name": container_name}
+                        ),
+                    )
+                )
+            logger.info(
+                _m(
+                    "Started Docker Container",
+                    extra=get_extra_info(
+                        {**default_extra, "container_name": container_name}
+                    ),
+                ),
+            )
+
+    async def recover_pod_after_stale_vloopback_mount(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        container_error: str | None,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+    ) -> bool:
+        # DAH-2306: bring back a still-rented pod the host could not auto-restart after a reboot.
+        # The reboot leaves the vloopback mountpoint dir behind, dockerd's `unless-stopped` restart
+        # hits the plugin's "file exists" and the container stays down until the rental ends. Only
+        # that exact failure is recovered: a pod stopped on purpose exits with an empty State.Error
+        # and never matches, so a customer's stop is never overridden.
+        if not container_error or not _is_stale_vloopback_mountpoint_error(container_error):
+            return False
+
+        log_extra = {**default_extra, "container_name": container_name}
+        try:
+            encryption_state = await self._local_volume_encryption_state(
+                ssh_client, container_name
+            )
+            if encryption_state is _VolumeEncryptionState.UNKNOWN or (
+                encryption_state is _VolumeEncryptionState.ENCRYPTED
+                and not _can_remount_encrypted_volume(local_volume_path)
+            ):
+                logger.warning(
+                    _m(
+                        "POD_STALE_MOUNT_RECOVERY_SKIPPED_ENCRYPTED_VOLUME",
+                        extra=get_extra_info({
+                            **log_extra,
+                            "volume_encryption_state": encryption_state.value,
+                        }),
+                    )
+                )
+                return False
+            repaired_volume = await self._repair_stale_mountpoint_of_container_volume(
+                ssh_client,
+                container_name,
+                log_extra,
+            )
+        except TimeoutError:
+            # a command that did not finish in time is not a dead SSH transport: report it here so
+            # the check keeps its POD_NOT_RUNNING verdict instead of turning it into
+            # EXECUTOR_TRANSPORT_UNREACHABLE and dropping the penalty.
+            logger.warning(
+                _m(
+                    "POD_STALE_MOUNT_RECOVERY_TIMED_OUT",
+                    extra=get_extra_info(log_extra),
+                )
+            )
+            return False
+        if not repaired_volume:
+            logger.warning(
+                _m(
+                    "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED",
+                    extra=get_extra_info(log_extra),
+                )
+            )
+            return False
+
+        log_extra = {**log_extra, "local_volume": repaired_volume}
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(
+                executor_info,
+                miner_hotkey,
+                log_extra,
+            )
+            require_rental_docker_ssh_host_key(executor_info)
+            await self.start_existing_container(
+                executor_info=executor_info,
+                private_key=private_key,
+                known_hosts_policy=known_hosts_policy,
+                container_name=container_name,
+                local_volume_path=local_volume_path,
+                pod_id=pod_id,
+                default_extra=log_extra,
+            )
+        except asyncio.CancelledError:
+            # the whole check runs under an outer timeout, so a cancellation can land between
+            # `docker start` and the gocryptfs remount and leave the container up with its
+            # plaintext path unmounted — exactly the state the Exception branch below stops. The
+            # stop is shielded because an unshielded await in a cancelled task never runs; the
+            # cancellation itself still propagates.
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(
+                    self._stop_half_recovered_container(ssh_client, container_name)
+                )
+            raise
+        except Exception as exc:
+            container_stopped = await self._stop_half_recovered_container(
+                ssh_client, container_name
+            )
+            logger.error(
+                _m(
+                    "POD_STALE_MOUNT_RECOVERY_START_FAILED",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "error": str(exc),
+                        "container_stopped": container_stopped,
+                    }),
+                )
+            )
+            return False
+
+        logger.info(
+            _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
+        )
+        return True
+
+    async def _local_volume_encryption_state(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+    ) -> _VolumeEncryptionState:
+        # whether the pod's rental volume is gocryptfs-encrypted, which recovery may only touch
+        # when it knows the plaintext path. An encrypted volume is mounted as the ciphertext at
+        # /lium-cipher and the plaintext path the customer actually uses is recorded nowhere on the
+        # host; DAH-2545 carries it in the backend's rental-active response. Remounting at the
+        # /root default would silently turn a custom path into an ordinary container dir, so
+        # writes to it would land unencrypted on the miner's disk. An inspect that does not answer
+        # is UNKNOWN rather than ENCRYPTED: recovery stands down either way, but a pod we could not
+        # even look at must not be started on the strength of a path we cannot match to a volume.
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect {shlex.quote(container_name)} "
+            '--format \'{{range .Mounts}}{{println .Destination}}{{end}}\'',
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        if getattr(inspect_result, "exit_status", 0) != 0:
+            return _VolumeEncryptionState.UNKNOWN
+        if _LIUM_CIPHER_MOUNT in (inspect_result.stdout or "").split():
+            return _VolumeEncryptionState.ENCRYPTED
+        return _VolumeEncryptionState.PLAIN
+
+    async def _repair_stale_mountpoint_of_container_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        log_extra: dict[str, Any],
+    ) -> str | None:
+        # the volume whose stale mountpoint kept the container down, read off the container itself.
+        # `docker inspect` reports mounts of a stopped container, so the real name is taken from the
+        # host instead of guessed from pod_id — a pod created through the edit path carries a
+        # backend-supplied volume name that no convention derives. Every mount can be offered
+        # blindly: repair_stale_vloopback_mountpoint accepts only a vloopback volume whose stale
+        # mountpoint dir is present and empty.
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect {shlex.quote(container_name)} "
+            '--format \'{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}\'',
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        if getattr(inspect_result, "exit_status", 0) != 0:
+            return None
+
+        for candidate_volume in (inspect_result.stdout or "").split():
+            repaired = await self.repair_stale_vloopback_mountpoint(
+                ssh_client,
+                candidate_volume,
+                {**log_extra, "local_volume": candidate_volume},
+            )
+            if repaired:
+                return candidate_volume
+        return None
+
+    async def _stop_half_recovered_container(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+    ) -> bool:
+        # a start that brought the container up but failed afterwards — a gocryptfs remount that did
+        # not take — leaves the customer a running pod with an empty plaintext dir, and no later
+        # cycle revisits it because recovery only fires on a stopped container. Put it back down so
+        # the POD_NOT_RUNNING verdict keeps matching what the customer sees. A no-op when the start
+        # itself was what failed.
+        try:
+            stop_result = await ssh_client.run(
+                f"/usr/bin/docker stop {shlex.quote(container_name)}",
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+            return getattr(stop_result, "exit_status", 1) == 0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
 
     def _container_deleted(self, payload: ContainerDeleteRequest) -> ContainerDeleted:
         return ContainerDeleted(

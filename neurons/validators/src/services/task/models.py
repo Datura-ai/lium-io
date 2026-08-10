@@ -38,6 +38,7 @@ class JobResult(BaseModel):
     rented_gpu_count: int | None = None
     is_spot: bool = False
     is_new_rentals_paused: bool = False
+    is_provider_banned: bool = False
     provider_discord_connected: bool = True
     rental_created_at: datetime | None = None
     default_job_owner: str | None = None  # "miner" | "lium" | None; miner default job is excluded from unrented incentive
@@ -67,6 +68,8 @@ class JobResult(BaseModel):
     hourly_rate: float | None = None                  # Hourly rate for the executor in this cycle for scoring logic
     max_cap: int | None = None                        # Max cap for GPU counts in this cycle for scoring logic
     count_bucket: int | None = None                    # gpu_count_bucket the executor is accounted against; 0 = aggregate-cap path
+    bucket_reassigned_from: int | None = None          # DAH-2528: gpu_count bucket the executor left because it was over cap
+    bucket_reassigned_from_multiplier: float | None = None  # source bucket's cap multiplier at reassignment time
     total_unrented_by_gpu_type: float | None = None          # Weighted GPU count for the executor in this cycle for scoring logic
     cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
     eligible_for_rental_share: bool = False
@@ -131,6 +134,8 @@ class JobResult(BaseModel):
                 "effective_rate": self.effective_rate,
                 "total_rental_cost": self.total_rental_cost,
                 "count_bucket": self.count_bucket,
+                "bucket_reassigned_from": self.bucket_reassigned_from,
+                "bucket_reassigned_from_multiplier": self.bucket_reassigned_from_multiplier,
                 "max_cap": self.max_cap,
                 "total_unrented_by_gpu_type": self.total_unrented_by_gpu_type,
                 "cap_dilution_applied": self.cap_dilution_applied,

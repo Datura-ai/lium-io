@@ -44,6 +44,15 @@ SOFT_LIMIT_PRICE_RATE = 1.1
 # incentive but stays active.
 MIN_DISK_TO_VRAM_RATE = 1.5
 
+# DAH-2546 — flagship capability gate. An unrented 8x machine of these base models must
+# have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
+# quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
+# the incentive but stays active.
+FLAGSHIP_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300"})
+FLAGSHIP_CAPABILITY_GPU_COUNT = 8
+# Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
+NCU_PROFILING_UNRESTRICTED = "unrestricted"
+
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
@@ -53,6 +62,14 @@ class InsufficientDisk(BaseModel):
     vram_gb: float
     disk_gb: float
     rate: float  # required disk-to-VRAM margin the machine failed to clear
+
+
+class MissingFlagshipCapability(BaseModel):
+    """What the scrape reported about NCU profiling on a flagship machine that offers no open
+    profiling counters, real GPU splitting or attested CVM. Sole owner of these scrape keys."""
+
+    ncu_profiling_access: str | None  # None = the scrape carries no observation at all
+    ncu_profiling_scrape_error: str | None  # set when the probe could not read the driver params
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -150,9 +167,11 @@ class RentalPriceIncentive(DefaultIncentive):
     - Phase 2: Calculate dynamic emission splits based on rental costs
     - Phase 3: Distribute weights across burn/mining/rental pools
 
-    Cap dilution is applied per `(base_model, gpu_count_bucket)`. Buckets are
-    derived from each executor's `gpu_splitting_min_count` (when GPU splitting
-    is enabled) or its `gpu_count`.
+    Cap dilution is applied per `(base_model, gpu_count_bucket)`. An executor is
+    rated against its `gpu_count` bucket; a split-capable executor falls back to
+    its `gpu_splitting_min_count` tier when the `gpu_count` bucket has no cap
+    configured, or (DAH-2528) when that bucket is over cap and the whole node
+    fits under the split tier's cap.
     """
 
     price_provider: PriceProvider = PriceProvider()
@@ -174,6 +193,9 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unrented_count_by_bucket: dict[tuple[str, int], int] = {}
         self._weighted_rate_sum_by_bucket: dict[tuple[str, int], float] = {}
         self.cap_multiplier_by_bucket: dict[tuple[str, int], float] = {}
+        # DAH-2528: split-capable idle executors pinned to their gpu_count bucket,
+        # revisited once per-bucket fill is known. Items: (base_model, result).
+        self._split_fallback_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
         self.rental_share = 0.0
         self.rental_share_raw = 0.0
@@ -308,6 +330,72 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
+    def _missing_flagship_capability(
+        self, result: JobResult, base_model: str
+    ) -> MissingFlagshipCapability | None:
+        # None also when the machine is out of the gate's scope: not an 8x flagship, or unscraped
+        if result.gpu_count != FLAGSHIP_CAPABILITY_GPU_COUNT:
+            return None
+        if base_model not in FLAGSHIP_CAPABILITY_BASE_MODELS:
+            return None
+        if result.spec is None:
+            # no scrape at all: a synthetic or estimated job result, nothing to measure
+            return None
+        ncu_profiling_access = result.spec.get("ncu_profiling_access")
+        # min_gpu_count equal to the node size is whole-host-only in practice (rent_executor
+        # rejects smaller requests), so it does not count as splitting
+        has_real_splitting: bool = bool(
+            result.supports_gpu_splitting
+            and result.gpu_splitting_min_count
+            and result.gpu_splitting_min_count < result.gpu_count
+        )
+        # DAH-2594 — a CVM provider has no access to the host GPU drivers, so NCU counters are
+        # unreachable by construction; a verified TDX quote is that machine's capability path.
+        # The quote alone, not JobResult.tdx_attestation_passed: that flag also drops on a failed
+        # GPU-CC verdict, which is observe-only today, so a CVM submitting failing GPU evidence
+        # would earn less than one submitting none. Bad GPU evidence is the GPU-attestation
+        # enforcement flag's job; once it is on, evidence is mandatory and no digest reaches here.
+        attested_cvm: bool = result.attestation_digest is not None
+        if (
+            ncu_profiling_access == NCU_PROFILING_UNRESTRICTED
+            or has_real_splitting
+            or attested_cvm
+        ):
+            return None
+        return MissingFlagshipCapability(
+            ncu_profiling_access=ncu_profiling_access,
+            ncu_profiling_scrape_error=result.spec.get("ncu_profiling_scrape_error"),
+        )
+
+    def _log_flagship_capability_limit(
+        self, result: JobResult, missing: MissingFlagshipCapability
+    ) -> None:
+        # structured log for every rental-eligible 8x flagship executor lacking all capabilities
+        enforced = settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT
+        logger.info(
+            _m(
+                "Unrented flagship executor has no NCU profiling, GPU splitting "
+                "or confidential computing"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "ncu_profiling_access": missing.ncu_profiling_access,
+                    # tells a shadow report apart: probe failed vs provider left counters closed
+                    "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
+                    "supports_gpu_splitting": result.supports_gpu_splitting,
+                    "gpu_splitting_min_count": result.gpu_splitting_min_count,
+                    # separates a self-declared CVM whose TDX quote did not verify from an
+                    # ordinary host; attestation_digest is None on every line emitted here
+                    "tdx_quote_present": bool(result.executor_info.tdx_quote),
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
     def _reason_excluded_from_both_pools(self, job_result: JobResult) -> MinerLogLine | None:
         """First reason (if any) the executor is excluded from BOTH incentive pools.
 
@@ -315,6 +403,8 @@ class RentalPriceIncentive(DefaultIncentive):
         checks. Returns None when no hard exclusion applies (executor may still be
         gated later by the rental-pool-only soft price limit).
         """
+        if job_result.is_provider_banned:
+            return MinerLogLine.no_payout_because_banned_network_abuse(job_result)
         if job_result.is_spot:
             return MinerLogLine.no_payout_because_spot_tier(job_result)
         if is_missing_discord_after_cutoff(job_result):
@@ -413,9 +503,12 @@ class RentalPriceIncentive(DefaultIncentive):
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:
         """Aggregate per-`(base_model, bucket)` metrics for the rental-share
-        algorithm. Bucket resolution is symmetric with the rate-resolution path
-        so split-capable executors land in the bucket of their
-        `gpu_splitting_min_count`.
+        algorithm. A split-capable executor lands in its `gpu_count` bucket when
+        that bucket has a configured cap (falling back to its
+        `gpu_splitting_min_count` tier only when it has none); its rate is the
+        best of the bundle rate and the min-count rate. Occupancy-aware
+        reassignment happens later in `_reassign_split_candidates`, once every
+        bucket's fill is known.
         """
         if not result.is_successful:
             return
@@ -468,11 +561,80 @@ class RentalPriceIncentive(DefaultIncentive):
                     * result.driver_multiplier
                 )
 
+                # DAH-2528: a split-capable node pinned to its gpu_count bucket may
+                # still be moved to its split tier if the bucket turns out over cap.
+                if (
+                    result.supports_gpu_splitting
+                    and result.gpu_splitting_min_count
+                    and bucket == result.gpu_count
+                    and bucket != result.gpu_splitting_min_count
+                ):
+                    self._split_fallback_candidates.append((base_model, result))
+
+    def _reassign_split_candidates(self) -> None:
+        """DAH-2528: occupancy-aware bucket fallback for split-capable idle executors.
+
+        `_resolve_bucket` pins a split-capable executor to its `gpu_count` bucket
+        whenever that bucket has a configured cap, no matter how crowded it is. This
+        second pass runs once every bucket's fill is known: it moves a node out of an
+        over-cap `gpu_count` bucket into its `gpu_splitting_min_count` tier, but only
+        when the whole node fits under the target cap — a move never pushes the target
+        over cap, so nodes already rated there are never diluted by a newcomer. Greedy
+        in ascending executor-uuid order, so an unchanged fleet reproduces identical
+        assignments every cycle.
+        """
+        candidates = sorted(
+            self._split_fallback_candidates,
+            key=lambda item: str(item[1].executor_info.uuid),
+        )
+        for base_model, result in candidates:
+            src_bucket = result.count_bucket
+            tgt_bucket = result.gpu_splitting_min_count
+            cap_spec = self.config.max_unrented_gpus.get(base_model, {})
+            src_cap = cap_spec.get(src_bucket, 0)
+            tgt_cap = cap_spec.get(tgt_bucket, 0)
+            if tgt_cap <= 0:
+                continue
+            src_key = (base_model, src_bucket)
+            tgt_key = (base_model, tgt_bucket)
+            src_count = self.unrented_count_by_bucket.get(src_key, 0)
+            if src_count <= src_cap:
+                # source bucket pays full weight already (or emptied by earlier moves)
+                continue
+            tgt_count = self.unrented_count_by_bucket.get(tgt_key, 0)
+            if tgt_count + result.gpu_count > tgt_cap:
+                # the whole node must fit: never over-fill the target
+                continue
+            # Admission implies the move pays strictly better: the target ends at or
+            # under cap (multiplier exactly 1.0) while the source is strictly over
+            # cap (multiplier < 1.0).
+            src_multiplier = min(src_count, src_cap) / src_count
+
+            weighted_rate = (
+                result.gpu_count
+                * result.hourly_rate
+                * result.sysbox_multiplier
+                * result.driver_multiplier
+            )
+            self.unrented_count_by_bucket[src_key] = src_count - result.gpu_count
+            self._weighted_rate_sum_by_bucket[src_key] -= weighted_rate
+            self.unrented_count_by_bucket[tgt_key] = tgt_count + result.gpu_count
+            self._weighted_rate_sum_by_bucket[tgt_key] = (
+                self._weighted_rate_sum_by_bucket.get(tgt_key, 0.0) + weighted_rate
+            )
+            result.bucket_reassigned_from = src_bucket
+            result.bucket_reassigned_from_multiplier = src_multiplier
+            result.count_bucket = tgt_bucket
+            result.max_cap = tgt_cap
+
     async def _on_finish_pre_process(self) -> None:
         """Callback after pre-processing all job results.
 
         - Calculate rental share
         """
+        # DAH-2528: rebalance split-capable nodes before multipliers are computed.
+        self._reassign_split_candidates()
+
         # Step 1: cap multiplier per (base_model, bucket).
         for (base_model, bucket), unrented_count in self.unrented_count_by_bucket.items():
             max_cap = self.config.max_unrented_gpus.get(base_model, {}).get(bucket, 0)
@@ -564,6 +726,11 @@ class RentalPriceIncentive(DefaultIncentive):
         # update incentive logs
         report: MinerLogLine = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
         result.record_incentive_log(report)
+
+        # DAH-2528: tell the miner why the node was rated against its split tier
+        if result.bucket_reassigned_from is not None:
+            reassigned: MinerLogLine = MinerLogLine.unrented_bucket_reassigned(result)
+            result.incentive_logs.append(reassigned.to_log_line())
 
         self._explain_zero_effective_rate(result, bucket)
 
@@ -659,6 +826,21 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
                     job_result, insufficient_disk
+                )
+                job_result.record_incentive_log(reason)
+
+        # DAH-2546 flagship capability gate; shadow-only while the flag is off
+        missing_capability = (
+            self._missing_flagship_capability(job_result, base_model)
+            if eligible_for_rental_share
+            else None
+        )
+        if missing_capability is not None:
+            self._log_flagship_capability_limit(job_result, missing_capability)
+            if settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+                    job_result, missing_capability
                 )
                 job_result.record_incentive_log(reason)
 

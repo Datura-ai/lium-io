@@ -6,6 +6,9 @@ from pydantic import BaseModel, RootModel, field_validator
 from services.const import FILLER_CONTAINER_PREFIX
 
 GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
+# The GPU itself is gone until a host reset (post-Xid): "gpu requires reset", "unknown device",
+# "NVML unknown". Same quarantine as the mismatch above — the host cannot serve a rental either way.
+GPU_RUNTIME_DEVICE_FAULT_REASON = "GPU_RUNTIME_DEVICE_FAULT"
 
 
 class Error(BaseModel, extra="allow"):
@@ -61,6 +64,9 @@ class RentedMachine(BaseModel):
 class RentedMachineResponse(BaseModel):
     machines: list[RentedMachine]
     banned_guids: list[str] = []
+    banned_hotkeys: list[str] = []
+    banned_coldkeys: list[str] = []
+    banned_provider_guids: list[str] = []
 
 
 class NetworkEMA(BaseModel):
@@ -100,6 +106,9 @@ class RentedExecutorsResponse(BaseModel):
     # collide. Empty for a backend that predates the field — the collision simply stays.
     filler_ports_by_executor: dict[str, list[int]] = {}
     banned_guids: list[str] = []
+    banned_hotkeys: list[str] = []
+    banned_coldkeys: list[str] = []
+    banned_provider_guids: list[str] = []
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
     spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
@@ -112,6 +121,19 @@ class RentedExecutorsResponse(BaseModel):
     # as a special manual (bare-metal) rental. Defaults to empty so an older backend that omits the
     # field force-passes nobody (fail-closed) rather than everybody.
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
+
+    def is_provider_banned(
+        self,
+        *,
+        miner_hotkey: str,
+        miner_coldkey: str | None = None,
+        gpu_uuids: list[str] | None = None,
+    ) -> bool:
+        if miner_hotkey in self.banned_hotkeys:
+            return True
+        if miner_coldkey and miner_coldkey in self.banned_coldkeys:
+            return True
+        return any(gpu_uuid in self.banned_provider_guids for gpu_uuid in (gpu_uuids or []))
 
     @field_validator("filler_containers_by_executor")
     @classmethod
@@ -161,6 +183,15 @@ class RentedExecutorsResponse(BaseModel):
 class PodRentalActiveResponse(BaseModel):
     active: bool
     rental_closed_at: datetime | None = None
+    # DAH-2545: where an encrypted rental volume is mounted in plaintext inside the container.
+    # Nothing on the host records it, so without this the validator cannot remount gocryptfs when
+    # it revives a pod. Absent — an older backend, or a pod it does not know — means recovery of an
+    # encrypted volume must stand down rather than guess a path.
+    local_volume_path: str | None = None
+
+
+class PodHostRebootRecoveredResponse(BaseModel):
+    recorded: bool
 
 
 class FillerRunActiveResponse(BaseModel):

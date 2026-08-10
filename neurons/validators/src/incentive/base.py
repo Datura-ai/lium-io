@@ -5,13 +5,12 @@ from abc import ABC, abstractmethod
 
 import bittensor
 from pydantic import BaseModel
+from services.redis_service import RedisService
+from services.task_service import JobResult
 
 from incentive.burn_service import BurnService
 from incentive.config import IncentiveConfig
 from incentive.utils import log_for_monitoring
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.redis_service import RedisService
-from services.task_service import JobResult
 
 
 class BaseIncentive(ABC):
@@ -121,6 +120,7 @@ class BaseIncentive(ABC):
         self,
         miners: list[bittensor.NeuronInfo],
         last_mechanism_step_block: int | None,
+        current_epoch: int | None = None,
     ) -> dict[str, float]:
         """Calculate final weights with burning logic applied for this cycle.
 
