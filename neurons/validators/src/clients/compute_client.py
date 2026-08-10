@@ -858,11 +858,13 @@ class ComputeClient:
                         extra=get_extra_info({**logging_extra, "status": result.status}),
                     )
                 )
-                if not provisioning:
+                if not provisioning and getattr(job_request, "intent", "release") != "switch":
                     # DAH-2629 — the switch back: a verified teardown means the node is free
                     # RIGHT NOW, so the validation CVM goes back up without waiting for the
                     # next cycle's sweep to notice. Best-effort and fire-and-forget; the
-                    # sweep remains the safety net.
+                    # sweep remains the safety net. A "switch" teardown is the opposite case:
+                    # the backend cleared the node for a renter launch it is about to send,
+                    # and a relaunch here would race that order for the node.
                     self._schedule_validation_cvm_return(job_request, logging_extra)
             else:
                 response = FailedCvmRequest(

@@ -311,6 +311,55 @@ class TestTheDriver:
         assert response.status is None
         assert "could not be reached" in response.msg
 
+    async def test_a_release_teardown_triggers_the_switch_back(self, monkeypatch):
+        """A rental ended; the node is verifiably free, so the validation CVM goes back up."""
+        monkeypatch.setattr(
+            CvmdRelay,
+            "forward",
+            AsyncMock(return_value=RelayResult(status=200, body={"torn_down": True})),
+        )
+        client = _client()
+        client._schedule_validation_cvm_return = Mock()
+
+        await client.cvm_driver(
+            CvmTeardownRequest(
+                miner_hotkey="miner",
+                executor_id=EXECUTOR_ID,
+                pod_id="pod-1",
+                cvmd_url="https://10.0.0.1:8443",
+                call=SignedCvmdCall(method="DELETE", path="/v1/cvm", headers=SIGNED_HEADERS),
+            )
+        )
+
+        client._schedule_validation_cvm_return.assert_called_once()
+
+    async def test_a_switch_teardown_does_not_relaunch_under_the_renter(self, monkeypatch):
+        """intent="switch" clears the node for a renter launch the backend is about to send.
+        A relaunch here would race that very order for the node, and the loser of the race is
+        a customer's 409."""
+        monkeypatch.setattr(
+            CvmdRelay,
+            "forward",
+            AsyncMock(return_value=RelayResult(status=200, body={"torn_down": True})),
+        )
+        client = _client()
+        client._schedule_validation_cvm_return = Mock()
+
+        await client.cvm_driver(
+            CvmTeardownRequest(
+                miner_hotkey="miner",
+                executor_id=EXECUTOR_ID,
+                pod_id="pod-1",
+                cvmd_url="https://10.0.0.1:8443",
+                call=SignedCvmdCall(method="DELETE", path="/v1/cvm", headers=SIGNED_HEADERS),
+                intent="switch",
+            )
+        )
+
+        client._schedule_validation_cvm_return.assert_not_called()
+        (response,) = client.message_queue
+        assert isinstance(response, CvmTornDown)
+
     async def test_the_two_operations_get_different_timeouts(self, monkeypatch):
         """A verified teardown holds until the node's memory is back, which on a large guest is
         tens of minutes — far longer than a launch waits for a guest to boot."""
