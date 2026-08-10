@@ -82,6 +82,45 @@ def assert_unambiguous(artifacts: list[Artifact], *, where: str) -> None:
         seen[key] = artifact.id
 
 
+def resolve_base(artifacts: list[Artifact], *, qemu: str, os_image_hash: str) -> Artifact:
+    """Return an approved entry pinning this QEMU build and this OS image, whatever its compose.
+
+    A renter CVM's compose is derived from the customer's order (DAH-2579), so it cannot appear
+    in a manifest that was signed before the order existed. What the catalog still decides for
+    such a launch is the rest of the stack — which OS image and which QEMU build this fleet is
+    approved to run — and that is what this resolves. The compose is authorized on a different
+    path and a more direct one: the request carrying it is signed by the platform key, and the
+    validator re-derives the expected hash from the same order, so a host that substitutes a
+    compose of its own fails verification rather than merely failing to be listed.
+
+    `kind` is deliberately not a filter. The manifest is the full cross product of approved
+    composes x images x QEMU builds, so every approved image already appears under every kind;
+    filtering on it would narrow nothing while reading as though it did.
+
+    Which of several matching entries is returned does not matter — they agree on both fields
+    that are used, the image path and the image hash — but it is made deterministic anyway, so
+    that two launches of one order name the same entry in their reports.
+    """
+    candidates = sorted(
+        (a for a in artifacts if a.qemu == qemu and a.os_image_hash == os_image_hash),
+        key=lambda a: a.id,
+    )
+    if candidates:
+        return candidates[0]
+
+    for field, value in (("qemu", qemu), ("os_image_hash", os_image_hash)):
+        if not any(getattr(a, field) == value for a in artifacts):
+            approved = sorted({getattr(a, field) for a in artifacts}) or ["(none)"]
+            raise TripleNotFound(
+                f"{field}={value!r} is not approved on this host; the catalog allows: "
+                f"{', '.join(approved)}"
+            )
+    raise TripleNotFound(
+        f"the catalog approves qemu={qemu!r} and os_image_hash={os_image_hash!r} separately but "
+        f"never together"
+    )
+
+
 def resolve(
     artifacts: list[Artifact], *, kind: str, qemu: str, os_image_hash: str, compose_hash: str
 ) -> Artifact:

@@ -5,9 +5,11 @@ parsed and the scope check already evaluated. They never re-read the raw bytes: 
 only has to disagree with the first once for the scope check and the handler to act on different
 values.
 
-`POST {kind: "validation"}` and `DELETE` do real work as of DAH-2576. `POST {kind: "renter"}`
-still answers 501: the renter body is DAH-2580's to define, and validating it against a
-validation-shaped model now would be inventing its contract.
+`POST {kind: "validation"}` and `DELETE` do real work as of DAH-2576; `POST {kind: "renter"}`
+as of DAH-2580. The two bodies differ because the two stacks are approved differently: a
+validation request names a triple the catalog already carries, while a renter request carries
+the compose itself, because it was derived from an order that did not exist when the manifest
+was signed. Which key may send which is decided before either model is built — see `auth/scope`.
 
 Both mutating handlers run the manager on a worker thread, and both are slow on purpose. A
 launch waits for the guest to boot; a `DELETE` waits for the node's hardware to actually come
@@ -33,13 +35,22 @@ from pydantic import BaseModel, Field, ValidationError
 from cvmd import __version__
 from cvmd.catalog import HEX64, CatalogStore, refresh_once
 from cvmd.cvm.manager import KIND_RENTER, KIND_VALIDATION, CvmManager, LaunchFailure, Triple
+from cvmd.cvm.renter import RenterOrder
 from cvmd.state.store import StateStore
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-RENTER_NOT_IMPLEMENTED = "renter CVM provisioning lands in DAH-2580"
+# A renter compose is a customer's docker-compose with one service injected, so it is far larger
+# than a validation body's three hashes — but it is still a compose file, and a request carrying
+# megabytes of one is not an order. The daemon's own `max_body_bytes` (64 KiB by default) is the
+# hard cap; this bound sits under it so an oversized compose is refused by name rather than as an
+# unexplained 413.
+MAX_COMPOSE_CHARS = 32 * 1024
+
+# Scripts run before the workload and are folded into the same measured file. Same reasoning.
+MAX_SCRIPT_CHARS = 8 * 1024
 
 
 class CreateCvmRequest(BaseModel):
@@ -57,6 +68,54 @@ class CreateCvmRequest(BaseModel):
     qemu: str = Field(min_length=1)
     os_image_hash: str = Field(pattern=HEX64)
     compose_hash: str = Field(pattern=HEX64)
+
+
+class CreateRenterCvmRequest(BaseModel):
+    """One customer order: the same pinned triple, plus the inputs that produce its compose.
+
+    `compose_hash` is not derived from the fields below and is not optional. It is what the
+    platform computed for this order and what the validator will independently expect, so it is
+    the value the launch is checked against — cvmd hashes the `app-compose.json` that dstack
+    actually writes and refuses to start QEMU on any difference. Recomputing it here from
+    `compose` instead would replace that comparison with cvmd agreeing with itself.
+
+    The four flags are present because `setup_instance` folds every one of them into that same
+    measured file. A request that omitted one and let cvmd default it would produce a CVM that
+    measures as something the platform never predicted, and the failure would read as an
+    unapproved stack. The defaults match dstack's own.
+
+    `extra="forbid"`: an unknown field means the sender is speaking a version of this contract
+    this host does not implement, and quietly ignoring it would launch a CVM that differs from
+    the one they described.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    kind: str
+    qemu: str = Field(min_length=1)
+    os_image_hash: str = Field(pattern=HEX64)
+    compose_hash: str = Field(pattern=HEX64)
+    compose: str = Field(min_length=1, max_length=MAX_COMPOSE_CHARS)
+    init_script: str | None = Field(default=None, max_length=MAX_SCRIPT_CHARS)
+    pre_launch_script: str | None = Field(default=None, max_length=MAX_SCRIPT_CHARS)
+    local_key_provider: bool = True
+    enable_logs: bool = False
+    enable_sysinfo: bool = False
+    rental_id: str | None = Field(default=None, max_length=128)
+
+    def order(self) -> RenterOrder:
+        return RenterOrder(
+            qemu=self.qemu,
+            os_image_hash=self.os_image_hash,
+            compose_hash=self.compose_hash,
+            compose=self.compose,
+            init_script=self.init_script,
+            pre_launch_script=self.pre_launch_script,
+            local_key_provider=self.local_key_provider,
+            enable_logs=self.enable_logs,
+            enable_sysinfo=self.enable_sysinfo,
+            rental_id=self.rental_id,
+        )
 
 
 def _store(request: Request) -> StateStore:
@@ -119,10 +178,11 @@ async def get_state(request: Request) -> dict:
 async def create_cvm(request: Request) -> JSONResponse:
     body = request.state.parsed_body
 
-    # Checked before the model so the renter path keeps answering 501 rather than 422 for a
-    # body whose required fields DAH-2580 has not defined yet.
+    # Dispatched on the same field the scope check read, so the model a body is validated
+    # against is always the one belonging to the key that was allowed to send it. The scope
+    # check has already rejected any other `kind`, so this is the whole set.
     if isinstance(body, dict) and body.get("kind") == KIND_RENTER:
-        return JSONResponse(status_code=501, content={"detail": RENTER_NOT_IMPLEMENTED})
+        return await _create_renter(request, body)
 
     try:
         parsed = CreateCvmRequest.model_validate(body)
@@ -138,6 +198,22 @@ async def create_cvm(request: Request) -> JSONResponse:
     return await _exclusively(
         request,
         lambda: manager.create(kind=KIND_VALIDATION, triple=triple),
+        success=201,
+    )
+
+
+async def _create_renter(request: Request, body: dict) -> JSONResponse:
+    """Launch this order's CVM. Only ever reached with the platform key's scope."""
+    try:
+        parsed = CreateRenterCvmRequest.model_validate(body)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422, content={"detail": exc.errors(include_url=False)})
+
+    manager = _manager(request)
+    order = parsed.order()
+    return await _exclusively(
+        request,
+        lambda: manager.create_renter(order),
         success=201,
     )
 

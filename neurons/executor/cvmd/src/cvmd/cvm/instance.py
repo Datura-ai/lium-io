@@ -44,13 +44,18 @@ class Instance:
     compose_hash: str
     ports: list[PortReport] = field(default_factory=list)
     ssh_fingerprint: str | None = None
+    # DAH-2580, renter CVMs only: what the platform called the rental this CVM belongs to,
+    # carried so an operator can match a running guest back to it. Defaults to None, which is
+    # what a validation CVM has and what a record written before this task has — so an older
+    # instance.json still decodes rather than reading as corrupt and failing the node.
+    rental_id: str | None = None
 
     def to_json(self) -> dict:
         return {"version": SCHEMA_VERSION, **asdict(self)}
 
     def report(self) -> dict:
         """The launch report the API returns: identity, reachability, and what it measures as."""
-        return {
+        report = {
             "instance_id": self.instance_id,
             "kind": self.kind,
             "artifact_id": self.artifact_id,
@@ -62,6 +67,11 @@ class Instance:
                 "compose_hash": self.compose_hash,
             },
         }
+        # Only present on a renter CVM, so a validation report keeps the exact shape DAH-2576
+        # shipped and its tests pin.
+        if self.rental_id is not None:
+            report["rental_id"] = self.rental_id
+        return report
 
 
 def now_iso() -> str:
@@ -85,6 +95,7 @@ def _decode(raw) -> Instance | None:
             compose_hash=str(raw["compose_hash"]),
             ports=ports,
             ssh_fingerprint=raw.get("ssh_fingerprint"),
+            rental_id=raw.get("rental_id"),
         )
     except (KeyError, TypeError, ValueError):
         return None

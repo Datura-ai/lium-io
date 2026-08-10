@@ -19,6 +19,7 @@ from cvmd.catalog import (
     TripleNotFound,
     parse_manifest,
     resolve,
+    resolve_base,
 )
 
 QEMU = "10.1.0"
@@ -470,6 +471,84 @@ class TestResolving:
                 artifacts, kind="sandbox", qemu=QEMU, os_image_hash=OS_IMAGE, compose_hash=COMPOSE
             )
 
+class TestResolvingARenterBase:
+    """DAH-2580: what the catalog decides for a launch whose compose it cannot carry.
+
+    A renter compose is derived per order, so no signed manifest can hold its hash. The image
+    and the QEMU build are still the catalog's to approve, and that is what `resolve_base`
+    matches on.
+    """
+
+    @pytest.fixture
+    def artifacts(self, store, catalog_signer):
+        store.install(
+            signed(
+                catalog_signer,
+                manifest_entry(qemu=QEMU, os_image_hash=OS_IMAGE, compose_hash=COMPOSE),
+                manifest_entry(
+                    id="other-image",
+                    qemu="9.2.1",
+                    os_image_hash="f" * 64,
+                    os_image_name="dstack-nvidia-0.5.11",
+                    compose_hash="c" * 64,
+                ),
+            ),
+            source="test",
+        )
+        return store.artifacts()
+
+    def test_an_approved_image_and_qemu_resolve_without_a_compose_hash(self, artifacts):
+        found = resolve_base(artifacts, qemu=QEMU, os_image_hash=OS_IMAGE)
+        assert found.id == "validation-v3"
+        assert found.os_image_hash == OS_IMAGE
+
+    def test_a_validation_entry_is_a_legitimate_base(self, artifacts):
+        """`kind` is deliberately not a filter — the manifest is a cross product, so every
+        approved image already appears under every kind and filtering would narrow nothing."""
+        found = resolve_base(artifacts, qemu=QEMU, os_image_hash=OS_IMAGE)
+        assert found.kind == "validation"
+
+    @pytest.mark.parametrize(("field", "value"), [("qemu", "0.0.0"), ("os_image_hash", "9" * 64)])
+    def test_an_unapproved_component_is_named_in_the_refusal(self, artifacts, field, value):
+        request = {"qemu": QEMU, "os_image_hash": OS_IMAGE}
+        request[field] = value
+
+        with pytest.raises(TripleNotFound) as raised:
+            resolve_base(artifacts, **request)
+
+        message = str(raised.value)
+        assert field in message
+        assert value in message
+
+    def test_two_approved_components_that_never_appear_together_are_refused(self, artifacts):
+        """Both halves are approved; the pairing is not. Saying so is the difference between
+        an operator checking the manifest and an operator checking their request."""
+        with pytest.raises(TripleNotFound, match="separately but never together"):
+            resolve_base(artifacts, qemu=QEMU, os_image_hash="f" * 64)
+
+    def test_the_choice_between_equivalent_bases_is_deterministic(self, store, catalog_signer):
+        """Several entries can share an image and a QEMU build — they differ only in compose.
+
+        Any of them answers the two questions being asked, so which one is returned does not
+        matter; that it is the *same* one every time does, so two launches of one order name
+        the same entry in their reports.
+        """
+        store.install(
+            signed(
+                catalog_signer,
+                manifest_entry(id="zzz", compose_hash="1" * 64),
+                manifest_entry(id="aaa", compose_hash="2" * 64),
+            ),
+            source="test",
+        )
+        artifacts = store.artifacts()
+
+        first = resolve_base(artifacts, qemu="10.1.0", os_image_hash="a" * 64)
+        second = resolve_base(list(reversed(artifacts)), qemu="10.1.0", os_image_hash="a" * 64)
+        assert first.id == second.id == "aaa"
+
+
+class TestResolvingDuplicates:
     def test_two_entries_with_the_same_triple_are_refused(self, store, catalog_signer):
         """A request that could resolve to either entry has no single answer."""
         store.install(
