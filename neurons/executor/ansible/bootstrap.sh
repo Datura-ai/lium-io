@@ -300,7 +300,7 @@ case "$GUARD_STATE" in
       printf '    kernel  — kernel command line and GRUB (needs a reboot)\n'
       printf '    gpu     — confidential-compute mode (resets every GPU)\n'
       printf '    qemu    — the QEMU build (changes RTMR0)\n'
-      printf '  Still converging: preflight, docker, repo, sgx_key_provider, stubs, verify.\n'
+      printf '  Still converging: preflight, docker, repo, sgx_key_provider, catalog, verify.\n'
       printf '\n'
       "${SUDO[@]}" "$GUARD" "${GUARD_ARGS[@]+"${GUARD_ARGS[@]}"}" --recovery
       printf '\n'

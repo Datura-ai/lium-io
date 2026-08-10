@@ -15,6 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from conftest import manifest_entry, manifest_payload, sign_manifest
 from cvmd.config import Config, LaunchConfig
 from cvmd.cvm import measure, release, supervisor
 from cvmd.cvm.instance import InstanceStore
@@ -36,14 +37,17 @@ def free_ports() -> tuple[int, int]:
 
 
 @pytest.fixture
-def catalog_file(tmp_path, compose_file, guest_scripts, image_dir, dstack, monkeypatch) -> Path:
-    """A catalog pinning the triple this host will actually produce.
+def catalog_store(tmp_path, compose_file, guest_scripts, image_dir, dstack, catalog_signer):
+    """A signed manifest pinning the triple this host will actually produce.
 
     The compose hash is computed by preparing the CVM once and measuring it — the same value
     `setup_instance` will produce during the test. Hardcoding a hash would make the test assert
     that two constants are equal; deriving it makes the test assert that the *gate* works.
+
+    The manifest carries the compose and the scripts as content, so the artifact the launch uses
+    is materialized from signed bytes rather than read from wherever the fixture wrote them.
     """
-    from cvmd.catalog import Artifact
+    from cvmd.catalog import Artifact, CatalogConfig, CatalogStore
     from cvmd.dstack.plan import setup_namespace
 
     init, pre_launch = guest_scripts
@@ -69,45 +73,49 @@ def catalog_file(tmp_path, compose_file, guest_scripts, image_dir, dstack, monke
     )
     compose_hash = measure.compose_hash(probe_dir)
 
-    path = tmp_path / "catalog.json"
-    path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "artifacts": [
-                    {
-                        "id": "validation-test",
-                        "kind": "validation",
-                        "qemu": QEMU_FALLBACK,
-                        "os_image_hash": OS_IMAGE_HASH,
-                        "compose_hash": compose_hash,
-                        "os_image_path": str(image_dir),
-                        "compose_path": str(compose_file),
-                        "init_script": str(init),
-                        "pre_launch_script": str(pre_launch),
-                    }
-                ],
-            }
+    store = CatalogStore(
+        CatalogConfig(
+            cache_path=tmp_path / "catalog" / "manifest.json",
+            signer=catalog_signer.ss58_address,
+            images_dir=image_dir.parent,
+            materialize_dir=tmp_path / "catalog" / "artifacts",
         )
     )
-    return path
+    store.install(
+        sign_manifest(
+            manifest_payload(
+                manifest_entry(
+                    id="validation-test",
+                    qemu=QEMU_FALLBACK,
+                    os_image_hash=OS_IMAGE_HASH,
+                    os_image_name=image_dir.name,
+                    compose_hash=compose_hash,
+                    compose=compose_file.read_text(),
+                    init_script=init.read_text(),
+                    pre_launch_script=pre_launch.read_text(),
+                )
+            ),
+            catalog_signer,
+        ),
+        source="test",
+    )
+    return store
 
 
 @pytest.fixture
-def approved(catalog_file) -> Triple:
-    entry = json.loads(catalog_file.read_text())["artifacts"][0]
+def approved(catalog_store) -> Triple:
+    entry = catalog_store.current().entries[0]
     return Triple(
-        qemu=entry["qemu"],
-        os_image_hash=entry["os_image_hash"],
-        compose_hash=entry["compose_hash"],
+        qemu=entry.qemu,
+        os_image_hash=entry.os_image_hash,
+        compose_hash=entry.compose_hash,
     )
 
 
 @pytest.fixture
-def launch_config(tmp_path, dstack_scripts, catalog_file, env_file, free_ports) -> LaunchConfig:
+def launch_config(tmp_path, dstack_scripts, env_file, free_ports) -> LaunchConfig:
     return LaunchConfig(
         dstack_scripts_dir=dstack_scripts,
-        catalog_path=catalog_file,
         run_dir=tmp_path / "vms",
         vcpus=2,
         memory="2G",
@@ -122,7 +130,7 @@ def launch_config(tmp_path, dstack_scripts, catalog_file, env_file, free_ports) 
 
 
 @pytest.fixture
-def manager(state_dir, launch_config, monkeypatch) -> CvmManager:
+def manager(catalog_store, state_dir, launch_config, monkeypatch) -> CvmManager:
     # This host's QEMU is whatever the developer happens to have, or none. Pinning the reported
     # version makes the catalog's `qemu` field meaningful in a test rather than machine-dependent.
     monkeypatch.setattr(
@@ -130,6 +138,7 @@ def manager(state_dir, launch_config, monkeypatch) -> CvmManager:
     )
     return CvmManager(
         config=launch_config,
+        catalog_store=catalog_store,
         store=StateStore(state_dir),
         instances=InstanceStore(state_dir),
         switches=SwitchStore(state_dir),
@@ -260,9 +269,10 @@ class TestRefusals:
         assert str(free_ports[0]) in raised.value.reason
         assert not spawned
 
-    def test_a_host_with_no_launch_configuration(self, state_dir, approved):
+    def test_a_host_with_no_launch_configuration(self, catalog_store, state_dir, approved):
         manager = CvmManager(
             config=LaunchConfig(),
+            catalog_store=catalog_store,
             store=StateStore(state_dir),
             instances=InstanceStore(state_dir),
             switches=SwitchStore(state_dir),
@@ -287,7 +297,7 @@ class TestRefusals:
         assert not spawned
 
     def test_an_ssh_guest_port_that_nothing_forwards(
-        self, state_dir, launch_config, approved, spawned, monkeypatch
+        self, catalog_store, state_dir, launch_config, approved, spawned, monkeypatch
     ):
         """A one-character config slip must not become "running, fingerprint null".
 
@@ -301,6 +311,7 @@ class TestRefusals:
         mismatched = replace(launch_config, ssh_guest_port=2201)
         manager = CvmManager(
             config=mismatched,
+            catalog_store=catalog_store,
             store=StateStore(state_dir),
             instances=InstanceStore(state_dir),
             switches=SwitchStore(state_dir),
@@ -360,13 +371,22 @@ class TestReconciliation:
         assert manager.reconcile() is NodeState.RECONCILING
 
     def test_a_running_cvm_is_adopted_after_a_restart(
-        self, manager, approved, spawned, guest_is_up, state_dir, launch_config, monkeypatch
+        self,
+        catalog_store,
+        manager,
+        approved,
+        spawned,
+        guest_is_up,
+        state_dir,
+        launch_config,
+        monkeypatch,
     ):
         """A CVM outlives a cvmd restart; the daemon has to come back under it."""
         manager.create(kind="validation", triple=approved)
 
         restarted = CvmManager(
             config=launch_config,
+            catalog_store=catalog_store,
             store=StateStore(state_dir),
             instances=InstanceStore(state_dir),
             switches=SwitchStore(state_dir),
@@ -374,7 +394,15 @@ class TestReconciliation:
         assert restarted.reconcile() is NodeState.VALIDATION_RUNNING
 
     def test_a_record_whose_supervisor_is_gone_fails_the_node(
-        self, manager, approved, spawned, guest_is_up, state_dir, launch_config, monkeypatch
+        self,
+        catalog_store,
+        manager,
+        approved,
+        spawned,
+        guest_is_up,
+        state_dir,
+        launch_config,
+        monkeypatch,
     ):
         """Measured on au11: a stale `runtime.json` outlived its process by hours.
 
@@ -386,6 +414,7 @@ class TestReconciliation:
 
         restarted = CvmManager(
             config=launch_config,
+            catalog_store=catalog_store,
             store=StateStore(state_dir),
             instances=InstanceStore(state_dir),
             switches=SwitchStore(state_dir),
@@ -410,12 +439,13 @@ class TestReconciliation:
         assert manager.reconcile() is NodeState.FAILED
         assert "no CVM is running on it" in manager._store.document.last_error
 
-    def test_a_host_that_manages_no_cvms_is_left_alone(self, state_dir):
+    def test_a_host_that_manages_no_cvms_is_left_alone(self, catalog_store, state_dir):
         """cvmd installed before its catalog exists must not re-derive a state it cannot see."""
         store = StateStore(state_dir)
         store.transition(NodeState.LAUNCHING)
         manager = CvmManager(
             config=LaunchConfig(),
+            catalog_store=catalog_store,
             store=store,
             instances=InstanceStore(state_dir),
             switches=SwitchStore(state_dir),
@@ -423,11 +453,14 @@ class TestReconciliation:
 
         assert manager.reconcile() is NodeState.LAUNCHING
 
-    def test_an_unreadable_instance_record_fails_closed(self, state_dir, launch_config):
+    def test_an_unreadable_instance_record_fails_closed(
+        self, catalog_store, state_dir, launch_config
+    ):
         """Never "no record, therefore idle" — a CVM cvmd forgot may still be running."""
         (state_dir / "instance.json").write_text("{ truncated")
         manager = CvmManager(
             config=launch_config,
+            catalog_store=catalog_store,
             store=StateStore(state_dir),
             instances=InstanceStore(state_dir),
             switches=SwitchStore(state_dir),
@@ -466,7 +499,14 @@ class TestOverHttp:
 
     @pytest.fixture
     def launching_client(
-        self, clients_file, state_dir, launch_config, spawned, guest_is_up, monkeypatch
+        self,
+        clients_file,
+        state_dir,
+        launch_config,
+        catalog_store,
+        spawned,
+        guest_is_up,
+        monkeypatch,
     ):
         from conftest import signed_request  # noqa: F401 - imported for the tests below
         from cvmd.app import create_app
@@ -475,7 +515,12 @@ class TestOverHttp:
         monkeypatch.setattr(
             "cvmd.cvm.measure.qemu_version", lambda _dstack: QEMU_FALLBACK, raising=True
         )
-        config = Config(authorized_clients=clients_file, state_dir=state_dir, launch=launch_config)
+        config = Config(
+            authorized_clients=clients_file,
+            state_dir=state_dir,
+            launch=launch_config,
+            catalog=catalog_store.config,
+        )
         with TestClient(create_app(config), raise_server_exceptions=False) as client:
             yield client
 
@@ -830,13 +875,22 @@ class TestVerifiedRelease:
         assert manager._store.state is NodeState.FAILED
 
     def test_hugepages_still_out_of_the_pool_are_not_a_free_node(
-        self, state_dir, launch_config, approved, spawned, guest_is_up, host_is_free, monkeypatch
+        self,
+        catalog_store,
+        state_dir,
+        launch_config,
+        approved,
+        spawned,
+        guest_is_up,
+        host_is_free,
+        monkeypatch,
     ):
         monkeypatch.setattr(
             "cvmd.cvm.measure.qemu_version", lambda _dstack: QEMU_FALLBACK, raising=True
         )
         manager = CvmManager(
             config=replace(launch_config, hugepages=True),
+            catalog_store=catalog_store,
             store=StateStore(state_dir),
             instances=InstanceStore(state_dir),
             switches=SwitchStore(state_dir),

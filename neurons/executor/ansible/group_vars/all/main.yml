@@ -270,31 +270,11 @@ lium_cvmd_dstack_scripts_dir: ""
 # during the rollout, and separate directories are what guarantee that.
 lium_cvmd_run_dir: /var/lib/cvmd/vms
 
-# The approved artifact catalog: which software stacks this host may launch.
-# Each entry pins a triple (QEMU build + OS image hash + compose hash) and the
-# local paths that produce it. A request naming a triple that is not here is
-# refused, which is what lets a validator detect a host serving a stack other
-# than the one it expects to attest.
-#
-#   lium_cvmd_catalog:
-#     - id: validation-v3
-#       kind: validation
-#       qemu: "10.1.0"
-#       os_image_hash: a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02
-#       compose_hash: ab4d14336f0762c0d8ec7631a69148246661de84ceead7a215f8a33b74fd43e6
-#       os_image_path: /opt/lium-io/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11
-#       compose_path: /etc/cvmd/composes/validation-v3.yml
-#       init_script: /opt/lium-io/neurons/executor/dstacktee/app/init_script.sh
-#       pre_launch_script: /opt/lium-io/neurons/executor/dstacktee/app/pre_launch_script.sh
-#
-# Hashes must be 64 lowercase hex digits — no `sha256:` prefix, no uppercase.
-# cvmd compares them against values it computes itself, so any other spelling
-# would never match and the launch would fail as "not approved", which sends an
-# operator looking at the wrong thing.
-#
-# This is the DAH-2576 stub. DAH-2578 replaces it with the backend's signed
-# manifest, at which point this list stops being the source of truth.
-lium_cvmd_catalog: []
+# The approved artifact catalog — which software stacks this host may launch —
+# is DAH-2578's signed manifest, configured under `lium_catalog_*` further down
+# this file. It was an inline list here until then, and moving it was the point
+# of that task: a list an operator maintains per host is a list that drifts, and
+# a revoked image stays launchable on every host nobody remembered to edit.
 
 # dstack's key-provider port, which the guest reaches for its sealing key. The
 # same default lium-cvm.sh relies on.
@@ -367,7 +347,41 @@ lium_cvm_ssh_guest_port: 0
 lium_cvm_pin_numa: false
 lium_cvm_hugepages: false
 
-# catalog variable interface. Unset => the stub says what it is waiting on.
-# Set => the stub asserts its companion then fails "not implemented".
+# --- the approved artifact catalog (DAH-2578) --------------------------------
+#
+# The catalog is no longer a list written here. It is a signed manifest the
+# platform publishes and cvmd fetches, and the three settings below are all a
+# host needs to consume one.
+#
+# The ss58 of the platform key that signs the manifest. Everything rests on it:
+# a manifest is verified against THIS address, never against the one the
+# document carries, so nothing an attacker can serve is accepted without the
+# platform's key. Unset => this host launches nothing, and says so.
+lium_catalog_signer: ""
+
+# Where cvmd polls for the current manifest. Unset => cvmd never fetches, and
+# the host runs on whatever seed was staged below — which is a legitimate
+# configuration for an air-gapped host and a dead end for a normal one, because
+# a revocation can then never reach it.
 lium_catalog_manifest_url: ""
+
+# Optional extra pin for the DAY-ZERO seed fetch only. The signature is what
+# makes a manifest trustworthy, so this is not required: pinning a checksum
+# would mean re-editing this file every time the platform publishes a new
+# serial, and the fetch would start failing the moment it did.
 lium_catalog_manifest_sha256: ""
+
+# A signed manifest to stage as the seed, from the Ansible controller rather
+# than over the network. For an air-gapped host, or for bringing a host up
+# before it can reach the backend.
+lium_catalog_manifest_src: ""
+
+# How often cvmd asks for the current manifest. This is the upper bound on how
+# long a revocation takes to reach a node nobody pushes to.
+lium_catalog_refresh_seconds: 300
+lium_catalog_fetch_timeout_seconds: 30
+
+# Where day-zero staged the approved CVM OS images. A manifest entry names one
+# of them by directory name; cvmd joins it onto this path and the measurement
+# gate checks the image's own digest.txt against the pinned hash.
+lium_catalog_images_dir: "{{ lium_repo_path }}/neurons/executor/dstacktee/run/images"

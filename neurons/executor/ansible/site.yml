@@ -129,20 +129,19 @@
   roles:
     - sgx_key_provider
 
-- name: The cvmd control daemon
+# One play, and `catalog` second, deliberately. The seed manifest is cvmd
+# configuration: it is written into cvmd's config directory, validated by cvmd's
+# own verifier through cvmd's venv, and a change to it has to restart cvmd. Two
+# plays would put the paths, the interpreter and the `Restart cvmd` handler out
+# of scope for the role that needs all three — handlers do not cross a play
+# boundary — so the seed would be staged and never read until the next reboot.
+- name: The cvmd control daemon and the artifact catalog it starts from
   hosts: localhost
   gather_facts: false
   become: true
-  tags: [cvmd, converge]
+  tags: [cvmd, catalog, converge]
   roles:
     - cvmd
-
-- name: Stubs — the catalog variable interface
-  hosts: localhost
-  gather_facts: false
-  become: true
-  tags: [stubs, converge]
-  roles:
     - catalog
 
 # `common` runs AGAIN here, and that is the point.

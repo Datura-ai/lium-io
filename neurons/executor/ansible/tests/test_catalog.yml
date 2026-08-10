@@ -1,0 +1,271 @@
+---
+# The `catalog` role stages the signed manifest a host starts from (DAH-2578).
+#
+# It was a stub until this task, and the property the stub established is the one
+# kept here: loud in BOTH directions. Unset, it says so and ends. Set, it either
+# stages a manifest cvmd has verified or it fails — never a half-configured host
+# that looks finished.
+#
+# The staging path runs for real, against a manifest signed here with the same
+# library cvmd verifies with, checked by cvmd's own `parse_manifest`. That needs
+# a Python with cvmd importable, so the play finds one and skips the block with a
+# named message rather than silently passing if there is none.
+#
+# block/rescue rather than `ignore_errors` on the include: ignore_errors does
+# not cover a failure raised by a task INSIDE an included role, so the play
+# would abort before any assertion ran.
+
+- name: The catalog role is quiet and clean when nothing is configured
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+  roles:
+    - catalog
+  tasks:
+    - name: Reaching here means the role ended cleanly
+      ansible.builtin.debug:
+        msg: "ok  the catalog role no-ops cleanly when no manifest is named"
+
+- name: The catalog role refuses every half-configuration, by name
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+
+  tasks:
+    # A manifest with no signer is a file of unknown authorship deciding what
+    # this node runs. It is the one refusal that matters most, because the
+    # failure it prevents is silent: cvmd would accept the file, refuse every
+    # launch, and report it as a signature problem.
+    - name: Run catalog with a URL but no signer
+      block:
+        - name: Include catalog with only a URL
+          ansible.builtin.include_role:
+            name: catalog
+          vars:
+            lium_catalog_manifest_url: https://example.invalid/manifest.json
+            lium_catalog_signer: ""
+
+        - name: Record that catalog accepted an unverifiable manifest
+          ansible.builtin.set_fact:
+            catalog_unsigned_refused: false
+            catalog_unsigned_msg: ""
+      rescue:
+        - name: Record the refusal
+          ansible.builtin.set_fact:
+            catalog_unsigned_refused: true
+            catalog_unsigned_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: A manifest with no signer is refused, naming the signer
+      ansible.builtin.assert:
+        that:
+          - catalog_unsigned_refused | bool
+          - "'lium_catalog_signer' in catalog_unsigned_msg"
+        fail_msg: >-
+          catalog accepted a manifest URL with no signer, or refused for some
+          other reason. refused={{ catalog_unsigned_refused }}
+          msg={{ catalog_unsigned_msg }}
+        quiet: true
+
+    - name: Run catalog with both a URL and a local file
+      block:
+        - name: Include catalog with two sources
+          ansible.builtin.include_role:
+            name: catalog
+          vars:
+            lium_catalog_manifest_url: https://example.invalid/manifest.json
+            lium_catalog_manifest_src: /nonexistent/manifest.json
+            lium_catalog_signer: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+
+        - name: Record that catalog accepted two sources
+          ansible.builtin.set_fact:
+            catalog_both_refused: false
+            catalog_both_msg: ""
+      rescue:
+        - name: Record the refusal
+          ansible.builtin.set_fact:
+            catalog_both_refused: true
+            catalog_both_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: Two sources for one seed is refused
+      ansible.builtin.assert:
+        that:
+          - catalog_both_refused | bool
+          - "'exactly one' in catalog_both_msg"
+        fail_msg: >-
+          catalog accepted both a URL and a local file, so which one seeds the
+          host would depend on task order. refused={{ catalog_both_refused }}
+          msg={{ catalog_both_msg }}
+        quiet: true
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: "PASS the catalog role refuses an unverifiable manifest and an ambiguous source."
+
+- name: A signed manifest is staged, and an unsigned one is not
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    catalog_test_dir: "{{ lookup('env', 'ANSIBLE_LIUM_TMP') | default('/tmp/lium-catalog-test', true) }}"
+
+  tasks:
+    # cvmd is a separate package with its own venv. This looks for one in the
+    # checkout, which is where the pytest suite leaves it; a runner without one
+    # gets a named skip rather than a green run that checked nothing.
+    - name: Find a Python that can import cvmd
+      ansible.builtin.shell: |
+        set -eu
+        for candidate in \
+          "{{ playbook_dir }}/../../cvmd/.venv/bin/python" \
+          /opt/cvmd/venv/bin/python
+        do
+          if [ -x "$candidate" ] && "$candidate" -c 'from cvmd.catalog import parse_manifest' 2>/dev/null; then
+            printf '%s\n' "$candidate"
+            exit 0
+          fi
+        done
+        exit 1
+      register: catalog_python_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Report that the staging block cannot run here
+      ansible.builtin.debug:
+        msg: >-
+          SKIP no Python with cvmd importable was found, so the staging block did
+          not run. Create the cvmd venv (cd neurons/executor/cvmd && pdm install)
+          to exercise it.
+      when: catalog_python_probe.rc != 0
+
+    - name: Stage a real manifest and prove the role reads it
+      when: catalog_python_probe.rc == 0
+      vars:
+        catalog_python: "{{ catalog_python_probe.stdout }}"
+      block:
+        - name: Make a directory for the fixtures
+          ansible.builtin.file:
+            path: "{{ catalog_test_dir }}"
+            state: directory
+            mode: "0750"
+
+        # Signed with the same library cvmd verifies with, and with a throwaway
+        # dev key — //Ferdie is a well-known substrate test URI, not a secret.
+        - name: Mint a signed manifest and print its signer
+          ansible.builtin.command:
+            argv:
+              - "{{ catalog_python }}"
+              - -c
+              - |
+                import json, sys
+                from datetime import UTC, datetime, timedelta
+                from bittensor.sp_core import Keypair
+
+                keypair = Keypair.create_from_uri("//Ferdie")
+                issued = datetime.now(UTC)
+                payload = json.dumps({
+                    "version": 1,
+                    "serial": 1,
+                    "issued_at": issued.isoformat(),
+                    "expires_at": (issued + timedelta(days=1)).isoformat(),
+                    "floors": {"os_image": 1, "qemu": 1, "compose": 1},
+                    "artifacts": [{
+                        "id": "validation-fixture",
+                        "kind": "validation",
+                        "qemu": "9.2.1",
+                        "os_image_hash": "a" * 64,
+                        "os_image_name": "dstack-nvidia-0.5.11",
+                        "compose_hash": "b" * 64,
+                        "compose": "services:\n  executor:\n    image: example\n",
+                        "versions": {"os_image": 1, "qemu": 1, "compose": 1},
+                    }],
+                })
+                blob = b"lium-cvm-catalog-v1\x00" + payload.encode()
+                envelope = {
+                    "schema": "lium-cvm-catalog/1",
+                    "payload": payload,
+                    "signer": keypair.ss58_address,
+                    "signature": "0x" + keypair.sign(blob).hex(),
+                }
+                with open(sys.argv[1], "w") as handle:
+                    json.dump(envelope, handle)
+                print(keypair.ss58_address)
+              - "{{ catalog_test_dir }}/manifest.json"
+          register: catalog_minted
+          changed_when: false
+
+        - name: Stage the signed manifest through the role
+          ansible.builtin.include_role:
+            name: catalog
+          vars:
+            lium_catalog_manifest_src: "{{ catalog_test_dir }}/manifest.json"
+            lium_catalog_signer: "{{ catalog_minted.stdout }}"
+            cvmd_python: "{{ catalog_python }}"
+            cvmd_config_dir: "{{ catalog_test_dir }}/etc"
+            cvmd_catalog_seed_path: "{{ catalog_test_dir }}/etc/manifest.json"
+            cvmd_file_owner: "{{ lookup('env', 'USER') }}"
+            cvmd_file_group: "{{ lookup('env', 'USER') }}"
+
+        - name: The staged file is there and reads back as the manifest that was minted
+          ansible.builtin.command:
+            argv:
+              - "{{ catalog_python }}"
+              - -c
+              - |
+                import pathlib, sys
+                from cvmd.catalog import parse_manifest
+                manifest = parse_manifest(
+                    pathlib.Path(sys.argv[1]).read_bytes(), signer=sys.argv[2]
+                )
+                assert manifest.serial == 1, manifest.serial
+                assert [e.id for e in manifest.entries] == ["validation-fixture"]
+                print("ok")
+              - "{{ catalog_test_dir }}/etc/manifest.json"
+              - "{{ catalog_minted.stdout }}"
+          changed_when: false
+
+        # The signature is checked against the CONFIGURED signer, so staging the
+        # same bytes on a host that trusts a different key must fail. This is the
+        # check that would silently pass if the role ever verified a manifest
+        # against the signer the document names.
+        - name: Staging the same manifest under a different signer fails
+          block:
+            - name: Include catalog with the wrong signer
+              ansible.builtin.include_role:
+                name: catalog
+              vars:
+                lium_catalog_manifest_src: "{{ catalog_test_dir }}/manifest.json"
+                lium_catalog_signer: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+                cvmd_python: "{{ catalog_python }}"
+                cvmd_config_dir: "{{ catalog_test_dir }}/etc"
+                cvmd_catalog_seed_path: "{{ catalog_test_dir }}/etc/manifest.json"
+                cvmd_file_owner: "{{ lookup('env', 'USER') }}"
+                cvmd_file_group: "{{ lookup('env', 'USER') }}"
+
+            - name: Record that the role accepted a manifest signed by someone else
+              ansible.builtin.set_fact:
+                catalog_wrong_signer_refused: false
+          rescue:
+            - name: Record the refusal
+              ansible.builtin.set_fact:
+                catalog_wrong_signer_refused: true
+
+        - name: A manifest signed by another key is refused
+          ansible.builtin.assert:
+            that:
+              - catalog_wrong_signer_refused | bool
+            fail_msg: >-
+              The role staged a manifest signed by a key this host does not
+              trust. The signature must be checked against lium_catalog_signer,
+              never against the `signer` field inside the document.
+            quiet: true
+
+        - name: Remove the fixtures
+          ansible.builtin.file:
+            path: "{{ catalog_test_dir }}"
+            state: absent
+
+        - name: PASS
+          ansible.builtin.debug:
+            msg: "PASS a signed manifest stages; the same bytes under another signer do not."

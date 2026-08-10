@@ -15,8 +15,17 @@ from typing import Any
 
 def write_json_durable(path: Path, payload: Any) -> None:
     """Replace `path` with `payload` as JSON, atomically, and return only once it is on disk."""
+    write_bytes_durable(path, json.dumps(payload, sort_keys=True).encode())
+
+
+def write_bytes_durable(path: Path, encoded: bytes, *, mode: int | None = None) -> None:
+    """Replace `path` with exactly `encoded`, atomically, returning once it is on disk.
+
+    `mode` is applied to the temporary file before the rename, so the file is never briefly
+    readable at the 0600 a NamedTemporaryFile is created with, nor at whatever the umask would
+    have made it — the permissions the caller asked for are the only ones it ever has.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(payload, sort_keys=True).encode()
 
     # NamedTemporaryFile in the same directory: rename(2) is only atomic within a filesystem.
     handle = tempfile.NamedTemporaryFile(
@@ -28,6 +37,8 @@ def write_json_durable(path: Path, payload: Any) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)

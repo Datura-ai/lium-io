@@ -10,6 +10,7 @@ tests/fixtures/generate_golden_vector.py and only verified here.
 import json
 import secrets
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,8 @@ from fastapi.testclient import TestClient
 VALIDATOR_URI = "//Alice"
 PLATFORM_URI = "//Bob"
 STRANGER_URI = "//Charlie"
+CATALOG_SIGNER_URI = "//Dave"
+OTHER_SIGNER_URI = "//Eve"
 
 
 @pytest.fixture
@@ -70,6 +73,76 @@ def clients_file(tmp_path: Path, validator_key: Keypair, platform_key: Keypair) 
 @pytest.fixture
 def config(clients_file: Path, state_dir: Path) -> Config:
     return Config(authorized_clients=clients_file, state_dir=state_dir)
+
+
+# --------------------------------------------------------------------------- DAH-2578
+#
+# The manifest helpers sign with the same library cvmd verifies with, for the same reason the
+# request signer does: a second implementation in the tests is a second thing to keep in step
+# with the protocol, and it would pass while the real backend failed. What these helpers do NOT
+# share with the daemon is the *envelope* — it is written out by hand below, so a change to
+# `manifest.py` that quietly altered the wire shape breaks these tests rather than moving with
+# them.
+
+
+@pytest.fixture
+def catalog_signer() -> Keypair:
+    """The platform key the host is configured to trust."""
+    return Keypair.create_from_uri(CATALOG_SIGNER_URI)
+
+
+@pytest.fixture
+def other_signer() -> Keypair:
+    """A valid key that is not the one this host trusts."""
+    return Keypair.create_from_uri(OTHER_SIGNER_URI)
+
+
+def manifest_payload(
+    *entries: dict,
+    serial: int = 1,
+    floors: dict[str, int] | None = None,
+    issued_at: datetime | None = None,
+    ttl_seconds: int = 86400,
+) -> str:
+    issued = issued_at or datetime.now(UTC)
+    return json.dumps(
+        {
+            "version": 1,
+            "serial": serial,
+            "issued_at": issued.isoformat(),
+            "expires_at": (issued + timedelta(seconds=ttl_seconds)).isoformat(),
+            "floors": floors or {"os_image": 1, "qemu": 1, "compose": 1},
+            "artifacts": list(entries),
+        }
+    )
+
+
+def sign_manifest(payload: str, keypair: Keypair, *, signer: str | None = None) -> bytes:
+    """Wrap `payload` in the signed envelope, exactly as the backend serves it."""
+    blob = b"lium-cvm-catalog-v1\x00" + payload.encode()
+    return json.dumps(
+        {
+            "schema": "lium-cvm-catalog/1",
+            "payload": payload,
+            "signer": signer or keypair.ss58_address,
+            "signature": "0x" + keypair.sign(blob).hex(),
+        }
+    ).encode()
+
+
+def manifest_entry(**overrides) -> dict:
+    base = {
+        "id": "validation-v3",
+        "kind": "validation",
+        "qemu": "10.1.0",
+        "os_image_hash": "a" * 64,
+        "os_image_name": "dstack-nvidia-0.5.11",
+        "compose_hash": "b" * 64,
+        "compose": "services:\n  executor:\n    image: example\n",
+        "versions": {"os_image": 1, "qemu": 1, "compose": 1},
+    }
+    base.update(overrides)
+    return base
 
 
 # --------------------------------------------------------------------------- DAH-2576

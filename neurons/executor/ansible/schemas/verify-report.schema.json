@@ -133,7 +133,7 @@
               "net.acl_probe_required",
               "guard.host_state",
               "cvmd.service_state",
-              "catalog.stub_status"
+              "catalog.manifest"
             ]
           },
           "title": {
