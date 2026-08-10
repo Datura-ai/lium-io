@@ -14,8 +14,10 @@ raise_cluster_overlay() {
     fi
 
     mkdir -p /etc/wireguard
-    # wg reads the private key from this file, so it must not be world-readable.
-    umask 077
+    # Create the file restricted FIRST, then write into it: the config holds this node's private
+    # key. Done with `install` rather than `umask` on purpose — a umask set here would survive into
+    # `exec "$@"` below and silently make every file the customer's job writes mode 600.
+    install -m 600 /dev/null /etc/wireguard/wg0.conf
     echo "$conf_b64" | base64 -d > /etc/wireguard/wg0.conf
 
     # wg-quick needs NET_ADMIN, which a group-rental pod is given; if it is missing we surface it
