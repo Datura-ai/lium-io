@@ -52,10 +52,17 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "neurons" / "validators" / "src"))
 
+# The customer's own half of the order. It must open the guest SSH port cvmd's readiness
+# gate waits on (2200 by fleet convention — `cvm_ssh_guest_port`): a compose with nothing
+# listening there launches a guest that is never declared ready and the create answers 504.
+# That is also what a real customer ships — SSH access to their CVM is the product.
 CUSTOMER_COMPOSE = """services:
-  app:
+  ssh:
     image: alpine:3.20
-    command: sleep infinity
+    command: sh -c "apk add --no-cache openssh && ssh-keygen -A && /usr/sbin/sshd -D -e"
+    ports:
+      - "2200:22"
+    restart: unless-stopped
 """
 
 FORBIDDEN_PORT = 32000
@@ -162,11 +169,19 @@ def main() -> int:
     parser.add_argument("--keep-validation-cvm", action="store_true", help="leave the validation CVM running at the end")
     args = parser.parse_args()
 
-    sys.path.insert(0, str(Path(args.backend_src).resolve()))
     from bittensor_wallet import Keypair
 
-    from services.cvm_compose import AgentSpec, derive  # the backend's real derivation
-    from services.cvmd_client import CvmdClient  # noqa: F401 — imported to prove the module loads
+    # The backend's real derivation, loaded by explicit file path: both repos ship a
+    # `services` package, and letting them shadow each other on sys.path is exactly the
+    # kind of silent wrong-module import this harness exists to rule out.
+    import importlib.util
+
+    compose_path = Path(args.backend_src).resolve() / "services" / "cvm_compose.py"
+    spec = importlib.util.spec_from_file_location("backend_cvm_compose", compose_path)
+    backend_cvm_compose = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backend_cvm_compose)
+    AgentSpec = backend_cvm_compose.AgentSpec
+    derive = backend_cvm_compose.derive
 
     platform = Keypair.create_from_uri(args.platform_uri)
     validator = Keypair.create_from_uri(args.validator_uri)
@@ -186,7 +201,7 @@ def main() -> int:
         print("   aborting: this harness only runs against an idle host")
         return summary()
 
-    config_read = ssh(args, "cat /etc/cvmd/config.toml")
+    config_read = ssh(args, "sudo cat /etc/cvmd/config.toml")
     ranges = [line for line in config_read.stdout.splitlines() if "port" in line.lower()]
     check(
         config_read.returncode == 0 and str(FORBIDDEN_PORT) not in config_read.stdout,
@@ -320,9 +335,9 @@ def main() -> int:
             "the host ends idle, as it began",
             f"state={state.get('state')}",
         )
-        disks = ssh(args, "ls /var/lib/cvmd/vms/*/hda.img 2>/dev/null | wc -l")
+        disks = ssh(args, "sudo sh -c 'ls /var/lib/cvmd/vms/*/hda.img 2>/dev/null | wc -l'")
         check(disks.stdout.strip() == "0", "no CVM disks left behind", disks.stdout.strip())
-        staged = ssh(args, "ls -A /var/lib/cvmd/renter 2>/dev/null | wc -l")
+        staged = ssh(args, "sudo sh -c 'ls -A /var/lib/cvmd/renter 2>/dev/null | wc -l'")
         check(staged.stdout.strip() == "0", "no staged composes left behind", staged.stdout.strip())
 
     return summary()
