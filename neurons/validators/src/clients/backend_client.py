@@ -9,10 +9,6 @@ from urllib.parse import urlencode
 
 import aiohttp
 import bittensor
-from pydantic import BaseModel, ValidationError
-from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
-
-from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import (
     DefaultDockerImage,
     DefaultDockerImagesResponse,
@@ -23,6 +19,10 @@ from protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
     RentedExecutorsResponse,
 )
+from pydantic import BaseModel, ValidationError
+from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
+
+from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +291,7 @@ class BackendClient:
         container_port: int,
         executor_id: str | None = None,
         rental_in_progress: bool = False,
+        gpu_uuids: list[str] | None = None,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -303,6 +304,9 @@ class BackendClient:
             rental_in_progress: True if this validator already sees an active customer rental for the
                 executor. Lets the backend skip the container-creating check immediately; the backend
                 still re-checks the DB itself when this is False.
+            gpu_uuids: GPU UUIDs from the scrape this cycle. The backend's probe asks the container
+                runtime to resolve exactly these instead of `--gpus all`, which never names a card
+                and so let a host advertising GPUs it cannot hand over pass the check (DAH-2614).
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -316,6 +320,10 @@ class BackendClient:
             "miner_hotkey": miner_hotkey,
             "container_port": container_port,
             "rental_in_progress": rental_in_progress,
+            # Sent from this cycle's scrape rather than read from the backend's stored specs: those
+            # are a cycle behind and absent entirely on an executor's first pass — the very check
+            # where a fabricated GPU matters most.
+            "gpu_uuids": gpu_uuids or [],
         }
 
         if executor_id:
