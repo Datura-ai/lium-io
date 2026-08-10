@@ -12,6 +12,7 @@ import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
+    CancelStorageOperationRequest,
     RestoreContainerRequest,
     BaseServerRequest,
     ContainerCreateRequest,
@@ -660,11 +661,17 @@ class ComputeClient:
         try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
-            error_msg = f"Invalid message received from backend: {str(ex)}"
+            error_msg = "Invalid message received from backend"
             logger.error(
                 _m(
                     error_msg,
-                    extra=get_extra_info({**self.logging_extra, "error": str(ex), "raw_msg": raw_msg}),
+                    extra=get_extra_info(
+                        {
+                            **self.logging_extra,
+                            "error_type": type(ex).__name__,
+                            "raw_message_length": len(raw_msg),
+                        }
+                    ),
                 )
             )
             pass
@@ -766,7 +773,7 @@ class ComputeClient:
             "miner_hotkey": job_request.miner_hotkey,
             "miner_ip": miner_axon_info.ip,
             "miner_port": miner_axon_info.port,
-            "job_request": str(job_request),
+            "request_type": job_request.message_type.value,
             "executor_id": str(job_request.executor_id),
         }
         logger.info(
@@ -921,3 +928,5 @@ class ComputeClient:
             await self.backup_handler.handle_backup_container_req(job_request)
         elif isinstance(job_request, RestoreContainerRequest):
             await self.backup_handler.handle_restore_container_req(job_request)
+        elif isinstance(job_request, CancelStorageOperationRequest):
+            await self.backup_handler.handle_cancel_storage_operation_req(job_request)

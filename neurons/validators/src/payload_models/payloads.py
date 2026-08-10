@@ -191,6 +191,7 @@ class ContainerRequestType(enum.Enum):
     AddDebugSshKeyRequest = "AddDebugSshKeyRequest"
     BackupContainerRequest = "BackupContainerRequest"
     RestoreContainerRequest = "RestoreContainerRequest"
+    CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
 
 
@@ -215,8 +216,24 @@ class ContainerBaseRequest(BaseServerRequest):
 class ExternalVolumeInfo(BaseModel):
     name: str
     plugin: str
-    iam_user_access_key: str
-    iam_user_secret_key: str
+    iam_user_access_key: str = Field(repr=False)
+    iam_user_secret_key: str = Field(repr=False)
+    session_token: str | None = Field(default=None, repr=False)
+
+
+class BootstrapRestoreSpec(BaseModel):
+    restore_log_id: str
+    backup_engine: str
+    repository_pod_id: str
+    repository_password: str | None = Field(default=None, repr=False)
+    backup_volume_info: ExternalVolumeInfo
+    snapshot_id: str | None = None
+    legacy_object_key: str | None = None
+    legacy_object_size_bytes: int | None = None
+    auth_token: str = Field(repr=False)
+    restore_path: str
+    s3_connections: int = Field(default=64, ge=1, le=128)
+    failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
 class PayloadPortMapping(BaseModel):
@@ -278,6 +295,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     pre_dispatch_profilers: list[dict] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
+    bootstrap_restore: BootstrapRestoreSpec | None = None
     enable_jupyter: bool | None = None
     enable_volume_encryption: bool | None = None
     available_ports: list[PayloadPortMapping] | None = None
@@ -391,10 +409,15 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_path: str
     source_volume_path: str
     backup_target_path: str
-    auth_token: str  # JWT for progress updates
+    auth_token: str = Field(repr=False)  # JWT for progress updates
     backup_log_id: str
     volume_encrypted: bool = False
     container_name: str | None = None
+    backup_engine: str = "tar_aws_cli"
+    repository_pod_id: str | None = None
+    repository_password: str | None = Field(default=None, repr=False)
+    s3_connections: int = Field(default=64, ge=1, le=128)
+    failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -403,11 +426,23 @@ class RestoreContainerRequest(ContainerBaseRequest):
     backup_volume_info: ExternalVolumeInfo  # S3 backup volume with credentials
     backup_source_path: str  # path in backup S3 volume
     target_volume_path: str  # local volume mounted path
-    auth_token: str  # JWT for progress updates
+    auth_token: str = Field(repr=False)  # JWT for progress updates
     restore_log_id: str
     restore_path: str
     volume_encrypted: bool = False
     container_name: str | None = None
+    backup_engine: str = "tar_aws_cli"
+    repository_pod_id: str | None = None
+    repository_password: str | None = Field(default=None, repr=False)
+    snapshot_id: str | None = None
+    legacy_object_size_bytes: int | None = None
+    s3_connections: int = Field(default=64, ge=1, le=128)
+    failure_timeout_seconds: int = Field(default=600, gt=0)
+
+
+class CancelStorageOperationRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.CancelStorageOperationRequest
+    operation_id: str
 
 
 ##############################################################
@@ -567,6 +602,7 @@ class ContainerCreated(ContainerBaseResponse):
     profilers: list[ProfilerStep] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
+    restore_log_id: str | None = None
     jupyter_url: str | None = None
     warnings: list[ContainerWarningCode] | None = None
     storage_limit_gb: int | None = None
