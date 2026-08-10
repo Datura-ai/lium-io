@@ -110,6 +110,9 @@ class JsonEventWriter:
     def diagnostic(self, message: str) -> None:
         self._write({"event": "diagnostic", "operation_id": self._operation_id, "message": message})
 
+    def stage(self, stage: str) -> None:
+        self._write({"event": "stage", "operation_id": self._operation_id, "stage": stage})
+
     def heartbeat_if_due(self) -> None:
         now = self._clock()
         if now - self._last_heartbeat_at < self._heartbeat_interval_seconds:
@@ -295,6 +298,7 @@ class ResticStorageRunner:
         exit_code, _ = self._stream_command(command, cwd)
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
+        self._events.stage("FINALIZING")
         return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
 
     def _restore_legacy_archive(self) -> ResticResult:
@@ -319,6 +323,7 @@ class ResticStorageRunner:
                 "bytes_restored": restore_stats.total_size,
             }
         )
+        self._events.stage("FINALIZING")
         return ResticResult("COMPLETED", OperationResultQuality.FULL, None, exit_code)
 
     def _stream(
