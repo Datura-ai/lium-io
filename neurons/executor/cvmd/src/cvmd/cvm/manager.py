@@ -270,34 +270,20 @@ class CvmManager:
 
         dstack, mappings = self._preflight()
         base = self._resolve_base(order)
-
-        instance_id = str(uuid.uuid4())
-        staged_dir = self._config.renter_dir / instance_id
-        try:
-            artifact = renter.stage(order, base=base, directory=staged_dir)
-        except catalog.CatalogError as exc:
-            raise LaunchFailure(500, f"staging this order failed: {exc}") from exc
-
-        try:
-            return self._launch(
-                kind=KIND_RENTER,
-                triple=Triple(
-                    qemu=order.qemu,
-                    os_image_hash=order.os_image_hash,
-                    compose_hash=order.compose_hash,
-                ),
-                artifact=artifact,
-                dstack=dstack,
-                mappings=mappings,
-                instance_id=instance_id,
-                rental_id=order.rental_id,
-                staged_dir=staged_dir,
-            )
-        except BaseException:
-            # Covers the refusals raised before `_launch` reaches its own cleanup — resolving,
-            # entering LAUNCHING — and anything unexpected. Idempotent with the discard inside.
-            renter.discard(staged_dir)
-            raise
+        return self._launch(
+            kind=KIND_RENTER,
+            triple=Triple(
+                qemu=order.qemu,
+                os_image_hash=order.os_image_hash,
+                compose_hash=order.compose_hash,
+            ),
+            dstack=dstack,
+            mappings=mappings,
+            instance_id=str(uuid.uuid4()),
+            order=order,
+            base=base,
+            rental_id=order.rental_id,
+        )
 
     def _preflight(self):
         """Everything that must hold before a launch of any kind is attempted.
@@ -327,15 +313,36 @@ class CvmManager:
         *,
         kind: str,
         triple: Triple,
-        artifact: catalog.Artifact,
         dstack,
         mappings: list[ports.PortMapping],
         instance_id: str,
+        artifact: catalog.Artifact | None = None,
+        order: renter.RenterOrder | None = None,
+        base: catalog.Artifact | None = None,
         rental_id: str | None = None,
-        staged_dir: Path | None = None,
     ) -> dict:
-        """prepare -> MEASURE -> launch -> confirm, once the artifact is settled."""
+        """prepare -> MEASURE -> launch -> confirm.
+
+        A renter order is staged **here**, after `_enter_launching`, and that ordering is
+        load-bearing rather than tidy. `_enter_launching` can run reconciliation — a node left
+        FAILED by a previous refusal has to be re-derived before it may launch again — and
+        reconciliation sweeps stale staging directories. Staging before it therefore writes a
+        compose that the very next line deletes, and the launch fails with the file it just
+        wrote reported missing. Found on au11, not in a unit test: the sweep only fires when the
+        node reaches `_enter_launching` in a state that needs reconciling.
+        """
         self._enter_launching()
+
+        staged_dir: Path | None = None
+        if order is not None:
+            staged_dir = self._config.renter_dir / instance_id
+            try:
+                artifact = renter.stage(order, base=base, directory=staged_dir)
+            except catalog.CatalogError as exc:
+                self._store.transition(
+                    NodeState.FAILED, last_error=f"staging this order failed: {exc}"
+                )
+                raise LaunchFailure(500, f"staging this order failed: {exc}") from exc
 
         vm_dir = self._config.run_dir / instance_id
         try:

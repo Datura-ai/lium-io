@@ -186,6 +186,44 @@ class TestTheMeasurementGate:
         assert not launch_config.run_dir.exists() or list(launch_config.run_dir.iterdir()) == []
 
 
+class TestALaunchAfterAFailedOne:
+    """The ordering hardware caught: staging has to happen after the node commits.
+
+    `_enter_launching` re-derives the node's state when it finds it FAILED, and reconciliation
+    sweeps stale staging directories. An order staged before that call is written and then
+    immediately deleted, and the launch fails reporting the file it had just written as missing.
+    Found on au11 on the second launch of a session, never in a unit test — because the sweep
+    only fires when the node arrives at `_enter_launching` needing to be reconciled.
+    """
+
+    def test_a_refusal_does_not_poison_the_next_launch(
+        self, manager, order, spawned, guest_is_up, launch_config
+    ):
+        from dataclasses import replace
+
+        with pytest.raises(LaunchFailure):
+            manager.create_renter(replace(order, compose=order.compose + "# tampered\n"))
+        assert manager._store.state == NodeState.FAILED
+
+        report = manager.create_renter(order)
+
+        assert report["state"] == "RENTER_RUNNING"
+        assert report["measurements"]["compose_hash"] == order.compose_hash
+        assert list(launch_config.renter_dir.iterdir()) == []
+
+    def test_the_same_holds_for_a_validation_launch_after_a_renter_refusal(
+        self, manager, order, approved, spawned, guest_is_up
+    ):
+        from dataclasses import replace
+
+        with pytest.raises(LaunchFailure):
+            manager.create_renter(replace(order, compose_hash="f" * 64))
+
+        report = manager.create(kind="validation", triple=approved)
+
+        assert report["state"] == "VALIDATION_RUNNING"
+
+
 class TestWhatTheCatalogStillDecides:
     def test_an_unapproved_os_image_is_refused_by_name(self, manager, order, spawned):
         from dataclasses import replace

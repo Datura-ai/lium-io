@@ -1,6 +1,6 @@
 [project]
 name = "cvmd"
-version = "0.1.0"
+version = "0.2.0"
 description = "CVM host daemon — signed two-scope control API for lium.io CVM nodes (DAH-2575)"
 authors = [
     {name = "waris", email = "waris0609@outlook.com"},
