@@ -42,18 +42,27 @@ configure_nested_docker() {
     # The renter's own image runs under the pod's inner daemon, and RDMA there needs devices, the
     # IPC_LOCK capability and an unlimited memlock. Docker can default the ulimit and nothing else,
     # so the rest arrives through a default runtime that edits the OCI spec (lium-rdma-runc).
+    # The base image ships a daemon.json of its own (the nvidia runtime lives there), so this
+    # merges into whatever is already on disk rather than replacing it.
     mkdir -p /etc/docker
-    if [[ -e /etc/docker/daemon.json ]]; then
-        echo "lium-cluster: /etc/docker/daemon.json already exists, leaving it alone" >&2
-        return 0
-    fi
-    cat > /etc/docker/daemon.json <<'JSON'
-{
-  "runtimes": {"lium-rdma": {"path": "/usr/local/bin/lium-rdma-runc"}},
-  "default-runtime": "lium-rdma",
-  "default-ulimits": {"memlock": {"Name": "memlock", "Hard": -1, "Soft": -1}}
-}
-JSON
+    python3 - <<'PY'
+import json
+import os
+
+CONFIG_PATH = "/etc/docker/daemon.json"
+
+config = {}
+if os.path.isfile(CONFIG_PATH):
+    with open(CONFIG_PATH) as handle:
+        config = json.load(handle) or {}
+
+config.setdefault("runtimes", {})["lium-rdma"] = {"path": "/usr/local/bin/lium-rdma-runc"}
+config["default-runtime"] = "lium-rdma"
+config.setdefault("default-ulimits", {})["memlock"] = {"Name": "memlock", "Hard": -1, "Soft": -1}
+
+with open(CONFIG_PATH, "w") as handle:
+    json.dump(config, handle, indent=4)
+PY
 }
 
 raise_cluster_overlay
