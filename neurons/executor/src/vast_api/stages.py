@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 from vast_api.config import VastSettings
 from vast_api.docker_ops import DockerOps
-from vast_api.errors import ApiFailure, ApiRefusal
+from vast_api.errors import ApiFailure, ApiRefusal, safe_error
 from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
 from vast_api.vast_client import VastClient
@@ -53,8 +53,8 @@ def run_ladder(stages: list[Stage], store: RunStore, run_id: str) -> bool:
             return False
         except Exception as exc:
             logger.exception("stage %s crashed in run %s", stage.name, run_id)
-            store.stage_finished(run_id, stage.name, "failed", str(exc)[:500])
-            store.finish(run_id, "failed", error={"code": "unexpected", "detail": str(exc)[:500]})
+            store.stage_finished(run_id, stage.name, "failed", safe_error(exc))
+            store.finish(run_id, "failed", error={"code": "unexpected", "detail": safe_error(exc)})
             return False
     return True
 
@@ -198,11 +198,15 @@ def build_setup_ladder(
         if rc != 0:
             raise ApiFailure("install_rollback", f"kaalia installer download failed: {output[:300]}")
         machine_key = vast.mint_machine_key()  # rotates — mint right before use
-        rc, output = docker_ops.exec_in_uns([
-            "bash", "-c",
-            f"cd /root && python3 vi2.py {machine_key} --no-libvirt --no-partitioning "
-            f"--ports {settings.PORT_RANGE_START} {settings.PORT_RANGE_END}",
-        ])
+        # the key travels as an env var, never interpolated into the shell line
+        rc, output = docker_ops.exec_in_uns(
+            [
+                "bash", "-c",
+                f'cd /root && python3 vi2.py "$MACHINE_KEY" --no-libvirt --no-partitioning '
+                f"--ports {settings.PORT_RANGE_START} {settings.PORT_RANGE_END}",
+            ],
+            env={"MACHINE_KEY": machine_key},
+        )
         if rc != 0:
             raise ApiFailure("install_rollback", f"kaalia installer failed: {output[-500:]}")
 
@@ -232,6 +236,17 @@ def build_setup_ladder(
         return False
 
     def register_do() -> None:
+        if ctx["machine_id"] is not None:
+            # a typo'd machine_id must fail BEFORE identify creates an orphan record;
+            # a persisted id equal to the requested one is fine (identify re-adopts it
+            # even while /machines/ lags behind)
+            machine_ids = [machine.get("id") for machine in vast.get_machines()]
+            rc, output = docker_ops.exec_in_uns(["cat", "/var/lib/vastai_kaalia/numeric_machine_id"])
+            persisted_id = int(output.strip()) if rc == 0 and output.strip().isdigit() else None
+            if ctx["machine_id"] not in machine_ids and persisted_id != ctx["machine_id"]:
+                raise ApiFailure(
+                    "identify_rejected", f"machine {ctx['machine_id']} is not on this account"
+                )
         rc, output = docker_ops.exec_in_uns(["cat", "/var/lib/vastai_kaalia/machine_id"])
         if rc == 0 and output.strip():
             machine_api_key = output.strip()

@@ -30,6 +30,8 @@ def verify_token(request: Request, authorization: str | None = Header(None)) -> 
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     provided = authorization.removeprefix("Bearer ")
+    if not provided:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
     # compare bytes: compare_digest raises TypeError on non-ASCII str input
     if not hmac.compare_digest(provided.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid bearer token")

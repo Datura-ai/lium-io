@@ -55,7 +55,8 @@ class RunStore:
             for doc in self.list_runs():
                 if doc.state == "running":
                     raise ApiRefusal("run_in_progress", f"run {doc.run_id} is still running")
-            run_id = f"{op}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+            # microseconds keep a same-second retry from overwriting the previous doc
+            run_id = f"{op}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')}"
             doc = RunDoc(
                 run_id=run_id,
                 op=op,
@@ -103,6 +104,7 @@ class RunStore:
         with self._lock:
             doc = self.get(run_id)
             if doc is None:
+                logger.warning("run doc %s missing, dropping stage event %s=%s", run_id, name, state)
                 return
             for stage in doc.stages:
                 if stage.name == name:
@@ -123,6 +125,7 @@ class RunStore:
         with self._lock:
             doc = self.get(run_id)
             if doc is None:
+                logger.warning("run doc %s missing, dropping finish state %s", run_id, state)
                 return
             doc.state = state
             doc.finished_at = _utcnow_iso()

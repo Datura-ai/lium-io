@@ -46,9 +46,14 @@ class HostOps:
         return first_line.split(":")[0] or None
 
     def _image_has_filesystem(self) -> bool:
-        # blkid exits non-zero (and prints nothing) when the image carries no filesystem
-        result = self.run(["blkid", self.settings.DATA_ROOT_IMG], check=False)
-        return result.returncode == 0 and bool(result.stdout.strip())
+        # blkid rc 2 is the documented "nothing found"; any other non-zero rc is a
+        # broken blkid and must never green-light mkfs.xfs -f over live data
+        rc = self.run(["blkid", self.settings.DATA_ROOT_IMG], check=False).returncode
+        if rc == 0:
+            return True
+        if rc == 2:
+            return False
+        raise ApiFailure("host_command_failed", f"blkid failed rc={rc}")
 
     def ensure_data_root(self) -> None:
         # build the loop-XFS nested data-root per SUCCESS-PATH phase 1 step 1, idempotently
@@ -97,8 +102,14 @@ class HostOps:
         ])
         gpus = []
         for line in result.stdout.strip().splitlines():
-            idx, mem, util = [part.strip() for part in line.split(",")]
-            gpus.append({"idx": int(idx), "mem_mib": int(mem), "util_pct": int(util)})
+            # ghost GPUs print "[Unknown Error]" — refuse loudly, not with a bare 500
+            try:
+                idx, mem, util = [part.strip() for part in line.split(",")]
+                gpus.append({"idx": int(idx), "mem_mib": int(mem), "util_pct": int(util)})
+            except ValueError:
+                raise ApiFailure(
+                    "host_command_failed", f"nvidia-smi returned non-numeric fields: {line!r}"[:300]
+                )
         return gpus
 
     def gpu_compute_apps(self) -> list[dict]:
@@ -112,6 +123,11 @@ class HostOps:
         for line in result.stdout.strip().splitlines():
             if not line.strip():
                 continue
-            pid, mem = [part.strip() for part in line.split(",")]
-            apps.append({"pid": int(pid), "mem_mib": int(mem)})
+            try:
+                pid, mem = [part.strip() for part in line.split(",")]
+                apps.append({"pid": int(pid), "mem_mib": int(mem)})
+            except ValueError:
+                raise ApiFailure(
+                    "host_command_failed", f"nvidia-smi returned non-numeric fields: {line!r}"[:300]
+                )
         return apps

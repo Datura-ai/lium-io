@@ -1,6 +1,7 @@
 import json
 import logging
 import subprocess
+from pathlib import Path
 
 import requests
 
@@ -38,9 +39,21 @@ class VastClient:
         except requests.RequestException as exc:
             raise ApiFailure("vast_api_failed", f"GET {path} failed: {type(exc).__name__}")
 
+    def _ensure_cli_key_file(self) -> None:
+        # the CLI reads ~/.vast_api_key on its own; --api-key in argv would be
+        # world-readable via /proc/<pid>/cmdline under --pid host
+        key = self._account_key()
+        path = Path.home() / ".vast_api_key"
+        if path.exists() and path.read_text().strip() == key:
+            return
+        path.touch(mode=0o600)
+        path.chmod(0o600)  # touch keeps an existing file's mode — force it
+        path.write_text(key + "\n")
+
     def _cli(self, args: list[str], timeout: int = 600) -> str:
-        # run one vastai CLI command; the key never reaches logs or error text
-        cmd = ["vastai"] + args + ["--api-key", self._account_key()]
+        # run one vastai CLI command; the key never reaches logs, error text, or argv
+        self._ensure_cli_key_file()
+        cmd = ["vastai"] + args
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -60,7 +73,10 @@ class VastClient:
             data = response.json()
         except ValueError:
             raise ApiFailure("vast_api_failed", "GET /machines/ returned non-JSON")
-        return data.get("machines", data) if isinstance(data, dict) else data
+        machines = data.get("machines") if isinstance(data, dict) else data
+        if not isinstance(machines, list):
+            raise ApiFailure("vast_api_failed", "unexpected /machines/ response shape")
+        return machines
 
     def mint_machine_key(self) -> str:
         # MK rotates on every call — mint right before use, never cache

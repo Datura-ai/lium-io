@@ -6,7 +6,7 @@ from pathlib import Path
 
 from vast_api.config import VastSettings
 from vast_api.docker_ops import DockerOps
-from vast_api.errors import ApiFailure, ApiRefusal
+from vast_api.errors import ApiFailure, ApiRefusal, safe_error
 from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
 from vast_api.stages import SETUP_STAGE_NAMES, build_setup_ladder, run_ladder
@@ -15,15 +15,6 @@ from vast_api.vast_client import VastClient
 logger = logging.getLogger(__name__)
 
 GPU_BUSY_MEM_MIB = 1000
-
-
-def _safe_error(exc: Exception) -> str:
-    # only our own error types carry curated text; anything else may embed internals
-    # (host paths, command lines, stack info) — log it, expose the class name alone
-    if isinstance(exc, (ApiRefusal, ApiFailure)):
-        return f"{exc.code}: {exc.detail}"[:300]
-    logger.warning("suppressed error detail in API response: %r", exc)
-    return type(exc).__name__
 
 
 class VastManager:
@@ -62,6 +53,11 @@ class VastManager:
             for m in machines:
                 if m.get("id") == int(persisted):
                     return m
+            # a stale persisted id must never fall through to guessing — on a shared
+            # account the guess could be somebody else's machine
+            raise ApiFailure(
+                "machine_unresolved", f"persisted machine {persisted} is not on this account"
+            )
         if len(machines) == 1:
             return machines[0]
         host_ips = self.host.local_ips()
@@ -77,12 +73,15 @@ class VastManager:
 
     def _refuse_setup_if_rental_running(self) -> None:
         # the ladder restarts nested dockerd/vastai — forbidden during a live rental.
-        # Best-effort: a fresh box has no resolvable machine and setup must proceed.
+        # Only a fresh box (zero machines on the account) may proceed: any other
+        # resolution failure cannot prove there is no rental.
         try:
             machine = self._resolve_machine()
-        except Exception as exc:
-            logger.info("rental pre-flight skipped, machine not resolvable: %s", str(exc)[:200])
-            return
+        except ApiFailure as exc:
+            if exc.code == "no_machine":
+                logger.info("rental pre-flight skipped, fresh box: %s", exc.detail)
+                return
+            raise ApiRefusal(exc.code, f"cannot verify rental state: {exc.detail}")
         if machine.get("current_rentals_running", 0) > 0:
             raise ApiRefusal(
                 "rental_running",
@@ -107,7 +106,10 @@ class VastManager:
                     )
             except Exception as exc:
                 logger.exception("setup run %s crashed outside the ladder", run_id)
-                self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": _safe_error(exc)})
+                try:
+                    self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": safe_error(exc)})
+                except Exception:
+                    logger.critical("failed to persist terminal state for %s", run_id, exc_info=True)
 
         threading.Thread(target=_execute, name=run_id, daemon=True).start()
         return run_id
@@ -131,16 +133,28 @@ class VastManager:
                 self.runs.finish(run_id, "succeeded", result=result)
             except (ApiRefusal, ApiFailure) as exc:
                 self.runs.stage_finished(run_id, "self_test", "failed", exc.detail)
-                self.runs.finish(run_id, "failed", error={"code": exc.code, "detail": exc.detail})
+                try:
+                    self.runs.finish(run_id, "failed", error={"code": exc.code, "detail": exc.detail})
+                except Exception:
+                    logger.critical("failed to persist terminal state for %s", run_id, exc_info=True)
             except Exception as exc:
                 logger.exception("self-test run %s crashed", run_id)
-                self.runs.stage_finished(run_id, "self_test", "failed", _safe_error(exc))
-                self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": _safe_error(exc)})
+                self.runs.stage_finished(run_id, "self_test", "failed", safe_error(exc))
+                try:
+                    self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": safe_error(exc)})
+                except Exception:
+                    logger.critical("failed to persist terminal state for %s", run_id, exc_info=True)
 
         threading.Thread(target=_execute, name=run_id, daemon=True).start()
         return run_id
 
     # --- sync market ops ---
+
+    def _refuse_if_run_in_progress(self) -> None:
+        # a live setup/self-test run mutates the same container/daemons — refuse without force
+        for doc in self.runs.list_runs():
+            if doc.state == "running":
+                raise ApiRefusal("run_in_progress", "a setup/self-test run is active")
 
     def _refuse_if_gpu_busy(self) -> None:
         # the Lium filler on a card blocks the offer — refuse without force
@@ -152,6 +166,8 @@ class VastManager:
 
     def list_machine(self, price_gpu_usd: float, duration: str = "7 days", force: bool = False) -> dict:
         # always the proven unlist→list cycle — a repeated list does not rebuild a stuck listing
+        if not force:
+            self._refuse_if_run_in_progress()
         machine = self._resolve_machine()
         if not force:
             self._refuse_if_gpu_busy()
@@ -174,7 +190,9 @@ class VastManager:
             )
         return {"listed": True, "offers": offers, "warnings": []}
 
-    def unlist(self) -> dict:
+    def unlist(self, force: bool = False) -> dict:
+        if not force:
+            self._refuse_if_run_in_progress()
         machine = self._resolve_machine()
         self.vast.unlist_machine(machine["id"])
         return {"listed": False, "offers_remaining": len(self.vast.search_offers(machine["id"]))}
@@ -184,14 +202,16 @@ class VastManager:
         return self.list_machine(price_gpu_usd)
 
     def delete(self, purge: bool = False, force: bool = False) -> dict:
+        if not force:
+            self._refuse_if_run_in_progress()
         machine = None
         try:
             machine = self._resolve_machine()
         except ApiFailure as exc:
-            # no_machine (zero records) and vast_api_failed (outage) → container-only
-            # delete proceeds; machine_unresolved (records exist, none matched) must
-            # NOT silently bypass the rental rail — refuse unless forced
-            if exc.code == "machine_unresolved" and not force:
+            # only no_machine (zero records) proves there is no rental — any other
+            # failure (unresolved id, Vast outage) must NOT silently bypass the
+            # rental rail; refuse unless forced
+            if exc.code != "no_machine" and not force:
                 raise ApiRefusal(exc.code, exc.detail)
         if machine and machine.get("current_rentals_running", 0) > 0 and not force:
             raise ApiRefusal(
@@ -202,11 +222,13 @@ class VastManager:
         state_removed = False
         vast_record_deleted = False
         if purge:
-            self.host.run(["rm", "-rf", self.settings.STATE_DIR_HOST])
-            state_removed = True
+            # account record first: a failed record delete must not leave an orphan
+            # with the local identity already destroyed
             if machine:
                 self.vast.delete_machine(machine["id"])
                 vast_record_deleted = True
+            self.host.run(["rm", "-rf", self.settings.STATE_DIR_HOST])
+            state_removed = True
         return {
             "container_removed": container_removed,
             "state_removed": state_removed,
@@ -232,12 +254,12 @@ class VastManager:
                 "inet_up": machine.get("inet_up"),
             }
         except Exception as exc:
-            vast_section = {"error": _safe_error(exc)}
+            vast_section = {"error": safe_error(exc)}
 
         try:
             offers = self.vast.search_offers(machine["id"]) if machine else []
         except Exception as exc:
-            offers = {"error": _safe_error(exc)}
+            offers = {"error": safe_error(exc)}
 
         box_section: dict = {}
         try:
@@ -245,7 +267,7 @@ class VastManager:
             box_section["vast_uns_up"] = self.docker_ops.get_vast_uns() is not None
             box_section["filler_running"] = self.docker_ops.filler_running()
         except Exception as exc:
-            box_section["error"] = _safe_error(exc)
+            box_section["error"] = safe_error(exc)
         try:
             rc, active = self.docker_ops.exec_in_uns(["systemctl", "is-active", "vastai"])
             box_section["kaalia_active"] = rc == 0 and active.strip() == "active"
@@ -254,11 +276,11 @@ class VastManager:
             )
             box_section["kaalia_last_log"] = last_log.strip()[-300:]
         except Exception as exc:
-            box_section["kaalia_error"] = _safe_error(exc)
+            box_section["kaalia_error"] = safe_error(exc)
         try:
             box_section["gpus"] = self.host.gpu_stats()
         except Exception as exc:
-            box_section["gpus_error"] = _safe_error(exc)
+            box_section["gpus_error"] = safe_error(exc)
 
         vast_verified = bool(machine and machine.get("verification") == "verified")
         return {

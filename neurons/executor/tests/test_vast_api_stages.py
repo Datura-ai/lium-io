@@ -2,11 +2,13 @@ import json
 import subprocess
 from unittest.mock import Mock
 
+import pytest
+
 from vast_api.config import VastSettings
 from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
-from vast_api.errors import ApiFailure
-from vast_api.service import _parse_self_test, _safe_error
+from vast_api.errors import ApiFailure, safe_error
+from vast_api.service import VastManager, _parse_self_test
 from vast_api.stages import SETUP_STAGE_NAMES, Stage, build_setup_ladder, run_ladder
 
 
@@ -39,7 +41,7 @@ def test_unsatisfied_stage_runs_do_and_verify(tmp_path):
 
 
 def test_setup_ladder_stage_names_and_order(tmp_path):
-    settings = VastSettings(VAST_API_TOKEN="t", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
 
     stages, _ = build_setup_ladder(settings, Mock(), Mock(), Mock())
 
@@ -53,7 +55,7 @@ def test_setup_ladder_stage_names_and_order(tmp_path):
 
 def test_g0_failure_aborts_whole_ladder(tmp_path):
     store = RunStore(str(tmp_path))
-    settings = VastSettings(VAST_API_TOKEN="t", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
     docker_ops = Mock()
     docker_ops.executor_running.return_value = False
     stages, _ = build_setup_ladder(settings, Mock(), docker_ops, Mock())
@@ -73,7 +75,7 @@ def test_g0_failure_aborts_whole_ladder(tmp_path):
 def _host_with_fake_run(tmp_path):
     # returns host whose run() is faked via `responses`: command name -> (rc, stdout);
     # commands not listed succeed silently
-    settings = VastSettings(VAST_API_TOKEN="t", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
     host = HostOps(settings)
     calls = []
     responses = {}
@@ -159,8 +161,59 @@ def test_parse_self_test_unparseable_output():
 
 
 def test_safe_error_keeps_curated_text_hides_internals():
-    curated = _safe_error(ApiFailure("no_machine", "no machine registered on this account"))
-    leaky = _safe_error(RuntimeError("nsenter -t 1 -m -n cat /var/lib/secret failed"))
+    curated = safe_error(ApiFailure("no_machine", "no machine registered on this account"))
+    leaky = safe_error(RuntimeError("nsenter -t 1 -m -n cat /var/lib/secret failed"))
 
     assert curated == "no_machine: no machine registered on this account"
     assert leaky == "RuntimeError"
+
+
+def test_container_stage_state_mount_rail_aborts_without_remove(tmp_path):
+    store = RunStore(str(tmp_path))
+    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
+    docker_ops = Mock()
+    docker_ops.executor_running.return_value = True
+    docker_ops.executor_network.return_value = "executor_default"
+    docker_ops.image_exists.return_value = True
+    container = Mock()
+    docker_ops.get_vast_uns.return_value = container
+    docker_ops.vast_uns_has_state_mount.return_value = False
+    stages, _ = build_setup_ladder(settings, Mock(), docker_ops, Mock())
+    run_id = store.create("setup", {}, [stage.name for stage in stages])
+
+    succeeded = run_ladder(stages, store, run_id)
+
+    assert succeeded is False
+    doc = store.get(run_id)
+    assert doc.error["code"] == "state_mount_missing"
+    container.remove.assert_not_called()
+
+
+def _manager_with_mocks(tmp_path):
+    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
+    return VastManager(settings=settings, host=Mock(), docker_ops=Mock(), vast=Mock(), runs=Mock())
+
+
+def test_resolve_machine_persisted_id_beats_ip_match(tmp_path):
+    manager = _manager_with_mocks(tmp_path)
+    manager.vast.get_machines.return_value = [
+        {"id": 1, "public_ipaddr": "192.0.2.7"},
+        {"id": 2, "public_ipaddr": ""},
+    ]
+    manager.host.run.return_value = Mock(stdout="2\n")
+    manager.host.local_ips.return_value = ["192.0.2.7"]
+
+    machine = manager._resolve_machine()
+
+    assert machine["id"] == 2
+
+
+def test_resolve_machine_stale_persisted_id_is_terminal(tmp_path):
+    manager = _manager_with_mocks(tmp_path)
+    manager.vast.get_machines.return_value = [{"id": 1, "public_ipaddr": "192.0.2.7"}]
+    manager.host.run.return_value = Mock(stdout="99\n")
+
+    with pytest.raises(ApiFailure) as exc_info:
+        manager._resolve_machine()
+
+    assert exc_info.value.code == "machine_unresolved"

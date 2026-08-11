@@ -42,7 +42,15 @@ class DockerOps:
         return container.status == "running"
 
     def executor_network(self) -> str | None:
-        # the docker network the executor compose stack created (--network value for vast-uns)
+        # the network the executor container itself sits on (--network value for vast-uns);
+        # the name-contains scan is only a fallback when that read fails
+        try:
+            container = self.client.containers.get(self.settings.EXECUTOR_CONTAINER_NAME)
+            networks = container.attrs["NetworkSettings"]["Networks"]
+            if networks:
+                return next(iter(networks))
+        except Exception:
+            logger.warning("reading executor container networks failed", exc_info=True)
         for network in self.client.networks.list():
             if "executor" in network.name:
                 return network.name
@@ -149,7 +157,10 @@ class DockerOps:
         rc, output = self.exec_in_uns(["systemctl", "restart", "docker"])
         if rc != 0:
             raise ApiFailure("host_command_failed", f"nested docker start failed: {output[:500]}")
-        self.exec_in_uns(["chattr", "+i", "/etc/docker/daemon.json"])
+        # immutability is the only protection against kaalia rewriting daemon.json
+        rc, output = self.exec_in_uns(["chattr", "+i", "/etc/docker/daemon.json"])
+        if rc != 0:
+            raise ApiFailure("host_command_failed", f"chattr +i daemon.json failed: {output[-300:]}")
 
     def nested_daemon_matches_asset(self) -> bool:
         rc, output = self.exec_in_uns(["cat", "/etc/docker/daemon.json"])

@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,7 +11,7 @@ class VastSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    VAST_API_TOKEN: str
+    VAST_API_TOKEN: str = Field(min_length=16)  # an empty/short token must fail at startup
     VAST_ACCOUNT_KEY_FILE: str = "/run/secrets/vast_host_key"
     EXECUTOR_CONTAINER_NAME: str = "executor-executor-1"
     VAST_UNS_NAME: str = "vast-uns"

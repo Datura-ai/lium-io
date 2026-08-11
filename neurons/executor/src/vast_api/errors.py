@@ -1,9 +1,13 @@
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # Machine-readable error codes shared by refusals and failures (see plan-vastctl.md):
 # g0_failed, state_mount_missing, gpu_broken, install_rollback, identify_rejected,
 # gpu_busy, rental_running, run_in_progress.
+
+logger = logging.getLogger(__name__)
 
 
 class ApiRefusal(Exception):
@@ -22,6 +26,15 @@ class ApiFailure(Exception):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+
+
+def safe_error(exc: Exception) -> str:
+    # only our own error types carry curated text; anything else may embed internals
+    # (host paths, command lines, stack info) — log it, expose the class name alone
+    if isinstance(exc, (ApiRefusal, ApiFailure)):
+        return f"{exc.code}: {exc.detail}"[:300]
+    logger.warning("suppressed error detail in API response: %r", exc)
+    return type(exc).__name__
 
 
 def _error_response(status_code: int, code: str, detail: str) -> JSONResponse:

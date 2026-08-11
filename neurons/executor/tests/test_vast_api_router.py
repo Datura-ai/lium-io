@@ -3,13 +3,14 @@ from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from vast_api.config import VastSettings
 from vast_api.errors import ApiFailure, ApiRefusal
 from vast_api.shell import build_app
 from vast_api.vast_client import VastClient
 
-TOKEN = "secret-token"
+TOKEN = "secret-token-0123456789"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
@@ -111,7 +112,7 @@ def test_list_gpu_busy_overridden_with_force(tmp_path):
 
 
 def test_non_ascii_token_yields_401_not_500(tmp_path):
-    settings = VastSettings(VAST_API_TOKEN="sécrèt-tökén", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(VAST_API_TOKEN="sécrèt-tökén-àbcdéf", RUNS_DIR=str(tmp_path / "runs"))
     app = build_app(settings)
     client = TestClient(app)
 
@@ -211,6 +212,7 @@ def test_delete_proceeds_when_account_has_no_machines(tmp_path):
 def test_search_offers_cli_line_has_any_flags(tmp_path, monkeypatch):
     key_file = tmp_path / "vast_host_key"
     key_file.write_text("k123\n")
+    monkeypatch.setenv("HOME", str(tmp_path))  # ~/.vast_api_key lands in tmp
     settings = VastSettings(
         VAST_API_TOKEN=TOKEN, VAST_ACCOUNT_KEY_FILE=str(key_file), RUNS_DIR=str(tmp_path / "runs")
     )
@@ -227,3 +229,127 @@ def test_search_offers_cli_line_has_any_flags(tmp_path, monkeypatch):
 
     assert offers == []
     assert "machine_id=147139 rentable=any rented=any verified=any" in captured["cmd"]
+    assert "--api-key" not in captured["cmd"]  # key must never reach argv
+    assert (tmp_path / ".vast_api_key").read_text().strip() == "k123"
+    assert (tmp_path / ".vast_api_key").stat().st_mode & 0o777 == 0o600
+
+
+def test_empty_token_fails_settings_validation(tmp_path):
+    with pytest.raises(ValidationError):
+        VastSettings(VAST_API_TOKEN="", RUNS_DIR=str(tmp_path / "runs"))
+
+
+def test_list_offers_never_appear_fails_listing_not_confirmed(tmp_path, monkeypatch):
+    app, client = _build_client(tmp_path)
+    manager = _wire_market_mocks(app)
+    manager.vast.search_offers.return_value = []
+    monkeypatch.setattr("vast_api.service.time.sleep", Mock())
+
+    response = client.post("/vast/list", json={"price_gpu_usd": 1.5}, headers=AUTH)
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "listing_not_confirmed"
+
+
+def test_failure_returns_500_error_envelope(tmp_path):
+    app, client = _build_client(tmp_path)
+    app.state.vast_manager = Mock(status=Mock(side_effect=ApiFailure("vast_api_failed", "boom")))
+
+    response = client.get("/vast/status", headers=AUTH)
+
+    assert response.status_code == 500
+    assert response.json() == {"error": {"code": "vast_api_failed", "detail": "boom"}}
+
+
+def _wire_delete_mocks(app, machine: dict):
+    manager = app.state.vast_manager
+    manager.vast = Mock()
+    manager.vast.get_machines.return_value = [machine]
+    manager.host = Mock()
+    manager.host.run.return_value = Mock(stdout="")
+    manager.docker_ops = Mock()
+    manager.docker_ops.delete_vast_uns.return_value = True
+    return manager
+
+
+def test_delete_refused_while_rental_running(tmp_path):
+    app, client = _build_client(tmp_path)
+    manager = _wire_delete_mocks(app, {"id": 147139, "current_rentals_running": 1})
+
+    response = client.request("DELETE", "/vast", json={}, headers=AUTH)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "rental_running"
+    manager.docker_ops.delete_vast_uns.assert_not_called()
+
+
+def test_delete_rental_running_overridden_with_force(tmp_path):
+    app, client = _build_client(tmp_path)
+    manager = _wire_delete_mocks(app, {"id": 147139, "current_rentals_running": 1})
+
+    response = client.request("DELETE", "/vast", json={"force": True}, headers=AUTH)
+
+    assert response.status_code == 200
+    manager.docker_ops.delete_vast_uns.assert_called_once()
+
+
+def test_delete_purge_removes_state_and_vast_record(tmp_path):
+    app, client = _build_client(tmp_path)
+    manager = _wire_delete_mocks(app, {"id": 147139})
+
+    response = client.request("DELETE", "/vast", json={"purge": True}, headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["state_removed"] is True
+    assert response.json()["vast_record_deleted"] is True
+    manager.vast.delete_machine.assert_called_once_with(147139)
+
+
+def test_delete_plain_keeps_state_and_vast_record(tmp_path):
+    app, client = _build_client(tmp_path)
+    manager = _wire_delete_mocks(app, {"id": 147139})
+
+    response = client.request("DELETE", "/vast", json={}, headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["state_removed"] is False
+    assert response.json()["vast_record_deleted"] is False
+    manager.vast.delete_machine.assert_not_called()
+    rm_calls = [c for c in manager.host.run.call_args_list if c.args[0][:2] == ["rm", "-rf"]]
+    assert rm_calls == []
+
+
+def test_setup_fresh_box_without_machines_still_202(tmp_path):
+    app, client = _build_client(tmp_path)
+    manager = app.state.vast_manager
+    manager.vast = Mock()
+    manager.vast.get_machines.return_value = []
+    manager.host = Mock()
+    manager.docker_ops = Mock()
+
+    response = client.post("/vast/setup", json={}, headers=AUTH)
+
+    assert response.status_code == 202
+
+
+def test_list_refused_while_run_in_progress(tmp_path):
+    app, client = _build_client(tmp_path)
+    manager = _wire_market_mocks(app)
+    manager.runs.create("setup", {}, ["a"])  # a live run doc in the real store
+
+    response = client.post("/vast/list", json={"price_gpu_usd": 1.5}, headers=AUTH)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "run_in_progress"
+    manager.vast.unlist_machine.assert_not_called()
+
+
+def test_list_run_in_progress_overridden_with_force(tmp_path):
+    app, client = _build_client(tmp_path)
+    manager = _wire_market_mocks(app)
+    manager.runs.create("setup", {}, ["a"])
+
+    response = client.post("/vast/list", json={"price_gpu_usd": 1.5, "force": True}, headers=AUTH)
+
+    assert response.status_code == 200
+    manager.vast.unlist_machine.assert_called_once()
