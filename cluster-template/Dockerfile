@@ -21,7 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /usr/local/bin/lium-cluster-entrypoint
-RUN chmod +x /usr/local/bin/lium-cluster-entrypoint
+COPY lium-rdma-runc.py /usr/local/bin/lium-rdma-runc
+RUN chmod +x /usr/local/bin/lium-cluster-entrypoint /usr/local/bin/lium-rdma-runc
+
+# The base image starts the inner Docker daemon only when asked. A cluster pod always wants it: the
+# renter's job usually runs in their own image, and that is where the fabric has to reach.
+ENV ENABLE_DIND=true
 
 ENTRYPOINT ["/usr/local/bin/lium-cluster-entrypoint"]
-CMD ["sleep", "infinity"]
+# The base image's own start script, which our entrypoint execs into after raising the overlay.
+CMD ["/start.sh"]

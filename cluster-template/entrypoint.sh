@@ -38,5 +38,27 @@ raise_cluster_overlay() {
     echo "lium-cluster: wg0 up at $(wg show wg0 2>/dev/null | awk '/interface/{print}')" >&2
 }
 
+configure_nested_docker() {
+    # The renter's own image runs under the pod's inner daemon, and RDMA there needs devices, the
+    # IPC_LOCK capability and an unlimited memlock. Docker can default the ulimit and nothing else,
+    # so the rest arrives through a default runtime that edits the OCI spec (lium-rdma-runc).
+    mkdir -p /etc/docker
+    if [[ -e /etc/docker/daemon.json ]]; then
+        echo "lium-cluster: /etc/docker/daemon.json already exists, leaving it alone" >&2
+        return 0
+    fi
+    cat > /etc/docker/daemon.json <<'JSON'
+{
+  "runtimes": {"lium-rdma": {"path": "/usr/local/bin/lium-rdma-runc"}},
+  "default-runtime": "lium-rdma",
+  "default-ulimits": {"memlock": {"Name": "memlock", "Hard": -1, "Soft": -1}}
+}
+JSON
+}
+
 raise_cluster_overlay
-exec "$@"
+configure_nested_docker
+
+# Hand off to the base image's own entrypoint, which starts the inner Docker daemon and the rest of
+# the pod's services. Replacing it outright is what left a cluster pod without dockerd.
+exec /pytorch-entrypoint.sh "$@"
