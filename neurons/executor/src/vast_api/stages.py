@@ -1,0 +1,285 @@
+import logging
+import secrets
+from collections.abc import Callable
+
+from vast_api.config import VastSettings
+from vast_api.docker_ops import DockerOps
+from vast_api.errors import ApiFailure, ApiRefusal
+from vast_api.host_ops import HostOps
+from vast_api.runs import RunStore
+from vast_api.vast_client import VastClient
+
+logger = logging.getLogger(__name__)
+
+SETUP_STAGE_NAMES = [
+    "g0_gate", "image", "container", "data_root", "nested_daemon",
+    "gpu", "dmi_shim", "kaalia", "register", "report",
+]
+
+
+class Stage:
+    def __init__(
+        self,
+        name: str,
+        check: Callable[[], bool] | None,
+        do: Callable[[], None],
+        verify: Callable[[], None] | None = None,
+    ):
+        self.name = name
+        self.check = check
+        self.do = do
+        self.verify = verify
+
+
+def run_ladder(stages: list[Stage], store: RunStore, run_id: str) -> bool:
+    # execute the ladder in order, streaming stage events; first failure aborts
+    for stage in stages:
+        store.stage_started(run_id, stage.name)
+        try:
+            if stage.check is not None and stage.check():
+                store.stage_finished(run_id, stage.name, "ok")
+                continue
+            stage.do()
+            if stage.verify is not None:
+                stage.verify()
+            store.stage_finished(run_id, stage.name, "done")
+        except (ApiRefusal, ApiFailure) as exc:
+            store.stage_finished(run_id, stage.name, "failed", exc.detail)
+            store.finish(run_id, "failed", error={"code": exc.code, "detail": exc.detail})
+            return False
+        except Exception as exc:
+            logger.exception("stage %s crashed in run %s", stage.name, run_id)
+            store.stage_finished(run_id, stage.name, "failed", str(exc)[:500])
+            store.finish(run_id, "failed", error={"code": "unexpected", "detail": str(exc)[:500]})
+            return False
+    return True
+
+
+def build_setup_ladder(
+    settings: VastSettings,
+    host: HostOps,
+    docker_ops: DockerOps,
+    vast: VastClient,
+    machine_id: int | None = None,
+) -> tuple[list[Stage], dict]:
+    # build the idempotent G0→G2 ladder; ctx carries network + machine_id between stages
+    ctx: dict = {"machine_id": machine_id}
+
+    # --- g0_gate: never build a standalone Vast host ---
+
+    def g0_check() -> bool:
+        if not docker_ops.executor_running():
+            return False
+        network = docker_ops.executor_network()
+        if network is None:
+            return False
+        ctx["network"] = network
+        return True
+
+    def g0_do() -> None:
+        raise ApiFailure(
+            "g0_failed",
+            f"{settings.EXECUTOR_CONTAINER_NAME} not running or executor network missing — "
+            "Vast goes ON a Lium machine, never on a box of its own",
+        )
+
+    # --- image ---
+
+    def image_check() -> bool:
+        return docker_ops.image_exists()
+
+    def image_verify() -> None:
+        if not docker_ops.image_exists():
+            raise ApiFailure("host_command_failed", f"{settings.VAST_UNS_IMAGE_TAG} missing after build")
+
+    # --- container ---
+
+    def container_check() -> bool:
+        container = docker_ops.get_vast_uns()
+        if container is None:
+            return False
+        if not docker_ops.vast_uns_has_state_mount(container):
+            # identity lives only inside this container: recreating it would throw
+            # away the registered machine — refuse instead of silently fixing
+            raise ApiFailure(
+                "state_mount_missing",
+                "vast-uns runs without the /var/lib/vastai_kaalia state mount",
+            )
+        return container.status == "running"
+
+    def container_do() -> None:
+        container = docker_ops.get_vast_uns()
+        if container is not None:
+            container.remove(force=True)  # stopped container with the state mount — safe to recreate
+        # mounts must exist before docker run: state dir, DMI dump, loop-XFS data-root
+        host.run(["mkdir", "-p", settings.STATE_DIR_HOST])
+        if not host.path_exists(settings.DMI_BIN_HOST):
+            host.dump_dmi()
+        host.ensure_data_root()
+        docker_ops.run_vast_uns(ctx["network"])
+
+    def container_verify() -> None:
+        container = docker_ops.get_vast_uns()
+        if container is None or container.status != "running":
+            raise ApiFailure("host_command_failed", "vast-uns did not reach running state")
+
+    # --- data_root ---
+
+    def data_root_check() -> bool:
+        return host.data_root_mounted()
+
+    def data_root_verify() -> None:
+        if not host.data_root_mounted():
+            raise ApiFailure("host_command_failed", f"{settings.DATA_ROOT_MOUNT} is not a mountpoint")
+
+    # --- nested_daemon ---
+
+    def nested_daemon_check() -> bool:
+        return docker_ops.nested_daemon_matches_asset() and docker_ops.nested_docker_active()
+
+    def nested_daemon_verify() -> None:
+        if not docker_ops.nested_docker_active():
+            raise ApiFailure("host_command_failed", "nested docker is not active after install")
+        # verify the file, not the exit code: nvidia-ctk without --in-place changes nothing
+        rc, _ = docker_ops.exec_in_uns(
+            ["grep", "-E", "no-cgroups *= *false", "/etc/nvidia-container-runtime/config.toml"]
+        )
+        if rc != 0:
+            raise ApiFailure("host_command_failed", "no-cgroups=false not set in nvidia-container-runtime config")
+
+    # --- gpu: the check IS the satisfaction test, twice around a daemon-reload ---
+
+    def gpu_check() -> bool:
+        if not docker_ops.nested_gpu_ok():
+            return False
+        docker_ops.exec_in_uns(["systemctl", "daemon-reload"])
+        return docker_ops.nested_gpu_ok()
+
+    def gpu_do() -> None:
+        raise ApiFailure(
+            "gpu_broken",
+            "nested --runtime=nvidia container cannot see the GPU (or loses it after daemon-reload)",
+        )
+
+    # --- dmi_shim ---
+
+    def dmi_shim_check() -> bool:
+        rc, _ = docker_ops.exec_in_uns(["dmidecode", "-t", "system"])
+        return rc == 0
+
+    def dmi_shim_do() -> None:
+        # dump_dmi rewrites the CONTENT in place (inode kept), so the ro bind-mount
+        # inside the running vast-uns sees the fresh dump immediately
+        host.dump_dmi()
+
+    def dmi_shim_verify() -> None:
+        rc, output = docker_ops.exec_in_uns(["dmidecode", "-t", "system"])
+        if rc != 0:
+            raise ApiFailure("host_command_failed", f"dmidecode shim failed in vast-uns: {output[:200]}")
+
+    # --- kaalia ---
+
+    def kaalia_check() -> bool:
+        rc, _ = docker_ops.exec_in_uns(["test", "-d", "/var/lib/vastai_kaalia/latest"])
+        return rc == 0
+
+    def kaalia_do() -> None:
+        # apt lists must be present or the installer rolls the whole install back
+        rc, output = docker_ops.exec_in_uns(["apt-get", "update"])
+        if rc != 0:
+            raise ApiFailure("install_rollback", f"apt-get update failed in vast-uns: {output[:300]}")
+        rc, output = docker_ops.exec_in_uns(
+            ["bash", "-c", "wget -q https://console.vast.ai/install -O /root/vi2.py"]
+        )
+        if rc != 0:
+            raise ApiFailure("install_rollback", f"kaalia installer download failed: {output[:300]}")
+        machine_key = vast.mint_machine_key()  # rotates — mint right before use
+        rc, output = docker_ops.exec_in_uns([
+            "bash", "-c",
+            f"cd /root && python3 vi2.py {machine_key} --no-libvirt --no-partitioning "
+            f"--ports {settings.PORT_RANGE_START} {settings.PORT_RANGE_END}",
+        ])
+        if rc != 0:
+            raise ApiFailure("install_rollback", f"kaalia installer failed: {output[-500:]}")
+
+    def kaalia_verify() -> None:
+        rc, _ = docker_ops.exec_in_uns(["test", "-d", "/var/lib/vastai_kaalia/latest"])
+        if rc != 0:
+            raise ApiFailure("install_rollback", "latest/ never appeared — installer rolled back")
+
+    # --- register ---
+
+    def register_check() -> bool:
+        rc, _ = docker_ops.exec_in_uns(["test", "-f", "/var/lib/vastai_kaalia/machine_id"])
+        if rc != 0:
+            return False
+        machines = vast.get_machines()
+        machine_ids = [machine.get("id") for machine in machines]
+        if ctx["machine_id"] is not None:
+            return ctx["machine_id"] in machine_ids
+        if len(machines) == 1:
+            ctx["machine_id"] = machines[0].get("id")
+            return True
+        return False
+
+    def register_do() -> None:
+        rc, output = docker_ops.exec_in_uns(["cat", "/var/lib/vastai_kaalia/machine_id"])
+        if rc == 0 and output.strip():
+            machine_api_key = output.strip()
+        else:
+            machine_api_key = secrets.token_hex(32)
+            docker_ops.write_file_in_uns("/var/lib/vastai_kaalia/machine_id", machine_api_key)
+        machine_key = vast.mint_machine_key()  # fresh Bearer — the full key is rejected here
+        response = vast.identify(machine_key, machine_api_key)
+        # the identify quirk: success:false while the machine id IS created
+        numeric_id = response.get("machine_id")
+        if numeric_id is None:
+            raise ApiFailure("identify_rejected", f"identify returned no machine_id: {str(response)[:200]}")
+        if ctx["machine_id"] is not None and numeric_id != ctx["machine_id"]:
+            raise ApiFailure(
+                "identify_rejected",
+                f"identified as machine {numeric_id}, expected to adopt {ctx['machine_id']}",
+            )
+        ctx["machine_id"] = numeric_id
+        # restart so kaalia picks up the identity (installer-started daemon has none)
+        docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
+
+    def register_verify() -> None:
+        machine_ids = [machine.get("id") for machine in vast.get_machines()]
+        if ctx["machine_id"] not in machine_ids:
+            raise ApiFailure(
+                "identify_rejected", f"machine {ctx['machine_id']} did not appear in /machines/"
+            )
+
+    # --- report ---
+
+    def report_check() -> bool:
+        for machine in vast.get_machines():
+            if machine.get("id") == ctx["machine_id"]:
+                return bool(machine.get("disk_space"))
+        return False
+
+    def report_do() -> None:
+        # a 403 ("Invalid or missing nonce") is a state, not an API change: restart + retry once
+        cmd = ["bash", "-c", "cd /var/lib/vastai_kaalia/latest && python3 send_mach_info.py"]
+        rc, output = docker_ops.exec_in_uns(cmd)
+        if rc == 0 and "403" not in output:
+            return
+        docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
+        rc, output = docker_ops.exec_in_uns(cmd)
+        if rc != 0 or "403" in output:
+            raise ApiFailure("report_failed", f"send_mach_info.py failed twice: {output[-300:]}")
+
+    stages = [
+        Stage("g0_gate", g0_check, g0_do),
+        Stage("image", image_check, docker_ops.build_image, image_verify),
+        Stage("container", container_check, container_do, container_verify),
+        Stage("data_root", data_root_check, host.ensure_data_root, data_root_verify),
+        Stage("nested_daemon", nested_daemon_check, docker_ops.install_nested_daemon, nested_daemon_verify),
+        Stage("gpu", gpu_check, gpu_do),
+        Stage("dmi_shim", dmi_shim_check, dmi_shim_do, dmi_shim_verify),
+        Stage("kaalia", kaalia_check, kaalia_do, kaalia_verify),
+        Stage("register", register_check, register_do, register_verify),
+        Stage("report", report_check, report_do),
+    ]
+    return stages, ctx
