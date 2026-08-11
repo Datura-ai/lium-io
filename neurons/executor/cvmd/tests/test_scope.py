@@ -1,10 +1,10 @@
 """The full 2-key x 5-endpoint-class scope matrix, plus single-parse enforcement.
 
 The `client` fixture's host has no launch configuration, which is what makes the authorized
-cells readable: an authorized create answers **503** ("this host has no launch configuration
-for ..."), a code only the handler can produce. Reaching a 503 therefore proves the request
-cleared auth and scope, exactly as the 501 did before DAH-2576 filled the handlers in.
-Launching for real is `test_launch.py`'s job; this file is about who may ask.
+cells readable: an authorized create of either kind answers **503** ("this host has no launch
+configuration for ..."), a code only the handler can produce. Reaching a 503 therefore proves
+the request cleared auth and scope. Launching for real is `test_launch.py`'s job; this file is
+about who may ask.
 """
 
 import json
@@ -25,23 +25,33 @@ VALIDATION_BODY = {
     "compose_hash": HASH_B,
 }
 
+# Same reasoning for the renter body: a create that is short of a required field reports 422
+# from the model, which the scope layer also produces, and the cell stops distinguishing
+# anything. This is the smallest body DAH-2580 accepts.
+RENTER_BODY = {
+    "kind": "renter",
+    "qemu": "10.1.0",
+    "os_image_hash": HASH_A,
+    "compose_hash": HASH_B,
+    "compose": "services:\n  app:\n    image: alpine:3.20\n",
+}
+
 VALIDATION_CREATE = ("POST", "/v1/cvm", VALIDATION_BODY)
-RENTER_CREATE = ("POST", "/v1/cvm", {"kind": "renter"})
+RENTER_CREATE = ("POST", "/v1/cvm", RENTER_BODY)
 RENTER_DESTROY = ("DELETE", "/v1/cvm", None)
 STATE_READ = ("GET", "/v1/state", None)
 HEALTH = ("GET", "/health", None)
 
 # Every cell of {validator, platform} x {the five endpoint classes}.
 #
-# 403 is a scope violation on an otherwise valid request. 501 is the renter create, whose body
-# DAH-2580 defines. 503 and 200 are handlers that ran.
+# 403 is a scope violation on an otherwise valid request. 503 and 200 are handlers that ran.
 MATRIX = [
     ("validator", VALIDATION_CREATE, 503),
     ("validator", RENTER_CREATE, 403),
     ("validator", RENTER_DESTROY, 403),
     ("validator", STATE_READ, 200),
     ("platform", VALIDATION_CREATE, 403),
-    ("platform", RENTER_CREATE, 501),
+    ("platform", RENTER_CREATE, 503),
     ("platform", RENTER_DESTROY, 200),
     ("platform", STATE_READ, 200),
 ]
@@ -120,8 +130,9 @@ class TestSingleParse:
     def test_scope_follows_the_last_duplicate(self, client, validator_key):
         """cvmd's parse resolves `kind` to `validation`, so the validator key is the one allowed.
 
-        503 rather than 501 is the tell: the request reached the *validation* handler. Had any
-        layer read `renter` — the first value — it would have been 501 instead.
+        The tell is that it reached a handler *under the validator key at all*. Had any layer
+        read `renter` — the first value — the scope check would have demanded the platform key
+        and answered 403.
         """
         response = signed_request(
             client, validator_key, "POST", "/v1/cvm", body=self.DUPLICATE_KIND
@@ -140,12 +151,12 @@ class TestSingleParse:
         """The middleware consumes the request stream to enforce the size cap.
 
         A handler that re-read the body would find it spent, so reaching the renter handler's
-        501 here is positive evidence that the handler is using the object the middleware
-        passed forward.
+        503 — a code only that handler produces — is positive evidence that the handler is
+        using the object the middleware passed forward.
         """
-        body = json.dumps({"kind": "renter", "image": "sha256:abc"}).encode()
+        body = json.dumps(RENTER_BODY).encode()
         response = signed_request(client, platform_key, "POST", "/v1/cvm", body=body)
-        assert response.status_code == 501
+        assert response.status_code == 503
 
     def test_required_scope_reads_the_parsed_object(self):
         """The unit-level statement of the same property, with no HTTP in the way."""

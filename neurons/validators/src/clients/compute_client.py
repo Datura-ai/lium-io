@@ -40,6 +40,11 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
+    CvmProvisionRequest,
+    CvmTeardownRequest,
+    CvmProvisioned,
+    CvmTornDown,
+    FailedCvmRequest,
 )
 from protocol.vc_protocol.compute_requests import (
     Error,
@@ -83,6 +88,12 @@ from services.redis_service import (
     NORMALIZED_SCORE_CHANNEL,
 )
 from clients.handlers.backup_handler import BackupHandler
+from services.cvmd_relay import (
+    DEFAULT_PROVISION_TIMEOUT_SECONDS,
+    DEFAULT_TEARDOWN_TIMEOUT_SECONDS,
+    CvmdRelay,
+    CvmdRelayError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -676,7 +687,16 @@ class ComputeClient:
             )
             pass
         else:
-            task = asyncio.create_task(self.miner_driver(job_request))
+            # A CVM request needs no miner and no axon lookup: it is a signed call this
+            # validator forwards straight to the node's own daemon. Routing it through
+            # miner_driver would make a rental depend on a miner connection that has nothing
+            # to do with it.
+            driver = (
+                self.cvm_driver
+                if isinstance(job_request, (CvmProvisionRequest, CvmTeardownRequest))
+                else self.miner_driver
+            )
+            task = asyncio.create_task(driver(job_request))
             await self.miner_drivers.put(task)
             return
 
@@ -744,6 +764,88 @@ class ComputeClient:
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)
         return miner.axon_info
+
+    async def cvm_driver(self, job_request: CvmProvisionRequest | CvmTeardownRequest):
+        """Replay one platform-signed cvmd call and hand the host's answer straight back.
+
+        Nothing is decided here. The bytes were signed by the backend, the verdict is the
+        host's HTTP status, and the report is passed through unchanged so the backend can
+        compare the measurements against what it derived for the order — a validator that
+        summarized them would be standing between two parties who are checking each other.
+        """
+        provisioning = isinstance(job_request, CvmProvisionRequest)
+        logging_extra = {
+            **self.logging_extra,
+            "miner_hotkey": job_request.miner_hotkey,
+            "executor_id": str(job_request.executor_id),
+            "pod_id": job_request.pod_id,
+            "cvmd_url": job_request.cvmd_url,
+            "operation": "provision" if provisioning else "teardown",
+        }
+        logger.info(_m("Relaying a signed cvmd call", extra=get_extra_info(logging_extra)))
+
+        call = job_request.call
+        try:
+            result = await CvmdRelay().forward(
+                base_url=job_request.cvmd_url,
+                method=call.method,
+                path=call.path,
+                body=call.body,
+                headers=call.headers,
+                timeout_seconds=(
+                    DEFAULT_PROVISION_TIMEOUT_SECONDS
+                    if provisioning
+                    else DEFAULT_TEARDOWN_TIMEOUT_SECONDS
+                ),
+            )
+        except CvmdRelayError as exc:
+            # No status: the host was never reached, which is a different problem from a host
+            # that refused. A launch that timed out on this side may still be running there.
+            response = FailedCvmRequest(
+                miner_hotkey=job_request.miner_hotkey,
+                executor_id=job_request.executor_id,
+                pod_id=job_request.pod_id,
+                msg="the CVM host could not be reached",
+                detail=str(exc),
+            )
+            logger.error(
+                _m("cvmd relay failed", extra=get_extra_info({**logging_extra, "error": str(exc)}))
+            )
+        else:
+            if result.ok:
+                built = CvmProvisioned if provisioning else CvmTornDown
+                response = built(
+                    miner_hotkey=job_request.miner_hotkey,
+                    executor_id=job_request.executor_id,
+                    pod_id=job_request.pod_id,
+                    report=result.body,
+                )
+                logger.info(
+                    _m(
+                        "cvmd accepted the call",
+                        extra=get_extra_info({**logging_extra, "status": result.status}),
+                    )
+                )
+            else:
+                response = FailedCvmRequest(
+                    miner_hotkey=job_request.miner_hotkey,
+                    executor_id=job_request.executor_id,
+                    pod_id=job_request.pod_id,
+                    msg="the CVM host refused the request",
+                    status=result.status,
+                    detail=result.reason(),
+                )
+                logger.warning(
+                    _m(
+                        "cvmd refused the call",
+                        extra=get_extra_info(
+                            {**logging_extra, "status": result.status, "detail": result.reason()}
+                        ),
+                    )
+                )
+
+        async with self.lock:
+            self.message_queue.append(response)
 
     async def miner_driver(
         self,

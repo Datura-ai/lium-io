@@ -92,9 +92,32 @@ class ManualRentalInfo(BaseModel):
     gpu_count: int
 
 
+class CvmExpectations(BaseModel):
+    """What a rented CVM node must measure as, and what it was sold with (DAH-2581).
+
+    Produced by the backend from the customer's own order — the compose hash is the value it
+    derived and put in the launch request, so a node running anything else measures differently.
+    Sent per executor so the validator can check a renter CVM without a second round trip, and
+    absent for every node that is not one.
+
+    `gpu_model` and `gpu_count` are what the customer paid for. Checking them here is what makes
+    "the node delivered the hardware it sold" a verified statement rather than a billing record.
+    """
+
+    qemu: str | None = None
+    os_image_hash: str | None = None
+    compose_hash: str | None = None
+    gpu_model: str | None = None
+    gpu_count: int | None = None
+
+
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
+    # executor_id → what a rented CVM on that node must measure as. Empty for a backend that
+    # predates DAH-2581, which leaves renter verification with nothing to check rather than
+    # failing every node — the flag that enforces it is default-off for the same reason.
+    cvm_expectations: dict[str, CvmExpectations] = {}
     # Legacy single-filler map (one container per executor), kept for a backend that predates the
     # list field. Read via get_filler_containers' fallback, never directly.
     filler_containers_by_executor: dict[str, str] = {}  # executor_id -> filler_<FillerRun.id>

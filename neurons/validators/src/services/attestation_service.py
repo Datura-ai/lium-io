@@ -16,6 +16,7 @@ from fastapi import Depends
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import TDX_WHITELIST
+from services.cvm_whitelist import CvmWhitelistSource
 from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,13 @@ TDX_ATTESTED_EXECUTOR_SET = "tdx_attested_executors"
 # used to bound re-attestation cadence (G3: freshness = provably recent, not
 # every wave).
 TDX_LAST_ATTESTATION_EVENT_PREFIX = "tdx_last_attestation_event"
+
+# The separator the in-CVM agent joins GPU UUIDs with before digesting them (DAH-2579,
+# attest-agent/identity.py). A character no NVIDIA UUID can contain, so no two different GPU
+# sets can produce the same joined string. Reproduced here rather than imported: the agent is a
+# separate package that does not ship with the validator, and the value is part of the wire
+# contract, so a copy that drifts must fail a test rather than silently accept a wrong set.
+GPU_UUID_SEPARATOR = ","
 
 
 class AttestationError(RuntimeError):
@@ -76,10 +84,38 @@ class HostPolicyResult:
     attestation_digest: str | None = None
     tee_type: str | None = None
     gpu_attestation_passed: bool | None = None
+    # DAH-2581 — which report_data recipe the quote satisfied, so a rollout can be watched
+    # rather than guessed at: "how much of the fleet still answers v1" is the question that
+    # decides when v1 can be dropped from the accepted list.
+    report_data_recipe: str | None = None
+    # DAH-2582 — the hardware-bound identities this attestation produced. Every one of them is
+    # signed by something the node does not control, which is what makes a collision between
+    # two executors provable rather than merely suspicious.
+    instance_id: str | None = None
+    device_id: str | None = None
+    gpu_ueids: list[str] = field(default_factory=list)
+    # The SSH host key the quote's report_data is bound to. Two executors presenting the same
+    # one are the same sshd, and therefore the same machine — the cheapest of the four checks
+    # and the only one that works on a node whose GPU evidence never arrived.
+    pinned_host_key: str | None = None
 
     @property
     def attestation_passed(self) -> bool:
         return self.attestation_digest is not None and self.gpu_attestation_passed is not False
+
+    def identities(self) -> dict[str, list[str]]:
+        """The identities the uniqueness check compares across the fleet, by class.
+
+        Grouped by class rather than flattened so a collision names *what* collided — one GPU
+        answering for two executors is a different fraud from one CVM doing so, and the message
+        an operator reads should say which.
+        """
+        return {
+            "cvm_instance_id": [self.instance_id] if self.instance_id else [],
+            "cvm_device_id": [self.device_id] if self.device_id else [],
+            "gpu_ueid": list(self.gpu_ueids),
+            "pinned_host_key": [self.pinned_host_key] if self.pinned_host_key else [],
+        }
 
 
 class AttestationService:
@@ -105,6 +141,15 @@ class AttestationService:
         # Used for the minimal-G5 CVM ratchet and the re-attest cadence; both
         # degrade gracefully (log-only) when Redis is absent (e.g. unit tests).
         self.redis_service = redis_service
+        # DAH-2581 — the platform's signed catalog, refreshed on a timer and held in memory.
+        # One per service instance rather than a module global so a test can substitute one
+        # without leaking a manifest into every other test in the process.
+        self.whitelist_source = CvmWhitelistSource()
+        # DAH-2582 — the GPU ueids decoded from the last evidence set this service checked.
+        # Held on the instance because `_check_gpu_claims` is where the claims are already
+        # decoded and re-decoding them elsewhere would be a second place to keep in step. Read
+        # immediately by `prepare_host_policy`, never across executors.
+        self._last_gpu_ueids: list[str] = []
 
     def _should_verify(self, executor: ExecutorSSHInfo) -> bool:
         return self.enabled and bool(executor.tdx_quote)
@@ -117,28 +162,57 @@ class AttestationService:
     def nonce_enabled(self) -> bool:
         return self.enabled and settings.ENABLE_ATTESTATION_NONCE
 
-    async def maybe_issue_nonce(self, miner_hotkey: str) -> AttestationNonce | None:
+    async def maybe_issue_nonce(
+        self, miner_hotkey: str, *, rented: bool = False
+    ) -> AttestationNonce | None:
         """Mint a fresh attestation nonce when this miner is due for a
         nonce-bound attestation event.
 
-        Freshness is bounded by TDX_REATTEST_INTERVAL_SECONDS rather than
-        demanded every validation wave — GPU evidence collection is seconds per
-        node, so the cadence is load-shed (see remediation plan §4). The event
-        timestamp is recorded at issuance so a persistently failing executor
-        cannot force per-wave collection. Without Redis the interval cannot be
-        tracked, so a nonce is issued every wave (safe, just not load-shed).
+        Freshness is bounded by an interval rather than demanded every validation
+        wave — GPU evidence collection is seconds per node, so the cadence is
+        load-shed (see remediation plan §4). The event timestamp is recorded at
+        issuance so a persistently failing executor cannot force per-wave
+        collection. Without Redis the interval cannot be tracked, so a nonce is
+        issued every wave (safe, just not load-shed).
+
+        DAH-2581: a miner holding a rented CVM is re-attested on the far tighter
+        TDX_RENTAL_REATTEST_INTERVAL_SECONDS (900 s). A rental is exactly when a
+        node has something to gain from swapping the stack underneath a proof it
+        gave once at launch, and it is also when the customer is relying on that
+        proof — so the two cadences are sized for two different risks rather than
+        one being a compromise between them.
+
+        The cadence is per miner and the *tighter* one wins, because the key is
+        shared: a miner with one rented executor and ten idle ones gets the rental
+        cadence for all of them. That is the safe direction — it over-attests idle
+        nodes rather than under-attesting a rented one.
         """
         if not self.nonce_enabled:
             return None
+
+        interval = (
+            settings.TDX_RENTAL_REATTEST_INTERVAL_SECONDS
+            if rented
+            else settings.TDX_REATTEST_INTERVAL_SECONDS
+        )
 
         if self.redis_service is not None:
             key = f"{TDX_LAST_ATTESTATION_EVENT_PREFIX}:{miner_hotkey}"
             try:
                 raw = await self.redis_service.get(key)
                 last = float(raw.decode() if isinstance(raw, bytes) else raw) if raw else 0.0
-                if (time.time() - last) < settings.TDX_REATTEST_INTERVAL_SECONDS:
+                if (time.time() - last) < interval:
                     return None
                 await self.redis_service.set(key, str(time.time()))
+                logger.info(_m(
+                    "Issuing a nonce-bound attestation event",
+                    extra=get_extra_info({
+                        "miner_hotkey": miner_hotkey,
+                        "rented": rented,
+                        "interval_seconds": interval,
+                        "since_last_seconds": int(time.time() - last) if last else None,
+                    }),
+                ))
             except Exception as exc:
                 logger.warning(_m(
                     "Failed to read/record attestation-event cadence; issuing nonce",
@@ -151,6 +225,97 @@ class AttestationService:
         digest = hashlib.sha256(self.REPORT_PREFIX +
                                 host_key.encode("utf-8")).hexdigest()
         return f"0x{digest}"
+
+    # ------------------------------------------------------------------
+    # DAH-2581 — report_data recipes, accepted in lockstep
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def gpu_uuid_digest(uuids: list[str]) -> bytes:
+        """The digest the in-CVM agent takes over the GPU set it holds.
+
+        Sorted, so it depends on which GPUs are present rather than on the order NVML happened
+        to enumerate them in — an ordering that varies with PCI topology and would otherwise
+        make the same node attest differently after a reboot. A CVM with no GPUs digests to the
+        sha256 of the empty string rather than to a special case, so every quote carries a GPU
+        binding of the same shape.
+
+        This mirrors `attest-agent/identity.py:gpu_uuid_digest`. The two must agree exactly or a
+        correct node fails verification, which is why the separator is pinned as a constant.
+        """
+        return hashlib.sha256(GPU_UUID_SEPARATOR.join(sorted(uuids)).encode()).digest()
+
+    def _bound_gpu_digest(self, executor: ExecutorSSHInfo) -> bytes | None:
+        """The GPU digest to fold into the v2 identity, or None if it cannot be established.
+
+        The node supplies it, so it is never trusted on its own — and it does not need to be.
+        The digest is inside the hardware-signed report_data, so a node that supplies one set
+        and holds another produces a quote whose identity half this validator will not match.
+        What the value is *for* is telling the validator which set to expect; what makes it
+        evidence is that the hardware signed it.
+
+        `scraped_uuids` is the independent check, applied when this validator has already
+        collected the node's GPU UUIDs. A mismatch means the claim and the machine disagree,
+        which is refused rather than papered over — the whole point of FR-G6 is that a node
+        cannot claim GPUs it does not have.
+        """
+        claimed = (executor.gpu_uuid_digest or "").strip().lower()
+        if not claimed:
+            return None
+        try:
+            return bytes.fromhex(claimed)
+        except ValueError:
+            logger.warning(_m(
+                "Ignoring a GPU UUID digest that is not hex",
+                extra=get_extra_info({
+                    "executor": f"{executor.address}:{executor.port}",
+                    "gpu_uuid_digest": claimed,
+                }),
+            ))
+            return None
+
+    def _expected_identity_digests(
+        self,
+        executor: ExecutorSSHInfo,
+    ) -> list[tuple[str, bytes]]:
+        """Every identity half this validator will accept, as (recipe, 32 bytes).
+
+        A recipe change is a lockstep change — the node produces one value and the validator
+        compares against it — so a validator that accepted only the new one would fail every
+        node in the fleet the moment it shipped. Both are accepted through the transition and v1
+        is dropped from the configured list only once every node produces v2.
+
+            v1  sha256("SSH_HOST_KEY:" | host_key)
+            v2  sha256("SSH_HOST_KEY:" | host_key | gpu_uuid_digest)
+
+        v2 is the same identity material with the GPU set folded in, which is what makes "which
+        GPUs is this CVM holding" a hardware-signed claim instead of an asserted one. The renter
+        form substitutes the agent's TLS public key for the SSH host key, on the same shape, and
+        is produced by `attest-agent/identity.py`.
+        """
+        material = self.REPORT_PREFIX + (executor.ssh_host_key or "").encode("utf-8")
+        digests: list[tuple[str, bytes]] = []
+        for recipe in settings.get_report_data_recipes():
+            if recipe == "v1":
+                digests.append(("v1", hashlib.sha256(material).digest()))
+            elif recipe == "v2":
+                gpu_digest = self._bound_gpu_digest(executor)
+                if gpu_digest is None:
+                    # Not a failure: a node that has not started producing v2 simply has nothing
+                    # to bind. It still has to satisfy some accepted recipe, so this narrows the
+                    # accepted set rather than widening it.
+                    logger.info(_m(
+                        "Skipping report_data recipe v2: this executor supplied no GPU digest",
+                        extra=get_extra_info({"executor": f"{executor.address}:{executor.port}"}),
+                    ))
+                    continue
+                digests.append(("v2", hashlib.sha256(material + gpu_digest).digest()))
+            else:
+                logger.warning(_m(
+                    "Ignoring an unknown report_data recipe",
+                    extra=get_extra_info({"recipe": recipe}),
+                ))
+        return digests
 
     async def _call_verifier(self, quote_json: str, executor: ExecutorSSHInfo) -> dict:
         if not self.verifier_url:
@@ -193,14 +358,46 @@ class AttestationService:
         except ValueError:
             return None
 
-    async def _check_whitelist(self, compose_hash: str, os_image_hash: str, executor: ExecutorSSHInfo) -> bool:
+    async def _check_whitelist(
+        self,
+        compose_hash: str,
+        os_image_hash: str,
+        executor: ExecutorSSHInfo,
+        kind: str | None = None,
+    ) -> bool:
         """Check the attestation digest against the whitelist.
 
-        G2: compose hashes carry a monotonic release version; acceptance requires
-        the version to be at/above TDX_MINIMUM_COMPOSE_VERSION so a below-floor
-        (rotated-back or known-bad) runner release is rejected immediately
-        instead of aging out of a rolling window.
+        DAH-2581: the platform's signed catalog is consulted first when this validator holds
+        one. It is the same document every CVM host verifies before launching, so "what a host
+        may run" and "what this validator accepts" stop being two lists that drift — and a
+        revocation reaches both without a redeploy.
+
+        The static list stays as the fallback, deliberately. A validator that could not reach
+        the backend would otherwise reject every CVM in the fleet, which is a far worse outage
+        than accepting a slightly stale set; the catalog's own expiry bounds how stale.
+
+        G2: compose hashes in the static list carry a monotonic release version; acceptance
+        requires the version to be at/above TDX_MINIMUM_COMPOSE_VERSION so a below-floor
+        (rotated-back or known-bad) runner release is rejected immediately instead of aging out
+        of a rolling window. The catalog carries the same idea as its own floors, applied by the
+        backend before the manifest is signed.
         """
+        catalog = await self._catalog()
+        if catalog is not None:
+            approved = catalog.approves(
+                os_image_hash=os_image_hash, compose_hash=compose_hash, kind=kind
+            )
+            logger.info(_m(
+                "Checked the attestation digest against the signed CVM catalog",
+                extra=get_extra_info({
+                    "executor": f"{executor.address}:{executor.port}",
+                    "serial": catalog.serial,
+                    "kind": kind,
+                    "approved": approved,
+                }),
+            ))
+            return approved
+
         if os_image_hash not in TDX_WHITELIST["OS_IMAGE_HASH"]:
             return False
 
@@ -222,6 +419,20 @@ class AttestationService:
             return False
 
         return True
+
+    async def _catalog(self):
+        """The signed CVM catalog in force, or None when this validator has none.
+
+        None is the honest answer for three different situations — the feature is off, the
+        backend has never been reachable, or the manifest in hand has expired — and all three
+        mean the same thing to the caller: fall back to the static list rather than approve
+        nothing.
+        """
+        source = self.whitelist_source
+        if source is None or not source.enabled:
+            return None
+        await source.refresh()
+        return source.current()
 
     # ------------------------------------------------------------------
     # G4 — TCB status / advisory enforcement
@@ -283,10 +494,16 @@ class AttestationService:
     def _validate_verifier_response(
         self,
         verifier_payload: dict,
-        expected_report_hex: str,
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None = None,
-    ) -> None:
+    ) -> str | None:
+        """Check the verifier's answer. Returns which report_data recipe matched.
+
+        The identity half is compared as the whole first 32 bytes rather than as a prefix. Both
+        spellings accept the same quotes today — a sha256 is exactly 32 bytes — but "the first
+        32 bytes are this digest" is what the recipe actually says, and a prefix comparison
+        would keep passing if a future recipe shortened it.
+        """
         details = verifier_payload.get("details")
         if not isinstance(details, dict):
             raise AttestationError(
@@ -295,16 +512,16 @@ class AttestationService:
         is_valid = bool(verifier_payload.get("is_valid"))
         quote_verified = bool(details.get("quote_verified"))
 
-        expected_bytes = self._normalise_report_data(expected_report_hex)
         returned_bytes = self._normalise_report_data(
             details.get("report_data"))
-        report_matches = (
-            expected_bytes is not None
-            and returned_bytes is not None
-            and returned_bytes.startswith(expected_bytes)
-        )
+        matched_recipe: str | None = None
+        if returned_bytes is not None and len(returned_bytes) >= 32:
+            for recipe, expected in self._expected_identity_digests(executor):
+                if returned_bytes[:32] == expected:
+                    matched_recipe = recipe
+                    break
 
-        if not (is_valid and quote_verified and report_matches):
+        if not (is_valid and quote_verified and matched_recipe is not None):
             raise AttestationError(
                 f"Verifier rejected TDX quote for executor {executor.address}:{executor.port}"
             )
@@ -342,6 +559,8 @@ class AttestationService:
 
         # G4 — enforce TCB/advisory posture (warn-only unless ENABLE_TCB_ENFORCEMENT).
         self._enforce_tcb(details, executor)
+
+        return matched_recipe
 
     # ------------------------------------------------------------------
     # G1 — NVIDIA GPU confidential-compute attestation (verification side)
@@ -396,6 +615,7 @@ class AttestationService:
         are asserted when present.
         """
         failures: list[str] = []
+        self._last_gpu_ueids = []
 
         if not (isinstance(nras_response, list) and nras_response
                 and isinstance(nras_response[0], list | tuple) and len(nras_response[0]) >= 2):
@@ -416,6 +636,14 @@ class AttestationService:
             if not isinstance(gpu_token, str):
                 continue
             claims = self._decode_jwt_claims(gpu_token)
+            # DAH-2581/2582: the ueid is this GPU's hardware-attested identity — the one
+            # identifier in the whole evidence set that a node cannot choose. Collected here
+            # because it is where the claims are already decoded, and used by the cross-node
+            # uniqueness check: the same ueid appearing under two executors is one GPU
+            # answering for two, and the evidence proving it is signed.
+            ueid = claims.get("ueid")
+            if isinstance(ueid, str) and ueid:
+                self._last_gpu_ueids.append(ueid)
             if claims.get("measres") not in (None, "success"):
                 failures.append(f"gpu_att_failed:{gpu_name}:measres")
             if expected_nonce_hex:
@@ -546,8 +774,10 @@ class AttestationService:
         self,
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None = None,
-    ) -> tuple[str | None, str | None]:
-        """Verify TDX quote and return (attestation_digest, tee_type).
+        expectations=None,
+        kind: str | None = None,
+    ) -> tuple[str | None, str | None, dict]:
+        """Verify TDX quote and return (attestation_digest, tee_type, facts).
 
         Validates the quote string, calls the external verifier, extracts
         os_image_hash / compose_hash from the response, and checks the whitelist
@@ -562,9 +792,8 @@ class AttestationService:
                 f"Executor {executor.address}:{executor.port} provided empty TDX quote"
             )
 
-        expected_report = self._expected_report_data(executor.ssh_host_key)
         verifier_payload = await self._call_verifier(quote.strip(), executor)
-        self._validate_verifier_response(verifier_payload, expected_report, executor, nonce=nonce)
+        recipe = self._validate_verifier_response(verifier_payload, executor, nonce=nonce)
 
         details = verifier_payload.get("details", {})
         app_info = details.get("app_info", {})
@@ -596,7 +825,10 @@ class AttestationService:
                 )
 
             is_whitelisted = await self._check_whitelist(
-                compose_hash=compose_hash, os_image_hash=os_image_hash, executor=executor
+                compose_hash=compose_hash,
+                os_image_hash=os_image_hash,
+                executor=executor,
+                kind=kind,
             )
             if not is_whitelisted:
                 raise AttestationError(
@@ -612,12 +844,87 @@ class AttestationService:
                 }),
             ))
 
+        self._assert_renter_expectations(details, expectations, executor)
+
         logger.info(_m(
             "TDX quote verified",
-            extra=get_extra_info({"executor": f"{executor.address}:{executor.port}"}),
+            extra=get_extra_info({
+                "executor": f"{executor.address}:{executor.port}",
+                "report_data_recipe": recipe,
+                "instance_id": app_info.get("instance_id"),
+            }),
         ))
 
-        return attestation_digest, tee_type
+        return attestation_digest, tee_type, {
+            "report_data_recipe": recipe,
+            "instance_id": app_info.get("instance_id"),
+            "device_id": app_info.get("device_id"),
+        }
+
+    def _assert_renter_expectations(
+        self,
+        details: dict,
+        expectations,
+        executor: ExecutorSSHInfo,
+    ) -> None:
+        """Check a rented CVM against what was actually sold (DAH-2581).
+
+        Three things, and they come from three different places, which is the point:
+
+          the OS image   is in the platform's catalog — checked by `_check_whitelist`
+          the compose    is the hash the backend DERIVED for this customer's order, so a node
+                         running a different stack measures differently and is caught here
+          the GPUs       are the model and count the customer paid for
+
+        The GPU check is what turns "the node delivered the hardware it sold" from a billing
+        record into a verified statement. It reads the count from the attested evidence rather
+        than from the node's scraped specs: specs are asserted by software the host controls,
+        while the ueid list came out of signed GPU evidence.
+
+        Enforcement is behind a flag. Off, every mismatch is logged with the same detail and
+        nothing fails — which is how the blast radius gets measured before it is taken.
+        """
+        if expectations is None:
+            return
+
+        app_info = details.get("app_info", {}) or {}
+        mismatches: list[str] = []
+
+        expected_compose = getattr(expectations, "compose_hash", None)
+        if expected_compose and app_info.get("compose_hash") != expected_compose:
+            mismatches.append(
+                f"compose_hash: sold {expected_compose}, measured {app_info.get('compose_hash')}"
+            )
+
+        expected_image = getattr(expectations, "os_image_hash", None)
+        if expected_image and app_info.get("os_image_hash") != expected_image:
+            mismatches.append(
+                f"os_image_hash: sold {expected_image}, measured {app_info.get('os_image_hash')}"
+            )
+
+        expected_count = getattr(expectations, "gpu_count", None)
+        if expected_count is not None and self._last_gpu_ueids:
+            attested = len(self._last_gpu_ueids)
+            if attested != expected_count:
+                mismatches.append(f"gpu_count: sold {expected_count}, attested {attested}")
+
+        if not mismatches:
+            return
+
+        extra = get_extra_info({
+            "executor": f"{executor.address}:{executor.port}",
+            "executor_uuid": executor.uuid,
+            "reason": "renter_cvm_mismatch",
+            "mismatches": mismatches,
+            "enforced": settings.ENABLE_RENTER_CVM_VERIFICATION,
+        })
+        if settings.ENABLE_RENTER_CVM_VERIFICATION:
+            logger.warning(_m("Renter CVM does not match what was sold", extra=extra))
+            raise AttestationError(
+                f"Renter CVM on executor {executor.address}:{executor.port} does not match the "
+                f"order it is serving — " + "; ".join(mismatches)
+            )
+        logger.warning(_m("Renter CVM mismatch (not enforced)", extra=extra))
 
     async def _record_attested_executor(self, executor: ExecutorSSHInfo) -> None:
         """Ratchet: remember that this executor is a CVM (minimal-G5)."""
@@ -634,7 +941,11 @@ class AttestationService:
     async def _reject_omitted_quote_if_ratcheted(self, executor: ExecutorSSHInfo) -> None:
         """Minimal-G5 fail-closed: a previously attested executor cannot silently
         drop its quote to skip verification (host-key-only bypass)."""
-        if not (self.enabled and settings.ENABLE_TCB_ENFORCEMENT):
+        # DAH-2582 gives this its own flag. It was previously reachable only under
+        # ENABLE_TCB_ENFORCEMENT, which bundles it with a much broader posture change — so a
+        # fleet that wanted "a CVM may not stop being one" had to also take every TCB and
+        # advisory rejection at the same time. Either flag now arms it.
+        if not (self.enabled and (settings.ENABLE_TCB_ENFORCEMENT or settings.ENABLE_CVM_QUOTE_REQUIRED)):
             return
         if executor.tdx_quote or self.redis_service is None:
             return
@@ -701,6 +1012,8 @@ class AttestationService:
         self,
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None = None,
+        expectations=None,
+        kind: str | None = None,
     ) -> HostPolicyResult:
         """Verify TDX (and, when supplied, NVIDIA GPU) attestation and build the
         SSH known_hosts policy for the executor.
@@ -728,11 +1041,21 @@ class AttestationService:
 
         attestation_digest, tee_type = None, None
         gpu_attestation_passed: bool | None = None
+        facts: dict = {}
+        gpu_ueids: list[str] = []
         if should_verify:
-            attestation_digest, tee_type = await self._verify_tdx(executor, nonce=nonce)
+            # GPU evidence is verified BEFORE the renter expectations are checked, because the
+            # attested GPU count is one of the things they compare against — and the ueids only
+            # exist once the evidence has been through NRAS. So the TDX quote is checked first
+            # (it establishes the stack), then the GPUs, then the two together against the order.
+            gpu_attestation_passed = await self._verify_gpu(executor, nonce)
+            gpu_ueids = list(self._last_gpu_ueids)
+
+            attestation_digest, tee_type, facts = await self._verify_tdx(
+                executor, nonce=nonce, expectations=expectations, kind=kind
+            )
             await self._record_attested_executor(executor)
 
-            gpu_attestation_passed = await self._verify_gpu(executor, nonce)
             # tee_type only claims verified GPU CC when the evidence was bound
             # to the validator-issued challenge (an unbound pass is replayable).
             if gpu_attestation_passed is True and nonce is not None:
@@ -744,4 +1067,11 @@ class AttestationService:
             attestation_digest=attestation_digest,
             tee_type=tee_type,
             gpu_attestation_passed=gpu_attestation_passed,
+            report_data_recipe=facts.get("report_data_recipe"),
+            instance_id=facts.get("instance_id"),
+            device_id=facts.get("device_id"),
+            gpu_ueids=gpu_ueids,
+            # Only meaningful once a quote verified. Before that the host key is merely what the
+            # node claimed; after it, it is what the hardware signed over.
+            pinned_host_key=executor.ssh_host_key if attestation_digest else None,
         )

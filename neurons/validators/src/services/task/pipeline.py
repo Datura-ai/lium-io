@@ -114,6 +114,11 @@ class ContextState:
     # serves STALE content under an unchanged tag); None = not compared this cycle
     # (not cached / no backend digest / unreadable RepoDigest — strict fail-open).
     recommended_image_digest_match: bool | None = None
+    # DAH-2582 — the hardware-bound identities this cycle's attestation established, by class
+    # (gpu_ueid / cvm_instance_id / cvm_device_id / pinned_host_key). Empty for a node that is
+    # not a CVM or did not attest, which the uniqueness check reads as "nothing to compare"
+    # rather than as "unique".
+    attested_identities: dict[str, list[str]] = field(default_factory=dict)
 
 
 class CheckResult(BaseModel):

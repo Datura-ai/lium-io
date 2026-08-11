@@ -83,6 +83,13 @@ class LaunchConfig:
 
     dstack_scripts_dir: Path | None = None
     run_dir: Path | None = None
+    # Where a renter order's compose and scripts are staged before they are measured (DAH-2580).
+    # Daemon-owned, defaulted off `state_dir` for the same reason the catalog's working files
+    # are: a host that named its state directory has already said where these go, and another
+    # required setting is another chance to point one of them at a directory Ansible also writes.
+    # Deliberately NOT under `run_dir`: that directory is scanned for stray CVM disks, and a
+    # staging directory appearing there would read as a guest nobody has a record of.
+    renter_dir: Path | None = None
     key_provider_port: int = DEFAULT_KEY_PROVIDER_PORT
     launch_timeout_seconds: int = DEFAULT_LAUNCH_TIMEOUT_SECONDS
     teardown_timeout_seconds: int = DEFAULT_TEARDOWN_TIMEOUT_SECONDS
@@ -221,11 +228,12 @@ def _as_bool(value, key: str) -> bool:
     raise ConfigError(f"{key} must be a boolean, got {value!r}")
 
 
-def _load_launch(table: dict) -> LaunchConfig:
+def _load_launch(table: dict, state_dir: Path) -> LaunchConfig:
     """Read the DAH-2576 launch settings. Absent is fine; malformed is fatal."""
     launch = LaunchConfig(
         dstack_scripts_dir=_as_path(_get(table, "dstack_scripts_dir")),
         run_dir=_as_path(_get(table, "run_dir")),
+        renter_dir=_as_path(_get(table, "renter_dir")) or state_dir / "renter",
         key_provider_port=_as_int(
             _get(table, "key_provider_port", DEFAULT_KEY_PROVIDER_PORT), "key_provider_port"
         ),
@@ -384,6 +392,6 @@ def load_config(path: Path | None = None) -> Config:
         tls_key=tls_key,
         skew_seconds=skew_seconds,
         max_body_bytes=max_body_bytes,
-        launch=_load_launch(table),
+        launch=_load_launch(table, state_dir),
         catalog=_load_catalog(table, state_dir),
     )

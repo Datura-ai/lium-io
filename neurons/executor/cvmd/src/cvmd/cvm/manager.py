@@ -21,7 +21,7 @@ from pathlib import Path
 
 from cvmd import catalog
 from cvmd.config import LaunchConfig
-from cvmd.cvm import measure, ports, release, sshkey, supervisor
+from cvmd.cvm import measure, ports, release, renter, sshkey, supervisor
 from cvmd.cvm.instance import Instance, InstanceStore, PortReport, now_iso
 from cvmd.cvm.switching import RELEASED, TIMED_OUT, SwitchRecord, SwitchStore
 from cvmd.dstack.loader import DStackUnavailable, load_dstack
@@ -136,6 +136,8 @@ class CvmManager:
         if not self.manages_cvms:
             return self._store.state
 
+        self._sweep_staging()
+
         if self._instances.load_error:
             return self._fail(
                 f"{self._instances.load_error}; refusing to assume this node is idle while a "
@@ -182,6 +184,22 @@ class CvmManager:
         run_dir = self._config.run_dir
         return supervisor.vm_directories(run_dir) if run_dir else []
 
+    def _sweep_staging(self) -> None:
+        """Remove every renter staging directory left on this host.
+
+        Safe to do unconditionally, and only ever runs at reconciliation. A launch discards its
+        own staging directory the moment the measurement passes, and `run_instance` never reads
+        it — so anything still here belongs to a launch that was killed partway, and it is a
+        customer's compose sitting in a directory with no CVM to justify it.
+        """
+        renter_dir = self._config.renter_dir
+        if renter_dir is None or not renter_dir.is_dir():
+            return
+        for child in sorted(renter_dir.iterdir()):
+            if child.is_dir():
+                logger.info("removing the renter staging directory %s left by an earlier run", child)
+                renter.discard(child)
+
     def _settle(self, state: NodeState) -> NodeState:
         """Move to `state`, clearing any stale error, going the long way if the edge is illegal.
 
@@ -222,30 +240,111 @@ class CvmManager:
     # ------------------------------------------------------------------ create
 
     def create(self, *, kind: str, triple: Triple) -> dict:
-        """Launch a CVM and return its launch report. Raises LaunchFailure on any refusal."""
-        config = self._config
-        missing = config.missing()
+        """Launch a catalog-pinned CVM and return its report. Raises LaunchFailure on refusal."""
+        dstack, mappings = self._preflight()
+        artifact = self._resolve(kind, triple)
+        return self._launch(
+            kind=kind,
+            triple=triple,
+            artifact=artifact,
+            dstack=dstack,
+            mappings=mappings,
+            instance_id=str(uuid.uuid4()),
+        )
+
+    def create_renter(self, order: renter.RenterOrder) -> dict:
+        """Launch a CVM for one customer order (DAH-2580).
+
+        The same path as `create`, with the compose staged from the order instead of read out
+        of the manifest — see `cvm/renter.py` for why that does not weaken what authorizes the
+        launch. The catalog still decides the image and the QEMU build, and the measurement gate
+        still refuses anything that does not hash to the `compose_hash` the request named.
+
+        The staging directory is removed as soon as the measurement has passed, on every path.
+        `setup_instance` is the only thing that ever reads it — `run_instance` works from
+        `app-compose.json` — so from that moment the customer's compose has no reason to remain
+        readable in a plain directory on a host they do not control.
+        """
+        if self._config.renter_dir is None:
+            raise LaunchFailure(503, "this host has no launch configuration for renter_dir")
+
+        dstack, mappings = self._preflight()
+        base = self._resolve_base(order)
+        return self._launch(
+            kind=KIND_RENTER,
+            triple=Triple(
+                qemu=order.qemu,
+                os_image_hash=order.os_image_hash,
+                compose_hash=order.compose_hash,
+            ),
+            dstack=dstack,
+            mappings=mappings,
+            instance_id=str(uuid.uuid4()),
+            order=order,
+            base=base,
+            rental_id=order.rental_id,
+        )
+
+    def _preflight(self):
+        """Everything that must hold before a launch of any kind is attempted.
+
+        Ordered so that the cheap, host-wide refusals come first: a node that is not configured,
+        cannot run the launcher, or is already holding a guest should say so before an order is
+        written anywhere.
+        """
+        missing = self._config.missing()
         if missing:
             raise LaunchFailure(
                 503, f"this host has no launch configuration for {', '.join(missing)}"
             )
 
         dstack = self._load_dstack()
-        artifact = self._resolve(kind, triple)
         mappings = self._parse_ports()
-
         self._assert_ssh_port_is_forwarded(mappings)
-
         self._assert_node_is_free()
         try:
             ports.assert_free(mappings)
         except ports.PortError as exc:
             raise LaunchFailure(409, str(exc)) from exc
+        return dstack, mappings
 
+    def _launch(
+        self,
+        *,
+        kind: str,
+        triple: Triple,
+        dstack,
+        mappings: list[ports.PortMapping],
+        instance_id: str,
+        artifact: catalog.Artifact | None = None,
+        order: renter.RenterOrder | None = None,
+        base: catalog.Artifact | None = None,
+        rental_id: str | None = None,
+    ) -> dict:
+        """prepare -> MEASURE -> launch -> confirm.
+
+        A renter order is staged **here**, after `_enter_launching`, and that ordering is
+        load-bearing rather than tidy. `_enter_launching` can run reconciliation — a node left
+        FAILED by a previous refusal has to be re-derived before it may launch again — and
+        reconciliation sweeps stale staging directories. Staging before it therefore writes a
+        compose that the very next line deletes, and the launch fails with the file it just
+        wrote reported missing. Found on au11, not in a unit test: the sweep only fires when the
+        node reaches `_enter_launching` in a state that needs reconciling.
+        """
         self._enter_launching()
 
-        instance_id = str(uuid.uuid4())
-        vm_dir = config.run_dir / instance_id
+        staged_dir: Path | None = None
+        if order is not None:
+            staged_dir = self._config.renter_dir / instance_id
+            try:
+                artifact = renter.stage(order, base=base, directory=staged_dir)
+            except catalog.CatalogError as exc:
+                self._store.transition(
+                    NodeState.FAILED, last_error=f"staging this order failed: {exc}"
+                )
+                raise LaunchFailure(500, f"staging this order failed: {exc}") from exc
+
+        vm_dir = self._config.run_dir / instance_id
         try:
             self._prepare(dstack, artifact=artifact, vm_dir=vm_dir)
             measured = self._measure(dstack, artifact=artifact, vm_dir=vm_dir, triple=triple)
@@ -254,15 +353,18 @@ class CvmManager:
             # so removing it returns the node to exactly where it was.
             self._discard(vm_dir)
             raise
+        finally:
+            renter.discard(staged_dir)
 
         instance = self._start(
-            dstack_scripts_dir=config.dstack_scripts_dir,
+            dstack_scripts_dir=self._config.dstack_scripts_dir,
             artifact=artifact,
             instance_id=instance_id,
             vm_dir=vm_dir,
             mappings=mappings,
             measured=measured,
             kind=kind,
+            rental_id=rental_id,
         )
         return self._await_ready(instance, mappings)
 
@@ -291,6 +393,23 @@ class CvmManager:
                 qemu=triple.qemu,
                 os_image_hash=triple.os_image_hash,
                 compose_hash=triple.compose_hash,
+            )
+        except catalog.TripleNotFound as exc:
+            raise LaunchFailure(422, str(exc)) from exc
+
+    def _resolve_base(self, order: renter.RenterOrder) -> catalog.Artifact:
+        """The catalog entry approving this order's OS image and QEMU build.
+
+        Same two statuses and the same distinction as `_resolve`: 503 is "this host has no
+        catalog it can trust right now", 422 is "the catalog is fine and does not approve that".
+        """
+        try:
+            artifacts = self._catalog.artifacts()
+        except catalog.CatalogError as exc:
+            raise LaunchFailure(503, str(exc)) from exc
+        try:
+            return catalog.resolve_base(
+                artifacts, qemu=order.qemu, os_image_hash=order.os_image_hash
             )
         except catalog.TripleNotFound as exc:
             raise LaunchFailure(422, str(exc)) from exc
@@ -408,6 +527,7 @@ class CvmManager:
         mappings: list[ports.PortMapping],
         measured: measure.Measurements,
         kind: str,
+        rental_id: str | None = None,
     ) -> Instance:
         try:
             pid = supervisor.spawn(
@@ -443,6 +563,7 @@ class CvmManager:
                     )
                     for m in mappings
                 ],
+                rental_id=rental_id,
             )
         )
 

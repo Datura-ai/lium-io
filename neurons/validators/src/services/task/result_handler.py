@@ -156,6 +156,18 @@ class ResultHandler:
         # Rides executor.specs to the backend like tdx_attestation_passed.
         if context.gpu_attestation_passed is not None:
             specs["gpu_attestation_passed"] = context.gpu_attestation_passed
+        # DAH-2582 — the hardware-bound identities this attestation established. Published so
+        # the backend can dedup on attested identity rather than only on the GPU UUIDs it
+        # scrapes: a scraped UUID is asserted by software on the host, while these came out of
+        # signed evidence, so the backend's duplicate detection stops depending on the honesty
+        # of the node it is checking. Omitted entirely for a node that attested nothing, which
+        # keeps a non-CVM executor's specs exactly as they were.
+        if context.state.attested_identities:
+            specs["attested_identities"] = {
+                identity_class: list(values)
+                for identity_class, values in context.state.attested_identities.items()
+                if values
+            }
         # FP32 TFLOPS metrics (device-0 representative), captured by CapabilityCheck.
         # Only added when present; absent → fail-safe (TFLOPS disabled/failed). The
         # backend types this nested object as MachineSpecs.gpu_metrics.

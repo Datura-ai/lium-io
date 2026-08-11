@@ -23,6 +23,7 @@ from cvmd.catalog.artifacts import (
     assert_hex64,
     assert_unambiguous,
     resolve,
+    resolve_base,
 )
 from cvmd.catalog.client import FetchError, fetch, refresh_once
 from cvmd.catalog.manifest import Entry, Manifest, assert_not_rollback, parse_manifest
@@ -45,4 +46,5 @@ __all__ = [
     "parse_manifest",
     "refresh_once",
     "resolve",
+    "resolve_base",
 ]
