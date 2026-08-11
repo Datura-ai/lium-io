@@ -263,35 +263,31 @@ class VastManager:
 
 
 def _parse_self_test(raw_text: str) -> dict:
-    # tolerate CLI noise around the JSON verdict
+    # real CLI verdict (seen live on 147139): top-level success/failure_code/phase, checks
+    # as a list of {id, status: pass|fail|info, summary}; tolerate CLI noise around the JSON
     try:
         raw = json.loads(raw_text)
     except ValueError:
         start = raw_text.find("{")
-        if start < 0:
-            return {"passed": False, "checks": [], "parse_error": "no JSON in self-test output"}
-        try:
-            raw = json.loads(raw_text[start:])
-        except ValueError:
-            return {"passed": False, "checks": [], "parse_error": "unparseable self-test output"}
-    checks = []
-    raw_checks = raw.get("checks", {})
-    if isinstance(raw_checks, dict):
-        for name, value in raw_checks.items():
-            if isinstance(value, dict):
-                checks.append({"name": name, "passed": bool(value.get("passed")), "detail": value.get("detail")})
-            else:
-                checks.append({"name": name, "passed": bool(value), "detail": None})
-    elif isinstance(raw_checks, list):
-        for item in raw_checks:
-            checks.append({
-                "name": item.get("name", "?"),
-                "passed": bool(item.get("passed")),
-                "detail": item.get("detail"),
-            })
-    failure_code = raw.get("failure_code")
-    passed = bool(raw.get("success", failure_code is None and all(c["passed"] for c in checks)))
-    result = {"passed": passed, "checks": checks}
-    if failure_code:
-        result["failure_code"] = failure_code
+        raw = None
+        if start >= 0:
+            try:
+                raw = json.loads(raw_text[start:])
+            except ValueError:
+                raw = None
+        if raw is None:
+            return {"passed": False, "checks": [], "parse_error": "no parseable JSON in self-test output"}
+    checks = [
+        {
+            "name": c.get("id") or c.get("title", "?"),
+            "status": c.get("status", "?"),
+            "detail": c.get("summary"),
+        }
+        for c in raw.get("checks") or []
+        if isinstance(c, dict)
+    ]
+    result = {"passed": bool(raw.get("success")), "checks": checks}
+    for key in ("failure_code", "phase", "stage", "reason"):
+        if raw.get(key):
+            result[key] = raw[key]
     return result

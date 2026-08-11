@@ -1,9 +1,11 @@
+import json
 import subprocess
 from unittest.mock import Mock
 
 from vast_api.config import VastSettings
 from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
+from vast_api.service import _parse_self_test
 from vast_api.stages import SETUP_STAGE_NAMES, Stage, build_setup_ladder, run_ladder
 
 
@@ -121,3 +123,35 @@ def test_dump_dmi_writes_content_in_place(tmp_path):
     assert ["dmidecode", "--dump-bin", tmp] in calls  # dump to temp, never the target
     copy_call = next(args for args in calls if args[0] == "sh")
     assert f"cat {tmp} > {settings.DMI_BIN_HOST}" in copy_call[2]
+
+
+def test_parse_self_test_real_cli_shape():
+    # trimmed from a live verdict on machine 147139 (2026-08-11)
+    raw = json.dumps({
+        "success": False,
+        "failure_code": "preflight_requirements_failed",
+        "phase": "preflight",
+        "checks": [
+            {"id": "cuda.version", "status": "pass", "summary": "CUDA version: actual 12.8 CUDA, required >= 11.8 CUDA"},
+            {"id": "reliability", "status": "fail", "summary": "Reliability: actual 0.6684413 ratio, required > 0.9 ratio"},
+            {"id": "network.direct_ports.recommended_max", "status": "info", "summary": "Recommended max ports"},
+        ],
+    })
+
+    result = _parse_self_test("some CLI noise\n" + raw)
+
+    assert result["passed"] is False
+    assert result["failure_code"] == "preflight_requirements_failed"
+    assert [(c["name"], c["status"]) for c in result["checks"]] == [
+        ("cuda.version", "pass"),
+        ("reliability", "fail"),
+        ("network.direct_ports.recommended_max", "info"),
+    ]
+
+
+def test_parse_self_test_unparseable_output():
+    result = _parse_self_test("no json here at all")
+
+    assert result["passed"] is False
+    assert result["checks"] == []
+    assert "parse_error" in result
