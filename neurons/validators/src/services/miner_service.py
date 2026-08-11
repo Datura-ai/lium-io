@@ -59,7 +59,7 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.attestation_service import AttestationService
+from services.attestation_service import TDX_ATTESTED_EXECUTOR_SET, AttestationService
 from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
@@ -195,6 +195,25 @@ class MinerService:
         pubkey = self._normalize_public_key(public_key)
         return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce)).hex()}"
 
+    @staticmethod
+    def _miner_holds_a_rental(
+        payload: MinerJobRequestPayload, rented_data: RentedExecutorsResponse | None
+    ) -> bool:
+        """Does this miner currently hold a rented executor? (DAH-2581)
+
+        Decides which re-attestation cadence applies. Per miner rather than per executor
+        because the nonce is minted once per miner and fans out to all of its executors — so a
+        miner with one rented node and ten idle ones gets the rental cadence for all of them.
+        That is the safe direction: it over-attests idle nodes rather than under-attesting a
+        rented one.
+        """
+        if rented_data is None:
+            return False
+        return any(
+            executor.miner_hotkey == payload.miner_hotkey and executor.pods
+            for executor in rented_data.executors.values()
+        )
+
     async def request_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
@@ -256,7 +275,8 @@ class MinerService:
                 # must echo in TDX report_data[32:64] / GPU evidence. The nonce is
                 # covered by validator_signature so it cannot be stripped or swapped.
                 attestation_nonce = await self.attestation_service.maybe_issue_nonce(
-                    payload.miner_hotkey
+                    payload.miner_hotkey,
+                    rented=self._miner_holds_a_rental(payload, rented_data),
                 )
                 nonce_hex = attestation_nonce.value_hex if attestation_nonce else None
 
@@ -838,8 +858,69 @@ class MinerService:
                 error_code=error_code,
             )
 
+    async def _refuse_if_cvm_node(self, payload: ContainerBaseRequest):
+        """Refuse a container rental on a node whose renter workload is a CVM (DAH-2580).
+
+        A CVM node's customer workload runs inside a confidential guest launched through cvmd,
+        not in a docker container this validator creates over SSH. Serving both paths would not
+        just be redundant — creating the container means opening an SSH session and a docker
+        API call against the very node the customer has been told we never enter, and it would
+        do so *while* their CVM is running on it.
+
+        So the two paths are made exclusive here, at the one place every container request goes
+        through, rather than left to whoever builds the request to remember.
+
+        The test is the minimal-G5 ratchet: has this executor ever presented a valid TDX quote?
+        It is deliberately one-way. An executor that has attested once and now claims not to be
+        a CVM is either lying or broken, and both answers are "do not open a shell on it".
+
+        Redis being unavailable returns None — unknown, not "no". The caller decides, and it
+        decides to continue: a Redis outage must not stop every ordinary rental in the fleet.
+        Nothing about a CVM node's confidentiality depends on this check alone; the CVM itself
+        is what the customer verifies.
+        """
+        if not isinstance(payload, ContainerCreateRequest):
+            return None
+        if self.redis_service is None:
+            return None
+        try:
+            is_cvm = await self.redis_service.is_elem_exists_in_set(
+                TDX_ATTESTED_EXECUTOR_SET, str(payload.executor_id)
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Could not check whether this executor is a CVM node; continuing",
+                    extra=get_extra_info({
+                        "executor_id": str(payload.executor_id),
+                        "error": str(exc),
+                    }),
+                )
+            )
+            return None
+        if not is_cvm:
+            return None
+
+        return self._handle_container_error(
+            payload,
+            _m(
+                "Refusing a container rental on a CVM node",
+                extra=get_extra_info({
+                    "miner_hotkey": payload.miner_hotkey,
+                    "executor_id": str(payload.executor_id),
+                    "pod_id": payload.pod_id,
+                    "reason": "cvm_node_not_container_rentable",
+                }),
+            ),
+            FailedContainerErrorCodes.CvmNodeNotContainerRentable,
+        )
+
     async def handle_container(self, payload: ContainerBaseRequest):
         """Handle container request - uses REST API if configured, otherwise WebSocket."""
+        refusal = await self._refuse_if_cvm_node(payload)
+        if refusal is not None:
+            return refusal
+
         if settings.USE_REST_API:
             logger.info(
                 _m(
@@ -1734,7 +1815,8 @@ class MinerService:
 
             # G3 — attestation event (REST path); see the WebSocket path for details.
             attestation_nonce = await self.attestation_service.maybe_issue_nonce(
-                payload.miner_hotkey
+                payload.miner_hotkey,
+                rented=self._miner_holds_a_rental(payload, rented_data),
             )
             nonce_hex = attestation_nonce.value_hex if attestation_nonce else None
 

@@ -212,7 +212,10 @@ class Settings(BaseSettings):
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
-    DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
+    # DAH-2582 graduates this from dry run. The check has been observing since it shipped and
+    # the behaviour it detects — one miner registering the same executor UUID more than once —
+    # has no legitimate form, so continuing to only watch it is a standing invitation.
+    DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=False, description="Observe mode: detect duplicate executors but don't penalize")
 
     # DAH-2272: when on, raise the asyncssh logger to DEBUG (debug level 2) so the
     # SSH handshake (banner / key exchange / auth) is logged per connection, and
@@ -323,6 +326,76 @@ class Settings(BaseSettings):
     # ("≥ approved version", newest-wins — never a rolling window). 0 accepts every
     # whitelisted hash (today's behavior).
     TDX_MINIMUM_COMPOSE_VERSION: int = Field(env="TDX_MINIMUM_COMPOSE_VERSION", default=0)
+
+    # ------------------------------------------------------------------ DAH-2581
+    #
+    # Every flag below is default-off. The checks they gate are new and each of them can fail
+    # a node the fleet is currently paying, so they land dark and are turned on per environment
+    # once the observe-mode logs say what the blast radius is.
+
+    # Take the approved image/compose set from the platform's signed manifest instead of from
+    # the static TDX_WHITELIST. Off, or unreachable, falls back to the static list — never to
+    # an empty one, which would fail every CVM in the fleet.
+    ENABLE_DYNAMIC_CVM_WHITELIST: bool = Field(env="ENABLE_DYNAMIC_CVM_WHITELIST", default=False)
+    CVM_CATALOG_MANIFEST_URL: str | None = Field(env="CVM_CATALOG_MANIFEST_URL", default=None)
+    # The ss58 this validator checks the manifest against. Never the `signer` field inside the
+    # document: a document that names its own signer proves only that whoever wrote it also
+    # chose who to blame.
+    CVM_CATALOG_SIGNER_SS58: str | None = Field(env="CVM_CATALOG_SIGNER_SS58", default=None)
+    CVM_CATALOG_REFRESH_SECONDS: int = Field(env="CVM_CATALOG_REFRESH_SECONDS", default=300)
+    CVM_CATALOG_FETCH_TIMEOUT_SECONDS: int = Field(
+        env="CVM_CATALOG_FETCH_TIMEOUT_SECONDS", default=30
+    )
+
+    # Which report_data recipes this validator accepts, newest-first, comma separated.
+    #
+    #   v1  sha256("SSH_HOST_KEY:" | host_key)                  — what the fleet produces today
+    #   v2  sha256(identity | gpu_uuid_digest)                  — adds which GPUs the CVM holds
+    #
+    # A recipe change is a lockstep change: the executor produces one value and the validator
+    # compares against it, so a validator that accepted only v2 would fail every node in the
+    # fleet the moment it shipped. Both are accepted through the transition, and v1 is dropped
+    # from this list only once every node produces v2.
+    TDX_REPORT_DATA_RECIPES: str = Field(env="TDX_REPORT_DATA_RECIPES", default="v1")
+
+    # A renter CVM is checked against what was actually sold: the image is in the catalog, the
+    # compose hash is the one the backend derived for that order, and the GPUs are the ones the
+    # customer paid for. Off means the checks run and log, and fail nothing.
+    ENABLE_RENTER_CVM_VERIFICATION: bool = Field(
+        env="ENABLE_RENTER_CVM_VERIFICATION", default=False
+    )
+
+    # How often a CVM is re-attested *while it is rented*. Far tighter than the idle cadence:
+    # a rental is exactly when a node has something to gain from swapping the stack underneath
+    # a proof it gave once at launch.
+    TDX_RENTAL_REATTEST_INTERVAL_SECONDS: int = Field(
+        env="TDX_RENTAL_REATTEST_INTERVAL_SECONDS", default=900
+    )
+
+    # ------------------------------------------------------------------ DAH-2582
+
+    # Fail a CVM-class node that stops presenting a quote, without also taking the whole TCB
+    # posture change. Previously this was reachable only under ENABLE_TCB_ENFORCEMENT.
+    ENABLE_CVM_QUOTE_REQUIRED: bool = Field(env="ENABLE_CVM_QUOTE_REQUIRED", default=False)
+
+    # Fail every executor claiming a hardware-bound identity that another executor also claims.
+    # Default-off is the task's own acceptance path: 48 h of observation over the fleet showing
+    # zero collisions among genuinely distinct hosts comes first, because an identifier that is
+    # less unique than assumed would otherwise fail the whole fleet on the day this ships.
+    ENABLE_ATTESTED_IDENTITY_UNIQUENESS: bool = Field(
+        env="ENABLE_ATTESTED_IDENTITY_UNIQUENESS", default=False
+    )
+    # How long a claimed identity is remembered. Long enough to span several validation cycles,
+    # short enough that a node legitimately re-registering after a rebuild stops colliding with
+    # its own past.
+    ATTESTED_IDENTITY_TTL_SECONDS: int = Field(
+        env="ATTESTED_IDENTITY_TTL_SECONDS", default=21600
+    )
+
+    def get_report_data_recipes(self) -> list[str]:
+        """The accepted recipes, in the order they are tried. Always at least v1."""
+        recipes = [r.strip().lower() for r in self.TDX_REPORT_DATA_RECIPES.split(",") if r.strip()]
+        return recipes or ["v1"]
 
     def get_allowed_tcb_statuses(self) -> set[str]:
         return {s.strip() for s in self.TDX_ALLOWED_TCB_STATUSES.split(",") if s.strip()}

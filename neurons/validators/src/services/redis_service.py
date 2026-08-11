@@ -144,6 +144,17 @@ class RedisService:
         async with self.lock:
             await self.redis.set(key, value)
 
+    async def set_with_expiration(self, key: str, value: str, ttl_seconds: int):
+        """Set a key that removes itself.
+
+        DAH-2582 needs this for the attested-identity registry: an entry has to age out so a
+        node that legitimately re-registers under a new executor id after a rebuild eventually
+        stops colliding with its own past, and so an unbounded key space does not accumulate one
+        entry per GPU per node forever.
+        """
+        async with self.lock:
+            await self.redis.set(key, value, ex=ttl_seconds)
+
     async def get(self, key: str):
         """Get a value by key from Redis."""
         async with self.lock:

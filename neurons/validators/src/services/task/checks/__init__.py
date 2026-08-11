@@ -1,3 +1,4 @@
+from .attested_identity_unique import AttestedIdentityUniqueCheck
 from .banned_gpu import BannedGpuCheck
 from .banned_provider import BannedProviderCheck
 from .cached_template_verification import CachedTemplateVerificationCheck
@@ -35,6 +36,7 @@ __all__ = [
     "CapabilityCheck",
     "CollateralCheck",
     "CustomBuildOrphanSweepCheck",
+    "AttestedIdentityUniqueCheck",
     "DuplicateExecutorCheck",
     "FinalizeCheck",
     "GpuCountCheck",

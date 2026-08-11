@@ -1,6 +1,7 @@
 """Fail-closed startup: config and the authorized-clients file."""
 
 import json
+from pathlib import Path
 
 import pytest
 from cvmd.app import create_app
@@ -118,6 +119,30 @@ class TestConfig:
         assert config.max_body_bytes == 4096
         assert config.skew_seconds == 60
         assert config.tls_enabled is False
+
+    def test_the_renter_staging_directory_defaults_off_state_dir(self, tmp_path):
+        """DAH-2580: a daemon-owned working directory, so naming `state_dir` is enough.
+
+        Deliberately not under `run_dir` — that directory is scanned for stray CVM disks, and
+        a staging directory appearing there would read as a guest with no record.
+        """
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'authorized_clients = "/etc/cvmd/authorized_clients.json"\n'
+            'state_dir = "/var/lib/cvmd"\n'
+            'run_dir = "/var/lib/cvmd/vms"\n'
+        )
+        config = load_config(path)
+        assert config.launch.renter_dir == Path("/var/lib/cvmd/renter")
+
+    def test_the_renter_staging_directory_can_be_overridden(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'authorized_clients = "/etc/cvmd/authorized_clients.json"\n'
+            'state_dir = "/var/lib/cvmd"\n'
+            'renter_dir = "/srv/cvmd-renter"\n'
+        )
+        assert load_config(path).launch.renter_dir == Path("/srv/cvmd-renter")
 
     def test_missing_required_key_refuses(self, tmp_path):
         path = tmp_path / "config.toml"

@@ -14,6 +14,7 @@ Covers, per the remediation-plan test matrix (§6):
 """
 
 import base64
+import hashlib
 import json
 import sys
 import time
@@ -66,8 +67,21 @@ pytestmark = pytest.mark.asyncio
 # ---------------------------------------------------------------------------
 
 
-def _verifier_response() -> dict:
-    return json.loads(VERIFIER_RESPONSE_PATH.read_text())
+def _verifier_response(executor: ExecutorSSHInfo | None = None, nonce_hex: str | None = None) -> dict:
+    """The recorded verifier response, re-bound to the executor under test.
+
+    DAH-2581 moved the expected identity digest out of the caller's hands and into a derivation
+    from the executor — which is the whole point of having recipes — so a fixture whose
+    `report_data` belongs to some other host no longer represents a quote anyone would accept.
+    Rebinding it here keeps every test below asserting what it says it asserts.
+    """
+    response = json.loads(VERIFIER_RESPONSE_PATH.read_text())
+    executor = executor or _make_executor()
+    identity = hashlib.sha256(
+        AttestationService.REPORT_PREFIX + executor.ssh_host_key.encode("utf-8")
+    ).hexdigest()
+    response["details"]["report_data"] = identity + (nonce_hex or "0" * 64)
+    return response
 
 
 def _make_executor(**overrides) -> ExecutorSSHInfo:
@@ -148,21 +162,19 @@ def test_g4_bad_tcb_status_rejected_when_enforced(service, monkeypatch, bad_stat
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     response = _verifier_response()
     response["details"]["tcb_status"] = bad_status
-    expected = "0x" + response["details"]["report_data"][:64]
 
     # Act / Assert
     with pytest.raises(AttestationError, match="tcb_status_not_allowed"):
-        service._validate_verifier_response(response, expected, _make_executor())
+        service._validate_verifier_response(response, _make_executor())
 
 
 def test_g4_bad_tcb_status_warn_only_when_not_enforced(service):
     # Arrange — enforcement off (fixture default): violations must not reject
     response = _verifier_response()
     response["details"]["tcb_status"] = "OutOfDate"
-    expected = "0x" + response["details"]["report_data"][:64]
 
     # Act — must not raise
-    service._validate_verifier_response(response, expected, _make_executor())
+    service._validate_verifier_response(response, _make_executor())
 
 
 def test_g4_allowlisted_tcb_status_accepted(service, monkeypatch):
@@ -171,10 +183,9 @@ def test_g4_allowlisted_tcb_status_accepted(service, monkeypatch):
     monkeypatch.setattr(settings, "TDX_ALLOWED_TCB_STATUSES", "UpToDate,SWHardeningNeeded")
     response = _verifier_response()
     response["details"]["tcb_status"] = "SWHardeningNeeded"
-    expected = "0x" + response["details"]["report_data"][:64]
 
     # Act — must not raise
-    service._validate_verifier_response(response, expected, _make_executor())
+    service._validate_verifier_response(response, _make_executor())
 
 
 def test_g4_unexpected_advisory_rejected_when_enforced(service, monkeypatch):
@@ -182,11 +193,10 @@ def test_g4_unexpected_advisory_rejected_when_enforced(service, monkeypatch):
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     response = _verifier_response()
     response["details"]["advisory_ids"] = ["INTEL-SA-00837"]
-    expected = "0x" + response["details"]["report_data"][:64]
 
     # Act / Assert
     with pytest.raises(AttestationError, match="advisory_present"):
-        service._validate_verifier_response(response, expected, _make_executor())
+        service._validate_verifier_response(response, _make_executor())
 
 
 def test_g4_allowlisted_advisory_accepted(service, monkeypatch):
@@ -195,10 +205,9 @@ def test_g4_allowlisted_advisory_accepted(service, monkeypatch):
     monkeypatch.setattr(settings, "TDX_ALLOWED_ADVISORY_IDS", "INTEL-SA-00837")
     response = _verifier_response()
     response["details"]["advisory_ids"] = ["INTEL-SA-00837"]
-    expected = "0x" + response["details"]["report_data"][:64]
 
     # Act — must not raise
-    service._validate_verifier_response(response, expected, _make_executor())
+    service._validate_verifier_response(response, _make_executor())
 
 
 @pytest.mark.parametrize("flag", ["event_log_verified", "os_image_hash_verified"])
@@ -207,11 +216,10 @@ def test_g4_unverified_flags_rejected_when_enforced(service, monkeypatch, flag):
     monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     response = _verifier_response()
     response["details"][flag] = False
-    expected = "0x" + response["details"]["report_data"][:64]
 
     # Act / Assert
     with pytest.raises(AttestationError):
-        service._validate_verifier_response(response, expected, _make_executor())
+        service._validate_verifier_response(response, _make_executor())
 
 
 # ---------------------------------------------------------------------------
@@ -222,23 +230,20 @@ def test_g4_unverified_flags_rejected_when_enforced(service, monkeypatch, flag):
 def test_g3_nonce_round_trip_accepted(service):
     # Arrange — report_data[32:64] echoes the issued nonce
     nonce = AttestationNonce.issue()
-    response = _verifier_response()
-    prefix = response["details"]["report_data"][:64]
-    response["details"]["report_data"] = prefix + nonce.value_hex
+    response = _verifier_response(nonce_hex=nonce.value_hex)
 
     # Act — must not raise
-    service._validate_verifier_response(response, "0x" + prefix, _make_executor(), nonce=nonce)
+    service._validate_verifier_response(response, _make_executor(), nonce=nonce)
 
 
 def test_g3_nonce_mismatch_rejected(service):
     # Arrange — fixture report_data carries zeros in [32:64], not the nonce
     nonce = AttestationNonce.issue()
     response = _verifier_response()
-    expected = "0x" + response["details"]["report_data"][:64]
 
     # Act / Assert
     with pytest.raises(AttestationError, match="does not echo"):
-        service._validate_verifier_response(response, expected, _make_executor(), nonce=nonce)
+        service._validate_verifier_response(response, _make_executor(), nonce=nonce)
 
 
 def test_g3_stale_nonce_rejected(service, monkeypatch):
@@ -246,22 +251,19 @@ def test_g3_stale_nonce_rejected(service, monkeypatch):
     monkeypatch.setattr(settings, "ATTESTATION_NONCE_TTL_SECONDS", 600)
     nonce = AttestationNonce.issue()
     nonce.issued_at = time.time() - 601
-    response = _verifier_response()
-    prefix = response["details"]["report_data"][:64]
-    response["details"]["report_data"] = prefix + nonce.value_hex
+    response = _verifier_response(nonce_hex=nonce.value_hex)
 
     # Act / Assert
     with pytest.raises(AttestationError, match="nonce expired"):
-        service._validate_verifier_response(response, "0x" + prefix, _make_executor(), nonce=nonce)
+        service._validate_verifier_response(response, _make_executor(), nonce=nonce)
 
 
 def test_g3_legacy_no_nonce_still_accepted(service):
     # Arrange — no nonce issued: the legacy prefix-only check applies
     response = _verifier_response()
-    expected = "0x" + response["details"]["report_data"][:64]
 
     # Act — must not raise
-    service._validate_verifier_response(response, expected, _make_executor(), nonce=None)
+    service._validate_verifier_response(response, _make_executor(), nonce=None)
 
 
 async def test_g3_maybe_issue_nonce_respects_interval(monkeypatch):
