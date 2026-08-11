@@ -13,11 +13,21 @@
 # userspace RDMA libs and nvidia-smi are all baked in. The renter runs their own torchrun on top.
 FROM daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind
 
-# wireguard-tools brings wg + wg-quick, iproute2 the `ip` this entrypoint needs. Everything else a
-# distributed job wants (torch, CUDA, ibverbs, sshd) is already in the base.
+# wireguard-tools brings wg + wg-quick, iproute2 the `ip` this entrypoint needs.
+#
+# The RDMA userspace is NOT in the base, despite the devices being forwarded: without libibverbs and
+# the provider plugins NCCL logs "Failed to open libibverbs.so[.1]" and quietly falls back to its
+# socket transport, so the job would crawl over the overlay while every device check still passes.
+# ibverbs-utils is the diagnosis the renter reaches for first (ibv_devinfo), and perftest is how
+# anyone confirms the fabric end to end (ib_write_bw).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         wireguard-tools \
         iproute2 \
+        libibverbs1 \
+        librdmacm1 \
+        ibverbs-providers \
+        ibverbs-utils \
+        perftest \
     && rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /usr/local/bin/lium-cluster-entrypoint
