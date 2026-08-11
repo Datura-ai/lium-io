@@ -43,6 +43,15 @@ class VastManager:
         machines = self.vast.get_machines()
         if not machines:
             raise ApiFailure("no_machine", "no machine registered on this account")
+        # primary key: the numeric id persisted at register time — IP matching fails
+        # on NAT'ed clouds where the host interface never carries the public address
+        persisted = self.host.run(
+            ["cat", f"{self.settings.STATE_DIR_HOST}/numeric_machine_id"], check=False
+        ).stdout.strip()
+        if persisted.isdigit():
+            for m in machines:
+                if m.get("id") == int(persisted):
+                    return m
         if len(machines) == 1:
             return machines[0]
         host_ips = self.host.local_ips()

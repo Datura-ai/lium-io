@@ -71,6 +71,7 @@ def _wire_market_mocks(app, gpu_mem_mib: int = 1):
     manager.vast.get_machines.return_value = [{"id": 147139}]
     manager.vast.search_offers.return_value = [{"id": 47437865}]
     manager.host = Mock()
+    manager.host.run.return_value = Mock(stdout="")  # no persisted numeric_machine_id
     manager.host.gpu_stats.return_value = [{"idx": 0, "mem_mib": gpu_mem_mib, "util_pct": 0}]
     manager.host.gpu_compute_apps.return_value = []
     return manager
@@ -145,6 +146,8 @@ def test_setup_refused_while_rental_running(tmp_path):
     manager = app.state.vast_manager
     manager.vast = Mock()
     manager.vast.get_machines.return_value = [{"id": 147139, "current_rentals_running": 1}]
+    manager.host = Mock()
+    manager.host.run.return_value = Mock(stdout="")
 
     response = client.post("/vast/setup", json={}, headers=AUTH)
 
@@ -158,6 +161,7 @@ def test_setup_force_overrides_rental_rail(tmp_path):
     manager.vast = Mock()
     manager.vast.get_machines.return_value = [{"id": 147139, "current_rentals_running": 1}]
     manager.host = Mock()
+    manager.host.run.return_value = Mock(stdout="")
     manager.docker_ops = Mock()
 
     response = client.post("/vast/setup", json={"force": True}, headers=AUTH)
@@ -175,6 +179,7 @@ def test_delete_refused_when_machine_unresolved(tmp_path):
         {"id": 2, "public_ipaddr": ""},
     ]
     manager.host = Mock()
+    manager.host.run.return_value = Mock(stdout="")
     manager.host.local_ips.return_value = ["192.0.2.7"]
     manager.docker_ops = Mock()
 

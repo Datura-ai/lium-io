@@ -41,9 +41,10 @@ def test_setup_ladder_stage_names_and_order(tmp_path):
     stages, _ = build_setup_ladder(settings, Mock(), Mock(), Mock())
 
     assert [stage.name for stage in stages] == SETUP_STAGE_NAMES
+    # kaalia before nested_daemon/gpu: the nvidia runtime is kaalia's shim
     assert SETUP_STAGE_NAMES == [
-        "g0_gate", "image", "container", "data_root", "nested_daemon",
-        "gpu", "dmi_shim", "kaalia", "register", "report",
+        "g0_gate", "image", "container", "data_root", "dmi_shim",
+        "kaalia", "nested_daemon", "gpu", "register", "report",
     ]
 
 

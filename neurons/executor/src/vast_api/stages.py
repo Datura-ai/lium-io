@@ -1,5 +1,6 @@
 import logging
 import secrets
+import time
 from collections.abc import Callable
 
 from vast_api.config import VastSettings
@@ -11,9 +12,12 @@ from vast_api.vast_client import VastClient
 
 logger = logging.getLogger(__name__)
 
+# kaalia MUST precede nested_daemon/gpu: the nested daemon.json declares the
+# nvidia runtime through kaalia_docker_shim, which only exists after the kaalia
+# install (proven on the fresh-box exam 2026-08-11: gpu_broken by construction).
 SETUP_STAGE_NAMES = [
-    "g0_gate", "image", "container", "data_root", "nested_daemon",
-    "gpu", "dmi_shim", "kaalia", "register", "report",
+    "g0_gate", "image", "container", "data_root", "dmi_shim",
+    "kaalia", "nested_daemon", "gpu", "register", "report",
 ]
 
 
@@ -217,6 +221,11 @@ def build_setup_ladder(
         machine_ids = [machine.get("id") for machine in machines]
         if ctx["machine_id"] is not None:
             return ctx["machine_id"] in machine_ids
+        # the numeric id persisted at register time resolves this box on a shared account
+        rc, output = docker_ops.exec_in_uns(["cat", "/var/lib/vastai_kaalia/numeric_machine_id"])
+        if rc == 0 and output.strip().isdigit() and int(output.strip()) in machine_ids:
+            ctx["machine_id"] = int(output.strip())
+            return True
         if len(machines) == 1:
             ctx["machine_id"] = machines[0].get("id")
             return True
@@ -241,15 +250,23 @@ def build_setup_ladder(
                 f"identified as machine {numeric_id}, expected to adopt {ctx['machine_id']}",
             )
         ctx["machine_id"] = numeric_id
+        # persist the numeric id in the state dir: public_ipaddr matching fails on
+        # NAT'ed clouds (hyperstack), so this is the primary resolve key from now on
+        docker_ops.write_file_in_uns("/var/lib/vastai_kaalia/numeric_machine_id", str(numeric_id))
         # restart so kaalia picks up the identity (installer-started daemon has none)
         docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
 
     def register_verify() -> None:
-        machine_ids = [machine.get("id") for machine in vast.get_machines()]
-        if ctx["machine_id"] not in machine_ids:
-            raise ApiFailure(
-                "identify_rejected", f"machine {ctx['machine_id']} did not appear in /machines/"
-            )
+        # a freshly identified machine can lag /machines/ by tens of seconds
+        # (seen live: created id absent on the immediate read, present ~1 min later)
+        for _ in range(18):
+            machine_ids = [machine.get("id") for machine in vast.get_machines()]
+            if ctx["machine_id"] in machine_ids:
+                return
+            time.sleep(5)
+        raise ApiFailure(
+            "identify_rejected", f"machine {ctx['machine_id']} did not appear in /machines/"
+        )
 
     # --- report ---
 
@@ -261,7 +278,8 @@ def build_setup_ladder(
 
     def report_do() -> None:
         # a 403 ("Invalid or missing nonce") is a state, not an API change: restart + retry once
-        cmd = ["bash", "-c", "cd /var/lib/vastai_kaalia/latest && python3 send_mach_info.py"]
+        # the script lives in the kaalia root, NOT in latest/ (verified on a live install)
+        cmd = ["bash", "-c", "cd /var/lib/vastai_kaalia && python3 send_mach_info.py"]
         rc, output = docker_ops.exec_in_uns(cmd)
         if rc == 0 and "403" not in output:
             return
@@ -275,10 +293,10 @@ def build_setup_ladder(
         Stage("image", image_check, docker_ops.build_image, image_verify),
         Stage("container", container_check, container_do, container_verify),
         Stage("data_root", data_root_check, host.ensure_data_root, data_root_verify),
-        Stage("nested_daemon", nested_daemon_check, docker_ops.install_nested_daemon, nested_daemon_verify),
-        Stage("gpu", gpu_check, gpu_do),
         Stage("dmi_shim", dmi_shim_check, dmi_shim_do, dmi_shim_verify),
         Stage("kaalia", kaalia_check, kaalia_do, kaalia_verify),
+        Stage("nested_daemon", nested_daemon_check, docker_ops.install_nested_daemon, nested_daemon_verify),
+        Stage("gpu", gpu_check, gpu_do),
         Stage("register", register_check, register_do, register_verify),
         Stage("report", report_check, report_do),
     ]
