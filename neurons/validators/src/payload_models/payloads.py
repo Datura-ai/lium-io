@@ -259,6 +259,20 @@ class CacheVolume(BaseModel):
     target: str
 
 
+class ClusterMembership(BaseModel):
+    """Set by the backend when this pod is one node of an atomic multi-node group rental (DAH-2620).
+
+    The validator uses it to mint this node's WireGuard overlay config and join it to the group so
+    NCCL's socket bootstrap can reach the peers; the tensors still travel over InfiniBand. Absent on
+    an ordinary single-node rental, which then behaves exactly as before.
+    """
+
+    node_index: int
+    # This node's fully-rendered wg-quick config, minted by the backend for the whole group so every
+    # node's keys and peer list agree. The validator only injects it; it generates nothing itself.
+    wireguard_conf: str
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
     """Container creation request from the backend.
 
@@ -301,6 +315,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
+    cluster_membership: ClusterMembership | None = None
     active_volume_names: list[str] | None = None
     # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator
     # builds the image from this Dockerfile on the executor host instead of pulling
