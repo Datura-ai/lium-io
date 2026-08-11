@@ -35,6 +35,34 @@ raise_cluster_overlay() {
     export NCCL_SOCKET_NTHREADS=4
     export NCCL_NSOCKS_PERTHREAD=8
 
+    publish_cluster_env
+}
+
+publish_cluster_env() {
+    # Exporting only reaches what this script execs. A renter almost always arrives over SSH, whose
+    # session starts from a clean environment — and NCCL then picks the docker bridge, announces
+    # 172.x to its peers and the job hangs or crawls. So the same variables are written where a
+    # session will read them: PAM reads /etc/environment, a login shell reads /etc/profile.d.
+    local vars=(
+        "NCCL_SOCKET_IFNAME=wg0"
+        "GLOO_SOCKET_IFNAME=wg0"
+        "NCCL_SOCKET_NTHREADS=4"
+        "NCCL_NSOCKS_PERTHREAD=8"
+    )
+
+    for var in "${vars[@]}"; do
+        grep -q "^${var%%=*}=" /etc/environment 2>/dev/null || echo "$var" >> /etc/environment
+    done
+
+    mkdir -p /etc/profile.d
+    {
+        echo "# DAH-2620: the cluster overlay this pod is a member of."
+        for var in "${vars[@]}"; do
+            echo "export $var"
+        done
+    } > /etc/profile.d/lium-cluster.sh
+    chmod 644 /etc/profile.d/lium-cluster.sh
+
     echo "lium-cluster: wg0 up at $(wg show wg0 2>/dev/null | awk '/interface/{print}')" >&2
 }
 
