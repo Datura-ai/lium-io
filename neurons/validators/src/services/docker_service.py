@@ -954,7 +954,7 @@ class DockerService:
             volumes=tuple(volumes),
             restart_policy="unless-stopped",
             runtime="sysbox-runc" if payload.is_sysbox else None,
-            cap_add=("NET_ADMIN",),
+            cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
             ulimits=self._memlock_ulimit_for(devices, payload.memory_gb),
             devices=devices,
@@ -967,8 +967,24 @@ class DockerService:
         )
 
     @staticmethod
+    def _forwards_rdma(devices: tuple[DeviceMount, ...]) -> bool:
+        return any(device.path_on_host.startswith("/dev/infiniband/") for device in devices)
+
+    @classmethod
+    def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
+        """NET_ADMIN always, plus IPC_LOCK once the container holds verbs devices.
+
+        Registering an RDMA memory region locks pages. Unlimited memlock covers a root process, but
+        a workload that drops to an unprivileged user needs the capability as well, and without it
+        `ibv_reg_mr` fails where every sysfs read still succeeds (DAH-2620).
+        """
+        if not cls._forwards_rdma(devices):
+            return ("NET_ADMIN",)
+        return ("NET_ADMIN", "IPC_LOCK")
+
+    @classmethod
     def _memlock_ulimit_for(
-        devices: tuple[DeviceMount, ...], memory_gb: int | None
+        cls, devices: tuple[DeviceMount, ...], memory_gb: int | None
     ) -> tuple[ContainerUlimit, ...]:
         """Unlimited memlock, for a container that got RDMA devices AND a memory limit.
 
@@ -4403,6 +4419,7 @@ class DockerService:
                 gpu_config = await build_gpu_docker_config_for_executor(
                     ssh_client,
                     payload.gpu_uuids,
+                    rdma_required=payload.cluster_membership is not None,
                 )
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
