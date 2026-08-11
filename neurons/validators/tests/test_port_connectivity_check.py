@@ -187,34 +187,35 @@ async def test_port_connectivity_check(
             assert result.updates["state"].sysbox_runtime == sysbox_runtime
             if verify_success:
                 assert result.updates["state"].verified_port_count == 100
+            elif status_override == "skipped_rental_active":
+                # DAH-2647: the check was skipped, so it reports no count rather than zero.
+                assert result.updates["state"].verified_port_count is None
             else:
                 assert result.updates["state"].verified_port_count == 0
 
 
 @pytest.mark.parametrize(
-    "status,verified_port_count,expected_measured",
+    "status,probed_port_count,expected_count",
     [
-        ("ok", 3, True),
-        ("no_working_ports", 0, True),
-        ("no_ports", 0, False),
-        ("error", 0, False),
+        ("ok", 3, 3),
+        ("no_working_ports", 0, 0),
+        ("no_ports", 0, None),
+        ("error", 0, None),
     ],
 )
 @pytest.mark.asyncio
-async def test_port_connectivity_flags_a_cycle_that_never_probed(
-    status, verified_port_count, expected_measured, context_factory
+async def test_port_connectivity_reports_no_count_when_it_never_probed(
+    status, probed_port_count, expected_count, context_factory
 ):
-    """DAH-2647: no_ports and error carry no evidence about the executor's ports."""
-    connectivity_service = DummyConnectivityService(
-        success=status == "ok",
-        verified_port_count=verified_port_count,
-        status=status,
-    )
+    """DAH-2647: no_ports and error carry no evidence about the executor's ports, so they must
+    reach PortCountCheck as an absent count rather than as a measured zero."""
     ctx = context_factory(
         services=build_services(
             redis=DummyRedis(),
             backend=DummyBackendService(),
-            connectivity=connectivity_service,
+            connectivity=DummyConnectivityService(
+                success=status == "ok", verified_port_count=probed_port_count, status=status
+            ),
         ),
         config=build_context_config(job_batch_id="batch-123"),
         state=build_state(),
@@ -222,7 +223,7 @@ async def test_port_connectivity_flags_a_cycle_that_never_probed(
 
     result = await PortConnectivityCheck().run(ctx)
 
-    assert result.updates["state"].ports_measured is expected_measured
+    assert result.updates["state"].verified_port_count == expected_count
 
 
 @pytest.mark.asyncio

@@ -59,10 +59,8 @@ class PortConnectivityCheck:
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
         }
-        # DAH-2647: only ok/no_working_ports come from ports that were actually probed.
-        # no_ports means the selector had nothing left to offer (a rental holds the whole
-        # declared range, and during teardown that snapshot is a moment stale), and error
-        # means the check itself died — neither is evidence about the executor's ports.
+        # DAH-2647: no_ports means the selector had nothing left to offer — a rental holds
+        # the whole declared range, and during teardown that snapshot is a moment stale.
         ports_measured = result.status in ("ok", "no_working_ports")
         updated_state = replace(
             ctx.state,
@@ -72,8 +70,7 @@ class PortConnectivityCheck:
                 "verified_ports": [p.external for p in result.successful_ports],
             },
             sysbox_runtime=result.sysbox_runtime,
-            verified_port_count=verified_port_count,
-            ports_measured=ports_measured,
+            verified_port_count=verified_port_count if ports_measured else None,
         )
 
         # DAH-2272 (tolerate): a customer rental force-removes port-check / DinD

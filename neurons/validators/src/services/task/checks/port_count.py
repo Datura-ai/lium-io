@@ -5,7 +5,7 @@ from dataclasses import replace
 from services.const import MIN_PORT_COUNT
 
 from ..messages import PortCountMessages as Msg, render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import CheckResult, Context, ContextState
 
 
 class PortCountCheck:
@@ -19,13 +19,10 @@ class PortCountCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        port_count: int = ctx.state.verified_port_count
+        port_count: int | None = ctx.state.verified_port_count
 
-        # DAH-2647: nothing was probed this cycle, so port_count is an absent measurement
-        # rather than a verdict. Scoring the executor 0 on it zeroes healthy nodes over an
-        # SSH drop or a teardown-stale rental snapshot. Leave the last published count
-        # standing and let the next cycle measure.
-        if not ctx.state.ports_measured:
+        # DAH-2647: failing on an absent measurement zeroes healthy nodes.
+        if port_count is None:
             event = render_message(
                 Msg.PORT_COUNT_NOT_MEASURED,
                 ctx=ctx,
@@ -38,15 +35,7 @@ class PortCountCheck:
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
-        updated_state = replace(
-            ctx.state,
-            specs={
-                **ctx.state.specs,
-                "available_port_count": port_count,
-                "port_range": ctx.executor.port_range,
-                "port_mappings": ctx.executor.port_mappings,
-            },
-        )
+        updated_state = self._state_with_published_port_count(ctx, port_count)
 
         if not is_rented and port_count < MIN_PORT_COUNT:
             event = render_message(
@@ -74,4 +63,17 @@ class PortCountCheck:
             passed=True,
             event=event,
             updates={"port_count": port_count, "state": updated_state},
+        )
+
+    @staticmethod
+    def _state_with_published_port_count(ctx: Context, port_count: int) -> ContextState:
+        """The state carrying this cycle's port availability into the specs the backend stores."""
+        return replace(
+            ctx.state,
+            specs={
+                **ctx.state.specs,
+                "available_port_count": port_count,
+                "port_range": ctx.executor.port_range,
+                "port_mappings": ctx.executor.port_mappings,
+            },
         )
