@@ -79,7 +79,7 @@ from services.gpu_power_limit import (
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
-from services.cluster_fabric import cluster_pod_networking
+from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
@@ -965,6 +965,31 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
         )
+
+    @staticmethod
+    async def _assert_cluster_overlay_port_free(
+        ssh_client: asyncssh.SSHClientConnection, default_extra: dict
+    ) -> None:
+        """A cluster node publishes the WireGuard port 1:1, so nothing else may hold it.
+
+        Docker's own refusal is `Bind for 0.0.0.0:51820 failed: port is already allocated`, which
+        says nothing about the overlay and sends whoever reads it hunting through the rental's TCP
+        mappings. Checking first turns that into an answer that names the port and the holder
+        (DAH-2620).
+        """
+        result = await ssh_client.run(
+            f"docker ps --filter publish={WIREGUARD_LISTEN_PORT} --format '{{{{.Names}}}}'"
+        )
+        holders = [name.strip() for name in result.stdout.splitlines() if name.strip()]
+        if not holders:
+            return
+
+        message = (
+            f"UDP {WIREGUARD_LISTEN_PORT} is taken by {', '.join(holders)}, so the cluster overlay "
+            "cannot bind. A node can carry one cluster pod at a time."
+        )
+        logger.error(_m("Cluster overlay port busy", extra=get_extra_info({**default_extra, "holders": holders})))
+        raise RuntimeError(message)
 
     @staticmethod
     def _forwards_rdma(devices: tuple[DeviceMount, ...]) -> bool:
@@ -4420,6 +4445,10 @@ class DockerService:
                     ssh_client,
                     payload.gpu_uuids,
                 )
+
+                if payload.cluster_membership is not None:
+                    current_step = "cluster_overlay_port"
+                    await self._assert_cluster_overlay_port_free(ssh_client, default_extra)
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
                 # gpu_power_limits). Fail-closed: apply undoes any partial work on failure, and the
