@@ -230,13 +230,6 @@ class Settings(BaseSettings):
     # rental incentive while staying active. When False, the breach is only logged
     # (shadow mode) so prod impact can be observed before enforcing.
     ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)
-    # DAH-2571. Off until a RoCEv2 queue pair from inside a container is shown to reach a neighbour
-    # on the same segment, or not to. RDMA bypasses the host network stack entirely — no iptables,
-    # no conntrack, no rate limit on a link the provider also uses for storage — so on the 21 prod
-    # hosts sharing an IPv4-mapped segment this would be a new, unfiltered path to a neighbour.
-    # Turning it on later costs nothing; taking it back after machines are sold does.
-    ENABLE_RDMA_DEVICE_PASSTHROUGH: bool = Field(env="ENABLE_RDMA_DEVICE_PASSTHROUGH", default=False)
-
     # DAH-2520 — unrented VRAM/disk sanity gate. When True, an unrented executor whose
     # total GPU VRAM exceeds the machine's total disk loses the unrented rental incentive
     # while staying active. When False, the breach is only logged (shadow mode) so prod

@@ -1,4 +1,4 @@
-"""DAH-2620 — a node of a cluster rental gets the verbs devices without waiting for the RoCE flag.
+"""DAH-2620 — a node of a cluster rental gets the verbs devices, not just a view of the card.
 
 The overlay only carries NCCL's bootstrap; the tensors are supposed to ride InfiniBand. Without
 `/dev/infiniband/uverbs*` in the container NCCL silently falls back to its socket transport and the
@@ -7,7 +7,6 @@ whole job runs over WireGuard, which is the failure the sysfs-only detection hid
 
 import pytest
 
-from core.config import settings
 from services.docker_service import DockerService
 from services.nvidia_devices import _query_shared_nodes
 from services.rental_docker_sdk import DeviceMount
@@ -15,13 +14,12 @@ from tests.test_nvidia_devices import FakeRun, fake_ssh
 
 
 @pytest.mark.asyncio
-async def test_a_cluster_node_gets_verbs_devices_with_the_roce_flag_off(monkeypatch) -> None:
+async def test_a_whole_host_node_gets_the_verbs_devices() -> None:
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_RDMA_DEVICE_PASSTHROUGH", False)
     ssh = fake_ssh(FakeRun(""))
 
     # Act
-    await _query_shared_nodes(ssh, is_whole_host_rental=True, rdma_required=True)
+    await _query_shared_nodes(ssh, is_whole_host_rental=True)
 
     # Assert
     probe_command: str = ssh.run.call_args.args[0]
@@ -30,13 +28,12 @@ async def test_a_cluster_node_gets_verbs_devices_with_the_roce_flag_off(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_cluster_node_still_never_gets_the_subnet_manager_devices(monkeypatch) -> None:
+async def test_the_subnet_manager_devices_are_never_forwarded() -> None:
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_RDMA_DEVICE_PASSTHROUGH", False)
     ssh = fake_ssh(FakeRun(""))
 
     # Act
-    await _query_shared_nodes(ssh, is_whole_host_rental=True, rdma_required=True)
+    await _query_shared_nodes(ssh, is_whole_host_rental=True)
 
     # Assert
     probe_command: str = ssh.run.call_args.args[0]
@@ -46,14 +43,13 @@ async def test_a_cluster_node_still_never_gets_the_subnet_manager_devices(monkey
 
 
 @pytest.mark.asyncio
-async def test_a_partial_rental_gets_nothing_even_when_the_cluster_asks(monkeypatch) -> None:
-    # A cluster is whole nodes by construction, so this can only be a caller mistake — and the
-    # verbs devices belong to cards the other tenant on the box may be renting.
-    monkeypatch.setattr(settings, "ENABLE_RDMA_DEVICE_PASSTHROUGH", False)
+async def test_a_partial_rental_gets_no_verbs_devices() -> None:
+    # The verbs devices belong to cards the other tenant on the box may be renting. A cluster is
+    # whole nodes by construction, so this can only ever be a caller mistake.
     ssh = fake_ssh(FakeRun(""))
 
     # Act
-    await _query_shared_nodes(ssh, is_whole_host_rental=False, rdma_required=True)
+    await _query_shared_nodes(ssh, is_whole_host_rental=False)
 
     # Assert
     probe_command: str = ssh.run.call_args.args[0]

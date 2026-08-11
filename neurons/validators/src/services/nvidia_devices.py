@@ -89,13 +89,8 @@ async def build_gpu_flags(
 async def build_gpu_docker_config_for_executor(
     ssh_client: asyncssh.SSHClientConnection,
     gpu_uuids: Sequence[str] | None,
-    rdma_required: bool = False,
 ) -> GpuDockerConfig:
-    """Resolve structured GPU Docker options for SDK container creation.
-
-    `rdma_required` is set for a node of a multi-node cluster rental, where the verbs devices are
-    the point of the product rather than an extra (DAH-2620).
-    """
+    """Resolve structured GPU Docker options for SDK container creation."""
     try:
         if gpu_uuids:
             per_gpu, host_total = await _query_gpu_nodes_for_uuids(ssh_client, gpu_uuids)
@@ -109,11 +104,7 @@ async def build_gpu_docker_config_for_executor(
         # manipulate another tenant's GPU, and the RDMA verbs devices belong to cards the other
         # tenant may be renting (DAH-2571). We don't sell MIG slices today, but stripping both
         # under partial rental closes the leak before either ever ships.
-        shared = await _query_shared_nodes(
-            ssh_client,
-            is_whole_host_rental=not is_partial_rental,
-            rdma_required=rdma_required,
-        )
+        shared = await _query_shared_nodes(ssh_client, is_whole_host_rental=not is_partial_rental)
         return build_gpu_docker_config(gpu_uuids, device_nodes=(*per_gpu, *shared))
     except Exception:
         logger.warning(
@@ -216,7 +207,6 @@ async def _query_shared_nodes(
     ssh: asyncssh.SSHClientConnection,
     *,
     is_whole_host_rental: bool = True,
-    rdma_required: bool = False,
 ) -> tuple[str, ...]:
     """Enumerate shared NVIDIA control nodes, and the RDMA verbs nodes, that exist on the host.
 
@@ -224,14 +214,12 @@ async def _query_shared_nodes(
     device — all three belong to the host as a whole, and forwarding them would hand a tenant
     control nodes of a GPU or a card another tenant is renting on the same box.
 
-    RDMA is additionally behind ENABLE_RDMA_DEVICE_PASSTHROUGH, off by default: the path skips the
-    host network stack, so on a shared RoCE segment it reaches a neighbour with no iptables,
-    conntrack or rate limit in the way. `rdma_required` is the one case that does not wait for that
-    flag: a cluster rental (DAH-2620) is sold as one job spanning nodes of a single InfiniBand
-    fabric, so verbs are the product. The flag's risk is a shared IPv4/RoCE segment, and the backend
-    only forms a cluster from ports whose link layer is InfiniBand, which carries its own addressing
-    and never routes onto that segment. Only the `uverbs*` nodes and `rdma_cm` are ever forwarded,
-    never the /dev/infiniband directory:
+    A whole-host rental gets the verbs devices unconditionally. It rode a separate
+    ENABLE_RDMA_DEVICE_PASSTHROUGH switch while RDMA from inside a container was unproven; that
+    switch has been on in prod since DAH-2571 and a multi-node cluster rental (DAH-2620) cannot
+    work without the devices at all, so the second rubber-stamp is gone and the only gate left is
+    the whole-host rule below. Only the `uverbs*` nodes and `rdma_cm` are ever forwarded, never the
+    /dev/infiniband directory:
     that also carries `issm*`, the subnet-manager interface, and `umad*`, raw MAD access. A renter
     holding `issm` can interfere with the fabric every other tenant on it depends on (DAH-2571).
     """
@@ -240,7 +228,7 @@ async def _query_shared_nodes(
         "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
         "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
     )
-    if is_whole_host_rental and (settings.ENABLE_RDMA_DEVICE_PASSTHROUGH or rdma_required):
+    if is_whole_host_rental:
         globs += " /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
     cmd = (
         f"for p in {globs}; do "

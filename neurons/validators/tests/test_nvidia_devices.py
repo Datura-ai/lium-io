@@ -192,8 +192,8 @@ async def test_query_shared_nodes_includes_host_wide_nodes_by_default():
     cmd = ssh.run.call_args.args[0]
     assert "/dev/nvidia-caps" in cmd
     assert "/dev/nvidia-caps-imex-channels" in cmd
-    # RDMA needs the whole-host branch AND its own flag — see test_infiniband_passthrough.py
-    assert "/dev/infiniband" not in cmd
+    # RDMA rides the same whole-host branch — see test_infiniband_passthrough.py
+    assert "/dev/infiniband/uverbs[0-9]*" in cmd
 
 
 # ---------------------------- build_gpu_flags ----------------------------

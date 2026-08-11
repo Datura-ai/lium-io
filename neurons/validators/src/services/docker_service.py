@@ -4419,7 +4419,6 @@ class DockerService:
                 gpu_config = await build_gpu_docker_config_for_executor(
                     ssh_client,
                     payload.gpu_uuids,
-                    rdma_required=payload.cluster_membership is not None,
                 )
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
