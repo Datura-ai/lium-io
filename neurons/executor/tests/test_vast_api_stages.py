@@ -5,7 +5,8 @@ from unittest.mock import Mock
 from vast_api.config import VastSettings
 from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
-from vast_api.service import _parse_self_test
+from vast_api.errors import ApiFailure
+from vast_api.service import _parse_self_test, _safe_error
 from vast_api.stages import SETUP_STAGE_NAMES, Stage, build_setup_ladder, run_ladder
 
 
@@ -155,3 +156,11 @@ def test_parse_self_test_unparseable_output():
     assert result["passed"] is False
     assert result["checks"] == []
     assert "parse_error" in result
+
+
+def test_safe_error_keeps_curated_text_hides_internals():
+    curated = _safe_error(ApiFailure("no_machine", "no machine registered on this account"))
+    leaky = _safe_error(RuntimeError("nsenter -t 1 -m -n cat /var/lib/secret failed"))
+
+    assert curated == "no_machine: no machine registered on this account"
+    assert leaky == "RuntimeError"

@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 GPU_BUSY_MEM_MIB = 1000
 
 
+def _safe_error(exc: Exception) -> str:
+    # only our own error types carry curated text; anything else may embed internals
+    # (host paths, command lines, stack info) — log it, expose the class name alone
+    if isinstance(exc, (ApiRefusal, ApiFailure)):
+        return f"{exc.code}: {exc.detail}"[:300]
+    logger.warning("suppressed error detail in API response: %r", exc)
+    return type(exc).__name__
+
+
 class VastManager:
     """Wires HostOps/DockerOps/VastClient/RunStore into the /vast operations."""
 
@@ -98,7 +107,7 @@ class VastManager:
                     )
             except Exception as exc:
                 logger.exception("setup run %s crashed outside the ladder", run_id)
-                self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": str(exc)[:500]})
+                self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": _safe_error(exc)})
 
         threading.Thread(target=_execute, name=run_id, daemon=True).start()
         return run_id
@@ -125,8 +134,8 @@ class VastManager:
                 self.runs.finish(run_id, "failed", error={"code": exc.code, "detail": exc.detail})
             except Exception as exc:
                 logger.exception("self-test run %s crashed", run_id)
-                self.runs.stage_finished(run_id, "self_test", "failed", str(exc)[:500])
-                self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": str(exc)[:500]})
+                self.runs.stage_finished(run_id, "self_test", "failed", _safe_error(exc))
+                self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": _safe_error(exc)})
 
         threading.Thread(target=_execute, name=run_id, daemon=True).start()
         return run_id
@@ -223,12 +232,12 @@ class VastManager:
                 "inet_up": machine.get("inet_up"),
             }
         except Exception as exc:
-            vast_section = {"error": str(exc)[:300]}
+            vast_section = {"error": _safe_error(exc)}
 
         try:
             offers = self.vast.search_offers(machine["id"]) if machine else []
         except Exception as exc:
-            offers = {"error": str(exc)[:300]}
+            offers = {"error": _safe_error(exc)}
 
         box_section: dict = {}
         try:
@@ -236,7 +245,7 @@ class VastManager:
             box_section["vast_uns_up"] = self.docker_ops.get_vast_uns() is not None
             box_section["filler_running"] = self.docker_ops.filler_running()
         except Exception as exc:
-            box_section["error"] = str(exc)[:300]
+            box_section["error"] = _safe_error(exc)
         try:
             rc, active = self.docker_ops.exec_in_uns(["systemctl", "is-active", "vastai"])
             box_section["kaalia_active"] = rc == 0 and active.strip() == "active"
@@ -245,11 +254,11 @@ class VastManager:
             )
             box_section["kaalia_last_log"] = last_log.strip()[-300:]
         except Exception as exc:
-            box_section["kaalia_error"] = str(exc)[:300]
+            box_section["kaalia_error"] = _safe_error(exc)
         try:
             box_section["gpus"] = self.host.gpu_stats()
         except Exception as exc:
-            box_section["gpus_error"] = str(exc)[:300]
+            box_section["gpus_error"] = _safe_error(exc)
 
         vast_verified = bool(machine and machine.get("verification") == "verified")
         return {
