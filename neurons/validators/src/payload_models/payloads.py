@@ -541,6 +541,11 @@ class CvmTeardownRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.CvmTeardownRequest
     cvmd_url: str
     call: SignedCvmdCall
+    # Why the node is being cleared. "release" ends a rental, and this validator may put its
+    # validation CVM straight back up. "switch" clears the node for a renter launch the
+    # backend is about to dispatch — relaunching here would race the very order the teardown
+    # serves, and the loser of that race is a customer's 409.
+    intent: str = "release"
 
 
 class ContainerWarningCode(enum.Enum):
