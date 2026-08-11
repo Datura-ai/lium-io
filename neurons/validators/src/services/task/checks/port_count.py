@@ -19,7 +19,19 @@ class PortCountCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        port_count = ctx.state.verified_port_count
+        port_count: int = ctx.state.verified_port_count
+
+        # DAH-2647: nothing was probed this cycle, so port_count is an absent measurement
+        # rather than a verdict. Scoring the executor 0 on it zeroes healthy nodes over an
+        # SSH drop or a teardown-stale rental snapshot. Leave the last published count
+        # standing and let the next cycle measure.
+        if not ctx.state.ports_measured:
+            event = render_message(
+                Msg.PORT_COUNT_NOT_MEASURED,
+                ctx=ctx,
+                check_id=self.check_id,
+            )
+            return CheckResult(passed=True, event=event)
 
         # Check if executor is rented (same pattern as rented_machine.py)
         rented_data = ctx.state.rented_data

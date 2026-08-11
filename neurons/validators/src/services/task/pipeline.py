@@ -102,6 +102,10 @@ class ContextState:
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
     verified_port_count: int = 0
+    # DAH-2647: False when the port probe never reached a verdict this cycle — no port
+    # could be selected, or the SSH session died mid-check. verified_port_count is then
+    # zero for lack of a measurement, not because the executor has no working ports.
+    ports_measured: bool = True
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None

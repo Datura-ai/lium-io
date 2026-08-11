@@ -46,6 +46,28 @@ async def test_port_count_insufficient_fails_when_not_rented(context_factory, po
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("port_count", [0, MIN_PORT_COUNT - 1])
+async def test_port_count_unmeasured_passes_when_not_rented(context_factory, port_count):
+    """DAH-2647: a cycle that never probed must not read as 'this executor has no ports'."""
+    ctx = context_factory(state=build_state(verified_port_count=port_count, ports_measured=False))
+
+    result = await PortCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.PORT_COUNT_NOT_MEASURED.reason
+
+
+@pytest.mark.asyncio
+async def test_port_count_unmeasured_keeps_the_published_count(context_factory):
+    """DAH-2647: an absent measurement must not overwrite the count the listing reads."""
+    ctx = context_factory(state=build_state(verified_port_count=0, ports_measured=False))
+
+    result = await PortCountCheck().run(ctx)
+
+    assert "state" not in result.updates
+
+
+@pytest.mark.asyncio
 async def test_port_count_insufficient_passes_when_rented(context_factory):
     """Check passes when port count < MIN_PORT_COUNT but executor is rented."""
     rented_data = RentedExecutorsResponse(

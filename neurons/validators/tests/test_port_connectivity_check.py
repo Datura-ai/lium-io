@@ -191,6 +191,40 @@ async def test_port_connectivity_check(
                 assert result.updates["state"].verified_port_count == 0
 
 
+@pytest.mark.parametrize(
+    "status,verified_port_count,expected_measured",
+    [
+        ("ok", 3, True),
+        ("no_working_ports", 0, True),
+        ("no_ports", 0, False),
+        ("error", 0, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_port_connectivity_flags_a_cycle_that_never_probed(
+    status, verified_port_count, expected_measured, context_factory
+):
+    """DAH-2647: no_ports and error carry no evidence about the executor's ports."""
+    connectivity_service = DummyConnectivityService(
+        success=status == "ok",
+        verified_port_count=verified_port_count,
+        status=status,
+    )
+    ctx = context_factory(
+        services=build_services(
+            redis=DummyRedis(),
+            backend=DummyBackendService(),
+            connectivity=connectivity_service,
+        ),
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(),
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].ports_measured is expected_measured
+
+
 @pytest.mark.asyncio
 async def test_port_connectivity_passes_filler_ports_as_exclusions(context_factory):
     """DAH-2527: an idle filler holds ports without creating a pod, so this executor has no entry

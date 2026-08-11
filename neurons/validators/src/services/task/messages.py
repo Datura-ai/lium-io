@@ -793,6 +793,13 @@ class PortCountMessages:
         impact="Score set to 0",
         remediation="Increase port range or check port mappings configuration.",
     )
+    PORT_COUNT_NOT_MEASURED = MessageTemplate(
+        event="Port availability not measured",
+        reason="PORT_COUNT_NOT_MEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
 
 
 VERIFYX_DEBUG_DOC_URL = (
