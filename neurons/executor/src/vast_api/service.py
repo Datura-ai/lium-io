@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 
 from vast_api.config import VastSettings
@@ -147,9 +148,22 @@ class VastManager:
             self._refuse_if_gpu_busy()
         self.vast.unlist_machine(machine["id"])
         self.vast.list_machine(machine["id"], price_gpu_usd, duration)
-        offers = self.vast.search_offers(machine["id"])
-        warnings = [] if offers else ["no offers after unlist→list — listing may be stuck"]
-        return {"listed": True, "offers": offers, "warnings": warnings}
+        # the CLI prints "offers created/updated" even when it listed NOTHING (seen live:
+        # a restricted api key silently no-ops — listing needs the full account key), so
+        # the only trustworthy signal is the offers actually appearing; they can lag ~1 min
+        offers: list[dict] = []
+        for _ in range(9):
+            offers = self.vast.search_offers(machine["id"])
+            if offers:
+                break
+            time.sleep(10)
+        if not offers:
+            raise ApiFailure(
+                "listing_not_confirmed",
+                "no offers appeared within 90s of unlist→list — stuck listing, "
+                "a key without listing rights, or a busy GPU",
+            )
+        return {"listed": True, "offers": offers, "warnings": []}
 
     def unlist(self) -> dict:
         machine = self._resolve_machine()
