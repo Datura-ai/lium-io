@@ -40,10 +40,6 @@ class SetupRequest(BaseModel):
     force: bool = False
 
 
-class SelfTestRequest(BaseModel):
-    pass
-
-
 class ListRequest(BaseModel):
     price_gpu_usd: float
     duration: str = "7 days"
@@ -85,12 +81,3 @@ class StatusDoc(BaseModel):
     box: dict[str, Any]
     lium: dict[str, Any]
     ttl: dict[str, Any]
-
-
-class ErrorBody(BaseModel):
-    code: str
-    detail: str
-
-
-class ErrorEnvelope(BaseModel):
-    error: ErrorBody

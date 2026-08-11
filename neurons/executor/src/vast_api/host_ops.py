@@ -93,41 +93,27 @@ class HostOps:
         result = self.run(["hostname", "-I"], check=False)
         return result.stdout.split()
 
-    def gpu_stats(self) -> list[dict]:
-        # per-GPU memory + utilization from the host driver
-        result = self.run([
-            "nvidia-smi",
-            "--query-gpu=index,memory.used,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ])
-        gpus = []
-        for line in result.stdout.strip().splitlines():
-            # ghost GPUs print "[Unknown Error]" — refuse loudly, not with a bare 500
-            try:
-                idx, mem, util = [part.strip() for part in line.split(",")]
-                gpus.append({"idx": int(idx), "mem_mib": int(mem), "util_pct": int(util)})
-            except ValueError:
-                raise ApiFailure(
-                    "host_command_failed", f"nvidia-smi returned non-numeric fields: {line!r}"[:300]
-                )
-        return gpus
-
-    def gpu_compute_apps(self) -> list[dict]:
-        # running compute processes on any GPU (the Lium filler shows up here)
-        result = self.run([
-            "nvidia-smi",
-            "--query-compute-apps=pid,used_memory",
-            "--format=csv,noheader,nounits",
-        ])
-        apps = []
+    def _query_nvidia_smi(self, query: str, fields: list[str]) -> list[dict]:
+        # ghost GPUs print "[Unknown Error]" for numeric fields — refuse loudly, not a bare 500
+        result = self.run(["nvidia-smi", query, "--format=csv,noheader,nounits"])
+        rows = []
         for line in result.stdout.strip().splitlines():
             if not line.strip():
                 continue
             try:
-                pid, mem = [part.strip() for part in line.split(",")]
-                apps.append({"pid": int(pid), "mem_mib": int(mem)})
+                rows.append({name: int(part.strip()) for name, part in zip(fields, line.split(","))})
             except ValueError:
                 raise ApiFailure(
                     "host_command_failed", f"nvidia-smi returned non-numeric fields: {line!r}"[:300]
                 )
-        return apps
+        return rows
+
+    def gpu_stats(self) -> list[dict]:
+        # per-GPU memory + utilization from the host driver
+        return self._query_nvidia_smi(
+            "--query-gpu=index,memory.used,utilization.gpu", ["idx", "mem_mib", "util_pct"]
+        )
+
+    def gpu_compute_apps(self) -> list[dict]:
+        # running compute processes on any GPU (the Lium filler shows up here)
+        return self._query_nvidia_smi("--query-compute-apps=pid,used_memory", ["pid", "mem_mib"])

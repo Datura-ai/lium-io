@@ -12,7 +12,6 @@ from vast_api.schemas import (
     PriceRequest,
     RunAccepted,
     RunDoc,
-    SelfTestRequest,
     SetupRequest,
     StatusDoc,
     UnlistResponse,
@@ -60,7 +59,7 @@ def vast_setup(payload: SetupRequest, request: Request):
 
 
 @router.post("/vast/self-test", response_model=RunAccepted, status_code=202)
-def vast_self_test(payload: SelfTestRequest, request: Request):
+def vast_self_test(request: Request):
     return RunAccepted(run_id=_manager(request).self_test())
 
 

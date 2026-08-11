@@ -9,7 +9,7 @@ from vast_api.docker_ops import DockerOps
 from vast_api.errors import ApiFailure, ApiRefusal, safe_error
 from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
-from vast_api.stages import SETUP_STAGE_NAMES, build_setup_ladder, run_ladder
+from vast_api.stages import build_setup_ladder, run_ladder
 from vast_api.vast_client import VastClient
 
 logger = logging.getLogger(__name__)
@@ -91,13 +91,15 @@ class VastManager:
     def setup(self, machine_id: int | None = None, force: bool = False) -> str:
         if not force:
             self._refuse_setup_if_rental_running()
-        run_id = self.runs.create("setup", {"machine_id": machine_id}, SETUP_STAGE_NAMES)
+        # build first (pure closure construction) so the run doc's stage list is
+        # derived from the ladder itself, never a second hand-kept name list
+        stages, ctx = build_setup_ladder(
+            self.settings, self.host, self.docker_ops, self.vast, machine_id
+        )
+        run_id = self.runs.create("setup", {"machine_id": machine_id}, [s.name for s in stages])
 
         def _execute() -> None:
             try:
-                stages, ctx = build_setup_ladder(
-                    self.settings, self.host, self.docker_ops, self.vast, machine_id
-                )
                 if run_ladder(stages, self.runs, run_id):
                     self.runs.finish(
                         run_id,
@@ -117,6 +119,13 @@ class VastManager:
     def self_test(self) -> str:
         run_id = self.runs.create("selftest", {}, ["self_test"])
 
+        def _fail(code: str, detail: str) -> None:
+            self.runs.stage_finished(run_id, "self_test", "failed", detail)
+            try:
+                self.runs.finish(run_id, "failed", error={"code": code, "detail": detail})
+            except Exception:
+                logger.critical("failed to persist terminal state for %s", run_id, exc_info=True)
+
         def _execute() -> None:
             self.runs.stage_started(run_id, "self_test")
             try:
@@ -132,18 +141,10 @@ class VastManager:
                 self.runs.stage_finished(run_id, "self_test", "done")
                 self.runs.finish(run_id, "succeeded", result=result)
             except (ApiRefusal, ApiFailure) as exc:
-                self.runs.stage_finished(run_id, "self_test", "failed", exc.detail)
-                try:
-                    self.runs.finish(run_id, "failed", error={"code": exc.code, "detail": exc.detail})
-                except Exception:
-                    logger.critical("failed to persist terminal state for %s", run_id, exc_info=True)
+                _fail(exc.code, exc.detail)
             except Exception as exc:
                 logger.exception("self-test run %s crashed", run_id)
-                self.runs.stage_finished(run_id, "self_test", "failed", safe_error(exc))
-                try:
-                    self.runs.finish(run_id, "failed", error={"code": "unexpected", "detail": safe_error(exc)})
-                except Exception:
-                    logger.critical("failed to persist terminal state for %s", run_id, exc_info=True)
+                _fail("unexpected", safe_error(exc))
 
         threading.Thread(target=_execute, name=run_id, daemon=True).start()
         return run_id

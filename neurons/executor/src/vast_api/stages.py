@@ -12,14 +12,6 @@ from vast_api.vast_client import VastClient
 
 logger = logging.getLogger(__name__)
 
-# kaalia MUST precede nested_daemon/gpu: the nested daemon.json declares the
-# nvidia runtime through kaalia_docker_shim, which only exists after the kaalia
-# install (proven on the fresh-box exam 2026-08-11: gpu_broken by construction).
-SETUP_STAGE_NAMES = [
-    "g0_gate", "image", "container", "data_root", "dmi_shim",
-    "kaalia", "nested_daemon", "gpu", "register", "report",
-]
-
 
 class Stage:
     def __init__(
@@ -303,6 +295,9 @@ def build_setup_ladder(
         if rc != 0 or "403" in output:
             raise ApiFailure("report_failed", f"send_mach_info.py failed twice: {output[-300:]}")
 
+    # kaalia MUST precede nested_daemon/gpu: the nested daemon.json declares the
+    # nvidia runtime through kaalia_docker_shim, which only exists after the kaalia
+    # install (proven on the fresh-box exam 2026-08-11: gpu_broken by construction).
     stages = [
         Stage("g0_gate", g0_check, g0_do),
         Stage("image", image_check, docker_ops.build_image, image_verify),

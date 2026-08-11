@@ -9,7 +9,7 @@ from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
 from vast_api.errors import ApiFailure, safe_error
 from vast_api.service import VastManager, _parse_self_test
-from vast_api.stages import SETUP_STAGE_NAMES, Stage, build_setup_ladder, run_ladder
+from vast_api.stages import Stage, build_setup_ladder, run_ladder
 
 
 def test_satisfied_stage_check_short_circuits_to_ok(tmp_path):
@@ -45,9 +45,8 @@ def test_setup_ladder_stage_names_and_order(tmp_path):
 
     stages, _ = build_setup_ladder(settings, Mock(), Mock(), Mock())
 
-    assert [stage.name for stage in stages] == SETUP_STAGE_NAMES
     # kaalia before nested_daemon/gpu: the nvidia runtime is kaalia's shim
-    assert SETUP_STAGE_NAMES == [
+    assert [stage.name for stage in stages] == [
         "g0_gate", "image", "container", "data_root", "dmi_shim",
         "kaalia", "nested_daemon", "gpu", "register", "report",
     ]

@@ -11,6 +11,8 @@ from vast_api.errors import ApiFailure
 logger = logging.getLogger(__name__)
 
 VAST_API_BASE = "https://console.vast.ai/api/v0"
+# proven listing disk price ($/GB/hr) — a constant, not a knob anyone tunes
+LISTING_DISK_PRICE_USD = "0.02"
 
 
 class VastClient:
@@ -121,7 +123,7 @@ class VastClient:
         self._cli([
             "list", "machine", str(machine_id),
             "--price_gpu", str(price_gpu_usd),
-            "--price_disk", "0.02",
+            "--price_disk", LISTING_DISK_PRICE_USD,
             "--duration", duration,
         ])
 
