@@ -273,33 +273,31 @@ def build_setup_ladder(
                 "identify_rejected", f"vastai unit not active after identify: {output.strip()[:100]}"
             )
 
-    # --- report: no check — re-reporting an already-reporting machine is harmless ---
+    # --- report: no check — re-verifying an already-reporting daemon is harmless ---
 
     def report_do() -> None:
-        # send_mach_info.py is unpacked from daemon.tar.gz by the freshly restarted
-        # kaalia — on a first install it appears seconds to minutes after register,
-        # so wait for it instead of failing the whole run (seen live on 147260)
-        wait = (
-            "for i in $(seq 1 24); do"
-            " [ -f /var/lib/vastai_kaalia/send_mach_info.py ] && exit 0; sleep 5; done; exit 1"
-        )
-        rc, _ = docker_ops.exec_in_uns(["bash", "-c", wait])
+        # Manual `send_mach_info.py` is permanently blocked server-side (403
+        # "Invalid or missing nonce" — the nonce comes only from a server challenge
+        # to the daemon; recipe-breaking change recorded in journal-verified-quest,
+        # re-confirmed live on 147260). The daemon self-reports gpu/cpu/disk on its
+        # own cycle, so this stage verifies the daemon IS reporting: recent log
+        # activity and no auth rejections. Record completeness in /machines/ is the
+        # backend's check after the run (it holds the account key).
+        rc, output = docker_ops.exec_in_uns(["systemctl", "is-active", "vastai"])
         if rc != 0:
-            raise ApiFailure("report_failed", "send_mach_info.py never unpacked within 120s")
-        # a 403 ("Invalid or missing nonce") is a daemon state, not an API change:
-        # restart vastai and give it time to check in and obtain a nonce before the
-        # retry — an immediate retry still 403s (seen live on 147260).
-        # the script lives in the kaalia root, NOT in latest/ (verified on a live install)
-        cmd = ["bash", "-c", "cd /var/lib/vastai_kaalia && python3 send_mach_info.py"]
-        output = ""
-        for attempt in range(3):
-            if attempt:
-                docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
-                docker_ops.exec_in_uns(["sleep", "30"])
-            rc, output = docker_ops.exec_in_uns(cmd)
-            if rc == 0 and "403" not in output:
-                return
-        raise ApiFailure("report_failed", f"send_mach_info.py failed 3 times: {output[-300:]}")
+            raise ApiFailure("report_failed", f"vastai unit not active: {output.strip()[:100]}")
+        rc, _ = docker_ops.exec_in_uns(
+            # kaalia writes its log continuously — a stale log means the daemon
+            # is wedged even if the unit shows active
+            ["bash", "-c", "find /var/lib/vastai_kaalia/kaalia.log -newermt '-120 seconds' | grep -q ."]
+        )
+        if rc != 0:
+            raise ApiFailure("report_failed", "kaalia.log has not advanced in 120s")
+        rc, output = docker_ops.exec_in_uns(
+            ["bash", "-c", "tail -n 500 /var/lib/vastai_kaalia/kaalia.log | grep -i 'authorization rejected' || true"]
+        )
+        if output.strip():
+            raise ApiFailure("report_failed", f"kaalia rejects auth: {output.strip()[:200]}")
 
     # kaalia MUST precede nested_daemon/gpu: the nested daemon.json declares the
     # nvidia runtime through kaalia_docker_shim, which only exists after the kaalia
