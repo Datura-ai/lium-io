@@ -1278,12 +1278,13 @@ def test_select_floor_candidates_live_zero_selected_burn_inactive_positive_exclu
 
     miners = [
         create_neuron_info(uid=5, hotkey="live_absent"),
-        create_neuron_info(uid=100, hotkey="live_burner"),
+        # uid 101 is a burn uid that the vector dropped: only the burn check can exclude it
+        create_neuron_info(uid=101, hotkey="live_burner_absent"),
         create_neuron_info(uid=6, hotkey="inactive"),
         create_neuron_info(uid=7, hotkey="live_present"),
     ]
     uint_uids = [100, 7]
-    active_hotkeys = {"live_absent", "live_burner", "live_present"}
+    active_hotkeys = {"live_absent", "live_burner_absent", "live_present"}
 
     candidates = _select_floor_candidates(uint_uids, miners, active_hotkeys, {100, 101})
 
@@ -1330,6 +1331,71 @@ def test_apply_eligibility_floor_stops_when_burn_exhausted(create_neuron_info):
 
     assert floored_hotkeys == ["live_a"]
     assert dict(zip(out_uids, out_weights)) == {100: 1, 5: 1}
+
+
+def test_apply_eligibility_floor_floors_several_miners_in_one_publish(create_neuron_info):
+    from clients.subtensor_client import _apply_eligibility_floor
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="big_burner"),
+        create_neuron_info(uid=101, hotkey="small_burner"),
+        create_neuron_info(uid=5, hotkey="live_a"),
+        create_neuron_info(uid=6, hotkey="live_b"),
+        create_neuron_info(uid=7, hotkey="live_c"),
+    ]
+    # the donor is re-picked per candidate, so the two burn entries drain evenly
+    uint_uids = [100, 101]
+    uint_weights = [10, 9]
+
+    out_uids, out_weights, floored_hotkeys = _apply_eligibility_floor(
+        uint_uids, uint_weights, miners, {"live_a", "live_b", "live_c"}, {100, 101}
+    )
+
+    assert floored_hotkeys == ["live_a", "live_b", "live_c"]
+    assert dict(zip(out_uids, out_weights)) == {100: 8, 101: 8, 5: 1, 6: 1, 7: 1}
+    assert sum(out_weights) == sum(uint_weights)
+
+
+def test_apply_eligibility_floor_without_any_burn_entry_changes_nothing(create_neuron_info):
+    from clients.subtensor_client import _apply_eligibility_floor
+
+    miners = [
+        create_neuron_info(uid=3, hotkey="earner"),
+        create_neuron_info(uid=5, hotkey="live_absent"),
+    ]
+    uint_uids = [3]
+    uint_weights = [500]
+
+    out_uids, out_weights, floored_hotkeys = _apply_eligibility_floor(
+        uint_uids, uint_weights, miners, {"live_absent"}, {100}
+    )
+
+    assert floored_hotkeys == []
+    assert (out_uids, out_weights) == ([3], [500])
+
+
+@pytest.mark.asyncio
+async def test_set_weights_mirror_payload_carries_the_floored_entries(
+    mock_subtensor_client,
+    create_neuron_info,
+):
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=2, hotkey="earner"),
+        create_neuron_info(uid=3, hotkey="idle"),
+    ]
+
+    with patch.object(mock_subtensor_client, "send_weights_to_lium", AsyncMock()) as mirror:
+        await _run_set_weights_and_capture(
+            mock_subtensor_client,
+            miners,
+            {"burner": 0.8, "earner": 0.2},
+            normalize=True,
+            active_hotkeys={"idle"},
+        )
+
+    payload = mirror.call_args.args[0]
+    assert dict(zip(payload["uids"], payload["weights"]))[3] == 1
 
 
 @pytest.mark.asyncio
@@ -1385,6 +1451,34 @@ async def test_set_weights_floors_active_hotkey_with_zero_score(
     by_uid = dict(zip(list(call.kwargs["uids"]), list(call.kwargs["weights"])))
 
     assert by_uid[3] == 1, f"live idle miner was dropped from the vector: {by_uid}"
+    assert by_uid[100] == 65534
+
+
+@pytest.mark.asyncio
+async def test_set_weights_floors_live_miner_on_a_retired_burner_uid(
+    mock_subtensor_client,
+    create_neuron_info,
+):
+    # BURNERS holds the pre-DAH-2274 slots; with the new burn logic on they receive nothing
+    # and are ordinary miner uids, so a live miner sitting there still deserves the floor.
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=2, hotkey="earner"),
+        create_neuron_info(uid=1, hotkey="idle_on_retired_burner_uid"),
+    ]
+
+    await _run_set_weights_and_capture(
+        mock_subtensor_client,
+        miners,
+        {"burner": 0.8, "earner": 0.2},
+        normalize=True,
+        active_hotkeys={"idle_on_retired_burner_uid"},
+    )
+
+    call = mock_subtensor_client.subtensor.set_weights.call_args
+    by_uid = dict(zip(list(call.kwargs["uids"]), list(call.kwargs["weights"])))
+
+    assert by_uid[1] == 1, f"live miner on a retired burner uid was dropped: {by_uid}"
     assert by_uid[100] == 65534
 
 
