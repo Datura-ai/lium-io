@@ -122,9 +122,11 @@ class DockerOps:
         )
 
     def vast_rental_containers(self) -> list[str]:
-        # a live Vast contract IS a container C.<id> in the nested dockerd
-        # (plan-contract-events) — the local rental-detection signal
-        rc, output = self.exec_in_uns(["docker", "ps", "--format", "{{.Names}}"])
+        # a Vast contract IS a container C.<id> in the nested dockerd — and it must be
+        # counted in ANY state: a client-stopped instance still holds the contract and
+        # its storage, and can restart anytime (verified live on 147063: C.47368067
+        # Exited while the client kept the instance; rentals_running showed 0)
+        rc, output = self.exec_in_uns(["docker", "ps", "-a", "--format", "{{.Names}}"])
         if rc != 0:
             raise ApiFailure("host_command_failed", f"nested docker ps failed: {output[:300]}")
         return [name for name in output.split() if name.startswith("C.")]
