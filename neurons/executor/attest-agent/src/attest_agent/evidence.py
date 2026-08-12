@@ -9,6 +9,13 @@ NVIDIA verifier stack, returns `None` for GPU evidence with a stated reason — 
 return an empty list, which a verifier would be entitled to read as "this CVM holds no
 GPUs" when the truth is "this agent could not tell". The two answers lead to opposite
 decisions on the validator's side, so they must not share an encoding.
+
+**The reason is authored here, never quoted from an exception.** Every `detail` below is
+returned to whoever can reach the agent's port, so a vendor exception pasted into one hands
+an unauthenticated caller this guest's internals — driver versions, library paths, NVML's
+own error text (CodeQL `py/stack-trace-exposure`). The exception goes to the log, which is
+on the host an operator is already reading; the response keeps the distinction the validator
+acts on, which is *which* of these four states this CVM is in, not what the vendor said.
 """
 
 import hashlib
@@ -48,7 +55,8 @@ def gpu_uuids() -> tuple[list[str], str]:
     try:
         pynvml.nvmlInit()
     except Exception as exc:  # noqa: BLE001 - NVML raises its own exception family
-        return [], f"NVML did not initialise ({exc}), so no GPU can be identified"
+        logger.warning("NVML did not initialise: %s", exc)
+        return [], "NVML did not initialise, so no GPU can be identified"
 
     try:
         uuids = []
@@ -58,7 +66,8 @@ def gpu_uuids() -> tuple[list[str], str]:
             uuids.append(uuid.decode() if isinstance(uuid, bytes) else uuid)
         return uuids, f"{len(uuids)} GPU(s) read from NVML"
     except Exception as exc:  # noqa: BLE001
-        return [], f"NVML failed while enumerating devices: {exc}"
+        logger.warning("NVML failed while enumerating devices: %s", exc)
+        return [], "NVML failed while enumerating devices, so no GPU can be identified"
     finally:
         try:
             pynvml.nvmlShutdown()
@@ -91,7 +100,7 @@ def collect_gpu_evidence(uuids: list[str], nonce_hex: str) -> GpuEvidence:
         # refused to answer at all would leave it unable to tell "no evidence" from
         # "no agent".
         logger.warning("GPU evidence collection failed: %s", exc)
-        return GpuEvidence(uuids, None, f"GPU evidence collection failed: {exc}")
+        return GpuEvidence(uuids, None, "GPU evidence collection failed")
 
 
 def tdx_quote(report_data: bytes, *, timeout: int) -> str:

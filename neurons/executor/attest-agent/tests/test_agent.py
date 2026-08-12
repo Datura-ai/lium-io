@@ -16,7 +16,12 @@ import json
 
 import pytest
 from attest_agent import evidence
-from attest_agent.app import NonceLedger, create_app
+from attest_agent.app import (
+    BAD_REQUEST_DETAIL,
+    NO_QUOTE_DETAIL,
+    NonceLedger,
+    create_app,
+)
 from attest_agent.config import Config
 from attest_agent.identity import (
     IdentityError,
@@ -188,7 +193,13 @@ class TestAttesting:
         "body", [{}, {"nonce": "abc"}, {"nonce": "zz" * 32}], ids=["absent", "short", "not-hex"]
     )
     def test_a_malformed_nonce_is_422(self, client, body):
-        assert client.post("/v1/attest", json=body).status_code == 422
+        response = client.post("/v1/attest", json=body)
+
+        assert response.status_code == 422
+        # One field, one constraint — so stating the requirement is strictly more useful to a
+        # caller than pydantic's or `parse_nonce`'s reading of what they sent, and it does not
+        # echo their input back or expose which validator rejected it.
+        assert response.json()["detail"] == BAD_REQUEST_DETAIL
 
     def test_no_quote_is_503_rather_than_500(self, config, gpus, monkeypatch):
         """The guest agent being unreachable is a condition of this host right now, and a
@@ -203,7 +214,11 @@ class TestAttesting:
             response = client.post("/v1/attest", json={"nonce": NONCE})
 
         assert response.status_code == 503
-        assert "no guest agent" in response.json()["detail"]
+        assert response.json()["detail"] == NO_QUOTE_DETAIL
+        assert "no guest agent" not in response.json()["detail"], (
+            "the exception's own text is for the log; the agent answers anyone who can reach "
+            "its port, and that text is a view of the guest's internals"
+        )
 
     def test_health_advertises_what_a_verifier_pins(self, client):
         health = client.get("/health").json()
@@ -308,3 +323,20 @@ class TestDegradingHonestly:
 
         assert uuids == []
         assert detail
+
+    def test_an_nvml_failure_names_the_state_without_quoting_the_driver(self, monkeypatch):
+        """`detail` reaches whoever can reach the agent's port. It has to say WHICH of the
+        four states this CVM is in, because that is what the validator acts on — and it must
+        not carry NVML's own text, which describes the guest rather than the state."""
+
+        class FakeNvml:
+            @staticmethod
+            def nvmlInit():
+                raise RuntimeError("libnvidia-ml.so.1: cannot open shared object file")
+
+        monkeypatch.setitem(__import__("sys").modules, "pynvml", FakeNvml)
+        uuids, detail = evidence.gpu_uuids()
+
+        assert uuids == []
+        assert "NVML did not initialise" in detail
+        assert "libnvidia-ml" not in detail

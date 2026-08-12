@@ -82,6 +82,12 @@ def test_unknown_kind_is_422_not_a_scope_bypass(client, platform_key):
     body = json.dumps({"kind": "something-else"}).encode()
     response = signed_request(client, platform_key, "POST", "/v1/cvm", body=body)
     assert response.status_code == 422
+    # The reason reaches the caller intact. `BodyRejected` is a returned value rather than a
+    # raised exception, and the whole point of that shape is that it costs the caller nothing:
+    # they still learn what they sent and which kinds exist.
+    detail = response.json()["detail"]
+    assert "something-else" in detail
+    assert "renter" in detail and "validation" in detail
 
 
 def test_missing_kind_is_422(client, platform_key):

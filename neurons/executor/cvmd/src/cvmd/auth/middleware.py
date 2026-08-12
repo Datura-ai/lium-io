@@ -155,11 +155,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(status_code=401, content=UNAUTHORIZED)
 
         parsed_body = _parse_body(body)
-        try:
-            needed = required_scope(request.method, path, parsed_body)
-        except BodyRejected as exc:
-            logger.info("422 %s %s: %s", request.method, path, exc)
-            return JSONResponse(status_code=422, content={"detail": str(exc)})
+        needed = required_scope(request.method, path, parsed_body)
+        if isinstance(needed, BodyRejected):
+            logger.info("422 %s %s: %s", request.method, path, needed.detail)
+            return JSONResponse(status_code=422, content={"detail": needed.detail})
 
         if needed is not EITHER_KEY and client.scope is not needed:
             logger.warning(

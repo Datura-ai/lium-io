@@ -405,6 +405,25 @@ class TestInstalling:
         assert described["usable"] is False
         assert "holds no catalog manifest" in described["error"]
 
+    def test_describe_names_the_state_without_quoting_the_verifier(self, store, tmp_path):
+        """A manifest that does not verify is reported, and the verifier's own words are not.
+
+        `/v1/catalog` exists to say which state this host is in, and it still does. What it
+        must not carry is the text of the exception that decided — that is a caught
+        exception's message on the wire, which is what CodeQL's py/stack-trace-exposure
+        flags. `current()` keeps the precise reason for the launch path and for the log.
+        """
+        store.config.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        store.config.cache_path.write_bytes(b"not a manifest")
+
+        described = store.describe()
+
+        assert described["usable"] is False
+        assert "did not verify" in described["error"]
+        assert "JSON" not in described["error"], "the parser's complaint belongs in the log"
+        with pytest.raises(CatalogError, match="not valid JSON"):
+            store.current()
+
     def test_describe_reports_the_manifest_in_force(self, store, catalog_signer):
         store.install(signed(catalog_signer, manifest_entry(), serial=4), source="test")
 
@@ -470,6 +489,7 @@ class TestResolving:
             resolve(
                 artifacts, kind="sandbox", qemu=QEMU, os_image_hash=OS_IMAGE, compose_hash=COMPOSE
             )
+
 
 class TestResolvingARenterBase:
     """DAH-2580: what the catalog decides for a launch whose compose it cannot carry.

@@ -9,6 +9,7 @@ two parsers over the same bytes only need to disagree once — duplicate keys, u
 number coercion — for the scope check and the handler to act on different values.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 from cvmd.auth.clients import Scope
@@ -27,29 +28,38 @@ KIND_TO_SCOPE = {
 }
 
 
-class BodyRejected(Exception):
+@dataclass(frozen=True)
+class BodyRejected:
     """The body is absent, unparseable, or not a shape the scope rules understand → 422.
 
-    Only ever raised after the signature verified, so this is a well-formedness complaint about
-    an authenticated request — never a path to a scope bypass.
+    Returned, not raised. `detail` goes straight into the response, and a reason read off a
+    caught exception is what CodeQL's `py/stack-trace-exposure` flags: a raised exception
+    carries its traceback, and the rule does not try to guess how much of it the message
+    repeats. A plain value keeps the reason exactly as precise as it was — none of these
+    three is derived from an exception in the first place — without routing it through one.
+
+    Only ever produced after the signature verified, so this is a well-formedness complaint
+    about an authenticated request — never a path to a scope bypass.
     """
 
+    detail: str
 
-def required_scope(method: str, path: str, parsed_body: Any) -> Scope | None:
+
+def required_scope(method: str, path: str, parsed_body: Any) -> Scope | BodyRejected | None:
     """Return the scope this request needs, or EITHER_KEY if any authorized key may make it.
 
-    Raises BodyRejected when the body is required but unusable.
+    Returns a BodyRejected when the body is required but unusable.
     """
     if path == CVM_PATH and method == "POST":
         if not isinstance(parsed_body, dict):
-            raise BodyRejected("body must be a JSON object")
+            return BodyRejected("body must be a JSON object")
         kind = parsed_body.get("kind")
         if not isinstance(kind, str):
-            raise BodyRejected("body has no `kind`")
+            return BodyRejected("body has no `kind`")
         scope = KIND_TO_SCOPE.get(kind)
         if scope is None:
             allowed = ", ".join(sorted(KIND_TO_SCOPE))
-            raise BodyRejected(f"unknown kind {kind!r} (allowed: {allowed})")
+            return BodyRejected(f"unknown kind {kind!r} (allowed: {allowed})")
         return scope
 
     if path == CVM_PATH and method == "DELETE":

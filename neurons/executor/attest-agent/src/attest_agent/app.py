@@ -43,6 +43,19 @@ logger = logging.getLogger(__name__)
 
 NONCE_HEX_CHARS = 64
 
+# What a failing request is told. Authored here rather than taken from the exception that
+# caused it: this agent answers anyone who can reach its port, and an exception's text is a
+# view of the guest's internals — SDK import paths, the dstack socket's own error, pydantic's
+# reading of the body (CodeQL `py/stack-trace-exposure`). Each one is logged in full first,
+# so nothing is lost to the operator; only the caller's copy is narrowed.
+#
+# Narrowing costs the caller nothing here. There is exactly one way to make a bad request —
+# the model has one field with one constraint — and the other two are host conditions no
+# caller can act on beyond the status code they already carry.
+BAD_REQUEST_DETAIL = 'the body must be {"nonce": "<64 hex characters>"}'
+NO_IDENTITY_DETAIL = "this agent cannot state its identity, so it cannot be attested"
+NO_QUOTE_DETAIL = "this agent could not obtain a TDX quote from the dstack guest agent"
+
 
 class AttestRequest(BaseModel):
     nonce: str = Field(min_length=NONCE_HEX_CHARS, max_length=NONCE_HEX_CHARS)
@@ -111,7 +124,8 @@ def create_app(config: Config) -> FastAPI:
             request = AttestRequest.model_validate(body)
             nonce = parse_nonce(request.nonce)
         except (ValidationError, IdentityError) as exc:
-            return JSONResponse(status_code=422, content={"detail": str(exc)})
+            logger.info("422: %s", exc)
+            return JSONResponse(status_code=422, content={"detail": BAD_REQUEST_DETAIL})
 
         cached = app.state.ledger.get(request.nonce)
         if cached is not None:
@@ -122,7 +136,8 @@ def create_app(config: Config) -> FastAPI:
         try:
             data = report_data(identity.public_key_der, uuids, nonce)
         except IdentityError as exc:
-            return JSONResponse(status_code=500, content={"detail": str(exc)})
+            logger.error("cannot bind report_data to this CVM's identity: %s", exc)
+            return JSONResponse(status_code=500, content={"detail": NO_IDENTITY_DETAIL})
 
         try:
             quote = tdx_quote(data, timeout=config.quote_timeout_seconds)
@@ -130,7 +145,7 @@ def create_app(config: Config) -> FastAPI:
             # 503, not 500: the guest agent being unreachable is a condition of this host
             # right now, and a verifier that retries later may well succeed.
             logger.error("no quote: %s", exc)
-            return JSONResponse(status_code=503, content={"detail": str(exc)})
+            return JSONResponse(status_code=503, content={"detail": NO_QUOTE_DETAIL})
 
         gpu = collect_gpu_evidence(uuids, request.nonce)
         answer = {

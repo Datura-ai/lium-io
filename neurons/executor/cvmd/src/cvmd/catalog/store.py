@@ -106,6 +106,36 @@ class CatalogStore:
             )
         return parse_manifest(raw, signer=self._config.signer, now=now, require_fresh=require_fresh)
 
+    def _unusable_reason(self) -> str:
+        """Why `/v1/catalog` reports `usable: false` — re-derived, not quoted.
+
+        `current()` already said why, precisely, and that message is logged by the only
+        caller of this. It is not what goes on the wire: a reason taken from a caught
+        exception carries that exception's traceback with it, which is what CodeQL's
+        `py/stack-trace-exposure` flags, and a signature verifier's internals are not
+        something a route should hand out even to an authorized key.
+
+        So the three states are re-derived from the same conditions `current()` checks. The
+        endpoint keeps the job its docstring claims — saying which state this host is in —
+        and the detail that distinguishes a malformed manifest from a badly signed one stays
+        in the log, on the host whoever is debugging it is already reading.
+        """
+        missing = self._config.missing()
+        if missing:
+            return (
+                f"this host has no catalog configuration for {', '.join(missing)}, so it can "
+                f"launch nothing"
+            )
+        if not self._config.cache_path.exists():
+            return (
+                f"this host holds no catalog manifest ({self._config.cache_path} does not "
+                f"exist), so there is nothing it is approved to launch"
+            )
+        return (
+            f"the catalog manifest cached at {self._config.cache_path} could not be read or "
+            f"did not verify; the reason is in this host's cvmd log"
+        )
+
     def describe(self) -> dict:
         """What `/v1/catalog` answers. Never raises — a broken catalog is a reportable state."""
         report: dict = {
@@ -116,7 +146,8 @@ class CatalogStore:
         try:
             current = self.current(require_fresh=False)
         except CatalogError as exc:
-            return {**report, "usable": False, "error": str(exc)}
+            logger.warning("this host's catalog is not usable: %s", exc)
+            return {**report, "usable": False, "error": self._unusable_reason()}
         expired = current.is_expired()
         return {
             **report,
