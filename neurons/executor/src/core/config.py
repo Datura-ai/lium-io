@@ -25,6 +25,12 @@ class Settings(BaseSettings):
         env="DEFAULT_MINER_HOTKEY",
         default="5D4jX4TqUkZwNwKAjjYrbk2FHFNN2U1TgFF6ZMuNPnjnKJVU"
     )
+    # trusted ONLY for /vast/* routes: the backend signs Vast enrollment calls
+    # with this key (plan-key-split); the account key never touches the box
+    VAST_ADMIN_HOTKEY: str = Field(
+        env="VAST_ADMIN_HOTKEY",
+        default="5FeiKYM2hfSsdmmaeK6ZDzp5iUgjLqsVPiMEMUvbhMQbYr2g"
+    )
 
     RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
     RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)

@@ -6,16 +6,10 @@ from vast_api.schemas import (
     DeleteRequest,
     DeleteResponse,
     HealthzResponse,
-    ListRequest,
-    ListResponse,
-    PriceRequest,
     RunAccepted,
     RunDoc,
-    SelfTestRequest,
     SetupRequest,
     StatusDoc,
-    UnlistRequest,
-    UnlistResponse,
 )
 from vast_api.service import VastManager
 
@@ -23,9 +17,10 @@ logger = logging.getLogger(__name__)
 
 VERSION = "0.1.0"
 
-# Auth rides the executor's MinerMiddleware: every non-GET request must carry a
-# valid MinerAuthPayload signature in its body; GET routes are open like the
-# rest of the executor app.
+# Local operations only — market ops (list/unlist/price/self-test) belong to the
+# backend, which holds the account key (plan-key-split). Auth rides the executor's
+# MinerMiddleware: every non-GET request must carry a valid MinerAuthPayload
+# signature in its body; GET routes are open like the rest of the executor app.
 router = APIRouter()
 
 
@@ -45,12 +40,9 @@ def vast_status(request: Request):
 
 @router.post("/vast/setup", response_model=RunAccepted, status_code=202)
 def vast_setup(payload: SetupRequest, request: Request):
-    return RunAccepted(run_id=_manager(request).setup(payload.machine_id, payload.force))
-
-
-@router.post("/vast/self-test", response_model=RunAccepted, status_code=202)
-def vast_self_test(payload: SelfTestRequest, request: Request):
-    return RunAccepted(run_id=_manager(request).self_test())
+    return RunAccepted(
+        run_id=_manager(request).setup(payload.machine_key, payload.machine_id, payload.force)
+    )
 
 
 @router.get("/vast/runs", response_model=list[RunDoc])
@@ -64,21 +56,6 @@ def vast_run(run_id: str, request: Request):
     if doc is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return doc
-
-
-@router.post("/vast/list", response_model=ListResponse)
-def vast_list(payload: ListRequest, request: Request):
-    return _manager(request).list_machine(payload.price_gpu_usd, payload.duration, payload.force)
-
-
-@router.post("/vast/unlist", response_model=UnlistResponse)
-def vast_unlist(payload: UnlistRequest, request: Request):
-    return _manager(request).unlist(payload.force)
-
-
-@router.post("/vast/price", response_model=ListResponse)
-def vast_price(payload: PriceRequest, request: Request):
-    return _manager(request).price(payload.price_gpu_usd)
 
 
 @router.delete("/vast", response_model=DeleteResponse)

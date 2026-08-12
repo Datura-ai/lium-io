@@ -11,9 +11,6 @@ class VastSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # host-side path (read via nsenter): the key survives executor container
-    # recreation and needs no compose changes on the miner's side
-    VAST_ACCOUNT_KEY_FILE: str = "/var/lib/vast-account-key"
     EXECUTOR_CONTAINER_NAME: str = "executor-executor-1"
     VAST_UNS_NAME: str = "vast-uns"
     VAST_UNS_IMAGE_TAG: str = "vast-uns-kaalia:img"

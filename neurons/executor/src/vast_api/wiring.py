@@ -22,7 +22,7 @@ def attach_vast_api(app: FastAPI, settings: VastSettings | None = None) -> None:
     settings = settings or VastSettings()
     host = HostOps(settings)
     docker_ops = DockerOps(settings)
-    vast = VastClient(settings, host)
+    vast = VastClient()
     runs = RunStore(settings.RUNS_DIR)
     app.state.vast_manager = VastManager(
         settings=settings, host=host, docker_ops=docker_ops, vast=vast, runs=runs

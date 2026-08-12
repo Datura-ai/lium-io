@@ -1,6 +1,5 @@
 import logging
 import secrets
-import time
 from collections.abc import Callable
 
 from vast_api.config import VastSettings
@@ -56,10 +55,13 @@ def build_setup_ladder(
     host: HostOps,
     docker_ops: DockerOps,
     vast: VastClient,
+    machine_key: str,
     machine_id: int | None = None,
 ) -> tuple[list[Stage], dict]:
-    # build the idempotent G0→G2 ladder; ctx carries network + machine_id between stages
-    ctx: dict = {"machine_id": machine_id}
+    # build the idempotent G0→G2 ladder; ctx carries network + machine_id between
+    # stages. machine_key is backend-minted per setup call and rotates on every
+    # mint (plan-key-split) — the box never holds the account key.
+    ctx: dict = {"machine_id": machine_id, "machine_key": machine_key}
 
     # --- g0_gate: never build a standalone Vast host ---
 
@@ -189,7 +191,6 @@ def build_setup_ladder(
         )
         if rc != 0:
             raise ApiFailure("install_rollback", f"kaalia installer download failed: {output[:300]}")
-        machine_key = vast.mint_machine_key()  # rotates — mint right before use
         # the key travels as an env var, never interpolated into the shell line
         rc, output = docker_ops.exec_in_uns(
             [
@@ -197,7 +198,7 @@ def build_setup_ladder(
                 f'cd /root && python3 vi2.py "$MACHINE_KEY" --no-libvirt --no-partitioning '
                 f"--ports {settings.PORT_RANGE_START} {settings.PORT_RANGE_END}",
             ],
-            env={"MACHINE_KEY": machine_key},
+            env={"MACHINE_KEY": ctx["machine_key"]},
         )
         if rc != 0:
             raise ApiFailure("install_rollback", f"kaalia installer failed: {output[-500:]}")
@@ -210,43 +211,28 @@ def build_setup_ladder(
     # --- register ---
 
     def register_check() -> bool:
+        # local-only: /machines/ visibility belongs to the backend (plan-key-split).
+        # A typo'd requested machine_id also fails backend-side, before this run starts.
         rc, _ = docker_ops.exec_in_uns(["test", "-f", "/var/lib/vastai_kaalia/machine_id"])
         if rc != 0:
             return False
-        machines = vast.get_machines()
-        machine_ids = [machine.get("id") for machine in machines]
-        if ctx["machine_id"] is not None:
-            return ctx["machine_id"] in machine_ids
-        # the numeric id persisted at register time resolves this box on a shared account
         rc, output = docker_ops.exec_in_uns(["cat", "/var/lib/vastai_kaalia/numeric_machine_id"])
-        if rc == 0 and output.strip().isdigit() and int(output.strip()) in machine_ids:
-            ctx["machine_id"] = int(output.strip())
-            return True
-        if len(machines) == 1:
-            ctx["machine_id"] = machines[0].get("id")
-            return True
-        return False
+        if rc != 0 or not output.strip().isdigit():
+            return False
+        persisted = int(output.strip())
+        if ctx["machine_id"] is not None and persisted != ctx["machine_id"]:
+            return False
+        ctx["machine_id"] = persisted
+        return True
 
     def register_do() -> None:
-        if ctx["machine_id"] is not None:
-            # a typo'd machine_id must fail BEFORE identify creates an orphan record;
-            # a persisted id equal to the requested one is fine (identify re-adopts it
-            # even while /machines/ lags behind)
-            machine_ids = [machine.get("id") for machine in vast.get_machines()]
-            rc, output = docker_ops.exec_in_uns(["cat", "/var/lib/vastai_kaalia/numeric_machine_id"])
-            persisted_id = int(output.strip()) if rc == 0 and output.strip().isdigit() else None
-            if ctx["machine_id"] not in machine_ids and persisted_id != ctx["machine_id"]:
-                raise ApiFailure(
-                    "identify_rejected", f"machine {ctx['machine_id']} is not on this account"
-                )
         rc, output = docker_ops.exec_in_uns(["cat", "/var/lib/vastai_kaalia/machine_id"])
         if rc == 0 and output.strip():
             machine_api_key = output.strip()
         else:
             machine_api_key = secrets.token_hex(32)
             docker_ops.write_file_in_uns("/var/lib/vastai_kaalia/machine_id", machine_api_key)
-        machine_key = vast.mint_machine_key()  # fresh Bearer — the full key is rejected here
-        response = vast.identify(machine_key, machine_api_key)
+        response = vast.identify(ctx["machine_key"], machine_api_key)
         # the identify quirk: success:false while the machine id IS created
         numeric_id = response.get("machine_id")
         if numeric_id is None:
@@ -264,24 +250,18 @@ def build_setup_ladder(
         docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
 
     def register_verify() -> None:
-        # a freshly identified machine can lag /machines/ by tens of seconds
-        # (seen live: created id absent on the immediate read, present ~1 min later)
-        for _ in range(18):
-            machine_ids = [machine.get("id") for machine in vast.get_machines()]
-            if ctx["machine_id"] in machine_ids:
-                return
-            time.sleep(5)
-        raise ApiFailure(
-            "identify_rejected", f"machine {ctx['machine_id']} did not appear in /machines/"
-        )
+        # appearance in /machines/ is verified by the backend after the run; locally
+        # verify the identity landed and kaalia runs with it
+        rc, output = docker_ops.exec_in_uns(["cat", "/var/lib/vastai_kaalia/numeric_machine_id"])
+        if rc != 0 or output.strip() != str(ctx["machine_id"]):
+            raise ApiFailure("identify_rejected", "numeric_machine_id not persisted after identify")
+        rc, output = docker_ops.exec_in_uns(["systemctl", "is-active", "vastai"])
+        if rc != 0:
+            raise ApiFailure(
+                "identify_rejected", f"vastai unit not active after identify: {output.strip()[:100]}"
+            )
 
-    # --- report ---
-
-    def report_check() -> bool:
-        for machine in vast.get_machines():
-            if machine.get("id") == ctx["machine_id"]:
-                return bool(machine.get("disk_space"))
-        return False
+    # --- report: no check — re-reporting an already-reporting machine is harmless ---
 
     def report_do() -> None:
         # a 403 ("Invalid or missing nonce") is a state, not an API change: restart + retry once
@@ -308,6 +288,6 @@ def build_setup_ladder(
         Stage("nested_daemon", nested_daemon_check, docker_ops.install_nested_daemon, nested_daemon_verify),
         Stage("gpu", gpu_check, gpu_do),
         Stage("register", register_check, register_do, register_verify),
-        Stage("report", report_check, report_do),
+        Stage("report", None, report_do),
     ]
     return stages, ctx

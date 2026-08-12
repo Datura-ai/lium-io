@@ -121,6 +121,14 @@ class DockerOps:
             command=["-c", VAST_UNS_ENTRYPOINT_CMD],
         )
 
+    def vast_rental_containers(self) -> list[str]:
+        # a live Vast contract IS a container C.<id> in the nested dockerd
+        # (plan-contract-events) — the local rental-detection signal
+        rc, output = self.exec_in_uns(["docker", "ps", "--format", "{{.Names}}"])
+        if rc != 0:
+            raise ApiFailure("host_command_failed", f"nested docker ps failed: {output[:300]}")
+        return [name for name in output.split() if name.startswith("C.")]
+
     def delete_vast_uns(self) -> bool:
         container = self.get_vast_uns()
         if container is None:

@@ -59,13 +59,6 @@ RUN curl -fsSLo /tmp/gocryptfs.tgz \
 RUN pip install -U pdm
 ENV PDM_CHECK_UPDATE=false
 
-# vastai CLI for the vast_api module — its own venv, outside the pdm lock, so
-# its dependency tree cannot disturb the pinned app environment
-RUN python -m venv /opt/vastai \
-  && /opt/vastai/bin/pip install --no-cache-dir vastai==1.5.3 \
-  && ln -s /opt/vastai/bin/vastai /usr/local/bin/vastai \
-  && vastai --help >/dev/null
-
 COPY pyproject.toml pdm.lock README.md ./
 COPY --from=datura . /datura
 

@@ -26,6 +26,14 @@ def request_timeout_seconds(path: str) -> int:
     return AUTHENTICATED_REQUEST_TIMEOUT_SECONDS
 
 
+def trusted_hotkeys(path: str) -> list[str]:
+    # the Vast admin key opens /vast/* only — never the rest of the executor API
+    hotkeys = [settings.MINER_HOTKEY_SS58_ADDRESS, settings.DEFAULT_MINER_HOTKEY]
+    if path.startswith("/vast"):
+        hotkeys.append(settings.VAST_ADMIN_HOTKEY)
+    return hotkeys
+
+
 class MinerMiddleware(BaseHTTPMiddleware):
     def __init__(self, app) -> None:
         super().__init__(app)
@@ -58,11 +66,8 @@ class MinerMiddleware(BaseHTTPMiddleware):
 
             logger.info(_m("miner ip", extra=default_extra))
 
-            # Try verifying with both the configured miner hotkey and the default portal hotkey
-            hotkeys_to_verify = [
-                settings.MINER_HOTKEY_SS58_ADDRESS,
-                settings.DEFAULT_MINER_HOTKEY,
-            ]
+            # Try verifying with every hotkey trusted for this path
+            hotkeys_to_verify = trusted_hotkeys(request.url.path)
 
             verified = False
             for hotkey in hotkeys_to_verify:

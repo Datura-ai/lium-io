@@ -88,11 +88,6 @@ class HostOps:
         self.run(["dmidecode", "--dump-bin", tmp])
         self.run(["sh", "-c", f"cat {tmp} > {target} && rm -f {tmp}"])
 
-    def local_ips(self) -> list[str]:
-        # all host interface addresses — used to pick this box's machine on a shared account
-        result = self.run(["hostname", "-I"], check=False)
-        return result.stdout.split()
-
     def _query_nvidia_smi(self, query: str, fields: list[str]) -> list[dict]:
         # ghost GPUs print "[Unknown Error]" for numeric fields — refuse loudly, not a bare 500
         result = self.run(["nvidia-smi", query, "--format=csv,noheader,nounits"])
@@ -114,6 +109,3 @@ class HostOps:
             "--query-gpu=index,memory.used,utilization.gpu", ["idx", "mem_mib", "util_pct"]
         )
 
-    def gpu_compute_apps(self) -> list[dict]:
-        # running compute processes on any GPU (the Lium filler shows up here)
-        return self._query_nvidia_smi("--query-compute-apps=pid,used_memory", ["pid", "mem_mib"])

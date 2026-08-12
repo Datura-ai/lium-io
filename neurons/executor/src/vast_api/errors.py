@@ -3,9 +3,9 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# Machine-readable error codes shared by refusals and failures (see plan-vastctl.md):
-# g0_failed, state_mount_missing, gpu_broken, install_rollback, identify_rejected,
-# gpu_busy, rental_running, run_in_progress.
+# Machine-readable error codes shared by refusals and failures (see plan-vastctl.md
+# + plan-key-split.md): g0_failed, state_mount_missing, gpu_broken, install_rollback,
+# identify_rejected, report_failed, rental_running, run_in_progress, host_command_failed.
 
 logger = logging.getLogger(__name__)
 

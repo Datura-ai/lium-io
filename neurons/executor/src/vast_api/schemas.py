@@ -41,37 +41,11 @@ class HealthzResponse(BaseModel):
 
 
 class SetupRequest(MinerAuthPayload):
+    # machine_key is backend-minted per call and rotates on every mint
+    # (plan-key-split); the account key never reaches this box
+    machine_key: str
     machine_id: int | None = None
     force: bool = False
-
-
-class SelfTestRequest(MinerAuthPayload):
-    pass
-
-
-class ListRequest(MinerAuthPayload):
-    price_gpu_usd: float
-    duration: str = "7 days"
-    force: bool = False
-
-
-class PriceRequest(MinerAuthPayload):
-    price_gpu_usd: float
-
-
-class UnlistRequest(MinerAuthPayload):
-    force: bool = False
-
-
-class ListResponse(BaseModel):
-    listed: bool
-    offers: list[dict[str, Any]]
-    warnings: list[str] = []
-
-
-class UnlistResponse(BaseModel):
-    listed: bool
-    offers_remaining: int
 
 
 class DeleteRequest(MinerAuthPayload):
@@ -82,15 +56,12 @@ class DeleteRequest(MinerAuthPayload):
 class DeleteResponse(BaseModel):
     container_removed: bool
     state_removed: bool
-    vast_record_deleted: bool
 
 
 class StatusDoc(BaseModel):
-    # Sections degrade independently: a broken probe reports {"error": ...}
-    # in its section while the rest still answers.
-    goal: dict[str, Any]
-    vast: dict[str, Any]
-    offers: list[dict[str, Any]] | dict[str, Any]
+    # Local sections only, degrading independently (a broken probe reports
+    # {"error": ...} in its slot). Vast-side data (listed, reliability, offers)
+    # is merged by the backend, which holds the account key.
+    machine_id: int | None = None
+    rental_containers: list[str] | dict[str, Any] | None = None
     box: dict[str, Any]
-    lium: dict[str, Any]
-    ttl: dict[str, Any]

@@ -1,14 +1,10 @@
-import json
 import subprocess
 from unittest.mock import Mock
-
-import pytest
 
 from vast_api.config import VastSettings
 from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
 from vast_api.errors import ApiFailure, safe_error
-from vast_api.service import VastManager, _parse_self_test
 from vast_api.stages import Stage, build_setup_ladder, run_ladder
 
 
@@ -43,7 +39,7 @@ def test_unsatisfied_stage_runs_do_and_verify(tmp_path):
 def test_setup_ladder_stage_names_and_order(tmp_path):
     settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
 
-    stages, _ = build_setup_ladder(settings, Mock(), Mock(), Mock())
+    stages, _ = build_setup_ladder(settings, Mock(), Mock(), Mock(), "mk-test")
 
     # kaalia before nested_daemon/gpu: the nvidia runtime is kaalia's shim
     assert [stage.name for stage in stages] == [
@@ -57,7 +53,7 @@ def test_g0_failure_aborts_whole_ladder(tmp_path):
     settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
     docker_ops = Mock()
     docker_ops.executor_running.return_value = False
-    stages, _ = build_setup_ladder(settings, Mock(), docker_ops, Mock())
+    stages, _ = build_setup_ladder(settings, Mock(), docker_ops, Mock(), "mk-test")
     run_id = store.create("setup", {}, [stage.name for stage in stages])
 
     succeeded = run_ladder(stages, store, run_id)
@@ -127,43 +123,11 @@ def test_dump_dmi_writes_content_in_place(tmp_path):
     assert f"cat {tmp} > {settings.DMI_BIN_HOST}" in copy_call[2]
 
 
-def test_parse_self_test_real_cli_shape():
-    # trimmed from a live verdict on machine 147139 (2026-08-11)
-    raw = json.dumps({
-        "success": False,
-        "failure_code": "preflight_requirements_failed",
-        "phase": "preflight",
-        "checks": [
-            {"id": "cuda.version", "status": "pass", "summary": "CUDA version: actual 12.8 CUDA, required >= 11.8 CUDA"},
-            {"id": "reliability", "status": "fail", "summary": "Reliability: actual 0.6684413 ratio, required > 0.9 ratio"},
-            {"id": "network.direct_ports.recommended_max", "status": "info", "summary": "Recommended max ports"},
-        ],
-    })
-
-    result = _parse_self_test("some CLI noise\n" + raw)
-
-    assert result["passed"] is False
-    assert result["failure_code"] == "preflight_requirements_failed"
-    assert [(c["name"], c["status"]) for c in result["checks"]] == [
-        ("cuda.version", "pass"),
-        ("reliability", "fail"),
-        ("network.direct_ports.recommended_max", "info"),
-    ]
-
-
-def test_parse_self_test_unparseable_output():
-    result = _parse_self_test("no json here at all")
-
-    assert result["passed"] is False
-    assert result["checks"] == []
-    assert "parse_error" in result
-
-
 def test_safe_error_keeps_curated_text_hides_internals():
-    curated = safe_error(ApiFailure("no_machine", "no machine registered on this account"))
+    curated = safe_error(ApiFailure("rental_running", "live Vast contract container(s)"))
     leaky = safe_error(RuntimeError("nsenter -t 1 -m -n cat /var/lib/secret failed"))
 
-    assert curated == "no_machine: no machine registered on this account"
+    assert curated == "rental_running: live Vast contract container(s)"
     assert leaky == "RuntimeError"
 
 
@@ -177,7 +141,7 @@ def test_container_stage_state_mount_rail_aborts_without_remove(tmp_path):
     container = Mock()
     docker_ops.get_vast_uns.return_value = container
     docker_ops.vast_uns_has_state_mount.return_value = False
-    stages, _ = build_setup_ladder(settings, Mock(), docker_ops, Mock())
+    stages, _ = build_setup_ladder(settings, Mock(), docker_ops, Mock(), "mk-test")
     run_id = store.create("setup", {}, [stage.name for stage in stages])
 
     succeeded = run_ladder(stages, store, run_id)
@@ -188,31 +152,40 @@ def test_container_stage_state_mount_rail_aborts_without_remove(tmp_path):
     container.remove.assert_not_called()
 
 
-def _manager_with_mocks(tmp_path):
+def _exec_responses(docker_ops, table):
+    # exec_in_uns faked by first token of the command: token -> (rc, output)
+    def fake_exec(cmd, env=None):
+        key = cmd[0] if isinstance(cmd, list) else str(cmd)
+        return table.get(key, (0, ""))
+
+    docker_ops.exec_in_uns.side_effect = fake_exec
+
+
+def test_register_check_adopts_persisted_numeric_id(tmp_path):
     settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
-    return VastManager(settings=settings, host=Mock(), docker_ops=Mock(), vast=Mock(), runs=Mock())
+    docker_ops = Mock()
+    _exec_responses(docker_ops, {"test": (0, ""), "cat": (0, "147063\n")})
+    stages, ctx = build_setup_ladder(settings, Mock(), docker_ops, Mock(), "mk-test")
+    register = next(stage for stage in stages if stage.name == "register")
+
+    satisfied = register.check()
+
+    assert satisfied is True
+    assert ctx["machine_id"] == 147063
 
 
-def test_resolve_machine_persisted_id_beats_ip_match(tmp_path):
-    manager = _manager_with_mocks(tmp_path)
-    manager.vast.get_machines.return_value = [
-        {"id": 1, "public_ipaddr": "192.0.2.7"},
-        {"id": 2, "public_ipaddr": ""},
-    ]
-    manager.host.run.return_value = Mock(stdout="2\n")
-    manager.host.local_ips.return_value = ["192.0.2.7"]
+def test_register_do_identifies_with_backend_minted_key(tmp_path):
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
+    docker_ops = Mock()
+    _exec_responses(docker_ops, {"cat": (0, "abc123hex\n"), "systemctl": (0, "")})
+    vast = Mock()
+    vast.identify.return_value = {"success": False, "machine_id": 147200}
+    stages, ctx = build_setup_ladder(settings, Mock(), docker_ops, vast, "mk-from-backend")
+    register = next(stage for stage in stages if stage.name == "register")
 
-    machine = manager._resolve_machine()
+    register.do()
 
-    assert machine["id"] == 2
-
-
-def test_resolve_machine_stale_persisted_id_is_terminal(tmp_path):
-    manager = _manager_with_mocks(tmp_path)
-    manager.vast.get_machines.return_value = [{"id": 1, "public_ipaddr": "192.0.2.7"}]
-    manager.host.run.return_value = Mock(stdout="99\n")
-
-    with pytest.raises(ApiFailure) as exc_info:
-        manager._resolve_machine()
-
-    assert exc_info.value.code == "machine_unresolved"
+    vast.identify.assert_called_once_with("mk-from-backend", "abc123hex")
+    assert ctx["machine_id"] == 147200
+    written = [c.args for c in docker_ops.write_file_in_uns.call_args_list]
+    assert ("/var/lib/vastai_kaalia/numeric_machine_id", "147200") in written
