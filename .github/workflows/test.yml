@@ -240,7 +240,7 @@ jobs:
           ansible-playbook -i inventory/localhost.yml tests/test_grub_fixtures.yml
           ansible-playbook -i inventory/localhost.yml tests/test_kernel_idempotence.yml
           ansible-playbook -i inventory/localhost.yml tests/test_sgx_registration.yml
-          ansible-playbook -i inventory/localhost.yml tests/test_stubs.yml
+          ansible-playbook -i inventory/localhost.yml tests/test_catalog.yml
           ansible-playbook -i inventory/localhost.yml tests/test_cvmd.yml
           ansible-playbook -i inventory/localhost.yml tests/test_cvmd_launch.yml
           ansible-playbook -i inventory/localhost.yml tests/test_repo_app_pristine.yml
