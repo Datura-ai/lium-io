@@ -85,6 +85,23 @@ class HostOps:
                 self.run(["losetup", "-d", loop], check=False)  # don't leak the loop device
             raise
 
+    def reserve_publish_ports(self) -> None:
+        # the publish range sits inside the kernel's ephemeral span (32768-60999), so
+        # any outbound connection can squat a port and fail docker's bind at container
+        # start ("address already in use" with no listener in sight) — reserve it;
+        # merged with existing reservations, persisted for reboot (restart_policy
+        # restarts vast-uns at boot and needs the same guarantee)
+        span = f"{self.settings.PORT_RANGE_START}-{self.settings.PORT_RANGE_END}"
+        current = self.run(["sysctl", "-n", "net.ipv4.ip_local_reserved_ports"]).stdout.strip()
+        reserved = [part.strip() for part in current.split(",") if part.strip()]
+        if span not in reserved:
+            merged = ",".join(reserved + [span])
+            self.run(["sysctl", "-w", f"net.ipv4.ip_local_reserved_ports={merged}"])
+            self.run([
+                "sh", "-c",
+                f"echo 'net.ipv4.ip_local_reserved_ports={merged}' > /etc/sysctl.d/99-vast-uns-ports.conf",
+            ])
+
     def purge_data_root(self) -> None:
         # tear down the loop-XFS nested data-root: a surviving data-root resurrects
         # old C.<contract_id> containers on the next setup and the rental rail 409s

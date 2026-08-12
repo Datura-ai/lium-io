@@ -151,6 +151,29 @@ def test_purge_data_root_without_attached_loop_skips_detach(tmp_path):
     assert ["rm", "-f", settings.DATA_ROOT_IMG] in calls
 
 
+def test_reserve_publish_ports_merges_with_existing(tmp_path):
+    host, calls, settings, responses = _host_with_fake_run(tmp_path)
+    responses["sysctl"] = (0, "50000\n")  # pre-existing reservation must survive
+
+    host.reserve_publish_ports()
+
+    span = f"{settings.PORT_RANGE_START}-{settings.PORT_RANGE_END}"
+    write_call = next(args for args in calls if args[0] == "sysctl" and args[1] == "-w")
+    assert write_call[2] == f"net.ipv4.ip_local_reserved_ports=50000,{span}"
+    persist_call = next(args for args in calls if args[0] == "sh")
+    assert "/etc/sysctl.d/99-vast-uns-ports.conf" in persist_call[2]
+
+
+def test_reserve_publish_ports_idempotent_when_already_reserved(tmp_path):
+    host, calls, settings, responses = _host_with_fake_run(tmp_path)
+    span = f"{settings.PORT_RANGE_START}-{settings.PORT_RANGE_END}"
+    responses["sysctl"] = (0, f"{span}\n")
+
+    host.reserve_publish_ports()
+
+    assert not any(args[0] == "sysctl" and args[1] == "-w" for args in calls)
+
+
 def test_dump_dmi_writes_content_in_place(tmp_path):
     host, calls, settings, responses = _host_with_fake_run(tmp_path)
 

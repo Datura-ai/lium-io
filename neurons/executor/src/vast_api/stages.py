@@ -114,6 +114,7 @@ def build_setup_ladder(
         if not host.path_exists(settings.DMI_BIN_HOST):
             host.dump_dmi()
         host.ensure_data_root()
+        host.reserve_publish_ports()
         docker_ops.run_vast_uns(ctx["network"])
 
     def container_verify() -> None:
