@@ -6,6 +6,7 @@ from core.config import settings as executor_settings
 from vast_api.config import VastSettings
 from vast_api.docker_ops import DockerOps
 from vast_api.errors import ApiRefusal, safe_error
+from vast_api.events import EVENTS_CONFIG_FILE
 from vast_api.host_ops import HostOps
 from vast_api.runs import RunStore
 from vast_api.stages import build_setup_ladder, run_ladder
@@ -88,12 +89,33 @@ class VastManager:
 
     # --- async setup run ---
 
-    def setup(self, machine_key: str, machine_id: int | None = None, force: bool = False) -> str:
+    def setup(
+        self,
+        machine_key: str,
+        machine_id: int | None = None,
+        force: bool = False,
+        events_token: str | None = None,
+        events_url: str | None = None,
+        executor_id: str | None = None,
+    ) -> str:
         # the overlap rail is not force-overridable: colliding ports break Lium
         # pod creation regardless of intent
         self._refuse_if_port_overlap()
         if not force:
             self._refuse_if_rental_running()
+        if events_token or events_url or executor_id:
+            # contract-events delivery config for the poller; re-setup overwrites
+            # it (idempotent), a setup body without the fields keeps the old one
+            self.host.write_state_file(
+                EVENTS_CONFIG_FILE,
+                json.dumps(
+                    {
+                        "events_token": events_token,
+                        "events_url": events_url,
+                        "executor_id": executor_id,
+                    }
+                ),
+            )
         # build first (pure closure construction) so the run doc's stage list is
         # derived from the ladder itself, never a second hand-kept name list
         stages, ctx = build_setup_ladder(

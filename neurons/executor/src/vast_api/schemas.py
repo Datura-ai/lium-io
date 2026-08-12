@@ -46,6 +46,11 @@ class SetupRequest(MinerAuthPayload):
     machine_key: str
     machine_id: int | None = None
     force: bool = False
+    # contract-events delivery config (plan-contract-events): persisted under
+    # STATE_DIR_HOST for the poller; re-setup overwrites it (idempotent)
+    events_token: str | None = None
+    events_url: str | None = None
+    executor_id: str | None = None
 
 
 class DeleteRequest(MinerAuthPayload):

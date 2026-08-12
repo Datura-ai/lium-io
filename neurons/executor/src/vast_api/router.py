@@ -67,7 +67,14 @@ def vast_status(request: Request, x_signature: str = Header(...), x_timestamp: i
 @router.post("/vast/setup", response_model=RunAccepted, status_code=202)
 def vast_setup(payload: SetupRequest, request: Request):
     return RunAccepted(
-        run_id=_manager(request).setup(payload.machine_key, payload.machine_id, payload.force)
+        run_id=_manager(request).setup(
+            payload.machine_key,
+            payload.machine_id,
+            payload.force,
+            events_token=payload.events_token,
+            events_url=payload.events_url,
+            executor_id=payload.executor_id,
+        )
     )
 
 

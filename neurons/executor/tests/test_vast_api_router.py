@@ -226,6 +226,46 @@ def test_setup_fresh_box_without_vast_uns_still_202(tmp_path):
     assert response.status_code == 202
 
 
+def test_setup_persists_events_config(tmp_path):
+    # the three optional fields land in events_config.json under STATE_DIR_HOST
+    # for the contract-events poller; re-setup overwrites (idempotent)
+    app, client = _build_client(tmp_path)
+    manager = app.state.vast_manager
+    manager.docker_ops = Mock()
+    manager.docker_ops.get_vast_uns.return_value = None
+    manager.host = Mock()
+    body = {
+        **SETUP,
+        "events_token": "tok-1",
+        "events_url": "https://backend.example/vast/events",
+        "executor_id": "ec8c2436-1039-45aa-a508-bcbe865fbcd8",
+    }
+
+    response = client.post("/vast/setup", json=body)
+
+    assert response.status_code == 202
+    name, content = manager.host.write_state_file.call_args.args
+    assert name == "events_config.json"
+    assert json.loads(content) == {
+        "events_token": "tok-1",
+        "events_url": "https://backend.example/vast/events",
+        "executor_id": "ec8c2436-1039-45aa-a508-bcbe865fbcd8",
+    }
+
+
+def test_setup_without_events_fields_keeps_existing_config(tmp_path):
+    app, client = _build_client(tmp_path)
+    manager = app.state.vast_manager
+    manager.docker_ops = Mock()
+    manager.docker_ops.get_vast_uns.return_value = None
+    manager.host = Mock()
+
+    response = client.post("/vast/setup", json=SETUP)
+
+    assert response.status_code == 202
+    manager.host.write_state_file.assert_not_called()
+
+
 def _set_renting_config(monkeypatch, port_range: str | None, port_mappings: str | None):
     monkeypatch.setattr("vast_api.service.executor_settings.RENTING_PORT_RANGE", port_range)
     monkeypatch.setattr("vast_api.service.executor_settings.RENTING_PORT_MAPPINGS", port_mappings)

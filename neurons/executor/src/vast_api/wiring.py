@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from vast_api.config import VastSettings
 from vast_api.docker_ops import DockerOps
 from vast_api.errors import register_error_handlers
+from vast_api.events import ContractEventsPoller
 from vast_api.host_ops import HostOps
 from vast_api.router import router
 from vast_api.runs import RunStore
@@ -26,6 +27,10 @@ def attach_vast_api(app: FastAPI, settings: VastSettings | None = None) -> None:
     runs = RunStore(settings.RUNS_DIR)
     app.state.vast_manager = VastManager(
         settings=settings, host=host, docker_ops=docker_ops, vast=vast, runs=runs
+    )
+    # started as an asyncio task in the executor app lifespan (executor.py)
+    app.state.vast_events_poller = ContractEventsPoller(
+        settings=settings, host=host, docker_ops=docker_ops
     )
     register_error_handlers(app)
     app.include_router(router)

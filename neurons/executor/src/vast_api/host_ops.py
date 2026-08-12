@@ -1,3 +1,4 @@
+import base64
 import logging
 import subprocess
 
@@ -35,6 +36,23 @@ class HostOps:
 
     def path_exists(self, path: str) -> bool:
         return self.run(["test", "-e", path], check=False).returncode == 0
+
+    def read_state_file(self, name: str) -> str | None:
+        # a file under STATE_DIR_HOST (next to the machine identity); absent file
+        # is None, not an error
+        result = self.run(["cat", f"{self.settings.STATE_DIR_HOST}/{name}"], check=False)
+        return result.stdout if result.returncode == 0 else None
+
+    def write_state_file(self, name: str, content: str) -> None:
+        # atomic write (tmp + mv) under STATE_DIR_HOST, surviving executor-container
+        # restarts; content travels base64-encoded so it never meets the shell
+        path = f"{self.settings.STATE_DIR_HOST}/{name}"
+        encoded = base64.b64encode(content.encode()).decode()
+        self.run([
+            "sh", "-c",
+            f"mkdir -p {self.settings.STATE_DIR_HOST} && "
+            f"echo '{encoded}' | base64 -d > {path}.tmp && mv {path}.tmp {path}",
+        ])
 
     def data_root_mounted(self) -> bool:
         return self.run(["mountpoint", "-q", self.settings.DATA_ROOT_MOUNT], check=False).returncode == 0

@@ -39,6 +39,9 @@ async def lifespan(app: FastAPI):
     # Start pulling this host's cache template image as soon as the executor
     # boots, and keep it fresh in the background, without blocking startup.
     prefetch_task = asyncio.create_task(run_cache_template_prefetch())
+    # Watch the nested dockerd for Vast contract start/end edges and report
+    # them to the backend (no-op until the machine is enrolled and configured).
+    events_task = asyncio.create_task(app.state.vast_events_poller.run_forever())
     try:
         yield
     finally:
@@ -49,6 +52,13 @@ async def lifespan(app: FastAPI):
             pass
         except Exception as e:
             logger.warning(f"cache template pre-pull task ended with error: {e}")
+        events_task.cancel()
+        try:
+            await events_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"vast contract events task ended with error: {e}")
 
 
 app = FastAPI(
