@@ -280,6 +280,22 @@ def test_setup_unset_renting_ports_pass(tmp_path, monkeypatch):
     assert response.status_code == 202
 
 
+def test_setup_with_never_started_vast_uns_still_202(tmp_path):
+    # created = the container never ran (e.g. failed port bind at docker start):
+    # the nested dockerd never lived, so no rental can exist — recovery must not
+    # demand force
+    app, client = _build_client(tmp_path)
+    manager = app.state.vast_manager
+    manager.docker_ops = Mock()
+    manager.docker_ops.get_vast_uns.return_value = Mock(status="created")
+    manager.host = Mock()
+
+    response = client.post("/vast/setup", json=SETUP)
+
+    assert response.status_code == 202
+    manager.docker_ops.vast_rental_containers.assert_not_called()
+
+
 def test_setup_unreachable_nested_docker_is_500_not_silent_pass(tmp_path):
     # vast-uns exists but nested docker cannot answer — the rail cannot prove
     # "no rental", so it must refuse by failure rather than proceed

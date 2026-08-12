@@ -47,9 +47,12 @@ class VastManager:
     def _refuse_if_rental_running(self) -> None:
         # a live Vast contract IS a C.<id> container in the nested dockerd
         # (plan-contract-events) — local detection, no account key needed.
-        # No vast-uns at all → nothing can be rented; an unreachable nested
-        # docker raises and refuses by failure, force is the override.
-        if self.docker_ops.get_vast_uns() is None:
+        # No vast-uns at all → nothing can be rented; a never-started container
+        # (status=created, e.g. a failed port bind at docker start) is the same —
+        # the nested dockerd never ran under it. An unreachable nested docker in
+        # any other state raises and refuses by failure, force is the override.
+        uns = self.docker_ops.get_vast_uns()
+        if uns is None or uns.status == "created":
             return
         containers = self.docker_ops.vast_rental_containers()
         if containers:
