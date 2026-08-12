@@ -62,6 +62,13 @@ def test_default_shared_config_has_all_fields() -> None:
     assert DEFAULT_SHARED_CONFIG.max_initial_port_count == 200
     assert DEFAULT_SHARED_CONFIG.total_burn_emission == 0.91
     assert DEFAULT_SHARED_CONFIG.require_storage_limit_supported is False
+    assert DEFAULT_SHARED_CONFIG.multinode_clusters_enabled is False
+
+
+def test_multinode_clusters_flag_defaults_to_off() -> None:
+    # fail-closed: a payload from an older backend, or one that never loads, must not advertise a
+    # capability the server would refuse (DAH-2620)
+    assert DEFAULT_SHARED_CONFIG.multinode_clusters_enabled is False
 
 
 def test_machine_prices_p90_defaults_to_empty() -> None:
@@ -127,6 +134,7 @@ def test_shared_config_serializes_to_json() -> None:
     assert "machine_prices" in data
     assert "gpu_architectures" in data
     assert "require_storage_limit_supported" in data
+    assert "multinode_clusters_enabled" in data
     assert "default_docker_images" in data
     assert isinstance(data["gpu_architectures"]["NVIDIA B200"]["arch"], str)
 

@@ -47,6 +47,12 @@ class SharedConfig(BaseModel):
     max_initial_port_count: int
     total_burn_emission: float
     require_storage_limit_supported: bool = False
+    # Multi-node InfiniBand cluster rentals (DAH-2620). The client half of the switch the backend
+    # enforces on POST /executors/cluster/rent, so the UI can hide a capability the server would
+    # refuse instead of offering a button that 403s. Defaults False: an older backend that does not
+    # send it, or a payload that fails to load, must read as "off" rather than advertise the
+    # feature.
+    multinode_clusters_enabled: bool = False
     # Provider payout timing (DAH-2370). Surfaced so the provider portal can show
     # an expected (not guaranteed) payout time. Optional with defaults so older
     # serialized configs still validate.
