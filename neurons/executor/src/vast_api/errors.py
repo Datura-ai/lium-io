@@ -5,7 +5,8 @@ from fastapi.responses import JSONResponse
 
 # Machine-readable error codes shared by refusals and failures (see plan-vastctl.md
 # + plan-key-split.md): g0_failed, state_mount_missing, gpu_broken, install_rollback,
-# identify_rejected, report_failed, rental_running, run_in_progress, host_command_failed.
+# identify_rejected, report_failed, rental_running, run_in_progress, port_range_overlap,
+# host_command_failed.
 
 logger = logging.getLogger(__name__)
 

@@ -63,5 +63,8 @@ class StatusDoc(BaseModel):
     # {"error": ...} in its slot). Vast-side data (listed, reliability, offers)
     # is merged by the backend, which holds the account key.
     machine_id: int | None = None
+    # set only when the machine_id read itself broke (nsenter timeout etc.);
+    # a plain "not enrolled" keeps machine_id null with no error
+    machine_id_error: str | None = None
     rental_containers: list[str] | dict[str, Any] | None = None
     box: dict[str, Any]

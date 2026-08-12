@@ -14,8 +14,8 @@ from core.logger import _m, get_logger
 logger = get_logger(__name__)
 
 AUTHENTICATED_REQUEST_TIMEOUT_SECONDS = 30
-# /vast market ops legitimately block up to ~90s waiting for offers to appear
-# after unlist→list; everything else keeps the tight cap
+# /vast/setup returns 202 immediately, but status/delete probe the nested dockerd
+# through blocking execs that can be slow; everything else keeps the tight cap
 VAST_REQUEST_TIMEOUT_SECONDS = 180
 
 

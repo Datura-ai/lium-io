@@ -1,6 +1,8 @@
+import json
 import logging
 import threading
 
+from core.config import settings as executor_settings
 from vast_api.config import VastSettings
 from vast_api.docker_ops import DockerOps
 from vast_api.errors import ApiRefusal, safe_error
@@ -53,9 +55,40 @@ class VastManager:
         if containers:
             raise ApiRefusal("rental_running", f"live Vast contract container(s): {containers}")
 
+    def _lium_renting_ports(self) -> list[int]:
+        # external host ports the Lium rental path publishes; same parsing as the
+        # validator's port_utils.get_all_ports (that module is not importable here)
+        if executor_settings.RENTING_PORT_MAPPINGS:
+            return [int(pair[1]) for pair in json.loads(executor_settings.RENTING_PORT_MAPPINGS)]
+        port_range = executor_settings.RENTING_PORT_RANGE
+        if not port_range:
+            return []
+        if "-" in port_range:
+            start, end = (int(p.strip()) for p in port_range.split("-"))
+            return list(range(start, end + 1))
+        return [int(p.strip()) for p in port_range.split(",")]
+
+    def _refuse_if_port_overlap(self) -> None:
+        # vast-uns publishes PORT_RANGE_START..END on the host — a collision with the
+        # Lium renting ports breaks pod creation (deploy_failed penalties)
+        overlap = [
+            port
+            for port in self._lium_renting_ports()
+            if self.settings.PORT_RANGE_START <= port <= self.settings.PORT_RANGE_END
+        ]
+        if overlap:
+            raise ApiRefusal(
+                "port_range_overlap",
+                f"Lium renting ports overlap the vast-uns publish range "
+                f"{self.settings.PORT_RANGE_START}-{self.settings.PORT_RANGE_END}: {overlap[:20]}",
+            )
+
     # --- async setup run ---
 
     def setup(self, machine_key: str, machine_id: int | None = None, force: bool = False) -> str:
+        # the overlap rail is not force-overridable: colliding ports break Lium
+        # pod creation regardless of intent
+        self._refuse_if_port_overlap()
         if not force:
             self._refuse_if_rental_running()
         # build first (pure closure construction) so the run doc's stage list is
@@ -95,6 +128,9 @@ class VastManager:
         container_removed = self.docker_ops.delete_vast_uns()
         state_removed = False
         if purge:
+            # the nested data-root must go too: old C.<contract_id> containers in it
+            # would resurrect contracts of the deleted machine on the next setup
+            self.host.purge_data_root()
             self.host.run(["rm", "-rf", self.settings.STATE_DIR_HOST])
             state_removed = True
         return {"container_removed": container_removed, "state_removed": state_removed}
@@ -105,11 +141,17 @@ class VastManager:
         # local sections only, degrading independently; Vast-side data (listed,
         # reliability, offers) is merged by the backend, which holds the account key
         machine_id = None
-        result = self.host.run(
-            ["cat", f"{self.settings.STATE_DIR_HOST}/numeric_machine_id"], check=False
-        )
-        if result.stdout.strip().isdigit():
-            machine_id = int(result.stdout.strip())
+        machine_id_error = None
+        try:
+            # check=False: file absent / unreadable rc is "not enrolled", not an error
+            result = self.host.run(
+                ["cat", f"{self.settings.STATE_DIR_HOST}/numeric_machine_id"], check=False
+            )
+            if result.stdout.strip().isdigit():
+                machine_id = int(result.stdout.strip())
+        except Exception as exc:
+            # a broken read (e.g. nsenter timeout) must not 500 the whole status
+            machine_id_error = safe_error(exc)
 
         rental: list | dict | None
         try:
@@ -141,4 +183,9 @@ class VastManager:
         except Exception as exc:
             box["gpus_error"] = safe_error(exc)
 
-        return {"machine_id": machine_id, "rental_containers": rental, "box": box}
+        return {
+            "machine_id": machine_id,
+            "machine_id_error": machine_id_error,
+            "rental_containers": rental,
+            "box": box,
+        }

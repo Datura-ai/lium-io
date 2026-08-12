@@ -40,8 +40,15 @@ class HostOps:
         return self.run(["mountpoint", "-q", self.settings.DATA_ROOT_MOUNT], check=False).returncode == 0
 
     def _existing_loop(self) -> str | None:
-        # already-attached loop device for the data-root image, if any
+        # already-attached loop device for the data-root image, if any; a failed
+        # losetup must never read as "none" — ensure_data_root would attach a
+        # second loop to the same image (the leaked-loop class)
         result = self.run(["losetup", "-j", self.settings.DATA_ROOT_IMG], check=False)
+        if result.returncode != 0:
+            raise ApiFailure(
+                "host_command_failed",
+                f"losetup -j failed rc={result.returncode}: {result.stderr.strip()[:200]}",
+            )
         first_line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
         return first_line.split(":")[0] or None
 
@@ -77,6 +84,16 @@ class HostOps:
             if attached_fresh:
                 self.run(["losetup", "-d", loop], check=False)  # don't leak the loop device
             raise
+
+    def purge_data_root(self) -> None:
+        # tear down the loop-XFS nested data-root: a surviving data-root resurrects
+        # old C.<contract_id> containers on the next setup and the rental rail 409s
+        # forever. Order matters: umount → losetup -d → rm (container already removed).
+        self.run(["umount", self.settings.DATA_ROOT_MOUNT], check=False)  # ok if not mounted
+        loop = self._existing_loop()
+        if loop is not None:
+            self.run(["losetup", "-d", loop])
+        self.run(["rm", "-f", self.settings.DATA_ROOT_IMG])
 
     def dump_dmi(self) -> None:
         # dmidecode refuses to overwrite an existing dump, and the target file is

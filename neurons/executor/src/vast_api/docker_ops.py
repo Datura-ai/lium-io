@@ -51,18 +51,24 @@ class DockerOps:
 
     def executor_network(self) -> str | None:
         # the network the executor container itself sits on (--network value for vast-uns);
-        # the name-contains scan is only a fallback when that read fails
+        # a failed read must not degrade into the name scan — that can silently attach
+        # vast-uns to the wrong network
         try:
             container = self.client.containers.get(self.settings.EXECUTOR_CONTAINER_NAME)
             networks = container.attrs["NetworkSettings"]["Networks"]
-            if networks:
-                return next(iter(networks))
-        except Exception:
+        except Exception as exc:
             logger.warning("reading executor container networks failed", exc_info=True)
-        for network in self.client.networks.list():
-            if "executor" in network.name:
-                return network.name
-        return None
+            raise ApiFailure(
+                "host_command_failed",
+                f"reading executor container networks failed: {type(exc).__name__}",
+            )
+        if networks:
+            return next(iter(networks))
+        # fallback only for primary-succeeded-but-empty; more than one match is ambiguous
+        matches = [network.name for network in self.client.networks.list() if "executor" in network.name]
+        if len(matches) > 1:
+            raise ApiFailure("host_command_failed", f"ambiguous executor networks: {matches}")
+        return matches[0] if matches else None
 
     # --- image / container lifecycle ---
 
@@ -107,6 +113,9 @@ class DockerOps:
             detach=True,
             privileged=True,
             network=network,
+            # the Vast machine must survive a host reboot; without this the
+            # container stays Exited and the machine goes offline
+            restart_policy={"Name": "unless-stopped"},
             cgroupns="private",
             security_opt=["label=disable"],
             tmpfs={"/run": "", "/run/lock": ""},
@@ -146,7 +155,14 @@ class DockerOps:
         container = self.get_vast_uns()
         if container is None:
             raise ApiFailure("host_command_failed", "vast-uns container is not running")
-        exit_code, output = container.exec_run(cmd, environment=env)
+        if container.status != "running":
+            raise ApiFailure(
+                "host_command_failed", f"vast-uns container is not running (status={container.status})"
+            )
+        try:
+            exit_code, output = container.exec_run(cmd, environment=env)
+        except docker.errors.APIError as exc:
+            raise ApiFailure("host_command_failed", f"exec in vast-uns failed: {str(exc)[:300]}")
         return exit_code, output.decode(errors="replace") if isinstance(output, bytes) else str(output)
 
     def write_file_in_uns(self, path: str, content: str) -> None:
@@ -186,6 +202,15 @@ class DockerOps:
             return False
         asset = (ASSETS_DIR / "daemon.json").read_text()
         return output.strip() == asset.strip()
+
+    def nested_daemon_immutable(self) -> bool:
+        # a run interrupted between `systemctl restart docker` and `chattr +i` leaves
+        # daemon.json mutable forever (kaalia rewrites it on next start) — the stage
+        # is only satisfied when the immutability bit is actually set
+        rc, output = self.exec_in_uns(["lsattr", "/etc/docker/daemon.json"])
+        if rc != 0 or not output.split():
+            return False
+        return "i" in output.split()[0]
 
     def nested_docker_active(self) -> bool:
         rc, output = self.exec_in_uns(["systemctl", "is-active", "docker"])

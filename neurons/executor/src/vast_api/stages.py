@@ -133,7 +133,11 @@ def build_setup_ladder(
     # --- nested_daemon ---
 
     def nested_daemon_check() -> bool:
-        return docker_ops.nested_daemon_matches_asset() and docker_ops.nested_docker_active()
+        return (
+            docker_ops.nested_daemon_matches_asset()
+            and docker_ops.nested_docker_active()
+            and docker_ops.nested_daemon_immutable()
+        )
 
     def nested_daemon_verify() -> None:
         if not docker_ops.nested_docker_active():
@@ -150,7 +154,10 @@ def build_setup_ladder(
     def gpu_check() -> bool:
         if not docker_ops.nested_gpu_ok():
             return False
-        docker_ops.exec_in_uns(["systemctl", "daemon-reload"])
+        rc, output = docker_ops.exec_in_uns(["systemctl", "daemon-reload"])
+        if rc != 0:
+            # a failed reload would make the ×2 gate pass vacuously
+            raise ApiFailure("host_command_failed", f"daemon-reload failed in vast-uns: {output[:200]}")
         return docker_ops.nested_gpu_ok()
 
     def gpu_do() -> None:
@@ -187,7 +194,8 @@ def build_setup_ladder(
         if rc != 0:
             raise ApiFailure("install_rollback", f"apt-get update failed in vast-uns: {output[:300]}")
         rc, output = docker_ops.exec_in_uns(
-            ["bash", "-c", "wget -q https://console.vast.ai/install -O /root/vi2.py"]
+            # -nv (not -q) so a download failure carries wget's own error text into the run doc
+            ["bash", "-c", "wget -nv https://console.vast.ai/install -O /root/vi2.py"]
         )
         if rc != 0:
             raise ApiFailure("install_rollback", f"kaalia installer download failed: {output[:300]}")
@@ -246,8 +254,11 @@ def build_setup_ladder(
         # persist the numeric id in the state dir: public_ipaddr matching fails on
         # NAT'ed clouds (hyperstack), so this is the primary resolve key from now on
         docker_ops.write_file_in_uns("/var/lib/vastai_kaalia/numeric_machine_id", str(numeric_id))
-        # restart so kaalia picks up the identity (installer-started daemon has none)
-        docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
+        # restart so kaalia picks up the identity (installer-started daemon has none);
+        # a wedged restart must not report success with the pre-identity daemon running
+        rc, output = docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
+        if rc != 0:
+            raise ApiFailure("host_command_failed", f"vastai restart failed after identify: {output[:200]}")
 
     def register_verify() -> None:
         # appearance in /machines/ is verified by the backend after the run; locally

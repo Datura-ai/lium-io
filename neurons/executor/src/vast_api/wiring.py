@@ -1,8 +1,8 @@
 """Wiring of the vast_api module into the executor FastAPI app.
 
 Auth rides the executor's MinerMiddleware: every non-GET request must carry a
-valid MinerAuthPayload signature in its body; GET routes are open like the rest
-of the executor app.
+valid MinerAuthPayload signature in its body. Sensitive GET routes verify their
+own x-signature/x-timestamp headers in the router; only /healthz is open.
 """
 
 from fastapi import FastAPI

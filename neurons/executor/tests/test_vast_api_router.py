@@ -1,10 +1,15 @@
+import json
+import sys
+import time
 from unittest.mock import Mock
 
+import bittensor
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+import vast_api.router
 from core.config import settings
 from middlewares.miner import request_timeout_seconds, trusted_hotkeys
 from vast_api.config import VastSettings
@@ -16,6 +21,26 @@ from vast_api.wiring import attach_vast_api
 # exercise the router itself, so bodies carry unverified auth fields
 SIGNED = {"data_to_sign": "d", "signature": "s"}
 SETUP = {**SIGNED, "machine_key": "mk-test"}
+
+# throwaway keypair for the sensitive-GET header auth; tests that GET must
+# monkeypatch vast_api.router.trusted_hotkeys to trust it
+GET_KEYPAIR = bittensor.Keypair.create_from_uri("//VastGetTester")
+
+
+def _trust_get_keypair(monkeypatch):
+    # the package __init__ rebinds `router` to the APIRouter, shadowing the
+    # submodule for attribute walks — patch the real module object instead
+    monkeypatch.setattr(
+        sys.modules["vast_api.router"], "trusted_hotkeys", lambda path: [GET_KEYPAIR.ss58_address]
+    )
+
+
+def _signed_get_headers(path: str, timestamp: int | None = None) -> dict[str, str]:
+    timestamp = int(time.time()) if timestamp is None else timestamp
+    message = json.dumps({"path": path, "timestamp": timestamp}, sort_keys=True)
+    # no 0x prefix on purpose — exercises the normalization path
+    signature = GET_KEYPAIR.sign(message).hex()
+    return {"x-signature": signature, "x-timestamp": str(timestamp)}
 
 
 def _build_client(tmp_path):
@@ -83,28 +108,78 @@ def test_refusal_returns_409_error_envelope(tmp_path):
     assert response.json() == {"error": {"code": "run_in_progress", "detail": "busy"}}
 
 
-def test_failure_returns_500_error_envelope(tmp_path):
+def test_failure_returns_500_error_envelope(tmp_path, monkeypatch):
     app, client = _build_client(tmp_path)
     app.state.vast_manager = Mock(status=Mock(side_effect=ApiFailure("host_command_failed", "boom")))
+    _trust_get_keypair(monkeypatch)
 
-    response = client.get("/vast/status")
+    response = client.get("/vast/status", headers=_signed_get_headers("/vast/status"))
 
     assert response.status_code == 500
     assert response.json() == {"error": {"code": "host_command_failed", "detail": "boom"}}
 
 
-def test_run_doc_args_never_contain_machine_key(tmp_path):
-    # run docs are readable via open GET /vast/runs — the key must not land there
+def test_sensitive_get_without_headers_is_422(tmp_path):
+    _, client = _build_client(tmp_path)
+
+    for path in ("/vast/status", "/vast/runs", "/vast/runs/some-run"):
+        assert client.get(path).status_code == 422
+
+
+def test_sensitive_get_wrong_signature_is_401(tmp_path, monkeypatch):
+    _, client = _build_client(tmp_path)
+    _trust_get_keypair(monkeypatch)
+    headers = _signed_get_headers("/vast/status")
+    headers["x-signature"] = "00" * 64
+
+    response = client.get("/vast/status", headers=headers)
+
+    assert response.status_code == 401
+
+
+def test_sensitive_get_stale_timestamp_is_401(tmp_path, monkeypatch):
+    _, client = _build_client(tmp_path)
+    _trust_get_keypair(monkeypatch)
+    headers = _signed_get_headers("/vast/status", timestamp=int(time.time()) - 301)
+
+    response = client.get("/vast/status", headers=headers)
+
+    assert response.status_code == 401
+
+
+def test_sensitive_get_signature_bound_to_path(tmp_path, monkeypatch):
+    # a signature minted for /vast/status must not open /vast/runs
+    _, client = _build_client(tmp_path)
+    _trust_get_keypair(monkeypatch)
+
+    response = client.get("/vast/runs", headers=_signed_get_headers("/vast/status"))
+
+    assert response.status_code == 401
+
+
+def test_sensitive_get_valid_signature_is_200(tmp_path, monkeypatch):
+    _, client = _build_client(tmp_path)
+    _trust_get_keypair(monkeypatch)
+
+    response = client.get("/vast/runs", headers=_signed_get_headers("/vast/runs"))
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_run_doc_args_never_contain_machine_key(tmp_path, monkeypatch):
+    # run docs are readable via GET /vast/runs — the key must not land there
     app, client = _build_client(tmp_path)
     manager = app.state.vast_manager
     manager.docker_ops = Mock()
     manager.docker_ops.get_vast_uns.return_value = None
     manager.host = Mock()
+    _trust_get_keypair(monkeypatch)
 
     response = client.post("/vast/setup", json={**SETUP, "machine_id": 147063})
 
     assert response.status_code == 202
-    runs = client.get("/vast/runs").json()
+    runs = client.get("/vast/runs", headers=_signed_get_headers("/vast/runs")).json()
     assert runs and "mk-test" not in str(runs)
     assert runs[0]["args"] == {"machine_id": 147063}
 
@@ -145,6 +220,60 @@ def test_setup_fresh_box_without_vast_uns_still_202(tmp_path):
     manager.docker_ops = Mock()
     manager.docker_ops.get_vast_uns.return_value = None
     manager.host = Mock()
+
+    response = client.post("/vast/setup", json=SETUP)
+
+    assert response.status_code == 202
+
+
+def _set_renting_config(monkeypatch, port_range: str | None, port_mappings: str | None):
+    monkeypatch.setattr("vast_api.service.executor_settings.RENTING_PORT_RANGE", port_range)
+    monkeypatch.setattr("vast_api.service.executor_settings.RENTING_PORT_MAPPINGS", port_mappings)
+
+
+def test_setup_refused_on_renting_port_range_overlap(tmp_path, monkeypatch):
+    app, client = _build_client(tmp_path)
+    _set_renting_config(monkeypatch, "39990-40010", None)
+
+    response = client.post("/vast/setup", json=SETUP)
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["code"] == "port_range_overlap"
+    assert "40000" in error["detail"]
+
+
+def test_setup_refused_on_renting_port_mappings_overlap(tmp_path, monkeypatch):
+    # the EXTERNAL side of a mapping is what the host publishes
+    app, client = _build_client(tmp_path)
+    _set_renting_config(monkeypatch, None, "[[46681, 40100], [46682, 56682]]")
+
+    response = client.post("/vast/setup", json=SETUP)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "port_range_overlap"
+
+
+def test_setup_disjoint_renting_ports_pass(tmp_path, monkeypatch):
+    app, client = _build_client(tmp_path)
+    manager = app.state.vast_manager
+    manager.docker_ops = Mock()
+    manager.docker_ops.get_vast_uns.return_value = None
+    manager.host = Mock()
+    _set_renting_config(monkeypatch, "20000-30000", None)
+
+    response = client.post("/vast/setup", json=SETUP)
+
+    assert response.status_code == 202
+
+
+def test_setup_unset_renting_ports_pass(tmp_path, monkeypatch):
+    app, client = _build_client(tmp_path)
+    manager = app.state.vast_manager
+    manager.docker_ops = Mock()
+    manager.docker_ops.get_vast_uns.return_value = None
+    manager.host = Mock()
+    _set_renting_config(monkeypatch, None, None)
 
     response = client.post("/vast/setup", json=SETUP)
 
@@ -209,6 +338,8 @@ def test_delete_purge_removes_state(tmp_path):
     assert response.json() == {"container_removed": True, "state_removed": True}
     rm_calls = [c for c in manager.host.run.call_args_list if c.args[0][:2] == ["rm", "-rf"]]
     assert len(rm_calls) == 1
+    # the nested dockerd data-root goes too, or old contracts resurrect on re-setup
+    manager.host.purge_data_root.assert_called_once()
 
 
 def test_delete_plain_keeps_state(tmp_path):
@@ -221,10 +352,10 @@ def test_delete_plain_keeps_state(tmp_path):
     assert response.json() == {"container_removed": True, "state_removed": False}
     rm_calls = [c for c in manager.host.run.call_args_list if c.args[0][:2] == ["rm", "-rf"]]
     assert rm_calls == []
+    manager.host.purge_data_root.assert_not_called()
 
 
-def test_status_reports_local_sections_only(tmp_path):
-    app, client = _build_client(tmp_path)
+def _wire_status_mocks(app):
     manager = app.state.vast_manager
     manager.host = Mock()
     manager.host.run.return_value = Mock(stdout="147063\n")
@@ -235,12 +366,49 @@ def test_status_reports_local_sections_only(tmp_path):
     manager.docker_ops.executor_health.return_value = "healthy"
     manager.docker_ops.filler_running.return_value = False
     manager.docker_ops.exec_in_uns.return_value = (0, "active\n")
+    return manager
 
-    response = client.get("/vast/status")
+
+def test_status_reports_local_sections_only(tmp_path, monkeypatch):
+    app, client = _build_client(tmp_path)
+    _wire_status_mocks(app)
+    _trust_get_keypair(monkeypatch)
+
+    response = client.get("/vast/status", headers=_signed_get_headers("/vast/status"))
 
     assert response.status_code == 200
     doc = response.json()
     assert doc["machine_id"] == 147063
+    assert doc["machine_id_error"] is None
     assert doc["rental_containers"] == ["C.777"]
     assert doc["box"]["kaalia_active"] is True
     assert "vast" not in doc and "offers" not in doc  # account-key sections are gone
+
+
+def test_status_machine_id_absent_is_null_without_error(tmp_path, monkeypatch):
+    app, client = _build_client(tmp_path)
+    manager = _wire_status_mocks(app)
+    manager.host.run.return_value = Mock(stdout="")  # cat rc!=0 → empty output
+    _trust_get_keypair(monkeypatch)
+
+    response = client.get("/vast/status", headers=_signed_get_headers("/vast/status"))
+
+    assert response.status_code == 200
+    doc = response.json()
+    assert doc["machine_id"] is None
+    assert doc["machine_id_error"] is None
+
+
+def test_status_broken_machine_id_read_reports_error_slot(tmp_path, monkeypatch):
+    # a read that raises (e.g. nsenter timeout) must not 500 the whole status
+    app, client = _build_client(tmp_path)
+    manager = _wire_status_mocks(app)
+    manager.host.run.side_effect = ApiFailure("host_command_failed", "cat timed out after 300s")
+    _trust_get_keypair(monkeypatch)
+
+    response = client.get("/vast/status", headers=_signed_get_headers("/vast/status"))
+
+    assert response.status_code == 200
+    doc = response.json()
+    assert doc["machine_id"] is None
+    assert doc["machine_id_error"] == "host_command_failed: cat timed out after 300s"
