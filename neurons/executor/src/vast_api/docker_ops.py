@@ -30,7 +30,15 @@ class DockerOps:
 
     def __init__(self, settings: VastSettings):
         self.settings = settings
-        self.client = docker.from_env(timeout=DOCKER_API_TIMEOUT_SECONDS)
+        self._client = None
+
+    @property
+    def client(self):
+        # lazy: from_env() negotiates the API version over the socket, and a docker
+        # hiccup at boot must not stop the executor app from starting
+        if self._client is None:
+            self._client = docker.from_env(timeout=DOCKER_API_TIMEOUT_SECONDS)
+        return self._client
 
     # --- G0 ---
 

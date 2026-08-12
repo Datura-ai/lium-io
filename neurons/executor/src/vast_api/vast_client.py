@@ -7,6 +7,7 @@ import requests
 
 from vast_api.config import VastSettings
 from vast_api.errors import ApiFailure
+from vast_api.host_ops import HostOps
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +24,21 @@ class VastClient:
     own exception text (which embeds the full request URL) never propagates.
     """
 
-    def __init__(self, settings: VastSettings):
+    def __init__(self, settings: VastSettings, host: HostOps):
         self.settings = settings
+        self.host = host
 
     def _account_key(self) -> str:
-        with open(self.settings.VAST_ACCOUNT_KEY_FILE) as f:
-            return f.read().strip()
+        # the key lives on the HOST filesystem (placed there at enrollment), so it
+        # survives executor container recreation; read via nsenter, never logged
+        result = self.host.run(["cat", self.settings.VAST_ACCOUNT_KEY_FILE], check=False)
+        key = result.stdout.strip()
+        if result.returncode != 0 or not key:
+            raise ApiFailure(
+                "vast_key_missing",
+                f"no account key at {self.settings.VAST_ACCOUNT_KEY_FILE} on the host",
+            )
+        return key
 
     def _get(self, path: str) -> requests.Response:
         # key-safe GET: key in header only; network errors reduced to the exception type

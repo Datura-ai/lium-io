@@ -1,18 +1,19 @@
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class VastSettings(BaseSettings):
-    """Standalone settings for the vast_api module.
+    """Settings for the vast_api module.
 
-    Deliberately independent from core.config: the executor Settings requires
-    MINER_HOTKEY_SS58_ADDRESS/DB_URI env vars the sidecar shell must not need.
+    Kept separate from core.config Settings on purpose: every field here has a
+    working default, so the executor boots unchanged on boxes that never touch
+    Vast.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    VAST_API_TOKEN: str = Field(min_length=16)  # an empty/short token must fail at startup
-    VAST_ACCOUNT_KEY_FILE: str = "/run/secrets/vast_host_key"
+    # host-side path (read via nsenter): the key survives executor container
+    # recreation and needs no compose changes on the miner's side
+    VAST_ACCOUNT_KEY_FILE: str = "/var/lib/vast-account-key"
     EXECUTOR_CONTAINER_NAME: str = "executor-executor-1"
     VAST_UNS_NAME: str = "vast-uns"
     VAST_UNS_IMAGE_TAG: str = "vast-uns-kaalia:img"
@@ -24,4 +25,3 @@ class VastSettings(BaseSettings):
     PORT_RANGE_START: int = 40000
     PORT_RANGE_END: int = 40300
     RUNS_DIR: str = "/var/lib/vast-api/runs"
-    LISTEN_PORT: int = 8151

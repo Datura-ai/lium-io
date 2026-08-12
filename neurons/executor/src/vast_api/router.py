@@ -1,7 +1,6 @@
-import hmac
 import logging
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from vast_api.schemas import (
     DeleteRequest,
@@ -12,8 +11,10 @@ from vast_api.schemas import (
     PriceRequest,
     RunAccepted,
     RunDoc,
+    SelfTestRequest,
     SetupRequest,
     StatusDoc,
+    UnlistRequest,
     UnlistResponse,
 )
 from vast_api.service import VastManager
@@ -22,21 +23,10 @@ logger = logging.getLogger(__name__)
 
 VERSION = "0.1.0"
 
-
-def verify_token(request: Request, authorization: str | None = Header(None)) -> None:
-    # mandatory bearer token on every route, /healthz included
-    expected = request.app.state.vast_settings.VAST_API_TOKEN
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    provided = authorization.removeprefix("Bearer ")
-    if not provided:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    # compare bytes: compare_digest raises TypeError on non-ASCII str input
-    if not hmac.compare_digest(provided.encode(), expected.encode()):
-        raise HTTPException(status_code=401, detail="Invalid bearer token")
-
-
-router = APIRouter(dependencies=[Depends(verify_token)])
+# Auth rides the executor's MinerMiddleware: every non-GET request must carry a
+# valid MinerAuthPayload signature in its body; GET routes are open like the
+# rest of the executor app.
+router = APIRouter()
 
 
 def _manager(request: Request) -> VastManager:
@@ -59,7 +49,7 @@ def vast_setup(payload: SetupRequest, request: Request):
 
 
 @router.post("/vast/self-test", response_model=RunAccepted, status_code=202)
-def vast_self_test(request: Request):
+def vast_self_test(payload: SelfTestRequest, request: Request):
     return RunAccepted(run_id=_manager(request).self_test())
 
 
@@ -82,8 +72,8 @@ def vast_list(payload: ListRequest, request: Request):
 
 
 @router.post("/vast/unlist", response_model=UnlistResponse)
-def vast_unlist(request: Request):
-    return _manager(request).unlist()
+def vast_unlist(payload: UnlistRequest, request: Request):
+    return _manager(request).unlist(payload.force)
 
 
 @router.post("/vast/price", response_model=ListResponse)
@@ -92,6 +82,5 @@ def vast_price(payload: PriceRequest, request: Request):
 
 
 @router.delete("/vast", response_model=DeleteResponse)
-def vast_delete(request: Request, payload: DeleteRequest | None = None):
-    payload = payload or DeleteRequest()
+def vast_delete(payload: DeleteRequest, request: Request):
     return _manager(request).delete(payload.purge, payload.force)

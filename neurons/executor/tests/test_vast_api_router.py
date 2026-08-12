@@ -2,55 +2,69 @@ import subprocess
 from unittest.mock import Mock
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from middlewares.miner import request_timeout_seconds
 from vast_api.config import VastSettings
 from vast_api.errors import ApiFailure, ApiRefusal
-from vast_api.shell import build_app
+from vast_api.schemas import SetupRequest
 from vast_api.vast_client import VastClient
+from vast_api.wiring import attach_vast_api
 
-TOKEN = "secret-token-0123456789"
-AUTH = {"Authorization": f"Bearer {TOKEN}"}
+# routes are mounted in the executor app behind MinerMiddleware; these tests
+# exercise the router itself, so bodies carry unverified auth fields
+SIGNED = {"data_to_sign": "d", "signature": "s"}
 
 
 def _build_client(tmp_path):
-    settings = VastSettings(VAST_API_TOKEN=TOKEN, RUNS_DIR=str(tmp_path / "runs"))
-    app = build_app(settings)
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
+    app = FastAPI()
+    attach_vast_api(app, settings)
     return app, TestClient(app)
 
 
-def test_healthz_401_without_token(tmp_path):
+def _host_with_key(key: str = "supersecretkey123"):
+    host = Mock()
+    host.run.return_value = Mock(returncode=0, stdout=key + "\n")
+    return host
+
+
+def test_healthz_open_get(tmp_path):
     _, client = _build_client(tmp_path)
 
     response = client.get("/healthz")
-
-    assert response.status_code == 401
-
-
-def test_healthz_401_with_wrong_token(tmp_path):
-    _, client = _build_client(tmp_path)
-
-    response = client.get("/healthz", headers={"Authorization": "Bearer wrong"})
-
-    assert response.status_code == 401
-
-
-def test_healthz_200_with_token(tmp_path):
-    _, client = _build_client(tmp_path)
-
-    response = client.get("/healthz", headers=AUTH)
 
     assert response.status_code == 200
     assert response.json()["ok"] is True
     assert response.json()["version"]
 
 
+def test_mutating_body_requires_auth_fields():
+    # the middleware skips GETs; every mutating body must carry the signature contract
+    with pytest.raises(ValidationError):
+        SetupRequest()
+
+
+def test_setup_without_auth_fields_is_422(tmp_path):
+    _, client = _build_client(tmp_path)
+
+    response = client.post("/vast/setup", json={})
+
+    assert response.status_code == 422
+
+
+def test_vast_paths_get_stretched_middleware_timeout():
+    assert request_timeout_seconds("/vast/list") == 180
+    assert request_timeout_seconds("/upload_ssh_key") == 30
+
+
 def test_setup_returns_202_and_run_id(tmp_path):
     app, client = _build_client(tmp_path)
     app.state.vast_manager = Mock(setup=Mock(return_value="setup-20260811-093015"))
 
-    response = client.post("/vast/setup", json={}, headers=AUTH)
+    response = client.post("/vast/setup", json=SIGNED)
 
     assert response.status_code == 202
     assert response.json() == {"run_id": "setup-20260811-093015"}
@@ -60,7 +74,7 @@ def test_refusal_returns_409_error_envelope(tmp_path):
     app, client = _build_client(tmp_path)
     app.state.vast_manager = Mock(setup=Mock(side_effect=ApiRefusal("run_in_progress", "busy")))
 
-    response = client.post("/vast/setup", json={}, headers=AUTH)
+    response = client.post("/vast/setup", json=SIGNED)
 
     assert response.status_code == 409
     assert response.json() == {"error": {"code": "run_in_progress", "detail": "busy"}}
@@ -82,7 +96,7 @@ def test_list_calls_unlist_then_list(tmp_path):
     app, client = _build_client(tmp_path)
     manager = _wire_market_mocks(app)
 
-    response = client.post("/vast/list", json={"price_gpu_usd": 1.5}, headers=AUTH)
+    response = client.post("/vast/list", json={**SIGNED, "price_gpu_usd": 1.5})
 
     assert response.status_code == 200
     assert response.json()["listed"] is True
@@ -94,7 +108,7 @@ def test_list_gpu_busy_refused_without_force(tmp_path):
     app, client = _build_client(tmp_path)
     manager = _wire_market_mocks(app, gpu_mem_mib=70000)
 
-    response = client.post("/vast/list", json={"price_gpu_usd": 1.5}, headers=AUTH)
+    response = client.post("/vast/list", json={**SIGNED, "price_gpu_usd": 1.5})
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "gpu_busy"
@@ -105,29 +119,15 @@ def test_list_gpu_busy_overridden_with_force(tmp_path):
     app, client = _build_client(tmp_path)
     manager = _wire_market_mocks(app, gpu_mem_mib=70000)
 
-    response = client.post("/vast/list", json={"price_gpu_usd": 1.5, "force": True}, headers=AUTH)
+    response = client.post("/vast/list", json={**SIGNED, "price_gpu_usd": 1.5, "force": True})
 
     assert response.status_code == 200
     manager.vast.unlist_machine.assert_called_once()
 
 
-def test_non_ascii_token_yields_401_not_500(tmp_path):
-    settings = VastSettings(VAST_API_TOKEN="sécrèt-tökén-àbcdéf", RUNS_DIR=str(tmp_path / "runs"))
-    app = build_app(settings)
-    client = TestClient(app)
-
-    response = client.get("/healthz", headers={"Authorization": "Bearer wrong"})
-
-    assert response.status_code == 401
-
-
 def test_account_key_never_leaks_on_http_error(tmp_path, monkeypatch):
-    key_file = tmp_path / "vast_host_key"
-    key_file.write_text("supersecretkey123\n")
-    settings = VastSettings(
-        VAST_API_TOKEN=TOKEN, VAST_ACCOUNT_KEY_FILE=str(key_file), RUNS_DIR=str(tmp_path / "runs")
-    )
-    vast = VastClient(settings)
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
+    vast = VastClient(settings, _host_with_key())
     mock_get = Mock(return_value=Mock(ok=False, status_code=401))
     monkeypatch.setattr("vast_api.vast_client.requests.get", mock_get)
 
@@ -142,6 +142,18 @@ def test_account_key_never_leaks_on_http_error(tmp_path, monkeypatch):
     assert kwargs["headers"]["Authorization"] == "Bearer supersecretkey123"
 
 
+def test_missing_host_key_is_vast_key_missing(tmp_path):
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
+    host = Mock()
+    host.run.return_value = Mock(returncode=1, stdout="")
+    vast = VastClient(settings, host)
+
+    with pytest.raises(ApiFailure) as exc_info:
+        vast.get_machines()
+
+    assert exc_info.value.code == "vast_key_missing"
+
+
 def test_setup_refused_while_rental_running(tmp_path):
     app, client = _build_client(tmp_path)
     manager = app.state.vast_manager
@@ -150,7 +162,7 @@ def test_setup_refused_while_rental_running(tmp_path):
     manager.host = Mock()
     manager.host.run.return_value = Mock(stdout="")
 
-    response = client.post("/vast/setup", json={}, headers=AUTH)
+    response = client.post("/vast/setup", json=SIGNED)
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "rental_running"
@@ -165,7 +177,7 @@ def test_setup_force_overrides_rental_rail(tmp_path):
     manager.host.run.return_value = Mock(stdout="")
     manager.docker_ops = Mock()
 
-    response = client.post("/vast/setup", json={"force": True}, headers=AUTH)
+    response = client.post("/vast/setup", json={**SIGNED, "force": True})
 
     assert response.status_code == 202
     assert response.json()["run_id"].startswith("setup-")
@@ -184,7 +196,7 @@ def test_delete_refused_when_machine_unresolved(tmp_path):
     manager.host.local_ips.return_value = ["192.0.2.7"]
     manager.docker_ops = Mock()
 
-    response = client.request("DELETE", "/vast", json={}, headers=AUTH)
+    response = client.request("DELETE", "/vast", json=SIGNED)
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "machine_unresolved"
@@ -199,7 +211,7 @@ def test_delete_proceeds_when_account_has_no_machines(tmp_path):
     manager.docker_ops = Mock()
     manager.docker_ops.delete_vast_uns.return_value = True
 
-    response = client.request("DELETE", "/vast", json={}, headers=AUTH)
+    response = client.request("DELETE", "/vast", json=SIGNED)
 
     assert response.status_code == 200
     assert response.json() == {
@@ -210,13 +222,9 @@ def test_delete_proceeds_when_account_has_no_machines(tmp_path):
 
 
 def test_search_offers_cli_line_has_any_flags(tmp_path, monkeypatch):
-    key_file = tmp_path / "vast_host_key"
-    key_file.write_text("k123\n")
     monkeypatch.setenv("HOME", str(tmp_path))  # ~/.vast_api_key lands in tmp
-    settings = VastSettings(
-        VAST_API_TOKEN=TOKEN, VAST_ACCOUNT_KEY_FILE=str(key_file), RUNS_DIR=str(tmp_path / "runs")
-    )
-    vast = VastClient(settings)
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
+    vast = VastClient(settings, _host_with_key("k123"))
     captured = {}
 
     def fake_run(cmd, capture_output, text, timeout):
@@ -234,18 +242,13 @@ def test_search_offers_cli_line_has_any_flags(tmp_path, monkeypatch):
     assert (tmp_path / ".vast_api_key").stat().st_mode & 0o777 == 0o600
 
 
-def test_empty_token_fails_settings_validation(tmp_path):
-    with pytest.raises(ValidationError):
-        VastSettings(VAST_API_TOKEN="", RUNS_DIR=str(tmp_path / "runs"))
-
-
 def test_list_offers_never_appear_fails_listing_not_confirmed(tmp_path, monkeypatch):
     app, client = _build_client(tmp_path)
     manager = _wire_market_mocks(app)
     manager.vast.search_offers.return_value = []
     monkeypatch.setattr("vast_api.service.time.sleep", Mock())
 
-    response = client.post("/vast/list", json={"price_gpu_usd": 1.5}, headers=AUTH)
+    response = client.post("/vast/list", json={**SIGNED, "price_gpu_usd": 1.5})
 
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "listing_not_confirmed"
@@ -255,7 +258,7 @@ def test_failure_returns_500_error_envelope(tmp_path):
     app, client = _build_client(tmp_path)
     app.state.vast_manager = Mock(status=Mock(side_effect=ApiFailure("vast_api_failed", "boom")))
 
-    response = client.get("/vast/status", headers=AUTH)
+    response = client.get("/vast/status")
 
     assert response.status_code == 500
     assert response.json() == {"error": {"code": "vast_api_failed", "detail": "boom"}}
@@ -276,7 +279,7 @@ def test_delete_refused_while_rental_running(tmp_path):
     app, client = _build_client(tmp_path)
     manager = _wire_delete_mocks(app, {"id": 147139, "current_rentals_running": 1})
 
-    response = client.request("DELETE", "/vast", json={}, headers=AUTH)
+    response = client.request("DELETE", "/vast", json=SIGNED)
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "rental_running"
@@ -287,7 +290,7 @@ def test_delete_rental_running_overridden_with_force(tmp_path):
     app, client = _build_client(tmp_path)
     manager = _wire_delete_mocks(app, {"id": 147139, "current_rentals_running": 1})
 
-    response = client.request("DELETE", "/vast", json={"force": True}, headers=AUTH)
+    response = client.request("DELETE", "/vast", json={**SIGNED, "force": True})
 
     assert response.status_code == 200
     manager.docker_ops.delete_vast_uns.assert_called_once()
@@ -297,7 +300,7 @@ def test_delete_purge_removes_state_and_vast_record(tmp_path):
     app, client = _build_client(tmp_path)
     manager = _wire_delete_mocks(app, {"id": 147139})
 
-    response = client.request("DELETE", "/vast", json={"purge": True}, headers=AUTH)
+    response = client.request("DELETE", "/vast", json={**SIGNED, "purge": True})
 
     assert response.status_code == 200
     assert response.json()["state_removed"] is True
@@ -309,7 +312,7 @@ def test_delete_plain_keeps_state_and_vast_record(tmp_path):
     app, client = _build_client(tmp_path)
     manager = _wire_delete_mocks(app, {"id": 147139})
 
-    response = client.request("DELETE", "/vast", json={}, headers=AUTH)
+    response = client.request("DELETE", "/vast", json=SIGNED)
 
     assert response.status_code == 200
     assert response.json()["state_removed"] is False
@@ -327,7 +330,7 @@ def test_setup_fresh_box_without_machines_still_202(tmp_path):
     manager.host = Mock()
     manager.docker_ops = Mock()
 
-    response = client.post("/vast/setup", json={}, headers=AUTH)
+    response = client.post("/vast/setup", json=SIGNED)
 
     assert response.status_code == 202
 
@@ -337,7 +340,7 @@ def test_list_refused_while_run_in_progress(tmp_path):
     manager = _wire_market_mocks(app)
     manager.runs.create("setup", {}, ["a"])  # a live run doc in the real store
 
-    response = client.post("/vast/list", json={"price_gpu_usd": 1.5}, headers=AUTH)
+    response = client.post("/vast/list", json={**SIGNED, "price_gpu_usd": 1.5})
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "run_in_progress"
@@ -349,7 +352,22 @@ def test_list_run_in_progress_overridden_with_force(tmp_path):
     manager = _wire_market_mocks(app)
     manager.runs.create("setup", {}, ["a"])
 
-    response = client.post("/vast/list", json={"price_gpu_usd": 1.5, "force": True}, headers=AUTH)
+    response = client.post("/vast/list", json={**SIGNED, "price_gpu_usd": 1.5, "force": True})
 
     assert response.status_code == 200
+    manager.vast.unlist_machine.assert_called_once()
+
+
+def test_unlist_force_bypasses_run_in_progress(tmp_path):
+    # the product's critical path: a Lium rent arriving mid-run must still unlist
+    app, client = _build_client(tmp_path)
+    manager = _wire_market_mocks(app)
+    manager.runs.create("setup", {}, ["a"])
+
+    refused = client.post("/vast/unlist", json=SIGNED)
+    forced = client.post("/vast/unlist", json={**SIGNED, "force": True})
+
+    assert refused.status_code == 409
+    assert refused.json()["error"]["code"] == "run_in_progress"
+    assert forced.status_code == 200
     manager.vast.unlist_machine.assert_called_once()

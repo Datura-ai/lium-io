@@ -1,10 +1,15 @@
 from typing import Any
 
+from payloads.miner import MinerAuthPayload
 from pydantic import BaseModel
 
 # Stage states: ok (already satisfied — skipped) / done (performed now) /
 # running / pending / failed / skipped (aborted before reached).
 # Run states: running / succeeded / failed.
+#
+# Mutating request bodies inherit MinerAuthPayload: MinerMiddleware verifies
+# `signature` over `data_to_sign` on every non-GET request, so the auth fields
+# are part of each mutating body's contract.
 
 
 class StageDoc(BaseModel):
@@ -35,19 +40,27 @@ class HealthzResponse(BaseModel):
     version: str
 
 
-class SetupRequest(BaseModel):
+class SetupRequest(MinerAuthPayload):
     machine_id: int | None = None
     force: bool = False
 
 
-class ListRequest(BaseModel):
+class SelfTestRequest(MinerAuthPayload):
+    pass
+
+
+class ListRequest(MinerAuthPayload):
     price_gpu_usd: float
     duration: str = "7 days"
     force: bool = False
 
 
-class PriceRequest(BaseModel):
+class PriceRequest(MinerAuthPayload):
     price_gpu_usd: float
+
+
+class UnlistRequest(MinerAuthPayload):
+    force: bool = False
 
 
 class ListResponse(BaseModel):
@@ -61,7 +74,7 @@ class UnlistResponse(BaseModel):
     offers_remaining: int
 
 
-class DeleteRequest(BaseModel):
+class DeleteRequest(MinerAuthPayload):
     purge: bool = False
     force: bool = False
 

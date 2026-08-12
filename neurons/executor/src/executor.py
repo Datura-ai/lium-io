@@ -12,6 +12,7 @@ from core.logger import get_logger
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
+from vast_api.wiring import attach_vast_api
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +62,7 @@ app = FastAPI(
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_middleware(MinerMiddleware)
 app.include_router(apis_router)
+attach_vast_api(app)
 
 reload = True if settings.ENV == "dev" else False
 

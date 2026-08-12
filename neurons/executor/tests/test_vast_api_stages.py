@@ -41,7 +41,7 @@ def test_unsatisfied_stage_runs_do_and_verify(tmp_path):
 
 
 def test_setup_ladder_stage_names_and_order(tmp_path):
-    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
 
     stages, _ = build_setup_ladder(settings, Mock(), Mock(), Mock())
 
@@ -54,7 +54,7 @@ def test_setup_ladder_stage_names_and_order(tmp_path):
 
 def test_g0_failure_aborts_whole_ladder(tmp_path):
     store = RunStore(str(tmp_path))
-    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
     docker_ops = Mock()
     docker_ops.executor_running.return_value = False
     stages, _ = build_setup_ladder(settings, Mock(), docker_ops, Mock())
@@ -74,7 +74,7 @@ def test_g0_failure_aborts_whole_ladder(tmp_path):
 def _host_with_fake_run(tmp_path):
     # returns host whose run() is faked via `responses`: command name -> (rc, stdout);
     # commands not listed succeed silently
-    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
     host = HostOps(settings)
     calls = []
     responses = {}
@@ -169,7 +169,7 @@ def test_safe_error_keeps_curated_text_hides_internals():
 
 def test_container_stage_state_mount_rail_aborts_without_remove(tmp_path):
     store = RunStore(str(tmp_path))
-    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
     docker_ops = Mock()
     docker_ops.executor_running.return_value = True
     docker_ops.executor_network.return_value = "executor_default"
@@ -189,7 +189,7 @@ def test_container_stage_state_mount_rail_aborts_without_remove(tmp_path):
 
 
 def _manager_with_mocks(tmp_path):
-    settings = VastSettings(VAST_API_TOKEN="test-token-0123456789", RUNS_DIR=str(tmp_path / "runs"))
+    settings = VastSettings(RUNS_DIR=str(tmp_path / "runs"))
     return VastManager(settings=settings, host=Mock(), docker_ops=Mock(), vast=Mock(), runs=Mock())
 
 

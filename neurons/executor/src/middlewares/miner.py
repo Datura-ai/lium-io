@@ -14,6 +14,16 @@ from core.logger import _m, get_logger
 logger = get_logger(__name__)
 
 AUTHENTICATED_REQUEST_TIMEOUT_SECONDS = 30
+# /vast market ops legitimately block up to ~90s waiting for offers to appear
+# after unlist→list; everything else keeps the tight cap
+VAST_REQUEST_TIMEOUT_SECONDS = 180
+
+
+def request_timeout_seconds(path: str) -> int:
+    # per-path timeout for authenticated requests
+    if path.startswith("/vast"):
+        return VAST_REQUEST_TIMEOUT_SECONDS
+    return AUTHENTICATED_REQUEST_TIMEOUT_SECONDS
 
 
 class MinerMiddleware(BaseHTTPMiddleware):
@@ -92,7 +102,7 @@ class MinerMiddleware(BaseHTTPMiddleware):
             try:
                 response = await asyncio.wait_for(
                     call_next(request),
-                    timeout=AUTHENTICATED_REQUEST_TIMEOUT_SECONDS,
+                    timeout=request_timeout_seconds(request.url.path),
                 )
             except TimeoutError:
                 logger.error(
