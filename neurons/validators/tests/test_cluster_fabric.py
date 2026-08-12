@@ -28,7 +28,7 @@ _SSH_AUTHORIZED_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIfake lium-cluster"
 
 
 def test_the_config_reaches_the_pod_intact_through_the_environment() -> None:
-    networking = cluster_pod_networking(_RENDERED_CONF)
+    networking = cluster_pod_networking(_RENDERED_CONF, _SSH_PRIVATE_KEY, _SSH_AUTHORIZED_KEY)
 
     # Base64 because the config is multi-line and travels as an env var; the entrypoint decodes it.
     decoded = base64.b64decode(networking.environment["LIUM_WIREGUARD_CONF_B64"]).decode()
@@ -36,7 +36,7 @@ def test_the_config_reaches_the_pod_intact_through_the_environment() -> None:
 
 
 def test_the_wireguard_port_is_published_over_udp() -> None:
-    networking = cluster_pod_networking(_RENDERED_CONF)
+    networking = cluster_pod_networking(_RENDERED_CONF, _SSH_PRIVATE_KEY, _SSH_AUTHORIZED_KEY)
 
     # WireGuard has no TCP mode, and the fleet publishes only TCP by default — without this the
     # handshake never happens and the overlay never forms.
@@ -145,3 +145,22 @@ def test_a_cluster_node_carries_the_shared_ssh_login_into_the_container(docker_s
     decoded = base64.b64decode(run_spec.environment["LIUM_CLUSTER_SSH_KEY_B64"]).decode()
     assert decoded == _SSH_PRIVATE_KEY
     assert run_spec.environment["LIUM_CLUSTER_SSH_PUBKEY"] == _SSH_AUTHORIZED_KEY
+
+
+def test_the_private_keys_never_reach_a_log_but_do_reach_the_wire() -> None:
+    # Every container create logs `str(payload)`; a nested model is rendered with its repr.
+    payload = _payload(
+        ClusterMembership(
+            node_index=0,
+            wireguard_conf=_RENDERED_CONF,
+            ssh_private_key=_SSH_PRIVATE_KEY,
+            ssh_authorized_key=_SSH_AUTHORIZED_KEY,
+        )
+    )
+
+    logged = str(payload)
+    assert "PrivateKey" not in logged
+    assert "OPENSSH PRIVATE KEY" not in logged
+    # the validator still receives everything it needs — only the log view is redacted
+    assert payload.cluster_membership.ssh_private_key == _SSH_PRIVATE_KEY
+    assert "ZmFrZS1rZXk=" in payload.model_dump_json()

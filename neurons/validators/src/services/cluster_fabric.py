@@ -32,8 +32,8 @@ class ClusterPodNetworking:
 
 def cluster_pod_networking(
     wireguard_conf: str,
-    ssh_private_key: str = "",
-    ssh_authorized_key: str = "",
+    ssh_private_key: str,
+    ssh_authorized_key: str,
 ) -> ClusterPodNetworking:
     """The config in env for the template's entrypoint, and the UDP port to publish.
 
