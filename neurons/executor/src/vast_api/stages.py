@@ -286,16 +286,20 @@ def build_setup_ladder(
         rc, _ = docker_ops.exec_in_uns(["bash", "-c", wait])
         if rc != 0:
             raise ApiFailure("report_failed", "send_mach_info.py never unpacked within 120s")
-        # a 403 ("Invalid or missing nonce") is a state, not an API change: restart + retry once
+        # a 403 ("Invalid or missing nonce") is a daemon state, not an API change:
+        # restart vastai and give it time to check in and obtain a nonce before the
+        # retry — an immediate retry still 403s (seen live on 147260).
         # the script lives in the kaalia root, NOT in latest/ (verified on a live install)
         cmd = ["bash", "-c", "cd /var/lib/vastai_kaalia && python3 send_mach_info.py"]
-        rc, output = docker_ops.exec_in_uns(cmd)
-        if rc == 0 and "403" not in output:
-            return
-        docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
-        rc, output = docker_ops.exec_in_uns(cmd)
-        if rc != 0 or "403" in output:
-            raise ApiFailure("report_failed", f"send_mach_info.py failed twice: {output[-300:]}")
+        output = ""
+        for attempt in range(3):
+            if attempt:
+                docker_ops.exec_in_uns(["systemctl", "restart", "vastai"])
+                docker_ops.exec_in_uns(["sleep", "30"])
+            rc, output = docker_ops.exec_in_uns(cmd)
+            if rc == 0 and "403" not in output:
+                return
+        raise ApiFailure("report_failed", f"send_mach_info.py failed 3 times: {output[-300:]}")
 
     # kaalia MUST precede nested_daemon/gpu: the nested daemon.json declares the
     # nvidia runtime through kaalia_docker_shim, which only exists after the kaalia
