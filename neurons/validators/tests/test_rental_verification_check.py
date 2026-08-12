@@ -122,6 +122,28 @@ async def test_rental_verification_no_ports():
 
 
 @pytest.mark.asyncio
+async def test_rental_verification_skipped_when_ports_were_never_measured():
+    """DAH-2647: PortCountCheck no longer halts an unmeasured cycle, so the empty port list is
+    reachable without meaning the executor has none — skip instead of zeroing it here."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={}, verified_port_count=None)
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SKIPPED_PORTS_NOT_MEASURED.reason
+    assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
 async def test_rental_verification_success():
     """Test successful rental verification."""
     backend_client = DummyBackendClient(

@@ -6,7 +6,7 @@ from neurons.validators.src.services.executor_connectivity.models import PortPai
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from tests.helpers import build_context_config, build_services, build_state, default_executor
 
 
 # Mock result class matching DockerConnectionCheckResult
@@ -195,21 +195,32 @@ async def test_port_connectivity_check(
 
 
 @pytest.mark.parametrize(
-    "status,probed_port_count,expected_count",
+    "status,probed_port_count,port_range,expected_count",
     [
-        ("ok", 3, 3),
-        ("no_working_ports", 0, 0),
-        ("no_ports", 0, None),
-        ("error", 0, None),
+        ("ok", 3, "8000-8010", 3),
+        ("no_working_ports", 0, "8000-8010", 0),
+        # the executor declares ports and something holds them all: no verdict
+        ("no_ports", 0, "8000-8010", None),
+        # the executor declares none at all: that IS a verdict about the executor
+        ("no_ports", 0, "", 0),
+        # a declaration we cannot even parse counts as declaring nothing, and must not raise
+        ("no_ports", 0, "not-json", 0),
+        # the selector raises on that same malformed value, so it also arrives as "error"
+        ("error", 0, "not-json", 0),
+        ("error", 0, "8000-8010", None),
     ],
 )
 @pytest.mark.asyncio
 async def test_port_connectivity_reports_no_count_when_it_never_probed(
-    status, probed_port_count, expected_count, context_factory
+    status, probed_port_count, port_range, expected_count, context_factory
 ):
-    """DAH-2647: no_ports and error carry no evidence about the executor's ports, so they must
-    reach PortCountCheck as an absent count rather than as a measured zero."""
+    """DAH-2647: a probe that reached no verdict must reach PortCountCheck as an absent count
+    rather than as a measured zero — but an executor that declares no ports is a verdict."""
+    executor = default_executor()
+    executor.port_range = "" if port_range == "not-json" else port_range
+    executor.port_mappings = {"": "[]", "not-json": "not-json"}.get(port_range)
     ctx = context_factory(
+        executor=executor,
         services=build_services(
             redis=DummyRedis(),
             backend=DummyBackendService(),

@@ -123,6 +123,17 @@ class RentalVerificationCheck:
         # Get verified ports from PortConnectivityCheck
         verified_ports = ctx.state.specs.get("verified_ports", []) if ctx.state.specs else []
 
+        # DAH-2647: PortCountCheck no longer halts a cycle whose port probe reached no verdict,
+        # so the empty list below is now reachable without meaning "this executor has no ports".
+        if ctx.state.verified_port_count is None:
+            event = render_message(
+                Msg.SKIPPED_PORTS_NOT_MEASURED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": executor.uuid},
+            )
+            return CheckResult(passed=True, event=event, updates={})
+
         # Fail if no verified ports are available (safety check - should be caught by PortConnectivityCheck)
         if not verified_ports:
             event = render_message(

@@ -984,6 +984,13 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed without backend rental verification",
     )
+    SKIPPED_PORTS_NOT_MEASURED = MessageTemplate(
+        event="Rental verification skipped, ports not measured",
+        reason="RENTAL_CHECK_SKIPPED_PORTS_NOT_MEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed without backend rental verification",
+    )
     VERIFIED = MessageTemplate(
         event="Rental verification successful",
         reason="RENTAL_VERIFIED",
