@@ -271,6 +271,10 @@ class ClusterMembership(BaseModel):
     # This node's fully-rendered wg-quick config, minted by the backend for the whole group so every
     # node's keys and peer list agree. The validator only injects it; it generates nothing itself.
     wireguard_conf: str
+    # DAH-2664: one SSH login shared by the whole group, so a pod can start a process on its peers —
+    # which is how mpirun, pdsh and every nccl-tests recipe launch. Empty from an older backend.
+    ssh_private_key: str = ""
+    ssh_authorized_key: str = ""
 
 
 class ContainerCreateRequest(ContainerBaseRequest):

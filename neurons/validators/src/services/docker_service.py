@@ -926,7 +926,11 @@ class DockerService:
         # tensors still travel over InfiniBand. Absent on an ordinary rental.
         cluster_udp_ports: tuple[int, ...] = ()
         if payload.cluster_membership is not None:
-            cluster_networking = cluster_pod_networking(payload.cluster_membership.wireguard_conf)
+            cluster_networking = cluster_pod_networking(
+                payload.cluster_membership.wireguard_conf,
+                payload.cluster_membership.ssh_private_key,
+                payload.cluster_membership.ssh_authorized_key,
+            )
             environment.update(cluster_networking.environment)
             cluster_udp_ports = cluster_networking.published_udp_ports
 

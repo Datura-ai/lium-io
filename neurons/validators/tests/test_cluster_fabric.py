@@ -23,6 +23,9 @@ Endpoint = 69.63.236.161:51820
 PersistentKeepalive = 25
 """
 
+_SSH_PRIVATE_KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nZmFrZS1rZXk=\n-----END OPENSSH PRIVATE KEY-----\n"
+_SSH_AUTHORIZED_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIfake lium-cluster"
+
 
 def test_the_config_reaches_the_pod_intact_through_the_environment() -> None:
     networking = cluster_pod_networking(_RENDERED_CONF)
@@ -103,3 +106,42 @@ def test_a_cluster_node_gets_its_config_and_the_udp_port_alongside_the_usual_one
     ]
     # The rental's own published ports are still there — the overlay is added, not substituted.
     assert any(port.protocol == "tcp" and port.container_port == 2000 for port in run_spec.ports)
+
+# --- DAH-2664: the group's shared SSH login ---
+
+
+def test_the_shared_ssh_login_reaches_the_pod_intact() -> None:
+    networking = cluster_pod_networking(_RENDERED_CONF, _SSH_PRIVATE_KEY, _SSH_AUTHORIZED_KEY)
+
+    # The private key is multi-line, so it travels base64'd like the config; the public line is not.
+    decoded = base64.b64decode(networking.environment["LIUM_CLUSTER_SSH_KEY_B64"]).decode()
+    assert decoded == _SSH_PRIVATE_KEY
+    assert networking.environment["LIUM_CLUSTER_SSH_PUBKEY"] == _SSH_AUTHORIZED_KEY
+
+
+def test_a_backend_that_sends_no_ssh_login_injects_nothing(docker_service) -> None:
+    # An older backend has no DAH-2664 fields, and the pod must still come up with its overlay.
+    payload = _payload(ClusterMembership(node_index=0, wireguard_conf=_RENDERED_CONF))
+
+    run_spec = _run_spec(docker_service, payload)
+
+    assert "LIUM_WIREGUARD_CONF_B64" in run_spec.environment
+    assert "LIUM_CLUSTER_SSH_KEY_B64" not in run_spec.environment
+    assert "LIUM_CLUSTER_SSH_PUBKEY" not in run_spec.environment
+
+
+def test_a_cluster_node_carries_the_shared_ssh_login_into_the_container(docker_service) -> None:
+    payload = _payload(
+        ClusterMembership(
+            node_index=0,
+            wireguard_conf=_RENDERED_CONF,
+            ssh_private_key=_SSH_PRIVATE_KEY,
+            ssh_authorized_key=_SSH_AUTHORIZED_KEY,
+        )
+    )
+
+    run_spec = _run_spec(docker_service, payload)
+
+    decoded = base64.b64decode(run_spec.environment["LIUM_CLUSTER_SSH_KEY_B64"]).decode()
+    assert decoded == _SSH_PRIVATE_KEY
+    assert run_spec.environment["LIUM_CLUSTER_SSH_PUBKEY"] == _SSH_AUTHORIZED_KEY
