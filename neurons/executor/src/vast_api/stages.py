@@ -276,6 +276,16 @@ def build_setup_ladder(
     # --- report: no check — re-reporting an already-reporting machine is harmless ---
 
     def report_do() -> None:
+        # send_mach_info.py is unpacked from daemon.tar.gz by the freshly restarted
+        # kaalia — on a first install it appears seconds to minutes after register,
+        # so wait for it instead of failing the whole run (seen live on 147260)
+        wait = (
+            "for i in $(seq 1 24); do"
+            " [ -f /var/lib/vastai_kaalia/send_mach_info.py ] && exit 0; sleep 5; done; exit 1"
+        )
+        rc, _ = docker_ops.exec_in_uns(["bash", "-c", wait])
+        if rc != 0:
+            raise ApiFailure("report_failed", "send_mach_info.py never unpacked within 120s")
         # a 403 ("Invalid or missing nonce") is a state, not an API change: restart + retry once
         # the script lives in the kaalia root, NOT in latest/ (verified on a live install)
         cmd = ["bash", "-c", "cd /var/lib/vastai_kaalia && python3 send_mach_info.py"]
