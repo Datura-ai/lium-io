@@ -83,6 +83,61 @@ def _convert_weights_with_positive_floor(
     return out_uids, out_vals, floored
 
 
+def _select_floor_candidates(
+    uint_uids,
+    miners,
+    active_hotkeys: set[str],
+    burn_uids: set[int],
+) -> list[tuple[int, str]]:
+    """Pick the hotkeys that had a live executor last cycle but are missing from the
+    u16 vector. Burn uids are never candidates — they fund the floor, they don't take it.
+
+    Returns a list of `(uid, hotkey)` tuples sorted by uid so the transfer is deterministic.
+    """
+    present = {int(u) for u in uint_uids}
+    return sorted(
+        (int(miner.uid), miner.hotkey)
+        for miner in miners
+        if miner.hotkey in active_hotkeys
+        and int(miner.uid) not in present
+        and int(miner.uid) not in burn_uids
+    )
+
+
+def _largest_burn_index(uids: list[int], weights: list[int], burn_uids: set[int]) -> int | None:
+    """Index of the burn entry currently carrying the most u16 mass, or None when the vector has no burner."""
+    burn_indexes = [ind for ind, uid in enumerate(uids) if uid in burn_uids]
+    if not burn_indexes:
+        return None
+    return max(burn_indexes, key=lambda ind: weights[ind])
+
+
+def _apply_eligibility_floor(
+    uint_uids,
+    uint_weights,
+    miners,
+    active_hotkeys: set[str],
+    burn_uids: set[int],
+) -> tuple[list[int], list[int], list[str]]:
+    """Give one u16 unit to every live hotkey the vector dropped, taken from the largest
+    burn entry so no earning miner is diluted. Builds new lists, never mutates the inputs.
+
+    Returns (uids, weights, floored_hotkeys).
+    """
+    out_uids = [int(u) for u in uint_uids]
+    out_weights = [int(w) for w in uint_weights]
+    floored_hotkeys: list[str] = []
+    for uid, hotkey in _select_floor_candidates(out_uids, miners, active_hotkeys, burn_uids):
+        donor = _largest_burn_index(out_uids, out_weights, burn_uids)
+        if donor is None or out_weights[donor] <= 1:
+            break
+        out_weights[donor] -= 1
+        out_uids.append(uid)
+        out_weights.append(1)
+        floored_hotkeys.append(hotkey)
+    return out_uids, out_weights, floored_hotkeys
+
+
 class SubtensorClient:
     # Static class variables (shared across all instances)
     _instance = None
@@ -350,11 +405,14 @@ class SubtensorClient:
         except Exception as e:
             logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
-    async def set_weights(self, miner_scores: dict[str, float]):
+    async def set_weights(self, miner_scores: dict[str, float], active_hotkeys: set[str] | None = None):
         """Set weights using accumulated scores with burning already applied.
 
         The miner_scores dict already includes burning logic from calculate_final_weights
         called per cycle. This method just normalizes and sends to chain.
+
+        `active_hotkeys` are the hotkeys with at least one live executor in the last
+        completed cycle — they get the u16 floor when the vector would drop them.
         """
         miners = await self.get_miners()
         logger.info(
@@ -422,6 +480,27 @@ class SubtensorClient:
 
         uint_uids, uint_weights, floored = _convert_weights_with_positive_floor(
             processed_uids, processed_weights
+        )
+
+        # DAH-2622: a hotkey that had a live executor last cycle keeps u16=1 even when it
+        # scored nothing, so the chain never deregisters it for a zero emission.
+        uint_uids, uint_weights, floor_hotkeys = _apply_eligibility_floor(
+            uint_uids,
+            uint_weights,
+            miners,
+            active_hotkeys or set(),
+            set(settings.BURNERS + settings.NEW_BURNERS),
+        )
+
+        logger.info(
+            _m(
+                "[set_weights] eligibility floor applied",
+                extra=get_extra_info({
+                    **self.default_extra,
+                    "floor_hotkeys": floor_hotkeys,
+                    "floor_count": len(floor_hotkeys),
+                }),
+            ),
         )
 
         # Resolve floored uids back to hotkeys so the log row is human-debuggable.

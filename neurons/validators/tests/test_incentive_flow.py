@@ -1,3 +1,4 @@
+import logging
 import pytest
 from unittest.mock import AsyncMock, patch
 
@@ -40,6 +41,14 @@ def expected_score(
 pytest_plugins = ["fixtures.incentive_fixtures"]
 
 
+def _floor_log_extras(caplog):
+    return [
+        {"floor_hotkeys": record.msg.extra["floor_hotkeys"], "floor_count": record.msg.extra["floor_count"]}
+        for record in caplog.records
+        if hasattr(record.msg, "extra") and "floor_hotkeys" in record.msg.extra
+    ]
+
+
 def _weights_by_uid(captured):
     return {
         int(uid): float(weight)
@@ -47,7 +56,9 @@ def _weights_by_uid(captured):
     }
 
 
-async def _run_set_weights_and_capture(mock_subtensor_client, miners, miner_scores, *, normalize=False):
+async def _run_set_weights_and_capture(
+    mock_subtensor_client, miners, miner_scores, *, normalize=False, active_hotkeys=None
+):
     captured = {}
 
     def capture_weights(uids, weights, netuid, subtensor, metagraph):
@@ -65,7 +76,9 @@ async def _run_set_weights_and_capture(mock_subtensor_client, miners, miner_scor
 
     with patch("clients.subtensor_client.process_weights_for_netuid", side_effect=capture_weights):
         mock_subtensor_client.get_miners = AsyncMock(return_value=miners)
-        await mock_subtensor_client.set_weights(miner_scores=miner_scores)
+        await mock_subtensor_client.set_weights(
+            miner_scores=miner_scores, active_hotkeys=active_hotkeys
+        )
 
     return captured
 
@@ -1253,6 +1266,72 @@ def test_convert_weights_with_positive_floor_handles_empty_and_all_zero():
     assert all_zero == ([], [], [])
 
 
+# ---------------------------------------------------------------------------
+# DAH-2622: a hotkey with a live executor must never fall out of the vector
+# ---------------------------------------------------------------------------
+
+
+def test_select_floor_candidates_live_zero_selected_burn_inactive_positive_excluded(
+    create_neuron_info,
+):
+    from clients.subtensor_client import _select_floor_candidates
+
+    miners = [
+        create_neuron_info(uid=5, hotkey="live_absent"),
+        create_neuron_info(uid=100, hotkey="live_burner"),
+        create_neuron_info(uid=6, hotkey="inactive"),
+        create_neuron_info(uid=7, hotkey="live_present"),
+    ]
+    uint_uids = [100, 7]
+    active_hotkeys = {"live_absent", "live_burner", "live_present"}
+
+    candidates = _select_floor_candidates(uint_uids, miners, active_hotkeys, {100, 101})
+
+    assert candidates == [(5, "live_absent")]
+
+
+def test_apply_eligibility_floor_funds_candidate_from_largest_burn_uid(create_neuron_info):
+    from clients.subtensor_client import _apply_eligibility_floor
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="big_burner"),
+        create_neuron_info(uid=101, hotkey="small_burner"),
+        create_neuron_info(uid=3, hotkey="earner"),
+        create_neuron_info(uid=5, hotkey="live_absent"),
+    ]
+    uint_uids = [100, 101, 3]
+    uint_weights = [65535, 30000, 500]
+
+    out_uids, out_weights, floored_hotkeys = _apply_eligibility_floor(
+        uint_uids, uint_weights, miners, {"live_absent"}, {100, 101}
+    )
+
+    assert dict(zip(out_uids, out_weights)) == {100: 65534, 101: 30000, 3: 500, 5: 1}
+    assert floored_hotkeys == ["live_absent"]
+    assert uint_uids == [100, 101, 3]
+    assert uint_weights == [65535, 30000, 500]
+
+
+def test_apply_eligibility_floor_stops_when_burn_exhausted(create_neuron_info):
+    from clients.subtensor_client import _apply_eligibility_floor
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=5, hotkey="live_a"),
+        create_neuron_info(uid=6, hotkey="live_b"),
+    ]
+    # the single burn entry carries exactly one spare unit above the u16 minimum
+    uint_uids = [100]
+    uint_weights = [2]
+
+    out_uids, out_weights, floored_hotkeys = _apply_eligibility_floor(
+        uint_uids, uint_weights, miners, {"live_a", "live_b"}, {100}
+    )
+
+    assert floored_hotkeys == ["live_a"]
+    assert dict(zip(out_uids, out_weights)) == {100: 1, 5: 1}
+
+
 @pytest.mark.asyncio
 async def test_set_weights_floors_positive_scores_to_min_one(
     mock_subtensor_client,
@@ -1268,9 +1347,11 @@ async def test_set_weights_floors_positive_scores_to_min_one(
     ]
     miner_scores = {"burner": 1.0, "tiny": 1e-9}  # "zero" deliberately absent
 
-    # normalize=True → captured floats sum to ~1, mirroring the SDK's real output
+    # normalize=True → captured floats sum to ~1, mirroring the SDK's real output.
+    # active_hotkeys=set() pins the pre-DAH-2622 baseline: with no live hotkey the
+    # eligibility floor never fires, so a zero-score miner stays out of the vector.
     await _run_set_weights_and_capture(
-        mock_subtensor_client, miners, miner_scores, normalize=True
+        mock_subtensor_client, miners, miner_scores, normalize=True, active_hotkeys=set()
     )
 
     call = mock_subtensor_client.subtensor.set_weights.call_args
@@ -1282,3 +1363,190 @@ async def test_set_weights_floors_positive_scores_to_min_one(
     assert by_uid[2] >= 1
     assert by_uid[100] == 65535
     assert 3 not in by_uid
+
+
+@pytest.mark.asyncio
+async def test_set_weights_floors_active_hotkey_with_zero_score(
+    mock_subtensor_client,
+    create_neuron_info,
+):
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=2, hotkey="earner"),
+        create_neuron_info(uid=3, hotkey="idle"),
+    ]
+    miner_scores = {"burner": 0.8, "earner": 0.2}  # "idle" scored nothing this epoch
+
+    await _run_set_weights_and_capture(
+        mock_subtensor_client, miners, miner_scores, normalize=True, active_hotkeys={"idle"}
+    )
+
+    call = mock_subtensor_client.subtensor.set_weights.call_args
+    by_uid = dict(zip(list(call.kwargs["uids"]), list(call.kwargs["weights"])))
+
+    assert by_uid[3] == 1, f"live idle miner was dropped from the vector: {by_uid}"
+    assert by_uid[100] == 65534
+
+
+@pytest.mark.asyncio
+async def test_set_weights_logs_eligibility_floor_applied(
+    mock_subtensor_client,
+    create_neuron_info,
+    caplog,
+):
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=2, hotkey="earner"),
+        create_neuron_info(uid=3, hotkey="idle"),
+    ]
+
+    with caplog.at_level(logging.INFO):
+        await _run_set_weights_and_capture(
+            mock_subtensor_client,
+            miners,
+            {"burner": 0.8, "earner": 0.2},
+            normalize=True,
+            active_hotkeys={"idle"},
+        )
+
+    assert _floor_log_extras(caplog) == [{"floor_hotkeys": ["idle"], "floor_count": 1}]
+
+
+@pytest.mark.asyncio
+async def test_set_weights_logs_eligibility_floor_even_when_empty(
+    mock_subtensor_client,
+    create_neuron_info,
+    caplog,
+):
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=2, hotkey="earner"),
+    ]
+
+    with caplog.at_level(logging.INFO):
+        await _run_set_weights_and_capture(
+            mock_subtensor_client,
+            miners,
+            {"burner": 0.8, "earner": 0.2},
+            normalize=True,
+            active_hotkeys=set(),
+        )
+
+    assert _floor_log_extras(caplog) == [{"floor_hotkeys": [], "floor_count": 0}]
+
+
+@pytest.mark.asyncio
+async def test_set_weights_floor_does_not_dilute_earning_miners(
+    mock_subtensor_client,
+    create_neuron_info,
+):
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=2, hotkey="earner_big"),
+        create_neuron_info(uid=3, hotkey="earner_small"),
+        create_neuron_info(uid=4, hotkey="idle"),
+    ]
+    miner_scores = {"burner": 0.8, "earner_big": 0.15, "earner_small": 0.05}
+
+    await _run_set_weights_and_capture(
+        mock_subtensor_client, miners, miner_scores, normalize=True, active_hotkeys=set()
+    )
+    without_floor = dict(
+        zip(
+            list(mock_subtensor_client.subtensor.set_weights.call_args.kwargs["uids"]),
+            list(mock_subtensor_client.subtensor.set_weights.call_args.kwargs["weights"]),
+        )
+    )
+    await _run_set_weights_and_capture(
+        mock_subtensor_client, miners, miner_scores, normalize=True, active_hotkeys={"idle"}
+    )
+    with_floor = dict(
+        zip(
+            list(mock_subtensor_client.subtensor.set_weights.call_args.kwargs["uids"]),
+            list(mock_subtensor_client.subtensor.set_weights.call_args.kwargs["weights"]),
+        )
+    )
+
+    assert with_floor[2] == without_floor[2]
+    assert with_floor[3] == without_floor[3]
+    assert with_floor[4] == 1
+    assert with_floor[100] == without_floor[100] - 1
+
+
+@pytest.mark.asyncio
+async def test_set_weights_floor_leaves_normalized_scores_untouched(
+    mock_subtensor_client,
+    create_neuron_info,
+):
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=2, hotkey="earner"),
+        create_neuron_info(uid=4, hotkey="idle"),
+    ]
+    miner_scores = {"burner": 0.8, "earner": 0.2}
+
+    await _run_set_weights_and_capture(
+        mock_subtensor_client, miners, miner_scores, normalize=True, active_hotkeys=set()
+    )
+    without_floor = mock_subtensor_client.redis_service.publish.call_args.args
+    await _run_set_weights_and_capture(
+        mock_subtensor_client, miners, miner_scores, normalize=True, active_hotkeys={"idle"}
+    )
+    with_floor = mock_subtensor_client.redis_service.publish.call_args.args
+
+    assert with_floor == without_floor
+
+
+@pytest.mark.asyncio
+async def test_active_hotkeys_reflects_successful_executors_only(
+    validator_with_mocks,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+):
+    validator = validator_with_mocks
+    validator.miner_scores = {}
+    validator.active_hotkeys = {"stale_from_previous_cycle"}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=2, hotkey="idle_miner"),
+        create_neuron_info(uid=3, hotkey="spot_miner"),
+        create_neuron_info(uid=4, hotkey="dead_miner"),
+    ]
+    spot_result = create_job_result(gpu_model="H100", gpu_count=1)
+    spot_result.is_spot = True
+
+    all_job_results = {
+        "idle_miner": [create_job_result(gpu_model="H100", gpu_count=1)],
+        "spot_miner": [spot_result],
+        "dead_miner": [create_job_result(score=0.0, job_score=0.0, gpu_model="A100", gpu_count=2)],
+    }
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    assert validator.active_hotkeys == {"idle_miner", "spot_miner"}
+
+
+@pytest.mark.asyncio
+async def test_sync_passes_active_hotkeys_to_set_weights(
+    validator_with_mocks,
+    mock_settings,
+    create_neuron_info,
+):
+    validator = validator_with_mocks
+    validator.miner_scores = {"live_miner": 1.0}
+    validator.active_hotkeys = {"live_miner"}
+    validator.completed_cycles_since_start = 1
+    # current_block == 100 in the fixture, so no new job cycle starts in this sync()
+    validator.last_job_run_blocks = 100
+    validator.subtensor_client.get_miners = AsyncMock(
+        return_value=[create_neuron_info(uid=2, hotkey="live_miner")]
+    )
+    validator.subtensor_client.should_set_weights = AsyncMock(return_value=True)
+    validator.subtensor_client.set_weights = AsyncMock()
+
+    await validator.sync()
+
+    call = validator.subtensor_client.set_weights.call_args
+    assert call.kwargs["active_hotkeys"] == {"live_miner"}
