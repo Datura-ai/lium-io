@@ -209,6 +209,26 @@ class Settings(BaseSettings):
     # filler container. Rollout: shadow first, flip enforcement after the shadow data is clean.
     FILLER_LIVENESS_CHECK_ENABLED: bool = Field(env="FILLER_LIVENESS_CHECK_ENABLED", default=True)
     FILLER_LIVENESS_ENFORCEMENT_ENABLED: bool = Field(env="FILLER_LIVENESS_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2671 spec-truth checks. Each pair mirrors the FILLER_LIVENESS precedent above:
+    # CHECK_ENABLED is the master switch — shadow mode computes the signal and emits the event/log
+    # but returns passed=True and never changes score; ENFORCEMENT (only effective while
+    # CHECK_ENABLED is on) additionally lets the signal fail closed / fail the check. No enforcement
+    # flag defaults to True: a false positive on a scoring path zeroes an honest miner's emission,
+    # so we shadow first and flip enforcement from clean fleet data (operator decision, not a commit).
+    #
+    # Item 1 — surface the kernel (procfs) GPU verdict the validator already computes and throws
+    # away, and refuse the spoofable nvidia-smi XML fallback when it disagrees with the kernel map.
+    KERNEL_GPU_VERDICT_CHECK_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_CHECK_ENABLED", default=True)
+    KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", default=False)
+    # Item 2a — corroborate the advertised CPU(s) count against sources the lscpu wrapper does not
+    # author (/proc/cpuinfo, /sys present population, docker NCPU).
+    CPU_TRUTH_CHECK_ENABLED: bool = Field(env="CPU_TRUTH_CHECK_ENABLED", default=True)
+    CPU_TRUTH_ENFORCEMENT_ENABLED: bool = Field(env="CPU_TRUTH_ENFORCEMENT_ENABLED", default=False)
+    # Item 3 — run the GPU work-proof on every claimed card concurrently (own challenge per card,
+    # sized from the registry SKU) and time the aggregate on the validator, so a count lie either
+    # fails device selection or serialises past a wide wall-clock threshold.
+    MATMUL_ALLCARDS_CHECK_ENABLED: bool = Field(env="MATMUL_ALLCARDS_CHECK_ENABLED", default=True)
+    MATMUL_ALLCARDS_ENFORCEMENT_ENABLED: bool = Field(env="MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", default=False)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")

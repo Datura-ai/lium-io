@@ -35,6 +35,7 @@ executor-side issues.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import shlex
 import xml.etree.ElementTree as ET
@@ -46,6 +47,100 @@ from core.config import settings
 from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
 
 logger = logging.getLogger(__name__)
+
+# Distinctive, stable log-message strings so ops can hang a Loki alert on them (DAH-2671, item 1).
+# There is no separate alert service in the validator — the structured log line IS the alert.
+_KERNEL_GPU_VERDICT_MISSING_MSG = "kernel_gpu_verdict: rented GPU absent from kernel procfs list"
+_KERNEL_GPU_VERDICT_DISAGREE_MSG = "kernel_gpu_verdict: kernel procfs vs nvidia-smi XML GPU disagreement"
+
+
+class MissingRentedGpuError(RuntimeError):
+    """A tenant-requested GPU UUID is absent from the kernel (procfs) GPU list.
+
+    The kernel `/proc/driver/nvidia/gpus/*/information` list is the one GPU inventory the NVML
+    shim does not author, so this is the truth verdict. Carries the full requested/visible/missing
+    UUID lists so the caught event can report counts and both lists without re-parsing the message.
+    """
+
+    def __init__(
+        self,
+        *,
+        requested_uuids: Sequence[str],
+        visible_uuids: Sequence[str],
+        missing_uuids: Sequence[str],
+    ):
+        self.requested_uuids = list(requested_uuids)
+        self.visible_uuids = list(visible_uuids)
+        self.missing_uuids = list(missing_uuids)
+        super().__init__(
+            f"GPU {self.missing_uuids[0]!r} requested by tenant not present on executor; "
+            f"visible: {sorted(self.visible_uuids)}"
+        )
+
+
+def _ssh_peer(ssh: asyncssh.SSHClientConnection) -> str | None:
+    # host:port of the executor, a usable Loki key even when the caller passes no executor_id
+    try:
+        peer = ssh.get_extra_info("peername")
+    except Exception:
+        return None
+    if isinstance(peer, tuple | list) and len(peer) >= 2:
+        return f"{peer[0]}:{peer[1]}"
+    # A mocked (AsyncMock) connection can hand back a coroutine here; drop it without awaiting.
+    if inspect.iscoroutine(peer):
+        peer.close()
+    return None
+
+
+def _emit_missing_rented_gpu(
+    ssh: asyncssh.SSHClientConnection,
+    exc: MissingRentedGpuError,
+    *,
+    executor_id: str | None,
+    default_extra: dict | None,
+) -> None:
+    logger.warning(
+        _KERNEL_GPU_VERDICT_MISSING_MSG,
+        extra={
+            **(default_extra or {}),
+            "kernel_gpu_verdict": "missing_rented_gpu",
+            "executor_id": executor_id,
+            "executor_peer": _ssh_peer(ssh),
+            "requested_gpu_count": len(exc.requested_uuids),
+            "visible_gpu_count": len(exc.visible_uuids),
+            "requested_uuids": exc.requested_uuids,
+            "visible_uuids": exc.visible_uuids,
+            "missing_uuids": exc.missing_uuids,
+        },
+    )
+
+
+def _emit_kernel_xml_disagreement(
+    ssh: asyncssh.SSHClientConnection,
+    gpu_uuids: Sequence[str],
+    proc_map: dict[str, int],
+    xml_map: dict[str, int],
+    *,
+    proc_unreadable: bool,
+    enforce: bool,
+) -> None:
+    logger.warning(
+        _KERNEL_GPU_VERDICT_DISAGREE_MSG,
+        extra={
+            "kernel_gpu_verdict": "kernel_xml_disagreement",
+            "executor_peer": _ssh_peer(ssh),
+            # proc_unreadable distinguishes the honest case (an unreadable /proc map, which
+            # enforcement also refuses) from a real spoof (proc readable but missing a card the
+            # spoofable XML claims). Under shadow, placement is unchanged; only this line is emitted.
+            "proc_unreadable": proc_unreadable,
+            "enforced": enforce,
+            "requested_uuids": list(gpu_uuids),
+            "kernel_visible_uuids": sorted(proc_map),
+            "xml_visible_uuids": sorted(xml_map),
+            "xml_would_add_uuids": [u for u in gpu_uuids if u not in proc_map and u in xml_map],
+        },
+    )
+
 
 _PROC_GPU_INFO_CMD = (
     "for f in /proc/driver/nvidia/gpus/*/information; do "
@@ -65,6 +160,9 @@ _PROC_GPU_INFO_CMD = (
 async def build_gpu_flags(
     ssh_client: asyncssh.SSHClientConnection,
     gpu_uuids: Sequence[str] | None,
+    *,
+    executor_id: str | None = None,
+    default_extra: dict | None = None,
 ) -> str:
     """Assemble the full GPU flag block for `docker run`.
 
@@ -79,7 +177,9 @@ async def build_gpu_flags(
     at WARNING). The pod will still be created in the legacy path; it just
     won't survive `systemctl daemon-reload` on the executor host.
     """
-    gpu_config = await build_gpu_docker_config_for_executor(ssh_client, gpu_uuids)
+    gpu_config = await build_gpu_docker_config_for_executor(
+        ssh_client, gpu_uuids, executor_id=executor_id, default_extra=default_extra
+    )
     device_flags = _device_flags(
         tuple(device.path_on_host for device in gpu_config.device_mounts)
     )
@@ -89,6 +189,9 @@ async def build_gpu_flags(
 async def build_gpu_docker_config_for_executor(
     ssh_client: asyncssh.SSHClientConnection,
     gpu_uuids: Sequence[str] | None,
+    *,
+    executor_id: str | None = None,
+    default_extra: dict | None = None,
 ) -> GpuDockerConfig:
     """Resolve structured GPU Docker options for SDK container creation."""
     try:
@@ -106,7 +209,14 @@ async def build_gpu_docker_config_for_executor(
         # under partial rental closes the leak before either ever ships.
         shared = await _query_shared_nodes(ssh_client, is_whole_host_rental=not is_partial_rental)
         return build_gpu_docker_config(gpu_uuids, device_nodes=(*per_gpu, *shared))
-    except Exception:
+    except Exception as exc:
+        # 1a: the kernel-truth verdict (a rented UUID absent from procfs) otherwise dies as a bare
+        # WARNING. Surface it as a stable structured event so ops can alert on it; behavior is
+        # unchanged — we still fall back to the legacy --gpus string below.
+        if isinstance(exc, MissingRentedGpuError) and settings.KERNEL_GPU_VERDICT_CHECK_ENABLED:
+            _emit_missing_rented_gpu(
+                ssh_client, exc, executor_id=executor_id, default_extra=default_extra
+            )
         logger.warning(
             "nvidia_devices: probe failed, falling back to legacy --gpus only "
             "(pod will not survive systemd daemon-reload on the executor)",
@@ -142,20 +252,45 @@ async def _query_gpu_nodes_for_uuids(
     total lets the caller decide whether this is a partial-host rental.
     """
     errors: list[str] = []
+    proc_unreadable = False
     try:
         uuid_to_minor = await _query_gpu_minor_map_from_proc(ssh)
     except RuntimeError as exc:
         errors.append(str(exc))
         uuid_to_minor = {}
+        proc_unreadable = True
 
     if not uuid_to_minor or _missing_gpu_uuids(gpu_uuids, uuid_to_minor):
+        # The kernel (procfs) map cannot satisfy the request; today we consult the NVML-backed
+        # nvidia-smi XML, which the shim can spoof, and let it replace the kernel truth. 1b: treat a
+        # kernel-vs-XML disagreement (XML supplies a UUID the kernel lacks) as the finding. Under
+        # enforcement, refuse the overwrite — the kernel truth stands and the missing-GPU verdict
+        # below fires (fail closed). Under shadow, emit and preserve today's overwrite exactly.
         try:
             xml_uuid_to_minor = await _query_gpu_minor_map_from_nvidia_smi_xml(ssh)
         except RuntimeError as exc:
             errors.append(str(exc))
-        else:
-            if xml_uuid_to_minor:
-                uuid_to_minor = xml_uuid_to_minor
+            xml_uuid_to_minor = {}
+
+        overwrite_with_xml = bool(xml_uuid_to_minor)
+        if xml_uuid_to_minor and settings.KERNEL_GPU_VERDICT_CHECK_ENABLED:
+            xml_would_add = [
+                u for u in gpu_uuids if u not in uuid_to_minor and u in xml_uuid_to_minor
+            ]
+            if xml_would_add:
+                enforce = settings.KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED
+                _emit_kernel_xml_disagreement(
+                    ssh,
+                    gpu_uuids,
+                    uuid_to_minor,
+                    xml_uuid_to_minor,
+                    proc_unreadable=proc_unreadable,
+                    enforce=enforce,
+                )
+                if enforce:
+                    overwrite_with_xml = False
+        if overwrite_with_xml:
+            uuid_to_minor = xml_uuid_to_minor
 
     if not uuid_to_minor:
         details = f": {'; '.join(errors)}" if errors else ""
@@ -163,9 +298,10 @@ async def _query_gpu_nodes_for_uuids(
 
     missing = _missing_gpu_uuids(gpu_uuids, uuid_to_minor)
     if missing:
-        raise RuntimeError(
-            f"GPU {missing[0]!r} requested by tenant not present on executor; "
-            f"visible: {sorted(uuid_to_minor)}"
+        raise MissingRentedGpuError(
+            requested_uuids=gpu_uuids,
+            visible_uuids=list(uuid_to_minor),
+            missing_uuids=missing,
         )
 
     # Deduplicated, request order kept: the caller compares this length against the host GPU count

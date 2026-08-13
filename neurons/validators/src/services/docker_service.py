@@ -4444,6 +4444,8 @@ class DockerService:
                 gpu_config = await build_gpu_docker_config_for_executor(
                     ssh_client,
                     payload.gpu_uuids,
+                    executor_id=payload.executor_id,
+                    default_extra=default_extra,
                 )
 
                 if payload.cluster_membership is not None:

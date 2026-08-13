@@ -1,0 +1,136 @@
+"""DAH-2671 item 3 — full-matmul-all-cards work-proof.
+
+RED→GREEN: before this change the work-proof ran ONE process with no device selection, so cards
+1..N-1 were never touched and a 1-GPU host advertising 8 passed. Now every claimed card gets its
+own challenge, pinned with CUDA_VISIBLE_DEVICES=<index>, timed in aggregate on the validator:
+  - a 1-real-card host under an 8-GPU claim fails device selection → fails under enforcement;
+  - an honest 8-card host passes;
+  - an aggregate wall-clock over threshold fails under enforcement, only emits under shadow;
+  - a single-card (legacy) executor is never judged by the all-cards path (probe returns None).
+"""
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+import services.matrix_validation_service as mvs
+
+
+@pytest.fixture
+def svc(monkeypatch):
+    """Real ValidationService with a fully mocked native wrapper (no .so on the test host)."""
+    wrapper = MagicMock(name="DMCompVerifyWrapper")
+    wrapper.DMCompVerify_new.return_value = "ptr"
+    wrapper.getCipherText.return_value = "deadbeef"
+    monkeypatch.setattr(mvs, "DMCompVerifyWrapper", lambda *a, **k: wrapper)
+    return mvs.ValidationService()
+
+
+def _executor():
+    return SimpleNamespace(root_dir="/root/app", python_path="/usr/bin/python")
+
+
+def _spec(count, model="NVIDIA H100 80GB HBM3"):
+    return {
+        "gpu": {
+            "count": count,
+            "details": [
+                {"name": model, "uuid": f"GPU-{i}", "capacity": 81920} for i in range(count)
+            ],
+        }
+    }
+
+
+def _card_index(cmd: str) -> int:
+    return int(cmd.split("CUDA_VISIBLE_DEVICES=")[1].split(" ")[0])
+
+
+def _ssh(real_cards: int):
+    # a host with `real_cards` genuine GPUs: indices past that fail device selection (invalid ordinal)
+    async def run(cmd, *args, **kwargs):
+        if "CUDA_VISIBLE_DEVICES=" in cmd:
+            if _card_index(cmd) < real_cards:
+                return SimpleNamespace(exit_status=0, stdout="RESULT_JSON: {}", stderr="")
+            return SimpleNamespace(exit_status=1, stdout="", stderr="invalid device ordinal")
+        # single-card fallback path (no device prefix) — benign output.
+        return SimpleNamespace(exit_status=0, stdout="UUID: x", stderr="")
+
+    return SimpleNamespace(run=run)
+
+
+def _flags(monkeypatch, *, enforce):
+    monkeypatch.setattr(mvs.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        mvs.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", enforce, raising=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_spoof_one_card_under_eight_claim_fails_under_enforcement(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=_ssh(real_cards=1),
+        executor_info=_executor(),
+        default_extra={},
+        machine_spec=_spec(8),
+    )
+    assert result.success is False
+    assert result.error_message.startswith("All-cards GPU work-proof failed")
+
+
+@pytest.mark.asyncio
+async def test_honest_eight_cards_probe_passes(svc):
+    probe = await svc._probe_all_claimed_cards(_ssh(real_cards=8), _executor(), {}, _spec(8))
+    assert probe is not None
+    assert probe.passed is True
+    assert len(probe.per_card) == 8
+    assert all(card["ok"] for card in probe.per_card)
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_over_threshold_fails_under_enforcement(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    # -1s threshold: any real elapsed trips it even though every card ran fine (models serialisation).
+    monkeypatch.setattr(mvs, "MATMUL_ALLCARDS_WALL_CLOCK_SECONDS", -1, raising=False)
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=_ssh(real_cards=8),
+        executor_info=_executor(),
+        default_extra={},
+        machine_spec=_spec(8),
+    )
+    assert result.success is False
+    assert "wall-clock" in result.error_message
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_over_threshold_only_emits_under_shadow(svc, monkeypatch, caplog):
+    _flags(monkeypatch, enforce=False)
+    monkeypatch.setattr(mvs, "MATMUL_ALLCARDS_WALL_CLOCK_SECONDS", -1, raising=False)
+    with caplog.at_level("WARNING"):
+        result = await svc.validate_gpu_model_and_process_job(
+            ssh_client=_ssh(real_cards=8),
+            executor_info=_executor(),
+            default_extra={},
+            machine_spec=_spec(8),
+        )
+    # shadow: the probe never turns into a returned all-cards failure.
+    assert not result.error_message.startswith("All-cards GPU work-proof failed")
+    # but the observation is emitted.
+    assert any("All-cards GPU work-proof" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_legacy_single_card_is_not_judged_by_all_cards(svc):
+    # gpu_count <= 1 → probe returns None, so the executor is judged only by the unchanged
+    # single-card path and a not-yet-upgraded / single-GPU fleet is never zeroed by this check.
+    probe = await svc._probe_all_claimed_cards(_ssh(real_cards=1), _executor(), {}, _spec(1))
+    assert probe is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_skips_probe(svc):
+    # a model with no registry VRAM size cannot be sized safely → probe returns None (fail-open).
+    probe = await svc._probe_all_claimed_cards(
+        _ssh(real_cards=8), _executor(), {}, _spec(8, model="NVIDIA MADE-UP 9000")
+    )
+    assert probe is None

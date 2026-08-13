@@ -1,17 +1,19 @@
 import asyncio
-import time
-import random
-import logging
 import json
+import logging
 import os
+import random
 import shlex
+import time
 import uuid as uuid4
+from ctypes import CDLL, POINTER, c_char_p, c_longlong, c_void_p
 from dataclasses import dataclass
 
 import asyncssh
 
+from core.config import settings
 from core.utils import _m, get_extra_info
-from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
+from services.gpu_spec_table import smallest_nominal_vram_mb
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,14 @@ logger = logging.getLogger(__name__)
 # GPU (e.g. VRAM held by an orphaned container, DAH-2364) hangs the whole pipeline until
 # the outer JOB_TIME_OUT cancellation, which dies silently without a reason_code (DAH-2365).
 MATRIX_VERIFY_TIMEOUT_SECONDS = 120
+
+# DAH-2671 item 3 — wide aggregate wall-clock (seconds) for the all-claimed-cards work-proof.
+# N honest cards run concurrently in ~single-card time (4-27s); a count lie that serialises onto one
+# real card blows out to ~N*single-card. This threshold is deliberately WIDE so honest slowdowns
+# (disabled P2P/IOMMU/ACS, 10-20% thermal throttle, a card already busy with a filler) do not trip
+# it; the emitted RAW timing lets ops recalibrate before flipping enforcement. The per-card SSH runs
+# each keep the MATRIX_VERIFY_TIMEOUT_SECONDS cap, so this only fails clear serialisation.
+MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 90
 
 
 class DMCompVerifyWrapper:
@@ -150,7 +160,23 @@ class ValidationResult:
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
         return self.success
-    
+
+
+@dataclass
+class AllCardsProbe:
+    """Outcome of the all-claimed-cards work-proof (DAH-2671 item 3).
+
+    Honesty (validator-side only, never sent to the host): this proves N cards' worth of capacity
+    existed in the window, NOT that the cards share one chassis — a relay to a genuine 8-GPU host
+    still passes. Chassis-binding (NCCL) and the per-card cryptographic seal are follow-on tickets.
+    """
+
+    passed: bool
+    failure_reason: str
+    elapsed_seconds: float
+    over_wall_clock: bool
+    per_card: list[dict]
+
 
 class ValidationService:
     def __init__(self):
@@ -221,6 +247,127 @@ class ValidationService:
                 )
             )
 
+    async def _probe_all_claimed_cards(
+        self, ssh_client, executor_info, default_extra: dict, machine_spec: dict
+    ) -> AllCardsProbe | None:
+        # concurrent per-card work-proof: one independent challenge per claimed card (own seed + own
+        # uuid + own cipher), each pinned with CUDA_VISIBLE_DEVICES=<index>, sized from the registry
+        # SKU (not host self-report), aggregate timed on the validator. Returns None when it does not
+        # apply — a single claimed card (legacy/whole-single-GPU path) or a model with no known
+        # registry VRAM size (cannot size safely) — so the caller's single-card path stays authoritative.
+        gpu = machine_spec.get("gpu", {}) or {}
+        gpu_count = gpu.get("count", 0) or 0
+        details = gpu.get("details", []) or []
+        if gpu_count <= 1 or not details:
+            return None
+
+        gpu_model = details[0].get("name", "") or ""
+        sized_vram_mb = smallest_nominal_vram_mb(gpu_model)
+        if not sized_vram_mb:
+            return None
+
+        gpu_uuids = ",".join(detail.get("uuid", "") for detail in details)
+        # machine_info is identical across cards — the executor's .so reconstructs it locally from
+        # getGPUInfo(); only seed+uuid (and thus the cipher) differ per card.
+        machine_info = json.dumps(
+            {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}, sort_keys=True
+        )
+        script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
+
+        challenges: list[VerifierParams] = []
+        for _ in range(gpu_count):
+            params = VerifierParams()
+            params.generate()
+            params.dim_k = int(self.get_max_matrix_dimensions(sized_vram_mb, params.dim_n))
+            params.cipher_text = self._generate_card_cipher(machine_info, params)
+            challenges.append(params)
+
+        start = time.perf_counter()
+        per_card = await asyncio.gather(
+            *(
+                self._run_one_card(ssh_client, executor_info, script_path, index, params)
+                for index, params in enumerate(challenges)
+            )
+        )
+        elapsed = time.perf_counter() - start
+
+        failed_cards = [outcome for outcome in per_card if not outcome["ok"]]
+        over_wall_clock = elapsed > MATMUL_ALLCARDS_WALL_CLOCK_SECONDS
+        passed = not failed_cards and not over_wall_clock
+        if failed_cards:
+            failure_reason = f"{len(failed_cards)}/{gpu_count} card(s) failed device work-proof"
+        elif over_wall_clock:
+            failure_reason = (
+                f"aggregate wall-clock {elapsed:.1f}s over {MATMUL_ALLCARDS_WALL_CLOCK_SECONDS}s "
+                f"(serialisation on fewer real cards than claimed)"
+            )
+        else:
+            failure_reason = ""
+
+        log_extra = {
+            **default_extra,
+            "gpu_count_claimed": gpu_count,
+            "gpu_model": gpu_model,
+            "sized_vram_mb": sized_vram_mb,
+            "elapsed_seconds": round(elapsed, 3),
+            "wall_clock_threshold_seconds": MATMUL_ALLCARDS_WALL_CLOCK_SECONDS,
+            "over_wall_clock": over_wall_clock,
+            "per_card": per_card,
+            "passed": passed,
+            "enforced": settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED,
+        }
+        log = logger.info if passed else logger.warning
+        log(_m("All-cards GPU work-proof", extra=get_extra_info(log_extra)))
+        return AllCardsProbe(
+            passed=passed,
+            failure_reason=failure_reason,
+            elapsed_seconds=elapsed,
+            over_wall_clock=over_wall_clock,
+            per_card=per_card,
+        )
+
+    def _generate_card_cipher(self, machine_info: str, params: "VerifierParams") -> str:
+        # generate one card's challenge on a dedicated object; no per-card seal is verified (a
+        # follow-on ticket), so the key is not retained past cipher generation.
+        gen_ptr = None
+        try:
+            gen_ptr = self.wrapper.DMCompVerify_new(10, 10)
+            self.wrapper.setDimension(gen_ptr, params.dim_n, params.dim_k)
+            self.wrapper.generateChallenge(gen_ptr, params.seed, machine_info, params.uuid)
+            return self.wrapper.getCipherText(gen_ptr) or ""
+        except Exception as e:
+            logger.error("Failed encrypt challenge request (all-cards): %s", str(e))
+            return ""
+        finally:
+            if gen_ptr is not None:
+                try:
+                    self.wrapper.free(gen_ptr)
+                except Exception:
+                    pass
+
+    async def _run_one_card(
+        self, ssh_client, executor_info, script_path: str, index: int, params: "VerifierParams"
+    ) -> dict:
+        # run the challenge pinned to one CUDA device index; a count lie fails device selection here
+        # (invalid ordinal) or serialises onto the one real card, caught by the aggregate wall-clock.
+        # The command sent to the executor is unchanged except the CUDA_VISIBLE_DEVICES env prefix,
+        # and never reveals which card/signal disagreed (anti-treadmill).
+        command = f"CUDA_VISIBLE_DEVICES={index} {executor_info.python_path} {script_path} {params}"
+        try:
+            result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
+        except (TimeoutError, asyncssh.TimeoutError):
+            return {"card_index": index, "ok": False, "reason": "timeout"}
+        except Exception as e:
+            return {"card_index": index, "ok": False, "reason": f"ssh_error: {e}"}
+
+        exit_status = getattr(result, "exit_status", 0)
+        stdout = getattr(result, "stdout", "") or ""
+        if exit_status != 0:
+            return {"card_index": index, "ok": False, "reason": f"exit_status={exit_status}"}
+        if not stdout.strip():
+            return {"card_index": index, "ok": False, "reason": "empty_output"}
+        return {"card_index": index, "ok": True, "reason": ""}
+
     async def validate_gpu_model_and_process_job(
         self,
         ssh_client,
@@ -228,6 +375,25 @@ class ValidationService:
         default_extra: dict,
         machine_spec: dict,
     ) -> ValidationResult:
+        # DAH-2671 item 3: all-claimed-cards work-proof. Shadow (MATMUL_ALLCARDS_CHECK_ENABLED
+        # without enforcement) logs timing + per-card outcome and NEVER changes the returned result;
+        # enforcement fails a count lie (device-selection error / OOM / serialised aggregate
+        # wall-clock). Single-card / unknown-model hosts skip it (probe returns None), which also
+        # keeps a not-yet-relevant fleet — and the legacy single-card path below — unchanged.
+        if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
+            all_cards = await self._probe_all_claimed_cards(
+                ssh_client, executor_info, default_extra, machine_spec
+            )
+            if (
+                settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED
+                and all_cards is not None
+                and not all_cards.passed
+            ):
+                return ValidationResult(
+                    success=False,
+                    error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
+                )
+
         # Per-call verifier object: its key MUST survive the SSH round-trip so we can
         # unseal the executor's authenticated response. A shared object would be clobbered
         # by concurrent validations across the `await` below. Freed in `finally`.
@@ -309,7 +475,7 @@ class ValidationService:
             # Run the script
             try:
                 result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
-            except (asyncssh.TimeoutError, asyncio.TimeoutError):
+            except (TimeoutError, asyncssh.TimeoutError):
                 # asyncssh's timeout only abandons the local wait — the remote process keeps
                 # running and holding GPU memory, so it must be killed explicitly.
                 error_msg = (
@@ -346,7 +512,7 @@ class ValidationService:
             try:
                 stdout = result.stdout.strip()
                 stderr = result.stderr.strip() if hasattr(result, 'stderr') else ""
-            except AttributeError as e:
+            except AttributeError:
                 error_msg = "Result object missing stdout attribute"
                 logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
                 return ValidationResult(

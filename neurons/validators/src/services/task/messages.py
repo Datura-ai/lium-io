@@ -1058,6 +1058,45 @@ class RentalVerificationMessages:
     )
 
 
+class CpuTruthMessages:
+    """DAH-2671 item 2a — corroborate advertised CPU(s) against sources the lscpu wrapper does not
+    author. Shadow (CPU_TRUTH_CHECK_ENABLED without enforcement) emits CPU_MISMATCH as a warning and
+    keeps passed=True; only CPU_TRUTH_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+
+    CPU_OK = MessageTemplate(
+        event="CPU core count corroborated",
+        reason="CPU_TRUTH_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    CPU_MISMATCH = MessageTemplate(
+        event="Advertised CPU cores exceed the kernel-present CPU population",
+        reason="CPU_TRUTH_MISMATCH",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "Advertise the real CPU(s) count. The kernel-present CPU population "
+            "(/sys/devices/system/cpu/present) is far below the reported core count."
+        ),
+    )
+    CPU_UNKNOWN = MessageTemplate(
+        event="CPU core count could not be corroborated",
+        reason="CPU_TRUTH_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed without penalty",
+    )
+    SKIPPED = MessageTemplate(
+        event="CPU truth check disabled",
+        reason="CPU_TRUTH_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class FinalizeMessages:
     COMPLETED = MessageTemplate(
         event="Validation task completed",
