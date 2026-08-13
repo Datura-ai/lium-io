@@ -49,6 +49,12 @@ class Instance:
     # what a validation CVM has and what a record written before this task has — so an older
     # instance.json still decodes rather than reading as corrupt and failing the node.
     rental_id: str | None = None
+    # DAH-2679: how many times reconciliation has re-spawned this CVM's supervisor over the
+    # same directory (host reboot, QEMU exit). Cumulative for the instance's whole life, never
+    # reset — reconciliation has no "the guest is healthy again" signal it could reset on, and
+    # a cap on the total is what stops a dying guest from crash-looping through every cvmd
+    # restart. Defaults to 0 so an older instance.json still decodes.
+    relaunch_attempts: int = 0
 
     def to_json(self) -> dict:
         return {"version": SCHEMA_VERSION, **asdict(self)}
@@ -71,6 +77,10 @@ class Instance:
         # shipped and its tests pin.
         if self.rental_id is not None:
             report["rental_id"] = self.rental_id
+        # Same reasoning: only present once a relaunch has actually happened, so every report
+        # for a CVM that booted once and stayed up keeps its pinned shape.
+        if self.relaunch_attempts:
+            report["relaunch_attempts"] = self.relaunch_attempts
         return report
 
 
@@ -96,6 +106,7 @@ def _decode(raw) -> Instance | None:
             ports=ports,
             ssh_fingerprint=raw.get("ssh_fingerprint"),
             rental_id=raw.get("rental_id"),
+            relaunch_attempts=int(raw.get("relaunch_attempts") or 0),
         )
     except (KeyError, TypeError, ValueError):
         return None
