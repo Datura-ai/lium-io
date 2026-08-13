@@ -150,6 +150,17 @@ def test_5xx_keeps_event_in_spool(monkeypatch):
     assert len(_state(host)["pending"]) == 1
 
 
+def test_429_keeps_event_in_spool(monkeypatch):
+    poller, host, _ = _poller(containers=["C.111"])
+    post = Mock(return_value=_response(429, "slow down"))
+    monkeypatch.setattr("vast_api.events.requests.post", post)
+
+    poller.poll_once()
+
+    # rate limiting is temporary: the edge must survive until the backend takes it
+    assert len(_state(host)["pending"]) == 1
+
+
 def test_4xx_drops_event(monkeypatch):
     poller, host, _ = _poller(containers=["C.111"])
     post = Mock(return_value=_response(401, "bad token"))

@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL_SECONDS = 30
 DELIVERY_TIMEOUT_SECONDS = 10
 
+# 4xx that the backend can answer again with a 2xx: request timeout, rate limit
+RETRYABLE_STATUSES = (408, 429)
+
 # both files live under STATE_DIR_HOST, next to the machine identity, so they
 # survive executor-container restarts
 EVENTS_CONFIG_FILE = "events_config.json"
@@ -89,8 +92,9 @@ class ContractEventsPoller:
     # --- delivery ---
 
     def _deliver(self, config: dict, pending: list[dict]) -> list[dict]:
-        # at-least-once POSTs: 2xx = delivered, 4xx = misconfiguration → drop
-        # loudly (must not loop forever), network/5xx → keep for the next cycle
+        # at-least-once POSTs: 2xx = delivered, permanent 4xx = misconfiguration →
+        # drop loudly (must not loop forever), network/5xx and the retryable 4xx
+        # (408, 429) → keep for the next cycle
         remaining = []
         for event in pending:
             try:
@@ -110,7 +114,10 @@ class ContractEventsPoller:
                 continue
             if 200 <= response.status_code < 300:
                 continue
-            if 400 <= response.status_code < 500:
+            if (
+                400 <= response.status_code < 500
+                and response.status_code not in RETRYABLE_STATUSES
+            ):
                 logger.error(
                     "contract event %s rejected with %s: %s — dropping",
                     event["event_id"],
