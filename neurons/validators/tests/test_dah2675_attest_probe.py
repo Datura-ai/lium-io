@@ -113,6 +113,23 @@ class TestLogOnly:
         service.agent_relay.forward.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_loopback_bound_forward_is_never_dialed(self, probe_on, caplog):
+        """cvmd's port parser defaults the bind address to 127.0.0.1; dialing the public
+        address for a loopback forward would time out every cycle and read, fleet-wide, as
+        "the agent is never up" — the exact wrong rollout signal."""
+        service = make_service()
+        loopback = [
+            {"protocol": "tcp", "address": "127.0.0.1", "host_port": 18451, "guest_port": 8451}
+        ]
+
+        with caplog.at_level("INFO"):
+            await service.probe_attest_agent(HOST, assessment_with_forwards(loopback))
+
+        service.agent_relay.forward.assert_not_awaited()
+        assert "CVM_RENTER_ATTEST_PROBE_FAILED" in caplog.text
+        assert "loopback" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_no_forward_for_the_agent_port_is_a_log_line(self, probe_on, caplog):
         service = make_service()
         only_ssh = [FORWARDS[0]]

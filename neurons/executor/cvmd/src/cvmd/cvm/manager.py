@@ -216,6 +216,12 @@ class CvmManager:
         """
         if not self._config.relaunch_renter or instance.kind != KIND_RENTER:
             return None
+        if self._store.state is not NodeState.RENTER_RUNNING:
+            # Only a rental that was LIVE relaunches. An interrupted teardown persists
+            # TEARDOWN or SWITCHING before it kills anything, so this is the guard that
+            # keeps a cvmd restart from resurrecting a CVM the platform already destroyed —
+            # over hardware `destroy` was in the middle of verifiably releasing.
+            return None
         if not (vm_dir / supervisor.DISK_IMAGE).exists():
             # Whatever removed the disk, there is nothing left to boot — the fail branch's
             # message about a directory with no supervisor is the honest answer.
@@ -227,18 +233,26 @@ class CvmManager:
                 instance.relaunch_attempts,
             )
             return None
+        if self._config.missing():
+            return None
         if supervisor.running_cvms():
             # Some other TDX guest holds this host's GPUs — launching over it would double-book
-            # them. The stray-guest handling in the caller is the right refusal.
-            return None
-        if self._config.missing():
+            # them. The stray-guest handling in the caller is the right refusal. Checked last:
+            # it is the one guard that walks /proc, and the in-memory refusals above decide
+            # most declines for free.
             return None
 
         # Spent before the spawn, not after: a spawn that dies between starting a process and
         # the pid file would otherwise retry unbounded, and an attempt that consumed host
         # resources is an attempt whether or not it produced a supervisor.
         attempt = instance.relaunch_attempts + 1
-        instance = self._instances.update(relaunch_attempts=attempt)
+        self._instances.update(relaunch_attempts=attempt)
+
+        # The surviving directory still holds the PREVIOUS life's pid file, and `spawn`
+        # returns the first pid it can read from that file — the fresh launch paths never
+        # see this because their directory is brand new. Without the unlink, the record
+        # would name a dead (or recycled) pid while the new guest boots.
+        (vm_dir / supervisor.PID_FILE).unlink(missing_ok=True)
         try:
             pid = supervisor.spawn(
                 scripts_dir=self._config.dstack_scripts_dir,

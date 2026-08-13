@@ -22,18 +22,13 @@ au11 via tools/cvm-local-e2e, not here.
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
+from test_dah2674_rental_scoring import make_miner_service, rented_data_for
 
 from core.config import settings
-from services.cvm_lifecycle import (
-    CvmdHost,
-    CvmLifecycleService,
-    SwitchAssessment,
-)
-from services.miner_service import MinerService
+from services.cvm_lifecycle import CvmdHost, SwitchAssessment
 from services.task.models import JobResult
 
 PAYLOAD = SimpleNamespace(miner_hotkey="5Miner", miner_coldkey="5Cold", job_batch_id="batch-1")
@@ -48,20 +43,6 @@ def host(uuid="e-1", address="203.0.113.7"):
         gpu_count=8,
         updated_at=0.0,
     )
-
-
-def make_miner_service(hosts, assessments):
-    """A miner service whose lifecycle answers `assessments` in order, one per host."""
-    service = MinerService.__new__(MinerService)
-    service.redis_service = MagicMock()
-    lifecycle = MagicMock(spec=CvmLifecycleService)
-    lifecycle.record_host = AsyncMock()
-    lifecycle.hosts_for_miner = AsyncMock(return_value=hosts)
-    lifecycle.assess = AsyncMock(side_effect=assessments)
-    lifecycle.schedule_ensure = MagicMock()
-    lifecycle.schedule_attest_probe = MagicMock()
-    service._cvm_lifecycle_service = lifecycle
-    return service, lifecycle
 
 
 UNREACHABLE = SwitchAssessment(reachable=False)
@@ -80,7 +61,12 @@ RENTER_RUNNING = SwitchAssessment(
     reachable=True,
     state="RENTER_RUNNING",
     has_cvm=True,
-    cvm={"instance_id": "r-1", "rental_id": "rental-1", "ports": []},
+    cvm={
+        "instance_id": "r-1",
+        "rental_id": "rental-1",
+        "supervisor_alive": True,
+        "ports": [],
+    },
 )
 FAILED = SwitchAssessment(reachable=True, state="FAILED", has_cvm=False)
 
@@ -114,7 +100,9 @@ class TestEveryStateInOneTable:
     ):
         service, lifecycle = make_miner_service([host()], [assessment])
 
-        results = await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[])
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for("e-1")
+        )
 
         assert len(results) == synthesized
         for result in results:
@@ -143,7 +131,9 @@ class TestOneCycleAcrossAMixedFleet:
             [IDLE_EMPTY, VALIDATION_RUNNING, SWITCHING_IN_BUDGET, RENTER_RUNNING, FAILED],
         )
 
-        results = await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[])
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for("e-rented")
+        )
 
         scored = {str(result.executor_info.uuid) for result in results}
         assert scored == {"e-switching", "e-rented"}
@@ -179,7 +169,9 @@ class TestOneCycleAcrossAMixedFleet:
         )
         service, lifecycle = make_miner_service([host("e-rented")], [RENTER_RUNNING])
 
-        results = await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[answered])
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[answered], rented_data=rented_data_for("e-rented")
+        )
 
         assert results == []
         lifecycle.assess.assert_not_awaited()
@@ -198,4 +190,7 @@ class TestEverythingOffIsToday:
 
         for assessment in (SWITCHING_IN_BUDGET, RENTER_RUNNING):
             service, _ = make_miner_service([host()], [assessment])
-            assert await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[]) == []
+            results = await service._record_and_grace_cvm_hosts(
+                PAYLOAD, existing=[], rented_data=rented_data_for("e-1")
+            )
+            assert results == []

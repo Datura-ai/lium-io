@@ -1,23 +1,28 @@
-"""DAH-2674: a node whose CVM a renter holds is scored, from host-side signals alone.
+"""DAH-2674: a node whose CVM a renter holds is scored — on two-party proof.
 
 During RENTER_RUNNING the executor process is gone with the validation CVM, so the node
 cannot answer a normal validation and — before this task — scored zero for the whole rental.
 The claims pinned here:
 
-  * a RENTER_RUNNING node gets the same forced-pass shape as a special manual rental:
-    score 1.0, ``spec=None`` so the backend's executor upsert is untouched, ``is_rented``;
-  * the ONLY evidence consumed is cvmd's signed state read — the synthesis takes nothing
-    from inside the guest, so a root renter cannot move the provider's score (DAH-2676's
-    rule, held by construction);
+  * the forced pass needs TWO independent parties to agree: cvmd's host-side state read says
+    RENTER_RUNNING, and the backend's rented-executors list says this executor is under a
+    paid rental for this miner. A host that fabricates its state earns nothing — and cannot
+    even keep its registry entry alive, because the refresh is gated the same way;
+  * nothing read from inside the guest participates, so a root renter cannot move the
+    provider's score (DAH-2676's rule, held by construction);
+  * a host whose own /proc read says the supervisor is dead (`supervisor_alive: false`) is a
+    host-side failure, not a scored cycle;
+  * the pass carries the rented executor's REAL address and port — the uptime ledger is
+    keyed on "address:port", and a synthesized port of 0 would miss it every cycle;
   * with ENABLE_CVM_RENTAL_SCORING off the sweep observes and contributes nothing;
   * a node that answered its validation normally is already scored and is never touched;
-  * the registry entry is refreshed on every rented sweep, scored or observed — a 720-hour
-    rental must not age out of the 7-day registry TTL and silently fall back to zero;
-  * the spot-tier and Discord gates come off rented_data exactly as the manual synthesis
-    reads them: a forced pass buys a place in the pool, not an exemption;
-  * an unknown GPU model is skipped — same weight-setting guard as every other synthesis;
-  * the zero-executor early return exempts a miner with registered cvmd hosts, so a miner
-    whose ONLY node is rented reaches this sweep instead of failing wholesale.
+  * the spot-tier and Discord gates ride rented_data exactly as the manual synthesis reads
+    them: a forced pass buys a place in the pool, not an exemption;
+  * an unknown GPU model is skipped — same weight-setting guard as every other synthesis.
+
+The zero-executor decision is deliberately NOT an upfront registry exemption: the flow
+defers it to after the sweep, so a genuinely broken miner still produces its failure record
+when no synthesis fires (see `_record_and_grace_cvm_hosts` call sites in miner_service.py).
 """
 
 from types import SimpleNamespace
@@ -47,25 +52,49 @@ HOST = CvmdHost(
 PAYLOAD = SimpleNamespace(miner_hotkey="5Miner", miner_coldkey="5Cold", job_batch_id="batch-1")
 
 
-def make_miner_service(hosts, assessment):
+def rented_data_for(executor_uuid="e-rented", *, miner_hotkey="5Miner", spot=(), discord=None):
+    """The backend's half of the proof: this executor is under a paid rental."""
+    return SimpleNamespace(
+        executors={
+            executor_uuid: SimpleNamespace(
+                miner_hotkey=miner_hotkey,
+                executor_ip_address="203.0.113.7",
+                executor_ip_port="4001",
+            )
+        },
+        spot_executor_ids=list(spot),
+        provider_discord_connected_executor_ids=discord,
+    )
+
+
+def make_miner_service(hosts, assessments):
+    """A miner service whose lifecycle answers `assessments` (one value, or one per host)."""
     service = MinerService.__new__(MinerService)
     service.redis_service = MagicMock()
     lifecycle = MagicMock(spec=CvmLifecycleService)
     lifecycle.record_host = AsyncMock()
     lifecycle.hosts_for_miner = AsyncMock(return_value=hosts)
-    lifecycle.assess = AsyncMock(return_value=assessment)
+    if isinstance(assessments, list):
+        lifecycle.assess = AsyncMock(side_effect=assessments)
+    else:
+        lifecycle.assess = AsyncMock(return_value=assessments)
     lifecycle.schedule_ensure = MagicMock()
     lifecycle.schedule_attest_probe = MagicMock()
     service._cvm_lifecycle_service = lifecycle
     return service, lifecycle
 
 
-def renter_running(ports=None):
+def renter_running(supervisor_alive=True):
     return SwitchAssessment(
         reachable=True,
         state="RENTER_RUNNING",
         has_cvm=True,
-        cvm={"instance_id": "cvm-1", "rental_id": "rental-1", "ports": ports or []},
+        cvm={
+            "instance_id": "cvm-1",
+            "rental_id": "rental-1",
+            "supervisor_alive": supervisor_alive,
+            "ports": [],
+        },
     )
 
 
@@ -102,7 +131,9 @@ class TestTheForcedPass:
     async def test_a_rented_node_scores_the_manual_rental_shape(self, rental_scoring_on):
         service, _ = make_miner_service([HOST], renter_running())
 
-        results = await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[])
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for()
+        )
 
         assert len(results) == 1
         passed = results[0]
@@ -116,17 +147,29 @@ class TestTheForcedPass:
         assert "CVM_RENTAL_FORCED_PASS" in passed.log_text
 
     @pytest.mark.asyncio
-    async def test_the_only_evidence_is_the_host_side_state_read(self, rental_scoring_on):
-        """The synthesis must complete from the assessment alone — the whole point of the
-        design is that nothing inside the guest participates. One state read, no other call
-        that could reach the guest."""
+    async def test_the_pass_carries_the_rented_executors_real_endpoint(self, rental_scoring_on):
+        """The uptime ledger is keyed on "address:port"; a synthesized port of 0 would miss
+        it every cycle and, on a fleet enforcing the collateral uptime penalty, silently
+        multiply the mining score to zero."""
+        service, _ = make_miner_service([HOST], renter_running())
+
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for()
+        )
+
+        assert results[0].executor_info.address == "203.0.113.7"
+        assert results[0].executor_info.port == 4001
+
+    @pytest.mark.asyncio
+    async def test_the_evidence_is_host_side_plus_backend_record_only(self, rental_scoring_on):
+        """One state read and the backend's own list — nothing that touches the guest."""
         service, lifecycle = make_miner_service([HOST], renter_running())
 
-        await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[])
+        await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for()
+        )
 
         lifecycle.assess.assert_awaited_once()
-        # The probe is scheduled, but it is log-only by construction (DAH-2675) — the score
-        # above was already built before it could ever run.
         lifecycle.schedule_ensure.assert_not_called()
 
     @pytest.mark.asyncio
@@ -134,7 +177,9 @@ class TestTheForcedPass:
         service, lifecycle = make_miner_service([HOST], renter_running())
 
         results = await service._record_and_grace_cvm_hosts(
-            PAYLOAD, existing=[scored_result(executor_uuid="e-rented")]
+            PAYLOAD,
+            existing=[scored_result(executor_uuid="e-rented")],
+            rented_data=rented_data_for(),
         )
 
         assert results == []
@@ -152,7 +197,48 @@ class TestTheForcedPass:
         )
         service, _ = make_miner_service([odd_host], renter_running())
 
-        assert await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[]) == []
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for("e-odd")
+        )
+        assert results == []
+
+
+class TestTheBackendIsHalfTheProof:
+    @pytest.mark.asyncio
+    async def test_a_state_answer_with_no_backend_rental_earns_nothing(self, rental_scoring_on):
+        """A host that fabricates RENTER_RUNNING has no rental the platform is billing —
+        without this gate, any HTTPS server answering /v1/state could farm emissions."""
+        service, lifecycle = make_miner_service([HOST], renter_running())
+
+        results = await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[], rented_data=None)
+
+        assert results == []
+        # A fabricated state answer must not keep its own registry entry alive either.
+        lifecycle.record_host.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_rental_recorded_for_another_miner_earns_nothing(self, rental_scoring_on):
+        service, _ = make_miner_service([HOST], renter_running())
+
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD,
+            existing=[],
+            rented_data=rented_data_for(miner_hotkey="5SomeoneElse"),
+        )
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_a_dead_supervisor_is_a_host_failure_not_a_scored_cycle(self, rental_scoring_on):
+        """QEMU died mid-rental and nothing relaunched it: the state document still says
+        RENTER_RUNNING, but the host's own /proc read says the guest is gone."""
+        service, _ = make_miner_service([HOST], renter_running(supervisor_alive=False))
+
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for()
+        )
+
+        assert results == []
 
 
 class TestObserveMode:
@@ -162,17 +248,24 @@ class TestObserveMode:
         monkeypatch.setattr(settings, "ENABLE_CVM_RENTAL_SCORING", False, raising=False)
         service, lifecycle = make_miner_service([HOST], renter_running())
 
-        assert await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[]) == []
-        # Observation still refreshes the registry: rollout-mode fleets have long rentals too.
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for()
+        )
+
+        assert results == []
+        # Observation still refreshes the registry for the CONFIRMED rental: rollout-mode
+        # fleets have long rentals too, and the host must not age out mid-rental.
         lifecycle.record_host.assert_awaited()
 
 
 class TestTheRegistryOutlivesTheRental:
     @pytest.mark.asyncio
-    async def test_a_rented_sweep_refreshes_the_hosts_entry(self, rental_scoring_on):
+    async def test_a_confirmed_rental_refreshes_the_hosts_entry(self, rental_scoring_on):
         service, lifecycle = make_miner_service([HOST], renter_running())
 
-        await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[])
+        await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for()
+        )
 
         kwargs = lifecycle.record_host.await_args.kwargs
         assert kwargs["executor_uuid"] == "e-rented"
@@ -185,13 +278,11 @@ class TestIncentiveGates:
     @pytest.mark.asyncio
     async def test_spot_and_discord_exclusions_ride_rented_data(self, rental_scoring_on):
         service, _ = make_miner_service([HOST], renter_running())
-        rented_data = SimpleNamespace(
-            spot_executor_ids=["e-rented"],
-            provider_discord_connected_executor_ids=[],
-        )
 
         results = await service._record_and_grace_cvm_hosts(
-            PAYLOAD, existing=[], rented_data=rented_data
+            PAYLOAD,
+            existing=[],
+            rented_data=rented_data_for(spot=["e-rented"], discord=[]),
         )
 
         assert results[0].is_spot is True
@@ -200,10 +291,12 @@ class TestIncentiveGates:
         ), "a forced pass buys a place in the pool, not an exemption from the gates"
 
     @pytest.mark.asyncio
-    async def test_no_rented_data_reads_as_no_exclusions(self, rental_scoring_on):
+    async def test_no_exclusion_lists_read_as_no_exclusions(self, rental_scoring_on):
         service, _ = make_miner_service([HOST], renter_running())
 
-        results = await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[])
+        results = await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for()
+        )
 
         assert results[0].is_spot is False
         assert results[0].provider_discord_connected is True
@@ -216,35 +309,11 @@ class TestTheAttestProbeHandoff:
         agent cannot extend the cycle — and being log-only it cannot move the score."""
         service, lifecycle = make_miner_service([HOST], renter_running())
 
-        await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[])
+        await service._record_and_grace_cvm_hosts(
+            PAYLOAD, existing=[], rented_data=rented_data_for()
+        )
 
         lifecycle.schedule_attest_probe.assert_called_once()
         host, assessment = lifecycle.schedule_attest_probe.call_args.args
         assert host.executor_uuid == "e-rented"
         assert assessment.renter_running
-
-
-class TestTheZeroExecutorExemption:
-    @pytest.mark.asyncio
-    async def test_a_miner_with_cvmd_hosts_is_exempt(self, monkeypatch):
-        monkeypatch.setattr(settings, "ENABLE_CVM_LIFECYCLE", True, raising=False)
-        service, _ = make_miner_service([HOST], renter_running())
-
-        assert await service._has_cvmd_hosts(PAYLOAD) is True
-
-    @pytest.mark.asyncio
-    async def test_lifecycle_off_keeps_todays_failure_path(self, monkeypatch):
-        monkeypatch.setattr(settings, "ENABLE_CVM_LIFECYCLE", False, raising=False)
-        service, lifecycle = make_miner_service([HOST], renter_running())
-
-        assert await service._has_cvmd_hosts(PAYLOAD) is False
-        lifecycle.hosts_for_miner.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_registry_trouble_means_no_exemption(self, monkeypatch):
-        """Fail toward the stricter outcome: a broken registry must not excuse a miner."""
-        monkeypatch.setattr(settings, "ENABLE_CVM_LIFECYCLE", True, raising=False)
-        service, lifecycle = make_miner_service([], renter_running())
-        lifecycle.hosts_for_miner.side_effect = RuntimeError("redis is down")
-
-        assert await service._has_cvmd_hosts(PAYLOAD) is False

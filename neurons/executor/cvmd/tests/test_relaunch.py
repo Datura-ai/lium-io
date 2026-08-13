@@ -41,8 +41,13 @@ def seed_cvm(
     kind: str = "renter",
     attempts: int = 0,
     with_disk: bool = True,
+    torn_down: bool = False,
 ) -> Path:
-    """Persist what a host reboot leaves: a record, a directory, a disk — and no process."""
+    """Persist what a host reboot leaves: a record, a directory, a disk — and no process.
+
+    `torn_down=True` seeds the interrupted-teardown shape instead: `destroy` persists
+    TEARDOWN before it kills anything, so that is the state a crash mid-teardown leaves.
+    """
     vm_dir = launch_config.run_dir / "cvm-under-test"
     vm_dir.mkdir(parents=True, exist_ok=True)
     if with_disk:
@@ -66,6 +71,8 @@ def seed_cvm(
     store = StateStore(state_dir)
     store.transition(NodeState.LAUNCHING)
     store.transition(NodeState.RENTER_RUNNING if kind == "renter" else NodeState.VALIDATION_RUNNING)
+    if torn_down:
+        store.transition(NodeState.TEARDOWN)
     return vm_dir
 
 
@@ -144,6 +151,27 @@ class TestTheRelaunch:
         instance = InstanceStore(state_dir).current
         assert "relaunch_attempts" not in instance.report()
 
+    def test_the_previous_lifes_pid_file_is_removed_before_the_spawn(
+        self, state_dir, relaunch_config, dead_supervisor, monkeypatch
+    ):
+        """`spawn` returns the first pid it can read from `supervisor.pid`, and the surviving
+        directory still holds the OLD life's file — without the unlink, the record would name
+        a dead (or recycled) pid while the new guest boots."""
+        vm_dir = seed_cvm(state_dir, relaunch_config)
+        (vm_dir / "supervisor.pid").write_text(f"{STALE_PID}\n")
+        seen: list[bool] = []
+
+        def fake_spawn(*, scripts_dir, vm_dir, kp_port):
+            seen.append((vm_dir / "supervisor.pid").exists())
+            return NEW_PID
+
+        monkeypatch.setattr(supervisor, "spawn", fake_spawn)
+        manager = make_manager(state_dir, relaunch_config)
+
+        assert manager.reconcile() is NodeState.RENTER_RUNNING
+        assert seen == [False], "the stale pid file must be gone before the supervisor starts"
+        assert manager._instances.current.supervisor_pid == NEW_PID
+
 
 class TestWhatDeclines:
     def test_the_flag_defaults_off_and_off_fails_exactly_as_before(
@@ -159,6 +187,18 @@ class TestWhatDeclines:
 
     def test_a_validation_cvm_never_relaunches(self, state_dir, relaunch_config, respawn):
         seed_cvm(state_dir, relaunch_config, kind="validation")
+        manager = make_manager(state_dir, relaunch_config)
+
+        assert manager.reconcile() is NodeState.FAILED
+        assert respawn == []
+
+    def test_an_interrupted_teardown_is_never_resurrected(
+        self, state_dir, relaunch_config, respawn
+    ):
+        """`destroy` persists TEARDOWN before it kills anything. A crash mid-teardown must
+        stay dead: relaunching it would boot a rental the platform already destroyed, over
+        hardware the teardown was in the middle of verifiably releasing."""
+        seed_cvm(state_dir, relaunch_config, torn_down=True)
         manager = make_manager(state_dir, relaunch_config)
 
         assert manager.reconcile() is NodeState.FAILED

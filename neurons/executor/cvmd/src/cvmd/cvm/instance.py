@@ -91,6 +91,12 @@ def now_iso() -> str:
 def _decode(raw) -> Instance | None:
     if not isinstance(raw, dict) or raw.get("version") != SCHEMA_VERSION:
         return None
+    # Tolerant like the other optional fields: this counter exists for bookkeeping, and a
+    # corrupted value must not make the whole record read as absent — that would fail a node
+    # holding a live CVM over a field nothing critical depends on.
+    attempts = raw.get("relaunch_attempts")
+    if not isinstance(attempts, int) or attempts < 0:
+        attempts = 0
     try:
         ports = [PortReport(**port) for port in raw.get("ports", [])]
         return Instance(
@@ -106,7 +112,7 @@ def _decode(raw) -> Instance | None:
             ports=ports,
             ssh_fingerprint=raw.get("ssh_fingerprint"),
             rental_id=raw.get("rental_id"),
-            relaunch_attempts=int(raw.get("relaunch_attempts") or 0),
+            relaunch_attempts=attempts,
         )
     except (KeyError, TypeError, ValueError):
         return None
