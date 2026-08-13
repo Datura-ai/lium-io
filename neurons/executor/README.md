@@ -147,4 +147,3 @@ The above command should show the `nvidia-smi` result if sysbox is installed cor
 ```shell
 sudo systemctl restart docker
 ```
-

@@ -30,6 +30,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    BootstrapRestoreSpec,
     CacheVolume,
     ContainerBaseRequest,
     ContainerCreated,
@@ -78,6 +79,7 @@ from services.gpu_power_limit import (
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
+from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
@@ -105,6 +107,11 @@ from services.rental_docker_sdk import (
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
+from services.storage_operations import (
+    start_storage_operation,
+    supports_storage_operation,
+    wait_for_storage_operation,
+)
 from services.task.runner import SSHCommandRunner
 from tenacity import RetryError
 
@@ -158,6 +165,27 @@ S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
 
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
+
+
+def _published_ports(
+    port_maps: list[tuple[int, int, int]],
+    cluster_udp_ports: tuple[int, ...],
+) -> tuple[PortBinding, ...]:
+    """The rental's own TCP ports, plus the UDP ports a cluster node needs on top.
+
+    WireGuard's handshake is UDP and the fleet publishes only TCP by default, so a cluster node that
+    got no UDP port here would raise its interface and never complete a handshake (DAH-2620).
+    """
+    return (
+        *(
+            PortBinding(container_port=docker_port, host_port=internal_port)
+            for docker_port, internal_port, _ in port_maps
+        ),
+        *(
+            PortBinding(container_port=udp_port, host_port=udp_port, protocol="udp")
+            for udp_port in cluster_udp_ports
+        ),
+    )
 
 
 def _s3fs_plugin_alias(volume_name: str) -> str:
@@ -893,6 +921,15 @@ class DockerService:
         }
         environment["NVIDIA_DRIVER_CAPABILITIES"] = "all"
 
+        # DAH-2620: a node of a multi-node group rental gets its WireGuard overlay config injected and
+        # the WireGuard UDP port published, so NCCL's socket bootstrap can reach the other nodes; the
+        # tensors still travel over InfiniBand. Absent on an ordinary rental.
+        cluster_udp_ports: tuple[int, ...] = ()
+        if payload.cluster_membership is not None:
+            cluster_networking = cluster_pod_networking(payload.cluster_membership.wireguard_conf)
+            environment.update(cluster_networking.environment)
+            cluster_udp_ports = cluster_networking.published_udp_ports
+
         volume_target = _LIUM_CIPHER_MOUNT if encrypted_local_volume else local_volume_path
         volumes = [VolumeMount(source=local_volume, target=volume_target)]
         occupied_targets = {volume_target}
@@ -913,14 +950,11 @@ class DockerService:
             name=container_name,
             command=build_container_command_argv(custom_options.startup_commands),
             environment=environment,
-            ports=tuple(
-                PortBinding(container_port=docker_port, host_port=internal_port)
-                for docker_port, internal_port, _ in port_maps
-            ),
+            ports=_published_ports(port_maps, cluster_udp_ports),
             volumes=tuple(volumes),
             restart_policy="unless-stopped",
             runtime="sysbox-runc" if payload.is_sysbox else None,
-            cap_add=("NET_ADMIN",),
+            cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
             ulimits=self._memlock_ulimit_for(devices, payload.memory_gb),
             devices=devices,
@@ -933,8 +967,49 @@ class DockerService:
         )
 
     @staticmethod
+    async def _assert_cluster_overlay_port_free(
+        ssh_client: asyncssh.SSHClientConnection, default_extra: dict
+    ) -> None:
+        """A cluster node publishes the WireGuard port 1:1, so nothing else may hold it.
+
+        Docker's own refusal is `Bind for 0.0.0.0:51820 failed: port is already allocated`, which
+        says nothing about the overlay and sends whoever reads it hunting through the rental's TCP
+        mappings. Checking first turns that into an answer that names the port and the holder
+        (DAH-2620).
+        """
+        result = await ssh_client.run(
+            f"docker ps --filter publish={WIREGUARD_LISTEN_PORT} --format '{{{{.Names}}}}'"
+        )
+        holders = [name.strip() for name in result.stdout.splitlines() if name.strip()]
+        if not holders:
+            return
+
+        message = (
+            f"UDP {WIREGUARD_LISTEN_PORT} is taken by {', '.join(holders)}, so the cluster overlay "
+            "cannot bind. A node can carry one cluster pod at a time."
+        )
+        logger.error(_m("Cluster overlay port busy", extra=get_extra_info({**default_extra, "holders": holders})))
+        raise RuntimeError(message)
+
+    @staticmethod
+    def _forwards_rdma(devices: tuple[DeviceMount, ...]) -> bool:
+        return any(device.path_on_host.startswith("/dev/infiniband/") for device in devices)
+
+    @classmethod
+    def _capabilities_for(cls, devices: tuple[DeviceMount, ...]) -> tuple[str, ...]:
+        """NET_ADMIN always, plus IPC_LOCK once the container holds verbs devices.
+
+        Registering an RDMA memory region locks pages. Unlimited memlock covers a root process, but
+        a workload that drops to an unprivileged user needs the capability as well, and without it
+        `ibv_reg_mr` fails where every sysfs read still succeeds (DAH-2620).
+        """
+        if not cls._forwards_rdma(devices):
+            return ("NET_ADMIN",)
+        return ("NET_ADMIN", "IPC_LOCK")
+
+    @classmethod
     def _memlock_ulimit_for(
-        devices: tuple[DeviceMount, ...], memory_gb: int | None
+        cls, devices: tuple[DeviceMount, ...], memory_gb: int | None
     ) -> tuple[ContainerUlimit, ...]:
         """Unlimited memlock, for a container that got RDMA devices AND a memory limit.
 
@@ -4316,6 +4391,18 @@ class DockerService:
                                 }),
                             ),
                         )
+
+                if payload.bootstrap_restore:
+                    current_step = "bootstrap_restore"
+                    await self._run_bootstrap_restore(
+                        ssh_client=ssh_client,
+                        executor_info=executor_info,
+                        payload=payload,
+                        restore=payload.bootstrap_restore,
+                        local_volume=local_volume,
+                        local_volume_path=local_volume_path,
+                        encrypted=use_encrypted_volume,
+                    )
                 if external_volume_info:
                     current_step = "external_volume_creation"
                     sysbox_subuid_base: int | None = None
@@ -4358,6 +4445,10 @@ class DockerService:
                     ssh_client,
                     payload.gpu_uuids,
                 )
+
+                if payload.cluster_membership is not None:
+                    current_step = "cluster_overlay_port"
+                    await self._assert_cluster_overlay_port_free(ssh_client, default_extra)
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
                 # gpu_power_limits). Fail-closed: apply undoes any partial work on failure, and the
@@ -4766,6 +4857,7 @@ class DockerService:
                     profilers=profilers,
                     backup_log_id=payload.backup_log_id,
                     restore_path=payload.restore_path,
+                    restore_log_id=payload.bootstrap_restore.restore_log_id if payload.bootstrap_restore else None,
                     jupyter_url=jupyter_url,
                     warnings=warnings,
                     storage_limit_gb=effective_storage_limit_gb,
@@ -4818,6 +4910,120 @@ class DockerService:
                     else None
                 ),
             )
+
+    async def _run_bootstrap_restore(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        payload: ContainerCreateRequest,
+        restore: BootstrapRestoreSpec,
+        local_volume: str,
+        local_volume_path: str,
+        encrypted: bool,
+    ) -> None:
+        if not await supports_storage_operation(ssh_client, restore.backup_engine):
+            # Legacy archives must remain restorable while executor-image adoption
+            # is gradual. Restic has no safe fallback without its pinned binary.
+            if restore.backup_engine == "tar_aws_cli" and not encrypted:
+                await self._run_legacy_bootstrap_restore(
+                    ssh_client=ssh_client,
+                    executor_info=executor_info,
+                    restore=restore,
+                    local_volume=local_volume,
+                    local_volume_path=local_volume_path,
+                )
+                return
+            raise RuntimeError(
+                f"executor does not support bootstrap restore engine {restore.backup_engine}"
+            )
+        operation_id = UUID(restore.restore_log_id)
+        workspace: dict[str, object] = {
+            "mode": "encrypted_bootstrap" if encrypted else "plain_volume",
+            "volume_name": local_volume,
+            "volume_path": local_volume_path,
+            "requested_path": restore.restore_path or local_volume_path,
+        }
+        if encrypted:
+            workspace["volume_passphrase"] = VolumeKeyDeriver.from_settings(settings).material(
+                payload.pod_id
+            ).passphrase
+
+        repository: dict[str, object] = {
+            "bucket": restore.backup_volume_info.name,
+            "access_key_id": restore.backup_volume_info.iam_user_access_key,
+            "secret_access_key": restore.backup_volume_info.iam_user_secret_key,
+            "session_token": restore.backup_volume_info.session_token,
+            "password": restore.repository_password,
+            "s3_connections": restore.s3_connections,
+        }
+        spec: dict[str, object] = {
+            "operation_id": restore.restore_log_id,
+            "pod_id": payload.pod_id,
+            "repository_pod_id": restore.repository_pod_id,
+            "action": "restore",
+            "engine": restore.backup_engine,
+            "repository": repository,
+            "workspace": workspace,
+            "snapshot_id": restore.snapshot_id,
+            "legacy_object_key": restore.legacy_object_key,
+            "legacy_object_size_bytes": restore.legacy_object_size_bytes,
+            "reporter": {
+                "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,
+                "auth_token": restore.auth_token,
+                "resource": "restore",
+                "failure_timeout_seconds": restore.failure_timeout_seconds,
+            },
+        }
+        files = await start_storage_operation(
+            ssh_client,
+            executor_info.python_path,
+            operation_id,
+            spec,
+            retain_terminal_artifacts=True,
+        )
+        await wait_for_storage_operation(ssh_client, files)
+
+    async def _run_legacy_bootstrap_restore(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        restore: BootstrapRestoreSpec,
+        local_volume: str,
+        local_volume_path: str,
+    ) -> None:
+        local_jobs = Path(__file__).resolve().parent.parent / "miner_jobs"
+        remote_script = "/root/app/restore_storage.py"
+        remote_helper = "/root/app/workspace_mount.py"
+        async with ssh_client.start_sftp_client() as sftp:
+            await sftp.put(str(local_jobs / "restore_storage.py"), remote_script)
+            await sftp.put(str(local_jobs / "workspace_mount.py"), remote_helper)
+        command = [
+            executor_info.python_path,
+            remote_script,
+            "--api-url",
+            settings.COMPUTE_REST_API_URL_EXTERNAL,
+            "--target-volume",
+            local_volume,
+            "--restore-path",
+            restore.restore_path or local_volume_path,
+            "--backup-source-path",
+            restore.legacy_object_key or "",
+            "--auth-token",
+            restore.auth_token,
+            "--restore-log-id",
+            restore.restore_log_id,
+            "--backup-volume-name",
+            restore.backup_volume_info.name,
+            "--backup-volume-iam_user_access_key",
+            restore.backup_volume_info.iam_user_access_key,
+            "--backup-volume-iam_user_secret_key",
+            restore.backup_volume_info.iam_user_secret_key,
+            "--target-volume-path",
+            local_volume_path,
+        ]
+        await ssh_client.run(shlex.join(command), check=True)
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
         async with self.lock:

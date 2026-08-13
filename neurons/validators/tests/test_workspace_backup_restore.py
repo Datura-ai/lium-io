@@ -1,7 +1,7 @@
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-from pathlib import Path
-import sys
 
 import pytest
 
@@ -9,9 +9,16 @@ MINER_JOBS_PATH = Path(__file__).resolve().parents[1] / "src" / "miner_jobs"
 sys.path.insert(0, str(MINER_JOBS_PATH))
 
 import backup_storage
-from datura.requests.miner_requests import ExecutorSSHInfo
 import restore_storage
 import workspace_mount as workspace_mount_module
+from datura.requests.miner_requests import ExecutorSSHInfo
+from payload_models.payloads import (
+    BackupContainerRequest,
+    ExternalVolumeInfo,
+    RestoreContainerRequest,
+)
+from services.docker_service import DockerService
+from services.miner_service import MinerService
 from workspace_mount import (
     VolumeAccess,
     detect_volume_access,
@@ -19,9 +26,9 @@ from workspace_mount import (
     normalize_workspace_path,
     require_container_running,
 )
-from payload_models.payloads import BackupContainerRequest, ExternalVolumeInfo, RestoreContainerRequest
+
+from services import docker_service as docker_service_module
 from services import miner_service as miner_service_module
-from services.miner_service import MinerService
 
 
 def _backup_args() -> SimpleNamespace:
@@ -508,3 +515,73 @@ async def test_miner_service_restore_argv_excludes_encryption_flags(monkeypatch)
     assert "--target-volume-encrypted" not in command
     assert "--container-name" not in command
     assert "--target-volume target-volume" in command
+
+
+def test_restic_backup_empty_path_targets_the_whole_volume():
+    payload = _backup_payload()
+    payload.backup_engine = "restic"
+    payload.repository_password = "repository-password"
+    payload.backup_path = ""
+
+    spec = MinerService._restic_backup_operation_spec(payload)
+
+    assert spec["workspace"]["requested_path"] == payload.source_volume_path
+    assert spec["reporter"]["failure_timeout_seconds"] == 600
+
+
+def test_restic_online_restore_empty_path_targets_the_whole_volume():
+    payload = _restore_payload()
+    payload.backup_engine = "restic"
+    payload.repository_password = "repository-password"
+    payload.snapshot_id = "a" * 64
+    payload.restore_path = ""
+
+    spec = MinerService._restic_restore_operation_spec(payload)
+
+    assert spec["workspace"]["requested_path"] == payload.target_volume_path
+    assert spec["reporter"]["failure_timeout_seconds"] == 600
+
+
+@pytest.mark.asyncio
+async def test_legacy_bootstrap_restore_falls_back_when_runner_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        docker_service_module,
+        "supports_storage_operation",
+        AsyncMock(return_value=False),
+    )
+    service = DockerService.__new__(DockerService)
+    service._run_legacy_bootstrap_restore = AsyncMock()
+    restore = SimpleNamespace(backup_engine="tar_aws_cli")
+
+    await service._run_bootstrap_restore(
+        ssh_client=AsyncMock(),
+        executor_info=_executor_info(),
+        payload=SimpleNamespace(pod_id="pod"),
+        restore=restore,
+        local_volume="volume",
+        local_volume_path="/root",
+        encrypted=False,
+    )
+
+    service._run_legacy_bootstrap_restore.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_restic_bootstrap_restore_requires_runner_capability(monkeypatch):
+    monkeypatch.setattr(
+        docker_service_module,
+        "supports_storage_operation",
+        AsyncMock(return_value=False),
+    )
+    service = DockerService.__new__(DockerService)
+
+    with pytest.raises(RuntimeError, match="does not support bootstrap restore engine restic"):
+        await service._run_bootstrap_restore(
+            ssh_client=AsyncMock(),
+            executor_info=_executor_info(),
+            payload=SimpleNamespace(pod_id="pod"),
+            restore=SimpleNamespace(backup_engine="restic"),
+            local_volume="volume",
+            local_volume_path="/root",
+            encrypted=False,
+        )

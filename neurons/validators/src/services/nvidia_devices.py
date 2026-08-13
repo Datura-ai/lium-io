@@ -214,10 +214,12 @@ async def _query_shared_nodes(
     device — all three belong to the host as a whole, and forwarding them would hand a tenant
     control nodes of a GPU or a card another tenant is renting on the same box.
 
-    RDMA is additionally behind ENABLE_RDMA_DEVICE_PASSTHROUGH, off by default: the path skips the
-    host network stack, so on a shared RoCE segment it reaches a neighbour with no iptables,
-    conntrack or rate limit in the way. Only the `uverbs*` nodes and `rdma_cm` are ever forwarded,
-    never the /dev/infiniband directory:
+    A whole-host rental gets the verbs devices unconditionally. It rode a separate
+    ENABLE_RDMA_DEVICE_PASSTHROUGH switch while RDMA from inside a container was unproven; that
+    switch has been on in prod since DAH-2571 and a multi-node cluster rental (DAH-2620) cannot
+    work without the devices at all, so the second rubber-stamp is gone and the only gate left is
+    the whole-host rule below. Only the `uverbs*` nodes and `rdma_cm` are ever forwarded, never the
+    /dev/infiniband directory:
     that also carries `issm*`, the subnet-manager interface, and `umad*`, raw MAD access. A renter
     holding `issm` can interfere with the fabric every other tenant on it depends on (DAH-2571).
     """
@@ -226,7 +228,7 @@ async def _query_shared_nodes(
         "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
         "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
     )
-    if is_whole_host_rental and settings.ENABLE_RDMA_DEVICE_PASSTHROUGH:
+    if is_whole_host_rental:
         globs += " /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
     cmd = (
         f"for p in {globs}; do "
