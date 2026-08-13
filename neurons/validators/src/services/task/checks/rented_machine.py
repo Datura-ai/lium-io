@@ -118,7 +118,11 @@ class TenantEnforcementCheck:
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
+        # EVERY filler on the node: a partially rented split node keeps one filler per free VRAM
+        # bundle running beside the renter (DAH-2465/DAH-2467), and allowlisting only the first
+        # makes its siblings' GPU processes read as usage outside the tenant.
+        filler_containers = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        filler_container = filler_containers[0] if filler_containers else None
 
         if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}
@@ -211,8 +215,7 @@ class TenantEnforcementCheck:
                 continue
 
         container_names = [pod.container_name for pod in rented_pods]
-        if filler_container:
-            container_names.append(filler_container)
+        container_names.extend(filler_containers)
         gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
 
