@@ -39,9 +39,28 @@ TDX_LAST_ATTESTATION_EVENT_PREFIX = "tdx_last_attestation_event"
 # contract, so a copy that drifts must fail a test rather than silently accept a wrong set.
 GPU_UUID_SEPARATOR = ","
 
+# DAH-2675 — the three verdicts on a rented CVM's live quote. Three, not two, because two of
+# the outcomes lead to opposite decisions and must not share an encoding: REJECTED means the
+# evidence was examined and failed (earns nothing), while UNAVAILABLE means nothing could be
+# examined (what that means is DAH-2676's question, so the caller falls back).
+RENTAL_QUOTE_VERIFIED = "verified"
+RENTAL_QUOTE_REJECTED = "rejected"
+RENTAL_QUOTE_UNAVAILABLE = "unavailable"
+
 
 class AttestationError(RuntimeError):
     """Raised when attestation or host verification fails."""
+
+
+@dataclass(frozen=True)
+class _QuoteOrigin:
+    """Where a relayed quote came from — just enough of an executor for the verifier call's
+    log labels. A rented CVM's quote arrives through cvmd (DAH-2675), so there is no
+    ExecutorSSHInfo to hand `_call_verifier`, and building a fake one would imply an SSH
+    session that never existed."""
+
+    address: str
+    port: int | str
 
 
 @dataclass
@@ -925,6 +944,131 @@ class AttestationService:
                 f"order it is serving — " + "; ".join(mismatches)
             )
         logger.warning(_m("Renter CVM mismatch (not enforced)", extra=extra))
+
+    async def verify_rented_cvm_quote(
+        self,
+        answer: dict,
+        *,
+        nonce: AttestationNonce,
+        expectations,
+        address: str,
+        port: int | str,
+    ) -> tuple[str, str]:
+        """Judge one agent answer for a rented CVM. Returns (verdict, reason).
+
+        The verdicts are the module constants RENTAL_QUOTE_VERIFIED / _REJECTED /
+        _UNAVAILABLE — see their comment for why three.
+
+        The identity binding is the renter recipe from attest-agent/identity.py:
+
+            report_data[:32]   == sha256(agent TLS public key ‖ gpu_uuid_digest(gpu_uuids))
+            report_data[32:64] == this call's nonce
+
+        The TLS key and the GPU list come from the agent's own answer. Self-supplied, and
+        that is fine — the hardware signed their digest, so an agent that states one set and
+        holds another produces a quote whose identity half this check will not match. What
+        the values are FOR is telling this validator what to expect; what makes them
+        evidence is the quote.
+
+        A VERIFIED verdict is full evidence with no feature flag behind it. The order checks
+        (compose, OS image, GPU count vs `expectations`) are enforced here unconditionally,
+        unlike `_assert_renter_expectations`'s flag-gated path: this path only ever runs for
+        the new rental-scoring decision, so there is no fleet to stage it across — a quote
+        that verifies but contradicts the order is a measured false claim, and it earns
+        nothing.
+        """
+        if not self.enabled:
+            return RENTAL_QUOTE_UNAVAILABLE, "TDX attestation is not enabled on this validator"
+
+        quote = answer.get("quote")
+        if not isinstance(quote, str) or not quote.strip():
+            return RENTAL_QUOTE_REJECTED, "the agent answered without a quote"
+
+        tls_key_hex = answer.get("tls_public_key")
+        gpu_uuids = answer.get("gpu_uuids")
+        if not isinstance(tls_key_hex, str) or not isinstance(gpu_uuids, list):
+            return RENTAL_QUOTE_REJECTED, "the agent answered without its identity material"
+        try:
+            tls_key = bytes.fromhex(tls_key_hex)
+        except ValueError:
+            return RENTAL_QUOTE_REJECTED, "the agent's TLS public key is not hex"
+        if not tls_key:
+            return RENTAL_QUOTE_REJECTED, "the agent's TLS public key is empty"
+        uuids = [str(uuid) for uuid in gpu_uuids]
+
+        origin = _QuoteOrigin(address=address, port=port)
+        try:
+            verifier_payload = await self._call_verifier(quote.strip(), origin)
+        except AttestationError as exc:
+            # Covers "no verifier URL", an HTTP error status, and a non-JSON answer — every
+            # one a condition of the verifier, not a judgement on the quote.
+            return RENTAL_QUOTE_UNAVAILABLE, str(exc)
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            return RENTAL_QUOTE_UNAVAILABLE, f"the verifier could not be reached: {exc}"
+
+        details = verifier_payload.get("details")
+        if not isinstance(details, dict):
+            return RENTAL_QUOTE_UNAVAILABLE, "the verifier's answer carried no details section"
+
+        if not (bool(verifier_payload.get("is_valid")) and bool(details.get("quote_verified"))):
+            return RENTAL_QUOTE_REJECTED, "the verifier refused the quote"
+
+        returned = self._normalise_report_data(details.get("report_data"))
+        if returned is None or len(returned) < 64:
+            return RENTAL_QUOTE_REJECTED, "the quote carries no usable report_data"
+
+        expected_identity = hashlib.sha256(tls_key + self.gpu_uuid_digest(uuids)).digest()
+        if returned[:32] != expected_identity:
+            return (
+                RENTAL_QUOTE_REJECTED,
+                "the quote's identity half does not bind the agent's TLS key and GPU set",
+            )
+
+        if nonce.is_expired(settings.ATTESTATION_NONCE_TTL_SECONDS):
+            # This validator's own slowness, not the node's evidence — never REJECTED.
+            return RENTAL_QUOTE_UNAVAILABLE, "the issued nonce expired before verification"
+        if returned[32:64] != nonce.value_bytes:
+            return (
+                RENTAL_QUOTE_REJECTED,
+                "the quote does not echo the issued nonce (stale or replayed)",
+            )
+
+        violations = self._collect_tcb_violations(details)
+        if violations:
+            # Same posture as every other quote path: warn-only telemetry until the fleet-wide
+            # TCB flag is taken, then enforced. Not a new flag — the same one.
+            logger.warning(_m(
+                "TCB posture violations on a rented CVM quote",
+                extra=get_extra_info({
+                    "executor": f"{address}:{port}",
+                    "violations": [
+                        {"reason": reason, "value": value} for reason, value in violations
+                    ],
+                    "enforced": settings.ENABLE_TCB_ENFORCEMENT,
+                }),
+            ))
+            if settings.ENABLE_TCB_ENFORCEMENT:
+                reason, value = violations[0]
+                return RENTAL_QUOTE_REJECTED, f"TCB enforcement failed: {reason}={value!r}"
+
+        app_info = details.get("app_info", {}) or {}
+        mismatches: list[str] = []
+        for field_name in ("compose_hash", "os_image_hash"):
+            expected = getattr(expectations, field_name, None) if expectations else None
+            if expected and app_info.get(field_name) != expected:
+                mismatches.append(
+                    f"{field_name}: sold {expected}, measured {app_info.get(field_name)}"
+                )
+        expected_count = getattr(expectations, "gpu_count", None) if expectations else None
+        if expected_count is not None and len(uuids) != expected_count:
+            mismatches.append(f"gpu_count: sold {expected_count}, attested {len(uuids)}")
+        if mismatches:
+            return (
+                RENTAL_QUOTE_REJECTED,
+                "the CVM does not match what was sold — " + "; ".join(mismatches),
+            )
+
+        return RENTAL_QUOTE_VERIFIED, "hardware-signed quote bound to this cycle's nonce"
 
     async def _record_attested_executor(self, executor: ExecutorSSHInfo) -> None:
         """Ratchet: remember that this executor is a CVM (minimal-G5)."""

@@ -25,18 +25,11 @@ defers it to after the sweep, so a genuinely broken miner still produces its fai
 when no synthesis fires (see `_record_and_grace_cvm_hosts` call sites in miner_service.py).
 """
 
-import json
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
 from cvm_helpers import PAYLOAD, cvmd_host, make_miner_service, rented_data_for, scored_result
 
 from core.config import settings
-from services.cvm_lifecycle import (
-    CVMD_HOSTS_KEY,
-    CvmLifecycleService,
-    SwitchAssessment,
-)
+from services.cvm_lifecycle import SwitchAssessment
 
 HOST = cvmd_host("e-rented")
 
@@ -144,7 +137,7 @@ class TestTheBackendIsHalfTheProof:
 
         assert results == []
         # A fabricated state answer must not keep its own registry entry alive either.
-        lifecycle.touch_host.assert_not_awaited()
+        lifecycle.record_host.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_rental_recorded_for_another_miner_earns_nothing(self, rental_scoring_on):
@@ -185,45 +178,30 @@ class TestObserveMode:
         assert results == []
         # Observation still refreshes the registry for the CONFIRMED rental: rollout-mode
         # fleets have long rentals too, and the host must not age out mid-rental.
-        lifecycle.touch_host.assert_awaited()
+        lifecycle.record_host.assert_awaited()
 
 
 class TestTheRegistryOutlivesTheRental:
     @pytest.mark.asyncio
-    async def test_a_confirmed_rental_refreshes_the_hosts_entry(self, rental_scoring_on):
+    async def test_a_confirmed_rental_rerecords_the_host_from_backend_facts(
+        self, rental_scoring_on
+    ):
+        """Re-recorded, not merely refreshed: the address and GPU shape written back are the
+        BACKEND's copy from this cycle's response, so the registry entry that the DAH-2629
+        launch path will need after the rental cannot drift from the system of record."""
         service, lifecycle = make_miner_service([HOST], renter_running())
 
         await service._record_and_grace_cvm_hosts(
             PAYLOAD, existing=[], rented_data=rented_data_for()
         )
 
-        lifecycle.touch_host.assert_awaited_once()
-        touched = lifecycle.touch_host.await_args.args[0]
-        assert touched.executor_uuid == "e-rented"
-        assert touched.address == "203.0.113.7"
-        assert touched.gpu_model == "NVIDIA H200"
-        assert touched.gpu_count == 8
-
-    @pytest.mark.asyncio
-    async def test_touch_host_rewrites_the_record_with_a_fresh_timestamp(self):
-        """The refresh is write-only: the caller's record IS the stored record, so there is
-        nothing a re-read could merge — one hset, no hget."""
-        from bittensor_wallet import Keypair
-
-        redis = MagicMock()
-        redis.hset = AsyncMock()
-        redis.hget = AsyncMock()
-        service = CvmLifecycleService(redis, MagicMock(), Keypair.create_from_uri("//Alice"))
-
-        await service.touch_host(HOST)
-
-        redis.hget.assert_not_awaited()
-        redis.hset.assert_awaited_once()
-        key, field, payload_json = redis.hset.await_args.args
-        assert key == CVMD_HOSTS_KEY
-        assert field == "e-rented"
-        stored = json.loads(payload_json)
-        assert stored["updated_at"] > 0.0, "the TTL clock must actually restart"
+        lifecycle.record_host.assert_awaited_once()
+        recorded = lifecycle.record_host.await_args.kwargs
+        assert recorded["executor_uuid"] == "e-rented"
+        assert recorded["address"] == "203.0.113.7"
+        assert recorded["miner_hotkey"] == "5Miner"
+        assert recorded["gpu_model"] == "NVIDIA H200"
+        assert recorded["gpu_count"] == 8
 
 
 class TestIncentiveGates:

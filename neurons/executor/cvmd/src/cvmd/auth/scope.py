@@ -17,8 +17,13 @@ from cvmd.auth.clients import Scope
 CVM_PATH = "/v1/cvm"
 STATE_PATH = "/v1/state"
 HEALTH_PATH = "/health"
+# DAH-2675: open to any authorized key via the default below, like the other non-mutating
+# routes. Requesting a quote grants nothing — the agent's answer is hardware-bound to the
+# caller's nonce — and the narrow ATTEST scope exists so a key can be authorized for exactly
+# this and hold no launch or teardown right.
+ATTEST_PATH = "/v1/attest"
 
-# Routes readable by either authorized key.
+# Routes open to any authorized key.
 EITHER_KEY = None
 
 # `kind` values accepted by POST /v1/cvm, and the scope each one demands.

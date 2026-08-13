@@ -14,10 +14,18 @@ from bittensor.sp_core import Keypair
 
 
 class Scope(StrEnum):
-    """What a key is allowed to do. The two scopes are disjoint by design."""
+    """What a key is allowed to do. The scopes are disjoint by design.
+
+    ATTEST holds no launch or teardown right at all: a key in this scope can make the reads
+    open to any authorized key, plus `POST /v1/attest` — which is itself open to any
+    authorized key, so the scope GRANTS nothing the other two lack. It exists for the
+    opposite direction: an operator can authorize a key that can request a renter CVM's
+    quote and nothing else (DAH-2675).
+    """
 
     VALIDATION = "validation"
     RENTER = "renter"
+    ATTEST = "attest"
 
 
 class AuthorizedClientsError(Exception):

@@ -23,6 +23,10 @@ naming the conditions that did not.
 The two `/v1/catalog` routes are DAH-2578's. Both are open to either authorized key, because
 neither decides what this host may run — the platform's signature does, and it is checked on
 every read of the cached manifest.
+
+`POST /v1/attest` is DAH-2675's: it relays one nonce-bound trust-check to the renter CVM's
+in-guest attest-agent and returns the answer verbatim. Open to any authorized key, because the
+answer authenticates itself — the quote binds the caller's nonce.
 """
 
 import asyncio
@@ -32,10 +36,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from cvmd import __version__
+from cvmd import __version__, agent_relay
 from cvmd.catalog import HEX64, CatalogStore, refresh_once
 from cvmd.cvm.manager import KIND_RENTER, KIND_VALIDATION, CvmManager, LaunchFailure, Triple
 from cvmd.cvm.renter import RenterOrder
+from cvmd.state.machine import NodeState
 from cvmd.state.store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -51,6 +56,20 @@ MAX_COMPOSE_CHARS = 32 * 1024
 
 # Scripts run before the workload and are folded into the same measured file. Same reasoning.
 MAX_SCRIPT_CHARS = 8 * 1024
+
+# DAH-2675 — the attest relay. The guest port matches the attest-agent's own default; a caller
+# whose order injected the agent elsewhere names the port in the request. The timeout bounds a
+# fresh quote plus GPU evidence, both collected inside the guest; callers budget above it so the
+# reason that reaches them is this host's, which names what actually failed.
+DEFAULT_AGENT_GUEST_PORT = 8451
+AGENT_RELAY_TIMEOUT_SECONDS = 120
+
+# Fixed refusal texts, authored here rather than derived from any caught exception — the full
+# exception goes to the journal, and a relayed error's text is a view of this host's internals
+# (CodeQL `py/stack-trace-exposure`).
+NO_RENTER_CVM_DETAIL = "no renter CVM is running on this node, so there is no agent to attest"
+NO_AGENT_FORWARD_DETAIL = "the renter CVM carries no port forward for the agent's guest port"
+AGENT_UNREACHABLE_DETAIL = "the renter CVM's attest-agent could not be reached from this host"
 
 
 class CreateCvmRequest(BaseModel):
@@ -221,6 +240,74 @@ async def _create_renter(request: Request, body: dict) -> JSONResponse:
 @router.delete("/v1/cvm")
 async def destroy_cvm(request: Request) -> JSONResponse:
     return await _exclusively(request, _manager(request).destroy, success=200)
+
+
+class AttestRelayRequest(BaseModel):
+    """One trust-check challenge for the renter CVM's in-guest agent.
+
+    The nonce is the VERIFIER'S challenge — the agent folds it into the hardware-signed
+    `report_data`, so it is pinned to the agent's contract (64 hex chars) rather than
+    reshaped here. It has nothing to do with the auth header's replay nonce.
+
+    `extra="forbid"` for the same reason as the renter order: an unknown field means the
+    sender speaks a version of this contract this host does not implement.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    nonce: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
+    agent_port: int = Field(default=DEFAULT_AGENT_GUEST_PORT, ge=1, le=65535)
+
+
+@router.post("/v1/attest")
+async def attest_renter_cvm(request: Request) -> JSONResponse:
+    """Relay one nonce-bound attestation request to the in-guest agent (DAH-2675).
+
+    cvmd is transport here, not authority: the agent's answer is returned verbatim, status
+    and all, because the quote inside it is self-authenticating — it binds the agent's TLS
+    key, the GPU set and the caller's nonce, so this host can refuse to relay but cannot
+    substitute an answer that verifies. Open to any authorized key (see `auth/scope`): the
+    call grants nothing, and the agent-side ledger makes a repeat of the same nonce
+    idempotent rather than a fresh quote.
+
+    On a worker thread like every other slow handler — a quote takes seconds and
+    `/v1/state` must stay answerable while it is produced.
+    """
+    try:
+        parsed = AttestRelayRequest.model_validate(request.state.parsed_body)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422, content={"detail": exc.errors(include_url=False)})
+
+    instance = request.app.state.instances.current
+    if (
+        _store(request).state is not NodeState.RENTER_RUNNING
+        or instance is None
+        or instance.kind != KIND_RENTER
+    ):
+        return JSONResponse(status_code=409, content={"detail": NO_RENTER_CVM_DETAIL})
+
+    forward = next((port for port in instance.ports if port.guest_port == parsed.agent_port), None)
+    if forward is None:
+        logger.warning(
+            "attest relay refused: no forward for guest port %d on CVM %s",
+            parsed.agent_port,
+            instance.instance_id,
+        )
+        return JSONResponse(status_code=502, content={"detail": NO_AGENT_FORWARD_DETAIL})
+
+    try:
+        status, answer = await asyncio.to_thread(
+            agent_relay.relay_attest,
+            address=forward.address,
+            host_port=forward.host_port,
+            nonce=parsed.nonce,
+            timeout_seconds=AGENT_RELAY_TIMEOUT_SECONDS,
+        )
+    except agent_relay.AgentRelayError as exc:
+        logger.warning("attest relay failed: %s", exc)
+        return JSONResponse(status_code=502, content={"detail": AGENT_UNREACHABLE_DETAIL})
+
+    return JSONResponse(status_code=status, content=answer)
 
 
 @router.get("/v1/catalog")

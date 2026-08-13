@@ -109,6 +109,10 @@ class CvmExpectations(BaseModel):
     compose_hash: str | None = None
     gpu_model: str | None = None
     gpu_count: int | None = None
+    # DAH-2675 — the guest port the order injected the attest-agent on, so the live quote
+    # check asks cvmd for the right forward. None (an older backend) leaves cvmd's default
+    # in force.
+    agent_port: int | None = None
 
 
 class RentedExecutorsResponse(BaseModel):

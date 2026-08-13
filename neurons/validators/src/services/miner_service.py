@@ -61,7 +61,14 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.attestation_service import TDX_ATTESTED_EXECUTOR_SET, AttestationService
+from services.attestation_service import (
+    RENTAL_QUOTE_REJECTED,
+    RENTAL_QUOTE_UNAVAILABLE,
+    RENTAL_QUOTE_VERIFIED,
+    TDX_ATTESTED_EXECUTOR_SET,
+    AttestationNonce,
+    AttestationService,
+)
 from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
@@ -774,6 +781,7 @@ class MinerService:
             CVM_SWITCH_BUDGET_EXCEEDED_EVENT,
             CVM_SWITCH_GRACE_EVENT,
             CVM_SWITCH_GRACE_OBSERVED_EVENT,
+            CvmdHost,
         )
 
         # getattr, not attribute access: results in this pipeline are duck-typed (tests and
@@ -822,6 +830,30 @@ class MinerService:
         }
         graces: list[JobResult] = []
         hosts = await lifecycle.hosts_for_miner(payload.miner_hotkey)
+
+        # DAH-2675: the backend's response is the authoritative list of rented CVM nodes, so a
+        # rental is swept even when this validator's registry has no entry for it — the
+        # registry is a cache here, never a dependency (the validator-stays-stateless rule).
+        # The GPU shape comes from the order the customer paid for, which is also what the
+        # quote check verifies against.
+        known = {host.executor_uuid for host in hosts}
+        # getattr like the rest of this pipeline: reduced shapes must read as "no CVM
+        # rentals", never as a failed batch.
+        rented_expectations = getattr(rented_data, "cvm_expectations", None) or {}
+        for executor_uuid, expectations in rented_expectations.items():
+            if executor_uuid in known:
+                continue
+            rented_executor = rented_data.executors.get(executor_uuid)
+            if rented_executor is None or rented_executor.miner_hotkey != payload.miner_hotkey:
+                continue
+            hosts.append(CvmdHost(
+                executor_uuid=executor_uuid,
+                address=rented_executor.executor_ip_address,
+                miner_hotkey=payload.miner_hotkey,
+                gpu_model=expectations.gpu_model,
+                gpu_count=expectations.gpu_count or 0,
+            ))
+
         for host in hosts:
             if host.executor_uuid in already_scored:
                 continue
@@ -942,30 +974,38 @@ class MinerService:
         rented_data: RentedExecutorsResponse | None,
         extra: dict,
     ) -> JobResult | None:
-        """Forced pass for a node whose CVM a renter holds (DAH-2674), or None.
+        """Score for a node whose CVM a renter holds (DAH-2674 + DAH-2675), or None.
 
-        The same shape and the same standard of proof as the special-manual-rental synthesis:
-        the pass needs TWO independent parties to agree. cvmd (host-side, outside the guest)
-        says RENTER_RUNNING, and the BACKEND's own rented-executors list says this executor
-        really is under a paid rental for this miner. Either alone is refusable — a host that
-        fabricates its state answer earns nothing without a rental the platform is billing,
-        and nothing read from inside the guest participates at all, so a root renter cannot
-        move the provider's score either (the DAH-2676 rule).
+        The gates come first, and both are the DAH-2674 two-party proof: cvmd (host-side,
+        outside the guest) says RENTER_RUNNING, and the BACKEND's own rented-executors list
+        says this executor really is under a paid rental for this miner. Either alone is
+        refusable — a host that fabricates its state answer earns nothing without a rental
+        the platform is billing. The host must also still hold its guest: cvmd reports
+        `supervisor_alive` from its own /proc read, and a dead QEMU mid-rental is a host
+        failure, not a scored cycle.
 
-        The host must also still be holding its guest: cvmd reports `supervisor_alive` from
-        its own /proc read, and a dead QEMU mid-rental is a host-side failure, not a scored
-        cycle. `spec` is None, like every synthesis here, so the backend's executor upsert is
-        untouched.
+        Then the live quote decides (DAH-2675). A quote relayed through cvmd, bound to this
+        cycle's fresh nonce and accepted by the verifier against the agent recipe AND the
+        order's expectations, is full evidence — the node scores on it with no feature flag.
+        A quote the verifier examined and refused (or one that contradicts what was sold)
+        earns nothing, flag or no flag: a measured false claim outranks the host-side
+        signals. Only when NO quote could be examined does the node fall back to the
+        DAH-2674 host-side pass, still behind `ENABLE_CVM_RENTAL_SCORING`, because what a
+        missing quote means (renter sabotage vs provider fault) is DAH-2676's question.
 
-        The registry entry is refreshed only for a backend-confirmed rental — a rental can run
-        720 hours against a 7-day registry TTL, and without the refresh the host would age out
-        of the very sweep that scores it. Gating the refresh the same way as the pass means a
-        fabricated state answer cannot keep its own registry entry alive either.
+        Nothing here reads validator-side state: the rental facts (address, GPU shape,
+        expectations) ride the backend's response each cycle. The registry entry is
+        re-recorded from those backend facts purely for the post-rental launch path
+        (DAH-2629 must find the host once it is idle again), gated behind the backend
+        cross-check so a fabricated state answer cannot keep its own entry alive. `spec` is
+        None, like every synthesis here, so the backend's executor upsert is untouched.
         """
         from services.cvm_lifecycle import (
             CVM_RENTAL_BACKEND_MISMATCH_EVENT,
             CVM_RENTAL_PASS_EVENT,
             CVM_RENTAL_PASS_OBSERVED_EVENT,
+            CVM_RENTAL_QUOTE_REJECTED_EVENT,
+            CVM_RENTAL_QUOTE_VERIFIED_EVENT,
             CVM_RENTAL_SUPERVISOR_DEAD_EVENT,
         )
 
@@ -984,9 +1024,29 @@ class MinerService:
             logger.warning(_m(CVM_RENTAL_SUPERVISOR_DEAD_EVENT, extra=extra))
             return None
 
-        await lifecycle.touch_host(host)
+        # The backend's copy of the node's facts outranks the registry's: the expectations
+        # rode in on THIS cycle's response, while a registry entry is whatever some earlier
+        # cycle recorded.
+        expectations = (getattr(rented_data, "cvm_expectations", None) or {}).get(executor_uuid)
+        gpu_model = (
+            expectations.gpu_model if expectations and expectations.gpu_model else host.gpu_model
+        )
+        gpu_count = (
+            expectations.gpu_count if expectations and expectations.gpu_count else host.gpu_count
+        )
 
-        if host.gpu_model not in BASE_GPU_MAP:
+        # Re-record rather than merely refresh: the backend facts are authoritative, and a
+        # rental can run 720 hours against the registry's 7-day TTL — without this the host
+        # would age out of the launch path that must find it once the rental ends.
+        await lifecycle.record_host(
+            executor_uuid=executor_uuid,
+            address=rented_executor.executor_ip_address,
+            miner_hotkey=payload.miner_hotkey,
+            gpu_model=gpu_model,
+            gpu_count=gpu_count or 0,
+        )
+
+        if gpu_model not in BASE_GPU_MAP:
             # Same guard as the manual-rental and switch-grace syntheses, same reason: an
             # unknown model reaching the incentive layer aborts weight-setting subnet-wide.
             logger.warning(_m(
@@ -995,8 +1055,19 @@ class MinerService:
             ))
             return None
 
-        if not settings.ENABLE_CVM_RENTAL_SCORING:
-            logger.info(_m(CVM_RENTAL_PASS_OBSERVED_EVENT, extra=extra))
+        verdict, quote_reason = await self._judge_rental_quote(
+            host, lifecycle, expectations, extra
+        )
+        if verdict == RENTAL_QUOTE_REJECTED:
+            # Examined and failed. Never scored — and never softened by the fallback below,
+            # which exists for absence of evidence, not for evidence of absence.
+            logger.warning(_m(
+                CVM_RENTAL_QUOTE_REJECTED_EVENT, extra={**extra, "reason": quote_reason}
+            ))
+            return None
+
+        if verdict != RENTAL_QUOTE_VERIFIED and not settings.ENABLE_CVM_RENTAL_SCORING:
+            logger.info(_m(CVM_RENTAL_PASS_OBSERVED_EVENT, extra={**extra, "quote": quote_reason}))
             return None
 
         # The incentive-layer gates come off rented_data exactly as the manual-rental synthesis
@@ -1012,9 +1083,13 @@ class MinerService:
         except (TypeError, ValueError):
             executor_port = 0
 
+        if verdict == RENTAL_QUOTE_VERIFIED:
+            event, reason = CVM_RENTAL_QUOTE_VERIFIED_EVENT, "cvm_rental_quote"
+        else:
+            event, reason = CVM_RENTAL_PASS_EVENT, "cvm_rental"
         log_text = _m(
-            CVM_RENTAL_PASS_EVENT,
-            extra={**extra, "gpu_count": host.gpu_count, "reason": "cvm_rental"},
+            event,
+            extra={**extra, "gpu_count": gpu_count, "reason": reason, "quote": quote_reason},
         ).to_full_string()
         logger.info(log_text)
         return self._forced_pass_result(
@@ -1022,17 +1097,56 @@ class MinerService:
             executor_uuid=executor_uuid,
             address=rented_executor.executor_ip_address,
             port=executor_port,
-            gpu_model=host.gpu_model,
-            gpu_count=host.gpu_count,
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
             log_text=log_text,
             # Rented exempts the minimum-driver gate, which we cannot measure here.
             is_rented=True,
             is_spot=is_spot,
             provider_discord_connected=provider_discord_connected,
-            # This is a CVM-class node: the registry entry that got us here was recorded by an
-            # attested cycle, and the sweep's own state read is the host-side continuation of it.
+            # On a verified quote this is a measurement made THIS cycle; on the fallback it is
+            # the DAH-2674 host-side continuation of the attested cycle that recorded the host.
             tdx_attestation_passed=True,
         )
+
+    async def _judge_rental_quote(
+        self, host, lifecycle, expectations, extra: dict
+    ) -> tuple[str, str]:
+        """One live trust check of a rented CVM: request through cvmd, verify here.
+
+        Never raises; every outcome is one of the three RENTAL_QUOTE_* verdicts. The nonce is
+        minted fresh per check, so no cache anywhere — the agent's ledger included — can
+        satisfy it with an old quote. The agent's guest port comes from the order's
+        expectations when the backend carries it; None leaves cvmd's default in force.
+        """
+        from services.cvm_lifecycle import CVM_RENTAL_QUOTE_UNAVAILABLE_EVENT
+
+        if not getattr(self.attestation_service, "enabled", False):
+            # No verifier to examine a quote — don't make the guest produce one that
+            # nothing will ever read. Same verdict the verification step would return.
+            return RENTAL_QUOTE_UNAVAILABLE, "TDX attestation is not enabled on this validator"
+
+        nonce = AttestationNonce.issue()
+        agent_port = getattr(expectations, "agent_port", None) if expectations else None
+        answer = await lifecycle.request_renter_quote(
+            host, nonce_hex=nonce.value_hex, agent_port=agent_port
+        )
+        if answer is None:
+            # The transport already logged its own UNAVAILABLE event with the failing leg.
+            return RENTAL_QUOTE_UNAVAILABLE, "no answer came back through cvmd"
+
+        verdict, reason = await self.attestation_service.verify_rented_cvm_quote(
+            answer,
+            nonce=nonce,
+            expectations=expectations,
+            address=host.address,
+            port=settings.CVMD_PORT,
+        )
+        if verdict == RENTAL_QUOTE_UNAVAILABLE:
+            logger.info(_m(
+                CVM_RENTAL_QUOTE_UNAVAILABLE_EVENT, extra={**extra, "reason": reason}
+            ))
+        return verdict, reason
 
     def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
         executor_info = ExecutorSSHInfo(

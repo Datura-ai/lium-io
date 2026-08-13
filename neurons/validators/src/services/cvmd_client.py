@@ -14,6 +14,7 @@ What this client can and cannot do is decided by cvmd, not here:
 
     POST /v1/cvm {kind: validation}   allowed — the validator's own scope
     GET  /v1/state, /v1/catalog       allowed — reads are open to either authorized key
+    POST /v1/attest                   allowed — open to any authorized key (DAH-2675)
     POST /v1/cvm {kind: renter}       403 — platform scope, this key is refused
     DELETE /v1/cvm                    403 — teardown is the platform's alone
 
@@ -52,11 +53,17 @@ NONCE_BYTES = 16
 
 CVM_PATH = "/v1/cvm"
 STATE_PATH = "/v1/state"
+ATTEST_PATH = "/v1/attest"
 
 KIND_VALIDATION = "validation"
 
 # A state read answers from memory; only the network is being waited on.
 DEFAULT_STATE_TIMEOUT_SECONDS = 30
+
+# An attest relay holds while the in-guest agent produces a fresh quote plus GPU evidence.
+# cvmd bounds its own dial at 120 s; this budget sits above it so the host's timeout is the
+# one that decides, and its reason is the one that reaches this validator.
+DEFAULT_ATTEST_TIMEOUT_SECONDS = 150
 
 
 def _lp(value: bytes) -> bytes:
@@ -162,8 +169,33 @@ class CvmdClient:
             timeout_seconds=DEFAULT_PROVISION_TIMEOUT_SECONDS,
         )
 
+    async def attest_renter(
+        self, base_url: str, *, nonce_hex: str, agent_port: int | None = None
+    ) -> RelayResult:
+        """Signed ``POST /v1/attest``: one nonce-bound trust check of the renter CVM's agent.
+
+        The nonce is this validator's challenge — the agent folds it into the hardware-signed
+        report_data, which is what makes the answer impossible for the relaying host to forge
+        or replay. ``agent_port`` names the guest port the order injected the agent on; None
+        leaves cvmd's default in force.
+        """
+        payload: dict = {"nonce": nonce_hex}
+        if agent_port:
+            payload["agent_port"] = agent_port
+        body = canonical_body(payload)
+        signed = sign_request(self._keypair, method="POST", path=ATTEST_PATH, body=body)
+        return await self._relay.forward(
+            base_url=base_url,
+            method=signed.method,
+            path=signed.path,
+            body=signed.body,
+            headers=signed.headers,
+            timeout_seconds=DEFAULT_ATTEST_TIMEOUT_SECONDS,
+        )
+
 
 __all__ = [
+    "ATTEST_PATH",
     "CVM_PATH",
     "STATE_PATH",
     "KIND_VALIDATION",
