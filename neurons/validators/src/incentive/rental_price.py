@@ -433,7 +433,7 @@ class RentalPriceIncentive(DefaultIncentive):
     def _bucket_key_str(base_model: str, bucket: int) -> str:
         return f"{base_model}·{bucket}"
 
-    async def calculate_mining_scores(self):
+    async def calculate_mining_scores(self) -> None:
         """Score all job results, first expanding partially rented split nodes (DAH-2467).
 
         A split-opted-in executor with only part of its GPUs rented earns in BOTH pools: the
@@ -499,7 +499,10 @@ class RentalPriceIncentive(DefaultIncentive):
             # DAH-2340 reasons ride a separate list — the unrented portion's zero reasons would
             # otherwise never reach the backend.
             portions.rented_portion.zero_incentive_reasons.extend(portions.free_portion.zero_incentive_reasons)
-            portions.sibling_results.remove(portions.free_portion)
+            # Drop by identity: two portions of one executor can compare equal as pydantic models.
+            portions.sibling_results[:] = [
+                result for result in portions.sibling_results if result is not portions.free_portion
+            ]
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:
         """Aggregate per-`(base_model, bucket)` metrics for the rental-share
