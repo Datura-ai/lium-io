@@ -465,6 +465,31 @@ class Settings(BaseSettings):
         env="CVM_SWITCH_BUDGET_SECONDS_BY_GPU_MODEL", default=""
     )
 
+    # DAH-2674 — provider scoring while a renter holds the node's CVM. During RENTER_RUNNING the
+    # executor process is gone with the validation CVM, so the node cannot answer a normal
+    # validation and would score zero for the whole rental — up to 720 hours for a node doing
+    # exactly what it was rented to do. The sweep synthesizes the same forced-pass shape as a
+    # special manual rental instead, from host-side signals alone (cvmd's signed state read), so
+    # nothing the renter does inside the guest can lower the provider's score.
+    # Off = observe: the sweep logs what it would have scored and changes nothing.
+    ENABLE_CVM_RENTAL_SCORING: bool = Field(env="ENABLE_CVM_RENTAL_SCORING", default=False)
+
+    # DAH-2675 — log-only probe of the attest-agent inside a rented CVM. The agent is the one
+    # thing the platform may talk to in a rental; this flag makes the sweep read its /health
+    # (liveness + the identity a verifier would pin) and LOG it. By construction the probe can
+    # never touch a score — enforcement needs the renter-fault attribution rules (DAH-2676)
+    # settled first, and a probe that failed open would be worse than no probe.
+    ENABLE_CVM_ATTEST_PROBE: bool = Field(env="ENABLE_CVM_ATTEST_PROBE", default=False)
+
+    # The guest-side port the attest-agent listens on — a fleet convention like the SSH guest
+    # port, resolved to a host port through the launch report's forward list.
+    CVM_ATTEST_AGENT_GUEST_PORT: int = Field(env="CVM_ATTEST_AGENT_GUEST_PORT", default=8451)
+
+    # A /health read answers from memory; only the network is being waited on.
+    CVM_ATTEST_PROBE_TIMEOUT_SECONDS: int = Field(
+        env="CVM_ATTEST_PROBE_TIMEOUT_SECONDS", default=15
+    )
+
     def get_cvm_switch_budget_seconds(self, gpu_model: str | None) -> int:
         """The switch budget for one hardware class. Unparseable config falls back to the
         default rather than failing the cycle — a bad JSON here must not zero a fleet."""

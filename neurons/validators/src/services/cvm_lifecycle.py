@@ -37,7 +37,7 @@ from datetime import UTC, datetime
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.cvmd_client import CvmdClient
-from services.cvmd_relay import CvmdRelayError
+from services.cvmd_relay import CvmdRelay, CvmdRelayError
 from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,12 @@ CVM_SWITCH_BUDGET_EXCEEDED_EVENT = "CVM_SWITCH_BUDGET_EXCEEDED"
 CVM_LAUNCH_STARTED_EVENT = "CVM_VALIDATION_LAUNCH_STARTED"
 CVM_LAUNCH_VERIFIED_EVENT = "CVM_VALIDATION_LAUNCH_VERIFIED"
 CVM_LAUNCH_FAILED_EVENT = "CVM_VALIDATION_LAUNCH_FAILED"
+# DAH-2674 — the rental forced pass and its observe-mode twin.
+CVM_RENTAL_PASS_EVENT = "CVM_RENTAL_FORCED_PASS"
+CVM_RENTAL_PASS_OBSERVED_EVENT = "CVM_RENTAL_FORCED_PASS_OBSERVED"
+# DAH-2675 — what the log-only attest-agent probe reports.
+CVM_ATTEST_PROBE_OK_EVENT = "CVM_RENTER_ATTEST_PROBE_OK"
+CVM_ATTEST_PROBE_FAILED_EVENT = "CVM_RENTER_ATTEST_PROBE_FAILED"
 
 
 @dataclass(frozen=True)
@@ -117,10 +123,18 @@ class SwitchAssessment:
     has_cvm: bool = False
     switching: bool = False
     elapsed_seconds: float | None = None
+    # The state answer's `cvm` object, verbatim. Carried so the renter-CVM handling can read
+    # the forward list (the attest-agent probe needs a host port) without a second state call.
+    cvm: dict | None = None
 
     @property
     def idle_without_cvm(self) -> bool:
         return self.state == STATE_RECONCILING and not self.has_cvm
+
+    @property
+    def renter_running(self) -> bool:
+        """A renter holds this node's CVM — the state cvmd reports for the whole rental."""
+        return self.state == STATE_RENTER_RUNNING and self.has_cvm
 
 
 def _parse_started_at(last_switch: dict | None) -> datetime | None:
@@ -145,6 +159,10 @@ class CvmLifecycleService:
         self.redis_service = redis_service
         self.whitelist_source = whitelist_source
         self.client = CvmdClient(keypair)
+        # The attest-agent is not cvmd: its /health takes no signature (it answers anyone who
+        # reaches its port) and its TLS certificate is the self-signed one whose key the quote
+        # binds — so the transport stance is the relay's, and the call is unsigned.
+        self.agent_relay = CvmdRelay()
         # Hosts with a launch in flight in THIS process, so one slow launch is not joined
         # by a second from the next cycle. The Redis cooldown covers everything else.
         self._launching: set[str] = set()
@@ -227,7 +245,8 @@ class CvmLifecycleService:
 
         body = result.body
         state = body.get("state")
-        has_cvm = body.get("cvm") is not None
+        cvm = body.get("cvm")
+        has_cvm = cvm is not None
         switching = state in (STATE_TEARDOWN, STATE_SWITCHING)
         elapsed = None
         if switching:
@@ -240,6 +259,7 @@ class CvmLifecycleService:
             has_cvm=has_cvm,
             switching=switching,
             elapsed_seconds=elapsed,
+            cvm=cvm if isinstance(cvm, dict) else None,
         )
 
     # ------------------------------------------------------------------ DAH-2629: launch
@@ -362,3 +382,88 @@ class CvmLifecycleService:
     def schedule_ensure(self, host: CvmdHost, *, assessment: SwitchAssessment | None = None) -> None:
         """Fire the launch as its own task — a boot must never extend a validation cycle."""
         asyncio.create_task(self.ensure_validation_cvm(host, assessment=assessment))
+
+    # ------------------------------------------------------------------ DAH-2675: attest probe
+
+    async def probe_attest_agent(self, host: CvmdHost, assessment: SwitchAssessment) -> None:
+        """Read the renter CVM's attest-agent /health and LOG what it says. Nothing else.
+
+        Log-only by construction: this method's whole output is two Loki events, so it cannot
+        touch a score no matter what it finds. That is deliberate — the renter has root in the
+        guest and can kill or firewall the agent, so until the renter-fault attribution rules
+        (DAH-2676) decide what an unreachable agent MEANS, acting on one would let the renter
+        (or a provider running the mirror image of that attack) move a score. What this buys
+        now is the rollout data: how often the agent answers, with which identity, across the
+        fleet — the same observe-before-enforce path every other CVM flag has taken.
+
+        The nonce-bound quote (`POST /v1/attest`) is deliberately NOT called here. A quote is
+        only worth requesting when something verifies it, and quote verification against a real
+        TDX host is the hardware half of DAH-2675.
+        """
+        if not settings.ENABLE_CVM_ATTEST_PROBE:
+            return
+
+        extra = get_extra_info({
+            "executor_uuid": host.executor_uuid,
+            "miner_hotkey": host.miner_hotkey,
+        })
+        try:
+            ports = (assessment.cvm or {}).get("ports") or []
+            host_port = next(
+                (
+                    mapping.get("host_port")
+                    for mapping in ports
+                    if isinstance(mapping, dict)
+                    and mapping.get("guest_port") == settings.CVM_ATTEST_AGENT_GUEST_PORT
+                ),
+                None,
+            )
+            if not host_port:
+                # The fleet forward list does not carry the agent's port — a config gap worth
+                # a log line, not an error: the probe is optional until enforcement exists.
+                logger.info(_m(
+                    f"{CVM_ATTEST_PROBE_FAILED_EVENT} — no forward for the agent's guest port",
+                    extra={**extra, "guest_port": settings.CVM_ATTEST_AGENT_GUEST_PORT},
+                ))
+                return
+
+            result = await self.agent_relay.forward(
+                base_url=f"https://{host.address}:{host_port}",
+                method="GET",
+                path="/health",
+                body="",
+                headers={},
+                timeout_seconds=settings.CVM_ATTEST_PROBE_TIMEOUT_SECONDS,
+            )
+            if not result.ok:
+                logger.info(_m(
+                    f"{CVM_ATTEST_PROBE_FAILED_EVENT} — the agent answered an error",
+                    extra={**extra, "status": result.status, "detail": result.reason()},
+                ))
+                return
+
+            body = result.body
+            logger.info(_m(
+                CVM_ATTEST_PROBE_OK_EVENT,
+                extra={
+                    **extra,
+                    "agent_version": body.get("version"),
+                    "tls_public_key": body.get("tls_public_key"),
+                    "gpu_uuid_digest": body.get("gpu_uuid_digest"),
+                    "gpu_count": len(body.get("gpu_uuids") or []),
+                },
+            ))
+        except CvmdRelayError as exc:
+            logger.info(_m(
+                f"{CVM_ATTEST_PROBE_FAILED_EVENT} — the agent was not reached",
+                extra={**extra, "error": str(exc)},
+            ))
+        except Exception as exc:  # noqa: BLE001 - a log-only probe must never surface a failure
+            logger.warning(_m(
+                f"{CVM_ATTEST_PROBE_FAILED_EVENT} — probe error",
+                extra={**extra, "error": str(exc)},
+            ))
+
+    def schedule_attest_probe(self, host: CvmdHost, assessment: SwitchAssessment) -> None:
+        """Fire the probe as its own task — a slow agent must never extend a validation cycle."""
+        asyncio.create_task(self.probe_attest_agent(host, assessment))
