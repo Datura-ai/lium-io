@@ -18,23 +18,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from bittensor_wallet import Keypair
+from cvm_helpers import cvmd_host
 
 from core.config import settings
 from services.cvm_lifecycle import (
-    CvmdHost,
     CvmLifecycleService,
     SwitchAssessment,
 )
 from services.cvmd_relay import CvmdRelayError, RelayResult
 
-HOST = CvmdHost(
-    executor_uuid="e-rented",
-    address="203.0.113.7",
-    miner_hotkey="5Miner",
-    gpu_model="NVIDIA H200",
-    gpu_count=8,
-    updated_at=0.0,
-)
+HOST = cvmd_host("e-rented")
 
 HEALTH = {
     "version": "0.3.0",
@@ -49,7 +42,6 @@ def assessment_with_forwards(ports):
     return SwitchAssessment(
         reachable=True,
         state="RENTER_RUNNING",
-        has_cvm=True,
         cvm={"instance_id": "cvm-1", "ports": ports},
     )
 
@@ -112,6 +104,18 @@ class TestLogOnly:
 
         service.agent_relay.forward.assert_not_awaited()
 
+    def test_flag_off_schedules_no_task_at_all(self, monkeypatch):
+        """The scheduler checks the flag too: with it off (the shipping default) every
+        rented host per cycle would otherwise allocate a task whose first statement
+        returns — pure waste, at fleet scale."""
+        monkeypatch.setattr(settings, "ENABLE_CVM_ATTEST_PROBE", False, raising=False)
+        service = make_service()
+        service._spawn_background = MagicMock()
+
+        service.schedule_attest_probe(HOST, assessment_with_forwards(FORWARDS))
+
+        service._spawn_background.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_a_loopback_bound_forward_is_never_dialed(self, probe_on, caplog):
         """cvmd's port parser defaults the bind address to 127.0.0.1; dialing the public
@@ -165,16 +169,15 @@ class TestLogOnly:
     @pytest.mark.asyncio
     async def test_a_malformed_state_body_never_raises(self, probe_on):
         service = make_service()
-        mangled = SwitchAssessment(
-            reachable=True,
-            state="RENTER_RUNNING",
-            has_cvm=True,
-            cvm={"ports": [{"guest_port": "not-a-number"}, None, 42]},
-        )
+        for ports in (
+            [{"guest_port": "not-a-number"}, None, 42],
+            [{"guest_port": 8451, "host_port": "garbage", "address": "0.0.0.0"}],
+        ):
+            mangled = SwitchAssessment(reachable=True, state="RENTER_RUNNING", cvm={"ports": ports})
 
-        await service.probe_attest_agent(HOST, mangled)
+            await service.probe_attest_agent(HOST, mangled)
 
-        service.agent_relay.forward.assert_not_awaited()
+            service.agent_relay.forward.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_the_quote_endpoint_is_never_requested(self, probe_on):

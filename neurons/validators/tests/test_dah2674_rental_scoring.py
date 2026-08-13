@@ -25,98 +25,35 @@ defers it to after the sweep, so a genuinely broken miner still produces its fai
 when no synthesis fires (see `_record_and_grace_cvm_hosts` call sites in miner_service.py).
 """
 
-from types import SimpleNamespace
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from datura.requests.miner_requests import ExecutorSSHInfo
+from cvm_helpers import PAYLOAD, cvmd_host, make_miner_service, rented_data_for, scored_result
 
 from core.config import settings
 from services.cvm_lifecycle import (
-    CvmdHost,
+    CVMD_HOSTS_KEY,
     CvmLifecycleService,
     SwitchAssessment,
 )
-from services.miner_service import MinerService
-from services.task.models import JobResult
 
-HOST = CvmdHost(
-    executor_uuid="e-rented",
-    address="203.0.113.7",
-    miner_hotkey="5Miner",
-    gpu_model="NVIDIA H200",
-    gpu_count=8,
-    updated_at=0.0,
-)
-
-PAYLOAD = SimpleNamespace(miner_hotkey="5Miner", miner_coldkey="5Cold", job_batch_id="batch-1")
-
-
-def rented_data_for(executor_uuid="e-rented", *, miner_hotkey="5Miner", spot=(), discord=None):
-    """The backend's half of the proof: this executor is under a paid rental."""
-    return SimpleNamespace(
-        executors={
-            executor_uuid: SimpleNamespace(
-                miner_hotkey=miner_hotkey,
-                executor_ip_address="203.0.113.7",
-                executor_ip_port="4001",
-            )
-        },
-        spot_executor_ids=list(spot),
-        provider_discord_connected_executor_ids=discord,
-    )
-
-
-def make_miner_service(hosts, assessments):
-    """A miner service whose lifecycle answers `assessments` (one value, or one per host)."""
-    service = MinerService.__new__(MinerService)
-    service.redis_service = MagicMock()
-    lifecycle = MagicMock(spec=CvmLifecycleService)
-    lifecycle.record_host = AsyncMock()
-    lifecycle.hosts_for_miner = AsyncMock(return_value=hosts)
-    if isinstance(assessments, list):
-        lifecycle.assess = AsyncMock(side_effect=assessments)
-    else:
-        lifecycle.assess = AsyncMock(return_value=assessments)
-    lifecycle.schedule_ensure = MagicMock()
-    lifecycle.schedule_attest_probe = MagicMock()
-    service._cvm_lifecycle_service = lifecycle
-    return service, lifecycle
+HOST = cvmd_host("e-rented")
 
 
 def renter_running(supervisor_alive=True):
     return SwitchAssessment(
         reachable=True,
         state="RENTER_RUNNING",
-        has_cvm=True,
         cvm={
             "instance_id": "cvm-1",
             "rental_id": "rental-1",
             "supervisor_alive": supervisor_alive,
             "ports": [],
         },
-    )
-
-
-def scored_result(executor_uuid="already-scored"):
-    return JobResult(
-        spec=None,
-        executor_info=ExecutorSSHInfo(
-            uuid=executor_uuid,
-            address="198.51.100.3",
-            port=1,
-            ssh_username="",
-            ssh_port=0,
-            python_path="",
-            root_dir="",
-        ),
-        score=1.0,
-        job_score=1.0,
-        job_batch_id="batch-1",
-        log_status="success",
-        log_text="ok",
-        gpu_model="NVIDIA H200",
-        gpu_count=8,
+        # What `assess` folds off the wire object above — see its parsing test in the
+        # DAH-2630 suite; the sweep reads only this field.
+        supervisor_alive=supervisor_alive,
     )
 
 
@@ -187,14 +124,7 @@ class TestTheForcedPass:
 
     @pytest.mark.asyncio
     async def test_an_unknown_gpu_model_is_never_passed(self, rental_scoring_on):
-        odd_host = CvmdHost(
-            executor_uuid="e-odd",
-            address="203.0.113.9",
-            miner_hotkey="5Miner",
-            gpu_model="Prototype GPU X",
-            gpu_count=1,
-            updated_at=0.0,
-        )
+        odd_host = cvmd_host("e-odd", "203.0.113.9", gpu_model="Prototype GPU X", gpu_count=1)
         service, _ = make_miner_service([odd_host], renter_running())
 
         results = await service._record_and_grace_cvm_hosts(
@@ -214,7 +144,7 @@ class TestTheBackendIsHalfTheProof:
 
         assert results == []
         # A fabricated state answer must not keep its own registry entry alive either.
-        lifecycle.record_host.assert_not_awaited()
+        lifecycle.touch_host.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_rental_recorded_for_another_miner_earns_nothing(self, rental_scoring_on):
@@ -255,7 +185,7 @@ class TestObserveMode:
         assert results == []
         # Observation still refreshes the registry for the CONFIRMED rental: rollout-mode
         # fleets have long rentals too, and the host must not age out mid-rental.
-        lifecycle.record_host.assert_awaited()
+        lifecycle.touch_host.assert_awaited()
 
 
 class TestTheRegistryOutlivesTheRental:
@@ -267,11 +197,33 @@ class TestTheRegistryOutlivesTheRental:
             PAYLOAD, existing=[], rented_data=rented_data_for()
         )
 
-        kwargs = lifecycle.record_host.await_args.kwargs
-        assert kwargs["executor_uuid"] == "e-rented"
-        assert kwargs["address"] == "203.0.113.7"
-        assert kwargs["gpu_model"] == "NVIDIA H200"
-        assert kwargs["gpu_count"] == 8
+        lifecycle.touch_host.assert_awaited_once()
+        touched = lifecycle.touch_host.await_args.args[0]
+        assert touched.executor_uuid == "e-rented"
+        assert touched.address == "203.0.113.7"
+        assert touched.gpu_model == "NVIDIA H200"
+        assert touched.gpu_count == 8
+
+    @pytest.mark.asyncio
+    async def test_touch_host_rewrites_the_record_with_a_fresh_timestamp(self):
+        """The refresh is write-only: the caller's record IS the stored record, so there is
+        nothing a re-read could merge — one hset, no hget."""
+        from bittensor_wallet import Keypair
+
+        redis = MagicMock()
+        redis.hset = AsyncMock()
+        redis.hget = AsyncMock()
+        service = CvmLifecycleService(redis, MagicMock(), Keypair.create_from_uri("//Alice"))
+
+        await service.touch_host(HOST)
+
+        redis.hget.assert_not_awaited()
+        redis.hset.assert_awaited_once()
+        key, field, payload_json = redis.hset.await_args.args
+        assert key == CVMD_HOSTS_KEY
+        assert field == "e-rented"
+        stored = json.loads(payload_json)
+        assert stored["updated_at"] > 0.0, "the TTL clock must actually restart"
 
 
 class TestIncentiveGates:

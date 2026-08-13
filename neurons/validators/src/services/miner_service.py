@@ -366,25 +366,6 @@ class MinerService:
                             ),
                         ),
                     )
-                    if (
-                        len(msg.executors) == 0
-                        and not self._has_manual_rental_executors(payload, rented_data)
-                        and not settings.ENABLE_CVM_LIFECYCLE
-                    ):
-                        # Zero executors is normally a miner failure. It is the *expected* shape when
-                        # every executor this miner has is under a manual rental, though -- the miner
-                        # drops each one because it can no longer install our key. Only fail when
-                        # there is genuinely nothing to score; otherwise fall through to synthesis.
-                        # A miner whose only node is a cvmd host has the same shape while that node
-                        # is rented or switching (DAH-2674), so with the lifecycle on the decision is
-                        # deferred to AFTER the sweep: if nothing could be synthesized either, the
-                        # failure record below is emitted exactly as before. Deciding late keeps the
-                        # failed-miner signal — an upfront registry-membership exemption would turn
-                        # a genuinely broken miner into no record at all.
-                        return self._build_failed_job_result(
-                            payload,
-                            "Miner returned zero executors in AcceptSSHKeyRequest",
-                        )
                     tasks = [
                         asyncio.create_task(
                             asyncio.wait_for(
@@ -419,9 +400,15 @@ class MinerService:
                         )
                     )
                     if len(msg.executors) == 0 and not results:
-                        # The deferred half of the zero-executor decision: every synthesis has
-                        # had its chance and produced nothing, so the original failure stands
-                        # and is recorded exactly as it always was.
+                        # The zero-executor decision, made AFTER every synthesis has had its
+                        # chance. Zero executors is normally a miner failure, but it is the
+                        # *expected* shape when every executor this miner has is under a manual
+                        # rental, or is a cvmd host mid-rental or mid-switch (DAH-2674) — the
+                        # miner drops each one because it can no longer install our key.
+                        # Deciding on "did anything synthesize?" rather than predicting what
+                        # could means a new synthesis source needs no gate edit here, and a
+                        # genuinely broken miner still gets its failure record exactly as
+                        # it always did.
                         return self._build_failed_job_result(
                             payload,
                             "Miner returned zero executors in AcceptSSHKeyRequest",
@@ -581,8 +568,8 @@ class MinerService:
     ):
         """Yield (executor_uuid, info, rented_executor) for this miner's force-passable rentals.
 
-        Shared by the cheap `_has_manual_rental_executors` probe and the actual synthesis so the
-        two can never disagree about which executors qualify.
+        One home for the qualification rules, so every consumer of the candidate list agrees
+        about which executors qualify.
         """
         if not rented_data or not rented_data.manual_rental_executors:
             return
@@ -623,32 +610,19 @@ class MinerService:
 
             yield executor_uuid, info, rented_executor
 
-    def _has_manual_rental_executors(
-        self,
-        payload: MinerJobRequestPayload,
-        rented_data: RentedExecutorsResponse | None,
-    ) -> bool:
-        """Whether this miner has any force-passable manual rental, without building anything.
-
-        Used to decide whether a zero-executor AcceptSSHKeyRequest is a genuine miner failure or
-        the expected shape when every executor has been handed to a renter.
-        """
-        return any(self._iter_manual_rental_candidates(payload, rented_data))
-
     @staticmethod
     def _incentive_gates(
-        rented_data: RentedExecutorsResponse | None, executor_uuid: str
+        rented_data: RentedExecutorsResponse, executor_uuid: str
     ) -> tuple[bool, bool]:
         """(is_spot, provider_discord_connected) for one executor, read off rented_data.
 
         One home for the tri-state contract every synthesis must honor: ``None`` for the
         Discord list means "the backend sent no exclusions", which passes — a re-derivation
-        that read it as "not connected" would silently cut scores fleet-wide.
+        that read it as "not connected" would silently cut scores fleet-wide. Every caller
+        has already proven the backend record exists, so ``rented_data`` is required here.
         """
-        is_spot = bool(rented_data and executor_uuid in (rented_data.spot_executor_ids or []))
-        discord_connected_ids = (
-            rented_data.provider_discord_connected_executor_ids if rented_data else None
-        )
+        is_spot = executor_uuid in (rented_data.spot_executor_ids or [])
+        discord_connected_ids = rented_data.provider_discord_connected_executor_ids
         provider_discord_connected = (
             True if discord_connected_ids is None else executor_uuid in discord_connected_ids
         )
@@ -1003,20 +977,14 @@ class MinerService:
             logger.warning(_m(CVM_RENTAL_BACKEND_MISMATCH_EVENT, extra=extra))
             return None
 
-        if (assessment.cvm or {}).get("supervisor_alive") is False:
+        if assessment.supervisor_alive is False:
             # The state document says RENTER_RUNNING but the host's own /proc read says the
             # supervisor is gone — QEMU died mid-rental and nothing relaunched it. That is a
             # host-side failure; paying it would score a rental the customer cannot reach.
             logger.warning(_m(CVM_RENTAL_SUPERVISOR_DEAD_EVENT, extra=extra))
             return None
 
-        await lifecycle.record_host(
-            executor_uuid=executor_uuid,
-            address=host.address,
-            miner_hotkey=host.miner_hotkey,
-            gpu_model=host.gpu_model,
-            gpu_count=host.gpu_count,
-        )
+        await lifecycle.touch_host(host)
 
         if host.gpu_model not in BASE_GPU_MAP:
             # Same guard as the manual-rental and switch-grace syntheses, same reason: an
@@ -2339,19 +2307,6 @@ class MinerService:
                         ),
                     ),
                 )
-                if (
-                    len(msg.executors) == 0
-                    and not self._has_manual_rental_executors(payload, rented_data)
-                    and not settings.ENABLE_CVM_LIFECYCLE
-                ):
-                    # See the WebSocket path: zero executors is the expected shape when every
-                    # executor is under a manual rental — and, with the lifecycle on, when the
-                    # miner's only node is a cvmd host mid-rental or mid-switch (DAH-2674), so
-                    # the decision is deferred until after the sweep below.
-                    return self._build_failed_job_result(
-                        payload,
-                        "Miner returned zero executors in AcceptSSHKeyRequest",
-                    )
                 tasks = [
                     asyncio.create_task(
                         asyncio.wait_for(
@@ -2378,8 +2333,8 @@ class MinerService:
                     self._build_manual_rental_results(payload, rented_data, existing=results)
                 )
                 # DAH-2629/2630/2674 — same accounting as the WebSocket path, including the
-                # deferred zero-executor decision: if no synthesis produced anything either,
-                # the failure record is emitted exactly as before.
+                # after-the-sweep zero-executor decision: if no synthesis produced anything
+                # either, the failure record is emitted exactly as before.
                 results.extend(
                     await self._record_and_grace_cvm_hosts(
                         payload, existing=results, rented_data=rented_data

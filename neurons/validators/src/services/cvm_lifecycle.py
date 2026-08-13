@@ -31,7 +31,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from core.config import settings
@@ -118,17 +118,40 @@ class CvmdHost:
 
 
 @dataclass(frozen=True)
+class PortForward:
+    """One host-side port forward from cvmd's state answer, reduced to what callers decide on."""
+
+    host_port: int
+    address: str
+
+    @property
+    def is_loopback(self) -> bool:
+        return self.address.startswith("127.") or self.address == "localhost"
+
+
+@dataclass(frozen=True)
 class SwitchAssessment:
-    """What one state read says about a possibly-switching node."""
+    """What one state read says about a possibly-switching node.
+
+    `assess` is the only reader of cvmd's wire format: every fact a caller decides on
+    (has_cvm, supervisor_alive, a port forward) is folded here, so no other module carries
+    the state answer's key names or their absent-means-what conventions.
+    """
 
     reachable: bool
     state: str | None = None
-    has_cvm: bool = False
     switching: bool = False
     elapsed_seconds: float | None = None
     # The state answer's `cvm` object, verbatim. Carried so the renter-CVM handling can read
     # the forward list (the attest-agent probe needs a host port) without a second state call.
     cvm: dict | None = None
+    # cvmd's own /proc read of its supervisor. Tri-state on purpose: None means the state
+    # answer did not carry the field (an older cvmd), which must never read as "dead".
+    supervisor_alive: bool | None = None
+
+    @property
+    def has_cvm(self) -> bool:
+        return self.cvm is not None
 
     @property
     def idle_without_cvm(self) -> bool:
@@ -138,6 +161,27 @@ class SwitchAssessment:
     def renter_running(self) -> bool:
         """A renter holds this node's CVM — the state cvmd reports for the whole rental."""
         return self.state == STATE_RENTER_RUNNING and self.has_cvm
+
+    def forward_for(self, guest_port: int) -> PortForward | None:
+        """The host-side forward for one guest port, or None when the list carries nothing
+        this validator could dial — a missing, portless, or malformed entry all read as
+        "no forward"."""
+        ports = (self.cvm or {}).get("ports") or []
+        entry = next(
+            (
+                item
+                for item in ports
+                if isinstance(item, dict) and item.get("guest_port") == guest_port
+            ),
+            None,
+        )
+        if entry is None or not entry.get("host_port"):
+            return None
+        try:
+            host_port = int(entry["host_port"])
+        except (TypeError, ValueError):
+            return None
+        return PortForward(host_port=host_port, address=str(entry.get("address") or ""))
 
 
 def _parse_started_at(last_switch: dict | None) -> datetime | None:
@@ -212,6 +256,26 @@ class CvmLifecycleService:
                 extra=get_extra_info({"executor_uuid": executor_uuid, "error": str(exc)}),
             ))
 
+    async def touch_host(self, host: CvmdHost) -> None:
+        """Refresh one host's registry TTL from a record the caller just read out of it.
+
+        Write-only on purpose: `record_host`'s merge re-read exists for callers holding
+        fresh payload data, and this caller's fields ARE the stored record, so a re-read
+        could never contribute anything. A rental can run 720 hours against a 7-day TTL;
+        without the refresh the host would age out of the very sweep that scores it.
+        """
+        try:
+            await self.redis_service.hset(
+                CVMD_HOSTS_KEY,
+                host.executor_uuid,
+                replace(host, updated_at=time.time()).to_json(),
+            )
+        except Exception as exc:  # noqa: BLE001 - registry writes must never break a cycle
+            logger.warning(_m(
+                "Could not refresh a cvmd host's registry entry",
+                extra=get_extra_info({"executor_uuid": host.executor_uuid, "error": str(exc)}),
+            ))
+
     async def hosts_for_miner(self, miner_hotkey: str) -> list[CvmdHost]:
         """This miner's registered cvmd hosts, with aged-out entries pruned as they are seen."""
         try:
@@ -260,7 +324,9 @@ class CvmLifecycleService:
         cvm = body.get("cvm")
         if not isinstance(cvm, dict):
             cvm = None
-        has_cvm = cvm is not None
+        supervisor_alive = cvm.get("supervisor_alive") if cvm else None
+        if not isinstance(supervisor_alive, bool):
+            supervisor_alive = None
         switching = state in (STATE_TEARDOWN, STATE_SWITCHING)
         elapsed = None
         if switching:
@@ -270,10 +336,10 @@ class CvmLifecycleService:
         return SwitchAssessment(
             reachable=True,
             state=state,
-            has_cvm=has_cvm,
             switching=switching,
             elapsed_seconds=elapsed,
             cvm=cvm,
+            supervisor_alive=supervisor_alive,
         )
 
     # ------------------------------------------------------------------ DAH-2629: launch
@@ -438,17 +504,8 @@ class CvmLifecycleService:
             "executor_uuid": host.executor_uuid,
             "miner_hotkey": host.miner_hotkey,
         })
-        ports = (assessment.cvm or {}).get("ports") or []
-        mapping = next(
-            (
-                entry
-                for entry in ports
-                if isinstance(entry, dict)
-                and entry.get("guest_port") == settings.CVM_ATTEST_AGENT_GUEST_PORT
-            ),
-            None,
-        )
-        if mapping is None or not mapping.get("host_port"):
+        forward = assessment.forward_for(settings.CVM_ATTEST_AGENT_GUEST_PORT)
+        if forward is None:
             # The fleet forward list does not carry the agent's port — a config gap worth
             # a log line, not an error: the probe is optional until enforcement exists.
             logger.info(_m(
@@ -457,8 +514,7 @@ class CvmLifecycleService:
             ))
             return
 
-        bind_address = str(mapping.get("address") or "")
-        if bind_address.startswith("127.") or bind_address == "localhost":
+        if forward.is_loopback:
             # cvmd's port parser defaults the bind address to 127.0.0.1, and a loopback
             # forward is reachable from the CVM host alone. Dialing the public address would
             # time out every cycle and read, fleet-wide, as "the agent is never up" — the
@@ -467,7 +523,7 @@ class CvmLifecycleService:
             logger.info(_m(
                 f"{CVM_ATTEST_PROBE_FAILED_EVENT} — the agent's forward is bound to loopback "
                 f"on the host, so this validator cannot reach it",
-                extra={**extra, "bind_address": bind_address, "host_port": mapping.get("host_port")},
+                extra={**extra, "bind_address": forward.address, "host_port": forward.host_port},
             ))
             return
 
@@ -476,7 +532,7 @@ class CvmLifecycleService:
         # Anything truly unexpected surfaces through `_reap_background`.
         try:
             result = await self.agent_relay.forward(
-                base_url=f"https://{host.address}:{mapping['host_port']}",
+                base_url=f"https://{host.address}:{forward.host_port}",
                 method="GET",
                 path="/health",
                 body="",
@@ -511,4 +567,8 @@ class CvmLifecycleService:
 
     def schedule_attest_probe(self, host: CvmdHost, assessment: SwitchAssessment) -> None:
         """Fire the probe as its own task — a slow agent must never extend a validation cycle."""
+        if not settings.ENABLE_CVM_ATTEST_PROBE:
+            # The coroutine guards itself too (for direct callers); checking here as well keeps
+            # the default-off configuration from allocating a task just to throw it away.
+            return
         self._spawn_background(self.probe_attest_agent(host, assessment))

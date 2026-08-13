@@ -198,7 +198,7 @@ HOST = CvmdHost(
     updated_at=0.0,
 )
 
-IDLE = SwitchAssessment(reachable=True, state="RECONCILING", has_cvm=False)
+IDLE = SwitchAssessment(reachable=True, state="RECONCILING")
 
 
 def make_lifecycle(catalog_entry, *, cooldown_active=False):
@@ -314,9 +314,11 @@ class TestEnsureValidationCvm:
         service.client.launch_validation = AsyncMock()
 
         for assessment in (
-            SwitchAssessment(reachable=True, state="RENTER_RUNNING", has_cvm=True),
-            SwitchAssessment(reachable=True, state="SWITCHING", has_cvm=True, switching=True),
-            SwitchAssessment(reachable=True, state="FAILED", has_cvm=False),
+            SwitchAssessment(reachable=True, state="RENTER_RUNNING", cvm={"instance_id": "r-1"}),
+            SwitchAssessment(
+                reachable=True, state="SWITCHING", cvm={"instance_id": "s-1"}, switching=True
+            ),
+            SwitchAssessment(reachable=True, state="FAILED"),
             SwitchAssessment(reachable=False),
         ):
             assert await service.ensure_validation_cvm(HOST, assessment=assessment) is False

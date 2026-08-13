@@ -21,54 +21,46 @@ The hardware leg of DAH-2678 — the same sweep against a real cvmd on a TDX hos
 au11 via tools/cvm-local-e2e, not here.
 """
 
-from types import SimpleNamespace
-
 import pytest
+from cvm_helpers import PAYLOAD, cvmd_host, make_miner_service, rented_data_for
 from datura.requests.miner_requests import ExecutorSSHInfo
-from test_dah2674_rental_scoring import make_miner_service, rented_data_for
 
 from core.config import settings
-from services.cvm_lifecycle import CvmdHost, SwitchAssessment
+from services.cvm_lifecycle import SwitchAssessment
 from services.task.models import JobResult
 
-PAYLOAD = SimpleNamespace(miner_hotkey="5Miner", miner_coldkey="5Cold", job_batch_id="batch-1")
-
-
-def host(uuid="e-1", address="203.0.113.7"):
-    return CvmdHost(
-        executor_uuid=uuid,
-        address=address,
-        miner_hotkey="5Miner",
-        gpu_model="NVIDIA H200",
-        gpu_count=8,
-        updated_at=0.0,
-    )
-
-
 UNREACHABLE = SwitchAssessment(reachable=False)
-IDLE_EMPTY = SwitchAssessment(reachable=True, state="RECONCILING", has_cvm=False)
-LAUNCHING = SwitchAssessment(reachable=True, state="LAUNCHING", has_cvm=False)
+IDLE_EMPTY = SwitchAssessment(reachable=True, state="RECONCILING")
+LAUNCHING = SwitchAssessment(reachable=True, state="LAUNCHING")
 VALIDATION_RUNNING = SwitchAssessment(
-    reachable=True, state="VALIDATION_RUNNING", has_cvm=True, cvm={"instance_id": "v-1"}
+    reachable=True, state="VALIDATION_RUNNING", cvm={"instance_id": "v-1"}
 )
 SWITCHING_IN_BUDGET = SwitchAssessment(
-    reachable=True, state="SWITCHING", has_cvm=True, switching=True, elapsed_seconds=30.0
+    reachable=True,
+    state="SWITCHING",
+    cvm={"instance_id": "s-1"},
+    switching=True,
+    elapsed_seconds=30.0,
 )
 SWITCHING_OVER_BUDGET = SwitchAssessment(
-    reachable=True, state="SWITCHING", has_cvm=True, switching=True, elapsed_seconds=301.0
+    reachable=True,
+    state="SWITCHING",
+    cvm={"instance_id": "s-1"},
+    switching=True,
+    elapsed_seconds=301.0,
 )
 RENTER_RUNNING = SwitchAssessment(
     reachable=True,
     state="RENTER_RUNNING",
-    has_cvm=True,
     cvm={
         "instance_id": "r-1",
         "rental_id": "rental-1",
         "supervisor_alive": True,
         "ports": [],
     },
+    supervisor_alive=True,
 )
-FAILED = SwitchAssessment(reachable=True, state="FAILED", has_cvm=False)
+FAILED = SwitchAssessment(reachable=True, state="FAILED")
 
 
 @pytest.fixture
@@ -98,7 +90,7 @@ class TestEveryStateInOneTable:
     async def test_what_one_state_earns(
         self, full_lifecycle_on, assessment, synthesized, launch_scheduled
     ):
-        service, lifecycle = make_miner_service([host()], [assessment])
+        service, lifecycle = make_miner_service([cvmd_host()], [assessment])
 
         results = await service._record_and_grace_cvm_hosts(
             PAYLOAD, existing=[], rented_data=rented_data_for("e-1")
@@ -120,11 +112,11 @@ class TestOneCycleAcrossAMixedFleet:
         the rented node synthesize a pass; the empty host gets its launch scheduled; the rest
         contribute nothing. The per-state table above says each row; this says they compose."""
         fleet = [
-            host("e-idle", "203.0.113.1"),
-            host("e-validating", "203.0.113.2"),
-            host("e-switching", "203.0.113.3"),
-            host("e-rented", "203.0.113.4"),
-            host("e-failed", "203.0.113.5"),
+            cvmd_host("e-idle", "203.0.113.1"),
+            cvmd_host("e-validating", "203.0.113.2"),
+            cvmd_host("e-switching", "203.0.113.3"),
+            cvmd_host("e-rented", "203.0.113.4"),
+            cvmd_host("e-failed", "203.0.113.5"),
         ]
         service, lifecycle = make_miner_service(
             fleet,
@@ -167,7 +159,7 @@ class TestOneCycleAcrossAMixedFleet:
             gpu_model="NVIDIA H200",
             gpu_count=8,
         )
-        service, lifecycle = make_miner_service([host("e-rented")], [RENTER_RUNNING])
+        service, lifecycle = make_miner_service([cvmd_host("e-rented")], [RENTER_RUNNING])
 
         results = await service._record_and_grace_cvm_hosts(
             PAYLOAD, existing=[answered], rented_data=rented_data_for("e-rented")
@@ -189,7 +181,7 @@ class TestEverythingOffIsToday:
         monkeypatch.setattr(settings, "CVM_SWITCH_BUDGET_SECONDS_BY_GPU_MODEL", "", raising=False)
 
         for assessment in (SWITCHING_IN_BUDGET, RENTER_RUNNING):
-            service, _ = make_miner_service([host()], [assessment])
+            service, _ = make_miner_service([cvmd_host()], [assessment])
             results = await service._record_and_grace_cvm_hosts(
                 PAYLOAD, existing=[], rented_data=rented_data_for("e-1")
             )

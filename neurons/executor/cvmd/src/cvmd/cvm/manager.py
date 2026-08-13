@@ -248,11 +248,6 @@ class CvmManager:
         attempt = instance.relaunch_attempts + 1
         self._instances.update(relaunch_attempts=attempt)
 
-        # The surviving directory still holds the PREVIOUS life's pid file, and `spawn`
-        # returns the first pid it can read from that file — the fresh launch paths never
-        # see this because their directory is brand new. Without the unlink, the record
-        # would name a dead (or recycled) pid while the new guest boots.
-        (vm_dir / supervisor.PID_FILE).unlink(missing_ok=True)
         try:
             pid = supervisor.spawn(
                 scripts_dir=self._config.dstack_scripts_dir,

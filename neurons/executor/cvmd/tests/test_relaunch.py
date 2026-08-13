@@ -16,9 +16,11 @@ The claims pinned here:
 
 No readiness is asserted because none is probed: a live supervisor is the same evidence the
 adopt path accepts, and whether the sealing key actually unlocks the same disk is the
-hardware half of DAH-2679 (a TDX host, not this suite).
+hardware half of DAH-2679 (a TDX host, not this suite). The stale pid file a surviving
+directory still holds is `spawn`'s own concern, pinned in test_supervisor.py.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -31,7 +33,7 @@ from cvmd.state.machine import NodeState
 from cvmd.state.store import StateStore
 
 STALE_PID = 999_999_999
-NEW_PID = 424242
+NEW_PID = 424242  # the pid conftest's `spawned` fixture reports for every fake spawn
 
 
 def seed_cvm(
@@ -95,35 +97,15 @@ def relaunch_config(launch_config: LaunchConfig) -> LaunchConfig:
     return replace(launch_config, relaunch_renter=True)
 
 
-@pytest.fixture
-def dead_supervisor(monkeypatch):
-    """The recorded pid is gone, and nothing else holds a TDX guest on this host."""
-    monkeypatch.setattr(supervisor, "is_supervisor", lambda pid, vm_dir: False)
-    monkeypatch.setattr(supervisor, "running_cvms", list)
-
-
-@pytest.fixture
-def respawn(monkeypatch, dead_supervisor) -> list[dict]:
-    """Record the re-spawn instead of starting QEMU."""
-    calls: list[dict] = []
-
-    def fake_spawn(*, scripts_dir, vm_dir, kp_port):
-        calls.append({"scripts_dir": scripts_dir, "vm_dir": vm_dir, "kp_port": kp_port})
-        return NEW_PID
-
-    monkeypatch.setattr(supervisor, "spawn", fake_spawn)
-    return calls
-
-
 class TestTheRelaunch:
     def test_a_rebooted_renter_cvm_comes_back_over_its_own_directory(
-        self, state_dir, relaunch_config, respawn
+        self, state_dir, relaunch_config, spawned
     ):
         vm_dir = seed_cvm(state_dir, relaunch_config)
         manager = make_manager(state_dir, relaunch_config)
 
         assert manager.reconcile() is NodeState.RENTER_RUNNING
-        assert respawn == [
+        assert spawned == [
             {
                 "scripts_dir": relaunch_config.dstack_scripts_dir,
                 "vm_dir": vm_dir,
@@ -133,7 +115,7 @@ class TestTheRelaunch:
         assert manager._store.document.last_error is None
 
     def test_the_record_carries_the_new_pid_and_the_spent_attempt(
-        self, state_dir, relaunch_config, respawn
+        self, state_dir, relaunch_config, spawned
     ):
         seed_cvm(state_dir, relaunch_config)
         manager = make_manager(state_dir, relaunch_config)
@@ -151,31 +133,10 @@ class TestTheRelaunch:
         instance = InstanceStore(state_dir).current
         assert "relaunch_attempts" not in instance.report()
 
-    def test_the_previous_lifes_pid_file_is_removed_before_the_spawn(
-        self, state_dir, relaunch_config, dead_supervisor, monkeypatch
-    ):
-        """`spawn` returns the first pid it can read from `supervisor.pid`, and the surviving
-        directory still holds the OLD life's file — without the unlink, the record would name
-        a dead (or recycled) pid while the new guest boots."""
-        vm_dir = seed_cvm(state_dir, relaunch_config)
-        (vm_dir / "supervisor.pid").write_text(f"{STALE_PID}\n")
-        seen: list[bool] = []
-
-        def fake_spawn(*, scripts_dir, vm_dir, kp_port):
-            seen.append((vm_dir / "supervisor.pid").exists())
-            return NEW_PID
-
-        monkeypatch.setattr(supervisor, "spawn", fake_spawn)
-        manager = make_manager(state_dir, relaunch_config)
-
-        assert manager.reconcile() is NodeState.RENTER_RUNNING
-        assert seen == [False], "the stale pid file must be gone before the supervisor starts"
-        assert manager._instances.current.supervisor_pid == NEW_PID
-
 
 class TestWhatDeclines:
     def test_the_flag_defaults_off_and_off_fails_exactly_as_before(
-        self, state_dir, launch_config, respawn
+        self, state_dir, launch_config, spawned
     ):
         assert LaunchConfig().relaunch_renter is False
         seed_cvm(state_dir, launch_config)
@@ -183,17 +144,17 @@ class TestWhatDeclines:
 
         assert manager.reconcile() is NodeState.FAILED
         assert "is gone but its directory" in manager._store.document.last_error
-        assert respawn == []
+        assert spawned == []
 
-    def test_a_validation_cvm_never_relaunches(self, state_dir, relaunch_config, respawn):
+    def test_a_validation_cvm_never_relaunches(self, state_dir, relaunch_config, spawned):
         seed_cvm(state_dir, relaunch_config, kind="validation")
         manager = make_manager(state_dir, relaunch_config)
 
         assert manager.reconcile() is NodeState.FAILED
-        assert respawn == []
+        assert spawned == []
 
     def test_an_interrupted_teardown_is_never_resurrected(
-        self, state_dir, relaunch_config, respawn
+        self, state_dir, relaunch_config, spawned
     ):
         """`destroy` persists TEARDOWN before it kills anything. A crash mid-teardown must
         stay dead: relaunching it would boot a rental the platform already destroyed, over
@@ -202,10 +163,10 @@ class TestWhatDeclines:
         manager = make_manager(state_dir, relaunch_config)
 
         assert manager.reconcile() is NodeState.FAILED
-        assert respawn == []
+        assert spawned == []
 
     def test_a_directory_whose_disk_is_gone_has_nothing_to_boot(
-        self, state_dir, relaunch_config, respawn, monkeypatch
+        self, state_dir, relaunch_config, spawned
     ):
         vm_dir = seed_cvm(state_dir, relaunch_config, with_disk=False)
         # Keep something in the directory so it "remains" for the failure message's purposes.
@@ -213,10 +174,10 @@ class TestWhatDeclines:
         manager = make_manager(state_dir, relaunch_config)
 
         assert manager.reconcile() is NodeState.FAILED
-        assert respawn == []
+        assert spawned == []
 
     def test_a_stray_tdx_guest_blocks_the_relaunch(
-        self, state_dir, relaunch_config, respawn, monkeypatch
+        self, state_dir, relaunch_config, spawned, monkeypatch
     ):
         """GPU passthrough is exclusive — booting over a foreign guest double-books it."""
         seed_cvm(state_dir, relaunch_config)
@@ -226,12 +187,12 @@ class TestWhatDeclines:
         manager = make_manager(state_dir, relaunch_config)
 
         assert manager.reconcile() is NodeState.FAILED
-        assert respawn == []
+        assert spawned == []
 
 
 class TestTheAttemptCap:
     def test_a_failed_spawn_spends_the_attempt_and_fails_the_node(
-        self, state_dir, relaunch_config, dead_supervisor, monkeypatch
+        self, state_dir, relaunch_config, spawned, monkeypatch
     ):
         seed_cvm(state_dir, relaunch_config)
 
@@ -248,13 +209,13 @@ class TestTheAttemptCap:
         )
 
     def test_past_the_cap_the_node_fails_instead_of_looping(
-        self, state_dir, relaunch_config, respawn
+        self, state_dir, relaunch_config, spawned
     ):
         seed_cvm(state_dir, relaunch_config, attempts=RELAUNCH_MAX_ATTEMPTS)
         manager = make_manager(state_dir, relaunch_config)
 
         assert manager.reconcile() is NodeState.FAILED
-        assert respawn == []
+        assert spawned == []
 
 
 class TestOldRecordsStillDecode:
@@ -263,8 +224,6 @@ class TestOldRecordsStillDecode:
     ):
         """The field is new; the fleet's records are not. An old record must not read as
         corrupt — that would fail the node for a schema change."""
-        import json
-
         vm_dir = relaunch_config.run_dir / "old-cvm"
         record = {
             "version": 1,
