@@ -412,8 +412,10 @@ async def test_g1_per_gpu_claims_checked(service, monkeypatch):
         return _nras_response(
             overall=True,
             nonce=nonce.value_hex,
-            per_gpu={"GPU-0": {"measres": "success", "eat_nonce": nonce.value_hex},
-                     "GPU-1": {"measres": "fail", "eat_nonce": nonce.value_hex}},
+            per_gpu={"GPU-0": {"measres": "success", "eat_nonce": nonce.value_hex,
+                               "ueid": "ueid-0"},
+                     "GPU-1": {"measres": "fail", "eat_nonce": nonce.value_hex,
+                               "ueid": "ueid-1"}},
         )
 
     monkeypatch.setattr(service, "_post_nras", fake_post)
@@ -434,13 +436,58 @@ async def test_g1_nras_pass_returns_true(service, monkeypatch):
             overall=True,
             nonce=nonce.value_hex,
             per_gpu={"GPU-0": {"measres": "success", "eat_nonce": nonce.value_hex,
-                               "dbgstat": "disabled", "secboot": True}},
+                               "dbgstat": "disabled", "secboot": True, "ueid": "ueid-0"}},
         )
 
     monkeypatch.setattr(service, "_post_nras", fake_post)
 
     # Act / Assert
     assert await service._verify_gpu(executor, nonce) is True
+    assert service._last_gpu_ueids == ["ueid-0"]
+
+
+async def test_g1_a_gpu_that_does_not_identify_itself_fails(service, monkeypatch):
+    """The ueid is the only GPU identifier the node cannot choose, so a per-GPU token
+    without one is a GPU this response cannot identify. Left silent it would just shrink the
+    attested set, and every count taken on that set would quietly agree."""
+    monkeypatch.setattr(settings, "ENABLE_GPU_ATTESTATION_ENFORCEMENT", True)
+    nonce = AttestationNonce.issue()
+    executor = _make_executor(nvidia_payload=_gpu_payload(nonce.value_hex))
+
+    async def fake_post(payload, executor_):
+        return _nras_response(
+            overall=True,
+            nonce=nonce.value_hex,
+            per_gpu={"GPU-0": {"measres": "success", "ueid": "ueid-0"},
+                     "GPU-1": {"measres": "success"}},
+        )
+
+    monkeypatch.setattr(service, "_post_nras", fake_post)
+
+    with pytest.raises(AttestationError, match="GPU-1:ueid_missing"):
+        await service._verify_gpu(executor, nonce)
+
+
+async def test_g1_two_gpus_with_one_identity_fail(service, monkeypatch):
+    """One ueid answering twice is one GPU counted twice. Deduplicating would hide it:
+    either the response describes two devices and one is impersonating the other, or it
+    describes one and the count is inflated."""
+    monkeypatch.setattr(settings, "ENABLE_GPU_ATTESTATION_ENFORCEMENT", True)
+    nonce = AttestationNonce.issue()
+    executor = _make_executor(nvidia_payload=_gpu_payload(nonce.value_hex))
+
+    async def fake_post(payload, executor_):
+        return _nras_response(
+            overall=True,
+            nonce=nonce.value_hex,
+            per_gpu={"GPU-0": {"measres": "success", "ueid": "same-ueid"},
+                     "GPU-1": {"measres": "success", "ueid": "same-ueid"}},
+        )
+
+    monkeypatch.setattr(service, "_post_nras", fake_post)
+
+    with pytest.raises(AttestationError, match="ueid_duplicate"):
+        await service._verify_gpu(executor, nonce)
 
 
 async def test_g1_nras_unreachable_fail_closed_when_enforced(service, monkeypatch):

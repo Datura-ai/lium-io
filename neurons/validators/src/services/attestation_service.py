@@ -39,6 +39,14 @@ TDX_LAST_ATTESTATION_EVENT_PREFIX = "tdx_last_attestation_event"
 # contract, so a copy that drifts must fail a test rather than silently accept a wrong set.
 GPU_UUID_SEPARATOR = ","
 
+# The domain-separation tag the renter agent hashes ahead of its identity material
+# (attest-agent/identity.py:RENTER_IDENTITY_DOMAIN_V1). It gives those 32 bytes one stated
+# purpose, so nothing else ever taken over the same TLS key can be read as this binding, and
+# it carries the version inside the hashed bytes: a later recipe is a new tag this validator
+# either knows or refuses, never an old digest reinterpreted. Reproduced here for the same
+# reason as the separator above — separate package, wire contract, drift must fail a test.
+RENTER_IDENTITY_DOMAIN_V1 = b"LIUM_RENTER_ATTEST_TLS_V1\x00"
+
 # DAH-2675 — the three verdicts on a rented CVM's live quote. Three, not two, because two of
 # the outcomes lead to opposite decisions and must not share an encoding: REJECTED means the
 # evidence was examined and failed (earns nothing), while UNAVAILABLE means nothing could be
@@ -261,8 +269,30 @@ class AttestationService:
 
         This mirrors `attest-agent/identity.py:gpu_uuid_digest`. The two must agree exactly or a
         correct node fails verification, which is why the separator is pinned as a constant.
+
+        What it is NOT is proof of the GPU set. NVML identifiers are read by the guest; binding
+        them keeps the host from swapping the claim in flight, and stops there. Which GPUs are
+        really present is settled by the per-GPU ueids in the NVIDIA evidence — see
+        `_rented_gpu_identity`.
         """
         return hashlib.sha256(GPU_UUID_SEPARATOR.join(sorted(uuids)).encode()).digest()
+
+    @staticmethod
+    def renter_identity_digest(tls_public_key_der: bytes, uuids: list[str]) -> bytes:
+        """The identity half of a renter CVM's report_data.
+
+            sha256("LIUM_RENTER_ATTEST_TLS_V1\\0" ‖ tls_spki_der ‖ gpu_uuid_digest(uuids))
+
+        The key is hashed as its SubjectPublicKeyInfo DER — the encoding a TLS client reads off
+        the wire, and the one the agent takes out of its own certificate. The encoding is part
+        of the recipe, not an implementation detail: this validator only ever holds wire bytes,
+        so any other encoding reproduces a different digest and fails an honest node.
+        """
+        return hashlib.sha256(
+            RENTER_IDENTITY_DOMAIN_V1
+            + tls_public_key_der
+            + AttestationService.gpu_uuid_digest(uuids)
+        ).digest()
 
     def _bound_gpu_digest(self, executor: ExecutorSSHInfo) -> bytes | None:
         """The GPU digest to fold into the v2 identity, or None if it cannot be established.
@@ -273,10 +303,9 @@ class AttestationService:
         What the value is *for* is telling the validator which set to expect; what makes it
         evidence is that the hardware signed it.
 
-        `scraped_uuids` is the independent check, applied when this validator has already
-        collected the node's GPU UUIDs. A mismatch means the claim and the machine disagree,
-        which is refused rather than papered over — the whole point of FR-G6 is that a node
-        cannot claim GPUs it does not have.
+        That is an integrity argument and nothing more: it pins the guest to one claim about
+        its NVML devices. Whether those devices are real, genuine, and this many is answered by
+        the per-GPU ueids in the NVIDIA evidence (`_check_gpu_claims`), never here.
         """
         claimed = (executor.gpu_uuid_digest or "").strip().lower()
         if not claimed:
@@ -307,10 +336,14 @@ class AttestationService:
             v1  sha256("SSH_HOST_KEY:" | host_key)
             v2  sha256("SSH_HOST_KEY:" | host_key | gpu_uuid_digest)
 
-        v2 is the same identity material with the GPU set folded in, which is what makes "which
-        GPUs is this CVM holding" a hardware-signed claim instead of an asserted one. The renter
-        form substitutes the agent's TLS public key for the SSH host key, on the same shape, and
-        is produced by `attest-agent/identity.py`.
+        v2 is the same identity material with the guest's observed GPU set folded in, so that
+        set travels inside the hardware's signature instead of beside it — the host cannot
+        rewrite it, and it cannot be lifted onto another quote. It does not make those NVML
+        identifiers attested; that is what the ueids in the NVIDIA evidence are for.
+
+        The renter form is the same idea over the agent's TLS key rather than the SSH host key,
+        and carries an explicit versioned domain tag (RENTER_IDENTITY_DOMAIN_V1) where these two
+        rely on the `SSH_HOST_KEY:` prefix. See `renter_identity_digest`.
         """
         material = self.REPORT_PREFIX + (executor.ssh_host_key or "").encode("utf-8")
         digests: list[tuple[str, bytes]] = []
@@ -663,6 +696,12 @@ class AttestationService:
             ueid = claims.get("ueid")
             if isinstance(ueid, str) and ueid:
                 self._last_gpu_ueids.append(ueid)
+            else:
+                # A per-GPU token with no ueid is a GPU this response cannot identify. Left
+                # silent it would simply shrink the attested set, and every decision taken on
+                # that set — how many GPUs are here, whether one of them is also answering for
+                # another node — would quietly narrow to the GPUs that did identify themselves.
+                failures.append(f"gpu_att_failed:{gpu_name}:ueid_missing")
             if claims.get("measres") not in (None, "success"):
                 failures.append(f"gpu_att_failed:{gpu_name}:measres")
             if expected_nonce_hex:
@@ -679,6 +718,14 @@ class AttestationService:
             if allowed_hwmodels and isinstance(hwmodel, str):
                 if not any(hwmodel.startswith(allowed) for allowed in allowed_hwmodels):
                     failures.append(f"gpu_att_failed:{gpu_name}:hwmodel={hwmodel}")
+
+        # One ueid answering twice is one GPU counted twice. It has to fail here rather than be
+        # deduplicated, because either reading is a lie: if the response really describes two
+        # devices then one of them is impersonating the other, and if it describes one then the
+        # count is inflated.
+        duplicates = sorted({u for u in self._last_gpu_ueids if self._last_gpu_ueids.count(u) > 1})
+        if duplicates:
+            failures.append(f"gpu_att_failed:ueid_duplicate:{len(duplicates)}")
 
         return not failures, failures
 
@@ -945,6 +992,78 @@ class AttestationService:
             )
         logger.warning(_m("Renter CVM mismatch (not enforced)", extra=extra))
 
+    async def _rented_gpu_identity(
+        self,
+        answer: dict,
+        nonce: AttestationNonce,
+        origin: _QuoteOrigin,
+    ) -> tuple[list[str] | None, str | None, str]:
+        """What the NVIDIA evidence in a rented CVM's answer proves about its GPUs.
+
+        Returns (ueids, verdict, detail). A verdict that is not None settles the whole trust
+        check and the caller returns it as-is; otherwise `ueids` is the attested GPU set, or
+        None when there is no evidence to judge.
+
+        This is where the GPU set is actually established. The `gpu_uuids` bound into the
+        quote cannot do it: NVML identifiers are read by the guest and vouched for by nobody,
+        so binding them proves only that the host did not alter what the guest read. A `ueid`
+        comes out of evidence NVIDIA signed and is the one GPU identifier in this answer the
+        node cannot choose.
+
+        The three outcomes are the three this module already keeps apart. Evidence NRAS
+        examined and refused is REJECTED — a measured false claim earns nothing. NRAS being
+        unreachable is UNAVAILABLE, exactly as the TDX verifier being down is: this
+        validator's condition, not the node's. Evidence the agent never supplied is
+        observe-only unless GPU-attestation enforcement is on — the same posture and the same
+        flag as `_verify_gpu`, because when to fail a fleet on missing GPU evidence is one
+        decision, taken once.
+        """
+        payload = answer.get("gpu_evidence")
+        detail = str(answer.get("gpu_evidence_detail") or "no GPU evidence in the answer")
+        log_extra = {"executor": f"{origin.address}:{origin.port}", "detail": detail}
+
+        if not isinstance(payload, dict) or not payload.get("evidence_list"):
+            if settings.ENABLE_GPU_ATTESTATION_ENFORCEMENT:
+                return None, RENTAL_QUOTE_REJECTED, f"no attested GPU identity: {detail}"
+            logger.warning(_m(
+                "Rented CVM answered with no submittable GPU evidence: its GPU set is unattested",
+                extra=get_extra_info(log_extra),
+            ))
+            return None, None, f"GPU set unattested ({detail})"
+
+        # Both halves must answer THIS challenge. A quote and an evidence set assembled from
+        # two different moments is a replay however well each half verifies on its own.
+        if payload.get("nonce") != nonce.value_hex:
+            return None, RENTAL_QUOTE_REJECTED, "the GPU evidence is not bound to the issued nonce"
+
+        try:
+            nras_response = await self._post_nras(payload, origin)
+        except AttestationError as exc:
+            # Includes an HTTP error status from NRAS, which could be a malformed submission
+            # rather than an outage. Classed as unavailable anyway: this validator cannot tell
+            # the two apart from a status code, and the conservative reading of "cannot tell"
+            # is the one that does not punish. A node gains nothing by it — refusing to answer
+            # reaches the same fallback more cheaply, and what absence MEANS is DAH-2676's.
+            logger.warning(_m(
+                "NRAS could not judge a rented CVM's GPU evidence",
+                extra=get_extra_info({**log_extra, "error": str(exc)}),
+            ))
+            return None, RENTAL_QUOTE_UNAVAILABLE, f"NRAS could not be reached: {exc}"
+
+        # Read back before any await: `_last_gpu_ueids` is per-service, and this is the only
+        # point at which it is known to belong to this answer.
+        passed, failures = self._check_gpu_claims(nras_response, nonce.value_hex, origin)
+        ueids = list(self._last_gpu_ueids)
+        if not passed:
+            return (
+                None,
+                RENTAL_QUOTE_REJECTED,
+                "NVIDIA refused this CVM's GPU evidence — " + "; ".join(failures),
+            )
+        if not ueids:
+            return None, RENTAL_QUOTE_REJECTED, "the GPU evidence identified no GPU"
+        return ueids, None, f"{len(ueids)} GPU(s) attested by ueid"
+
     async def verify_rented_cvm_quote(
         self,
         answer: dict,
@@ -961,7 +1080,8 @@ class AttestationService:
 
         The identity binding is the renter recipe from attest-agent/identity.py:
 
-            report_data[:32]   == sha256(agent TLS public key ‖ gpu_uuid_digest(gpu_uuids))
+            report_data[:32]   == sha256(RENTER_IDENTITY_DOMAIN_V1 ‖ tls_spki_der
+                                         ‖ gpu_uuid_digest(gpu_uuids))
             report_data[32:64] == this call's nonce
 
         The TLS key and the GPU list come from the agent's own answer. Self-supplied, and
@@ -969,6 +1089,10 @@ class AttestationService:
         holds another produces a quote whose identity half this check will not match. What
         the values are FOR is telling this validator what to expect; what makes them
         evidence is the quote.
+
+        That argument covers tampering, not authenticity: it makes the GPU UUIDs the guest's
+        own unaltered claim, never NVIDIA's. The GPU set itself is settled separately, on the
+        per-GPU ueids in the evidence — see `_rented_gpu_identity`.
 
         A VERIFIED verdict is full evidence with no feature flag behind it. The order checks
         (compose, OS image, GPU count vs `expectations`) are enforced here unconditionally,
@@ -1017,7 +1141,7 @@ class AttestationService:
         if returned is None or len(returned) < 64:
             return RENTAL_QUOTE_REJECTED, "the quote carries no usable report_data"
 
-        expected_identity = hashlib.sha256(tls_key + self.gpu_uuid_digest(uuids)).digest()
+        expected_identity = self.renter_identity_digest(tls_key, uuids)
         if returned[:32] != expected_identity:
             return (
                 RENTAL_QUOTE_REJECTED,
@@ -1059,16 +1183,49 @@ class AttestationService:
                 mismatches.append(
                     f"{field_name}: sold {expected}, measured {app_info.get(field_name)}"
                 )
+
+        # The GPU set arrives as two different claims, and they are not interchangeable:
+        #
+        #   gpu_uuids   what the guest READ from NVML, bound into report_data. The binding
+        #               stops the host altering it in flight and stops it being lifted onto
+        #               another quote. It does not make NVIDIA vouch for those identifiers.
+        #   ueid        each GPU's own attested identity, out of NRAS-verified evidence — the
+        #               one identifier here the node cannot choose.
+        #
+        # So the UUIDs are held to the weaker job they can actually do: they may CONTRADICT
+        # the order, since a signed claim that disagrees with what was sold is a false claim
+        # whoever made it. What the hardware IS — that these GPUs exist, that they are
+        # genuine, that there are this many of them — rests on the ueids.
         expected_count = getattr(expectations, "gpu_count", None) if expectations else None
-        if expected_count is not None and len(uuids) != expected_count:
-            mismatches.append(f"gpu_count: sold {expected_count}, attested {len(uuids)}")
+        ueids, gpu_verdict, gpu_detail = await self._rented_gpu_identity(answer, nonce, origin)
+        if gpu_verdict is not None:
+            return gpu_verdict, gpu_detail
+
+        if ueids is not None:
+            if len(ueids) != len(uuids):
+                mismatches.append(
+                    f"gpu_set: the guest reported {len(uuids)}, NVIDIA attested {len(ueids)}"
+                )
+            if expected_count is not None and len(ueids) != expected_count:
+                mismatches.append(f"gpu_count: sold {expected_count}, attested {len(ueids)}")
+        elif expected_count is not None and len(uuids) != expected_count:
+            # No attested set to count. The quote's own claim still has to agree with the
+            # order — it cannot prove the GPUs are there, but it can prove the node said
+            # something else than it sold.
+            mismatches.append(
+                f"gpu_count: sold {expected_count}, guest reported {len(uuids)} (unattested)"
+            )
+
         if mismatches:
             return (
                 RENTAL_QUOTE_REJECTED,
                 "the CVM does not match what was sold — " + "; ".join(mismatches),
             )
 
-        return RENTAL_QUOTE_VERIFIED, "hardware-signed quote bound to this cycle's nonce"
+        return (
+            RENTAL_QUOTE_VERIFIED,
+            f"hardware-signed quote bound to this cycle's nonce; {gpu_detail}",
+        )
 
     async def _record_attested_executor(self, executor: ExecutorSSHInfo) -> None:
         """Ratchet: remember that this executor is a CVM (minimal-G5)."""

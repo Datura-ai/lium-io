@@ -3,9 +3,12 @@
 The claims pinned here:
 
   * a quote relayed through cvmd, bound to THIS cycle's fresh nonce and accepted by the
-    verifier against the agent recipe (sha256(TLS key ‖ gpu_uuid_digest) ‖ nonce) AND the
-    order's expectations, scores the node with NO feature flag — a verified quote is full
-    evidence, not a rollout experiment;
+    verifier against the agent recipe (sha256(domain tag ‖ TLS SPKI DER ‖ gpu_uuid_digest)
+    ‖ nonce) AND the order's expectations, scores the node with NO feature flag — a verified
+    quote is full evidence, not a rollout experiment;
+  * which GPUs the CVM holds is decided on the NRAS-verified per-GPU ueids, never on the
+    NVML UUIDs in the quote: those are the guest's own observation, bound so the host cannot
+    rewrite them, and binding is not authentication;
   * a quote the verifier examined and refused — bad identity binding, wrong nonce, or a
     measurement that contradicts what was sold — earns nothing, even with the DAH-2674
     fallback flag on: evidence of a false claim outranks the host-side signals;
@@ -19,7 +22,9 @@ The claims pinned here:
     and the three-way verdict encoding.
 """
 
+import base64
 import hashlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -59,8 +64,38 @@ def expectations_for(**overrides):
 
 
 def identity_half(tls_key: bytes = TLS_KEY, uuids: list[str] | None = None) -> bytes:
+    """The renter recipe, spelled out rather than imported from the code under test — the
+    bytes are a wire contract with a package that does not ship with this one."""
     gpu_digest = hashlib.sha256(",".join(sorted(uuids or GPU_UUIDS)).encode()).digest()
-    return hashlib.sha256(tls_key + gpu_digest).digest()
+    return hashlib.sha256(b"LIUM_RENTER_ATTEST_TLS_V1\x00" + tls_key + gpu_digest).digest()
+
+
+def gpu_evidence(nonce: AttestationNonce, count: int = 2) -> dict:
+    """What the agent returns beside the quote: submittable to NRAS as-is."""
+    return {
+        "nonce": nonce.value_hex,
+        "evidence_list": [{"gpu": index} for index in range(count)],
+        "arch": "HOPPER",
+    }
+
+
+def nras_answer(nonce: AttestationNonce, ueids: list[str], *, overall: bool = True) -> list:
+    """An NRAS response in the shape `_check_gpu_claims` reads: the overall verdict as a
+    JWT, then one per-GPU token each carrying its own attested identity."""
+
+    def jwt(claims: dict) -> str:
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"header.{payload}.signature"
+
+    return [
+        ["JWT", jwt({"x-nvidia-overall-att-result": overall, "eat_nonce": nonce.value_hex})],
+        {
+            f"GPU-{index}": jwt(
+                {"measres": "success", "eat_nonce": nonce.value_hex, "ueid": ueid}
+            )
+            for index, ueid in enumerate(ueids)
+        },
+    ]
 
 
 def agent_answer(**overrides) -> dict:
@@ -98,12 +133,16 @@ def attestation(monkeypatch) -> AttestationService:
     return AttestationService(redis_service=None)
 
 
-async def judge(attestation, answer, payload, *, nonce=None, expectations=None):
+async def judge(attestation, answer, payload, *, nonce=None, expectations=None, nras=None):
     nonce = nonce or AttestationNonce.issue()
     if isinstance(payload, Exception):
         attestation._call_verifier = AsyncMock(side_effect=payload)
     else:
         attestation._call_verifier = AsyncMock(return_value=payload)
+    if isinstance(nras, Exception):
+        attestation._post_nras = AsyncMock(side_effect=nras)
+    elif nras is not None:
+        attestation._post_nras = AsyncMock(return_value=nras)
     return await attestation.verify_rented_cvm_quote(
         answer,
         nonce=nonce,
@@ -153,6 +192,21 @@ class TestTheVerificationMath:
         assert "identity" in reason
 
     @pytest.mark.asyncio
+    async def test_an_untagged_identity_digest_is_rejected(self, attestation):
+        """The domain tag is inside the hashed bytes, so the same key and GPU set hashed
+        without it is a different value. That is what the tag buys: nothing hashed over this
+        TLS key for another purpose, now or later, can be presented here as an identity."""
+        nonce = AttestationNonce.issue()
+        untagged = hashlib.sha256(
+            TLS_KEY + hashlib.sha256(",".join(sorted(GPU_UUIDS)).encode()).digest()
+        ).digest()
+        verdict, reason = await judge(
+            attestation, agent_answer(), verifier_payload(nonce, identity=untagged), nonce=nonce
+        )
+        assert verdict == RENTAL_QUOTE_REJECTED
+        assert "identity" in reason
+
+    @pytest.mark.asyncio
     async def test_a_quote_for_someone_elses_nonce_is_rejected(self, attestation):
         nonce = AttestationNonce.issue()
         stale = AttestationNonce.issue()
@@ -178,6 +232,125 @@ class TestTheVerificationMath:
             attestation, agent_answer(quote=""), verifier_payload(AttestationNonce.issue())
         )
         assert verdict == RENTAL_QUOTE_REJECTED
+
+
+class TestWhatDecidesTheGpuSet:
+    """The UUIDs in the quote and the ueids in the evidence are different kinds of claim.
+
+    An NVML UUID is read by the guest and vouched for by nobody: binding it into report_data
+    stops the host rewriting it in flight, and stops there. A ueid comes out of evidence
+    NVIDIA signed. So existence, authenticity and counting all rest on the ueids, and the
+    UUIDs are held to the one job they can do — contradicting the order.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_attested_ueids_are_what_the_count_is_taken_from(self, attestation):
+        nonce = AttestationNonce.issue()
+        verdict, reason = await judge(
+            attestation,
+            agent_answer(gpu_evidence=gpu_evidence(nonce)),
+            verifier_payload(nonce),
+            nonce=nonce,
+            nras=nras_answer(nonce, ["ueid-a", "ueid-b"]),
+        )
+        assert verdict == RENTAL_QUOTE_VERIFIED, reason
+        assert "2 GPU(s) attested by ueid" in reason
+
+    @pytest.mark.asyncio
+    async def test_a_guest_claiming_more_gpus_than_nvidia_attests_is_rejected(self, attestation):
+        """The quote binds two UUIDs and the hardware signed them — and one of the two is
+        still a device NVIDIA never vouched for. Exactly the gap the UUIDs cannot close."""
+        nonce = AttestationNonce.issue()
+        verdict, reason = await judge(
+            attestation,
+            agent_answer(gpu_evidence=gpu_evidence(nonce)),
+            verifier_payload(nonce),
+            nonce=nonce,
+            nras=nras_answer(nonce, ["ueid-a"]),
+        )
+        assert verdict == RENTAL_QUOTE_REJECTED
+        assert "gpu_set" in reason
+
+    @pytest.mark.asyncio
+    async def test_fewer_attested_gpus_than_sold_is_rejected(self, attestation):
+        nonce = AttestationNonce.issue()
+        one_gpu = ["GPU-aaa"]
+        verdict, reason = await judge(
+            attestation,
+            agent_answer(gpu_uuids=one_gpu, gpu_evidence=gpu_evidence(nonce, count=1)),
+            verifier_payload(nonce, identity=identity_half(uuids=one_gpu)),
+            nonce=nonce,
+            nras=nras_answer(nonce, ["ueid-a"]),
+        )
+        assert verdict == RENTAL_QUOTE_REJECTED
+        assert "gpu_count: sold 2, attested 1" in reason
+
+    @pytest.mark.asyncio
+    async def test_evidence_nvidia_refused_is_rejected(self, attestation):
+        nonce = AttestationNonce.issue()
+        verdict, reason = await judge(
+            attestation,
+            agent_answer(gpu_evidence=gpu_evidence(nonce)),
+            verifier_payload(nonce),
+            nonce=nonce,
+            nras=nras_answer(nonce, ["ueid-a", "ueid-b"], overall=False),
+        )
+        assert verdict == RENTAL_QUOTE_REJECTED
+        assert "NVIDIA refused" in reason
+
+    @pytest.mark.asyncio
+    async def test_evidence_for_another_challenge_is_rejected(self, attestation):
+        """A quote and an evidence set assembled from two moments is a replay, however well
+        each half verifies alone."""
+        nonce = AttestationNonce.issue()
+        verdict, reason = await judge(
+            attestation,
+            agent_answer(gpu_evidence=gpu_evidence(AttestationNonce.issue())),
+            verifier_payload(nonce),
+            nonce=nonce,
+        )
+        assert verdict == RENTAL_QUOTE_REJECTED
+        assert "not bound to the issued nonce" in reason
+
+    @pytest.mark.asyncio
+    async def test_nras_being_down_is_unavailable_not_rejected(self, attestation):
+        """This validator's condition, not the node's — the same class as the TDX verifier
+        being unreachable."""
+        nonce = AttestationNonce.issue()
+        verdict, reason = await judge(
+            attestation,
+            agent_answer(gpu_evidence=gpu_evidence(nonce)),
+            verifier_payload(nonce),
+            nonce=nonce,
+            nras=AttestationError("NRAS unreachable"),
+        )
+        assert verdict == RENTAL_QUOTE_UNAVAILABLE
+        assert "NRAS" in reason
+
+    @pytest.mark.asyncio
+    async def test_an_answer_with_no_evidence_leaves_the_gpu_set_unattested(self, attestation):
+        """Default posture: the quote still verifies, and the reason says plainly that the
+        GPU set is not attested — the count then falls back to contradicting the order."""
+        nonce = AttestationNonce.issue()
+        verdict, reason = await judge(
+            attestation, agent_answer(), verifier_payload(nonce), nonce=nonce
+        )
+        assert verdict == RENTAL_QUOTE_VERIFIED
+        assert "unattested" in reason
+
+    @pytest.mark.asyncio
+    async def test_no_evidence_is_rejected_once_gpu_enforcement_is_on(
+        self, attestation, monkeypatch
+    ):
+        """Same flag, same meaning as the validation path: when the fleet enforces GPU
+        attestation, a CVM that cannot identify its GPUs earns nothing."""
+        monkeypatch.setattr(settings, "ENABLE_GPU_ATTESTATION_ENFORCEMENT", True, raising=False)
+        nonce = AttestationNonce.issue()
+        verdict, reason = await judge(
+            attestation, agent_answer(), verifier_payload(nonce), nonce=nonce
+        )
+        assert verdict == RENTAL_QUOTE_REJECTED
+        assert "no attested GPU identity" in reason
 
 
 class TestTheOrderChecks:

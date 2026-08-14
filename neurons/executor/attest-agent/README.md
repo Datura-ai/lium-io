@@ -34,21 +34,33 @@ The answer carries a fresh TDX quote and NVIDIA CC evidence, both bound to the c
 nonce:
 
 ```
-report_data = sha256(agent_tls_public_key ‖ gpu_uuid_digest) ‖ nonce
-              |________________ 32 bytes _________________|  |_ 32 _|
-                      identity                                freshness
+report_data = sha256("LIUM_RENTER_ATTEST_TLS_V1\0" ‖ tls_spki_der ‖ gpu_uuid_digest) ‖ nonce
+              |_______________________ 32 bytes ______________________________|  |_ 32 _|
+                                 identity                                         freshness
 ```
+
+**The tag is versioned and NUL-terminated** so these 32 bytes state their purpose. Without
+it the digest is just "a hash over a TLS key", indistinguishable from any other use of the
+same key material, and a later recipe would be the same bytes read a second way instead of
+a new construction a verifier can accept or refuse by name.
 
 **The TLS key is in there because the quote and the channel have to be the same thing.**
 The validator's only way into a renter CVM is this agent's TLS endpoint. A quote that did
 not name the key proves some TDX guest exists somewhere; an attacker who can terminate TLS
 relays a genuine quote from a CVM it does not own, and the verifier cannot tell. The key is
 generated *inside* the guest on first boot, so its private half exists only in encrypted
-CVM memory and on the CVM's encrypted disk.
+CVM memory and on the CVM's encrypted disk. It is hashed as its SubjectPublicKeyInfo DER —
+the bytes a client sees on the wire, since that is all a verifier holds.
 
-**The GPU UUIDs are in there because of FR-G6.** Today those identifiers travel on a
-channel no proof covers, so a node can claim GPUs it does not hold. Folding their digest
-into the same 32 bytes makes the GPU set hardware-attested rather than software-asserted.
+**The GPU UUIDs are in there because of FR-G6** — so the GPU claim travels inside the
+hardware's signature instead of beside it, where the host could rewrite it or move it onto
+another quote.
+
+**What that does not do is authenticate the GPUs.** NVML UUIDs are read by the guest and
+vouched for by nobody. Whether those GPUs exist, are genuine, are in CC mode, and are not
+also answering for another node is decided on the per-GPU `ueid` claims in the NVIDIA
+evidence returned beside the quote — the one GPU identifier here a node cannot choose. The
+validator counts ueids, and refuses a response with a missing or repeated one.
 
 ## Idempotent, not amnesiac
 
@@ -69,6 +81,10 @@ A CVM with no GPUs, or a build without the NVIDIA verifier stack, returns `null`
 evidence **with a stated reason** — never an empty list. "This CVM holds no GPUs" and "this
 agent could not tell" lead to opposite decisions on the validator's side, so they do not
 share an encoding.
+
+When evidence is produced it is returned as the payload NRAS accepts —
+`{"nonce", "evidence_list", "arch"}` — not a bare evidence list, which NRAS will not judge.
+The collection flow mirrors the executor's own collector, single-GPU branch included.
 
 The dstack SDK and the NVIDIA stack are not declared in `pyproject.toml`: both exist only
 inside a CVM and both drag fragile native trees, so declaring them would make the agent

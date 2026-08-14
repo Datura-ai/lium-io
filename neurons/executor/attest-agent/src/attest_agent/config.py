@@ -10,6 +10,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from attest_agent.evidence import DEFAULT_GPU_ARCH
 from attest_agent.tls import TlsIdentity, load_or_create
 
 DEFAULT_PORT = 8451
@@ -33,6 +34,10 @@ class Config:
     state_dir: Path = DEFAULT_STATE_DIR
     quote_timeout_seconds: int = DEFAULT_QUOTE_TIMEOUT_SECONDS
     nonce_cache_size: int = DEFAULT_NONCE_CACHE_SIZE
+    # Which architecture NRAS is asked to verify this CVM's GPU evidence as. A fact about the
+    # cards the order passed in, so the platform sets it per rental where it differs from the
+    # fleet default; the agent has no way to read it off the devices.
+    gpu_arch: str = DEFAULT_GPU_ARCH
 
     @property
     def cert_path(self) -> Path:
@@ -63,6 +68,7 @@ def load_config() -> Config:
         state_dir=Path(os.environ.get("ATTEST_AGENT_STATE_DIR", str(DEFAULT_STATE_DIR))),
         quote_timeout_seconds=_int("ATTEST_AGENT_QUOTE_TIMEOUT", DEFAULT_QUOTE_TIMEOUT_SECONDS),
         nonce_cache_size=_int("ATTEST_AGENT_NONCE_CACHE", DEFAULT_NONCE_CACHE_SIZE),
+        gpu_arch=os.environ.get("ATTEST_AGENT_GPU_ARCH", "").strip() or DEFAULT_GPU_ARCH,
     )
     if config.port <= 0 or config.port > 65535:
         raise ValueError(f"ATTEST_AGENT_PORT must be in 1-65535, got {config.port}")
