@@ -48,6 +48,9 @@ class Validator:
         self.default_extra = {}
 
         self.miner_scores = {}
+        # Hotkeys with at least one live executor in the last completed cycle. Rebuilt
+        # every cycle, never persisted — set_weights floors them to u16=1.
+        self.active_hotkeys: set[str] = set()
         # Number of fully-completed sync cycles since this process started.
         # Used to skip the first post-restart set_weights when the in-memory
         # accumulator may have been re-built from a partial cycle.
@@ -185,7 +188,10 @@ class Validator:
                                 )
                             )
                         else:
-                            await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
+                            await self.subtensor_client.set_weights(
+                                miner_scores=self.miner_scores,
+                                active_hotkeys=self.active_hotkeys,
+                            )
                         self.miner_scores = {}
             except Exception as e:
                 logger.error(
@@ -406,6 +412,14 @@ class Validator:
                             ),
                         ),
                     )
+
+                    # DAH-2622: a miner whose machine passed validation must keep its UID even
+                    # when it earned nothing this cycle. Overwrite, never accumulate.
+                    self.active_hotkeys = {
+                        miner_hotkey
+                        for miner_hotkey, results in all_job_results.items()
+                        if any(result.is_successful for result in results)
+                    }
 
                     incentive = IncentiveFactory.create(
                         config=self.incentive,
