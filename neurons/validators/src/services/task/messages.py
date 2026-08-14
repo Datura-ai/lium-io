@@ -1014,6 +1014,17 @@ class RentalVerificationMessages:
             "`sudo reboot`, then check `nvidia-smi` and `dmesg` for Xid errors."
         ),
     )
+    CPU_QUOTA_EXCEEDS_HOST = MessageTemplate(
+        event="Advertised CPU cores exceed the host's physical cores",
+        reason="CPU_QUOTA_EXCEEDS_HOST",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0: the rental-verification container demanded the advertised cores and the host's Docker daemon rejected the count.",
+        remediation=(
+            "Advertise the real CPU(s) count. The host's Docker daemon refused `--cpus=<advertised>` "
+            "because the machine has fewer physical cores than reported."
+        ),
+    )
     API_ERROR = MessageTemplate(
         event="Rental verification API error",
         reason="RENTAL_CHECK_API_ERROR",

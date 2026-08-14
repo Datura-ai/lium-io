@@ -229,6 +229,13 @@ class Settings(BaseSettings):
     # fails device selection or serialises past a wide wall-clock threshold.
     MATMUL_ALLCARDS_CHECK_ENABLED: bool = Field(env="MATMUL_ALLCARDS_CHECK_ENABLED", default=True)
     MATMUL_ALLCARDS_ENFORCEMENT_ENABLED: bool = Field(env="MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", default=False)
+    # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
+    # host's Docker daemon creates the probe with `--cpus=<advertised>` and rejects a count that
+    # exceeds the machine's physical cores (a signal the lscpu wrapper cannot forge, since dockerd
+    # reads the kernel directly). CHECK_ENABLED sends the count and observes the verdict; ENFORCEMENT
+    # additionally zeroes the score on CPU_QUOTA_EXCEEDS_HOST.
+    RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=True)
+    RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
