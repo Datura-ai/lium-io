@@ -386,10 +386,15 @@ class ValidationService:
             return {"card_index": index, "ok": False, "reason": f"exit_status={exit_status}"}
         if not stdout.strip():
             return {"card_index": index, "ok": False, "reason": "empty_output"}
-        # Record whether the executor's decrypt recovered THIS card's challenge uuid. Emitted for
-        # observability, NOT yet gated on (verdict stays exit-status + non-empty): it lets the shadow
-        # data show per-card decrypt efficacy — chiefly that machine_info reconstructs correctly under
-        # CUDA_VISIBLE_DEVICES on a real multi-GPU host. Gate on it before enforcement (DAH-2671).
+        # Observability only — do NOT gate the verdict on this. Confirmed on a staging 2xA6000
+        # (DAH-2671): under CUDA_VISIBLE_DEVICES the .so's getGPUInfo() reconstructs machine_info from
+        # the masked (single) card, so its AES key diverges from the validator's full-N machine_info
+        # key and decrypt recovers no uuid — uuid_match is expected False on EVERY honest multi-GPU
+        # host (the same box's no-CVD legacy CapabilityCheck verified fine). Item 3 therefore proves
+        # card COUNT via device-selection failure (an index past the real cards -> CUDA_ERROR_NO_DEVICE
+        # -> non-zero exit -> ok False) plus the aggregate wall-clock, NOT per-card crypto; the per-card
+        # cryptographic seal that survives CVD is the named follow-on ticket. The field is kept so the
+        # shadow data records this, and so a future seal-aware .so would flip it True.
         returned_uuid = _extract_result_uuid(stdout)
         return {
             "card_index": index,
