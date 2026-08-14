@@ -99,10 +99,52 @@ async def test_mismatch_fails_under_enforcement(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.CPU_MISMATCH.reason
-    # The check is non-fatal, so the zeroing has to travel in `updates`, not in passed=False.
-    assert result.updates["score"] == 0.0
-    assert result.updates["job_score"] == 0.0
+    # The check is non-fatal and ScoreCheck runs after it, so the verdict travels as a context
+    # flag calculate_scores gates on — see test_mismatch_zeroes_the_final_score.
+    assert result.updates["cpu_truth_passed"] is False
     assert result.updates["clear_verified_job_info"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce, expected_score", [(True, 0.0), (False, 1.0)])
+async def test_mismatch_zeroes_the_final_score(context_factory, enforce, expected_score):
+    # End-to-end through the pipeline: CpuTruthCheck is non-fatal and ScoreCheck recomputes the
+    # score from scratch afterwards, so only a context flag calculate_scores reads survives.
+    from neurons.validators.src.services.task.checks.score import ScoreCheck
+    from neurons.validators.src.services.task.pipeline import Pipeline
+    from neurons.validators.src.services.task.score_calculator import calculate_scores
+
+    from tests.helpers import build_services, build_state, default_executor
+
+    class _NullSink:
+        async def emit(self, event):
+            pass
+
+    # ema_verifyx_download_speed present so the CPU-truth verdict is the only gate that can fire.
+    state = build_state(
+        specs={"cpu": {"count": 176}, "network": {"ema_verifyx_download_speed": 120.0}}
+    )
+    ctx = context_factory(
+        state=state,
+        ssh=_fake_ssh(present="0-43", cpuinfo="44"),
+        services=build_services(score_calculator=calculate_scores),
+        collateral_deposited=True,
+        executor=default_executor().model_copy(update={"price_per_gpu": None}),
+    )
+    with (
+        patch("neurons.validators.src.services.task.checks.cpu_truth.settings") as s,
+        patch("neurons.validators.src.services.task.score_calculator.settings") as score_s,
+    ):
+        s.CPU_TRUTH_CHECK_ENABLED = True
+        s.CPU_TRUTH_ENFORCEMENT_ENABLED = enforce
+        score_s.ENABLE_TDX_ATTESTATION = False
+        score_s.COLLATERAL_EXCLUDED_GPU_TYPES = []
+        score_s.ENABLE_NO_COLLATERAL = True
+        pipeline = Pipeline([CpuTruthCheck(), ScoreCheck()], _NullSink())
+        _, _, final_ctx = await pipeline.run(ctx)
+
+    assert final_ctx.score == expected_score
+    assert final_ctx.job_score == expected_score
 
 
 @pytest.mark.asyncio

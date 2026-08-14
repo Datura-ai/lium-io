@@ -298,6 +298,17 @@ class ValidationService:
             params.generate()
             params.dim_k = int(self.get_max_matrix_dimensions(sized_vram_mb, params.dim_n))
             params.cipher_text = self._generate_card_cipher(machine_info, params)
+            # A native error yields an empty cipher, which would go out as a bare `--cipher_text `
+            # and read as a failed work-proof on every card. Our own fault, not the host's: skip
+            # the probe and let the caller's single-card path decide, as the legacy path does.
+            if not params.cipher_text:
+                logger.warning(
+                    _m(
+                        "All-cards matmul skipped: cipher text generation failed (native error)",
+                        extra=get_extra_info(default_extra),
+                    )
+                )
+                return None
             challenges.append(params)
 
         # One SSH channel per card on a single connection, so the fan-out has to stay under the

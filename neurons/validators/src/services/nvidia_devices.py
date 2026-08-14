@@ -268,13 +268,15 @@ async def _query_gpu_nodes_for_uuids(
     total lets the caller decide whether this is a partial-host rental.
     """
     errors: list[str] = []
-    proc_unreadable = False
     try:
         uuid_to_minor = await _query_gpu_minor_map_from_proc(ssh)
     except RuntimeError as exc:
         errors.append(str(exc))
         uuid_to_minor = {}
-        proc_unreadable = True
+    # An empty map is the real signal, not the exception: _PROC_GPU_INFO_CMD swallows an
+    # unreadable procfs (unexpanded glob, `|| continue`, stderr discarded) and exits 0, so an
+    # honest host with no readable procfs would otherwise log identically to a spoof.
+    proc_unreadable = not uuid_to_minor
 
     if not uuid_to_minor or _missing_gpu_uuids(gpu_uuids, uuid_to_minor):
         # The kernel (procfs) map cannot satisfy the request; today we consult the NVML-backed

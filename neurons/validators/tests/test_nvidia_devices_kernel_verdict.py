@@ -143,6 +143,22 @@ async def test_unreadable_proc_recorded_distinctly(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_silently_empty_proc_still_records_unreadable(monkeypatch, caplog):
+    # The usual shape of the honest casualty: _PROC_GPU_INFO_CMD exits 0 with no rows (unexpanded
+    # glob, `|| continue`, stderr discarded), so no RuntimeError is raised. The map is still empty,
+    # and without proc_unreadable=True this host would log identically to a real spoof.
+    monkeypatch.setattr(nd.settings, "KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", True, raising=False)
+    ssh = _fake_ssh(FakeRun(""), FakeRun(_XML_BOTH))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError):
+            await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
+
+    rec = next(r for r in caplog.records if r.message == nd._KERNEL_GPU_VERDICT_DISAGREE_MSG)
+    assert rec.proc_unreadable is True
+
+
+@pytest.mark.asyncio
 async def test_check_disabled_preserves_legacy_behavior(monkeypatch, caplog):
     # master switch off → no emit, XML overwrites exactly as before the change.
     monkeypatch.setattr(nd.settings, "KERNEL_GPU_VERDICT_CHECK_ENABLED", False, raising=False)

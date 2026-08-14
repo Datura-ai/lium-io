@@ -76,14 +76,12 @@ class CpuTruthCheck:
                 impact=None if enforce else "Shadow observation only: score was NOT changed",
                 what=what,
             )
-            # The check is non-fatal, so passed=False alone changes nothing in the pipeline: under
-            # enforcement the score has to be zeroed explicitly, the same quarantine the CPU-quota
-            # verdict applies.
+            # The check is non-fatal, so passed=False alone changes nothing in the pipeline, and
+            # zeroing `score` here would be overwritten by ScoreCheck further down. The verdict
+            # travels as a context flag that calculate_scores gates on, like the TDX one.
             updates = (
                 {
-                    "score": 0.0,
-                    "job_score": 0.0,
-                    "score_warning": "Advertised CPU cores exceed the host's physical cores",
+                    "cpu_truth_passed": False,
                     "clear_verified_job_info": True,
                 }
                 if enforce

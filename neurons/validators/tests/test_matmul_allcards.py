@@ -138,6 +138,17 @@ async def test_unknown_model_skips_probe(svc):
     assert probe is None
 
 
+@pytest.mark.asyncio
+async def test_native_cipher_failure_skips_probe(svc, monkeypatch):
+    # Our own .so failing must not read as the host failing: an empty cipher would go out as a bare
+    # `--cipher_text ` and every card would come back ok=False. Skip the probe instead.
+    monkeypatch.setattr(
+        svc, "_generate_card_cipher", lambda machine_info, params: "", raising=False
+    )
+    probe = await svc._probe_all_claimed_cards(_ssh(real_cards=8), _executor(), {}, _spec(8))
+    assert probe is None
+
+
 def test_matmul_probe_vram_mb_floors_below_observed():
     # Finding 1: size each card's challenge from the 0.90 floor, NOT the raw nominal, so an honest
     # B200/L40S is never asked to allocate past its usable (NVML-reported) VRAM and OOM.
