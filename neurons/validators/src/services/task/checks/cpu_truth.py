@@ -18,13 +18,11 @@ CPU_TRUTH_MARGIN_CORES = 4
 
 
 class CpuTruthCheck:
-    """Corroborate the advertised CPU(s) count against sources the lscpu wrapper does not author.
+    """Compare the advertised CPU(s) count against the kernel-present population.
 
     The scrape reports `CPU(s):` from a `lscpu` a userspace wrapper can rewrite. This check reads,
     over ``ctx.ssh``, the kernel-present CPU population (`/sys/devices/system/cpu/present`, the same
-    population lscpu counts), the online logical CPUs (`/proc/cpuinfo`), and docker's NCPU. The
-    present count is the like-with-like comparison; `/proc/cpuinfo` and docker NCPU resolve through
-    the host too (bind-mount / PATH-wrap reachable) so they are recorded as corroborating only.
+    population lscpu counts) — one SSH read, the like-with-like comparison.
 
     Non-fatal and observe-only: shadow always passes, and only CPU_TRUTH_ENFORCEMENT_ENABLED lets a
     genuine mismatch fail and zero the score. Never fails on an inability to measure (SSH error, unreadable population,
@@ -35,7 +33,7 @@ class CpuTruthCheck:
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
-        # compare advertised CPU(s) against the kernel-present population and docker NCPU over ssh
+        # compare advertised CPU(s) against the kernel-present population over ssh
         if not settings.CPU_TRUTH_CHECK_ENABLED:
             event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             return CheckResult(passed=True, event=event)
@@ -45,9 +43,7 @@ class CpuTruthCheck:
             return self._unknown(ctx, reason="advertised CPU count missing from specs")
 
         try:
-            online = await self._read_online(ctx.ssh)
             present = await self._read_present(ctx.ssh)
-            ncpu = await self._read_ncpu(ctx.ssh)
         except (asyncssh.Error, OSError) as exc:
             return self._unknown(ctx, reason="ssh transport error", details={"error": repr(exc)})
 
@@ -55,15 +51,13 @@ class CpuTruthCheck:
             return self._unknown(
                 ctx,
                 reason="kernel-present CPU population unreadable",
-                details={"advertised": advertised, "online": online, "ncpu": ncpu},
+                details={"advertised": advertised},
             )
 
         what = {
             "executor_uuid": ctx.executor.uuid,
             "advertised": advertised,
-            "online": online,
             "present": present,
-            "ncpu": ncpu,
             "margin_cores": CPU_TRUTH_MARGIN_CORES,
         }
         enforce = settings.CPU_TRUTH_ENFORCEMENT_ENABLED
@@ -100,20 +94,12 @@ class CpuTruthCheck:
             return None
         return count if count > 0 else None
 
-    async def _read_online(self, ssh) -> int | None:
-        # online logical CPUs — corroborating, resolves through the host like the wrapper does
-        return _parse_int(await ssh.run("grep -c ^processor /proc/cpuinfo"))
-
     async def _read_present(self, ssh) -> int | None:
         # kernel-present CPU population — the authoritative like-with-like comparison
         res = await ssh.run("cat /sys/devices/system/cpu/present")
         if getattr(res, "exit_status", 1) != 0:
             return None
         return _count_cpu_list((getattr(res, "stdout", "") or "").strip())
-
-    async def _read_ncpu(self, ssh) -> int | None:
-        # docker's view of host CPUs by ABSOLUTE path (matches the scrape's docker invocation)
-        return _parse_int(await ssh.run("/usr/bin/docker info --format '{{.NCPU}}'"))
 
     def _unknown(
         self, ctx: Context, *, reason: str, details: dict | None = None
@@ -125,15 +111,6 @@ class CpuTruthCheck:
             what={"executor_uuid": ctx.executor.uuid, "reason": reason, **(details or {})},
         )
         return CheckResult(passed=True, event=event)
-
-
-def _parse_int(res) -> int | None:
-    if getattr(res, "exit_status", 1) != 0:
-        return None
-    try:
-        return int((getattr(res, "stdout", "") or "").strip())
-    except (TypeError, ValueError):
-        return None
 
 
 def _count_cpu_list(spec: str) -> int | None:

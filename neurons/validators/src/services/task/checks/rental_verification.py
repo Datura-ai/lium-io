@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
+
+from core.config import settings
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
@@ -12,13 +14,10 @@ from protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
 )
 
-from core.config import settings
-
 from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
-from .cpu_truth import CPU_TRUTH_MARGIN_CORES, _count_cpu_list
 
 
 @dataclass(frozen=True)
@@ -154,14 +153,16 @@ class RentalVerificationCheck:
         gpu_details = ctx.state.gpu_details or (ctx.state.specs or {}).get("gpu", {}).get("details", [])
         gpu_uuids = [detail["uuid"] for detail in gpu_details if isinstance(detail, dict) and detail.get("uuid")]
 
-        # DAH-2671 item 2b: hand the backend the advertised core count so the probe is created with
-        # `--cpus=<advertised>`. The daemon rejects a count above the host's physical cores — a lie
-        # the lscpu wrapper cannot cover, because dockerd reads the kernel directly. Skipped on TDX
-        # hosts (a real rent skips `--cpus` there too) and when the count is unreadable, so shadow
-        # only ever sends a number we could actually stand behind.
-        cpu_count = None
-        if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote:
-            cpu_count = await self._probe_cpu_limit(ctx)
+        # DAH-2671 item 2b: hand the backend the advertised core count AS-IS so the probe is created
+        # with `--cpus=<advertised>`. The backend classifier compares it against the daemon's own N
+        # from the refusal message and only classifies CPU_QUOTA_EXCEEDS_HOST when
+        # advertised > 2*N + 4 (honest max divergence is 2x — SMT off; observed spoofs 4-8x), so an
+        # honest SMT-off host falls into the backend's retry-without-flag path. No host-read capping:
+        # any source read from the judged host (sysfs/procfs) is spoofable, and a cap computed from
+        # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
+        # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
+        # rent skips `--cpus` there too) and when the count is unreadable.
+        cpu_count = self._advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
 
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
@@ -284,33 +285,6 @@ class RentalVerificationCheck:
             await ctx.services.container_cleanup.force_remove_health_checks(
                 ctx.ssh, ctx.executor.uuid
             )
-
-    async def _probe_cpu_limit(self, ctx: Context) -> int | None:
-        """The `--cpus` value to probe with: the advertised count, capped by ONLINE CPUs only on an
-        already-honest host.
-
-        Docker's `--cpus` ceiling is the online population, while CpuTruthCheck (item 2a) calls a
-        host honest against the kernel-PRESENT one. A host with cores offlined (present 128, online
-        64) is honest there and would be refused here on a quota it never claimed to serve, so cap
-        instead. But the cap reads /proc/cpuinfo, which item 2a itself treats as spoofable: a host
-        that fakes lscpu and leaves /proc/cpuinfo real would have the lie capped away and could never
-        trip CPU_QUOTA_EXCEEDS_HOST. So cap only where the advertised count already matches the
-        kernel-present population; otherwise send the advertised count and let the daemon refuse it.
-        """
-        advertised = self._advertised_cpu_count(ctx)
-        if advertised is None or ctx.ssh is None:
-            return advertised
-        try:
-            present = _count_cpu_list(
-                (await ctx.ssh.run("cat /sys/devices/system/cpu/present")).stdout
-            )
-            if present is None or advertised - present > CPU_TRUTH_MARGIN_CORES:
-                return advertised
-            res = await ctx.ssh.run("grep -c ^processor /proc/cpuinfo")
-            online = int((res.stdout or "").strip()) if res.exit_status == 0 else None
-        except (asyncssh.Error, OSError, AttributeError, TypeError, ValueError):
-            return advertised
-        return min(advertised, online) if online else advertised
 
     @staticmethod
     def _advertised_cpu_count(ctx: Context) -> int | None:

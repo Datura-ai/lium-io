@@ -183,19 +183,6 @@ class AllCardsProbe:
     per_card: list[dict]
 
 
-def _extract_result_uuid(stdout: str) -> str:
-    # uuid from the last RESULT_JSON marker, else the legacy "UUID:" line; "" if neither parses
-    lines = stdout.splitlines()
-    for line in reversed(lines):
-        if line.startswith("RESULT_JSON:"):
-            try:
-                return str(json.loads(line[len("RESULT_JSON:"):].strip()).get("uuid", "") or "")
-            except (ValueError, TypeError, AttributeError):
-                break
-    uuid_line = next((line for line in lines if line.startswith("UUID:")), None)
-    return uuid_line.split("UUID:")[1].strip() if uuid_line else ""
-
-
 class ValidationService:
     def __init__(self):
         """
@@ -410,23 +397,9 @@ class ValidationService:
             return {"card_index": index, "ok": False, "reason": f"exit_status={exit_status}"}
         if not stdout.strip():
             return {"card_index": index, "ok": False, "reason": "empty_output"}
-        # Observability only — do NOT gate the verdict on this. Confirmed on a staging 2xA6000
-        # (DAH-2671): under CUDA_VISIBLE_DEVICES the .so's getGPUInfo() reconstructs machine_info from
-        # the masked (single) card, so its AES key diverges from the validator's full-N machine_info
-        # key and decrypt recovers no uuid — uuid_match is expected False on EVERY honest multi-GPU
-        # host (the same box's no-CVD legacy CapabilityCheck verified fine). Item 3 therefore proves
-        # card COUNT via device-selection failure (an index past the real cards -> CUDA_ERROR_NO_DEVICE
-        # -> non-zero exit -> ok False) plus the aggregate wall-clock, NOT per-card crypto; the per-card
-        # cryptographic seal that survives CVD is the named follow-on ticket. The field is kept so the
-        # shadow data records this, and so a future seal-aware .so would flip it True.
-        returned_uuid = _extract_result_uuid(stdout)
-        return {
-            "card_index": index,
-            "ok": True,
-            "reason": "",
-            "returned_uuid": returned_uuid,
-            "uuid_match": bool(returned_uuid) and returned_uuid == params.uuid,
-        }
+        # No per-card cryptographic seal yet (follow-on ticket): the .so's AES key diverges under
+        # CUDA_VISIBLE_DEVICES, so per-card crypto cannot gate today.
+        return {"card_index": index, "ok": True, "reason": ""}
 
     async def validate_gpu_model_and_process_job(
         self,

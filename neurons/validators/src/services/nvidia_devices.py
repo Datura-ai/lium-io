@@ -37,7 +37,6 @@ executor-side issues.
 """
 from __future__ import annotations
 
-import inspect
 import logging
 import shlex
 import xml.etree.ElementTree as ET
@@ -88,9 +87,6 @@ def _ssh_peer(ssh: asyncssh.SSHClientConnection) -> str | None:
         return None
     if isinstance(peer, tuple | list) and len(peer) >= 2:
         return f"{peer[0]}:{peer[1]}"
-    # A mocked (AsyncMock) connection can hand back a coroutine here; drop it without awaiting.
-    if inspect.iscoroutine(peer):
-        peer.close()
     return None
 
 

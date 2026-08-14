@@ -18,16 +18,12 @@ from neurons.validators.src.services.task.checks.cpu_truth import (
 from neurons.validators.src.services.task.messages import CpuTruthMessages as Msg
 
 
-def _fake_ssh(*, cpuinfo="128", present="0-127", ncpu="128", raise_exc=None):
+def _fake_ssh(*, present="0-127", raise_exc=None):
     async def run(cmd, *args, **kwargs):
         if raise_exc is not None:
             raise raise_exc
-        if "/proc/cpuinfo" in cmd:
-            return SimpleNamespace(exit_status=0, stdout=cpuinfo, stderr="")
         if "/sys/devices/system/cpu/present" in cmd:
             return SimpleNamespace(exit_status=0, stdout=present, stderr="")
-        if "docker info" in cmd:
-            return SimpleNamespace(exit_status=0, stdout=ncpu, stderr="")
         return SimpleNamespace(exit_status=1, stdout="", stderr="")
 
     return SimpleNamespace(run=run)
@@ -76,7 +72,7 @@ async def test_match_passes(context_factory):
 @pytest.mark.asyncio
 async def test_mismatch_emits_under_shadow_and_still_passes(context_factory):
     # advertised 176 over a 44-core present population — the spoof signature.
-    ctx = context_factory(state=_state(176), ssh=_fake_ssh(present="0-43", cpuinfo="44"))
+    ctx = context_factory(state=_state(176), ssh=_fake_ssh(present="0-43"))
     with patch("neurons.validators.src.services.task.checks.cpu_truth.settings") as s:
         s.CPU_TRUTH_CHECK_ENABLED = True
         s.CPU_TRUTH_ENFORCEMENT_ENABLED = False
@@ -91,7 +87,7 @@ async def test_mismatch_emits_under_shadow_and_still_passes(context_factory):
 
 @pytest.mark.asyncio
 async def test_mismatch_fails_under_enforcement(context_factory):
-    ctx = context_factory(state=_state(176), ssh=_fake_ssh(present="0-43", cpuinfo="44"))
+    ctx = context_factory(state=_state(176), ssh=_fake_ssh(present="0-43"))
     with patch("neurons.validators.src.services.task.checks.cpu_truth.settings") as s:
         s.CPU_TRUTH_CHECK_ENABLED = True
         s.CPU_TRUTH_ENFORCEMENT_ENABLED = True
@@ -126,7 +122,7 @@ async def test_mismatch_zeroes_the_final_score(context_factory, enforce, expecte
     )
     ctx = context_factory(
         state=state,
-        ssh=_fake_ssh(present="0-43", cpuinfo="44"),
+        ssh=_fake_ssh(present="0-43"),
         services=build_services(score_calculator=calculate_scores),
         collateral_deposited=True,
         executor=default_executor().model_copy(update={"price_per_gpu": None}),
@@ -161,8 +157,8 @@ async def test_ssh_error_passes_with_unknown_reason(context_factory):
 
 @pytest.mark.asyncio
 async def test_offlined_cores_not_a_spoof(context_factory):
-    # honest host with cores offlined: present (== lscpu CPU(s)) equals advertised; online is lower.
-    ctx = context_factory(state=_state(128), ssh=_fake_ssh(present="0-127", cpuinfo="64"))
+    # honest host with cores offlined: present (== lscpu CPU(s)) equals advertised.
+    ctx = context_factory(state=_state(128), ssh=_fake_ssh(present="0-127"))
     with patch("neurons.validators.src.services.task.checks.cpu_truth.settings") as s:
         s.CPU_TRUTH_CHECK_ENABLED = True
         s.CPU_TRUTH_ENFORCEMENT_ENABLED = True

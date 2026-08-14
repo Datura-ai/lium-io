@@ -14,8 +14,8 @@ from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
 from neurons.validators.src.services.task.pipeline import CheckResult, Context
-from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from tests.helpers import build_services, build_state
 
 
@@ -1003,10 +1003,7 @@ async def test_cpu_quota_verdict_is_observe_only_in_shadow():
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
 
     from tests.helpers import make_context
-    # A spoofed host: 44 real cores in both /proc/cpuinfo and sysfs, 176 advertised. The cap only
-    # applies to hosts already honest against the kernel-present population, so 176 goes out intact
-    # and the daemon refuses it.
-    ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44))
+    ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
         mock_settings.SKIP_RENTAL_VERIFICATION = False
@@ -1028,10 +1025,7 @@ async def test_cpu_quota_verdict_zeroes_score_under_enforcement():
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
 
     from tests.helpers import make_context
-    # A spoofed host: 44 real cores in both /proc/cpuinfo and sysfs, 176 advertised. The cap only
-    # applies to hosts already honest against the kernel-present population, so 176 goes out intact
-    # and the daemon refuses it.
-    ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44))
+    ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
         mock_settings.SKIP_RENTAL_VERIFICATION = False
@@ -1055,7 +1049,7 @@ async def test_advertised_cpu_count_is_sent_to_the_backend():
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 44}})
 
     from tests.helpers import make_context
-    ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44))
+    ctx = make_context(services=services, state=state, ssh=_RecordingSSH())
 
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
         mock_settings.SKIP_RENTAL_VERIFICATION = False
@@ -1066,32 +1060,11 @@ async def test_advertised_cpu_count_is_sent_to_the_backend():
 
 
 @pytest.mark.asyncio
-async def test_cpu_count_sent_is_capped_by_the_hosts_online_cpus():
-    """An honest host with cores offlined: CpuTruthCheck compares against the kernel-PRESENT
-    population and passes it, so the probe must not ask for a `--cpus` quota above the ONLINE
-    count dockerd actually enforces."""
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
-    state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 128}})
-
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(64, present=128))
-
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.SKIP_RENTAL_VERIFICATION = False
-        mock_settings.RENTAL_CPU_LIMIT_CHECK_ENABLED = True
-        await RentalVerificationCheck().run(ctx)
-
-    assert backend_client.called_with["cpu_count"] == 64
-
-
-@pytest.mark.asyncio
-async def test_cpu_count_is_not_capped_on_a_host_that_lies_about_its_cores():
-    """A spoofed host whose /proc/cpuinfo stayed honest (44 real cores, 176 advertised): capping by
-    the online count would ask for a quota the daemon happily grants, so the lie must go out
-    uncapped and be refused."""
+async def test_fake_present_population_does_not_cap_the_advertised_count():
+    """Bypass regression: a spoofer faking `present` == advertised (176) while /proc/cpuinfo stays
+    real (44) must NOT get the advertised count capped to the online population — a host-read cap
+    would turn the lie into a quota the daemon happily grants. The count goes out AS-IS and the
+    daemon/backend classifier judges it."""
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, details={})
     )
@@ -1099,7 +1072,7 @@ async def test_cpu_count_is_not_capped_on_a_host_that_lies_about_its_cores():
     state = build_state(specs={"verified_ports": [8080], "cpu": {"count": 176}})
 
     from tests.helpers import make_context
-    ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44))
+    ctx = make_context(services=services, state=state, ssh=_OnlineCpuSSH(44, present=176))
 
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
         mock_settings.SKIP_RENTAL_VERIFICATION = False
