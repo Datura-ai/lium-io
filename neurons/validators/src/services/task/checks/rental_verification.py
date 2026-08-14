@@ -18,6 +18,7 @@ from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
+from .cpu_truth import CPU_TRUTH_MARGIN_CORES, _count_cpu_list
 
 
 @dataclass(frozen=True)
@@ -285,21 +286,30 @@ class RentalVerificationCheck:
             )
 
     async def _probe_cpu_limit(self, ctx: Context) -> int | None:
-        """The `--cpus` value to probe with: the advertised count, capped by the host's ONLINE CPUs.
+        """The `--cpus` value to probe with: the advertised count, capped by ONLINE CPUs only on an
+        already-honest host.
 
         Docker's `--cpus` ceiling is the online population, while CpuTruthCheck (item 2a) calls a
         host honest against the kernel-PRESENT one. A host with cores offlined (present 128, online
         64) is honest there and would be refused here on a quota it never claimed to serve, so cap
-        instead. A spoofed count is still refused: the lie inflates the online population too.
+        instead. But the cap reads /proc/cpuinfo, which item 2a itself treats as spoofable: a host
+        that fakes lscpu and leaves /proc/cpuinfo real would have the lie capped away and could never
+        trip CPU_QUOTA_EXCEEDS_HOST. So cap only where the advertised count already matches the
+        kernel-present population; otherwise send the advertised count and let the daemon refuse it.
         """
         advertised = self._advertised_cpu_count(ctx)
         if advertised is None or ctx.ssh is None:
             return advertised
         try:
+            present = _count_cpu_list(
+                (await ctx.ssh.run("cat /sys/devices/system/cpu/present")).stdout
+            )
+            if present is None or advertised - present > CPU_TRUTH_MARGIN_CORES:
+                return advertised
             res = await ctx.ssh.run("grep -c ^processor /proc/cpuinfo")
             online = int((res.stdout or "").strip()) if res.exit_status == 0 else None
-        except (asyncssh.Error, OSError, TypeError, ValueError):
-            online = None
+        except (asyncssh.Error, OSError, AttributeError, TypeError, ValueError):
+            return advertised
         return min(advertised, online) if online else advertised
 
     @staticmethod

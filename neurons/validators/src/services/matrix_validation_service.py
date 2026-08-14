@@ -30,6 +30,11 @@ MATRIX_VERIFY_TIMEOUT_SECONDS = 120
 # each keep the MATRIX_VERIFY_TIMEOUT_SECONDS cap, so this only fails clear serialisation.
 MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 90
 
+# Cards probed at once. Each card takes an SSH channel on one connection and MAX_GPU_COUNT is 14,
+# while OpenSSH defaults to MaxSessions 10 — 8 keeps the concurrency signal (a count lie still
+# serialises) and stays clear of that ceiling on the widest honest hosts.
+MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS = 8
+
 
 class DMCompVerifyWrapper:
     def __init__(self, lib_name: str):
@@ -295,12 +300,20 @@ class ValidationService:
             params.cipher_text = self._generate_card_cipher(machine_info, params)
             challenges.append(params)
 
+        # One SSH channel per card on a single connection, so the fan-out has to stay under the
+        # executor's sshd MaxSessions (OpenSSH defaults to 10). A 12-14 card host would otherwise
+        # push the tail channels into the ssh_error branch and read as a failed work-proof.
+        gate = asyncio.Semaphore(MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
+
+        async def run_gated(index: int, params: VerifierParams) -> dict:
+            async with gate:
+                return await self._run_one_card(
+                    ssh_client, executor_info, script_path, index, params
+                )
+
         start = time.perf_counter()
         per_card = await asyncio.gather(
-            *(
-                self._run_one_card(ssh_client, executor_info, script_path, index, params)
-                for index, params in enumerate(challenges)
-            )
+            *(run_gated(index, params) for index, params in enumerate(challenges))
         )
         elapsed = time.perf_counter() - start
 

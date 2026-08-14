@@ -96,7 +96,9 @@ async def test_disagreement_shadow_preserves_behavior_and_emits(caplog):
     ssh = _fake_ssh(FakeRun("GPU-aaa, 0\n"), FakeRun(_XML_BOTH))
 
     with caplog.at_level("WARNING"):
-        nodes, host_total = await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
+        nodes, host_total = await _query_gpu_nodes_for_uuids(
+            ssh, ["GPU-bbb"], executor_id="exec-9", default_extra={"miner_hotkey": "hk-1"}
+        )
 
     assert nodes == ("/dev/nvidia1",)  # XML overwrote the kernel map — placement unchanged
     assert host_total == 2
@@ -105,6 +107,9 @@ async def test_disagreement_shadow_preserves_behavior_and_emits(caplog):
     assert rec.proc_unreadable is False
     assert rec.enforced is False
     assert rec.xml_would_add_uuids == ["GPU-bbb"]
+    # the event has to be correlatable by miner/batch, not just by host:port
+    assert rec.executor_id == "exec-9"
+    assert rec.miner_hotkey == "hk-1"
 
 
 @pytest.mark.asyncio

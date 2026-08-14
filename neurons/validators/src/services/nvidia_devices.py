@@ -125,11 +125,15 @@ def _emit_kernel_xml_disagreement(
     *,
     proc_unreadable: bool,
     enforce: bool,
+    executor_id: str | None,
+    default_extra: dict | None,
 ) -> None:
     logger.warning(
         _KERNEL_GPU_VERDICT_DISAGREE_MSG,
         extra={
+            **(default_extra or {}),
             "kernel_gpu_verdict": "kernel_xml_disagreement",
+            "executor_id": executor_id,
             "executor_peer": _ssh_peer(ssh),
             # proc_unreadable distinguishes the honest case (an unreadable /proc map, which
             # enforcement also refuses) from a real spoof (proc readable but missing a card the
@@ -198,7 +202,9 @@ async def build_gpu_docker_config_for_executor(
     """Resolve structured GPU Docker options for SDK container creation."""
     try:
         if gpu_uuids:
-            per_gpu, host_total = await _query_gpu_nodes_for_uuids(ssh_client, gpu_uuids)
+            per_gpu, host_total = await _query_gpu_nodes_for_uuids(
+                ssh_client, gpu_uuids, executor_id=executor_id, default_extra=default_extra
+            )
             is_partial_rental = len(per_gpu) < host_total
         else:
             per_gpu = await _query_all_gpu_nodes(ssh_client)
@@ -252,6 +258,9 @@ async def _query_all_gpu_nodes(ssh: asyncssh.SSHClientConnection) -> tuple[str, 
 async def _query_gpu_nodes_for_uuids(
     ssh: asyncssh.SSHClientConnection,
     gpu_uuids: Sequence[str],
+    *,
+    executor_id: str | None = None,
+    default_extra: dict | None = None,
 ) -> tuple[tuple[str, ...], int]:
     """Resolve requested UUIDs to /dev/nvidiaN nodes, plus return host GPU count.
 
@@ -293,6 +302,8 @@ async def _query_gpu_nodes_for_uuids(
                     xml_uuid_to_minor,
                     proc_unreadable=proc_unreadable,
                     enforce=enforce,
+                    executor_id=executor_id,
+                    default_extra=default_extra,
                 )
                 if enforce:
                     overwrite_with_xml = False

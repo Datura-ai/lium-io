@@ -27,7 +27,7 @@ class CpuTruthCheck:
     the host too (bind-mount / PATH-wrap reachable) so they are recorded as corroborating only.
 
     Non-fatal and observe-only: shadow always passes, and only CPU_TRUTH_ENFORCEMENT_ENABLED lets a
-    genuine mismatch fail. Never fails on an inability to measure (SSH error, unreadable population,
+    genuine mismatch fail and zero the score. Never fails on an inability to measure (SSH error, unreadable population,
     missing advertised count) — those return passed=True with a distinct *_unknown reason.
     """
 
@@ -76,7 +76,20 @@ class CpuTruthCheck:
                 impact=None if enforce else "Shadow observation only: score was NOT changed",
                 what=what,
             )
-            return CheckResult(passed=not enforce, event=event)
+            # The check is non-fatal, so passed=False alone changes nothing in the pipeline: under
+            # enforcement the score has to be zeroed explicitly, the same quarantine the CPU-quota
+            # verdict applies.
+            updates = (
+                {
+                    "score": 0.0,
+                    "job_score": 0.0,
+                    "score_warning": "Advertised CPU cores exceed the host's physical cores",
+                    "clear_verified_job_info": True,
+                }
+                if enforce
+                else {}
+            )
+            return CheckResult(passed=not enforce, event=event, updates=updates)
 
         event = render_message(Msg.CPU_OK, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)

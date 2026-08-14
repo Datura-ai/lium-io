@@ -8,6 +8,7 @@ own challenge, pinned with CUDA_VISIBLE_DEVICES=<index>, timed in aggregate on t
   - an aggregate wall-clock over threshold fails under enforcement, only emits under shadow;
   - a single-card (legacy) executor is never judged by the all-cards path (probe returns None).
 """
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -147,6 +148,26 @@ def test_matmul_probe_vram_mb_floors_below_observed():
     # multi-variant: smallest nominal, then floored
     assert matmul_probe_vram_mb("NVIDIA GeForce RTX 3060") == round(8192 * VRAM_FLOOR_RATIO)
     assert matmul_probe_vram_mb("NVIDIA MADE-UP 9000") is None
+
+
+@pytest.mark.asyncio
+async def test_card_fan_out_stays_under_sshd_max_sessions(svc):
+    # Finding: one SSH channel per card on a single connection; OpenSSH defaults to MaxSessions 10,
+    # so a 14-card host must not open 14 at once or the tail channels read as failed work-proofs.
+    in_flight = 0
+    peak = 0
+
+    async def run(cmd, *a, **k):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return SimpleNamespace(exit_status=0, stdout="RESULT_JSON: {}", stderr="")
+
+    probe = await svc._probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(14))
+    assert probe is not None and probe.passed is True
+    assert peak <= mvs.MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS < 10
 
 
 @pytest.mark.asyncio

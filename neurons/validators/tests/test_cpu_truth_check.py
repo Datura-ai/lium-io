@@ -83,6 +83,7 @@ async def test_mismatch_emits_under_shadow_and_still_passes(context_factory):
         result = await CpuTruthCheck().run(ctx)
 
     assert result.passed is True  # shadow: never changes score
+    assert result.updates == {}
     assert result.event.reason_code == Msg.CPU_MISMATCH.reason
     assert result.event.what_we_saw["advertised"] == 176
     assert result.event.what_we_saw["present"] == 44
@@ -98,6 +99,10 @@ async def test_mismatch_fails_under_enforcement(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.CPU_MISMATCH.reason
+    # The check is non-fatal, so the zeroing has to travel in `updates`, not in passed=False.
+    assert result.updates["score"] == 0.0
+    assert result.updates["job_score"] == 0.0
+    assert result.updates["clear_verified_job_info"] is True
 
 
 @pytest.mark.asyncio
