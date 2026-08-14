@@ -215,19 +215,23 @@ def vram_window_for_size(nominal_mb: int) -> tuple[int, int]:
     return (round(nominal_mb * VRAM_FLOOR_RATIO), round(nominal_mb * VRAM_CEIL_RATIO))
 
 
-def smallest_nominal_vram_mb(model: str | None) -> int | None:
-    """Smallest nominal VRAM size (MB) for an advertised GPU model, via the registry SKU table.
+def matmul_probe_vram_mb(model: str | None) -> int | None:
+    """VRAM (MB) to size the all-cards work-proof from — registry-derived and floored to usable.
 
-    Normalizes the CUDA-reported name, then returns the SMALLEST nominal size when the model is
-    multi-variant (e.g. RTX 3060 8/12 GB -> 8192) so a work-proof sized from this never OOMs an
-    honest smaller-variant card. Returns None for unknown models — the caller sizes off host
-    self-report or skips, never guesses. Keeps all registry sizing in this one module (DAH-2671).
+    Normalizes the CUDA-reported name, takes the SMALLEST nominal size for a multi-variant model
+    (e.g. RTX 3060 8/12 GB -> 8192), then applies VRAM_FLOOR_RATIO (0.90) — the same floor
+    GpuVramPrecheck uses. NVML `.total` is physical VRAM minus vendor/ECC/driver-reserved regions,
+    observed up to ~6.7% below the marketing nominal (e.g. B200 reports 183359 on a 192 GB card,
+    L40S 46068 on 48 GB); sizing the matmul from the raw nominal would ask an honest B200/B300/L40S
+    to allocate past its usable VRAM and OOM (DAH-2671). The floor is registry-derived, NOT host
+    self-report, so a spoofing host still cannot shrink its own challenge. Returns None for unknown
+    models — the caller then skips rather than guessing. Keeps registry sizing in this one module.
     """
     canonical = normalize_gpu_model(model)
     sizes = GPU_VRAM_SIZES_MB.get(canonical)
     if not sizes:
         return None
-    return min(sizes)
+    return round(min(sizes) * VRAM_FLOOR_RATIO)
 
 
 def get_expected_vram_windows(canonical_model: str) -> list[tuple[int, int]] | None:

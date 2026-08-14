@@ -9,11 +9,12 @@ own challenge, pinned with CUDA_VISIBLE_DEVICES=<index>, timed in aggregate on t
   - a single-card (legacy) executor is never judged by the all-cards path (probe returns None).
 """
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import services.matrix_validation_service as mvs
+from services.gpu_spec_table import GPU_VRAM_SIZES_MB, VRAM_FLOOR_RATIO, matmul_probe_vram_mb
 
 
 @pytest.fixture
@@ -134,3 +135,33 @@ async def test_unknown_model_skips_probe(svc):
         _ssh(real_cards=8), _executor(), {}, _spec(8, model="NVIDIA MADE-UP 9000")
     )
     assert probe is None
+
+
+def test_matmul_probe_vram_mb_floors_below_observed():
+    # Finding 1: size each card's challenge from the 0.90 floor, NOT the raw nominal, so an honest
+    # B200/L40S is never asked to allocate past its usable (NVML-reported) VRAM and OOM.
+    b200 = matmul_probe_vram_mb("NVIDIA B200")
+    assert b200 == round(196608 * VRAM_FLOOR_RATIO)
+    assert b200 < 183359                                   # below observed usable total (registry note)
+    assert b200 < GPU_VRAM_SIZES_MB["NVIDIA B200"][0]      # strictly below the raw nominal
+    # multi-variant: smallest nominal, then floored
+    assert matmul_probe_vram_mb("NVIDIA GeForce RTX 3060") == round(8192 * VRAM_FLOOR_RATIO)
+    assert matmul_probe_vram_mb("NVIDIA MADE-UP 9000") is None
+
+
+@pytest.mark.asyncio
+async def test_timeout_sweeps_orphan_matmul(svc, monkeypatch):
+    # Finding 2: a timed-out per-card run must trigger _kill_remote_matmul, or the orphaned remote
+    # process keeps holding VRAM into the fatal single-card matmul that runs next in the same call.
+    _flags(monkeypatch, enforce=False)
+    killed = AsyncMock()
+    monkeypatch.setattr(svc, "_kill_remote_matmul", killed)
+
+    async def run(cmd, *a, **k):
+        if "CUDA_VISIBLE_DEVICES=0" in cmd:
+            raise TimeoutError
+        return SimpleNamespace(exit_status=0, stdout="RESULT_JSON: {}", stderr="")
+
+    probe = await svc._probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(2))
+    assert probe is not None and probe.passed is False
+    killed.assert_awaited_once()

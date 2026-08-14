@@ -13,7 +13,7 @@ import asyncssh
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.gpu_spec_table import smallest_nominal_vram_mb
+from services.gpu_spec_table import matmul_probe_vram_mb
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,19 @@ class AllCardsProbe:
     per_card: list[dict]
 
 
+def _extract_result_uuid(stdout: str) -> str:
+    # uuid from the last RESULT_JSON marker, else the legacy "UUID:" line; "" if neither parses
+    lines = stdout.splitlines()
+    for line in reversed(lines):
+        if line.startswith("RESULT_JSON:"):
+            try:
+                return str(json.loads(line[len("RESULT_JSON:"):].strip()).get("uuid", "") or "")
+            except (ValueError, TypeError, AttributeError):
+                break
+    uuid_line = next((line for line in lines if line.startswith("UUID:")), None)
+    return uuid_line.split("UUID:")[1].strip() if uuid_line else ""
+
+
 class ValidationService:
     def __init__(self):
         """
@@ -262,7 +275,7 @@ class ValidationService:
             return None
 
         gpu_model = details[0].get("name", "") or ""
-        sized_vram_mb = smallest_nominal_vram_mb(gpu_model)
+        sized_vram_mb = matmul_probe_vram_mb(gpu_model)
         if not sized_vram_mb:
             return None
 
@@ -318,6 +331,13 @@ class ValidationService:
         }
         log = logger.info if passed else logger.warning
         log(_m("All-cards GPU work-proof", extra=get_extra_info(log_extra)))
+
+        if any(outcome.get("reason") == "timeout" for outcome in per_card):
+            # asyncssh's timeout only abandons the local wait; a timed-out remote matmul keeps
+            # running and holding VRAM. The fatal single-card capability matmul runs next in this
+            # same call, so sweep the orphans first or it OOMs on device 0 — mirrors the legacy path.
+            await self._kill_remote_matmul(ssh_client, script_path, log_extra)
+
         return AllCardsProbe(
             passed=passed,
             failure_reason=failure_reason,
@@ -366,7 +386,18 @@ class ValidationService:
             return {"card_index": index, "ok": False, "reason": f"exit_status={exit_status}"}
         if not stdout.strip():
             return {"card_index": index, "ok": False, "reason": "empty_output"}
-        return {"card_index": index, "ok": True, "reason": ""}
+        # Record whether the executor's decrypt recovered THIS card's challenge uuid. Emitted for
+        # observability, NOT yet gated on (verdict stays exit-status + non-empty): it lets the shadow
+        # data show per-card decrypt efficacy — chiefly that machine_info reconstructs correctly under
+        # CUDA_VISIBLE_DEVICES on a real multi-GPU host. Gate on it before enforcement (DAH-2671).
+        returned_uuid = _extract_result_uuid(stdout)
+        return {
+            "card_index": index,
+            "ok": True,
+            "reason": "",
+            "returned_uuid": returned_uuid,
+            "uuid_match": bool(returned_uuid) and returned_uuid == params.uuid,
+        }
 
     async def validate_gpu_model_and_process_job(
         self,
