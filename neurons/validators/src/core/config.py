@@ -234,7 +234,11 @@ class Settings(BaseSettings):
     # exceeds the machine's physical cores (a signal the lscpu wrapper cannot forge, since dockerd
     # reads the kernel directly). CHECK_ENABLED sends the count and observes the verdict; ENFORCEMENT
     # additionally zeroes the score on CPU_QUOTA_EXCEEDS_HOST.
-    RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=True)
+    # Defaults to False, unlike the other CHECK_ENABLED flags: this one is the only item that
+    # changes what the backend does (the probe is created with `--cpus`), so a rejection the backend
+    # does not yet tag CPU_QUOTA_EXCEEDS_HOST lands in the fatal branch of the check. Flip it on once
+    # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
+    RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
     RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")

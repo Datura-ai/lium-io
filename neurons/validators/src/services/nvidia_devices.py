@@ -26,8 +26,10 @@ Public surface
 
 Failure handling
 ----------------
-`build_gpu_flags` never raises: any probe failure (SSH error, missing
-nvidia-smi, unknown UUID, etc.) is logged at WARNING and the function falls
+`build_gpu_flags` raises only one thing: `MissingRentedGpuError`, and only under
+KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED — a rented UUID the kernel cannot see must not become a
+container (DAH-2671, item 1). Every other probe failure (SSH error, missing
+nvidia-smi, etc.) is logged at WARNING and the function falls
 back to the legacy `--gpus`-only string. The pod still gets created — it
 just doesn't get the daemon-reload protection. This trades a known
 regression (back to today's behaviour) for resilience against unforeseen
@@ -217,6 +219,11 @@ async def build_gpu_docker_config_for_executor(
             _emit_missing_rented_gpu(
                 ssh_client, exc, executor_id=executor_id, default_extra=default_extra
             )
+            if settings.KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED:
+                # Fail closed: falling through to the legacy --gpus string would still create the
+                # container on a host that cannot hand over a rented card, only without the --device
+                # entries. The caller records this create FAILED, the same way gpu_power_cap does.
+                raise
         logger.warning(
             "nvidia_devices: probe failed, falling back to legacy --gpus only "
             "(pod will not survive systemd daemon-reload on the executor)",

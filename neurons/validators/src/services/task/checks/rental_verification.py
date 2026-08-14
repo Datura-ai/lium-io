@@ -160,7 +160,7 @@ class RentalVerificationCheck:
         # only ever sends a number we could actually stand behind.
         cpu_count = None
         if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote:
-            cpu_count = self._advertised_cpu_count(ctx)
+            cpu_count = await self._probe_cpu_limit(ctx)
 
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
@@ -283,6 +283,24 @@ class RentalVerificationCheck:
             await ctx.services.container_cleanup.force_remove_health_checks(
                 ctx.ssh, ctx.executor.uuid
             )
+
+    async def _probe_cpu_limit(self, ctx: Context) -> int | None:
+        """The `--cpus` value to probe with: the advertised count, capped by the host's ONLINE CPUs.
+
+        Docker's `--cpus` ceiling is the online population, while CpuTruthCheck (item 2a) calls a
+        host honest against the kernel-PRESENT one. A host with cores offlined (present 128, online
+        64) is honest there and would be refused here on a quota it never claimed to serve, so cap
+        instead. A spoofed count is still refused: the lie inflates the online population too.
+        """
+        advertised = self._advertised_cpu_count(ctx)
+        if advertised is None or ctx.ssh is None:
+            return advertised
+        try:
+            res = await ctx.ssh.run("grep -c ^processor /proc/cpuinfo")
+            online = int((res.stdout or "").strip()) if res.exit_status == 0 else None
+        except (asyncssh.Error, OSError, TypeError, ValueError):
+            online = None
+        return min(advertised, online) if online else advertised
 
     @staticmethod
     def _advertised_cpu_count(ctx: Context) -> int | None:

@@ -73,6 +73,20 @@ async def test_missing_rented_gpu_emits_structured_event(caplog):
     assert rec.executor_id == "exec-9"
 
 
+@pytest.mark.asyncio
+async def test_missing_rented_gpu_under_enforcement_refuses_the_container(monkeypatch, caplog):
+    # The verdict must reach the caller, not be swallowed into the legacy --gpus fallback: otherwise
+    # enforcement only drops the --device mounts and the container is still created.
+    monkeypatch.setattr(nd.settings, "KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", True, raising=False)
+    ssh = _fake_ssh(FakeRun("GPU-aaa, 0\n"), FakeRun(""))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(MissingRentedGpuError):
+            await build_gpu_docker_config_for_executor(ssh, ["GPU-bbb"], executor_id="exec-9")
+
+    assert any(r.message == nd._KERNEL_GPU_VERDICT_MISSING_MSG for r in caplog.records)
+
+
 # ---------------------------- 1b: kernel-vs-XML disagreement ----------------------------
 
 
