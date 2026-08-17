@@ -15,6 +15,10 @@ from ..pipeline import CheckResult, Context
 # vs 44), far outside any slack, so the margin never masks a real lie. The predicate is provisional:
 # the emitted RAW counts let ops recalibrate from a week of fleet data before flipping enforcement.
 CPU_TRUTH_MARGIN_CORES = 4
+# Reading one sysfs file is instant on a live host; without a bound a wedged host would hold the
+# check open for the executor's whole validation budget. A timeout lands in the *_unknown path
+# (asyncssh raises the builtin TimeoutError, itself an OSError), so the host is never failed for it.
+CPU_TRUTH_READ_TIMEOUT_SECONDS = 15
 
 
 class CpuTruthCheck:
@@ -38,7 +42,7 @@ class CpuTruthCheck:
             event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             return CheckResult(passed=True, event=event)
 
-        advertised = self._advertised_count(ctx)
+        advertised = advertised_cpu_count(ctx)
         if advertised is None:
             return self._unknown(ctx, reason="advertised CPU count missing from specs")
 
@@ -86,17 +90,11 @@ class CpuTruthCheck:
         event = render_message(Msg.CPU_OK, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)
 
-    def _advertised_count(self, ctx: Context) -> int | None:
-        cpu = (ctx.state.specs or {}).get("cpu") or {}
-        try:
-            count = int(cpu.get("count"))
-        except (TypeError, ValueError):
-            return None
-        return count if count > 0 else None
-
     async def _read_present(self, ssh) -> int | None:
         # kernel-present CPU population — the authoritative like-with-like comparison
-        res = await ssh.run("cat /sys/devices/system/cpu/present")
+        res = await ssh.run(
+            "cat /sys/devices/system/cpu/present", timeout=CPU_TRUTH_READ_TIMEOUT_SECONDS
+        )
         if getattr(res, "exit_status", 1) != 0:
             return None
         return _count_cpu_list((getattr(res, "stdout", "") or "").strip())
@@ -111,6 +109,16 @@ class CpuTruthCheck:
             what={"executor_uuid": ctx.executor.uuid, "reason": reason, **(details or {})},
         )
         return CheckResult(passed=True, event=event)
+
+
+def advertised_cpu_count(ctx: Context) -> int | None:
+    # the core count the miner reported this cycle, or None when the scrape produced no usable value
+    cpu = (ctx.state.specs or {}).get("cpu") or {}
+    try:
+        count = int(cpu.get("count"))
+    except (TypeError, ValueError):
+        return None
+    return count if count > 0 else None
 
 
 def _count_cpu_list(spec: str) -> int | None:

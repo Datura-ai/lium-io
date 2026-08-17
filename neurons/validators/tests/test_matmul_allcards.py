@@ -197,3 +197,39 @@ async def test_timeout_sweeps_orphan_matmul(svc, monkeypatch):
     probe = await svc._probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(2))
     assert probe is not None and probe.passed is False
     killed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ssh_error_sweeps_orphan_matmul(svc, monkeypatch):
+    # A channel that dies mid-run leaves the remote matmul untouched, exactly like a timeout — and
+    # the fatal single-card matmul that follows lands on device 0 and OOMs against it.
+    _flags(monkeypatch, enforce=False)
+    killed = AsyncMock()
+    monkeypatch.setattr(svc, "_kill_remote_matmul", killed)
+
+    async def run(cmd, *a, **k):
+        if "CUDA_VISIBLE_DEVICES=0" in cmd:
+            raise OSError("channel closed")
+        return SimpleNamespace(exit_status=0, stdout="RESULT_JSON: {}", stderr="")
+
+    probe = await svc._probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(2))
+    assert probe is not None and probe.passed is False
+    killed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_plain_card_failure_does_not_sweep(svc, monkeypatch):
+    # A card that answered (non-zero exit) has no process left to kill; sweeping there would pkill
+    # the fatal single-card matmul of a concurrent validator run on the same host for nothing.
+    _flags(monkeypatch, enforce=False)
+    killed = AsyncMock()
+    monkeypatch.setattr(svc, "_kill_remote_matmul", killed)
+
+    async def run(cmd, *a, **k):
+        if "CUDA_VISIBLE_DEVICES=0" in cmd:
+            return SimpleNamespace(exit_status=1, stdout="", stderr="invalid device ordinal")
+        return SimpleNamespace(exit_status=0, stdout="RESULT_JSON: {}", stderr="")
+
+    probe = await svc._probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(2))
+    assert probe is not None and probe.passed is False
+    killed.assert_not_awaited()

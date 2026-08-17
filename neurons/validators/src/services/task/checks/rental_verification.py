@@ -18,6 +18,7 @@ from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
+from .cpu_truth import advertised_cpu_count
 
 
 @dataclass(frozen=True)
@@ -162,7 +163,7 @@ class RentalVerificationCheck:
         # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
         # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
         # rent skips `--cpus` there too) and when the count is unreadable.
-        cpu_count = self._advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
+        cpu_count = advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
 
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
@@ -286,16 +287,6 @@ class RentalVerificationCheck:
                 ctx.ssh, ctx.executor.uuid
             )
 
-    @staticmethod
-    def _advertised_cpu_count(ctx: Context) -> int | None:
-        """The core count the miner reported this cycle, or None when the scrape produced no usable value."""
-        cpu = (ctx.state.specs or {}).get("cpu") or {}
-        try:
-            count = int(cpu.get("count"))
-        except (TypeError, ValueError):
-            return None
-        return count if count > 0 else None
-
     def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
         """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.
 
@@ -317,7 +308,7 @@ class RentalVerificationCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "source": "rental_verification",
                 "reason_code": response.reason_code,
-                "advertised_cpu_count": self._advertised_cpu_count(ctx),
+                "advertised_cpu_count": advertised_cpu_count(ctx),
                 "stderr": stderr,
                 "enforced": enforce,
                 "details": details,

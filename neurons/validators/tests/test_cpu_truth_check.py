@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 from neurons.validators.src.services.task.checks.cpu_truth import (
+    CPU_TRUTH_READ_TIMEOUT_SECONDS,
     CpuTruthCheck,
     _count_cpu_list,
 )
@@ -53,6 +54,25 @@ def test_count_cpu_list(spec, expected):
 
 
 # ---------------------------- behavior ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_sysfs_read_is_bounded(context_factory):
+    # An unbounded read on a wedged host would hold this check open for the executor's whole
+    # validation budget; the timeout turns that into the *_unknown path instead.
+    seen: dict = {}
+
+    async def run(cmd, *args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(exit_status=0, stdout="0-127", stderr="")
+
+    ctx = context_factory(state=_state(128), ssh=SimpleNamespace(run=run))
+    with patch("neurons.validators.src.services.task.checks.cpu_truth.settings") as s:
+        s.CPU_TRUTH_CHECK_ENABLED = True
+        s.CPU_TRUTH_ENFORCEMENT_ENABLED = False
+        await CpuTruthCheck().run(ctx)
+
+    assert seen.get("timeout") == CPU_TRUTH_READ_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio

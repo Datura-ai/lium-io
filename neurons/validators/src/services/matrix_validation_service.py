@@ -343,7 +343,7 @@ class ValidationService:
         log = logger.info if passed else logger.warning
         log(_m("All-cards GPU work-proof", extra=get_extra_info(log_extra)))
 
-        if any(outcome.get("reason") == "timeout" for outcome in per_card):
+        if any(self._leaves_matmul_running(outcome) for outcome in per_card):
             # asyncssh's timeout only abandons the local wait; a timed-out remote matmul keeps
             # running and holding VRAM. The fatal single-card capability matmul runs next in this
             # same call, so sweep the orphans first or it OOMs on device 0 — mirrors the legacy path.
@@ -356,6 +356,13 @@ class ValidationService:
             over_wall_clock=over_wall_clock,
             per_card=per_card,
         )
+
+    @staticmethod
+    def _leaves_matmul_running(outcome: dict) -> bool:
+        # the per-card failures where the remote matmul may still hold VRAM: a timeout abandons only
+        # the local wait, and a channel that dies mid-run (ssh_error) leaves the process untouched
+        reason = outcome.get("reason") or ""
+        return reason == "timeout" or reason.startswith("ssh_error")
 
     def _generate_card_cipher(self, machine_info: str, params: "VerifierParams") -> str:
         # generate one card's challenge on a dedicated object; no per-card seal is verified (a

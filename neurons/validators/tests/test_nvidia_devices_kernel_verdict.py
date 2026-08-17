@@ -134,7 +134,9 @@ async def test_unreadable_proc_recorded_distinctly(monkeypatch, caplog):
     ssh = _fake_ssh(FakeRun("proc boom", "err", exit_status=1), FakeRun(_XML_BOTH))
 
     with caplog.at_level("WARNING"):
-        with pytest.raises(RuntimeError):
+        # MissingRentedGpuError, not a bare RuntimeError: only the named verdict survives the
+        # caller's legacy fallback, so fail-closed holds here too.
+        with pytest.raises(MissingRentedGpuError):
             await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
 
     rec = next(r for r in caplog.records if r.message == nd._KERNEL_GPU_VERDICT_DISAGREE_MSG)
@@ -151,11 +153,36 @@ async def test_silently_empty_proc_still_records_unreadable(monkeypatch, caplog)
     ssh = _fake_ssh(FakeRun(""), FakeRun(_XML_BOTH))
 
     with caplog.at_level("WARNING"):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(MissingRentedGpuError):
             await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
 
     rec = next(r for r in caplog.records if r.message == nd._KERNEL_GPU_VERDICT_DISAGREE_MSG)
     assert rec.proc_unreadable is True
+
+
+@pytest.mark.asyncio
+async def test_empty_kernel_map_under_enforcement_refuses_the_container(monkeypatch, caplog):
+    # The bypass this closes: with an empty kernel map the refused XML overwrite left nothing to
+    # raise but a plain RuntimeError, which the caller catches and downgrades to the legacy --gpus
+    # string — the container is created anyway on NVML's spoofable word. Enforcement must refuse it.
+    monkeypatch.setattr(nd.settings, "KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", True, raising=False)
+    ssh = _fake_ssh(FakeRun(""), FakeRun(_XML_BOTH))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(MissingRentedGpuError):
+            await build_gpu_docker_config_for_executor(ssh, ["GPU-bbb"], executor_id="exec-9")
+
+
+@pytest.mark.asyncio
+async def test_empty_kernel_map_in_shadow_still_creates_the_container():
+    # Shadow is the fleet-wide default: the XML overwrite stands, so an honest host with an
+    # unreadable procfs keeps its device mounts and nothing about placement changes.
+    # Three responses: empty procfs, the XML fallback, then the shared-node query.
+    ssh = _fake_ssh(FakeRun(""), FakeRun(_XML_BOTH), FakeRun(""))
+
+    config = await build_gpu_docker_config_for_executor(ssh, ["GPU-bbb"], executor_id="exec-9")
+
+    assert [device.path_on_host for device in config.device_mounts] == ["/dev/nvidia1"]
 
 
 @pytest.mark.asyncio

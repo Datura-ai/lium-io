@@ -273,6 +273,7 @@ async def _query_gpu_nodes_for_uuids(
     # unreadable procfs (unexpanded glob, `|| continue`, stderr discarded) and exits 0, so an
     # honest host with no readable procfs would otherwise log identically to a spoof.
     proc_unreadable = not uuid_to_minor
+    refused_xml_overwrite = False
 
     if not uuid_to_minor or _missing_gpu_uuids(gpu_uuids, uuid_to_minor):
         # The kernel (procfs) map cannot satisfy the request; today we consult the NVML-backed
@@ -305,10 +306,21 @@ async def _query_gpu_nodes_for_uuids(
                 )
                 if enforce:
                     overwrite_with_xml = False
+                    refused_xml_overwrite = True
         if overwrite_with_xml:
             uuid_to_minor = xml_uuid_to_minor
 
     if not uuid_to_minor:
+        if refused_xml_overwrite:
+            # Enforcement just refused the XML overwrite on an unreadable procfs, so the kernel
+            # knows none of the rented cards. A plain RuntimeError here would land in the caller's
+            # generic branch and fall back to the legacy --gpus string — the container gets created
+            # anyway and fail-closed would not hold. Name the verdict instead.
+            raise MissingRentedGpuError(
+                requested_uuids=gpu_uuids,
+                visible_uuids=[],
+                missing_uuids=list(gpu_uuids),
+            )
         details = f": {'; '.join(errors)}" if errors else ""
         raise RuntimeError(f"GPU minor discovery returned no UUID/minor rows{details}")
 
