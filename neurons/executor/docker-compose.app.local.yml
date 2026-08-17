@@ -1,17 +1,4 @@
 services:
-  db:
-    image: postgres:14.0-alpine
-    healthcheck:
-      test: pg_isready -U postgres || exit 1
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=compute-subnet-db
-    ports:
-      - 8432:5432
-    volumes:
-      - db_data:/var/lib/postgresql/data
-
   executor:
     build:
       context: .
@@ -30,27 +17,31 @@ services:
       - /etc/docker/daemon.json:/etc/docker/daemon.json
       - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
       - reserve_data:/var/lium-reserve
+      - pod_logs:/var/lib/executor-pod-logs
     pid: host
     privileged: true
     environment:
-      - DB_URI=postgresql://postgres:password@db:5432/compute-subnet-db
       - NVIDIA_DRIVER_CAPABILITIES=all
-    depends_on:
-      - db
     labels:
-      autoheal-app: true
+      autoheal: true
     healthcheck:
-      test: ["CMD-SHELL", "nvidia-smi || exit 1"]
+      # probe the app itself on the loopback (no docker networking involved):
+      # a wedged agent goes unhealthy and autoheal restarts it, while nvidia-smi
+      # only proved the GPU driver was alive. Conservative thresholds so a
+      # host-IO storm (~2.5 min of continuous failure needed) cannot trigger
+      # false restarts.
+      test: [ "CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:${INTERNAL_PORT}/version || exit 1" ]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 120s
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [ gpu ]
 
   monitor:
     image: compute-subnet-executor:local
@@ -59,21 +50,18 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /dev/kmsg:/dev/kmsg:ro
+      - pod_logs:/var/lib/executor-pod-logs
     pid: host
     command: pdm run src/monitor.py
-    environment:
-      - DB_URI=postgresql://postgres:password@db:5432/compute-subnet-db
     depends_on:
       - executor
 
   autoheal:
     restart: always
     image: willfarrell/autoheal
-    environment:
-      - AUTOHEAL_CONTAINER_LABEL=all
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
-  db_data:
   reserve_data:
+  pod_logs:
