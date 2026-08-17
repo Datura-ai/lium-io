@@ -69,7 +69,9 @@ max_body_bytes = 65536
 #
 # The guest-side port carrying SSH. Set it and cvmd reports the guest's host-key fingerprint
 # and uses reading it as proof the CVM is up; leave it unset and readiness is a TCP accept,
-# which only proves QEMU is listening.
+# which only proves QEMU is listening. 2200 is the fleet convention: the executor's sshd in a
+# validation CVM, and the platform's guest-SSH service (the renter's way into the CVM itself)
+# in a renter CVM both bind it — so it must be one of the cvm_ports forwards above.
 # cvm_ssh_guest_port = 2200
 #
 # Both change the QEMU command line and therefore the measurements. lium-cvm.sh passes neither.
