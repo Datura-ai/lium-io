@@ -18,6 +18,30 @@ logger = get_logger(__name__)
 
 POD_LOG_FILE = Path(os.getenv("POD_LOG_FILE", "/var/lib/executor-pod-logs/pod_logs.jsonl"))
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
+KEEP_TAIL_BYTES = MAX_FILE_SIZE_BYTES // 2
+
+
+def _truncate_to_tail() -> None:
+    # drop the oldest events once the file passes the cap, keeping the freshest
+    # ones: the newest events are the ones a diagnosis actually needs
+    offset = POD_LOG_FILE.stat().st_size - KEEP_TAIL_BYTES
+    with open(POD_LOG_FILE, "rb") as f:
+        if offset > 0:
+            # start one byte early and read to the next newline: that discards the
+            # line the offset cut in half, and nothing more when it landed on a break
+            f.seek(offset - 1)
+            f.readline()
+        tail = f.read()
+    tmp_file = POD_LOG_FILE.with_name(POD_LOG_FILE.name + ".tmp")
+    with open(tmp_file, "wb") as f:
+        f.write(tail)
+    os.replace(tmp_file, POD_LOG_FILE)
+    logger.warning(
+        "Pod log file %s exceeded %d bytes, kept the newest %d bytes",
+        POD_LOG_FILE,
+        MAX_FILE_SIZE_BYTES,
+        len(tail),
+    )
 
 
 def append_pod_log(log: PodLog) -> None:
@@ -25,12 +49,7 @@ def append_pod_log(log: PodLog) -> None:
     try:
         POD_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         if POD_LOG_FILE.exists() and POD_LOG_FILE.stat().st_size > MAX_FILE_SIZE_BYTES:
-            logger.warning(
-                "Pod log file %s exceeds %d bytes, dropping event",
-                POD_LOG_FILE,
-                MAX_FILE_SIZE_BYTES,
-            )
-            return
+            _truncate_to_tail()
         with open(POD_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(log.model_dump_json() + "\n")
     except Exception as e:

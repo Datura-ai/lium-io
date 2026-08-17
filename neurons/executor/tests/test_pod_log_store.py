@@ -76,18 +76,27 @@ def test_append_never_raises_on_disk_failure(store_file, monkeypatch):
     pod_log_store.append_pod_log(PodLog(container_name="container_a", event="start"))
 
 
-def test_append_drops_events_when_file_exceeds_cap(store_file, monkeypatch):
-    # Arrange
-    monkeypatch.setattr(pod_log_store, "MAX_FILE_SIZE_BYTES", 10)
-    pod_log_store.append_pod_log(PodLog(container_name="container_a", event="start"))
-    size_after_first = store_file.stat().st_size
+def test_append_over_cap_drops_oldest_events_and_keeps_the_newest(store_file, monkeypatch):
+    # Arrange: ten equally sized lines, then a cap that only half of them fit under
+    written = [
+        PodLog(container_name="container_a", event=f"event_{i}",
+               created_at=datetime(2026, 7, 10, 12, i))
+        for i in range(10)
+    ]
+    for log in written:
+        pod_log_store.append_pod_log(log)
+    line_size = store_file.stat().st_size // len(written)
+    monkeypatch.setattr(pod_log_store, "MAX_FILE_SIZE_BYTES", 5 * line_size)
+    monkeypatch.setattr(pod_log_store, "KEEP_TAIL_BYTES", 5 * line_size)
+    fresh = PodLog(container_name="container_a", event="event_new",
+                   created_at=datetime(2026, 7, 10, 12, 10))
 
     # Act
-    pod_log_store.append_pod_log(PodLog(container_name="container_a", event="stop"))
+    pod_log_store.append_pod_log(fresh)
 
-    # Assert: second event dropped, file unchanged
-    assert store_file.stat().st_size == size_after_first
-    assert len(pod_log_store.find_by_container_name("container_a")) == 1
+    # Assert: the five oldest events are gone, the newest five plus the fresh one stay
+    result = pod_log_store.find_by_container_name("container_a")
+    assert [log.uuid for log in result] == [log.uuid for log in written[5:]] + [fresh.uuid]
 
 
 def test_pod_log_service_reads_from_store(store_file):
