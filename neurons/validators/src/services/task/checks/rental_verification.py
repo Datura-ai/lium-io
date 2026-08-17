@@ -4,19 +4,21 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
+
+from core.config import settings
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from protocol.vc_protocol.compute_requests import (
+    CPU_QUOTA_EXCEEDS_HOST_REASON,
     GPU_RUNTIME_DEVICE_FAULT_REASON,
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     FillerRunActiveResponse,
 )
 
-from core.config import settings
-
 from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
+from .cpu_truth import advertised_cpu_count
 
 
 @dataclass(frozen=True)
@@ -152,6 +154,17 @@ class RentalVerificationCheck:
         gpu_details = ctx.state.gpu_details or (ctx.state.specs or {}).get("gpu", {}).get("details", [])
         gpu_uuids = [detail["uuid"] for detail in gpu_details if isinstance(detail, dict) and detail.get("uuid")]
 
+        # DAH-2671 item 2b: hand the backend the advertised core count AS-IS so the probe is created
+        # with `--cpus=<advertised>`. The backend classifier compares it against the daemon's own N
+        # from the refusal message and only classifies CPU_QUOTA_EXCEEDS_HOST when
+        # advertised > 2*N + 4 (honest max divergence is 2x — SMT off; observed spoofs 4-8x), so an
+        # honest SMT-off host falls into the backend's retry-without-flag path. No host-read capping:
+        # any source read from the judged host (sysfs/procfs) is spoofable, and a cap computed from
+        # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
+        # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
+        # rent skips `--cpus` there too) and when the count is unreadable.
+        cpu_count = advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
+
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
             # already sees an active customer rental, the backend skips the container-creating check
@@ -164,6 +177,7 @@ class RentalVerificationCheck:
                 executor_id=executor.uuid,
                 rental_in_progress=has_customer_rental,
                 gpu_uuids=gpu_uuids,
+                cpu_count=cpu_count,
             )
 
             # Handle API failure (None response) - fail this executor
@@ -200,6 +214,8 @@ class RentalVerificationCheck:
                     event=event,
                     updates={},
                 )
+            elif response.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON:
+                return self._cpu_quota_verdict(ctx, response)
             elif response.reason_code in _GPU_RUNTIME_QUARANTINE:
                 quarantine = _GPU_RUNTIME_QUARANTINE[response.reason_code]
                 details = response.details or {}
@@ -270,6 +286,45 @@ class RentalVerificationCheck:
             await ctx.services.container_cleanup.force_remove_health_checks(
                 ctx.ssh, ctx.executor.uuid
             )
+
+    def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
+        """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.
+
+        Shadow (enforcement off) logs the verdict as a warning and keeps passed=True so scoring is
+        unchanged; enforcement zeroes the score and clears the verified job, the same quarantine the
+        GPU runtime faults use.
+        """
+        enforce = settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED
+        details = response.details or {}
+        stderr = details.get("docker_stderr") or response.error
+        event = render_message(
+            Msg.CPU_QUOTA_EXCEEDS_HOST,
+            ctx=ctx,
+            check_id=self.check_id,
+            severity=None if enforce else "warning",
+            impact=None if enforce else "Shadow observation only: score was NOT changed",
+            what={
+                "verified": False,
+                "executor_uuid": ctx.executor.uuid,
+                "source": "rental_verification",
+                "reason_code": response.reason_code,
+                "advertised_cpu_count": advertised_cpu_count(ctx),
+                "stderr": stderr,
+                "enforced": enforce,
+                "details": details,
+            },
+        )
+        updates = (
+            {
+                "score": 0.0,
+                "job_score": 0.0,
+                "score_warning": "Advertised CPU cores exceed the host's physical cores",
+                "clear_verified_job_info": True,
+            }
+            if enforce
+            else {}
+        )
+        return CheckResult(passed=not enforce, event=event, updates=updates)
 
     async def _verify_every_filler_alive(
         self, ctx: Context, filler_containers: list[str], *, enforce: bool

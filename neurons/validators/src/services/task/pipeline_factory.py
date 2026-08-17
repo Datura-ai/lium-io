@@ -9,9 +9,11 @@ import uuid
 from typing import cast
 
 import bittensor
-from clients.backend_client import BackendClient
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
+
+from clients.backend_client import BackendClient
+from core.config import settings, shared_client
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
@@ -21,10 +23,8 @@ from services.inspector_validation_service import InspectorValidationService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.redis_service import RENTAL_SUCCEED_MACHINE_SET, RedisService
-from services.verifyx_validation_service import VerifyXValidationService
-
-from core.config import settings, shared_client
 from services.ssh_service import SSHService
+from services.verifyx_validation_service import VerifyXValidationService
 
 from .checks import (
     BannedGpuCheck,
@@ -32,6 +32,7 @@ from .checks import (
     CachedTemplateVerificationCheck,
     CapabilityCheck,
     CollateralCheck,
+    CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DuplicateExecutorCheck,
     FinalizeCheck,
@@ -254,6 +255,11 @@ class PipelineFactory:
                 # here — before the rented short-circuit (TenantEnforcementCheck)
                 # — to gate rented and idle executors alike.
                 GpuVramPrecheck(),
+                # DAH-2671 item 2a: non-fatal, observe-only CPU-count corroboration. Placed right
+                # after the GPU spec-check group (and before the rented short-circuit) so it reads
+                # advertised specs already populated by the scrape; it only reads over SSH, mutates
+                # no executor state, and never zeroes score outside CPU_TRUTH_ENFORCEMENT_ENABLED.
+                CpuTruthCheck(),
                 GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
@@ -321,6 +327,8 @@ class PipelineFactory:
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
+                # DAH-2671 item 2a: read-only SSH corroboration, safe in dry run (mutates nothing).
+                CpuTruthCheck(),
                 # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.
                 GpuPowerLimitCheck(restore_stale_caps=False),

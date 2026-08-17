@@ -1,22 +1,10 @@
-import logging
+import asyncio
 
-from typing import Annotated
-from fastapi import Depends
-
-from core.db import get_session
-from daos.pod_log import PodLogDao
-
-
-logger = logging.getLogger(__name__)
+from models.pod_log import PodLog
+from services import pod_log_store
 
 
 class PodLogService:
-    def __init__(
-        self,
-        pod_log_dao: Annotated[PodLogDao, Depends(PodLogDao)]
-    ):
-        self.pod_log_dao = pod_log_dao
-
-    async def find_by_continer_name(self, container_name: str):
-        with get_session() as session:
-            return self.pod_log_dao.find_by_continer_name(session, container_name)
+    async def find_by_continer_name(self, container_name: str) -> list[PodLog]:
+        # file read happens off the event loop; a hanging disk must not block /ping
+        return await asyncio.to_thread(pod_log_store.find_by_container_name, container_name)

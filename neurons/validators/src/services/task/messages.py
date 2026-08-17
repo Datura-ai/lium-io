@@ -1014,6 +1014,17 @@ class RentalVerificationMessages:
             "`sudo reboot`, then check `nvidia-smi` and `dmesg` for Xid errors."
         ),
     )
+    CPU_QUOTA_EXCEEDS_HOST = MessageTemplate(
+        event="Advertised CPU cores exceed the host's physical cores",
+        reason="CPU_QUOTA_EXCEEDS_HOST",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0: the rental-verification container demanded the advertised cores and the host's Docker daemon rejected the count.",
+        remediation=(
+            "Advertise the real CPU(s) count. The host's Docker daemon refused `--cpus=<advertised>` "
+            "because the machine has fewer physical cores than reported."
+        ),
+    )
     API_ERROR = MessageTemplate(
         event="Rental verification API error",
         reason="RENTAL_CHECK_API_ERROR",
@@ -1055,6 +1066,45 @@ class RentalVerificationMessages:
         category="runtime",
         impact="Filler state unknown for this cycle",
         remediation="Ensure the executor is reachable over SSH and stays online",
+    )
+
+
+class CpuTruthMessages:
+    """DAH-2671 item 2a — corroborate advertised CPU(s) against sources the lscpu wrapper does not
+    author. Shadow (CPU_TRUTH_CHECK_ENABLED without enforcement) emits CPU_MISMATCH as a warning and
+    keeps passed=True; only CPU_TRUTH_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+
+    CPU_OK = MessageTemplate(
+        event="CPU core count corroborated",
+        reason="CPU_TRUTH_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    CPU_MISMATCH = MessageTemplate(
+        event="Advertised CPU cores exceed the kernel-present CPU population",
+        reason="CPU_TRUTH_MISMATCH",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "Advertise the real CPU(s) count. The kernel-present CPU population "
+            "(/sys/devices/system/cpu/present) is far below the reported core count."
+        ),
+    )
+    CPU_UNKNOWN = MessageTemplate(
+        event="CPU core count could not be corroborated",
+        reason="CPU_TRUTH_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed without penalty",
+    )
+    SKIPPED = MessageTemplate(
+        event="CPU truth check disabled",
+        reason="CPU_TRUTH_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
     )
 
 

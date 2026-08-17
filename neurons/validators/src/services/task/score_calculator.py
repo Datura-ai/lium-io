@@ -61,6 +61,14 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("CVM attestation not passed (TDX/GPU attestation required)")
 
+    # CPU-truth gate: the advertised CPU(s) count is contradicted by the kernel-present
+    # population. CpuTruthCheck is non-fatal and runs before this, so passed=False alone would
+    # not survive — only this gate actually zeroes the score. Shadow leaves the flag True.
+    if not ctx.cpu_truth_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Advertised CPU cores exceed the host's physical cores")
+
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"

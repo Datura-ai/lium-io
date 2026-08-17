@@ -47,7 +47,6 @@ Pre-check policy:
     - Models in neither -> raises UnsupportedGpuModelError.
 """
 from __future__ import annotations
-from typing import Dict, List, Optional, Set, Tuple
 
 # Per-window bounds are nominal × [VRAM_FLOOR_RATIO, VRAM_CEIL_RATIO].
 # See the module docstring for why 0.90 / 1.05 (NVML under-reporting + vendor drift).
@@ -60,7 +59,7 @@ VRAM_CEIL_RATIO = 1.05
 #   `observed: X` notes the prod NVML-reported value(s) we've seen for that
 #   model (most-common first). Used to verify the computed window covers reality.
 #   Multi-variant cards list one nominal size per real SKU (flagged `# multi-variant`).
-GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
+GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Blackwell data-center
     "NVIDIA B300 SXM6 AC":                                [294912],        # 288 GB; observed: 275040
     "NVIDIA B200":                                        [196608],        # 192 GB; observed: 183359 (49140 ~48GB outlier rejected)
@@ -168,7 +167,7 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not
 # enforce a VRAM range (e.g., legacy data, awaiting spec confirmation).
 # Pre-check returns None for these.
-KNOWN_UNRANGED: Set[str] = set()
+KNOWN_UNRANGED: set[str] = set()
 
 
 # --- Normalization (CUDA deviceProp.name -> canonical key) -------------------
@@ -177,7 +176,7 @@ KNOWN_UNRANGED: Set[str] = set()
 # keys directly. Add entries as new mismatches are observed in production
 # logs. Unmapped names pass through unchanged (and will likely produce
 # UnsupportedGpuModelError until added here).
-NORMALIZATION_MAP: Dict[str, str] = {
+NORMALIZATION_MAP: dict[str, str] = {
     # Tesla V100 family — CUDA reports "Tesla V100-..." in some driver versions
     "Tesla V100-SXM2-16GB":                 "NVIDIA Tesla V100 Tensor Core GPU",
     "Tesla V100-SXM2-32GB":                 "NVIDIA Tesla V100 Tensor Core GPU",
@@ -193,7 +192,7 @@ NORMALIZATION_MAP: Dict[str, str] = {
 }
 
 
-def normalize_gpu_model(name: Optional[str]) -> str:
+def normalize_gpu_model(name: str | None) -> str:
     """Map a CUDA-reported GPU name to a canonical GPU_MODEL_RATES key.
 
     Returns:
@@ -207,7 +206,7 @@ def normalize_gpu_model(name: Optional[str]) -> str:
     return NORMALIZATION_MAP.get(stripped, stripped)
 
 
-def vram_window_for_size(nominal_mb: int) -> Tuple[int, int]:
+def vram_window_for_size(nominal_mb: int) -> tuple[int, int]:
     """Compute the (vram_mb_min, vram_mb_max) acceptance window for one nominal size.
 
     Bounds are nominal × [VRAM_FLOOR_RATIO, VRAM_CEIL_RATIO], rounded to int. This
@@ -216,7 +215,26 @@ def vram_window_for_size(nominal_mb: int) -> Tuple[int, int]:
     return (round(nominal_mb * VRAM_FLOOR_RATIO), round(nominal_mb * VRAM_CEIL_RATIO))
 
 
-def get_expected_vram_windows(canonical_model: str) -> Optional[List[Tuple[int, int]]]:
+def matmul_probe_vram_mb(model: str | None) -> int | None:
+    """VRAM (MB) to size the all-cards work-proof from — registry-derived and floored to usable.
+
+    Normalizes the CUDA-reported name, takes the SMALLEST nominal size for a multi-variant model
+    (e.g. RTX 3060 8/12 GB -> 8192), then applies VRAM_FLOOR_RATIO (0.90) — the same floor
+    GpuVramPrecheck uses. NVML `.total` is physical VRAM minus vendor/ECC/driver-reserved regions,
+    observed up to ~6.7% below the marketing nominal (e.g. B200 reports 183359 on a 192 GB card,
+    L40S 46068 on 48 GB); sizing the matmul from the raw nominal would ask an honest B200/B300/L40S
+    to allocate past its usable VRAM and OOM (DAH-2671). The floor is registry-derived, NOT host
+    self-report, so a spoofing host still cannot shrink its own challenge. Returns None for unknown
+    models — the caller then skips rather than guessing. Keeps registry sizing in this one module.
+    """
+    canonical = normalize_gpu_model(model)
+    sizes = GPU_VRAM_SIZES_MB.get(canonical)
+    if not sizes:
+        return None
+    return round(min(sizes) * VRAM_FLOOR_RATIO)
+
+
+def get_expected_vram_windows(canonical_model: str) -> list[tuple[int, int]] | None:
     """Return the list of (vram_mb_min, vram_mb_max) windows for `canonical_model`.
 
     Windows are computed from the model's nominal VRAM size(s) via
