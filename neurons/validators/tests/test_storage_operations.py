@@ -21,6 +21,26 @@ def _spec() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+async def test_repeated_dispatch_reuses_running_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ssh_client = AsyncMock()
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "_operation_state", AsyncMock(return_value="RUNNING"))
+
+    files = await storage_operations.start_storage_operation(
+        ssh_client,
+        "/usr/bin/python3",
+        OPERATION_ID,
+        _spec(),
+        retain_terminal_artifacts=False,
+    )
+
+    assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    assert ssh_client.start_sftp_client.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_launch_failure_is_reported_before_the_error_is_reraised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

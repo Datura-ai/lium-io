@@ -39,6 +39,8 @@ def main() -> int:
                 lambda: Path(arguments.cancel_file).exists() if arguments.cancel_file else False
             ),
         )
+        if operation.action.value == "restore":
+            event_writer.stage("PREPARING")
         workspace = WorkspaceResolver().resolve(operation)
         ResticStorageRunner(operation, workspace, event_writer=event_writer).run()
         return 0

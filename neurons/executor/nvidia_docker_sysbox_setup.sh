@@ -5,6 +5,8 @@ set -e
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/compute-subnet/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd compute-subnet/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
+# Env:
+#   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
 
 SYSBOX_VERSION="0.6.6"
 SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
@@ -21,11 +23,60 @@ step() { echo -e "\n${B}[$1/$2]${N} $3"; }
 cleanup() { [ -n "$DOWNLOADED_DEB" ] && rm -f "$DOWNLOADED_DEB"; }
 trap cleanup EXIT
 
+version_ge() {
+    # a dotted version string ("29.5.1", "5.15.0-91-generic") against a major/minor floor
+    local major minor
+    major=${1%%.*} minor=${1#*.} minor=${minor%%.*}
+    [ "$major" -gt "$2" ] 2>/dev/null || { [ "$major" -eq "$2" ] && [ "$minor" -ge "$3" ]; } 2>/dev/null
+}
+
 docker_version_ge() {
-    local ver major minor
-    ver=$(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    major=${ver%%.*} minor=${ver#*.} minor=${minor%%.*}
-    [ "$major" -gt "$1" ] 2>/dev/null || { [ "$major" -eq "$1" ] && [ "$minor" -ge "$2" ]; } 2>/dev/null
+    # the DAEMON version — it writes the OCI spec sysbox has to accept, and it can differ from the client
+    version_ge "$(docker version --format '{{.Server.Version}}' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" "$1" "$2"
+}
+
+kernel_supports_idmapped() {
+    # overlayfs over ID-mapped mounts landed in 5.19; without it sysbox falls back to shiftfs
+    version_ge "$(uname -r)" 5 19
+}
+
+sysbox_idmapped_report() {
+    # what sysbox-mgr itself decided this boot: "yes", "no", or empty when unavailable
+    journalctl -u sysbox-mgr -b --no-pager 2>/dev/null \
+        | grep -o 'Overlayfs on ID-mapped mounts supported by kernel: [a-z]*' \
+        | tail -1 | awk '{print $NF}'
+}
+
+abort_on_active_rentals() {
+    # a rental blocks every path below, so check before anything that costs the node time or bandwidth
+    docker ps --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
+    fail "Active rentals found (pod_* containers). Cannot proceed."
+    docker ps --filter "name=pod_" --format "    - {{.Names}}" 2>/dev/null
+    exit 1
+}
+
+nvidia_hook_symptom() {
+    fail "Sysbox then falls back to shiftfs and runs the container rootfs from another path, so the NVIDIA hook fails with:"
+    fail "  nvidia-container-cli: mount error: .../merged/proc/driver/nvidia: no such file or directory"
+}
+
+fail_old_kernel() {
+    fail "Kernel $(uname -r) is too old for sysbox with GPUs — overlayfs gained ID-mapped mounts in 5.19 (6.x recommended)."
+    nvidia_hook_symptom
+    fail "Fix on Ubuntu 22.04: sudo apt-get install -y linux-generic-hwe-22.04 && sudo reboot"
+    fail "  Ubuntu 20.04 tops out at 5.15 even with HWE — upgrade the distro instead."
+    fail "Before rebooting: stop any rentals, and confirm the NVIDIA driver is DKMS-managed ('dkms status'),"
+    fail "otherwise a .run-installed driver will not load on the new kernel and the node comes back without GPUs."
+    fail "If this kernel is known to carry the backport, override with: sudo SYSBOX_SKIP_KERNEL_CHECK=1 bash $0"
+}
+
+fail_no_idmapped() {
+    fail "Sysbox reports it cannot use ID-mapped mounts, although kernel $(uname -r) supports them."
+    nvidia_hook_symptom
+    fail "Usual causes: Docker's data-root sits on a filesystem without ID-map support (ZFS, some btrfs setups),"
+    fail "or sysbox-mgr runs with ID-mapped mounts disabled. Check:"
+    fail "  docker info --format '{{.Driver}}'   (overlay2 expected)"
+    fail "  journalctl -u sysbox-mgr -b | grep -i id-mapped"
 }
 
 # ── 1. Pre-flight ────────────────────────────────────────
@@ -48,11 +99,37 @@ fi
 
 # ── 2. Already working? ─────────────────────────────────
 
-if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc \
-   && docker image inspect "$VERIFY_IMAGE" &>/dev/null \
-   && docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
-    ok "Sysbox is already working. Nothing to do."
-    exit 0
+if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc; then
+    # pull first: without the image the real test cannot run and the host would be judged on kernel version alone
+    if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
+        abort_on_active_rentals
+        echo "  Pulling $VERIFY_IMAGE to test the current setup..."
+        docker pull "$VERIFY_IMAGE" &>/dev/null || true
+    fi
+    if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
+        ok "Sysbox is already working. Nothing to do."
+        exit 0
+    fi
+fi
+
+# Reached only when the real GPU test above did not pass, so a working host is never rejected here.
+if [ "${SYSBOX_SKIP_KERNEL_CHECK:-0}" = "1" ]; then
+    warn "SYSBOX_SKIP_KERNEL_CHECK=1 — installing without the ID-mapped mounts check."
+else
+    IDMAPPED=$(sysbox_idmapped_report)
+    case "$IDMAPPED" in
+        yes) ;;
+        no)
+            if kernel_supports_idmapped; then fail_no_idmapped; else fail_old_kernel; fi
+            exit 1
+            ;;
+        *)  # sysbox-mgr reported nothing this boot — fall back to the kernel version
+            if ! kernel_supports_idmapped; then
+                fail_old_kernel
+                exit 1
+            fi
+            ;;
+    esac
 fi
 
 SKIP_INSTALL=false
@@ -64,12 +141,12 @@ step 2 7 "Checking running containers"
 
 EXECUTOR_COMPOSE_DIR=""
 all_containers=$(docker ps --format "{{.Names}}" 2>/dev/null || true)
-has_pods=false has_validator=false has_executor=false has_unknown=false
+has_validator=false has_executor=false has_unknown=false
 unknown_list=""
 
 for name in $all_containers; do
     case "$name" in
-        pod_*)       has_pods=true ;;
+        pod_*)       ;;  # handled by abort_on_active_rentals below
         container_*) has_validator=true ;;
         executor-*|executor_*)
             has_executor=true
@@ -81,11 +158,7 @@ for name in $all_containers; do
     esac
 done
 
-if [ "$has_pods" = true ]; then
-    fail "Active rentals found (pod_* containers). Cannot proceed."
-    docker ps --filter "name=pod_" --format "    - {{.Names}}" 2>/dev/null
-    exit 1
-fi
+abort_on_active_rentals
 
 if [ "$has_validator" = true ]; then
     fail "Validator check in progress (container_* containers). Wait ~30 seconds and retry."
@@ -176,6 +249,14 @@ step 4 7 "Configuring Docker"
 
 CONFIG='{"runtimes":{"sysbox-runc":{"path":"/usr/bin/sysbox-runc"},"nvidia":{"path":"nvidia-container-runtime","runtimeArgs":[]}},"features":{"cdi":false}}'
 
+# Docker >= 29.5 gives containers a private time namespace and puts it in the OCI spec; sysbox-runc
+# does not know that namespace type and rejects the whole spec. Set only on daemons that know the
+# flag — an unknown feature key on an older daemon is untested and would cost us the restart below.
+if docker_version_ge 29 5; then
+    CONFIG=$(echo "$CONFIG" | jq -c '.features["time-namespaces"] = false')
+    ok "Docker >= 29.5: disabling time namespaces for sysbox."
+fi
+
 mkdir -p /etc/docker
 if [ -f /etc/docker/daemon.json ]; then
     cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
@@ -227,13 +308,21 @@ else
     echo ""
     fail "Verification FAILED. Diagnostics:"
     echo ""
-    echo "    Docker:              $(docker --version 2>/dev/null || echo unknown)"
+    echo "    Docker daemon:       $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
+    echo "    Kernel:              $(uname -r)"
+    echo "    ID-mapped mounts:    $(sysbox_idmapped_report | grep . || echo 'not reported by sysbox-mgr')"
     echo "    NVIDIA driver:       $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo FAILED)"
     echo "    /proc/driver/nvidia: $(ls /proc/driver/nvidia &>/dev/null && echo exists || echo MISSING)"
     echo "    sysbox-runc:         $(sysbox-runc --version 2>/dev/null | head -1 || echo 'not found')"
     echo "    CDI specs:           $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo none)"
     echo "    daemon.json cdi:     $(jq -r '.features.cdi // "not set"' /etc/docker/daemon.json 2>/dev/null)"
+    echo "    daemon.json time-ns: $(jq -r '.features["time-namespaces"] | if . == null then "not set" else tostring end' /etc/docker/daemon.json 2>/dev/null)"
     echo ""
+    if docker_version_ge 29 5; then
+        fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
+        fail "  'namespace {\"time\" \"\"} does not exist'. The time-namespaces feature above turns that off;"
+        fail "  if the error is still there, downgrade the daemon to Docker 28.x."
+    fi
     fail "Check: journalctl -u docker.service --no-pager -n 20"
     fail "Check: journalctl -u sysbox-mgr.service --no-pager -n 20"
     exit 1

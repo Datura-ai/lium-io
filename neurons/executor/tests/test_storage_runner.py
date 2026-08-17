@@ -530,6 +530,8 @@ def test_restore_checkpoint_emits_bounded_progress(
 
 
 class _ReporterResponse:
+    status_code = 200
+
     def raise_for_status(self) -> None:
         return None
 
@@ -584,6 +586,38 @@ def test_reporter_preserves_zero_counters_and_receives_cancellation() -> None:
     assert payload["processed_bytes"] == 0
 
 
+def test_restore_reporter_surfaces_scan_then_restore_stages() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.RESTORE,
+        ),
+        session=session,
+    )
+
+    reporter.send(
+        {"event": "restic", "payload": {"message_type": "status", "total_files": 123}}
+    )
+    reporter.send(
+        {
+            "event": "restic",
+            "payload": {"message_type": "status", "total_files": 123, "files_restored": 1},
+        }
+    )
+
+    first_payload = session.requests[0]["json"]
+    second_payload = session.requests[1]["json"]
+    assert isinstance(first_payload, dict)
+    assert isinstance(second_payload, dict)
+    assert first_payload["stage"] == "PREPARING"
+    assert first_payload["total_files"] == 123
+    assert second_payload["stage"] == "RESTORING"
+
+
 def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
     session = _ReporterSession()
     reporter = StorageEventReporter(
@@ -619,6 +653,27 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
 class _FailingReporterSession:
     def put(self, *args: object, **kwargs: object) -> None:
         raise requests.ConnectionError("backend unavailable")
+
+
+class _RevokedReporterSession:
+    def put(self, *args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(status_code=404)
+
+
+def test_missing_restore_log_revokes_runner_without_waiting_for_lease() -> None:
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.RESTORE,
+        ),
+        session=_RevokedReporterSession(),
+    )
+
+    with pytest.raises(ReportingLeaseExpired, match="no longer active"):
+        reporter.send({"event": "heartbeat"})
 
 
 class _ManualClock:
