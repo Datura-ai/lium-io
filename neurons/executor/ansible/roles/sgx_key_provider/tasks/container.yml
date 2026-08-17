@@ -1,0 +1,94 @@
+---
+# The sealing-key provider container.
+#
+# Its healthy log line is the end-to-end proof that the whole SGX chain works:
+# registration, PCCS, QPL and qgsd all have to be right for the enclave to reach
+# PRODUCTION mode without an AESM error.
+
+# THE ONLY legitimately editable unmeasured file in the dstacktee tree.
+# Everything under app/ is hashed into the compose the validator whitelists.
+#
+# The checked-in copy already ships "use_secure_cert": false, so that half is an
+# idempotent no-op here — it still matters for the SYSTEM config, which Intel's
+# package genuinely ships as true. The substantive work on this copy is the
+# pccs_url repoint.
+- name: Point the key provider's QPL at the PCCS
+  ansible.builtin.lineinfile:
+    path: "{{ lium_repo_path }}/{{ lium_kp_qcnl_relpath }}"
+    regexp: '^\s*"pccs_url"\s*:'
+    line: '  "pccs_url": "{{ lium_pccs_url }}",'
+    create: false
+    mode: "0644"
+
+- name: Ensure the key provider's QPL accepts the local certificate
+  ansible.builtin.lineinfile:
+    path: "{{ lium_repo_path }}/{{ lium_kp_qcnl_relpath }}"
+    regexp: '^\s*"use_secure_cert"\s*:'
+    line: '  "use_secure_cert": false,'
+    create: false
+    mode: "0644"
+
+# The two edits above are safe TODAY only because the checked-in file is plain,
+# strict, comma-trailing JSON, so both regexps match. lineinfile APPENDS when a
+# regexp matches nothing, so the day that file is reformatted — reordered, given
+# comments, or switched to Intel's leading-comma house style — these tasks stop
+# matching and silently write their line after the closing brace instead. That is
+# exactly what happened to the SYSTEM copy, and nothing on the host said so: the
+# QPL just failed to parse its config, quote generation returned a DCAP error,
+# the key provider refused the guest, and the CVM rebooted at ~160s while the
+# converge reported success. Checked here so the damage cannot leave this role.
+- name: Confirm the key provider's QPL configuration is still valid JSON
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c "import json,sys; json.load(open(sys.argv[1]))"
+      {{ lium_repo_path }}/{{ lium_kp_qcnl_relpath }}
+  changed_when: false
+  register: lium_kp_qcnl_valid
+  failed_when: lium_kp_qcnl_valid.rc != 0
+  check_mode: false
+
+- name: Start the sealing-key provider
+  ansible.builtin.command:
+    cmd: docker compose up -d --build
+    chdir: "{{ lium_repo_path }}/neurons/executor/dstacktee/key-provider"
+  register: lium_kp_up
+  changed_when: true
+
+- name: Wait for the enclave to reach PRODUCTION mode
+  ansible.builtin.command:
+    cmd: docker logs dstack-key-provider
+  register: lium_kp_logs
+  changed_when: false
+  until: "'PRODUCTION mode' in lium_kp_logs.stdout"
+  retries: 30
+  delay: 5
+  failed_when: false
+  # Check mode skips the `docker compose up` above, so there is nothing to wait
+  # for — and a skipped command returns no stdout, so `until` can never be
+  # satisfied. `failed_when: false` does not rescue it: retry exhaustion is
+  # reported as a task failure in its own right. Observed as 30 attempts, 150
+  # seconds of delay, and then a dead run that never reached verify.
+  when: not ansible_check_mode
+
+# All three conditions together, because any one alone can look healthy:
+# a container can be running while its enclave crash-loops, and a restart count
+# above zero means it already failed at least once.
+- name: Assert the whole SGX chain works
+  ansible.builtin.assert:
+    that:
+      - "'PRODUCTION mode' in lium_kp_logs.stdout"
+      - "'error 44' not in (lium_kp_logs.stdout | lower)"
+      - "'load_enclave' not in (lium_kp_logs.stdout | lower)"
+    fail_msg: >-
+      The sealing-key provider is not healthy. "AESM service returned error 44"
+      or a failed load_enclave means this platform has no PCK certificates, so a
+      booted CVM would fail attestation and score zero. Check the pck_cert row
+      count in /opt/intel/sgx-dcap-pccs/pckcache.db — not
+      the MPA registration log, which reports success on broken hosts too.
+    success_msg: "Key provider running in PRODUCTION mode with no enclave errors."
+    quiet: true
+  when:
+    - lium_assert_key_provider | bool
+    # Check mode never started the container, so lium_kp_logs carries no stdout
+    # and this would fail every check run on every host, healthy or not.
+    - not ansible_check_mode

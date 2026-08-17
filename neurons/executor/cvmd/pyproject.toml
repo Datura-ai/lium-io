@@ -1,0 +1,54 @@
+[project]
+name = "cvmd"
+version = "0.2.0"
+description = "CVM host daemon — signed two-scope control API for lium.io CVM nodes (DAH-2575)"
+authors = [
+    {name = "waris", email = "waris0609@outlook.com"},
+]
+dependencies = [
+    # Pinned deliberately independent of the executor's `bittensor==9.0.0`.
+    #
+    # cvmd is a separate package with its own venv at /opt/cvmd/venv. It makes no chain calls —
+    # it only verifies hotkey signatures — so it shares no runtime with the executor and does not
+    # need to track its pin. Two facts make the split safe rather than accidental:
+    #
+    #   1. CVM hosts run the Ubuntu 25.10/26.04 system Python (3.13/3.14). bittensor 9.x does not
+    #      support 3.13; 11.x declares >=3.10,<3.15 and its one native dependency ships abi3
+    #      wheels, so a single wheel covers both with no compile step on the host.
+    #   2. A blob signed by bittensor 9.10.1 (what the validator runs) verifies under 11.0.2.
+    #      tests/test_golden_vector.py pins that with a committed fixture — it is the test that
+    #      fails if a future bump breaks wire compatibility with the signers.
+    #
+    # Do not "fix" the mismatch with the executor by downgrading. See tests/test_golden_vector.py.
+    "bittensor==11.0.2",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "pydantic>=2.9.0",
+]
+requires-python = ">=3.13,<3.15"
+readme = "README.md"
+license = {text = "MIT"}
+
+[project.scripts]
+cvmd = "cvmd.__main__:main"
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.pdm]
+distribution = true
+
+[tool.pdm.build]
+package-dir = "src"
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

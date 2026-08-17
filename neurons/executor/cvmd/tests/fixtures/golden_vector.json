@@ -1,0 +1,13 @@
+{
+  "_comment": "Signed once under the bittensor version named below. Verify it; never regenerate it in CI. If this fails after a bittensor bump, the new version has broken wire compatibility with the 9.x signers \u2014 that is the finding, not a stale fixture.",
+  "signed_with_bittensor": "9.10.1",
+  "ss58_address": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+  "crypto_type": 1,
+  "method": "POST",
+  "request_target": "/v1/cvm",
+  "body_utf8": "{\"kind\":\"renter\",\"image\":\"sha256:abc\",\"kernel\":\"sha256:def\",\"initrd\":\"sha256:012\"}",
+  "timestamp": "1754500000000000000",
+  "nonce": "9f2c1a7b4e6d80f35c9a1e4b7d2f6083",
+  "blob_sha256_hex": "351b2dc0a43ebdecfeff01d27aada99ac66d692fda90393a214a630df5521a11",
+  "signature_hex": "0248dd3bc14080bfef838c35b5323cab2dc280eb8ed09b8d4f0d6239e04653291509fb32a3a6b746de2a473c64c85178876993d652fdc569c93d3a57ed3c828b"
+}

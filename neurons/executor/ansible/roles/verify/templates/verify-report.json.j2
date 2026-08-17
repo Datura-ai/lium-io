@@ -1,0 +1,30 @@
+{#-
+  Facts are read through `ansible_facts[...]` rather than the top-level
+  `ansible_hostname` / `ansible_date_time` aliases. Auto-injection of top-level
+  facts is deprecated and is removed in ansible-core 2.24, at which point the
+  alias form would start rendering "unknown" into every report instead of
+  failing loudly.
+
+  The defaults matter too: the fixture tests run with `gather_facts: false`, so
+  there is no facts dictionary at all there.
+-#}
+{{
+  {
+    "schema_version": lium_report_schema_version,
+    "generated_at": ansible_facts.get('date_time', {}).get('iso8601', lium_generated_at_fallback),
+    "host": {
+      "hostname": ansible_facts.get('hostname', inventory_hostname),
+      "os": (lium.os_id | default('unknown')) ~ " " ~ (lium.os_version_id | default('unknown')),
+      "kernel": lium.kernel | default('unknown'),
+      "boot_id": lium.boot_id.value | default('unknown')
+    },
+    "summary": {
+      "ok": lium_summary.ok | int,
+      "warn": lium_summary.warn | int,
+      "must_fix": lium_summary.must_fix | int,
+      "unknown": lium_summary.unknown | int,
+      "skipped": lium_summary.skipped | int
+    },
+    "checks": lium_checks
+  } | to_nice_json
+}}

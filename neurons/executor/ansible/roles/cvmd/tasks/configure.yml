@@ -1,0 +1,101 @@
+---
+# Configuration and service state.
+#
+# Both files are rendered whole from a template and validated before they
+# replace anything. Neither is line-edited: `lineinfile` APPENDS when its regexp
+# does not match, which is how a structured config silently becomes invalid
+# while the run still reports success.
+
+- name: Ensure the config directory exists
+  ansible.builtin.file:
+    path: "{{ cvmd_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Render the cvmd config
+  ansible.builtin.template:
+    src: config.toml.j2
+    dest: "{{ cvmd_config_path }}"
+    owner: root
+    group: root
+    mode: "0640"
+    # Loaded by cvmd's OWN loader, not merely parsed as TOML. load_config is
+    # what refuses at startup — the TOML syntax, the required keys, the paired
+    # TLS settings, the port mappings dstack has to turn into hostfwd rules — so
+    # running it against the candidate file makes an unstartable daemon
+    # impossible to install. Caught here it leaves the previous config in place;
+    # caught at startup it leaves no working daemon.
+    validate: >-
+      {{ cvmd_python }} -c
+      'import sys, pathlib; from cvmd.config import load_config;
+      load_config(pathlib.Path(sys.argv[1]))' %s
+  notify: Restart cvmd
+
+# Validated by cvmd's OWN loader, not by a JSON parse. load_authorized_clients
+# is what refuses at startup — it does the ss58 checksum, the scope enum and the
+# duplicate check — so running it against the candidate file makes an
+# unstartable daemon impossible to install. This is the only check in the role
+# that verifies an address rather than its shape.
+- name: Render the authorized-clients file
+  ansible.builtin.template:
+    src: authorized_clients.json.j2
+    dest: "{{ cvmd_authorized_clients_path }}"
+    owner: root
+    group: root
+    mode: "0640"
+    validate: >-
+      {{ cvmd_python }} -c
+      'import sys, pathlib; from cvmd.auth.clients import load_authorized_clients;
+      load_authorized_clients(pathlib.Path(sys.argv[1]))' %s
+  notify: Restart cvmd
+
+- name: Ensure the CVM run directory exists
+  ansible.builtin.file:
+    path: "{{ lium_cvmd_run_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
+- name: Enable cvmd and start it
+  ansible.builtin.systemd_service:
+    name: cvmd.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# Handlers run at the end of the play by default, which would leave the health
+# check below probing the daemon that a config change has not yet reached.
+- name: Apply any pending restart before checking health
+  ansible.builtin.meta: flush_handlers
+
+- name: Choose the address to probe
+  ansible.builtin.set_fact:
+    # 0.0.0.0 is a bind wildcard, not a destination.
+    cvmd_probe_host: "{{ '127.0.0.1' if lium_cvmd_bind_address == '0.0.0.0' else lium_cvmd_bind_address }}"
+
+# validate_certs: false because install.sh generates a self-signed pair and
+# nothing pins it yet (client-side pinning is DAH-2580). This asserts the daemon
+# is up and serving TLS, not that the certificate is trusted.
+- name: Wait for cvmd to answer /health
+  ansible.builtin.uri:
+    url: "https://{{ cvmd_probe_host }}:{{ lium_cvmd_port }}/health"
+    validate_certs: false
+    status_code: 200
+  register: cvmd_health
+  retries: "{{ lium_cvmd_health_retries }}"
+  delay: "{{ lium_cvmd_health_delay }}"
+  until: cvmd_health is succeeded
+  # A health probe is a read. Marking it changed makes every converge report a
+  # change on a host where nothing moved.
+  changed_when: false
+
+- name: Report the running cvmd
+  ansible.builtin.debug:
+    msg: >-
+      cvmd {{ cvmd_health.json.version | default('?') }} is serving on
+      {{ lium_cvmd_bind_address }}:{{ lium_cvmd_port }} with
+      {{ lium_cvmd_authorized_clients | length }} authorised client(s).

@@ -1,0 +1,13 @@
+{# Rendered from lium_cvmd_authorized_clients. Read by cvmd at startup —
+   cvmd/src/cvmd/auth/clients.py:load_authorized_clients — which refuses the
+   whole file on a bad ss58, an unknown scope, or a repeated hotkey.
+
+   Only `hotkey` and `scope` are emitted. Copying the operator's dict through
+   verbatim would let an unrecognised key ride along into a file whose loader is
+   strict about the two it does know, and a note meant as a comment would then
+   look like configuration. #}
+{% set clients = [] %}
+{% for client in lium_cvmd_authorized_clients %}
+{% set _ = clients.append({'hotkey': client.hotkey, 'scope': client.scope}) %}
+{% endfor %}
+{{ clients | to_nice_json }}

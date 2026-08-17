@@ -1,0 +1,7 @@
+{{ ansible_managed | comment }}
+# DAH-2544 — vfio DMA entry limit.
+#
+# The shipped default is 65535, which kills a TDX guest mid-boot with
+#     VFIO_MAP_DMA failed: No space left on device
+# because TDX shared<->private page conversions exhaust it.
+options vfio_iommu_type1 dma_entry_limit={{ lium_dma_entry_limit }}

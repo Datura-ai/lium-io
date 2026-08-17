@@ -1,0 +1,22 @@
+{{ ansible_managed | comment }}
+# DAH-2544 — CVM host kernel command line.
+#
+# APPEND ONLY. This file must never assign GRUB_CMDLINE_LINUX.
+#
+# Ubuntu sources /etc/default/grub first and then /etc/default/grub.d/* in order,
+# so the ${GRUB_CMDLINE_LINUX_DEFAULT:-} expansion below preserves whatever the
+# provider already had. A plain assignment would clobber it — and on an au2-shaped
+# host, where the TDX arguments live in GRUB_CMDLINE_LINUX, clobbering the wrong
+# variable brings the host back up looking healthy but WITHOUT kvm_intel.tdx=on:
+# vfio bindings correct, GPUs CC-on, QEMU right, attestation silently failing.
+#
+# /etc/grub.d/10_linux emits the default entry as
+#     linux ... ${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}
+# so these tokens land LAST and win under the kernel's last-occurrence-wins
+# parameter parsing. See roles/kernel/README.md.
+#
+# The full required set is restated here every run rather than only the tokens
+# currently missing. That is what makes the file idempotent: writing only the
+# missing ones would empty this file on the second run, which would make them
+# missing again on the third.
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:-} {{ lium_required_tokens | join(' ') }}"

@@ -1,0 +1,95 @@
+{# Rendered by the cvmd role. packaging/config.toml is the same file with the
+   packaged defaults, installed by install.sh for a manual install; on an
+   Ansible-managed host this template is the one that wins, so the role knows
+   the port it must health-check. #}
+# Managed by Ansible (roles/cvmd) — edits here are overwritten on the next run.
+#
+# Every setting can be overridden by an environment variable named CVMD_<KEY>
+# (uppercase), which is how the tests reach it.
+
+authorized_clients = "{{ cvmd_authorized_clients_path }}"
+state_dir = "{{ cvmd_state_dir }}"
+
+host = "{{ lium_cvmd_bind_address }}"
+port = {{ lium_cvmd_port }}
+
+# HTTPS. install.sh generates a self-signed pair here if none exists. A
+# self-signed certificate that no client pins gives confidentiality against a
+# passive listener and no server authentication — client-side pinning is
+# DAH-2580.
+tls_cert = "{{ cvmd_tls_dir }}/cert.pem"
+tls_key = "{{ cvmd_tls_dir }}/key.pem"
+
+# The freshness window a request timestamp must fall inside, in seconds. It
+# rests on the host clock, which cvmd does not control.
+skew_seconds = {{ lium_cvmd_skew_seconds }}
+
+# Real bodies are a `kind` plus three hashes. The cap is enforced before the
+# body is buffered.
+max_body_bytes = {{ lium_cvmd_max_body_bytes }}
+
+# --- the launch path (DAH-2576) ---------------------------------------------
+#
+# Emitted only when the host has been given a scripts directory. An absent
+# setting is refused per-launch, naming itself; an empty string here would be a
+# path cvmd would try and fail to import.
+{% if lium_cvmd_dstack_scripts_dir %}
+dstack_scripts_dir = "{{ lium_cvmd_dstack_scripts_dir }}"
+run_dir = "{{ lium_cvmd_run_dir }}"
+key_provider_port = {{ lium_cvmd_key_provider_port }}
+launch_timeout_seconds = {{ lium_cvmd_launch_timeout_seconds }}
+
+# Two teardown budgets, because they measure two different things: how long the
+# guest is given to power itself off, and how long the host then takes to get
+# its hardware back.
+teardown_timeout_seconds = {{ lium_cvmd_teardown_timeout_seconds }}
+teardown_verify_timeout_seconds = {{ lium_cvmd_teardown_verify_timeout_seconds }}
+teardown_memory_tolerance = {{ lium_cvmd_teardown_memory_tolerance }}
+
+# CVM sizing — provider configuration, never sent in a request.
+{% if lium_cvm_vcpus %}
+cvm_vcpus = {{ lium_cvm_vcpus }}
+{% endif %}
+{% if lium_cvm_memory %}
+cvm_memory = "{{ lium_cvm_memory }}"
+{% endif %}
+{% if lium_cvm_disk %}
+cvm_disk = "{{ lium_cvm_disk }}"
+{% endif %}
+cvm_gpus = {{ lium_cvm_gpus | to_json }}
+cvm_ports = {{ lium_cvm_ports | to_json }}
+{% if lium_cvm_env_file %}
+cvm_env_file = "{{ lium_cvm_env_file }}"
+{% endif %}
+{% if lium_cvm_ssh_guest_port %}
+cvm_ssh_guest_port = {{ lium_cvm_ssh_guest_port }}
+{% endif %}
+cvm_pin_numa = {{ lium_cvm_pin_numa | lower }}
+cvm_hugepages = {{ lium_cvm_hugepages | lower }}
+{% endif %}
+
+# --- the approved artifact catalog (DAH-2578) --------------------------------
+#
+# The cache and the materialize directory are daemon-owned and live under
+# state_dir, so they are NOT written here: a file both Ansible and the daemon
+# write is a file that flaps on every converge. cvmd derives both from state_dir.
+#
+# The signer is emitted whenever it is set, with or without a scripts directory.
+# A host that cannot launch can still be asked what it would be allowed to
+# launch, and `/v1/catalog` answering that is how an operator tells "no catalog"
+# apart from "no launch configuration".
+{% if lium_catalog_signer %}
+catalog_signer = "{{ lium_catalog_signer }}"
+catalog_images_dir = "{{ lium_catalog_images_dir }}"
+catalog_refresh_seconds = {{ lium_catalog_refresh_seconds }}
+catalog_fetch_timeout_seconds = {{ lium_catalog_fetch_timeout_seconds }}
+{% if lium_catalog_manifest_url %}
+catalog_manifest_url = "{{ lium_catalog_manifest_url }}"
+{% endif %}
+{% if lium_catalog_manifest_url or lium_catalog_manifest_src %}
+# Staged by the `catalog` role. Read-only to cvmd, and adopted at startup only
+# when it is NEWER than the cache — the rollback guard is what stops a seed left
+# behind from undoing a revocation the backend has already published.
+catalog_seed_path = "{{ cvmd_catalog_seed_path }}"
+{% endif %}
+{% endif %}

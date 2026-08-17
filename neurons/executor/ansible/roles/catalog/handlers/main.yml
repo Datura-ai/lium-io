@@ -1,0 +1,19 @@
+---
+# Its own handler, with its own name, rather than notifying the cvmd role's.
+#
+# Handlers do not cross a play boundary and are not shared between roles that a
+# fixture includes one at a time, so borrowing `Restart cvmd` makes this role
+# runnable only in the exact play order site.yml happens to use — and the
+# failure is "handler not found" at the end of a converge that already staged
+# the file.
+#
+# cvmd adopts a newer seed at startup AND on its refresh cycle, so a missed
+# restart costs a refresh interval rather than the catalog. This makes day zero
+# immediate: the daemon is serving the staged manifest by the time the run ends,
+# which is also what the verify report reads.
+- name: Restart cvmd for the staged catalog
+  ansible.builtin.systemd_service:
+    name: cvmd.service
+    state: restarted
+    daemon_reload: true
+  when: not (lium_test_mode | default(false) | bool)

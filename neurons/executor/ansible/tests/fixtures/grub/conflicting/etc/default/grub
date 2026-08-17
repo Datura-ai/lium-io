@@ -1,0 +1,6 @@
+# Fixture: a stale dma_entry_limit AND a narrower pre-existing vfio-pci.ids.
+# Set membership would call both of these a pass; last-occurrence-wins does not,
+# and the superset rule refuses to shorten the id list.
+GRUB_DEFAULT=0
+GRUB_CMDLINE_LINUX="kvm_intel.tdx=on vfio_iommu_type1.dma_entry_limit=65535 vfio-pci.ids=10de:2335,10de:22a3"
+GRUB_CMDLINE_LINUX_DEFAULT="intel_iommu=on iommu=pt nohibernate"

@@ -1,0 +1,11 @@
+---
+# cvmd reads the config and the authorized-clients file once, at startup. A
+# changed client list that is never restarted into is the failure this exists to
+# prevent: the file on disk says a hotkey is authorised, the running daemon
+# still refuses it, and the verify report reads green because both are true of
+# what they describe.
+- name: Restart cvmd
+  ansible.builtin.systemd_service:
+    name: cvmd.service
+    state: restarted
+    daemon_reload: true

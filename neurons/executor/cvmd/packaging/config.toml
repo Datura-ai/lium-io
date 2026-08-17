@@ -1,0 +1,77 @@
+# cvmd default config. Installed to /etc/cvmd/config.toml if no config is already there —
+# install.sh never overwrites an existing one.
+#
+# Every setting can be overridden by an environment variable named CVMD_<KEY> (uppercase).
+
+authorized_clients = "/etc/cvmd/authorized_clients.json"
+state_dir = "/var/lib/cvmd"
+
+host = "0.0.0.0"
+port = 8443
+
+# HTTPS. install.sh generates a self-signed pair here if none exists. A self-signed certificate
+# that no client pins gives confidentiality against a passive listener and no server
+# authentication — client-side pinning is DAH-2580.
+tls_cert = "/etc/cvmd/tls/cert.pem"
+tls_key = "/etc/cvmd/tls/key.pem"
+
+# The freshness window a request timestamp must fall inside, in seconds. It rests on the host
+# clock, which cvmd does not control.
+skew_seconds = 60
+
+# Real bodies are a `kind` plus three hashes. The cap is enforced before the body is buffered.
+max_body_bytes = 65536
+
+# --- the launch path (DAH-2576) ----------------------------------------------
+#
+# Commented out because none of it has a safe default: every value names a path or a size that
+# only this host knows. cvmd runs without them and refuses a launch naming the one it lacks, so
+# an unconfigured host is observable rather than broken. On an Ansible-managed host the cvmd
+# role writes these; the values below are the shape, not a recommendation.
+#
+# Where dstack.py and host_api.py are. cvmd imports dstack.py as a library, so this is the
+# dstacktee `scripts` directory, not an executable.
+# dstack_scripts_dir = "/opt/lium-io/neurons/executor/dstacktee/scripts"
+#
+# The approved artifact catalog. DAH-2578 replaces this file with the backend's signed manifest.
+# catalog_path = "/etc/cvmd/catalog.json"
+#
+# Where cvmd keeps the VM directories it creates. Deliberately not dstacktee's own run/vms — a
+# CVM launched by lium-cvm.sh must stay untouched by cvmd while both paths exist.
+# run_dir = "/var/lib/cvmd/vms"
+#
+# key_provider_port = 3443
+# launch_timeout_seconds = 900
+#
+# The graceful-poweroff window before cvmd signals the process group. A large-memory TDX guest
+# returns its RAM to the host as it exits and that is slow — 43 minutes was measured for a
+# 1.13 TB guest.
+# teardown_timeout_seconds = 600
+#
+# How long the node's hardware then gets to come back — QEMU reaped, VFIO descriptors closed,
+# the guest's memory returned, the forwarded ports bindable. A separate budget because it
+# measures a different thing: a guest that exits in seconds can leave its memory draining for
+# tens of minutes. See roles/cvmd/README.md for the measured per-hardware-class values.
+# teardown_verify_timeout_seconds = 1800
+#
+# How much of the guest's configured memory must be back before the node counts as free. Below
+# 1.0 because MemAvailable is the kernel's own estimate.
+# teardown_memory_tolerance = 0.9
+#
+# CVM sizing is PROVIDER configuration and is never sent in a request: a caller names which
+# software stack to run, and the host decides how big it is.
+# cvm_vcpus = 16
+# cvm_memory = "64G"
+# cvm_disk = "200G"
+# cvm_gpus = ["19:00.0", "3b:00.0"]        # or ["all"], or [] for no passthrough
+# cvm_ports = ["tcp:0.0.0.0:2200:2200", "tcp:0.0.0.0:8001:8001"]
+# cvm_env_file = "/etc/cvmd/cvm.env"
+#
+# The guest-side port carrying SSH. Set it and cvmd reports the guest's host-key fingerprint
+# and uses reading it as proof the CVM is up; leave it unset and readiness is a TCP accept,
+# which only proves QEMU is listening.
+# cvm_ssh_guest_port = 2200
+#
+# Both change the QEMU command line and therefore the measurements. lium-cvm.sh passes neither.
+# cvm_pin_numa = false
+# cvm_hugepages = false

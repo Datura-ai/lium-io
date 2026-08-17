@@ -1,0 +1,237 @@
+---
+# The gate that stands between this playbook and the ar6 wedge.
+#
+# WHY THIS TEST EXISTS
+# --------------------
+# On 2026-08-06 a production CVM host was rebooted eight and a half minutes into
+# a TDX guest teardown. Shutdown started and then stalled: the old kernel stayed
+# on the network for over fourteen minutes, answering ping and completing TCP
+# handshakes on port 22 without ever sending an SSH banner, and platform reset
+# never arrived. Recovery was a datacentre power-cycle.
+#
+# roles/kernel/tasks/reboot.yml can reach that state, because the guard above it
+# is waivable with `-e lium_force_reboot=true`. wait_for_teardown.yml is the
+# unwaivable gate underneath, and this asserts all three of its branches.
+#
+# THE THIRD CASE IS THE ONE THAT ROTS
+# -----------------------------------
+# Cases 1 and 2 assert the gate BLOCKS. A gate that blocks unconditionally would
+# pass both of them and quietly make every reboot in this tree impossible — the
+# failure would surface on a real host, mid-converge, as a run that can never
+# finish. Case 3 asserts it lets a clean host through.
+
+- name: The pre-reboot teardown gate
+  hosts: localhost
+  gather_facts: false
+  vars:
+    gate_fixtures: /tmp/lium-teardown-gate
+    lium_common_files: "{{ playbook_dir }}/../roles/common/files"
+    # Two seconds, so the drain poll expires while the test is still watching.
+    # On a real host this is 90 minutes.
+    lium_reboot_drain_timeout_sec: 2
+    lium_reboot_drain_poll_sec: 1
+    gate_tasks: "{{ playbook_dir }}/../roles/kernel/tasks/wait_for_teardown.yml"
+
+  tasks:
+    - name: Start from clean fixtures
+      ansible.builtin.file:
+        path: "{{ gate_fixtures }}"
+        state: absent
+
+    # A synthetic /proc, same technique as tests/test_guard.sh. The stat lines
+    # are written to real field widths because the gate reads num_threads at
+    # field 18 and utime+stime at 12 and 13 — a short line would silently read
+    # as zero and the fixture would stop proving anything.
+    - name: Build a RUNNING qemu fixture
+      ansible.builtin.file:
+        path: "{{ gate_fixtures }}/live/123"
+        state: directory
+        mode: "0755"
+
+    - name: Give the running fixture its comm
+      ansible.builtin.copy:
+        dest: "{{ gate_fixtures }}/live/123/comm"
+        content: "qemu-system-x86\n"
+        mode: "0644"
+
+    - name: Give the running fixture its stat — state S, 9 threads
+      ansible.builtin.copy:
+        dest: "{{ gate_fixtures }}/live/123/stat"
+        content: "123 (qemu-system-x86) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 9 0 0\n"
+        mode: "0644"
+
+    - name: Give the running fixture an argv pointing at our tree
+      ansible.builtin.copy:
+        dest: "{{ gate_fixtures }}/live/123/cmdline"
+        content: "qemu-system-x86_64 -drive file=/opt/lium-io/run/vms/demo/hda.img"
+        mode: "0644"
+
+    - name: Build a ZOMBIE qemu fixture that will never drain
+      ansible.builtin.file:
+        path: "{{ gate_fixtures }}/dying/456"
+        state: directory
+        mode: "0755"
+
+    - name: Give the zombie fixture its comm
+      ansible.builtin.copy:
+        dest: "{{ gate_fixtures }}/dying/456/comm"
+        content: "qemu-system-x86\n"
+        mode: "0644"
+
+    - name: Give the zombie fixture its stat — state Z, 2 threads still alive
+      ansible.builtin.copy:
+        dest: "{{ gate_fixtures }}/dying/456/stat"
+        content: "456 (qemu-system-x86) Z 1 1 1 0 -1 0 0 0 0 0 51234 9876 0 0 20 0 2 0 0\n"
+        mode: "0644"
+
+    # A zombie's argv is always empty — the kernel frees it at exit. The gate
+    # must not need argv to decide, so the fixture withholds it.
+    - name: Give the zombie fixture the empty argv a real zombie has
+      ansible.builtin.copy:
+        dest: "{{ gate_fixtures }}/dying/456/cmdline"
+        content: ""
+        mode: "0644"
+
+    - name: Build a CLEAN proc root
+      ansible.builtin.file:
+        path: "{{ gate_fixtures }}/clean"
+        state: directory
+        mode: "0755"
+
+    # --- case 1: a running guest is refused immediately -----------------------
+    # Fail-fast, not wait: a live QEMU never exits on its own, so polling it for
+    # the full budget would burn 90 minutes to reach the same answer.
+    - name: Case 1 — run the gate against a RUNNING qemu
+      block:
+        - name: Include the gate with a live QEMU present
+          ansible.builtin.include_tasks: "{{ gate_tasks }}"
+          vars:
+            lium_proc_root: "{{ gate_fixtures }}/live"
+
+        - name: Case 1 reached the end of the gate
+          ansible.builtin.set_fact:
+            gate_case1_passed_through: true
+      rescue:
+        - name: Capture why case 1 was refused
+          ansible.builtin.set_fact:
+            gate_case1_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: The gate refuses to reboot out from under a running guest
+      ansible.builtin.assert:
+        that:
+          - gate_case1_passed_through is not defined
+          - gate_case1_msg is defined
+          - gate_case1_msg is search('RUNNING')
+          - gate_case1_msg is search('lium-cvm.sh stop')
+        fail_msg: >-
+          The gate let a reboot proceed with a running qemu-system process, or
+          refused it without telling the operator to stop the CVM first.
+          Message was: {{ gate_case1_msg | default('(the gate did not fail)') }}
+        quiet: true
+
+    # --- case 2: an unfinished teardown is refused after the budget -----------
+    - name: Case 2 — run the gate against a teardown that never finishes
+      block:
+        - name: Include the gate with a zombie QEMU present
+          ansible.builtin.include_tasks: "{{ gate_tasks }}"
+          vars:
+            lium_proc_root: "{{ gate_fixtures }}/dying"
+
+        - name: Case 2 reached the end of the gate
+          ansible.builtin.set_fact:
+            gate_case2_passed_through: true
+      rescue:
+        - name: Capture why case 2 was refused
+          ansible.builtin.set_fact:
+            gate_case2_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    # The message content is asserted, not just the refusal. The whole incident
+    # was an operator following recovery text that named the wrong action, so
+    # text that omits the power-cycle is itself the defect.
+    - name: The gate refuses, and points at an out-of-band power-cycle
+      ansible.builtin.assert:
+        that:
+          - gate_case2_passed_through is not defined
+          - gate_case2_msg is defined
+          - gate_case2_msg is search('OUT-OF-BAND')
+          - gate_case2_msg is search('lium_reboot_drain_timeout_sec')
+        fail_msg: >-
+          The gate let a reboot proceed into an unfinished TDX teardown, or
+          refused without naming the out-of-band power-cycle and the timeout
+          variable. This is the exact failure that wedged ar6.
+          Message was: {{ gate_case2_msg | default('(the gate did not fail)') }}
+        quiet: true
+
+    # --- case 3: a clean host is allowed through ------------------------------
+    - name: Case 3 — run the gate against a host with no qemu at all
+      block:
+        - name: Include the gate with an empty proc root
+          ansible.builtin.include_tasks: "{{ gate_tasks }}"
+          vars:
+            lium_proc_root: "{{ gate_fixtures }}/clean"
+
+        - name: Case 3 reached the end of the gate
+          ansible.builtin.set_fact:
+            gate_case3_passed_through: true
+      rescue:
+        - name: Capture why case 3 was refused
+          ansible.builtin.set_fact:
+            gate_case3_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: The gate lets a clean host reboot
+      ansible.builtin.assert:
+        that:
+          - gate_case3_passed_through is defined
+        fail_msg: >-
+          The gate blocked a host with no qemu-system process at all. It is
+          refusing unconditionally, which makes every reboot in this tree
+          impossible and would only surface mid-converge on real hardware.
+          Message was: {{ gate_case3_msg | default('(no message captured)') }}
+        quiet: true
+
+    # --- case 4: a probe that cannot run is refused, not waved through --------
+    # The direction this gate must never fail. `failed_when: false` makes every
+    # error look like success, and the classification reads only stdout — so
+    # before the rc check, a probe that died produced two empty lists, skipped
+    # all three refusals, and let the reboot proceed. Case 3 and a crashed probe
+    # were indistinguishable, which is why cases 1-3 could not catch it.
+    - name: Case 4 — run the gate with a probe that cannot execute
+      block:
+        - name: Include the gate with the guard script missing
+          ansible.builtin.include_tasks: "{{ gate_tasks }}"
+          vars:
+            lium_proc_root: "{{ gate_fixtures }}/clean"
+            lium_common_files: "{{ gate_fixtures }}/no-such-dir"
+
+        - name: Case 4 reached the end of the gate
+          ansible.builtin.set_fact:
+            gate_case4_passed_through: true
+      rescue:
+        - name: Capture why case 4 was refused
+          ansible.builtin.set_fact:
+            gate_case4_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: The gate refuses when it cannot tell whether a guest is running
+      ansible.builtin.assert:
+        that:
+          - gate_case4_passed_through is not defined
+          - gate_case4_msg is defined
+          - gate_case4_msg is search('UNKNOWN')
+        fail_msg: >-
+          The gate let a reboot proceed after its own probe failed to run. It
+          cannot distinguish "no QEMU on this host" from "I could not look",
+          and it must fail closed on the second. Message was:
+          {{ gate_case4_msg | default('(the gate did not fail)') }}
+        quiet: true
+
+    - name: Clean up the fixtures
+      ansible.builtin.file:
+        path: "{{ gate_fixtures }}"
+        state: absent
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: >-
+          PASS reboot teardown gate — refused a running guest, refused an
+          unfinished teardown with power-cycle instructions, allowed a clean
+          host, and refused when its own probe could not run.

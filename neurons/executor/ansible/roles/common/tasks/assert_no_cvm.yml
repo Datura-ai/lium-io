@@ -1,0 +1,60 @@
+---
+# The destructive guard, included with `tasks_from: assert_no_cvm`.
+#
+# Callers pass:
+#   common_guard_reason       — what is about to happen, in the provider's words
+#   common_guard_override_var — the name of the ONE variable that accepts THIS
+#                               damage. Blanket overrides are deliberately not
+#                               supported: `--force-converge` only restores the
+#                               destructive roles to the play, it does not
+#                               authorise anything.
+#
+# This runs in addition to the play-level pre_tasks guard in site.yml, so a role
+# invoked directly still cannot skip it.
+
+- name: Assert the guard inputs were supplied
+  ansible.builtin.assert:
+    that:
+      - common_guard_reason is defined
+      - common_guard_override_var is defined
+    fail_msg: >-
+      assert_no_cvm was included without common_guard_reason and
+      common_guard_override_var. Refusing to run a destructive step behind an
+      unnamed guard.
+    quiet: true
+
+# Fails closed. UNKNOWN reaches here only when the operator forced past
+# bootstrap.sh's own refusal, and it must still block anything destructive.
+- name: Refuse to converge over existing CVM state
+  ansible.builtin.fail:
+    msg: |
+      REFUSING: {{ common_guard_reason }}
+
+      Guard state: {{ lium.guard.state }}
+      Why:         {{ lium.guard.reason }}
+
+      {{ lium.guard.recovery }}
+
+      This step changes something the CVM's attestation measures. Doing it while
+      an encrypted data disk exists makes that disk permanently undecryptable —
+      by design, and unrecoverable. See docs/host-setup.md section 6.
+
+      If you have already drained the rentals and accept the consequence, set
+      the variable that names THIS specific damage:
+
+          -e {{ common_guard_override_var }}=true
+
+      That variable is deliberately not the same as --force-converge. Restoring
+      the role to the play and authorising the damage are two separate decisions.
+  when:
+    - lium.guard.state != 'CLEAN'
+    - not (lookup('vars', common_guard_override_var, default=false) | bool)
+
+- name: Record that a destructive step was explicitly authorised
+  ansible.builtin.debug:
+    msg: >-
+      {{ common_guard_override_var }}=true — proceeding with "{{ common_guard_reason }}"
+      despite guard state {{ lium.guard.state }}.
+  when:
+    - lium.guard.state != 'CLEAN'
+    - lookup('vars', common_guard_override_var, default=false) | bool

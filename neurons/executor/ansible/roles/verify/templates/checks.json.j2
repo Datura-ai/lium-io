@@ -1,0 +1,395 @@
+{#-
+  Every check, built as data and emitted as JSON so nothing has to be escaped by
+  hand. Each id has a matching `### <id>` heading in roles/verify/README.md, and
+  tests/test_verify_schema.sh asserts the schema enum, this list and those
+  headings all agree.
+
+  Status vocabulary:
+    OK       the check passed
+    WARN     worth reading, does not block
+    MUST_FIX blocks; bootstrap.sh exits non-zero
+    UNKNOWN  could not be read at all — never silently a pass
+    SKIPPED  deliberately not run, with a reason
+-#}
+{% set checks = [] %}
+
+{#- ---- the six preflight-derived checks, recomputed from lium.* ---- #}
+{% set _ = checks.append({
+  'id': 'os.supported',
+  'title': 'Ubuntu release is supported',
+  'status': 'OK' if lium.os_version_id in lium_os_matrix else 'MUST_FIX',
+  'observed': 'Ubuntu ' ~ (lium.os_version_id | default('unknown')),
+  'expected': 'one of ' ~ (lium_os_matrix.keys() | list | join(', ')),
+  'remediation': 'Reinstall on Ubuntu 25.10 or 26.04 LTS. Older releases lack the TDX kernel support this stack needs.',
+  'evidence_source': '/etc/os-release',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'cpu.tdx_enabled',
+  'title': 'Intel TDX is enabled',
+  'status': 'OK' if (lium.tdx_param.value | default('N')) == 'Y' else ('UNKNOWN' if not (lium.tdx_param.readable | bool) else 'MUST_FIX'),
+  'observed': 'kvm_intel tdx parameter = ' ~ (lium.tdx_param.value | default('unreadable')),
+  'expected': 'Y',
+  'remediation': 'BIOS: enable Intel TDX (and TME / TME-MT) in the CPU security menu. The kernel must be Canonical intel or mainline 6.16 or newer.',
+  'evidence_source': '/sys/module/kvm_intel/parameters/tdx',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'iommu.vt_d',
+  'title': 'VT-d / IOMMU is enabled',
+  'status': 'OK' if (lium.iommu_present.value | default(false) | bool) else 'MUST_FIX',
+  'observed': 'IOMMU groups present' if (lium.iommu_present.value | default(false) | bool) else '/sys/class/iommu is empty',
+  'expected': 'at least one IOMMU group',
+  'remediation': 'BIOS: enable VT-d / Intel Virtualization Technology for Directed I/O. Without it no device can be passed through to a TD guest.',
+  'evidence_source': '/sys/class/iommu/',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'sgx.devices_present',
+  'title': 'SGX device nodes are present',
+  'status': 'OK' if (lium.sgx_devices.value | default(0) | int) >= 2 else 'MUST_FIX',
+  'observed': (lium.sgx_devices.value | default(0)) ~ ' of 2 SGX device nodes',
+  'expected': 'both /dev/sgx_enclave and /dev/sgx_provision',
+  'remediation': 'BIOS: enable Intel SGX and set PRMRR size to 64M or more. An SGX Factory Reset may be required.',
+  'evidence_source': '/dev/sgx_enclave, /dev/sgx_provision',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'boot.grub_present',
+  'title': 'This host boots via GRUB',
+  'status': 'OK' if ((lium.boot_grub_present | bool) and (lium.update_grub_present | bool)) else 'MUST_FIX',
+  'observed': 'grub.cfg ' ~ ('present' if (lium.boot_grub_present | bool) else 'absent') ~ ', update-grub ' ~ ('on PATH' if (lium.update_grub_present | bool) else 'not found'),
+  'expected': '/boot/grub/grub.cfg exists and update-grub is on PATH',
+  'remediation': 'This host does not boot via GRUB (systemd-boot or a vendor bootloader). Apply the docs/host-setup.md section 2 kernel parameters by hand and re-run with --skip-tags kernel.',
+  'evidence_source': '/boot/grub/grub.cfg',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'gpu.cc_capable_present',
+  'title': 'A confidential-compute capable GPU is present',
+  'status': 'UNKNOWN' if not (lium.lspci_available.readable | bool) else ('OK' if (lium.gpu_bdfs | length) > 0 else 'MUST_FIX'),
+  'observed': (lium.lspci_available.reason if not (lium.lspci_available.readable | bool) else ((lium.gpu_bdfs | length) ~ ' CC-capable GPU(s)')),
+  'expected': 'at least one device matching ' ~ (lium_cc_gpu_pci_ids | join(', ')),
+  'remediation': 'Searched PCI ids: ' ~ (lium_cc_gpu_pci_ids | join(', ')) ~ '. If lspci is missing, install pciutils. If your GPU is CC-capable but not in that list it is not yet supported.',
+  'evidence_source': 'lspci -n',
+  'severity': 'blocker'}) %}
+
+{#- ---- SGX chain ---- #}
+{% set _ = checks.append({
+  'id': 'sgx.registration_pck_certs',
+  'title': 'This platform has PCK certificates',
+  'status': 'SKIPPED' if (lium_intel_api_key | length) == 0 else ('UNKNOWN' if not (lium.pck_cert_count.readable | bool) else ('OK' if (lium.pck_cert_count.value | int) > 0 else 'MUST_FIX')),
+  'observed': ('registration skipped: no Intel API key' if (lium_intel_api_key | length) == 0 else (lium.pck_cert_count.reason if not (lium.pck_cert_count.readable | bool) else ((lium.pck_cert_count.value | string) ~ ' PCK certificate(s)'))),
+  'expected': 'more than 0 rows in the pck_cert table',
+  'remediation': 'Set lium_intel_api_key to run a local PCCS and in-band registration; otherwise DCAP collateral comes from ' ~ lium_pccs_url ~ '. With 0 certificates the sealing-key enclave crash-loops with "AESM service returned error 44". Read the pck_cert row count. The MPA registration log is not a usable signal: it reports success on broken hosts too.',
+  'evidence_source': '/opt/intel/sgx-dcap-pccs/pckcache.db',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'sgx.pccs_active',
+  'title': 'The PCCS service is running',
+  'status': 'SKIPPED' if (lium_intel_api_key | length) == 0 else ('OK' if lium.pccs_active == 'active' else 'MUST_FIX'),
+  'observed': 'pccs is ' ~ lium.pccs_active,
+  'expected': 'active',
+  'remediation': 'systemctl status pccs. A PCCS that dies with ERR_MODULE_NOT_FOUND: config needs `npm install` in /opt/intel/sgx-dcap-pccs — the interactive postinst wizard normally does that and it fails under apt.',
+  'evidence_source': 'systemctl is-active pccs',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'sgx.qgsd_vsock_4050',
+  'title': 'qgsd serves TD quotes over vsock',
+  'status': 'UNKNOWN' if not (lium.qgsd_vsock_4050.readable | bool) else ('OK' if (lium.qgsd_vsock_4050.value | bool) else 'MUST_FIX'),
+  'observed': (lium.qgsd_vsock_4050.reason if not (lium.qgsd_vsock_4050.readable | bool) else ('listening on vsock 4050' if (lium.qgsd_vsock_4050.value | bool) else 'no vsock listener on 4050')),
+  'expected': 'a v_str LISTEN on port 4050',
+  'remediation': 'Uncomment `port = 4050` in /etc/qgs.conf and restart qgsd. It ships commented out, so qgsd serves a unix socket instead, reports active, and never answers the guest — the CVM then reboots at around 160 seconds with "vsock failure: Connection reset by peer (os error 104)".',
+  'evidence_source': 'ss -a --vsock',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'sgx.qpl_secure_cert_false',
+  'title': 'The QPL accepts the PCCS certificate',
+  'status': 'UNKNOWN' if not (lium.qcnl_use_secure_cert.readable | bool) else ('OK' if (lium.qcnl_use_secure_cert.value | lower) == 'false' else 'MUST_FIX'),
+  'observed': 'use_secure_cert = ' ~ (lium.qcnl_use_secure_cert.value | default('unreadable')),
+  'expected': 'false',
+  'remediation': 'Set "use_secure_cert": false in /etc/sgx_default_qcnl.conf AND in key-provider/sgx_default_qcnl.conf. Intel ships the system one as true, which rejects a local self-signed PCCS certificate: "[QCNL] CURL error: (60)", "[QPL] ... 0xb033", then the guest reboots.',
+  'evidence_source': '/etc/sgx_default_qcnl.conf',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'sgx.qpl_config_parses',
+  'title': 'The QPL configuration is readable JSON',
+  'status': 'UNKNOWN' if not (lium.qcnl_parses.readable | bool) else ('OK' if (lium.qcnl_parses.value | bool) else 'MUST_FIX'),
+  'observed': (lium.qcnl_parses.reason if not (lium.qcnl_parses.readable | bool) else ('parses' if (lium.qcnl_parses.value | bool) else 'does not parse as JSON')),
+  'expected': 'the file parses once whole-line // comments are stripped',
+  'remediation': 'Re-run the sgx role: it writes this file whole from a template with a json.load validate, so it cannot install an unparseable one. The pristine platform copy is kept at ' ~ lium_system_qcnl_path ~ '.pre-lium-cvm. This is checked separately from sgx.qpl_secure_cert_false because that check GREPS for a key, and a grep is satisfied by a line appended after the closing brace — which is exactly how a corrupted file passed while the QPL could not read a word of it. Symptom: every CVM reboots at ~160s, "cpus are not resettable, terminating", and docker logs dstack-key-provider shows "DCAP error".',
+  'evidence_source': lium_system_qcnl_path,
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'sgx.keyprovider_production',
+  'title': 'The sealing-key provider runs in production mode',
+  'status': 'OK' if ((lium.kp_production | int) > 0 and (lium.kp_aesm_error | int) == 0) else ('MUST_FIX' if lium.kp_running == 'true' else 'SKIPPED'),
+  'observed': 'running=' ~ lium.kp_running ~ ', restarts=' ~ lium.kp_restarts ~ ', production lines=' ~ (lium.kp_production | string) ~ ', enclave errors=' ~ (lium.kp_aesm_error | string),
+  'expected': 'PRODUCTION mode, RestartCount 0, no enclave errors',
+  'remediation': 'This is the end-to-end proof that the whole SGX chain works. "error 44" or a failed load_enclave means the platform has no PCK certificates — fix sgx.registration_pck_certs first.',
+  'evidence_source': 'docker logs dstack-key-provider',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'net.intel_api_reachable',
+  'title': "Intel's provisioning API is reachable",
+  'status': 'OK' if (lium.intel_api_reachable.value | bool) else 'WARN',
+  'observed': ('reachable' if (lium.intel_api_reachable.value | bool) else 'not reachable') ~ ' at ' ~ lium_intel_api_host ~ ':' ~ (lium_intel_api_port | string),
+  'expected': 'a TCP connection succeeds',
+  'remediation': 'Egress filtering is common in provider datacenters, and an unreachable Intel API turns in-band registration into an opaque hang. Allow outbound TCP to ' ~ lium_intel_api_host ~ ':' ~ (lium_intel_api_port | string) ~ ', or use a remote PCCS via lium_pccs_url.',
+  'evidence_source': 'TCP connect probe',
+  'severity': 'degraded'}) %}
+
+{#- ---- GPU ---- #}
+{% set _ = checks.append({
+  'id': 'gpu.cc_mode_all_on',
+  'title': 'Every GPU has confidential-compute mode on',
+  'status': 'SKIPPED' if (lium.gpu_bdfs | length) == 0 else ('UNKNOWN' if (lium.gpu_cc_mode | dict2items | rejectattr('value.readable') | list | length) > 0 else ('OK' if (lium.gpu_cc_mode | dict2items | selectattr('value.value', 'equalto', 'off') | list | length) == 0 else 'MUST_FIX')),
+  'observed': (lium.gpu_cc_mode | dict2items | selectattr('value.value', 'equalto', 'on') | list | length) ~ ' on, ' ~ (lium.gpu_cc_mode | dict2items | selectattr('value.value', 'equalto', 'off') | list | length) ~ ' off, ' ~ (lium.gpu_cc_mode | dict2items | rejectattr('value.readable') | list | length) ~ ' unreadable',
+  'expected': 'every GPU reports CC mode on',
+  'remediation': 'CC mode is OFF by default on a fresh host. It is a hardware prerequisite for GPU passthrough into a TD guest — ENABLE_GPU_ATTESTATION=false does NOT make it optional. Re-run the gpu role.',
+  'evidence_source': 'nvidia_gpu_tools.py --query-cc-mode',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'gpu.vfio_bound_all',
+  'title': 'Every GPU and NVSwitch is bound to vfio-pci',
+  'status': 'SKIPPED' if (lium.gpu_bdfs | length) == 0 else ('OK' if (lium.devices_not_vfio | length) == 0 else 'MUST_FIX'),
+  'observed': (lium.devices_not_vfio | length) ~ ' device(s) not bound to vfio-pci' ~ ((': ' ~ (lium.devices_not_vfio | join(', '))) if (lium.devices_not_vfio | length) > 0 else ''),
+  'expected': 'every GPU and NVSwitch bound to vfio-pci',
+  'remediation': 'Re-run the gpu role. Binding the GPUs but not the NVSwitches produces a guest that boots and then cannot see NVLink.',
+  'evidence_source': '/sys/bus/pci/devices/*/driver',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'gpu.device_inventory',
+  'title': 'GPU and NVSwitch inventory',
+  'status': 'OK',
+  'observed': (lium.gpu_bdfs | length) ~ ' GPU(s), ' ~ (lium.nvswitch_bdfs | length) ~ ' NVSwitch(es)',
+  'expected': 'informational',
+  'remediation': 'None. Recorded so a device that disappears between runs is visible — a hot-removed GPU is what makes vfio-pci.ids= try to narrow.',
+  'evidence_source': 'lspci -n',
+  'severity': 'info'}) %}
+
+{#- ---- kernel ---- #}
+{% set _ = checks.append({
+  'id': 'kernel.dma_entry_limit',
+  'title': 'The vfio DMA entry limit is raised',
+  'status': 'UNKNOWN' if not (lium.dma_entry_limit.readable | bool) else ('OK' if (lium.dma_entry_limit.value | int) >= (lium_dma_entry_limit | int) else 'MUST_FIX'),
+  'observed': 'dma_entry_limit = ' ~ (lium.dma_entry_limit.value | default('unreadable')),
+  'expected': (lium_dma_entry_limit | string),
+  'remediation': 'The shipped default is 65535, which kills a TD guest mid-boot with "VFIO_MAP_DMA failed: No space left on device" because TDX shared/private page conversions exhaust it.',
+  'evidence_source': '/sys/module/vfio_iommu_type1/parameters/dma_entry_limit',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'kernel.dma_persisted',
+  'title': 'The DMA entry limit survives a reboot',
+  'status': 'OK' if (lium.dma_persisted | bool) else 'MUST_FIX',
+  'observed': '/etc/modprobe.d/vfio-dma.conf ' ~ ('present' if (lium.dma_persisted | bool) else 'absent'),
+  'expected': 'the modprobe drop-in exists',
+  'remediation': 'The runtime write applies immediately but does not survive a reboot. Re-run the kernel role.',
+  'evidence_source': '/etc/modprobe.d/vfio-dma.conf',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'kernel.cmdline_tokens',
+  'title': 'The running kernel has every required parameter',
+  'status': 'UNKNOWN' if (not (lium.proc_cmdline.readable | bool) or not (lium_verify_cmdline_ok | bool)) else ('OK' if (lium_verify_cmdline.drift_tokens | default([]) | length) == 0 else 'MUST_FIX'),
+  'observed': ((lium_verify_cmdline.drift_tokens | default([]) | length) ~ ' token(s) missing from the running kernel') ~ (((': ' ~ (lium_verify_cmdline.drift_tokens | join(', '))) if (lium_verify_cmdline.drift_tokens | default([]) | length) > 0 else '')),
+  'expected': 'every required token resolves on /proc/cmdline',
+  'remediation': 'Re-run bootstrap.sh and allow the reboot. If it has already rebooted twice without effect, check whether /boot is full and whether update-grub actually rewrote grub.cfg.',
+  'evidence_source': '/proc/cmdline',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'kernel.grub_persisted',
+  'title': 'The kernel parameters are persisted in GRUB',
+  'status': 'UNKNOWN' if not (lium_verify_cmdline_ok | bool) else ('OK' if (lium_verify_cmdline.missing_tokens | default([]) | length) == 0 else 'MUST_FIX'),
+  'observed': (lium_verify_cmdline.missing_tokens | default([]) | length) ~ ' token(s) not resolving in the merged GRUB configuration',
+  'expected': 'every required token wins in GRUB_CMDLINE_LINUX plus GRUB_CMDLINE_LINUX_DEFAULT',
+  'remediation': 'Re-run the kernel role. The drop-in appends to GRUB_CMDLINE_LINUX_DEFAULT and never assigns GRUB_CMDLINE_LINUX, so a provider value is never clobbered.',
+  'evidence_source': '/etc/default/grub and /etc/default/grub.d/',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'kernel.grub_conflicting_tokens',
+  'title': 'No stale duplicate kernel parameters',
+  'status': 'UNKNOWN' if not (lium_verify_cmdline_ok | bool) else ('OK' if (lium_verify_cmdline.conflicting_keys | default([]) | length) == 0 else 'WARN'),
+  'observed': ((lium_verify_cmdline.conflicting_keys | default([]) | join(', ')) if (lium_verify_cmdline.conflicting_keys | default([]) | length) > 0 else 'none'),
+  'expected': 'each parameter appears once',
+  'remediation': 'These keys appear more than once with different values. Ours win, because 10_linux emits GRUB_CMDLINE_LINUX before GRUB_CMDLINE_LINUX_DEFAULT and the kernel takes the last occurrence — but relying on that ordering forever is fragile. Find the stale copy with: grep -n "kvm_intel\\|intel_iommu\\|vfio-pci.ids\\|iommu=pt\\|nohibernate" /etc/default/grub /etc/default/grub.d/*.cfg — it is usually in a vendor drop-in under /etc/default/grub.d/, not in /etc/default/grub itself. Do not edit 99-lium-cvm.cfg; this playbook rewrites it.',
+  'evidence_source': '/etc/default/grub and /etc/default/grub.d/*.cfg',
+  'severity': 'degraded'}) %}
+
+{#- ---- QEMU ---- #}
+{% set _ = checks.append({
+  'id': 'qemu.version_9_2_1',
+  'title': 'The dstack QEMU build is installed',
+  'status': 'UNKNOWN' if not (lium.qemu_version.readable | bool) else ('OK' if lium.qemu_version.value == lium_qemu_version else 'MUST_FIX'),
+  'observed': 'QEMU ' ~ (lium.qemu_version.value | default('unreadable') | default('not installed', true)),
+  'expected': lium_qemu_version,
+  'remediation': 'Attestation fails on RTMR0 if the host runs distro QEMU instead of the dstack build. Re-run the qemu role.',
+  'evidence_source': lium_qemu_prefix ~ '/bin/qemu-system-x86_64 --version',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'qemu.client_conf_path',
+  'title': 'dstack points at the right QEMU',
+  'status': 'OK' if (lium_qemu_prefix in (lium.qemu_client_conf_path | default(''))) else 'MUST_FIX',
+  'observed': 'client.conf path = ' ~ (lium.qemu_client_conf_path | default('not set')),
+  'expected': lium_qemu_prefix ~ '/bin/qemu-system-x86_64',
+  'remediation': 'Read from /etc/dstack/client.conf directly. Do not use the launcher check subcommand for this: it looks on PATH while the launcher uses client.conf, so it reports a false MISSING on a correctly configured host.',
+  'evidence_source': '/etc/dstack/client.conf',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'qemu.binary_sha256',
+  'title': 'The QEMU binary is unchanged since it was installed',
+  'status': 'SKIPPED' if (lium.qemu_recorded_sha256 | length) == 0 else ('OK' if lium.qemu_recorded_sha256 == (lium.qemu_sha256.value | default('')) else 'MUST_FIX'),
+  'observed': ('no recorded fingerprint' if (lium.qemu_recorded_sha256 | length) == 0 else ('matches' if lium.qemu_recorded_sha256 == (lium.qemu_sha256.value | default('')) else 'DIFFERS from the recorded fingerprint')),
+  'expected': 'the live binary matches ' ~ lium_state_dir ~ '/qemu.sha256',
+  'remediation': 'QEMU is a measured input. A binary that changed underneath a running CVM means RTMR0 no longer matches and any existing hda.img is undecryptable. Investigate before restarting anything.',
+  'evidence_source': lium_state_dir ~ '/qemu.sha256',
+  'severity': 'blocker'}) %}
+
+{#- ---- platform ---- #}
+{% set _ = checks.append({
+  'id': 'docker.installed',
+  'title': 'Docker is installed',
+  'status': 'OK' if (lium.docker_version | length) > 0 else 'MUST_FIX',
+  'observed': ('Docker ' ~ lium.docker_version) if (lium.docker_version | length) > 0 else 'not installed',
+  'expected': 'any version',
+  'remediation': 'Re-run the docker role. Note the apt suite is noble for both supported releases — Ubuntu 25.10 has no Docker repo of its own.',
+  'evidence_source': 'docker --version',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'repo.present',
+  'title': 'The lium-io checkout exists',
+  'status': 'OK' if (lium.repo_present | bool) else 'MUST_FIX',
+  'observed': lium_repo_path ~ ' ' ~ ('present' if (lium.repo_present | bool) else 'absent'),
+  'expected': 'the dstacktee tree exists',
+  'remediation': 'Re-run without --no-clone, or clone it by hand to ' ~ lium_repo_path ~ '.',
+  'evidence_source': lium_repo_path,
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'repo.app_pristine',
+  'title': 'The measured surface is unmodified',
+  'status': 'OK' if (lium.app_dirty_files | length) == 0 else 'MUST_FIX',
+  'observed': (lium.app_dirty_files | length) ~ ' modified file(s) under dstacktee/app',
+  'expected': 'no local modifications',
+  'remediation': 'git -C ' ~ lium_repo_path ~ ' checkout -- neurons/executor/dstacktee/app. Everything under app/ is hashed into the compose the validator whitelists; any edit produces a hash nobody has whitelisted and every attestation fails.',
+  'evidence_source': 'git status --porcelain',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'repo.ref_behind',
+  'title': 'The checkout was left where it was',
+  'status': 'WARN' if (lium.guard.state != 'CLEAN' and (lium.repo_present | bool)) else 'OK',
+  'observed': 'guard state ' ~ lium.guard.state ~ ', HEAD ' ~ (lium.repo_head | default('unknown') | truncate(12, true, '')),
+  'expected': 'the checkout is only moved on a host with no CVM state',
+  'remediation': 'The ref was not moved because this host still holds CVM state, and moving it rewrites the measured surface. Upgrading a host that has a CVM is a deliberate procedure: see docs/host-setup.md section 6.',
+  'evidence_source': 'git rev-parse HEAD',
+  'severity': 'info'}) %}
+
+{% set _ = checks.append({
+  'id': 'repo.os_image_present',
+  'title': 'The CVM OS image is downloaded',
+  'status': 'OK' if (lium.os_image_digest | length) > 0 else 'MUST_FIX',
+  'observed': ('digest ' ~ (lium.os_image_digest | truncate(20, true, ''))) if (lium.os_image_digest | length) > 0 else 'no image',
+  'expected': 'a digest.txt under run/images/',
+  'remediation': 'Run ./lium-cvm.sh download in neurons/executor/dstacktee.',
+  'evidence_source': 'run/images/*/digest.txt',
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
+  'id': 'repo.runner_digest_set',
+  'title': 'The executor runner digest is set',
+  'status': 'OK' if (lium.env_runner_digest | length) > 0 else 'WARN',
+  'observed': ('set' if (lium.env_runner_digest | length) > 0 else 'not set') ~ ' in dstacktee/.env',
+  'expected': 'EXECUTOR_RUNNER_IMAGE_DIGEST is set',
+  'remediation': 'Per-executor .env stays manual: see docs/host-setup.md section 5. Presence only is reported here, never a comparison against a whitelist — a checkout can be BEHIND the deployed validator, and on one occasion the whitelisted digest was the broken one. Do not downgrade to match a local list.',
+  'evidence_source': 'dstacktee/.env',
+  'severity': 'degraded'}) %}
+
+{#- ---- network ---- #}
+{% set _ = checks.append({
+  'id': 'net.local_listeners',
+  'title': 'Local listening sockets',
+  'status': 'OK',
+  'observed': ((lium_listeners.stdout_lines | default([]) | length) - 1) | string ~ ' listening socket(s)',
+  'expected': 'informational',
+  'remediation': 'None. Recorded so the report shows what was listening at the time of the run.',
+  'evidence_source': 'ss -tlnp',
+  'severity': 'info'}) %}
+
+{% set _ = checks.append({
+  'id': 'net.acl_probe_required',
+  'title': 'Port reachability must be checked from outside',
+  'status': 'WARN',
+  'observed': 'not verifiable from this host',
+  'expected': 'an off-site read test confirms the executor ports are reachable',
+  'remediation': 'ss proves a port is LISTENING, never that it is REACHABLE. Two hosts silently blackholed 8001/2200/19001 while permitting 22 and 30000-32767, and everything looked perfect from the host itself. Probe from an independent network with a READ test (exec 3<>/dev/tcp/HOST/PORT && head -c 2 <&3), and calibrate that vantage against a dead port on a well-known third party first — many networks forge SYN-ACKs for every destination, which makes a plain connect test worthless. Fixing datacenter ACLs is out of scope for this playbook.',
+  'evidence_source': 'not collectable locally',
+  'severity': 'degraded'}) %}
+
+{#- ---- guard and stubs ---- #}
+{% set _ = checks.append({
+  'id': 'guard.host_state',
+  'title': 'CVM state on this host',
+  'status': 'OK' if lium.guard.state == 'CLEAN' else ('UNKNOWN' if lium.guard.state == 'UNKNOWN' else 'WARN'),
+  'observed': lium.guard.state ~ ' — ' ~ lium.guard.reason,
+  'expected': 'CLEAN for a full converge',
+  'remediation': lium.guard.recovery,
+  'evidence_source': 'lium-guard.sh',
+  'severity': 'info'}) %}
+
+{# cvmd is optional per host, so "not requested" is SKIPPED rather than a
+   finding. Once requested it is a blocker: a host whose control daemon is down
+   accepts no CVM lifecycle call at all, and the failure is silent from the
+   outside — the port simply refuses to connect. #}
+{% set cvmd_requested = (lium_cvmd_package_url | length) > 0 %}
+{% set _ = checks.append({
+  'id': 'cvmd.service_state',
+  'title': 'cvmd control daemon',
+  'status': 'SKIPPED' if not cvmd_requested else ('OK' if lium.cvmd_unit_state == 'active' else 'MUST_FIX'),
+  'observed': 'not requested'
+              if not cvmd_requested
+              else ('active, package ' ~ (lium.cvmd_installed_sha256[:12] if (lium.cvmd_installed_sha256 | length) > 0 else 'unstamped')
+                    if lium.cvmd_unit_state == 'active'
+                    else 'cvmd.service is ' ~ lium.cvmd_unit_state),
+  'expected': 'active whenever lium_cvmd_package_url is set',
+  'remediation': 'cvmd is optional. Set lium_cvmd_package_url, lium_cvmd_package_sha256 and lium_cvmd_authorized_clients to install the control daemon.'
+                 if not cvmd_requested
+                 else 'Read `journalctl -u cvmd`. cvmd refuses to start on a config or authorized-clients file it cannot load exactly as written, so the message names the entry at fault; re-run `--tags cvmd` to re-render both.',
+  'evidence_source': 'systemctl is-active cvmd.service',
+  'severity': 'info' if not cvmd_requested else 'blocker'}) %}
+
+{# The catalog decides what this host may launch, so a host without a usable one
+   launches nothing — the same blocker as a dead cvmd, and just as silent from
+   the outside. Read through cvmd's OWN verifier against its OWN configured
+   signer, so this reports what the daemon will do rather than what a file looks
+   like. SKIPPED while cvmd was not requested: a host with no control daemon has
+   no catalog to have. #}
+{% set _ = checks.append({
+  'id': 'catalog.manifest',
+  'title': 'approved artifact catalog',
+  'status': 'SKIPPED' if not cvmd_requested else ('OK' if lium.cvmd_catalog_state == 'usable' else 'MUST_FIX'),
+  'observed': 'not requested' if not cvmd_requested else (lium.cvmd_catalog_state ~ ' — ' ~ lium.cvmd_catalog_detail),
+  'expected': 'a signed manifest, in date, from lium_catalog_signer',
+  'remediation': 'The catalog arrives with cvmd. Set lium_cvmd_package_url to install it.'
+                 if not cvmd_requested
+                 else ('Set lium_catalog_signer and either lium_catalog_manifest_url (cvmd polls it) or lium_catalog_manifest_src (staged from the controller), then re-run `--tags catalog`. Without one this host refuses every launch.'
+                       if lium.cvmd_catalog_state in ['none', 'error']
+                       else 'The manifest is past its expiry, so cvmd refuses to launch from it. Check that lium_catalog_manifest_url is reachable from this host — `journalctl -u cvmd | grep catalog` names the fetch failure — or stage a current one.'),
+  'evidence_source': 'cvmd.catalog.CatalogStore.describe()',
+  'severity': 'info' if not cvmd_requested else 'blocker'}) %}
+
+{{ checks | to_json }}

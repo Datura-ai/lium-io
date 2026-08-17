@@ -1,0 +1,236 @@
+---
+# cvmd — the CVM host control daemon (DAH-2575).
+#
+# LOUD IN BOTH DIRECTIONS, which is what the DAH-2544 stub established and this
+# keeps. Unset, the role says cvmd was not requested and ends. Set, it either
+# produces a daemon answering /health or fails the run. There is no path that
+# leaves a half-configured host looking finished.
+#
+# Everything the daemon refuses to start on is refused HERE first — a missing
+# checksum, an empty client list, an unknown scope, a duplicate hotkey. cvmd is
+# fail-closed on all of them, so skipping these checks would still be safe; it
+# would just report the problem as "systemd unit entered failed state" instead
+# of naming the variable the operator got wrong.
+
+- name: Report that cvmd was not requested
+  ansible.builtin.debug:
+    msg: >-
+      cvmd not installed — lium_cvmd_package_url is unset. Set it together with
+      lium_cvmd_package_sha256 and lium_cvmd_authorized_clients to install the
+      CVM host control daemon.
+  when: lium_cvmd_package_url | length == 0
+
+- name: End the role while cvmd is unset
+  ansible.builtin.meta: end_role
+  when: lium_cvmd_package_url | length == 0
+
+- name: Require the companion variables
+  ansible.builtin.assert:
+    that:
+      - lium_cvmd_package_sha256 | length > 0
+      - lium_cvmd_authorized_clients | length > 0
+    fail_msg: >-
+      lium_cvmd_package_url is set, but lium_cvmd_package_sha256 and
+      lium_cvmd_authorized_clients are both required with it. A package
+      installed without a checksum, or a daemon with no authorised clients, is
+      not a working configuration — cvmd refuses to start on an empty client
+      list, so the second is a dead service rather than an open one.
+    quiet: true
+
+- name: Every authorised client is a hotkey paired with a scope
+  ansible.builtin.assert:
+    that:
+      - item.hotkey is defined
+      - item.hotkey is string
+      - item.hotkey | length > 0
+      - item.scope is defined
+      - item.scope in cvmd_valid_scopes
+    fail_msg: >-
+      lium_cvmd_authorized_clients[{{ index }}] is not a {hotkey, scope} object
+      with scope in {{ cvmd_valid_scopes | join(', ') }}: {{ item | to_json }}.
+      This is the shape cvmd reads — a bare key string, or an SSH public key,
+      authorises nobody.
+    quiet: true
+  loop: "{{ lium_cvmd_authorized_clients }}"
+  loop_control:
+    index_var: index
+    label: "{{ item.hotkey | default(item) | string | truncate(16, true, '…') }}"
+
+# Format only. The base58 checksum is decoded by bittensor at daemon startup
+# (cvmd/src/cvmd/auth/clients.py:_validate_ss58), and nothing in Ansible can do
+# that without a new dependency. This catches the ordinary mistakes — an SSH
+# key, a coldkey file path, a truncated paste — and says so rather than pretending
+# to have verified the address.
+- name: Each hotkey looks like an ss58 address
+  ansible.builtin.assert:
+    that:
+      - item.hotkey is match('^5[1-9A-HJ-NP-Za-km-z]{46,47}$')
+    fail_msg: >-
+      lium_cvmd_authorized_clients[{{ index }}].hotkey is not shaped like a
+      bittensor ss58 address (48 base58 characters starting with 5):
+      {{ item.hotkey | to_json }}. Only the format is checked here; the checksum
+      is verified by cvmd at startup.
+    quiet: true
+  loop: "{{ lium_cvmd_authorized_clients }}"
+  loop_control:
+    index_var: index
+    label: "{{ item.hotkey | truncate(16, true, '…') }}"
+
+# A hotkey listed twice is ambiguous — one of the two scopes silently wins.
+# cvmd refuses the file outright; refusing here names the offending address.
+#
+# Counted per entry rather than comparing the list length against its unique
+# length. Both detect a duplicate, but only this one can say WHICH — `difference`
+# is a set difference, so subtracting the unique list from the full one is empty
+# whether or not a duplicate exists.
+- name: No hotkey is authorised twice
+  ansible.builtin.assert:
+    that:
+      - (cvmd_hotkeys | select('equalto', item.hotkey) | list | length) == 1
+    fail_msg: >-
+      {{ item.hotkey }} is authorised
+      {{ cvmd_hotkeys | select('equalto', item.hotkey) | list | length }} times in
+      lium_cvmd_authorized_clients, so one of its scopes would silently win.
+    quiet: true
+  loop: "{{ lium_cvmd_authorized_clients }}"
+  vars:
+    cvmd_hotkeys: "{{ lium_cvmd_authorized_clients | map(attribute='hotkey') | list }}"
+  loop_control:
+    label: "{{ item.hotkey | truncate(16, true, '…') }}"
+
+# --- the launch path (DAH-2576) ---------------------------------------------
+#
+# Optional as a whole: cvmd serves /health and /v1/state without any of it, and
+# refuses a launch naming the setting it lacks. But a host that has been given
+# HALF a launch configuration is a different thing — it looks configured and
+# refuses every launch at the first request, which is the worst moment to find
+# out. So the scripts directory is what switches these checks on.
+
+- name: A host configured to launch CVMs has what a launch needs
+  ansible.builtin.assert:
+    that:
+      - lium_cvmd_run_dir | length > 0
+      - lium_cvm_vcpus | int > 0
+      - lium_cvm_memory | length > 0
+      - lium_cvm_disk | length > 0
+      - lium_cvm_ports | length > 0
+      - lium_catalog_signer | length > 0
+    fail_msg: >-
+      lium_cvmd_dstack_scripts_dir is set, so this host is meant to launch CVMs,
+      but it is missing one of lium_cvmd_run_dir, lium_cvm_vcpus,
+      lium_cvm_memory, lium_cvm_disk, lium_cvm_ports or lium_catalog_signer.
+      cvmd would start and then refuse every launch. Sizing is deliberately
+      provider configuration and never part of a request, so there is nothing a
+      caller could supply to fill the gap — and without a signer there is no
+      manifest this host can trust, so its catalog is empty whatever else is
+      configured.
+    quiet: true
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
+- name: The dstack launcher is where the host says it is
+  ansible.builtin.stat:
+    path: "{{ lium_cvmd_dstack_scripts_dir }}/dstack.py"
+  register: cvmd_dstack_script
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
+# cvmd imports dstack.py rather than shelling out to it, and that import also
+# needs host_api.py beside it. Checking here names the wrong directory; checking
+# at launch time reports it as "this host cannot run the dstack launcher".
+- name: The dstack launcher is importable as a library
+  ansible.builtin.assert:
+    that:
+      - cvmd_dstack_script.stat.exists
+    fail_msg: >-
+      lium_cvmd_dstack_scripts_dir is {{ lium_cvmd_dstack_scripts_dir }}, and
+      there is no dstack.py in it. This must be the dstacktee `scripts`
+      directory — cvmd imports dstack.py from it as a library, so a path to the
+      repository root or to lium-cvm.sh will not do.
+    quiet: true
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
+# A cheap first pass that names the offending variable and index. The
+# authoritative check is cvmd's own parser, run against the rendered config by
+# configure.yml — but that needs the venv, which install.yml has not created
+# yet, and failing before a download beats failing after one.
+#
+# The range half is not decoration: `[0-9]{1,5}` alone accepts 0 and 70000, both
+# of which cvm/ports.py rejects, so without it this passes a host the daemon
+# then refuses to start on.
+- name: Each forwarded port is protocol[:address]:host:guest, with ports in 1-65535
+  ansible.builtin.assert:
+    that:
+      - item is match('^(tcp|udp):([^:]+:)?[0-9]{1,5}:[0-9]{1,5}$')
+      - item.split(':')[-2:] | map('int') | select('lt', 1) | list | length == 0
+      - item.split(':')[-2:] | map('int') | select('gt', 65535) | list | length == 0
+    fail_msg: >-
+      lium_cvm_ports[{{ index }}] is {{ item | to_json }}, which is not
+      'protocol[:address]:host_port:guest_port' with both ports in 1-65535.
+      dstack parses these into QEMU hostfwd rules, so a malformed one becomes a
+      CVM with no way in.
+    quiet: true
+  loop: "{{ lium_cvm_ports }}"
+  loop_control:
+    index_var: index
+
+# cvmd reads the guest's SSH host key through this forward, and that read is
+# also what proves the CVM is up. A guest port nothing forwards leaves the
+# launch with no readiness signal and no fingerprint, so cvmd refuses it — the
+# same refusal, named here instead of at the first request.
+- name: The SSH guest port is one of the forwarded ports
+  ansible.builtin.assert:
+    that:
+      - lium_cvm_ports | select('search', ':' ~ lium_cvm_ssh_guest_port ~ '$') | list | length > 0
+    fail_msg: >-
+      lium_cvm_ssh_guest_port is {{ lium_cvm_ssh_guest_port }}, and none of
+      lium_cvm_ports forwards it: {{ lium_cvm_ports | to_json }}. The guest port
+      is the LAST field of each mapping. cvmd reads the host key through that
+      forward, so with no match there is nothing to probe and the launch report
+      would carry no fingerprint.
+    quiet: true
+  when:
+    - lium_cvmd_dstack_scripts_dir | length > 0
+    - lium_cvm_ssh_guest_port | int > 0
+
+# The same bounds cvmd's own loader enforces (config.py:_load_launch), named here
+# so the offending variable is reported instead of a daemon that will not start.
+# A tolerance above 1.0 is the one that matters: it would demand more memory back
+# than the guest was ever given, so no teardown on this host could ever complete
+# and every node would end up FAILED holding a CVM that had already stopped.
+- name: The teardown budgets are usable
+  ansible.builtin.assert:
+    that:
+      - lium_cvmd_teardown_timeout_seconds | int > 0
+      - lium_cvmd_teardown_verify_timeout_seconds | int > 0
+      - lium_cvmd_teardown_memory_tolerance | float > 0
+      - lium_cvmd_teardown_memory_tolerance | float <= 1
+    fail_msg: >-
+      The teardown settings are not usable: teardown_timeout_seconds
+      {{ lium_cvmd_teardown_timeout_seconds }}, teardown_verify_timeout_seconds
+      {{ lium_cvmd_teardown_verify_timeout_seconds }},
+      teardown_memory_tolerance {{ lium_cvmd_teardown_memory_tolerance }}. Both
+      timeouts must be positive and the tolerance must be in (0, 1] — above 1 it
+      asks for more memory back than the guest ever had, which no teardown on
+      this host could satisfy.
+    quiet: true
+  when: lium_cvmd_dstack_scripts_dir | length > 0
+
+- name: Read the host Python version
+  ansible.builtin.command: python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'
+  register: cvmd_python_version
+  changed_when: false
+
+- name: Require a Python new enough for cvmd
+  ansible.builtin.assert:
+    that:
+      - cvmd_python_version.stdout is version(cvmd_min_python, '>=')
+    fail_msg: >-
+      cvmd requires Python >= {{ cvmd_min_python }}; this host has
+      {{ cvmd_python_version.stdout }}. The floor comes from bittensor 11.x,
+      which is what cvmd verifies signatures with. Ubuntu 25.10 ships 3.13.
+    quiet: true
+
+- name: Install the cvmd package
+  ansible.builtin.include_tasks: install.yml
+
+- name: Configure and start cvmd
+  ansible.builtin.include_tasks: configure.yml

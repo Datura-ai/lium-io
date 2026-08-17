@@ -1,0 +1,114 @@
+---
+# Every external command this playbook runs, as a named variable.
+#
+# Why they live here rather than inline in the tasks: Ansible's check mode skips
+# command/shell tasks entirely, so `--check --diff` can never show what a task
+# would have run. tests/test_command_vars.yml renders these variables and
+# asserts them against golden strings, which is the only mechanism that actually
+# pins the command text. tests/test_forbidden_strings.sh then greps this file
+# for the flags that must never come back.
+#
+# `lium_gpu_bdf` is set per device by the gpu role (and by the test).
+
+# --- GPU / nvtrust -----------------------------------------------------------
+# --gpu-bdf= is load-bearing: a bare --query-cc-mode only LISTS devices and
+# reports nothing about the one you care about (traps.md#2).
+lium_gpu_cc_query_cmd: >-
+  python3 {{ lium_nvtrust_tool }}
+  --gpu-bdf={{ lium_gpu_bdf }}
+  --query-cc-mode
+
+lium_gpu_ppcie_off_cmd: >-
+  python3 {{ lium_nvtrust_tool }}
+  --gpu-bdf={{ lium_gpu_bdf }}
+  --set-ppcie-mode=off
+  --reset-after-ppcie-mode-switch
+
+lium_gpu_cc_on_cmd: >-
+  python3 {{ lium_nvtrust_tool }}
+  --gpu-bdf={{ lium_gpu_bdf }}
+  --set-cc-mode=on
+  --reset-after-cc-mode-switch
+
+# Rebind one device to vfio-pci. driver_override plus drivers_probe, never the
+# two-argument modprobe form.
+lium_gpu_rebind_cmd: >-
+  printf '%s' vfio-pci > /sys/bus/pci/devices/{{ lium_gpu_bdf }}/driver_override
+  && printf '%s' {{ lium_gpu_bdf }} > /sys/bus/pci/drivers_probe
+
+# The ONLY sanctioned recovery for a wedged GPU: PCIe hot-remove plus rescan.
+# --reset-with-sbr left au1's GPU [broken, cfg space working] with the PCIe data
+# link down (DLLLA:0); --recover-broken-gpu and --reset-with-flr both failed to
+# bring it back. Those three flags are in tests/forbidden-patterns.txt.
+lium_gpu_rescan_cmd: >-
+  printf '%s' 1 > /sys/bus/pci/devices/{{ lium_gpu_bdf }}/remove
+  && sleep 2
+  && printf '%s' 1 > /sys/bus/pci/rescan
+  && sleep 3
+
+# --- kernel modules ----------------------------------------------------------
+# Two separate commands, deliberately. `modprobe vfio_iommu_type1 vfio-pci`
+# reads the second argument as a module PARAMETER and silently does nothing
+# (dmesg: unknown parameter 'vfio-pci' ignored) — traps.md#7.
+lium_modprobe_cmds:
+  - modprobe vfio_pci
+  - modprobe vfio_iommu_type1
+
+lium_update_grub_cmd: update-grub
+
+# --- reboot ------------------------------------------------------------------
+# ansible.builtin.reboot CANNOT be used in this tree. It refuses a local
+# connection outright — "Running ansible.builtin.reboot with local connection
+# would reboot the control node" — and inventory/localhost.yml sets
+# ansible_connection: local because a provider runs this ON the host it is
+# provisioning. There is no remote transport here, so the module's whole model
+# (reboot, then reconnect and carry on) does not apply: the control node IS the
+# host, and nothing survives to reconnect with. That is what lium-cvm-resume
+# .service is for.
+#
+# --on-active is what makes it detachable. A bare `reboot` starts the shutdown
+# immediately, and systemd then SIGTERMs the ansible process that called it
+# mid-task, so the log ends in the middle of a line and bootstrap.sh's exit code
+# is whatever the signal made it. The timer lets the task return, the play hold,
+# and the log flush before the host goes down.
+lium_reboot_systemd_unit: lium-converge-reboot
+lium_reboot_delay_sec: 5
+lium_reboot_cmd: >-
+  systemd-run --unit={{ lium_reboot_systemd_unit }} --collect
+  --on-active={{ lium_reboot_delay_sec }}
+  /sbin/reboot
+
+# --- repo --------------------------------------------------------------------
+# Run with chdir into the dstacktee checkout. A variable rather than a literal
+# for the usual reason — check mode never sees a command task — and so the
+# fixture test can point the clone-path case at a stub instead of pulling a
+# multi-gigabyte OS image.
+lium_os_image_download_cmd: ./lium-cvm.sh download
+
+# --- QEMU --------------------------------------------------------------------
+# Plain build. DUMP_ACPI_TABLES is deliberately absent: that variant is the
+# verifier's oracle binary and cannot run VMs (host-setup.md section 3).
+lium_qemu_configure_cmd: >-
+  ../configure
+  --prefix={{ lium_qemu_prefix }}
+  --target-list=x86_64-softmmu
+  --disable-werror
+  --enable-kvm
+  --enable-slirp
+
+# --setenv=HOME= is load-bearing. systemd-run starts with HOME UNSET, so the
+# build script's `set -u` dies at `cd $HOME` while the unit goes inactive within
+# seconds and looks finished with nothing built (traps.md#11). The unit name
+# matches fix-host.sh so a half-finished build from the skill is found, not
+# started twice.
+lium_qemu_systemd_run_cmd: >-
+  systemd-run --unit={{ lium_qemu_systemd_unit }} --collect
+  --setenv=HOME={{ lium_build_home }}
+  {{ lium_qemu_build_dir }}/build-qemu.sh
+
+# --- SGX ---------------------------------------------------------------------
+# This flips the registration efivar to "completed" and is irreversible, which
+# is why the efivar backup strictly precedes it.
+lium_pckid_tool_cmd: >-
+  /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool
+  -f {{ lium_state_dir }}/pckid.csv

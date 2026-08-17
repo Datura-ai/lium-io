@@ -1,0 +1,10 @@
+---
+- name: Restart pccs
+  ansible.builtin.systemd_service:
+    name: pccs
+    state: restarted
+
+- name: Restart qgsd
+  ansible.builtin.systemd_service:
+    name: qgsd
+    state: restarted

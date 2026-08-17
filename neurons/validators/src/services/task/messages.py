@@ -455,6 +455,54 @@ class DuplicateExecutorMessages:
     )
 
 
+class AttestedIdentityMessages:
+    """DAH-2582 — one CVM answering for several registered executors.
+
+    A collision is fatal for every executor involved rather than for whichever was seen second:
+    the evidence is hardware-signed, so both claims cannot be true, and picking a victim by
+    arrival order would let a miner farm the ordering. Failing all of them makes the attack cost
+    strictly more than it earns.
+    """
+
+    COLLISION = MessageTemplate(
+        event="Attested identity claimed by more than one executor",
+        reason="ATTESTED_IDENTITY_COLLISION",
+        severity="error",
+        category="policy",
+        impact="Score set to 0; verification cleared for every executor claiming it",
+        remediation=(
+            "One physical machine is registered as several executors. Deregister the duplicates; "
+            "the GPU and CVM identifiers in this event are signed by the hardware and cannot be "
+            "held by two distinct nodes."
+        ),
+    )
+    COLLISION_OBSERVED = MessageTemplate(
+        event="Attested identity claimed by more than one executor (observe mode)",
+        reason="ATTESTED_IDENTITY_COLLISION_OBSERVED",
+        severity="warning",
+        category="policy",
+        impact="Detected; no score impact (observe mode)",
+        remediation=(
+            "Investigate before enforcement is enabled. A collision among genuinely distinct "
+            "hosts means an identifier is less unique than assumed, not that a node is cheating."
+        ),
+    )
+    UNIQUE = MessageTemplate(
+        event="Attested identities unique across the fleet",
+        reason="ATTESTED_IDENTITY_UNIQUE",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    NOT_ATTESTED = MessageTemplate(
+        event="No attested identities to compare",
+        reason="ATTESTED_IDENTITY_ABSENT",
+        severity="info",
+        category="policy",
+        impact="Proceed; this node presented no hardware-bound identity this cycle",
+    )
+
+
 class CollateralMessages:
     VERIFIED = MessageTemplate(
         event="Collateral verified",

@@ -1,0 +1,387 @@
+---
+# Single place a new release or a new GPU is added.
+
+# Set as an ordinary variable, not via ansible.cfg's `ansible_managed` option:
+# that option is deprecated and is removed in ansible-core 2.23. Defining it here
+# also means it resolves under `gather_facts: false`, which the fixture tests use.
+ansible_managed: "Managed by the Lium CVM host playbook (DAH-2544). Local edits are overwritten on the next run."
+
+# Supported releases. Ubuntu 25.10 and 26.04 LTS only — 24.04 and older are
+# hard-rejected by preflight's os.supported gate. The apt suites are `noble` in
+# both cases: Ubuntu 25.10 has no Docker repo of its own and Intel's SGX repo
+# publishes no `questing`/`resolute` suite either (traps.md#7).
+lium_os_matrix:
+  "25.10": {codename: questing, sgx_suite: noble, docker_suite: noble}
+  "26.04": {codename: resolute, sgx_suite: noble, docker_suite: noble}
+
+# Field-verified on au1/au2/ar3 (8xH200 SXM + 4xNVSwitch), sourced from the
+# cvm-provision skill's preflight.sh:76 and fix-host.sh:164.
+# Blackwell (B200/B300) ids are NOT field-verified, so B200/B300 support is NOT
+# claimed anywhere in this tree — see the plan's section 6.2 and follow-up 8.
+lium_cc_gpu_pci_ids: ["10de:2335", "10de:2336", "10de:2330", "10de:233a"]
+lium_nvswitch_pci_ids: ["10de:22a3"]
+
+# QEMU — the dstack 9.2.1 fork. Source build at a pinned commit today; the
+# tarball pair is the interface a future release pipeline fills in (follow-up 3).
+lium_qemu_commit: dbcec07c0854bf873d346a09e87e4c993ccf2633
+lium_qemu_branch: dstack-qemu-9.2.1
+lium_qemu_repo: https://github.com/Dstack-TEE/qemu-tdx.git
+lium_qemu_prefix: /opt/qemu-dstack
+lium_qemu_version: "9.2.1"
+lium_qemu_systemd_unit: qemu-dstack-build
+lium_qemu_systemd_unit_legacy: lium-qemu-build
+lium_qemu_tarball_url: ""
+lium_qemu_tarball_sha256: ""
+lium_qemu_build_dir: /usr/local/lib/lium-cvm
+lium_build_home: /root
+
+# NVIDIA nvtrust — the CC-mode tool. /root/nvtrust is symlinked to this so the
+# cvm-provision skill's hardcoded paths keep working (plan section 6.5).
+lium_nvtrust_tag: "2025.4.11.001"
+lium_nvtrust_repo: https://github.com/NVIDIA/nvtrust
+lium_nvtrust_dir: /opt/nvtrust
+lium_nvtrust_tool: "{{ lium_nvtrust_dir }}/host_tools/python/nvidia_gpu_tools.py"
+
+# The kernel parameters that do not depend on what is plugged into this host.
+#
+# Shared rather than repeated, because TWO roles have to agree on the required
+# token set exactly: `kernel` writes it into the GRUB drop-in, and `verify`
+# rebuilds it to decide whether the running host matches. Restated as a literal
+# in both, they drifted — the report contradicted the converge that had just
+# succeeded, on hosts where nothing was wrong.
+#
+# The vfio-pci.ids= and dma_entry_limit tokens are NOT here: both are derived
+# per host and both roles derive them the same way from this list.
+lium_base_kernel_tokens:
+  - kvm_intel.tdx=on
+  - intel_iommu=on
+  - iommu=pt
+  - nohibernate
+
+# vfio. 65535 is the shipped default and it kills a TDX guest mid-boot with
+# `VFIO_MAP_DMA failed: No space left on device` (traps.md#7).
+lium_dma_entry_limit: 16777216
+
+# Reboot budget. Session-scoped: `verify` resets it to 0 on a clean converge, so
+# a healthy host that legitimately changes GRUB twice is not bricked. A genuine
+# reboot loop never reaches a clean verify, so loop protection is preserved.
+lium_max_converge_reboots: 2
+lium_reset_reboot_budget: false
+
+# How long the reboot will wait for a TDX guest teardown to drain before giving
+# up and telling the operator to power-cycle out of band.
+#
+# 90 minutes because teardown time scales with the guest's memory and this
+# playbook builds 1500G guests: a 1.13 TB guest was measured at 43 minutes, and
+# the ceiling has to clear the largest guest this tree provisions with room to
+# spare. Waiting an hour costs an hour. Not waiting cost a wedged host, a
+# datacentre ticket, and a manual power-cycle.
+#
+# This is a WAIT, not a bypass. There is deliberately no variable that lets the
+# reboot proceed with a QEMU still present — see roles/kernel/tasks/
+# wait_for_teardown.yml for why an override here would only re-arm the footgun.
+lium_reboot_drain_timeout_sec: 5400
+lium_reboot_drain_poll_sec: 15
+
+# How long the play holds after scheduling the reboot, waiting to be killed by
+# the shutdown. Generous: it is not a deadline for the reboot, it is the point
+# at which "the host is still here" becomes evidence the reboot never fired.
+lium_reboot_shutdown_grace_sec: 300
+
+# Start timeout for the post-reboot resume unit. Type=oneshot has none by
+# default, so without this a blocked resume leaves the host at boot forever with
+# provisioning half done. Generous, because the resume legitimately installs
+# packages and can compile QEMU; the point is a bound, not a tight one.
+lium_resume_timeout_sec: 5400
+
+lium_state_dir: /var/lib/lium-cvm
+lium_log_dir: /var/log/lium-cvm
+
+# Mirrors lium-guard.sh's BUILT-IN defaults. The script is the single source of
+# truth because bootstrap.sh runs it BEFORE Ansible starts, so it can never read
+# group_vars. tests/test_guard.sh asserts the two lists agree, so this
+# duplication cannot rot silently.
+lium_hda_search_roots: ["/home", "/opt", "/srv"]
+
+# Repo checkout the playbook converges.
+lium_repo_url: https://github.com/Datura-ai/lium-io.git
+lium_repo_path: /opt/lium-io
+lium_repo_ref: main
+lium_repo_clone: true
+
+# The ONE tracked file this playbook edits inside the checkout, named in one
+# place because two roles have to agree about it: `sgx_key_provider` repoints its
+# pccs_url, and `repo` has to restore it before moving the ref.
+#
+# Ansible's git module treats any tracked modification as fatal when force is no
+# — `has_local_mods` filters only untracked entries out of `git status
+# --porcelain` — so without the restore the SECOND converge aborts in `repo`,
+# over an edit `sgx` made on the first one.
+#
+# It is NOT part of the measured surface: everything hashed into the compose the
+# validator whitelists lives under dstacktee/app/, and this does not.
+lium_kp_qcnl_relpath: neurons/executor/dstacktee/key-provider/sgx_default_qcnl.conf
+
+# The SYSTEM QPL config, here rather than in sgx_key_provider/defaults because
+# two roles have to agree about it: `sgx_key_provider` writes it, and `verify`
+# reports on it. A role default is only in scope for its own role, so the verify
+# template referencing it there failed with "'lium_system_qcnl_path' is
+# undefined" — and only in the one fixture test that renders the whole report.
+#
+# ⚠ roles/common/files/lium-facts.sh hardcodes this same path. It runs before
+# Ansible does and cannot read group_vars, and it is deliberately NOT given an
+# environment override: pointing the collector at another file would redirect a
+# real decision about the real host, which is what the seam gate exists to stop.
+lium_system_qcnl_path: /etc/sgx_default_qcnl.conf
+
+# Set by bootstrap.sh --yes. The kernel role pauses for confirmation before a
+# reboot unless this is true.
+lium_assume_yes: false
+
+# SGX / DCAP. An unset lium_intel_api_key selects the DEGRADED path: no local
+# PCCS, no in-band registration, both qcnl files pointed at lium_pccs_url (which
+# may name a remote PCCS). See the plan's section 6.9.
+lium_pccs_url: "https://localhost:8081/sgx/certification/v4/"
+lium_intel_api_key: ""
+lium_pccs_user_token: ""
+lium_intel_registration_url: "https://api.trustedservices.intel.com/sgx/registration/v1/platform"
+lium_intel_api_host: api.trustedservices.intel.com
+lium_intel_api_port: 443
+
+# The PLATFORM_MANIFEST body length Intel accepts. The raw efivar is 17954 bytes
+# (a 4-byte version+size header plus this body); POSTing the 17954-byte blob
+# returns 400 InvalidPlatformManifest. This cost ar3 one 400 (traps.md#1).
+lium_platform_manifest_len: 17950
+
+# Disk headroom, in GB.
+lium_min_build_space_gb: 10
+lium_min_image_space_gb: 30
+
+# Per-action destructive overrides. Each names exactly the damage it accepts.
+# --force-converge only restores the destructive-tagged ROLES to the play; it
+# does not authorise the damage. These are the second lock.
+lium_force_qemu_rebuild: false   # accepts that any existing hda.img becomes undecryptable
+lium_force_gpu_cc: false         # accepts resetting every GPU
+lium_force_reboot: false         # accepts an unattended reboot
+
+# Preflight is fatal on a day-zero run. bootstrap.sh sets this false in
+# maintenance mode so a flipped BIOS knob is REPORTED in the verify report
+# instead of aborting the run before the report exists.
+lium_preflight_fatal: true
+
+# Set per device by the gpu role; also set by tests/test_command_vars.yml.
+# Declared here so --syntax-check and ansible-lint resolve the command strings.
+lium_gpu_bdf: ""
+
+# Production paths. A test replaces these through the seam gate below.
+lium_proc_cmdline_path: /proc/cmdline
+lium_grub_default_path: /etc/default/grub
+lium_grub_dropin_path: /etc/default/grub.d/99-lium-cvm.cfg
+lium_grubcfg_path: /boot/grub/grub.cfg
+lium_boot_id_path: /proc/sys/kernel/random/boot_id
+lium_proc_root: /proc
+lium_lspci_output: ""
+# The guard sweeps every locally mounted filesystem for a CVM data disk, because
+# the static roots above are conventions and a real host kept its checkout — and
+# a renter's 388 GB disk — on a data volume outside all of them. A fixture points
+# this at a hand-written mounts file, or at /dev/null to switch the sweep off.
+lium_mounts_path: /proc/mounts
+
+# Test seams. Every variable below is refused unless BOTH lium_test_mode is true
+# AND the environment variable ANSIBLE_LIUM_TEST is 1. Documented in
+# tests/README.md only — never in the provider-facing README.
+#
+# The gate compares each variable against its PRODUCTION value rather than
+# asking whether it is defined, because several of these are ordinary settings
+# that always have a value (lium_state_dir, lium_hda_search_roots). Comparing to
+# the production value is the only rule that covers both kinds uniformly and
+# gives "non-default" a precise meaning.
+lium_test_mode: false
+lium_seam_defaults:
+  lium_proc_cmdline_path: /proc/cmdline
+  lium_grub_default_path: /etc/default/grub
+  lium_grub_dropin_path: /etc/default/grub.d/99-lium-cvm.cfg
+  lium_grubcfg_path: /boot/grub/grub.cfg
+  lium_update_grub_cmd: update-grub
+  lium_lspci_output: ""
+  lium_proc_root: /proc
+  lium_boot_id_path: /proc/sys/kernel/random/boot_id
+  lium_hda_search_roots: ["/home", "/opt", "/srv"]
+  lium_state_dir: /var/lib/lium-cvm
+  lium_mounts_path: /proc/mounts
+
+# cvmd — the CVM host control daemon (DAH-2575).
+#
+# Unset URL => the role reports that cvmd was not requested and ends. Set => the
+# tarball is fetched against its checksum, installed, configured and started,
+# and the run fails if /health never answers.
+lium_cvmd_package_url: ""
+lium_cvmd_package_sha256: ""
+
+# Who may call cvmd, and in which scope. A list of {hotkey, scope} objects,
+# rendered verbatim into /etc/cvmd/authorized_clients.json:
+#
+#   lium_cvmd_authorized_clients:
+#     - hotkey: 5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX
+#       scope: validation
+#     - hotkey: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+#       scope: renter
+#
+# NOT a list of SSH public keys. cvmd authenticates a signed request against a
+# bittensor hotkey, so an ss58 address paired with a scope is the only thing it
+# can act on. The two scopes are disjoint by design — see roles/cvmd/README.md.
+lium_cvmd_authorized_clients: []
+
+# Where cvmd listens. 0.0.0.0 is the packaged default because the validator and
+# the connector both reach it across the network; a host that only needs local
+# callers should set 127.0.0.1 rather than rely on a firewall it does not own.
+lium_cvmd_bind_address: 0.0.0.0
+lium_cvmd_port: 8443
+
+# How long to wait for /health after starting the unit, as retries x delay
+# seconds. The first start builds nothing — the venv was already installed — so
+# this covers process start and TLS listener setup, not a build.
+lium_cvmd_health_retries: 30
+lium_cvmd_health_delay: 2
+
+# How far a request timestamp may sit from the host clock, in seconds. Widening
+# it widens the window a captured signature can be replayed in, bounded by the
+# nonce store; narrowing it starts rejecting clients whose clock drifts.
+lium_cvmd_skew_seconds: 60
+
+# The request-body cap, enforced before the body is buffered. Real bodies are a
+# `kind` plus three hashes — hundreds of bytes.
+lium_cvmd_max_body_bytes: 65536
+
+# --- the launch path (DAH-2576) ---------------------------------------------
+#
+# All of the below is optional. cvmd starts and serves /health and /v1/state
+# without it; a launch request on a host that lacks a setting is refused naming
+# that setting. That split is deliberate — a mistyped size should not take the
+# node's state reporting down with it.
+
+# Where dstack.py and host_api.py live on this host. cvmd imports dstack.py as a
+# library rather than shelling out, so this is a directory, not an executable.
+# Typically <repo>/neurons/executor/dstacktee/scripts.
+lium_cvmd_dstack_scripts_dir: ""
+
+# Where cvmd keeps the VM directories it creates. Deliberately NOT dstacktee's
+# own run/vms: a legacy CVM launched by lium-cvm.sh must stay untouched by cvmd
+# during the rollout, and separate directories are what guarantee that.
+lium_cvmd_run_dir: /var/lib/cvmd/vms
+
+# The approved artifact catalog — which software stacks this host may launch —
+# is DAH-2578's signed manifest, configured under `lium_catalog_*` further down
+# this file. It was an inline list here until then, and moving it was the point
+# of that task: a list an operator maintains per host is a list that drifts, and
+# a revoked image stays launchable on every host nobody remembered to edit.
+
+# dstack's key-provider port, which the guest reaches for its sealing key. The
+# same default lium-cvm.sh relies on.
+lium_cvmd_key_provider_port: 3443
+
+# How long a launch waits for the guest to answer before giving up and failing
+# the node. Generous because a TDX guest with a large memory backing boots
+# slowly; the CVM is left running on timeout, so this bounds the request, not
+# the VM.
+lium_cvmd_launch_timeout_seconds: 900
+
+# How long a graceful poweroff is given before cvmd signals the process group.
+# A large-memory TDX guest returns its RAM to the host as it exits, and that is
+# slow — 43 minutes was measured for a 1.13 TB guest on this fleet. Too low and
+# a legitimate slow exit is cut short by a SIGKILL.
+lium_cvmd_teardown_timeout_seconds: 600
+
+# How long the node's hardware then gets to come back: QEMU reaped with no
+# zombie, every /dev/vfio descriptor closed, the guest's memory returned and the
+# forwarded ports bindable. A teardown that runs out of this budget fails the
+# node naming the condition that did not hold, rather than reporting a success
+# the next launch would discover was false.
+#
+# A separate budget from the one above because it measures a different thing —
+# that one bounds how long the GUEST is given to power itself off, this one
+# bounds how long the HOST takes to get its hardware back afterwards. The two
+# are not proportional. See roles/cvmd/README.md for the measured values.
+lium_cvmd_teardown_verify_timeout_seconds: 1800
+
+# How much of the guest's configured memory must be back before the node counts
+# as free. Below 1.0 because MemAvailable is the kernel's own estimate and reads
+# a little short even on a host holding nothing.
+lium_cvmd_teardown_memory_tolerance: 0.9
+
+# --- CVM sizing: PROVIDER configuration, never an API field ------------------
+#
+# A cvmd request names which software stack to run; the host decides how big it
+# is. Settled while reviewing DAH-2575. Everything here is the CVM's shape, so
+# these are the CVM_* values from dstacktee/.env, moved to where the daemon can
+# read them.
+lium_cvm_vcpus: 0
+lium_cvm_memory: ""
+lium_cvm_disk: ""
+
+# PCI slots to pass through, e.g. ["19:00.0", "3b:00.0"], or the single entry
+# ["all"]. An empty list is a legal CVM with no passthrough — so it does not
+# block a launch the way a missing size does.
+lium_cvm_gpus: []
+
+# Forwarded ports as "protocol[:address]:host_port:guest_port". Every one must
+# be bindable before QEMU starts, so a mapping that collides with a CVM already
+# on this host refuses the launch instead of producing two guests fighting over
+# an address.
+lium_cvm_ports: []
+
+# Passed to dstack as --env-file. It lands in the guest's .user-config, which is
+# OUTSIDE app-compose.json — so its contents do not change the compose hash, and
+# two hosts with different env still measure identically.
+lium_cvm_env_file: ""
+
+# The guest-side port carrying SSH. When set, cvmd reads the guest's host key
+# through the matching forward and reports its fingerprint; that read is also
+# what proves the CVM is up, since a TCP accept only proves QEMU is listening.
+# Unset => readiness falls back to a TCP accept and the fingerprint is null.
+lium_cvm_ssh_guest_port: 0
+
+# Both left at what lium-cvm.sh leaves them at: it passes neither flag, so
+# argparse defaults them to false. They change the QEMU command line and
+# therefore the measurements — do not enable one on a single host.
+lium_cvm_pin_numa: false
+lium_cvm_hugepages: false
+
+# --- the approved artifact catalog (DAH-2578) --------------------------------
+#
+# The catalog is no longer a list written here. It is a signed manifest the
+# platform publishes and cvmd fetches, and the three settings below are all a
+# host needs to consume one.
+#
+# The ss58 of the platform key that signs the manifest. Everything rests on it:
+# a manifest is verified against THIS address, never against the one the
+# document carries, so nothing an attacker can serve is accepted without the
+# platform's key. Unset => this host launches nothing, and says so.
+lium_catalog_signer: ""
+
+# Where cvmd polls for the current manifest. Unset => cvmd never fetches, and
+# the host runs on whatever seed was staged below — which is a legitimate
+# configuration for an air-gapped host and a dead end for a normal one, because
+# a revocation can then never reach it.
+lium_catalog_manifest_url: ""
+
+# Optional extra pin for the DAY-ZERO seed fetch only. The signature is what
+# makes a manifest trustworthy, so this is not required: pinning a checksum
+# would mean re-editing this file every time the platform publishes a new
+# serial, and the fetch would start failing the moment it did.
+lium_catalog_manifest_sha256: ""
+
+# A signed manifest to stage as the seed, from the Ansible controller rather
+# than over the network. For an air-gapped host, or for bringing a host up
+# before it can reach the backend.
+lium_catalog_manifest_src: ""
+
+# How often cvmd asks for the current manifest. This is the upper bound on how
+# long a revocation takes to reach a node nobody pushes to.
+lium_catalog_refresh_seconds: 300
+lium_catalog_fetch_timeout_seconds: 30
+
+# Where day-zero staged the approved CVM OS images. A manifest entry names one
+# of them by directory name; cvmd joins it onto this path and the measurement
+# gate checks the image's own digest.txt against the pinned hash.
+lium_catalog_images_dir: "{{ lium_repo_path }}/neurons/executor/dstacktee/run/images"

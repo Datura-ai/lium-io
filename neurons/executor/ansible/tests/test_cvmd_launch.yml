@@ -1,0 +1,420 @@
+---
+# The cvmd role's launch-path checks — DAH-2576.
+#
+# The launch path as a whole is optional: cvmd serves /health and /v1/state
+# without it and refuses a launch naming the setting it lacks. What is NOT
+# acceptable is HALF of it, because that host looks configured and refuses every
+# launch at the first request. `lium_cvmd_dstack_scripts_dir` is what switches
+# these checks on, so each case below sets it and then leaves one thing out.
+#
+# Every case stops at an assert before install.yml, so this runs unprivileged
+# with nothing fetched and no service touched — same as tests/test_cvmd.yml.
+#
+# The shared settings are repeated per case rather than combined from a base
+# mapping: `include_role`'s `vars` must be a literal dictionary, and a templated
+# `{{ base | combine(...) }}` is rejected outright.
+
+- name: The cvmd role refuses a half-configured launch host
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    lium_cvmd_package_url: file:///nonexistent/cvmd.tar.gz
+    lium_cvmd_package_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    lium_cvmd_authorized_clients:
+      - hotkey: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+        scope: validation
+    lium_cvmd_dstack_scripts_dir: "{{ playbook_dir }}/../../dstacktee/scripts"
+    lium_cvm_vcpus: 16
+    lium_cvm_memory: 64G
+    lium_cvm_disk: 200G
+    lium_cvm_ports: ["tcp:0.0.0.0:12200:2200"]
+    lium_catalog_signer: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+
+  tasks:
+    # --- sizing missing ---------------------------------------------------
+    - name: Run cvmd with a scripts directory but no memory size
+      block:
+        - name: Include cvmd with sizing half-filled
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_memory: ""
+
+        - name: Record that cvmd accepted a host it cannot launch on
+          ansible.builtin.set_fact:
+            sizing_refused: false
+            sizing_msg: ""
+      rescue:
+        - name: Record the sizing refusal
+          ansible.builtin.set_fact:
+            sizing_refused: true
+            sizing_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A launch host missing a size is refused, and the variable is named
+      ansible.builtin.assert:
+        that:
+          - sizing_refused | bool
+          - "'lium_cvm_memory' in sizing_msg"
+        fail_msg: >-
+          cvmd accepted a host configured to launch CVMs with no memory size. It
+          would start and then refuse every launch, and sizing is provider
+          configuration so no caller could fill the gap.
+          refused={{ sizing_refused }} msg={{ sizing_msg }}
+        quiet: true
+
+    # --- no signer, so no catalog -----------------------------------------
+    #
+    # DAH-2578 moved the catalog out of this file and behind a signature, so
+    # "approves nothing" is now spelled "trusts nobody": with no signer there is
+    # no manifest this host can verify, and its catalog is empty whatever else
+    # is configured.
+    - name: Run cvmd with no catalog signer
+      block:
+        - name: Include cvmd with no signer
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_catalog_signer: ""
+
+        - name: Record that cvmd accepted a host with nothing approved
+          ansible.builtin.set_fact:
+            catalog_refused: false
+            catalog_msg: ""
+      rescue:
+        - name: Record the catalog refusal
+          ansible.builtin.set_fact:
+            catalog_refused: true
+            catalog_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A launch host that trusts no signer is refused
+      ansible.builtin.assert:
+        that:
+          - catalog_refused | bool
+          - "'lium_catalog_signer' in catalog_msg"
+        fail_msg: >-
+          cvmd accepted a launch host whose catalog approves nothing.
+          refused={{ catalog_refused }} msg={{ catalog_msg }}
+        quiet: true
+
+    # --- the scripts directory is not the scripts directory ---------------
+    - name: Run cvmd pointed at a directory with no dstack.py
+      block:
+        - name: Include cvmd with the dstacktee root instead of scripts/
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvmd_dstack_scripts_dir: "{{ playbook_dir }}/../../dstacktee"
+
+        - name: Record that cvmd accepted an unimportable launcher path
+          ansible.builtin.set_fact:
+            launcher_refused: false
+            launcher_msg: ""
+      rescue:
+        - name: Record the launcher refusal
+          ansible.builtin.set_fact:
+            launcher_refused: true
+            launcher_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A scripts directory with no dstack.py is refused, and says why
+      ansible.builtin.assert:
+        that:
+          - launcher_refused | bool
+          - "'dstack.py' in launcher_msg"
+        fail_msg: >-
+          cvmd accepted a launcher path it cannot import from. cvmd imports
+          dstack.py as a library, so the dstacktee root will not do.
+          refused={{ launcher_refused }} msg={{ launcher_msg }}
+        quiet: true
+
+    # --- a port mapping dstack cannot parse -------------------------------
+    - name: Run cvmd with a malformed port mapping
+      block:
+        - name: Include cvmd with a port missing its guest side
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ports: ["tcp:12200"]
+
+        - name: Record that cvmd accepted an unparseable mapping
+          ansible.builtin.set_fact:
+            port_refused: false
+            port_msg: ""
+      rescue:
+        - name: Record the port refusal
+          ansible.builtin.set_fact:
+            port_refused: true
+            port_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A malformed port mapping is refused before it becomes a hostfwd rule
+      ansible.builtin.assert:
+        that:
+          - port_refused | bool
+          - "'host_port' in port_msg"
+        fail_msg: >-
+          cvmd accepted a port mapping dstack cannot parse, which becomes a CVM
+          with no way in. refused={{ port_refused }} msg={{ port_msg }}
+        quiet: true
+
+    # --- a port in range for the regex but not for cvmd -------------------
+    # The shape is right and every field is a number, so a shape-only check
+    # passes it — and then cvm/ports.py rejects it and the daemon will not
+    # start. The role's job is to name the variable before that happens.
+    - name: Run cvmd with a port number outside 1-65535
+      block:
+        - name: Include cvmd with an out-of-range host port
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ports: ["tcp:0.0.0.0:70000:2200"]
+
+        - name: Record that cvmd accepted an unbindable port
+          ansible.builtin.set_fact:
+            range_refused: false
+            range_msg: ""
+      rescue:
+        - name: Record the range refusal
+          ansible.builtin.set_fact:
+            range_refused: true
+            range_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A port outside 1-65535 is refused with the same rule cvmd applies
+      ansible.builtin.assert:
+        that:
+          - range_refused | bool
+          - "'1-65535' in range_msg"
+        fail_msg: >-
+          cvmd accepted a port number its own parser rejects, so the daemon
+          would refuse to start on a config this run reported as good.
+          refused={{ range_refused }} msg={{ range_msg }}
+        quiet: true
+
+    # --- an SSH guest port nothing forwards -------------------------------
+    # The guest port is the LAST field, so 2200:22 forwards 22 and not 2200.
+    # cvmd reads the host key through that forward and uses the read as its
+    # readiness signal, so with no match the launch has neither.
+    - name: Run cvmd with an SSH guest port that no mapping carries
+      block:
+        - name: Include cvmd with the guest side one field out
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ports: ["tcp:0.0.0.0:12200:22"]
+            lium_cvm_ssh_guest_port: 2200
+
+        - name: Record that cvmd accepted an unprobeable SSH port
+          ansible.builtin.set_fact:
+            ssh_refused: false
+            ssh_msg: ""
+      rescue:
+        - name: Record the SSH-port refusal
+          ansible.builtin.set_fact:
+            ssh_refused: true
+            ssh_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: An SSH guest port nothing forwards is refused, and the variable is named
+      ansible.builtin.assert:
+        that:
+          - ssh_refused | bool
+          - "'lium_cvm_ssh_guest_port' in ssh_msg"
+        fail_msg: >-
+          cvmd accepted a host whose SSH guest port no forward carries. The
+          launch would have no readiness signal and report a null fingerprint.
+          refused={{ ssh_refused }} msg={{ ssh_msg }}
+        quiet: true
+
+    # The matching case, so the assert cannot pass by refusing everything.
+    - name: Run cvmd with an SSH guest port that is forwarded
+      block:
+        - name: Include cvmd with a matching guest port
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ports: ["tcp:0.0.0.0:12200:2200"]
+            lium_cvm_ssh_guest_port: 2200
+
+        - name: Record that the launch checks passed
+          ansible.builtin.set_fact:
+            ssh_match_refused: false
+            ssh_match_msg: ""
+      rescue:
+        - name: Record where the matching case stopped
+          ansible.builtin.set_fact:
+            ssh_match_refused: true
+            ssh_match_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A forwarded SSH guest port passes the launch checks
+      ansible.builtin.assert:
+        that:
+          - not (ssh_match_refused | bool) or 'lium_cvm_ssh_guest_port' not in ssh_match_msg
+        fail_msg: >-
+          cvmd refused an SSH guest port that IS forwarded, so the check rejects
+          valid configuration. msg={{ ssh_match_msg }}
+        quiet: true
+
+    # --- teardown budgets (DAH-2577) --------------------------------------
+    #
+    # A tolerance above 1.0 asks for more memory back than the guest was ever
+    # given, so NO teardown on the host could ever satisfy it: every node would
+    # end up FAILED holding a CVM that had already stopped. cvmd's own loader
+    # refuses it too, but only once the config has been rendered — and by then
+    # the previous, working config is what is being replaced.
+    - name: Run cvmd with a memory tolerance above 1
+      block:
+        - name: Include cvmd with an unsatisfiable tolerance
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ssh_guest_port: 2200
+            lium_cvmd_teardown_memory_tolerance: 1.5
+
+        - name: Record that cvmd accepted an unsatisfiable teardown budget
+          ansible.builtin.set_fact:
+            tolerance_refused: false
+            tolerance_msg: ""
+      rescue:
+        - name: Record the tolerance refusal
+          ansible.builtin.set_fact:
+            tolerance_refused: true
+            tolerance_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A teardown budget no host could meet is refused before install
+      ansible.builtin.assert:
+        that:
+          - tolerance_refused | bool
+          - "'teardown_memory_tolerance' in tolerance_msg"
+        fail_msg: >-
+          cvmd accepted teardown_memory_tolerance above 1. No teardown on this
+          host could complete, so every node would end up FAILED holding a CVM
+          that had already stopped.
+          refused={{ tolerance_refused }} msg={{ tolerance_msg }}
+        quiet: true
+
+    # The matching case, so the assert cannot pass by refusing everything.
+    - name: Run cvmd with the default teardown budgets
+      block:
+        - name: Include cvmd with a usable tolerance
+          ansible.builtin.include_role:
+            name: cvmd
+          vars:
+            lium_cvm_ssh_guest_port: 2200
+            lium_cvmd_teardown_memory_tolerance: 0.9
+
+        - name: Record that the teardown checks passed
+          ansible.builtin.set_fact:
+            tolerance_ok_refused: false
+            tolerance_ok_msg: ""
+      rescue:
+        - name: Record where the matching case stopped
+          ansible.builtin.set_fact:
+            tolerance_ok_refused: true
+            tolerance_ok_msg: >-
+              {{ ansible_failed_result.msg | default('') }}
+              {{ ansible_failed_result.results | default([]) | map(attribute='msg') | join(' ') }}
+
+    - name: A usable teardown budget passes the launch checks
+      ansible.builtin.assert:
+        that:
+          - not (tolerance_ok_refused | bool) or 'teardown' not in tolerance_ok_msg
+        fail_msg: >-
+          cvmd refused a teardown budget that is inside its own loader's bounds,
+          so the check rejects valid configuration. msg={{ tolerance_ok_msg }}
+        quiet: true
+
+- name: The rendered config carries the catalog settings cvmd reads
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    cvmd_config_render_path: /tmp/lium-cvmd-config.toml
+    lium_cvmd_dstack_scripts_dir: /opt/lium-io/neurons/executor/dstacktee/scripts
+    lium_catalog_signer: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+    lium_catalog_manifest_url: https://example.invalid/v1/cvm-catalog/manifest
+    lium_catalog_images_dir: /opt/images
+
+  tasks:
+    # The template reads the role's path defaults, and a bare `template` task
+    # has none of them in scope. Loaded from the role's own file rather than
+    # restated here, so the fixture cannot drift from the paths install.sh
+    # hardcodes.
+    - name: Load the cvmd role's defaults
+      ansible.builtin.include_vars:
+        file: ../roles/cvmd/defaults/main.yml
+
+    - name: Render the config template directly
+      ansible.builtin.template:
+        src: ../roles/cvmd/templates/config.toml.j2
+        dest: "{{ cvmd_config_render_path }}"
+        mode: "0600"
+
+    - name: Read it back
+      ansible.builtin.slurp:
+        src: "{{ cvmd_config_render_path }}"
+      register: rendered_config
+
+    # The two daemon-owned paths must NOT be here: cvmd derives them from
+    # state_dir, and a config that also named them would be a file Ansible and
+    # the daemon both write.
+    - name: It names the signer, the URL and the image directory, and nothing daemon-owned
+      ansible.builtin.assert:
+        that:
+          - "'catalog_signer = \"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY\"' in toml"
+          - "'catalog_manifest_url = \"https://example.invalid/v1/cvm-catalog/manifest\"' in toml"
+          - "'catalog_images_dir = \"/opt/images\"' in toml"
+          - "'catalog_seed_path = \"/etc/cvmd/manifest.json\"' in toml"
+          - "'catalog_cache_path' not in toml"
+          - "'catalog_materialize_dir' not in toml"
+        fail_msg: >-
+          The rendered config does not carry the catalog settings cvmd reads:
+          {{ toml }}
+        quiet: true
+      vars:
+        toml: "{{ rendered_config.content | b64decode }}"
+
+    - name: A host with no signer gets no catalog settings at all
+      ansible.builtin.template:
+        src: ../roles/cvmd/templates/config.toml.j2
+        dest: "{{ cvmd_config_render_path }}"
+        mode: "0600"
+      vars:
+        lium_catalog_signer: ""
+
+    - name: Read the signerless render back
+      ansible.builtin.slurp:
+        src: "{{ cvmd_config_render_path }}"
+      register: rendered_unsigned
+
+    - name: An empty signer is omitted, never written as an empty string
+      ansible.builtin.assert:
+        that:
+          - "'catalog_signer' not in (rendered_unsigned.content | b64decode)"
+        fail_msg: >-
+          The config carries a catalog_signer on a host that has none. An empty
+          string is not the same as absent: cvmd reports absent as "this host
+          has no catalog configuration", which is the truth.
+        quiet: true
+
+    - name: Remove the rendered config
+      ansible.builtin.file:
+        path: "{{ cvmd_config_render_path }}"
+        state: absent
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: "PASS cvmd refuses a half-configured launch host, and renders the catalog settings its loader reads."

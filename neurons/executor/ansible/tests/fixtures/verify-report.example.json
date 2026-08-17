@@ -1,0 +1,369 @@
+{
+  "checks": [
+    {
+      "evidence_source": "/etc/os-release",
+      "expected": "one of 25.10, 26.04",
+      "id": "os.supported",
+      "observed": "Ubuntu 26.04",
+      "remediation": "Reinstall on Ubuntu 25.10 or 26.04 LTS. Older releases lack the TDX kernel support this stack needs.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "Ubuntu release is supported"
+    },
+    {
+      "evidence_source": "/sys/module/kvm_intel/parameters/tdx",
+      "expected": "Y",
+      "id": "cpu.tdx_enabled",
+      "observed": "kvm_intel tdx parameter = Y",
+      "remediation": "BIOS: enable Intel TDX (and TME / TME-MT) in the CPU security menu. The kernel must be Canonical intel or mainline 6.16 or newer.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "Intel TDX is enabled"
+    },
+    {
+      "evidence_source": "/sys/class/iommu/",
+      "expected": "at least one IOMMU group",
+      "id": "iommu.vt_d",
+      "observed": "IOMMU groups present",
+      "remediation": "BIOS: enable VT-d / Intel Virtualization Technology for Directed I/O. Without it no device can be passed through to a TD guest.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "VT-d / IOMMU is enabled"
+    },
+    {
+      "evidence_source": "/dev/sgx_enclave, /dev/sgx_provision",
+      "expected": "both /dev/sgx_enclave and /dev/sgx_provision",
+      "id": "sgx.devices_present",
+      "observed": "2 of 2 SGX device nodes",
+      "remediation": "BIOS: enable Intel SGX and set PRMRR size to 64M or more. An SGX Factory Reset may be required.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "SGX device nodes are present"
+    },
+    {
+      "evidence_source": "/boot/grub/grub.cfg",
+      "expected": "/boot/grub/grub.cfg exists and update-grub is on PATH",
+      "id": "boot.grub_present",
+      "observed": "grub.cfg present, update-grub on PATH",
+      "remediation": "This host does not boot via GRUB (systemd-boot or a vendor bootloader). Apply the docs/host-setup.md section 2 kernel parameters by hand and re-run with --skip-tags kernel.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "This host boots via GRUB"
+    },
+    {
+      "evidence_source": "lspci -n",
+      "expected": "at least one device matching 10de:2335, 10de:2336, 10de:2330, 10de:233a",
+      "id": "gpu.cc_capable_present",
+      "observed": "8 CC-capable GPU(s)",
+      "remediation": "Searched PCI ids: 10de:2335, 10de:2336, 10de:2330, 10de:233a. If lspci is missing, install pciutils. If your GPU is CC-capable but not in that list it is not yet supported.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "A confidential-compute capable GPU is present"
+    },
+    {
+      "evidence_source": "/opt/intel/sgx-dcap-pccs/pckcache.db",
+      "expected": "more than 0 rows in the pck_cert table",
+      "id": "sgx.registration_pck_certs",
+      "observed": "8 PCK certificate(s)",
+      "remediation": "Set lium_intel_api_key to run a local PCCS and in-band registration; otherwise DCAP collateral comes from https://localhost:8081/sgx/certification/v4/. With 0 certificates the sealing-key enclave crash-loops with \"AESM service returned error 44\". Read the pck_cert row count, never /var/log/mpa_registration.log, which reports success on broken hosts too.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "This platform has PCK certificates"
+    },
+    {
+      "evidence_source": "systemctl is-active pccs",
+      "expected": "active",
+      "id": "sgx.pccs_active",
+      "observed": "pccs is active",
+      "remediation": "systemctl status pccs. A PCCS that dies with ERR_MODULE_NOT_FOUND: config needs `npm install` in /opt/intel/sgx-dcap-pccs \u2014 the interactive postinst wizard normally does that and it fails under apt.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The PCCS service is running"
+    },
+    {
+      "evidence_source": "ss -a --vsock",
+      "expected": "a v_str LISTEN on port 4050",
+      "id": "sgx.qgsd_vsock_4050",
+      "observed": "listening on vsock 4050",
+      "remediation": "Uncomment `port = 4050` in /etc/qgs.conf and restart qgsd. It ships commented out, so qgsd serves a unix socket instead, reports active, and never answers the guest \u2014 the CVM then reboots at around 160 seconds with \"vsock failure: Connection reset by peer (os error 104)\".",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "qgsd serves TD quotes over vsock"
+    },
+    {
+      "evidence_source": "/etc/sgx_default_qcnl.conf",
+      "expected": "false",
+      "id": "sgx.qpl_secure_cert_false",
+      "observed": "use_secure_cert = false",
+      "remediation": "Set \"use_secure_cert\": false in /etc/sgx_default_qcnl.conf AND in key-provider/sgx_default_qcnl.conf. Intel ships the system one as true, which rejects a local self-signed PCCS certificate: \"[QCNL] CURL error: (60)\", \"[QPL] ... 0xb033\", then the guest reboots.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The QPL accepts the PCCS certificate"
+    },
+    {
+      "evidence_source": "/etc/sgx_default_qcnl.conf",
+      "expected": "the file parses once whole-line // comments are stripped",
+      "id": "sgx.qpl_config_parses",
+      "observed": "parses",
+      "remediation": "Re-run the sgx role: it writes this file whole from a template with a json.load validate, so it cannot install an unparseable one. The pristine platform copy is kept at /etc/sgx_default_qcnl.conf.pre-lium-cvm. This is checked separately from sgx.qpl_secure_cert_false because that check GREPS for a key, and a grep is satisfied by a line appended after the closing brace \u2014 which is exactly how a corrupted file passed while the QPL could not read a word of it. Symptom: every CVM reboots at ~160s, \"cpus are not resettable, terminating\", and docker logs dstack-key-provider shows \"DCAP error\".",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The QPL configuration is readable JSON"
+    },
+    {
+      "evidence_source": "docker logs dstack-key-provider",
+      "expected": "PRODUCTION mode, RestartCount 0, no enclave errors",
+      "id": "sgx.keyprovider_production",
+      "observed": "running=true, restarts=0, production lines=1, enclave errors=0",
+      "remediation": "This is the end-to-end proof that the whole SGX chain works. \"error 44\" or a failed load_enclave means the platform has no PCK certificates \u2014 fix sgx.registration_pck_certs first.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The sealing-key provider runs in production mode"
+    },
+    {
+      "evidence_source": "TCP connect probe",
+      "expected": "a TCP connection succeeds",
+      "id": "net.intel_api_reachable",
+      "observed": "reachable at api.trustedservices.intel.com:443",
+      "remediation": "Egress filtering is common in provider datacenters, and an unreachable Intel API turns in-band registration into an opaque hang. Allow outbound TCP to api.trustedservices.intel.com:443, or use a remote PCCS via lium_pccs_url.",
+      "severity": "degraded",
+      "status": "OK",
+      "title": "Intel's provisioning API is reachable"
+    },
+    {
+      "evidence_source": "nvidia_gpu_tools.py --query-cc-mode",
+      "expected": "every GPU reports CC mode on",
+      "id": "gpu.cc_mode_all_on",
+      "observed": "8 on, 0 off, 0 unreadable",
+      "remediation": "CC mode is OFF by default on a fresh host. It is a hardware prerequisite for GPU passthrough into a TD guest \u2014 ENABLE_GPU_ATTESTATION=false does NOT make it optional. Re-run the gpu role.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "Every GPU has confidential-compute mode on"
+    },
+    {
+      "evidence_source": "/sys/bus/pci/devices/*/driver",
+      "expected": "every GPU and NVSwitch bound to vfio-pci",
+      "id": "gpu.vfio_bound_all",
+      "observed": "0 device(s) not bound to vfio-pci",
+      "remediation": "Re-run the gpu role. Binding the GPUs but not the NVSwitches produces a guest that boots and then cannot see NVLink.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "Every GPU and NVSwitch is bound to vfio-pci"
+    },
+    {
+      "evidence_source": "lspci -n",
+      "expected": "informational",
+      "id": "gpu.device_inventory",
+      "observed": "8 GPU(s), 4 NVSwitch(es)",
+      "remediation": "None. Recorded so a device that disappears between runs is visible \u2014 a hot-removed GPU is what makes vfio-pci.ids= try to narrow.",
+      "severity": "info",
+      "status": "OK",
+      "title": "GPU and NVSwitch inventory"
+    },
+    {
+      "evidence_source": "/sys/module/vfio_iommu_type1/parameters/dma_entry_limit",
+      "expected": "16777216",
+      "id": "kernel.dma_entry_limit",
+      "observed": "dma_entry_limit = 16777216",
+      "remediation": "The shipped default is 65535, which kills a TD guest mid-boot with \"VFIO_MAP_DMA failed: No space left on device\" because TDX shared/private page conversions exhaust it.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The vfio DMA entry limit is raised"
+    },
+    {
+      "evidence_source": "/etc/modprobe.d/vfio-dma.conf",
+      "expected": "the modprobe drop-in exists",
+      "id": "kernel.dma_persisted",
+      "observed": "/etc/modprobe.d/vfio-dma.conf present",
+      "remediation": "The runtime write applies immediately but does not survive a reboot. Re-run the kernel role.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The DMA entry limit survives a reboot"
+    },
+    {
+      "evidence_source": "/proc/cmdline",
+      "expected": "every required token resolves on /proc/cmdline",
+      "id": "kernel.cmdline_tokens",
+      "observed": "0 token(s) missing from the running kernel",
+      "remediation": "Re-run bootstrap.sh and allow the reboot. If it has already rebooted twice without effect, check whether /boot is full and whether update-grub actually rewrote grub.cfg.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The running kernel has every required parameter"
+    },
+    {
+      "evidence_source": "/etc/default/grub and /etc/default/grub.d/",
+      "expected": "every required token wins in GRUB_CMDLINE_LINUX plus GRUB_CMDLINE_LINUX_DEFAULT",
+      "id": "kernel.grub_persisted",
+      "observed": "0 token(s) not resolving in the merged GRUB configuration",
+      "remediation": "Re-run the kernel role. The drop-in appends to GRUB_CMDLINE_LINUX_DEFAULT and never assigns GRUB_CMDLINE_LINUX, so a provider value is never clobbered.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The kernel parameters are persisted in GRUB"
+    },
+    {
+      "evidence_source": "/etc/default/grub",
+      "expected": "each parameter appears once",
+      "id": "kernel.grub_conflicting_tokens",
+      "observed": "none",
+      "remediation": "These keys appear more than once with different values. Ours win, because 10_linux emits GRUB_CMDLINE_LINUX before GRUB_CMDLINE_LINUX_DEFAULT and the kernel takes the last occurrence \u2014 but relying on that ordering forever is fragile. Remove the stale copies from /etc/default/grub.",
+      "severity": "degraded",
+      "status": "OK",
+      "title": "No stale duplicate kernel parameters"
+    },
+    {
+      "evidence_source": "/opt/qemu-dstack/bin/qemu-system-x86_64 --version",
+      "expected": "9.2.1",
+      "id": "qemu.version_9_2_1",
+      "observed": "QEMU 9.2.1",
+      "remediation": "Attestation fails on RTMR0 if the host runs distro QEMU instead of the dstack build. Re-run the qemu role.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The dstack QEMU build is installed"
+    },
+    {
+      "evidence_source": "/etc/dstack/client.conf",
+      "expected": "/opt/qemu-dstack/bin/qemu-system-x86_64",
+      "id": "qemu.client_conf_path",
+      "observed": "client.conf path = /opt/qemu-dstack/bin/qemu-system-x86_64",
+      "remediation": "Read from /etc/dstack/client.conf directly. Do not use `lium-cvm.sh check` for this: it looks on PATH while the launcher uses client.conf, so it reports a false MISSING on a correctly configured host.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "dstack points at the right QEMU"
+    },
+    {
+      "evidence_source": "/tmp/lium-verify/state/qemu.sha256",
+      "expected": "the live binary matches /tmp/lium-verify/state/qemu.sha256",
+      "id": "qemu.binary_sha256",
+      "observed": "matches",
+      "remediation": "QEMU is a measured input. A binary that changed underneath a running CVM means RTMR0 no longer matches and any existing hda.img is undecryptable. Investigate before restarting anything.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The QEMU binary is unchanged since it was installed"
+    },
+    {
+      "evidence_source": "docker --version",
+      "expected": "any version",
+      "id": "docker.installed",
+      "observed": "Docker 27.3.1",
+      "remediation": "Re-run the docker role. Note the apt suite is noble for both supported releases \u2014 Ubuntu 25.10 has no Docker repo of its own.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "Docker is installed"
+    },
+    {
+      "evidence_source": "/tmp/lium-verify/no-such-repo",
+      "expected": "the dstacktee tree exists",
+      "id": "repo.present",
+      "observed": "/opt/lium-io present",
+      "remediation": "Re-run without --no-clone, or clone it by hand to /tmp/lium-verify/no-such-repo.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The lium-io checkout exists"
+    },
+    {
+      "evidence_source": "git status --porcelain",
+      "expected": "no local modifications",
+      "id": "repo.app_pristine",
+      "observed": "0 modified file(s) under dstacktee/app",
+      "remediation": "git -C /tmp/lium-verify/no-such-repo checkout -- neurons/executor/dstacktee/app. Everything under app/ is hashed into the compose the validator whitelists; any edit produces a hash nobody has whitelisted and every attestation fails.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The measured surface is unmodified"
+    },
+    {
+      "evidence_source": "git rev-parse HEAD",
+      "expected": "the checkout is only moved on a host with no CVM state",
+      "id": "repo.ref_behind",
+      "observed": "guard state CLEAN, HEAD b38ea5e04c1d",
+      "remediation": "The ref was not moved because this host still holds CVM state, and moving it rewrites the measured surface. Upgrading a host that has a CVM is a deliberate procedure: see docs/host-setup.md section 6.",
+      "severity": "info",
+      "status": "OK",
+      "title": "The checkout was left where it was"
+    },
+    {
+      "evidence_source": "run/images/*/digest.txt",
+      "expected": "a digest.txt under run/images/",
+      "id": "repo.os_image_present",
+      "observed": "digest sha256:9f2c1ab4e8d0",
+      "remediation": "Run ./lium-cvm.sh download in neurons/executor/dstacktee.",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The CVM OS image is downloaded"
+    },
+    {
+      "evidence_source": "dstacktee/.env",
+      "expected": "EXECUTOR_RUNNER_IMAGE_DIGEST is set",
+      "id": "repo.runner_digest_set",
+      "observed": "set in dstacktee/.env",
+      "remediation": "Per-executor .env stays manual: see docs/host-setup.md section 5. Presence only is reported here, never a comparison against a whitelist \u2014 a checkout can be BEHIND the deployed validator, and on one occasion the whitelisted digest was the broken one. Do not downgrade to match a local list.",
+      "severity": "degraded",
+      "status": "OK",
+      "title": "The executor runner digest is set"
+    },
+    {
+      "evidence_source": "ss -tlnp",
+      "expected": "informational",
+      "id": "net.local_listeners",
+      "observed": "27 listening socket(s)",
+      "remediation": "None. Recorded so the report shows what was listening at the time of the run.",
+      "severity": "info",
+      "status": "OK",
+      "title": "Local listening sockets"
+    },
+    {
+      "evidence_source": "not collectable locally",
+      "expected": "an off-site read test confirms the executor ports are reachable",
+      "id": "net.acl_probe_required",
+      "observed": "not verifiable from this host",
+      "remediation": "ss proves a port is LISTENING, never that it is REACHABLE. Two hosts silently blackholed 8001/2200/19001 while permitting 22 and 30000-32767, and everything looked perfect from the host itself. Probe from an independent network with a READ test (exec 3<>/dev/tcp/HOST/PORT && head -c 2 <&3), and calibrate that vantage against a dead port on a well-known third party first \u2014 many networks forge SYN-ACKs for every destination, which makes a plain connect test worthless. Fixing datacenter ACLs is out of scope for this playbook.",
+      "severity": "degraded",
+      "status": "WARN",
+      "title": "Port reachability must be checked from outside"
+    },
+    {
+      "evidence_source": "lium-guard.sh",
+      "expected": "CLEAN for a full converge",
+      "id": "guard.host_state",
+      "observed": "CLEAN \u2014 no CVM state found",
+      "remediation": "No action needed.",
+      "severity": "info",
+      "status": "OK",
+      "title": "CVM state on this host"
+    },
+    {
+      "evidence_source": "systemctl is-active cvmd.service",
+      "expected": "active whenever lium_cvmd_package_url is set",
+      "id": "cvmd.service_state",
+      "observed": "not requested",
+      "remediation": "cvmd is optional. Set lium_cvmd_package_url, lium_cvmd_package_sha256 and lium_cvmd_authorized_clients to install the control daemon.",
+      "severity": "info",
+      "status": "SKIPPED",
+      "title": "cvmd control daemon"
+    },
+    {
+      "evidence_source": "cvmd.catalog.CatalogStore.describe()",
+      "expected": "a signed manifest, in date, from lium_catalog_signer",
+      "id": "catalog.manifest",
+      "observed": "not requested",
+      "remediation": "The catalog arrives with cvmd. Set lium_cvmd_package_url to install it.",
+      "severity": "info",
+      "status": "SKIPPED",
+      "title": "approved artifact catalog"
+    }
+  ],
+  "generated_at": "2026-08-05T09:14:22Z",
+  "host": {
+    "hostname": "cvm-host-example",
+    "os": "ubuntu 26.04",
+    "kernel": "6.17.0-9-intel",
+    "boot_id": "4b1f6d2e-8c3a-4f77-9e21-0a5c7b3d9e14"
+  },
+  "schema_version": "1.0.0",
+  "summary": {
+    "ok": 32,
+    "warn": 1,
+    "must_fix": 0,
+    "unknown": 0,
+    "skipped": 2
+  }
+}

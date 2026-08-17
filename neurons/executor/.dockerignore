@@ -11,3 +11,8 @@ sysbox-ce_*
 # CVM runtime dir (guest disk images, tens of GB) — never part of the build
 # context, and COPY . . must not bake it into the executor image.
 dstacktee/
+# Provisioning playbook — runs on the HOST, never inside the executor image.
+ansible/
+# cvmd runs on the CVM host, not inside the executor container. It has its own venv and dist/,
+# which COPY . . would otherwise bake into the executor image.
+cvmd/

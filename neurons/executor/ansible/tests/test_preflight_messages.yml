@@ -1,0 +1,92 @@
+---
+# Merge-gate box 2, second half. Runs on the SUPPORTED-OS CONTAINER.
+#
+# The container is a genuinely supported Ubuntu release with none of the
+# hardware: no TDX module, no /dev/sgx_*, no NVIDIA device, no
+# /boot/grub/grub.cfg. So five preflight gates fire for the RIGHT REASON.
+#
+# pciutils and iproute2 are installed there on purpose, so the GPU gate fails as
+# "device absent" and not as "tool absent" — conflating those two would let a
+# missing tool masquerade as missing hardware, and would let this test pass for
+# entirely the wrong reason.
+#
+# It also asserts os.supported is NOT among the failures. On the CI runner
+# (Ubuntu 24.04) it would be, and every BIOS assertion below it would then never
+# execute at all.
+
+- name: Preflight message assertions
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    lium_state_dir: /tmp/lium-preflight/state
+    lium_log_dir: /tmp/lium-preflight/log
+    lium_hda_search_roots: ["/tmp/lium-preflight/no-such-root"]
+    lium_repo_path: /tmp/lium-preflight/no-such-repo
+    # Non-fatal, so the failures can be inspected rather than aborting the play.
+    lium_preflight_fatal: false
+
+  roles:
+    - common
+    - preflight
+
+  tasks:
+    - name: Preflight must have found failures on a host with none of the hardware
+      ansible.builtin.assert:
+        that:
+          - lium_preflight_failed | length > 0
+        fail_msg: >-
+          Preflight reported no failures on a host with no TDX, no SGX, no
+          IOMMU and no GRUB. Either the gates are not running, or they are
+          passing for the wrong reason.
+        quiet: true
+
+    - name: The OS gate must NOT have fired
+      ansible.builtin.assert:
+        that:
+          - "'os.supported' not in (lium_preflight_failed | map(attribute='id') | list)"
+        fail_msg: >-
+          preflight rejected the OS — this job must run on a SUPPORTED release,
+          otherwise the BIOS-knob assertions below never even execute. Found
+          Ubuntu {{ lium.os_version_id }}; supported are
+          {{ lium_os_matrix.keys() | list | join(', ') }}.
+        quiet: true
+
+    - name: Each BIOS knob is named by its own gate
+      ansible.builtin.assert:
+        that:
+          - item.id in (lium_preflight_failed | map(attribute='id') | list)
+          - item.text in (lium_preflight_failed | selectattr('id', 'equalto', item.id)
+                          | map(attribute='msg') | join(' '))
+        fail_msg: >-
+          Gate {{ item.id }} did not fire with the expected message text
+          "{{ item.text }}". Actual failures:
+          {{ lium_preflight_failed | map(attribute='msg') | join(' | ') }}
+        quiet: true
+      loop:
+        - {id: "cpu.tdx_enabled", text: "BIOS: enable Intel TDX"}
+        - {id: "sgx.devices_present", text: "BIOS: enable Intel SGX"}
+        - {id: "iommu.vt_d", text: "BIOS: enable VT-d"}
+        - {id: "gpu.cc_capable_present", text: "Searched PCI ids"}
+        - {id: "boot.grub_present", text: "does not boot via GRUB"}
+      loop_control:
+        label: "{{ item.id }}"
+
+    # The GPU gate must fail as DEVICE ABSENT, not TOOL ABSENT. pciutils is
+    # installed in the container precisely so this distinction is real.
+    - name: The GPU gate failed because there is no device, not because lspci is missing
+      ansible.builtin.assert:
+        that:
+          - lium.lspci_available.readable | bool
+        fail_msg: >-
+          lspci is not available, so gpu.cc_capable_present failed as "tool
+          absent" rather than "device absent". Install pciutils in this
+          environment — otherwise a missing tool masquerades as missing hardware
+          and this assertion passes for the wrong reason.
+        quiet: true
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: >-
+          PASS preflight named {{ lium_preflight_failed | length }} gate(s) on a
+          supported OS with none of the hardware.

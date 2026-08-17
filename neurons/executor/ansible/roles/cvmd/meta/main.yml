@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  role_name: cvmd
+  author: Lium
+  description: CVM host provisioning — install and configure the cvmd control daemon
+  company: Datura
+  license: MIT
+  min_ansible_version: "2.18"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - questing
+        - resolute
+  galaxy_tags: []
+dependencies: []

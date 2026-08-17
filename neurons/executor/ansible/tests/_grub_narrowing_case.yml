@@ -1,0 +1,76 @@
+---
+# One narrowing case. The kernel role must REFUSE rather than write a shorter
+# vfio-pci.ids list, and must name the id that would be dropped.
+
+- name: "Create the narrowing work tree: {{ narrow_case.name }}"
+  ansible.builtin.file:
+    path: "{{ grub_root }}/{{ narrow_case.name }}/etc/default/grub.d"
+    state: directory
+    mode: "0755"
+
+- name: "Copy the narrowing fixture in: {{ narrow_case.name }}"
+  ansible.builtin.copy:
+    src: "fixtures/grub/{{ narrow_case.fixture }}/etc/default/grub"
+    dest: "{{ grub_root }}/{{ narrow_case.name }}/etc/default/grub"
+    mode: "0644"
+
+- name: "Run the kernel role against it: {{ narrow_case.name }}"
+  block:
+    - name: "Converge: {{ narrow_case.name }}"
+      ansible.builtin.include_role:
+        name: kernel
+      vars:
+        lium_kernel_fixture_mode: true
+        lium_kernel_reboot_enabled: false
+        lium_grub_default_path: "{{ grub_root }}/{{ narrow_case.name }}/etc/default/grub"
+        lium_grub_dropin_path: "{{ grub_root }}/{{ narrow_case.name }}/etc/default/grub.d/99-lium-cvm.cfg"
+        lium_grubcfg_path: "{{ grub_root }}/{{ narrow_case.name }}/boot/grub/grub.cfg"
+        lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/{{ narrow_case.proc }}"
+        lium_modprobe_conf_path: "{{ grub_root }}/{{ narrow_case.name }}/etc/modprobe.d/vfio-dma.conf"
+        lium_modules_load_path: "{{ grub_root }}/{{ narrow_case.name }}/etc/modules-load.d/vfio.conf"
+        lium_update_grub_cmd: >-
+          {{ playbook_dir }}/fake-update-grub.sh
+          {{ grub_root }}/{{ narrow_case.name }}/etc/default/grub
+          {{ grub_root }}/{{ narrow_case.name }}/etc/default/grub.d
+          {{ grub_root }}/{{ narrow_case.name }}/boot/grub/grub.cfg
+
+    - name: "Record that the role did NOT refuse: {{ narrow_case.name }}"
+      ansible.builtin.set_fact:
+        narrow_refused: false
+        narrow_msg: ""
+  rescue:
+    - name: "Record the refusal: {{ narrow_case.name }}"
+      ansible.builtin.set_fact:
+        narrow_refused: true
+        narrow_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "The role refused and named the dropped id: {{ narrow_case.name }}"
+  ansible.builtin.assert:
+    that:
+      - narrow_refused | bool
+      - "'SHORTER' in narrow_msg"
+      - narrow_case.dropped in narrow_msg
+      - "'/sys/bus/pci/rescan' in narrow_msg"
+    fail_msg: >-
+      The kernel role must refuse to shorten vfio-pci.ids, name {{ narrow_case.dropped }}
+      as the id that would be dropped, and hint at a PCI rescan.
+      refused={{ narrow_refused }} msg={{ narrow_msg }}
+    quiet: true
+
+- name: "The drop-in was NOT written: {{ narrow_case.name }}"
+  ansible.builtin.stat:
+    path: "{{ grub_root }}/{{ narrow_case.name }}/etc/default/grub.d/99-lium-cvm.cfg"
+  register: narrow_dropin
+
+- name: "Nothing was changed before the refusal: {{ narrow_case.name }}"
+  ansible.builtin.assert:
+    that:
+      - not narrow_dropin.stat.exists
+    fail_msg: >-
+      The drop-in was written even though the role refused. The refusal must come
+      BEFORE anything is changed, or a failed run leaves a shorter id list behind.
+    quiet: true
+
+- name: "PASS narrowing: {{ narrow_case.name }}"
+  ansible.builtin.debug:
+    msg: "PASS narrowing {{ narrow_case.name }} — refused, named {{ narrow_case.dropped }}, wrote nothing"

@@ -1,0 +1,178 @@
+---
+# In-band SGX platform registration. No BIOS or BMC access needed.
+#
+# THIS IS IRREVERSIBLE. PCKIDRetrievalTool flips the registration efivar to
+# "completed" and the manifest may not be re-extractable afterwards. Which is
+# why step 1 is a backup, why it is guarded by `creates:` so a good backup is
+# never overwritten, and why this whole file only runs when pck_cert_count was
+# READ as 0 — never when it could not be read at all.
+
+- name: Ensure the efivar backup directory exists
+  ansible.builtin.file:
+    path: "{{ lium_state_dir }}/efivar-backup"
+    state: directory
+    mode: "0700"
+
+# `cat` redirection, never `cp`. cp fails on efivarfs with "Illegal seek".
+#
+# All four SGX efivars are matched by glob rather than named individually: the
+# GUID suffix varies by platform, and a hardcoded name that does not match would
+# back up nothing while reporting success — right before the irreversible step.
+- name: Back up every SGX efivar
+  ansible.builtin.shell:
+    cmd: |
+      set -Eeuo pipefail
+      found=0
+      for var in /sys/firmware/efi/efivars/Sgx*; do
+        [ -r "$var" ] || continue
+        name="$(basename "$var")"
+        dest="{{ lium_state_dir }}/efivar-backup/${name}"
+        if [ ! -s "$dest" ]; then
+          cat "$var" > "$dest"
+        fi
+        found=$((found + 1))
+      done
+      printf 'backed up %s SGX efivar(s)\n' "$found"
+      if [ "$found" -eq 0 ]; then
+        printf 'no SGX efivars found under /sys/firmware/efi/efivars\n' >&2
+        exit 1
+      fi
+    creates: "{{ lium_state_dir }}/efivar-backup/.complete"
+    executable: /bin/bash
+  register: lium_efivar_backup
+
+- name: Mark the efivar backup complete
+  ansible.builtin.file:
+    path: "{{ lium_state_dir }}/efivar-backup/.complete"
+    state: touch
+    mode: "0600"
+  when: lium_efivar_backup is changed
+
+- name: Assert the backup exists before doing anything irreversible
+  ansible.builtin.stat:
+    path: "{{ lium_state_dir }}/efivar-backup/.complete"
+  register: lium_efivar_marker
+
+- name: Refuse to register without a backup
+  ansible.builtin.fail:
+    msg: >-
+      The SGX efivar backup is missing, and the next step flips the registration
+      efivar irreversibly. Refusing to continue.
+  when: not lium_efivar_marker.stat.exists
+
+# Flips the registration efivar. Everything above this line exists to make that
+# survivable.
+- name: Extract the platform manifest
+  ansible.builtin.command:
+    cmd: "{{ lium_pckid_tool_cmd }}"
+    creates: "{{ lium_state_dir }}/pckid.csv"
+
+- name: Read the retrieval tool's CSV
+  ansible.builtin.slurp:
+    src: "{{ lium_state_dir }}/pckid.csv"
+  register: lium_pckid_csv
+
+# Field 6 is the PLATFORM_MANIFEST, hex-encoded.
+- name: Decode the platform manifest
+  ansible.builtin.shell:
+    cmd: |
+      set -Eeuo pipefail
+      tail -n +2 {{ lium_state_dir }}/pckid.csv | head -1 | cut -d, -f6 \
+        | tr -d ' "' | xxd -r -p > {{ lium_state_dir }}/platform_manifest.bin
+      stat -c %s {{ lium_state_dir }}/platform_manifest.bin
+    executable: /bin/bash
+  register: lium_manifest_decode
+  changed_when: true
+
+# 17950, EXACTLY.
+#
+# The raw efivar, after stripping only its 4-byte efivarfs attribute header, is
+# 17954 bytes: a 4-byte version+size header PLUS this 17950-byte body. POSTing
+# the 17954-byte version-prefixed blob returns
+#     400 Error-Code: InvalidPlatformManifest
+# Intel wants exactly the tool's field-6 bytes. This cost ar3 one 400.
+- name: Assert the manifest is exactly the body Intel accepts
+  ansible.builtin.assert:
+    that:
+      - (lium_manifest_decode.stdout | trim | int) == (lium_platform_manifest_len | int)
+    fail_msg: >-
+      The decoded platform manifest is {{ lium_manifest_decode.stdout | trim }} bytes,
+      not {{ lium_platform_manifest_len }}. 17954 means the version+size header was
+      not stripped and Intel will answer 400 InvalidPlatformManifest. Do not POST it.
+    quiet: true
+  # Check mode skipped both the extract and the decode, so there is no byte
+  # count to compare against.
+  when: not ansible_check_mode
+
+- name: Read the manifest bytes
+  ansible.builtin.slurp:
+    src: "{{ lium_state_dir }}/platform_manifest.bin"
+  register: lium_manifest_bytes
+
+# The `uri` module passes headers in-process. A curl invocation would put the
+# token on an argv that any local user can read out of /proc/<pid>/cmdline —
+# `no_log` hides a value from Ansible's own output and does nothing about that.
+- name: Register the platform with Intel
+  ansible.builtin.uri:
+    url: "{{ lium_intel_registration_url }}"
+    method: POST
+    headers:
+      Content-Type: application/octet-stream
+    body: "{{ lium_manifest_bytes.content | b64decode }}"
+    status_code: [201]
+    return_content: true
+  register: lium_intel_registration
+
+# A multi-package platform is NOT auto-cached by the lazy pckcert GET, which
+# just returns 400. The cache has to be warmed explicitly.
+- name: Warm the local PCCS cache
+  ansible.builtin.uri:
+    url: "{{ lium_pccs_url }}platforms"
+    method: POST
+    headers:
+      Content-Type: application/json
+      user-token: "{{ lium_pccs_user_token }}"
+    body_format: json
+    body:
+      enc_ppid: "{{ lium_pckid_fields[0] }}"
+      pce_id: "{{ lium_pckid_fields[1] }}"
+      cpu_svn: "{{ lium_pckid_fields[2] }}"
+      pce_svn: "{{ lium_pckid_fields[3] }}"
+      qe_id: "{{ lium_pckid_fields[4] }}"
+      platform_manifest: "{{ lium_pckid_fields[5] }}"
+    validate_certs: false
+    status_code: [200]
+  vars:
+    lium_pckid_fields: >-
+      {{ (lium_pckid_csv.content | b64decode).splitlines()[1] | trim | split(',') }}
+  no_log: true
+  when: lium_pccs_user_token | length > 0
+
+# Success is the pck_cert row count, and nothing else.
+#
+# /var/log/mpa_registration.log reported "registration is completed
+# successfully" on the BROKEN host and the healthy one alike, and
+# platforms_registered is 0 on a healthy host. Neither is a usable signal.
+- name: Re-read the PCK certificate count
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c "import sqlite3;
+      print(sqlite3.connect('file:/opt/intel/sgx-dcap-pccs/pckcache.db?mode=ro', uri=True)
+      .execute('select count(*) from pck_cert').fetchone()[0])"
+  register: lium_pck_after
+  changed_when: false
+  failed_when: false
+
+- name: Confirm registration actually populated the cache
+  ansible.builtin.assert:
+    that:
+      - (lium_pck_after.stdout | default('0') | trim | int) > 0
+    fail_msg: >-
+      Registration returned success but pckcache.db still has 0 PCK certificates.
+      That is the state that makes the sealing-key enclave crash-loop with
+      "AESM service returned error 44". Check the PCCS logs before booting a CVM.
+    success_msg: >-
+      pckcache.db now holds {{ lium_pck_after.stdout | trim }} PCK certificate(s).
+    quiet: true
+  # Check mode never ran the registration this is meant to confirm.
+  when: not ansible_check_mode

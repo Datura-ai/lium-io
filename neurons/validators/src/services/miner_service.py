@@ -61,7 +61,7 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.attestation_service import AttestationService
+from services.attestation_service import TDX_ATTESTED_EXECUTOR_SET, AttestationService
 from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
@@ -191,6 +191,20 @@ class MinerService:
         self.task_service = task_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
+        # DAH-2629/2630 — built on first use, not here: the wallet read prompts for a
+        # keystore, and most MinerService instances (tests, tooling) never touch cvmd.
+        self._cvm_lifecycle_service = None
+
+    def _cvm_lifecycle(self):
+        from services.cvm_lifecycle import CvmLifecycleService
+
+        if self._cvm_lifecycle_service is None:
+            self._cvm_lifecycle_service = CvmLifecycleService(
+                self.redis_service,
+                self.attestation_service.whitelist_source,
+                settings.get_bittensor_wallet().get_hotkey(),
+            )
+        return self._cvm_lifecycle_service
 
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
@@ -210,6 +224,25 @@ class MinerService:
         """
         pubkey = self._normalize_public_key(public_key)
         return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce)).hex()}"
+
+    @staticmethod
+    def _miner_holds_a_rental(
+        payload: MinerJobRequestPayload, rented_data: RentedExecutorsResponse | None
+    ) -> bool:
+        """Does this miner currently hold a rented executor? (DAH-2581)
+
+        Decides which re-attestation cadence applies. Per miner rather than per executor
+        because the nonce is minted once per miner and fans out to all of its executors — so a
+        miner with one rented node and ten idle ones gets the rental cadence for all of them.
+        That is the safe direction: it over-attests idle nodes rather than under-attesting a
+        rented one.
+        """
+        if rented_data is None:
+            return False
+        return any(
+            executor.miner_hotkey == payload.miner_hotkey and executor.pods
+            for executor in rented_data.executors.values()
+        )
 
     async def request_job_to_miner(
         self,
@@ -272,7 +305,8 @@ class MinerService:
                 # must echo in TDX report_data[32:64] / GPU evidence. The nonce is
                 # covered by validator_signature so it cannot be stripped or swapped.
                 attestation_nonce = await self.attestation_service.maybe_issue_nonce(
-                    payload.miner_hotkey
+                    payload.miner_hotkey,
+                    rented=self._miner_holds_a_rental(payload, rented_data),
                 )
                 nonce_hex = attestation_nonce.value_hex if attestation_nonce else None
 
@@ -367,6 +401,11 @@ class MinerService:
                     results = self._filter_task_results(msg.executors, raw_results, default_extra)
                     results.extend(
                         self._build_manual_rental_results(payload, rented_data, existing=results)
+                    )
+                    # DAH-2629/2630: record this cycle's cvmd hosts, grace the ones inside a
+                    # budgeted switch window, and bring empty ones back up.
+                    results.extend(
+                        await self._record_and_grace_cvm_hosts(payload, existing=results)
                     )
 
                     logger.info(
@@ -681,6 +720,176 @@ class MinerService:
 
         return results
 
+    async def _record_and_grace_cvm_hosts(
+        self,
+        payload: MinerJobRequestPayload,
+        existing: list[JobResult],
+    ) -> list[JobResult]:
+        """Record this cycle's attested cvmd hosts, then account for the ones that are
+        switching or empty (DAH-2629 + DAH-2630).
+
+        Runs after the real results, exactly like the manual-rental synthesis: a node that
+        answered normally is already scored and is skipped. Everything here is best-effort
+        against a validation cycle — a Redis or cvmd hiccup logs and contributes nothing,
+        it never fails the batch.
+        """
+        from services.cvm_lifecycle import (
+            CVM_SWITCH_BUDGET_EXCEEDED_EVENT,
+            CVM_SWITCH_GRACE_EVENT,
+            CVM_SWITCH_GRACE_OBSERVED_EVENT,
+        )
+
+        # getattr, not attribute access: results in this pipeline are duck-typed (tests and
+        # synthesized paths pass reduced shapes), and a missing field must read as "not
+        # attested", never as a failed batch.
+        attested = [
+            result
+            for result in existing
+            if getattr(result, "tdx_attestation_passed", False)
+            and getattr(result, "executor_info", None) is not None
+            and getattr(result.executor_info, "address", None)
+        ]
+        # Nothing to record and nothing to sweep: don't even build the lifecycle service.
+        # This is the common case on a fleet without CVM hosts, and it keeps the wallet
+        # read out of every cycle that has no use for it.
+        if not attested and not settings.ENABLE_CVM_LIFECYCLE:
+            return []
+
+        try:
+            lifecycle = self._cvm_lifecycle()
+        except Exception as exc:
+            logger.warning(_m(
+                "CVM lifecycle unavailable; skipping the sweep",
+                extra=get_extra_info({"miner_hotkey": payload.miner_hotkey, "error": str(exc)}),
+            ))
+            return []
+
+        # The registry feed: every executor that attested this cycle is a cvmd host, and its
+        # address/shape are fresh right now — which is the only time they are.
+        for result in attested:
+            await lifecycle.record_host(
+                executor_uuid=str(result.executor_info.uuid),
+                address=result.executor_info.address,
+                miner_hotkey=payload.miner_hotkey,
+                gpu_model=getattr(result, "gpu_model", None),
+                gpu_count=getattr(result, "gpu_count", 0) or 0,
+            )
+
+        if not settings.ENABLE_CVM_LIFECYCLE:
+            return []
+
+        already_scored = {
+            str(result.executor_info.uuid)
+            for result in existing
+            if getattr(result, "executor_info", None) is not None
+        }
+        graces: list[JobResult] = []
+        hosts = await lifecycle.hosts_for_miner(payload.miner_hotkey)
+        for host in hosts:
+            if host.executor_uuid in already_scored:
+                continue
+
+            extra = get_extra_info({
+                "job_batch_id": payload.job_batch_id,
+                "miner_hotkey": payload.miner_hotkey,
+                "executor_uuid": host.executor_uuid,
+                "gpu_model": host.gpu_model,
+            })
+
+            assessment = await lifecycle.assess(host)
+            if not assessment.reachable:
+                # An unreachable daemon says nothing about switching; the node scores as it
+                # would have anyway.
+                continue
+
+            if assessment.idle_without_cvm:
+                # DAH-2629: no CVM at all — bring the validation CVM up. Fire-and-forget:
+                # a boot takes minutes and must not extend this cycle. This cycle the node
+                # still scores nothing, which is exactly the "launch failure is a scoring
+                # signal" semantics until the launch lands.
+                lifecycle.schedule_ensure(host)
+                continue
+
+            if not assessment.switching:
+                continue
+
+            budget = settings.get_cvm_switch_budget_seconds(host.gpu_model)
+            elapsed = assessment.elapsed_seconds
+            if elapsed is None:
+                logger.warning(_m(
+                    f"{CVM_SWITCH_BUDGET_EXCEEDED_EVENT} — switching with no readable start time",
+                    extra=extra,
+                ))
+                continue
+            if elapsed > budget:
+                # The real signal FR-I3 wants: a switch that is taking too long is flagged,
+                # never silently extended. No grace — the node scores zero this cycle.
+                logger.warning(_m(
+                    CVM_SWITCH_BUDGET_EXCEEDED_EVENT,
+                    extra={**extra, "elapsed_seconds": round(elapsed, 1), "budget_seconds": budget},
+                ))
+                continue
+
+            if host.gpu_model not in BASE_GPU_MAP:
+                # Same guard as the manual-rental synthesis, same reason: an unknown model
+                # reaching the incentive layer aborts weight-setting for the whole subnet.
+                logger.warning(_m(
+                    "Switching node's GPU model is not in BASE_GPU_MAP; skipping its grace",
+                    extra=extra,
+                ))
+                continue
+
+            if not settings.ENABLE_SWITCHING_GRACE:
+                logger.info(_m(
+                    CVM_SWITCH_GRACE_OBSERVED_EVENT,
+                    extra={**extra, "elapsed_seconds": round(elapsed, 1), "budget_seconds": budget},
+                ))
+                continue
+
+            log_text = _m(
+                CVM_SWITCH_GRACE_EVENT,
+                extra={**extra, "elapsed_seconds": round(elapsed, 1), "budget_seconds": budget},
+            ).to_full_string()
+            logger.info(log_text)
+            graces.append(
+                JobResult(
+                    # spec=None on purpose: the backend skips its executor upsert on a null
+                    # spec, so a graced cycle cannot flip the stored row.
+                    spec=None,
+                    executor_info=ExecutorSSHInfo(
+                        uuid=host.executor_uuid,
+                        address=host.address,
+                        port=0,
+                        ssh_username="",
+                        ssh_port=0,
+                        python_path="",
+                        root_dir="",
+                    ),
+                    score=1.0,
+                    job_score=1.0,
+                    job_batch_id=payload.job_batch_id,
+                    log_status="success",
+                    log_text=log_text,
+                    gpu_model=host.gpu_model,
+                    gpu_count=host.gpu_count,
+                    # Not measurable mid-switch; a false reading would silently cut the score.
+                    sysbox_runtime=True,
+                    tdx_attestation_passed=True,
+                )
+            )
+
+        if graces:
+            logger.info(_m(
+                "Grace results for switching CVM nodes",
+                extra=get_extra_info({
+                    "job_batch_id": payload.job_batch_id,
+                    "miner_hotkey": payload.miner_hotkey,
+                    "executors": len(graces),
+                    "executor_uuids": [str(g.executor_info.uuid) for g in graces],
+                }),
+            ))
+        return graces
+
     def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
         executor_info = ExecutorSSHInfo(
             # Special uuid for failed miners
@@ -854,8 +1063,69 @@ class MinerService:
                 error_code=error_code,
             )
 
+    async def _refuse_if_cvm_node(self, payload: ContainerBaseRequest):
+        """Refuse a container rental on a node whose renter workload is a CVM (DAH-2580).
+
+        A CVM node's customer workload runs inside a confidential guest launched through cvmd,
+        not in a docker container this validator creates over SSH. Serving both paths would not
+        just be redundant — creating the container means opening an SSH session and a docker
+        API call against the very node the customer has been told we never enter, and it would
+        do so *while* their CVM is running on it.
+
+        So the two paths are made exclusive here, at the one place every container request goes
+        through, rather than left to whoever builds the request to remember.
+
+        The test is the minimal-G5 ratchet: has this executor ever presented a valid TDX quote?
+        It is deliberately one-way. An executor that has attested once and now claims not to be
+        a CVM is either lying or broken, and both answers are "do not open a shell on it".
+
+        Redis being unavailable returns None — unknown, not "no". The caller decides, and it
+        decides to continue: a Redis outage must not stop every ordinary rental in the fleet.
+        Nothing about a CVM node's confidentiality depends on this check alone; the CVM itself
+        is what the customer verifies.
+        """
+        if not isinstance(payload, ContainerCreateRequest):
+            return None
+        if self.redis_service is None:
+            return None
+        try:
+            is_cvm = await self.redis_service.is_elem_exists_in_set(
+                TDX_ATTESTED_EXECUTOR_SET, str(payload.executor_id)
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Could not check whether this executor is a CVM node; continuing",
+                    extra=get_extra_info({
+                        "executor_id": str(payload.executor_id),
+                        "error": str(exc),
+                    }),
+                )
+            )
+            return None
+        if not is_cvm:
+            return None
+
+        return self._handle_container_error(
+            payload,
+            _m(
+                "Refusing a container rental on a CVM node",
+                extra=get_extra_info({
+                    "miner_hotkey": payload.miner_hotkey,
+                    "executor_id": str(payload.executor_id),
+                    "pod_id": payload.pod_id,
+                    "reason": "cvm_node_not_container_rentable",
+                }),
+            ),
+            FailedContainerErrorCodes.CvmNodeNotContainerRentable,
+        )
+
     async def handle_container(self, payload: ContainerBaseRequest):
         """Handle container request - uses REST API if configured, otherwise WebSocket."""
+        refusal = await self._refuse_if_cvm_node(payload)
+        if refusal is not None:
+            return refusal
+
         if settings.USE_REST_API:
             logger.info(
                 _m(
@@ -1844,7 +2114,8 @@ class MinerService:
 
             # G3 — attestation event (REST path); see the WebSocket path for details.
             attestation_nonce = await self.attestation_service.maybe_issue_nonce(
-                payload.miner_hotkey
+                payload.miner_hotkey,
+                rented=self._miner_holds_a_rental(payload, rented_data),
             )
             nonce_hex = attestation_nonce.value_hex if attestation_nonce else None
 
@@ -1925,6 +2196,10 @@ class MinerService:
                 results = self._filter_task_results(msg.executors, raw_results, default_extra)
                 results.extend(
                     self._build_manual_rental_results(payload, rented_data, existing=results)
+                )
+                # DAH-2629/2630 — same accounting as the WebSocket path.
+                results.extend(
+                    await self._record_and_grace_cvm_hosts(payload, existing=results)
                 )
 
                 logger.info(

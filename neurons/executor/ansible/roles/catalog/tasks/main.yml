@@ -1,0 +1,141 @@
+---
+# catalog — stage the signed artifact manifest this host starts from (DAH-2578).
+#
+# The role does ONE thing: put a manifest the platform signed at
+# `cvmd_catalog_seed_path`, having proved cvmd will accept it. It is not the
+# source of truth and does not try to be — cvmd re-fetches from the backend on
+# a timer and replaces its own working copy. The seed exists so a host can
+# launch before it has ever reached the backend, and so an air-gapped host can
+# launch at all.
+#
+# Still loud in both directions, as the DAH-2544 stub established: unset, one
+# line saying so; set, a staged and verified file or a failed run.
+
+- name: Report that no catalog manifest was given
+  ansible.builtin.debug:
+    msg: >-
+      No catalog seed staged — neither lium_catalog_manifest_url nor
+      lium_catalog_manifest_src is set. cvmd will run on whatever manifest it
+      already holds, or refuse every launch if it holds none.
+  when:
+    - lium_catalog_manifest_url | length == 0
+    - lium_catalog_manifest_src | length == 0
+
+- name: End the role while no manifest is named
+  ansible.builtin.meta: end_role
+  when:
+    - lium_catalog_manifest_url | length == 0
+    - lium_catalog_manifest_src | length == 0
+
+# Without a signer there is nothing to check a signature against, so a staged
+# manifest would be a file of unknown authorship deciding what this node runs.
+# cvmd refuses it at launch time; refusing here names the variable.
+- name: Require the signer that makes a manifest evidence
+  ansible.builtin.assert:
+    that:
+      - lium_catalog_signer | length > 0
+    fail_msg: >-
+      A catalog manifest was named, but lium_catalog_signer is unset. The
+      manifest decides what this host will run and its signature is the only
+      thing that makes it trustworthy — cvmd verifies against the CONFIGURED
+      ss58, never against the one the document carries, so with no signer set
+      there is nothing to verify against and every manifest is refused.
+    quiet: true
+
+- name: Only one source of the seed
+  ansible.builtin.assert:
+    that:
+      - not (lium_catalog_manifest_url | length > 0 and lium_catalog_manifest_src | length > 0)
+    fail_msg: >-
+      lium_catalog_manifest_url and lium_catalog_manifest_src are both set, so
+      which one seeds this host would depend on task order. Set exactly one.
+    quiet: true
+
+- name: Ensure the config directory exists
+  ansible.builtin.file:
+    path: "{{ cvmd_config_dir }}"
+    state: directory
+    owner: "{{ cvmd_file_owner }}"
+    group: "{{ cvmd_file_group }}"
+    mode: "0750"
+
+# Validated by cvmd's OWN verifier, not by a JSON parse — the same pattern the
+# cvmd role uses for its config and its clients file. `parse_manifest` is what
+# refuses at launch time: it checks the schema, the signature against this
+# host's configured signer, the timestamps and the floors. Running it against
+# the candidate makes a manifest that cvmd would reject impossible to stage.
+#
+# require_fresh=False on purpose. An expired seed is reported below rather than
+# failing the run: expiry is a runtime property that changes with the clock, and
+# a converge that fails because the manifest aged out overnight would make every
+# host's day-zero depend on how recently someone re-minted a file.
+- name: Fetch the signed manifest
+  ansible.builtin.get_url:
+    url: "{{ lium_catalog_manifest_url }}"
+    dest: "{{ cvmd_catalog_seed_path }}"
+    checksum: "{{ ('sha256:' ~ lium_catalog_manifest_sha256) if lium_catalog_manifest_sha256 | length > 0 else omit }}"
+    owner: "{{ cvmd_file_owner }}"
+    group: "{{ cvmd_file_group }}"
+    mode: "0640"
+    validate_certs: true
+  when: lium_catalog_manifest_url | length > 0
+  notify: Restart cvmd for the staged catalog
+
+- name: Copy the signed manifest from the controller
+  ansible.builtin.copy:
+    src: "{{ lium_catalog_manifest_src }}"
+    dest: "{{ cvmd_catalog_seed_path }}"
+    owner: "{{ cvmd_file_owner }}"
+    group: "{{ cvmd_file_group }}"
+    mode: "0640"
+  when: lium_catalog_manifest_src | length > 0
+  notify: Restart cvmd for the staged catalog
+
+# Run against the staged file rather than as a `validate:` on the two tasks
+# above. get_url's validate runs before the checksum is compared, and having one
+# check that reads the final file — whichever task wrote it — is worth more than
+# having the failure arrive a fraction of a second earlier.
+- name: Read what the staged manifest actually says
+  ansible.builtin.command:
+    argv:
+      - "{{ cvmd_python }}"
+      - -c
+      - |
+        import json, pathlib, sys
+        from cvmd.catalog import parse_manifest
+        manifest = parse_manifest(
+            pathlib.Path(sys.argv[1]).read_bytes(), signer=sys.argv[2], require_fresh=False
+        )
+        print(json.dumps({
+            "serial": manifest.serial,
+            "expires_at": manifest.expires_at.isoformat(),
+            "expired": manifest.is_expired(),
+            "artifacts": [entry.id for entry in manifest.entries],
+            "floors": manifest.floors,
+        }))
+      - "{{ cvmd_catalog_seed_path }}"
+      - "{{ lium_catalog_signer }}"
+  register: catalog_staged
+  changed_when: false
+
+- name: Report the staged manifest
+  ansible.builtin.debug:
+    msg: >-
+      Catalog seed staged at {{ cvmd_catalog_seed_path }}: serial
+      {{ (catalog_staged.stdout | from_json).serial }},
+      {{ (catalog_staged.stdout | from_json).artifacts | length }} artifact(s)
+      ({{ (catalog_staged.stdout | from_json).artifacts | join(', ') }}), floors
+      {{ (catalog_staged.stdout | from_json).floors | to_json }}, expires
+      {{ (catalog_staged.stdout | from_json).expires_at }}.
+
+# Not a failure. cvmd will refuse to launch from it and say so, and a host whose
+# manifest URL works will replace it within one refresh interval. Saying it here
+# is what stops that being diagnosed twice.
+- name: Warn when the staged manifest has already expired
+  ansible.builtin.debug:
+    msg: >-
+      The staged manifest EXPIRED at
+      {{ (catalog_staged.stdout | from_json).expires_at }}. cvmd will refuse
+      every launch until it fetches a current one from
+      {{ lium_catalog_manifest_url | default('(no manifest URL is configured)', true) }}.
+  when: (catalog_staged.stdout | from_json).expired

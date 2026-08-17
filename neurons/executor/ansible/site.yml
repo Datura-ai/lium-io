@@ -1,0 +1,166 @@
+---
+# Day-zero CVM host provisioning. Run through bootstrap.sh, not directly.
+#
+# TWO INDEPENDENT TAG DIMENSIONS, doing two different jobs:
+#
+#   converge vs verify  — audit or act. Under `--tags verify` only `common`
+#                         (always) and `verify` run. Deliberately NOT preflight:
+#                         with `always` it would hard-fail by design on a host
+#                         missing a BIOS knob and abort the play before `verify`
+#                         emitted its report, killing the audit mode itself.
+#
+#   destructive         — what maintenance withholds. Only kernel, gpu and qemu
+#                         carry it: the three roles that can change a
+#                         measurement or reset a GPU. The maintenance profile is
+#                         `--skip-tags destructive`, so preflight, docker, repo,
+#                         sgx_key_provider, cvmd, catalog and verify all still
+#                         converge on a host that already has a CVM. cvmd in
+#                         particular MUST stay non-destructive: it restarts one
+#                         userspace daemon, and a host with a live CVM is
+#                         exactly where its control plane needs updating.
+#
+# EVERY TAG SET BELOW IS DECLARED AT PLAY LEVEL, NEVER ON THE ROLE ENTRY.
+# Play-level tags are inherited by that play's pre_tasks; role-entry tags are
+# not. Declared on the role entry, `--skip-tags destructive` would skip the role
+# but still run the guard pre_tasks — so every maintenance run on every host
+# that has ever created a CVM would abort on the guard it was supposed to be
+# routing around. It fails safe and loud, but it fails on 100% of maintenance
+# runs, and nothing before the hardware acceptance run would catch it.
+#
+# Ordering: kernel before gpu (GPUs must be vfio-pci bound, which the GRUB
+# vfio-pci.ids= provides after the reboot); qemu after docker (a 10-40 minute
+# build should not precede anything cheap that can fail).
+#
+# `gather_facts: false` on every play but two. This tree reads exactly two
+# ansible facts — ansible_date_time in kernel/tasks/arm_resume.yml, and
+# date_time plus hostname in the verify report — and everything else it needs
+# comes from the `lium` bundle, collected by a script. The default `implicit`
+# gathering ran a full `setup` ten times per run, enumerating every PCI device,
+# interface and mount on an 8-GPU host, to supply two values. Those two plays
+# still gather, deliberately: `gathering = smart` in ansible.cfg would have
+# collapsed the ten to one, but it also freezes date_time at the first play, so
+# a report written after a 40-minute QEMU build would be stamped with the time
+# the run started.
+
+- name: Collect host facts and derive the guard state
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [always]
+  roles:
+    - common
+
+- name: Preflight hard gates
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [preflight, converge]
+  roles:
+    - preflight
+
+- name: Kernel command line, vfio modules and GRUB
+  hosts: localhost
+  become: true
+  tags: [kernel, converge, destructive]
+  pre_tasks:
+    - name: Guard against converging over an existing CVM
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: assert_no_cvm
+      vars:
+        common_guard_reason: GRUB change requiring reboot
+        common_guard_override_var: lium_force_reboot
+  roles:
+    - kernel
+
+- name: GPU confidential-compute mode and vfio binding
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [gpu, converge, destructive]
+  pre_tasks:
+    - name: Guard against converging over an existing CVM
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: assert_no_cvm
+      vars:
+        common_guard_reason: GPU CC-mode flip resets every GPU
+        common_guard_override_var: lium_force_gpu_cc
+  roles:
+    - gpu
+
+- name: Docker engine
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [docker, converge]
+  roles:
+    - docker
+
+- name: QEMU — the dstack 9.2.1 build
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [qemu, converge, destructive]
+  pre_tasks:
+    - name: Guard against converging over an existing CVM
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: assert_no_cvm
+      vars:
+        common_guard_reason: replacing QEMU changes RTMR0 and invalidates any existing hda.img
+        common_guard_override_var: lium_force_qemu_rebuild
+  roles:
+    - qemu
+
+- name: Repo — lium-io checkout and CVM OS image
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [repo, converge]
+  roles:
+    - repo
+
+- name: SGX DCAP stack, quote plumbing and the sealing-key provider
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [sgx, converge]
+  roles:
+    - sgx_key_provider
+
+# One play, and `catalog` second, deliberately. The seed manifest is cvmd
+# configuration: it is written into cvmd's config directory, validated by cvmd's
+# own verifier through cvmd's venv, and a change to it has to restart cvmd. Two
+# plays would put the paths, the interpreter and the `Restart cvmd` handler out
+# of scope for the role that needs all three — handlers do not cross a play
+# boundary — so the seed would be staged and never read until the next reboot.
+- name: The cvmd control daemon and the artifact catalog it starts from
+  hosts: localhost
+  gather_facts: false
+  become: true
+  tags: [cvmd, catalog, converge]
+  roles:
+    - cvmd
+    - catalog
+
+# `common` runs AGAIN here, and that is the point.
+#
+# `lium` is a set_fact taken once in the first play, before any role ran. Every
+# converge role then changes the very things the report describes — docker
+# installed, QEMU built, the checkout cloned, CC mode flipped, the key provider
+# up. Rendering the report from the opening snapshot means the run that does the
+# work reports it as undone: ~8 MUST_FIX checks and a non-zero exit on a host
+# that just converged correctly, with a third run needed before it ever reads
+# green.
+#
+# Re-collecting is also what makes the report honest as a standalone audit:
+# `--tags verify` describes the host now, not whenever facts were last taken.
+# The cost is one extra fact collection and guard sweep per run.
+- name: Verify — emit the machine-readable report
+  hosts: localhost
+  become: true
+  tags: [verify]
+  roles:
+    - common
+    - verify

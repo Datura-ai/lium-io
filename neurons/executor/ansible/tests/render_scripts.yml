@@ -1,0 +1,61 @@
+---
+# Render every templated shell script so shellcheck can see it.
+#
+# A `*.sh.j2` is the one shell file nobody can check as committed — Jinja
+# delimiters are not valid shell. And build-qemu.sh.j2 is exactly where the
+# HOME trap lives, so leaving it unchecked would leave the highest-value script
+# in this tree the only unchecked one.
+#
+# The CI step shellchecks /tmp/lium-rendered/*.sh alongside the plain scripts.
+
+- name: Render templated shell scripts for shellcheck
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    render_dir: /tmp/lium-rendered
+
+  tasks:
+    - name: Start from an empty render directory
+      ansible.builtin.file:
+        path: "{{ render_dir }}"
+        state: absent
+
+    - name: Create the render directory
+      ansible.builtin.file:
+        path: "{{ render_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Find every templated shell script
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/../roles"
+        patterns: "*.sh.j2"
+        recurse: true
+      register: shell_templates
+
+    # If this ever finds nothing, the shellcheck step downstream would pass
+    # while checking nothing at all.
+    - name: At least one templated shell script must exist
+      ansible.builtin.assert:
+        that:
+          - shell_templates.files | length > 0
+        fail_msg: >-
+          No *.sh.j2 templates found under roles/. Either they moved, or the
+          rendering step is silently checking nothing.
+        quiet: true
+
+    - name: Render each one
+      ansible.builtin.template:
+        src: "{{ item.path }}"
+        dest: "{{ render_dir }}/{{ item.path | basename | regex_replace('\\.j2$', '') }}"
+        mode: "0755"
+      loop: "{{ shell_templates.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Report what was rendered
+      ansible.builtin.debug:
+        msg: >-
+          Rendered {{ shell_templates.files | length }} shell template(s) into
+          {{ render_dir }} for shellcheck.

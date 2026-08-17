@@ -1,0 +1,121 @@
+---
+# Every external command, asserted against a golden string.
+#
+# This exists because `--check --diff` CANNOT do it: check mode skips command and
+# shell tasks entirely, so Ansible never sees what they would have run. Naming
+# each command as a variable and asserting the variable is the only mechanism
+# that actually pins the text.
+#
+# No roles are run here and nothing is overridden, so the values asserted are
+# exactly the ones a real host would use.
+
+- name: Command variable goldens
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_gpu_bdf: "0000:19:00.0"
+
+    lium_expected_commands:
+      lium_gpu_cc_query_cmd: >-
+        python3 /opt/nvtrust/host_tools/python/nvidia_gpu_tools.py
+        --gpu-bdf=0000:19:00.0 --query-cc-mode
+
+      lium_gpu_ppcie_off_cmd: >-
+        python3 /opt/nvtrust/host_tools/python/nvidia_gpu_tools.py
+        --gpu-bdf=0000:19:00.0 --set-ppcie-mode=off --reset-after-ppcie-mode-switch
+
+      lium_gpu_cc_on_cmd: >-
+        python3 /opt/nvtrust/host_tools/python/nvidia_gpu_tools.py
+        --gpu-bdf=0000:19:00.0 --set-cc-mode=on --reset-after-cc-mode-switch
+
+      lium_gpu_rebind_cmd: >-
+        printf '%s' vfio-pci > /sys/bus/pci/devices/0000:19:00.0/driver_override
+        && printf '%s' 0000:19:00.0 > /sys/bus/pci/drivers_probe
+
+      lium_gpu_rescan_cmd: >-
+        printf '%s' 1 > /sys/bus/pci/devices/0000:19:00.0/remove && sleep 2
+        && printf '%s' 1 > /sys/bus/pci/rescan && sleep 3
+
+      lium_qemu_configure_cmd: >-
+        ../configure --prefix=/opt/qemu-dstack --target-list=x86_64-softmmu
+        --disable-werror --enable-kvm --enable-slirp
+
+      lium_qemu_systemd_run_cmd: >-
+        systemd-run --unit=qemu-dstack-build --collect --setenv=HOME=/root
+        /usr/local/lib/lium-cvm/build-qemu.sh
+
+      # --on-active, not a bare reboot: the timer lets the task return and the
+      # log flush instead of the shutdown SIGTERMing Ansible mid-task.
+      lium_reboot_cmd: >-
+        systemd-run --unit=lium-converge-reboot --collect --on-active=5
+        /sbin/reboot
+
+      lium_pckid_tool_cmd: >-
+        /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool
+        -f /var/lib/lium-cvm/pckid.csv
+
+      lium_update_grub_cmd: update-grub
+
+      lium_os_image_download_cmd: ./lium-cvm.sh download
+
+  tasks:
+    - name: Every command matches its golden string
+      ansible.builtin.assert:
+        that:
+          - lookup('vars', item.key) == item.value
+        fail_msg: |
+          {{ item.key }} does not match its golden value.
+            expected: {{ item.value }}
+            actual  : {{ lookup('vars', item.key) }}
+        quiet: true
+      loop: "{{ lium_expected_commands | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # Separate commands, never `modprobe vfio_iommu_type1 vfio-pci`. In the
+    # two-argument form the second argument is read as a module PARAMETER and
+    # the kernel silently logs "unknown parameter 'vfio-pci' ignored".
+    - name: The vfio modules are loaded as separate commands
+      ansible.builtin.assert:
+        that:
+          - lium_modprobe_cmds == ['modprobe vfio_pci', 'modprobe vfio_iommu_type1']
+        fail_msg: >-
+          lium_modprobe_cmds must be two separate modprobe commands, not one
+          command with two module arguments. Got: {{ lium_modprobe_cmds }}
+        quiet: true
+
+    # The three positives that carry the most field evidence, asserted
+    # individually so a failure names the specific trap it re-opens.
+    - name: The systemd-run line carries HOME
+      ansible.builtin.assert:
+        that:
+          - "'--setenv=HOME=' in lium_qemu_systemd_run_cmd"
+        fail_msg: >-
+          systemd-run starts with HOME UNSET. Without --setenv=HOME= the build
+          script's `set -u` dies at line 3 while the unit goes inactive within
+          seconds and looks finished with nothing built.
+        quiet: true
+
+    - name: The CC-mode query names a specific device
+      ansible.builtin.assert:
+        that:
+          - "'--gpu-bdf=' in lium_gpu_cc_query_cmd"
+        fail_msg: >-
+          A bare --query-cc-mode only LISTS devices and reports nothing about the
+          one you asked about.
+        quiet: true
+
+    - name: The QEMU build is the plain variant
+      ansible.builtin.assert:
+        that:
+          - "'DUMP_ACPI_TABLES' not in lium_qemu_configure_cmd"
+        fail_msg: >-
+          The DUMP_ACPI_TABLES variant is the verifier's ORACLE binary and cannot
+          run VMs. Building it produces a QEMU that looks installed and fails
+          every launch.
+        quiet: true
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: >-
+          PASS {{ lium_expected_commands | length + 4 }} command assertions.

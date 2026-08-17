@@ -1,0 +1,160 @@
+---
+# Merge-gate box 3.
+#
+# Four fixture shapes, each driven end to end through the write-side seams:
+#   render -> union -> write drop-in -> regenerate -> grub.cfg assertion -> drift
+#
+# `update-grub` is replaced by tests/fake-update-grub.sh, which reproduces
+# 10_linux's emission order (LINUX first, DEFAULT last) — the one behaviour the
+# whole append-only safety argument rests on.
+
+- name: GRUB fixtures
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Both gates. The job-level env supplies ANSIBLE_LIUM_TEST=1; this supplies
+    # the other half. A test that sets only one fails closed, which is correct
+    # but confusing if you have not read tests/README.md.
+    lium_test_mode: true
+    grub_root: /tmp/lium-grub-fixture
+    lium_state_dir: /tmp/lium-grub-fixture/state
+    lium_log_dir: /tmp/lium-grub-fixture/log
+    lium_hda_search_roots: ["/tmp/lium-grub-fixture/no-such-root"]
+    lium_repo_path: /tmp/lium-grub-fixture/no-such-repo
+    lium_lspci_output: "{{ playbook_dir }}/fixtures/lspci/h200_8gpu_4nvswitch.txt"
+    lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    # No sweep: this case declares its own search surface.
+    lium_mounts_path: /dev/null
+
+    # The play-level `common` role collects facts BEFORE any case runs, and each
+    # case overrides these per fixture. Left unset they default to /etc/default/grub
+    # — so `common` would read the REAL host's bootloader configuration and feed it
+    # into lium.grub_existing_vfio_ids, which the kernel role unions into a
+    # REFUSAL. On a GitHub runner that is harmless; on the machines most likely to
+    # run this suite by hand — TDX hosts with GPU passthrough — it fails the run
+    # pointing at a bug that is not there. Pinned at a path that does not exist so
+    # the fixture cases are the only source of GRUB state.
+    lium_grub_default_path: "{{ grub_root }}/host-grub-must-not-be-read/grub"
+    lium_grub_dropin_path: "{{ grub_root }}/host-grub-must-not-be-read/grub.d/99-lium-cvm.cfg"
+    lium_grubcfg_path: "{{ grub_root }}/host-grub-must-not-be-read/grub.cfg"
+
+    grub_cases:
+      - name: default_only
+        proc: cmdline_complete
+        must_survive: ["quiet", "splash"]
+        expect_drift: ["vfio-pci.ids"]
+        expect_conflicting: []
+        expect_only_in_linux: false
+
+      # The au2 shape. A naive edit of the wrong variable silently drops
+      # kvm_intel.tdx and the host comes back looking healthy.
+      - name: linux_only
+        proc: cmdline_missing_tdx
+        must_survive: ["kvm_intel.tdx=on"]
+        expect_drift: ["kvm_intel.tdx=on"]
+        expect_conflicting: []
+        expect_only_in_linux: true
+
+      - name: split
+        proc: cmdline_complete
+        must_survive: ["quiet", "kvm_intel.tdx=on"]
+        expect_drift: ["vfio-pci.ids"]
+        expect_conflicting: []
+        expect_only_in_linux: true
+
+      # A stale dma_entry_limit=65535 AND a narrower pre-existing vfio-pci.ids.
+      # Set membership would call both a pass.
+      - name: conflicting
+        proc: cmdline_narrower_vfio_ids
+        must_survive: ["kvm_intel.tdx=on"]
+        expect_drift: ["vfio-pci.ids"]
+        expect_conflicting: ["vfio_iommu_type1.dma_entry_limit", "vfio-pci.ids"]
+        expect_only_in_linux: true
+
+  pre_tasks:
+    # Cleared ONCE, here. Each fixture then gets its own untouched subdirectory
+    # rather than deleting and recreating one shared path between cases — that
+    # churn produced an intermittent "destination directory does not exist" at
+    # roughly one run in three, which on a merge gate is worse than a failure
+    # because it teaches people to re-run until green. It also leaves a failing
+    # case's tree behind for inspection.
+    - name: Clear the fixture root once
+      ansible.builtin.file:
+        path: "{{ grub_root }}"
+        state: absent
+
+    - name: Provide an empty proc root so no real QEMU can confuse the guard
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/fixtures/emptyproc"
+        state: directory
+        mode: "0755"
+
+    # Structural, and checkable on any machine — including the ones whose own
+    # bootloader configuration is empty, where simply running the suite would
+    # never reveal that the pin had been dropped.
+    - name: No GRUB path may point outside the fixture root
+      ansible.builtin.assert:
+        that:
+          - lium_grub_default_path is match(grub_root)
+          - lium_grub_dropin_path is match(grub_root)
+          - lium_grubcfg_path is match(grub_root)
+        fail_msg: >-
+          A GRUB path escapes {{ grub_root }}, so the play-level `common` role
+          reads this machine's real bootloader configuration and feeds it into
+          the kernel role's narrowing check. On a host that genuinely passes
+          GPUs through, that fails the suite over a healthy configuration.
+        quiet: true
+
+  roles:
+    - common
+
+  tasks:
+    - name: Run each GRUB fixture
+      ansible.builtin.include_tasks: _grub_case.yml
+      loop: "{{ grub_cases }}"
+      loop_control:
+        loop_var: grub_case
+        label: "{{ grub_case.name }}"
+      vars:
+        grub_work: "{{ grub_root }}/{{ grub_case.name }}"
+
+    # The superset rule had NO coverage: every other fixture leaves the
+    # existing id set empty, so "Refuse to narrow vfio-pci.ids" was skipped in
+    # all of them. Both halves are exercised here — an id only GRUB knows about,
+    # and an id only /proc/cmdline knows about. The second is the one that
+    # motivated reading /proc/cmdline at all: a host booted with ids that were
+    # later cleaned out of the GRUB files.
+    - name: Run each narrowing case
+      ansible.builtin.include_tasks: _grub_narrowing_case.yml
+      loop:
+        - name: grub_has_extra_id
+          fixture: narrowing
+          proc: cmdline_complete
+          dropped: "10de:2330"
+        - name: proc_has_extra_id
+          fixture: narrowing_proc_only
+          proc: cmdline_booted_extra_vfio_id
+          dropped: "10de:233a"
+      loop_control:
+        loop_var: narrow_case
+        label: "{{ narrow_case.name }}"
+
+    # ...and the other direction, which is the one a real provider hits: an id
+    # the playbook does not manage must neither trigger a refusal nor get
+    # silently unbound.
+    - name: An unmanaged vfio-pci id must be carried, not refused over
+      ansible.builtin.include_tasks: _grub_unmanaged_case.yml
+
+    - name: An absent grub.cfg must be regenerated even when nothing changed
+      ansible.builtin.include_tasks: _grub_regenerate_case.yml
+
+    # Pre-mortem #1 variant B: update-grub succeeds but writes nothing.
+    - name: An unreadable grub.cfg must refuse, not reboot
+      ansible.builtin.include_tasks: _grub_noreconfig_case.yml
+
+    - name: All GRUB fixtures passed
+      ansible.builtin.debug:
+        msg: >-
+          {{ grub_cases | length }} GRUB fixtures, 2 narrowing cases, the
+          unmanaged-id case, the regeneration case and the no-reconfigure case
+          passed.

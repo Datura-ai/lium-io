@@ -1,0 +1,178 @@
+---
+# Hard gates. No BIOS automation — this role asserts, names, and stops.
+#
+# Failures are COLLECTED and reported together, so a provider learns every knob
+# in one pass instead of one reboot at a time.
+#
+# Each check is its own task with a `when:` condition rather than a templated
+# boolean inside a data structure, because `when:` is evaluated as a real
+# condition. A templated `{{ expr }}` stored in a list renders to the STRING
+# "False", which is truthy, and the whole aggregate would silently pass.
+#
+# Every message names the exact knob and ends with a pointer to the manual
+# procedure. The failure message IS the support channel: providers run this
+# unattended, once, with no Lium access to their host.
+
+- name: Start with no preflight failures
+  ansible.builtin.set_fact:
+    lium_preflight_failed: []
+
+- name: Gate os.supported
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'os.supported',
+        'msg': 'Ubuntu 25.10 and 26.04 LTS only; found ' ~ (lium.os_version_id | default('unknown'))
+      }] }}
+  when: lium.os_version_id not in lium_os_matrix
+
+- name: Gate host.arch
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'host.arch',
+        'msg': 'Intel TDX hosts are x86_64; found ' ~ (lium.arch | default('unknown'))
+      }] }}
+  when: lium.arch != 'x86_64'
+
+- name: Gate host.sudo
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'host.sudo',
+        'msg': 'run as root or configure passwordless sudo'
+      }] }}
+  when: lookup('pipe', 'id -u') != '0'
+
+- name: Gate cpu.tdx_enabled
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'cpu.tdx_enabled',
+        'msg': 'BIOS: enable Intel TDX (and TME / TME-MT) in the CPU security menu;
+                kernel must be Canonical intel or mainline >= 6.16.
+                /sys/module/kvm_intel/parameters/tdx reported '
+               ~ (lium.tdx_param.value | default('unreadable'))
+      }] }}
+  when: (lium.tdx_param.value | default('N')) != 'Y'
+
+- name: Gate sgx.devices_present
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'sgx.devices_present',
+        'msg': 'BIOS: enable Intel SGX; set PRMRR size >= 64M; SGX Factory Reset may be required.
+                Expected both /dev/sgx_enclave and /dev/sgx_provision; found '
+               ~ (lium.sgx_devices.value | default(0)) ~ ' of 2'
+      }] }}
+  when: (lium.sgx_devices.value | default(0) | int) < 2
+
+- name: Gate iommu.vt_d
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'iommu.vt_d',
+        'msg': 'BIOS: enable VT-d / Intel Virtualization Technology for Directed I/O.
+                /sys/class/iommu/ is empty'
+      }] }}
+  when: not (lium.iommu_present.value | default(false) | bool)
+
+# Two distinct outcomes with two distinct messages. Conflating them would let a
+# missing TOOL masquerade as missing HARDWARE — and would let a CI grep pass for
+# entirely the wrong reason.
+- name: Gate gpu.cc_capable_present when the tool is missing
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'gpu.cc_capable_present',
+        'msg': 'cannot enumerate PCI devices: lspci not found (install pciutils)'
+      }] }}
+  when: not (lium.lspci_available.readable | default(false) | bool)
+
+- name: Gate gpu.cc_capable_present when no CC-capable device is present
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'gpu.cc_capable_present',
+        'msg': 'no CC-capable NVIDIA GPU found. Searched PCI ids: '
+               ~ (lium_cc_gpu_pci_ids | join(', ')) ~
+               '. If your GPU is CC-capable but not in that list it is not yet supported'
+      }] }}
+  when:
+    - lium.lspci_available.readable | default(false) | bool
+    - (lium.gpu_bdfs | default([]) | length) == 0
+
+- name: Gate boot.grub_present
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'boot.grub_present',
+        'msg': 'this host does not boot via GRUB (systemd-boot or a vendor bootloader).
+                Automated kernel command-line changes are not supported here. Add these
+                parameters to your bootloader by hand: kvm_intel.tdx=on intel_iommu=on
+                iommu=pt nohibernate vfio-pci.ids=<your GPU and NVSwitch ids>
+                vfio_iommu_type1.dma_entry_limit=16777216 -- then re-run with
+                --skip-tags kernel'
+      }] }}
+  when: >-
+    not (lium.boot_grub_present | default(false) | bool)
+    or not (lium.update_grub_present | default(false) | bool)
+
+- name: Gate disk.build_space
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'disk.build_space',
+        'msg': 'the QEMU build needs at least ' ~ lium_min_build_space_gb ~ ' GB free; found '
+               ~ (lium.build_space_gb.value | default('unknown')) ~ ' GB'
+      }] }}
+  when: (lium.build_space_gb.value | default(0) | int) < (lium_min_build_space_gb | int)
+
+- name: Gate disk.image_space
+  ansible.builtin.set_fact:
+    lium_preflight_failed: >-
+      {{ lium_preflight_failed + [{
+        'id': 'disk.image_space',
+        'msg': 'the CVM OS image and data disk need at least ' ~ lium_min_image_space_gb ~ ' GB free; found '
+               ~ (lium.image_space_gb.value | default('unknown')) ~ ' GB'
+      }] }}
+  when: (lium.image_space_gb.value | default(0) | int) < (lium_min_image_space_gb | int)
+
+- name: Report every failed preflight gate together
+  ansible.builtin.fail:
+    msg: |
+      This host is not ready. {{ lium_preflight_failed | length }} preflight gate(s) failed:
+      {% for failure in lium_preflight_failed %}
+
+        [{{ failure.id }}] {{ failure.msg | regex_replace('\s+', ' ') }}
+      {% endfor %}
+
+      Nothing has been changed. BIOS settings cannot be automated — fix the ones
+      named above and run this again. For the manual procedure, see
+      docs/host-setup.md section 1.
+  when:
+    - lium_preflight_failed | length > 0
+    - lium_preflight_fatal | bool
+
+# Maintenance mode. A host that lost a BIOS knob after a firmware update gets a
+# REPORT naming it, rather than an abort with no report at all.
+- name: Record the failed gates without aborting
+  ansible.builtin.debug:
+    msg: |
+      {{ lium_preflight_failed | length }} preflight gate(s) failed, and
+      lium_preflight_fatal is false, so the run continues and `verify` reports them:
+      {% for failure in lium_preflight_failed %}
+
+        [{{ failure.id }}] {{ failure.msg | regex_replace('\s+', ' ') }}
+      {% endfor %}
+
+      See docs/host-setup.md section 1.
+  when:
+    - lium_preflight_failed | length > 0
+    - not (lium_preflight_fatal | bool)
+
+- name: Confirm the host passed every gate
+  ansible.builtin.debug:
+    msg: >-
+      All preflight gates passed. The manual equivalent is docs/host-setup.md section 1.
+  when: lium_preflight_failed | length == 0

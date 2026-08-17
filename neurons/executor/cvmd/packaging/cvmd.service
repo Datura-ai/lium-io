@@ -1,0 +1,39 @@
+[Unit]
+Description=cvmd — CVM host control daemon
+Documentation=https://github.com/Datura-ai/lium-io/tree/main/neurons/executor/cvmd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cvmd/venv/bin/cvmd
+Environment=CVMD_CONFIG_PATH=/etc/cvmd/config.toml
+
+# /var/lib/cvmd — the state machine's state.json and the replay store live here. Losing this
+# directory resets the startup floor, so it is state, not cache.
+StateDirectory=cvmd
+
+# The CVM must outlive cvmd. A daemon upgrade that took the node's guest with it would be worse
+# than the outage it was fixing, which is why the supervisor detaches into its own session and
+# why RECONCILING exists at all.
+#
+# The default, control-group, kills EVERY process in the unit's cgroup on stop. A session is
+# not a cgroup, so detaching is not enough on its own: measured on au11, `systemctl restart
+# cvmd` logged
+#
+#     cvmd.service: Killing process 218807 (qemu-system-x86) with signal SIGKILL
+#
+# and the node came back FAILED with a CVM directory and no CVM. `process` stops the main
+# process only and leaves the supervisor — and the guest under it — running, for cvmd to adopt
+# on its next start.
+#
+# The consequence is deliberate: `systemctl stop cvmd` stops the control plane, not the CVM.
+# `systemctl kill cvmd` still reaches everything, which is the escape hatch for an operator who
+# means it.
+KillMode=process
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
