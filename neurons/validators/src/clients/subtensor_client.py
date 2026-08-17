@@ -340,6 +340,19 @@ class SubtensorClient:
 
             # Get miners that have opted in from portal BE
             miners_with_opt_in_status = await ValidatorPortalAPI.get_opted_in_miners()
+            if miners_with_opt_in_status is None:
+                logger.error(
+                    _m(
+                        "[fetch_miners] provider portal unavailable; keeping previous miner snapshot",
+                        extra=get_extra_info(
+                            {
+                                **self.default_extra,
+                                "previous_miner_count": len(self.miners),
+                            }
+                        ),
+                    ),
+                )
+                raise RuntimeError("provider portal unavailable")
 
             logger.info(
                 _m(
@@ -436,6 +449,32 @@ class SubtensorClient:
             )
             return
 
+        metagraph = self.get_metagraph()
+        available_miner_hotkeys = {miner.hotkey for miner in miners}
+        registered_hotkeys = {neuron.hotkey for neuron in metagraph.neurons}
+        missing_positive_score_hotkeys = sorted(
+            hotkey
+            for hotkey, score in miner_scores.items()
+            if score > 0
+            and hotkey in registered_hotkeys
+            and hotkey not in available_miner_hotkeys
+        )
+        if missing_positive_score_hotkeys:
+            logger.critical(
+                _m(
+                    "[set_weights] refusing to omit registered positive-score miners",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "missing_hotkeys": missing_positive_score_hotkeys,
+                        }
+                    ),
+                ),
+            )
+            raise RuntimeError(
+                "positive-score miners are missing from the current miner snapshot"
+            )
+
         # Build uids and weights arrays
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
@@ -462,7 +501,6 @@ class SubtensorClient:
         await self.redis_service.publish(NORMALIZED_SCORE_CHANNEL, message)
 
         # Process weights for blockchain
-        metagraph = self.get_metagraph()
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
             weights=weights,
