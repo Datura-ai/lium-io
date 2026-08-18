@@ -31,6 +31,28 @@ TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
 RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
+REPOSITORY_RETRY_DELAYS_SECONDS: tuple[float, ...] = (
+    2.0,
+    4.0,
+    8.0,
+    16.0,
+    30.0,
+    30.0,
+    30.0,
+    30.0,
+    30.0,
+)
+REPOSITORY_RETRY_POLL_SECONDS: float = 1.0
+RETRYABLE_REPOSITORY_ERROR_MARKERS: tuple[str, ...] = (
+    "access denied",
+    "request timeout",
+    "slow down",
+    "status code: 429",
+    "status code: 500",
+    "status code: 502",
+    "status code: 503",
+    "status code: 504",
+)
 ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
 ENCRYPTED_BOOTSTRAP_SCRIPT = r"""
 set -eu
@@ -192,38 +214,119 @@ class ResticStorageRunner:
         return result
 
     def _ensure_repository_for_backup(self) -> None:
-        probe = subprocess.run(
-            self._restic_command(["snapshots", "--json"]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
+        repository_probe = self._run_repository_command_with_retry(
+            ["snapshots", "--json"],
+            repository_command_name="probe",
+            accepted_exit_codes=(0, 10),
         )
-        if probe.returncode == 0:
+        if repository_probe.returncode == 0:
             return
-        if probe.returncode != 10:
-            detail = _redact(probe.stderr or probe.stdout, self._secret_values())
+        if repository_probe.returncode != 10:
+            failure_detail = self._redacted_repository_failure_detail(repository_probe)
             raise ResticOperationError(
-                f"restic repository probe failed with exit {probe.returncode}: {detail}"
+                "restic repository probe failed with exit "
+                f"{repository_probe.returncode}: {failure_detail}"
             )
 
-        initialized = subprocess.run(
-            self._restic_command(["init", "--json"]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
+        repository_initialization = self._run_repository_command_with_retry(
+            ["init", "--json"],
+            repository_command_name="initialization",
         )
-        if initialized.returncode == 0:
+        if repository_initialization.returncode == 0:
             return
 
-        retry_probe = subprocess.run(
-            self._restic_command(["snapshots", "--json"]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
+        # Initialization may have succeeded even if its response was lost. Probe
+        # again before retrying so we never initialize an existing repository.
+        repository_confirmation = self._run_repository_command_with_retry(
+            ["snapshots", "--json"],
+            repository_command_name="post-initialization probe",
+            accepted_exit_codes=(0, 10),
         )
-        if retry_probe.returncode != 0:
-            detail = _redact(initialized.stderr or initialized.stdout, self._secret_values())
-            raise ResticOperationError(f"restic repository initialization failed: {detail}")
+        if repository_confirmation.returncode != 0:
+            failure_detail = self._redacted_repository_failure_detail(repository_initialization)
+            raise ResticOperationError(
+                f"restic repository initialization failed: {failure_detail}"
+            )
+
+    def _run_repository_command_with_retry(
+        self,
+        restic_arguments: list[str],
+        *,
+        repository_command_name: str,
+        accepted_exit_codes: tuple[int, ...] = (0,),
+    ) -> subprocess.CompletedProcess[str]:
+        remaining_retry_delays = iter(REPOSITORY_RETRY_DELAYS_SECONDS)
+        while True:
+            self._raise_if_cancellation_requested()
+            repository_command_result = subprocess.run(
+                self._restic_command(restic_arguments),
+                env=self._environment,
+                capture_output=True,
+                text=True,
+            )
+            if repository_command_result.returncode in accepted_exit_codes:
+                return repository_command_result
+
+            failure_detail = self._redacted_repository_failure_detail(repository_command_result)
+            if not _is_retryable_repository_failure(failure_detail):
+                return repository_command_result
+            try:
+                retry_delay_seconds = next(remaining_retry_delays)
+            except StopIteration:
+                self._log_transient_repository_failure(
+                    repository_command_name,
+                    failure_detail,
+                    retry_delay_seconds=None,
+                )
+                raise ResticOperationError(
+                    "backup storage is not ready yet; please retry shortly"
+                ) from None
+            self._log_transient_repository_failure(
+                repository_command_name,
+                failure_detail,
+                retry_delay_seconds=retry_delay_seconds,
+            )
+            self._wait_before_repository_retry(retry_delay_seconds)
+
+    def _redacted_repository_failure_detail(
+        self,
+        repository_command_result: subprocess.CompletedProcess[str],
+    ) -> str:
+        command_output = repository_command_result.stderr or repository_command_result.stdout
+        return _redact(command_output, self._secret_values())
+
+    def _wait_before_repository_retry(self, delay_seconds: float) -> None:
+        deadline = time.monotonic() + delay_seconds
+        while True:
+            self._raise_if_cancellation_requested()
+            self._events.heartbeat_if_due()
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                return
+            time.sleep(min(REPOSITORY_RETRY_POLL_SECONDS, remaining_seconds))
+
+    def _raise_if_cancellation_requested(self) -> None:
+        if self._events.cancellation_requested:
+            raise StorageOperationCancelled("storage operation cancellation requested")
+
+    def _log_transient_repository_failure(
+        self,
+        repository_command_name: str,
+        failure_detail: str,
+        *,
+        retry_delay_seconds: float | None,
+    ) -> None:
+        retry_status = (
+            f"; retrying in {retry_delay_seconds:g}s"
+            if retry_delay_seconds is not None
+            else "; retries exhausted"
+        )
+        print(
+            "Transient repository "
+            f"{repository_command_name} failure{retry_status}: {failure_detail}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _require_repository_for_restore(self) -> None:
         # Restore is read-only: a missing source must fail instead of creating an
@@ -676,6 +779,14 @@ class ResticStorageRunner:
             if isinstance(self._workspace, DockerEncryptedVolumeWorkspace)
             else "",
         )
+
+
+def _is_retryable_repository_failure(failure_detail: str) -> bool:
+    normalized_detail = failure_detail.casefold().replace(" ", "")
+    return any(
+        marker.replace(" ", "") in normalized_detail
+        for marker in RETRYABLE_REPOSITORY_ERROR_MARKERS
+    )
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:
