@@ -59,7 +59,6 @@ def _operation_payload(
             "secret_access_key": "secret-key",
             "session_token": "session-token",
             "password": "repository-password",
-            "s3_connections": 64,
         },
         "workspace": workspace,
     }
@@ -71,6 +70,18 @@ def test_operation_derives_repository_from_pod() -> None:
     assert operation.repository.url_for_pod(operation.pod_id) == (
         f"s3:s3.amazonaws.com/backup-bucket/restic/v1/pods/{POD_ID}"
     )
+
+
+def test_legacy_s3_connection_override_is_ignored() -> None:
+    payload = _operation_payload()
+    repository = payload["repository"]
+    assert isinstance(repository, dict)
+    repository["s3_connections"] = 64
+
+    operation = StorageOperationSpec.from_mapping(payload)
+    runner = ResticStorageRunner(operation, LocalWorkspace(Path("/workspace")))
+
+    assert "s3.connections=64" not in runner._restic_command("snapshots")
 
 
 def test_restore_requires_snapshot_id() -> None:
@@ -100,17 +111,6 @@ def test_restore_missing_repository_never_initializes_it(
     assert raised.value.error_code == "RESTIC_REPOSITORY_MISSING"
     assert commands
     assert all("init" not in command for command in commands)
-
-
-@pytest.mark.parametrize("value", [0, 129, 1.5, True])
-def test_s3_connections_must_be_a_bounded_integer(value: object) -> None:
-    payload = _operation_payload()
-    repository = payload["repository"]
-    assert isinstance(repository, dict)
-    repository["s3_connections"] = value
-
-    with pytest.raises(OperationSpecError, match="s3_connections"):
-        StorageOperationSpec.from_mapping(payload)
 
 
 def test_requested_path_must_stay_inside_volume() -> None:
@@ -151,7 +151,7 @@ def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments()
     assert "customer-volume:/workspace:ro" in command
     assert command[command.index("--workdir") + 1] == "/workspace/checkpoints"
     assert command[command.index("--log-driver") + 1] == "none"
-    assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=2281701376"
+    assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=536870912"
     assert "AWS_ACCESS_KEY_ID" in command
     assert "AWS_SESSION_TOKEN" in command
     assert "access-key" not in command
@@ -428,7 +428,7 @@ def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
     assert "-U" in command
     assert "-m" not in command
     assert "/proc/4321/root/root/checkpoints" in command
-    assert "s3.connections=64" in command
+    assert not any(argument.startswith("s3.connections=") for argument in command)
 
 
 def test_encrypted_restore_preserves_user_xattrs() -> None:
@@ -530,6 +530,8 @@ def test_restore_checkpoint_emits_bounded_progress(
 
 
 class _ReporterResponse:
+    status_code = 200
+
     def raise_for_status(self) -> None:
         return None
 
@@ -584,6 +586,38 @@ def test_reporter_preserves_zero_counters_and_receives_cancellation() -> None:
     assert payload["processed_bytes"] == 0
 
 
+def test_restore_reporter_surfaces_scan_then_restore_stages() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.RESTORE,
+        ),
+        session=session,
+    )
+
+    reporter.send(
+        {"event": "restic", "payload": {"message_type": "status", "total_files": 123}}
+    )
+    reporter.send(
+        {
+            "event": "restic",
+            "payload": {"message_type": "status", "total_files": 123, "files_restored": 1},
+        }
+    )
+
+    first_payload = session.requests[0]["json"]
+    second_payload = session.requests[1]["json"]
+    assert isinstance(first_payload, dict)
+    assert isinstance(second_payload, dict)
+    assert first_payload["stage"] == "PREPARING"
+    assert first_payload["total_files"] == 123
+    assert second_payload["stage"] == "RESTORING"
+
+
 def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
     session = _ReporterSession()
     reporter = StorageEventReporter(
@@ -619,6 +653,27 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
 class _FailingReporterSession:
     def put(self, *args: object, **kwargs: object) -> None:
         raise requests.ConnectionError("backend unavailable")
+
+
+class _RevokedReporterSession:
+    def put(self, *args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(status_code=404)
+
+
+def test_missing_restore_log_revokes_runner_without_waiting_for_lease() -> None:
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.RESTORE,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.RESTORE,
+        ),
+        session=_RevokedReporterSession(),
+    )
+
+    with pytest.raises(ReportingLeaseExpired, match="no longer active"):
+        reporter.send({"event": "heartbeat"})
 
 
 class _ManualClock:

@@ -93,7 +93,6 @@ def _get_error_details(error: Exception) -> str:
 def _storage_repository_spec(
     volume_info,
     password: str | None,
-    s3_connections: int,
 ) -> dict[str, object]:
     return {
         "bucket": volume_info.name,
@@ -101,7 +100,6 @@ def _storage_repository_spec(
         "secret_access_key": volume_info.iam_user_secret_key,
         "session_token": volume_info.session_token,
         "password": password,
-        "s3_connections": s3_connections,
     }
 
 
@@ -1598,7 +1596,6 @@ class MinerService:
             "repository": _storage_repository_spec(
                 payload.backup_volume_info,
                 payload.repository_password,
-                payload.s3_connections,
             ),
             "workspace": {
                 "mode": "encrypted_running" if payload.volume_encrypted else "plain_volume",
@@ -1627,7 +1624,6 @@ class MinerService:
             "repository": _storage_repository_spec(
                 payload.backup_volume_info,
                 payload.repository_password,
-                payload.s3_connections,
             ),
             "workspace": {
                 "mode": "encrypted_running" if payload.volume_encrypted else "plain_volume",

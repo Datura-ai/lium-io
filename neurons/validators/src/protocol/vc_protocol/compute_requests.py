@@ -9,6 +9,11 @@ GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
 # The GPU itself is gone until a host reset (post-Xid): "gpu requires reset", "unknown device",
 # "NVML unknown". Same quarantine as the mismatch above — the host cannot serve a rental either way.
 GPU_RUNTIME_DEVICE_FAULT_REASON = "GPU_RUNTIME_DEVICE_FAULT"
+# DAH-2671: the rental-verification container was created with `--cpus=<advertised>` and the host's
+# Docker daemon rejected the count — the machine has fewer physical cores than the miner reported.
+# Unlike the two GPU faults above this is spec fraud, not a broken runtime, and it is rolled out
+# shadow-first (see RENTAL_CPU_LIMIT_* in core/config.py).
+CPU_QUOTA_EXCEEDS_HOST_REASON = "CPU_QUOTA_EXCEEDS_HOST"
 
 
 class Error(BaseModel, extra="allow"):

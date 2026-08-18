@@ -926,7 +926,11 @@ class DockerService:
         # tensors still travel over InfiniBand. Absent on an ordinary rental.
         cluster_udp_ports: tuple[int, ...] = ()
         if payload.cluster_membership is not None:
-            cluster_networking = cluster_pod_networking(payload.cluster_membership.wireguard_conf)
+            cluster_networking = cluster_pod_networking(
+                payload.cluster_membership.wireguard_conf,
+                payload.cluster_membership.ssh_private_key,
+                payload.cluster_membership.ssh_authorized_key,
+            )
             environment.update(cluster_networking.environment)
             cluster_udp_ports = cluster_networking.published_udp_ports
 
@@ -4444,6 +4448,8 @@ class DockerService:
                 gpu_config = await build_gpu_docker_config_for_executor(
                     ssh_client,
                     payload.gpu_uuids,
+                    executor_id=payload.executor_id,
+                    default_extra=default_extra,
                 )
 
                 if payload.cluster_membership is not None:
@@ -4955,7 +4961,6 @@ class DockerService:
             "secret_access_key": restore.backup_volume_info.iam_user_secret_key,
             "session_token": restore.backup_volume_info.session_token,
             "password": restore.repository_password,
-            "s3_connections": restore.s3_connections,
         }
         spec: dict[str, object] = {
             "operation_id": restore.restore_log_id,

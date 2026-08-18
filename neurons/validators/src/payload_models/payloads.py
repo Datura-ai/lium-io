@@ -232,7 +232,6 @@ class BootstrapRestoreSpec(BaseModel):
     legacy_object_size_bytes: int | None = None
     auth_token: str = Field(repr=False)
     restore_path: str
-    s3_connections: int = Field(default=64, ge=1, le=128)
     failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
@@ -270,7 +269,13 @@ class ClusterMembership(BaseModel):
     node_index: int
     # This node's fully-rendered wg-quick config, minted by the backend for the whole group so every
     # node's keys and peer list agree. The validator only injects it; it generates nothing itself.
-    wireguard_conf: str
+    # `repr=False` because every container create logs the whole request as `str(payload)` and this
+    # holds the node's WireGuard PrivateKey; the wire format still carries it.
+    wireguard_conf: str = Field(repr=False)
+    # DAH-2664: one SSH login shared by the whole group, so a pod can start a process on its peers —
+    # which is how mpirun, pdsh and every nccl-tests recipe launch. Empty from an older backend.
+    ssh_private_key: str = Field(default="", repr=False)
+    ssh_authorized_key: str = ""
 
 
 class ContainerCreateRequest(ContainerBaseRequest):
@@ -431,7 +436,6 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_engine: str = "tar_aws_cli"
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
-    s3_connections: int = Field(default=64, ge=1, le=128)
     failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
@@ -451,7 +455,6 @@ class RestoreContainerRequest(ContainerBaseRequest):
     repository_password: str | None = Field(default=None, repr=False)
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
-    s3_connections: int = Field(default=64, ge=1, le=128)
     failure_timeout_seconds: int = Field(default=600, gt=0)
 
 

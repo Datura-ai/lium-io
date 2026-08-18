@@ -292,6 +292,7 @@ class BackendClient:
         executor_id: str | None = None,
         rental_in_progress: bool = False,
         gpu_uuids: list[str] | None = None,
+        cpu_count: int | None = None,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -307,6 +308,10 @@ class BackendClient:
             gpu_uuids: GPU UUIDs from the scrape this cycle. The backend's probe asks the container
                 runtime to resolve exactly these instead of `--gpus all`, which never names a card
                 and so let a host advertising GPUs it cannot hand over pass the check (DAH-2614).
+            cpu_count: Advertised CPU-core count from the scrape this cycle. The backend creates the
+                probe with `--cpus=<cpu_count>`, so a host claiming more cores than it physically has
+                is rejected by its own Docker daemon (CPU_QUOTA_EXCEEDS_HOST) rather than only in a
+                paying customer's rent (DAH-2671). None omits the flag.
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -325,6 +330,11 @@ class BackendClient:
             # where a fabricated GPU matters most.
             "gpu_uuids": gpu_uuids or [],
         }
+
+        # Same rationale as gpu_uuids: send the count this cycle's scrape produced, not the backend's
+        # stored specs. Omitted when unset so an unchanged backend keeps the pre-DAH-2671 behaviour.
+        if cpu_count is not None:
+            json_data["cpu_count"] = cpu_count
 
         if executor_id:
             json_data["executor_id"] = executor_id

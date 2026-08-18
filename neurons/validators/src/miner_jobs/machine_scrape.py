@@ -1411,6 +1411,13 @@ def get_machine_specs():
         # print(f'Error getting os specs: {exc}', flush=True)
         data["os_scrape_error"] = repr(exc)
 
+    # uname reports the host kernel even from inside the container, unlike lsb_release above
+    data["data_kernel"] = ""
+    try:
+        data["data_kernel"] = run_cmd("uname -r").strip()
+    except Exception as exc:
+        data["kernel_scrape_error"] = repr(exc)
+
     
     data["data_network"] = benchmark_network_speed()
 

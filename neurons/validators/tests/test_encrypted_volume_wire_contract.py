@@ -51,6 +51,7 @@ def test_backend_backup_json_parses_encryption_fields():
         "backup_log_id": "backup-log-id",
         "volume_encrypted": True,
         "container_name": "pod_abc",
+        "s3_connections": 64,
     }
 
     parsed = BaseServerRequest.parse(json.dumps(payload))
@@ -58,6 +59,7 @@ def test_backend_backup_json_parses_encryption_fields():
     assert isinstance(parsed, BackupContainerRequest)
     assert parsed.volume_encrypted is True
     assert parsed.container_name == "pod_abc"
+    assert not hasattr(parsed, "s3_connections")
 
 
 def test_backend_restore_json_parses_encryption_fields():
@@ -72,6 +74,7 @@ def test_backend_restore_json_parses_encryption_fields():
         "restore_path": "/workspace/data",
         "volume_encrypted": True,
         "container_name": "pod_abc",
+        "s3_connections": 64,
     }
 
     parsed = BaseServerRequest.parse(json.dumps(payload))
@@ -79,3 +82,4 @@ def test_backend_restore_json_parses_encryption_fields():
     assert isinstance(parsed, RestoreContainerRequest)
     assert parsed.volume_encrypted is True
     assert parsed.container_name == "pod_abc"
+    assert not hasattr(parsed, "s3_connections")

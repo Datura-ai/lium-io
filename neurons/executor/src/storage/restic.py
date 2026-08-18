@@ -30,10 +30,7 @@ RESTORE_CHECKPOINT_PREFIX = "LIUM_RESTORE_CHECKPOINT_"
 TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
-RESTIC_PACK_SIZE_BYTES = 16 * MEBIBYTE
-RESTIC_OPEN_PACKER_COUNT = 4
-RESTIC_TEMP_PACK_HEADROOM = 2
-RESTIC_MINIMUM_TMPFS_BYTES = 256 * MEBIBYTE
+RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
 ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
 ENCRYPTED_BOOTSTRAP_SCRIPT = r"""
 set -eu
@@ -109,6 +106,9 @@ class JsonEventWriter:
 
     def diagnostic(self, message: str) -> None:
         self._write({"event": "diagnostic", "operation_id": self._operation_id, "message": message})
+
+    def stage(self, stage: str) -> None:
+        self._write({"event": "stage", "operation_id": self._operation_id, "stage": stage})
 
     def heartbeat_if_due(self) -> None:
         now = self._clock()
@@ -295,6 +295,7 @@ class ResticStorageRunner:
         exit_code, _ = self._stream_command(command, cwd)
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
+        self._events.stage("FINALIZING")
         return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
 
     def _restore_legacy_archive(self) -> ResticResult:
@@ -319,6 +320,7 @@ class ResticStorageRunner:
                 "bytes_restored": restore_stats.total_size,
             }
         )
+        self._events.stage("FINALIZING")
         return ResticResult("COMPLETED", OperationResultQuality.FULL, None, exit_code)
 
     def _stream(
@@ -596,12 +598,6 @@ class ResticStorageRunner:
         ]
 
     def _docker_helper_base(self) -> list[str]:
-        tmpfs_size_bytes = max(
-            RESTIC_MINIMUM_TMPFS_BYTES,
-            (self._operation.repository.s3_connections + RESTIC_OPEN_PACKER_COUNT)
-            * RESTIC_PACK_SIZE_BYTES
-            * RESTIC_TEMP_PACK_HEADROOM,
-        )
         return [
             self._docker_binary,
             "run",
@@ -612,7 +608,7 @@ class ResticStorageRunner:
             "none",
             "--read-only",
             "--tmpfs",
-            f"/tmp:rw,nosuid,nodev,size={tmpfs_size_bytes}",
+            f"/tmp:rw,nosuid,nodev,size={RESTIC_TMPFS_BYTES}",
             "-e",
             "AWS_ACCESS_KEY_ID",
             "-e",
@@ -633,16 +629,13 @@ class ResticStorageRunner:
         return f"lium-storage-{str(self._operation.operation_id)[:12]}"
 
     def _restic_command(self, arguments: list[str]) -> list[str]:
+        # Restic's native concurrency avoided the intermittent S3 transfer tails
+        # observed when Lium forced 64 connections.
         return [
             self._restic_binary,
             "--no-cache",
-            "-o",
-            self._s3_connection_option(),
             *arguments,
         ]
-
-    def _s3_connection_option(self) -> str:
-        return f"s3.connections={self._operation.repository.s3_connections}"
 
     def _workspace_path(self) -> str:
         return str(self._workspace.path)

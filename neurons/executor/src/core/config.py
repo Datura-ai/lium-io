@@ -31,8 +31,6 @@ class Settings(BaseSettings):
 
     ENV: str = Field(env="ENV", default="dev")
 
-    DB_URI: str = Field(env="DB_URI")
-
     # Compute-app (backend) base URL used to look up the default "cache template"
     # docker image for this host's GPU. Defaults to the same backend the
     # validators use; set to an empty value to disable the on-boot cache pre-pull.
