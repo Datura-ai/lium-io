@@ -207,6 +207,20 @@ async def test_cap_with_persistence_off_still_succeeds_but_warns(caplog) -> None
     assert "persistence mode is off" in str(warnings[0].msg)
 
 
+@pytest.mark.asyncio
+async def test_restore_with_persistence_off_does_not_warn(caplog) -> None:
+    # Only a cap is at risk from a lost persistence mode: a restore sets the limit back UP, and a
+    # driver unload lands on the default anyway. Warning here would inflate the cap-side signal.
+    ssh = fake_ssh(FakeRun(stdout=STATE_CSV), *_set_ok(400, persistence="Disabled"))
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+
+    with caplog.at_level(logging.DEBUG):
+        restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
+
+    assert restored == 1
+    assert not [record for record in caplog.records if record.levelno == logging.WARNING]
+
+
 # ---------------------------- apply_filler_gpu_power_limits (fail-closed) ----------------------------
 
 

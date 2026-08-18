@@ -145,7 +145,7 @@ def _parse_power_state_csv(stdout: str) -> dict[str, GpuPowerState]:
 
 def _parse_power_readback_csv(stdout: str) -> GpuPowerReadback:
     fields = [field.strip() for field in str(stdout).strip().split(",")]
-    watts = _watts_or_none(fields[0]) if fields else None
+    watts = _watts_or_none(fields[0])
     persistence_raw = fields[1].lower() if len(fields) > 1 else ""
     persistence_enabled: bool | None = None
     if persistence_raw in ("enabled", "disabled"):
@@ -293,15 +293,18 @@ async def _set_and_log_power_limit(
         "persistence_enabled": set_result.persistence_enabled,
     }
     _log(logging.INFO if failure is None else logging.ERROR, message, fields, log_extra)
-    # DAH-2702: a verified set with persistence off holds only until the driver unloads on an idle
-    # GPU, which is how a cap reverts with nobody touching the host. Observability only — refusing
-    # the filler here would drop PEARL from every host that cannot hold persistence mode.
-    if failure is None and set_result.persistence_enabled is False:
+    # DAH-2702: a verified cap with persistence off holds only until the driver unloads on an idle
+    # GPU, which is how a cap reverts with nobody touching the host. Only "cap" is at risk — a
+    # restore/raise sets the limit back UP, and a driver unload lands on the default anyway.
+    # Observability only: refusing the filler here would drop PEARL from every host that cannot
+    # hold persistence mode. Logged WITHOUT gpu_power_action/status so counters over the change
+    # events do not see this warning as a second cap.
+    if failure is None and action == "cap" and set_result.persistence_enabled is False:
         _log(
             logging.WARNING,
-            f"gpu power limit {action}: persistence mode is off for {gpu_uuid} after -pm 1; "
-            f"the {watts_after}W limit can revert on its own when the driver unloads",
-            fields,
+            f"gpu power limit cap: persistence mode is off for {gpu_uuid} after -pm 1; "
+            f"the {watts_after}W cap can revert on its own when the driver unloads",
+            {"executor_uuid": executor_id, "gpu_uuid": gpu_uuid, "persistence_enabled": False},
             log_extra,
         )
     return failure is None
