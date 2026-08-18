@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from neurons.validators.tests.helpers import build_scrape_namespace
+from neurons.validators.tests.helpers import build_scrape_namespace, dict_literal_keys
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -96,18 +96,6 @@ def test_probe_reports_both_readings_missing_without_guessing(
     assert "Cannot read" in probe.scrape_error and "Cannot stat" in probe.scrape_error
 
 
-def _dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
-    """Keys of the single dict literal assigned to `dict_name`, in source order."""
-    for node in ast.walk(module):
-        if (
-            isinstance(node, ast.Assign)
-            and getattr(node.targets[0], "id", "") == dict_name
-            and isinstance(node.value, ast.Dict)
-        ):
-            return [key.value for key in node.value.keys]
-    raise AssertionError(f"{dict_name} dict literal not found")
-
-
 def test_probe_keys_are_wired_through_both_obfuscation_tables() -> None:
     """A key missing from either table ships un-renamed/un-mapped - keep all three in both."""
     # Arrange
@@ -116,8 +104,8 @@ def test_probe_keys_are_wired_through_both_obfuscation_tables() -> None:
     new_keys = ["data_container_cap_eff", "data_nvidiactl_owner_uid", "data_power_cap_probe_error"]
 
     # Act
-    original_keys = _dict_literal_keys(service_module, "ORIGINAL_KEYS")
-    all_keys = _dict_literal_keys(service_module, "all_keys")
+    original_keys = dict_literal_keys(service_module, "ORIGINAL_KEYS")
+    all_keys = dict_literal_keys(service_module, "all_keys")
 
     # Assert
     for key in new_keys:

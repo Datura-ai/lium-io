@@ -1097,6 +1097,8 @@ def probe_gpu_power_cap_ability() -> GpuPowerCapProbe:
     # holds CAP_SYS_ADMIN *and* its root owns /dev/nvidiactl - a sysbox userns maps the device to
     # nobody while keeping every capability, so neither reading alone tells the two apart. Report both
     # raw values and let the backend decide; an unreadable one stays empty/None, never a guess.
+    # /proc/self/status is this scrape's own process, which is meaningful only because the scrape and
+    # the validator's `nvidia-smi -pl` run in the same SSH context - keep them together.
     scrape_errors: list[str] = []
 
     cap_eff: str = ""
