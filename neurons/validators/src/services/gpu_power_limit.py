@@ -288,9 +288,9 @@ async def _set_and_log_power_limit(
     if failure is not None:
         message = f"{message} ({failure})"
     # DAH-2702: with persistence off the driver unloads on an idle GPU and the stock limit returns,
-    # which is how a cap reverts untouched. Only a cap is at risk — restore/raise set the limit back
-    # UP, where an unload lands anyway. Never fail-closed: refusing the filler would drop PEARL from
-    # every host that cannot hold persistence mode.
+    # which is how a cap reverts untouched. Only a cap is worth warning about — an unload undoes a
+    # cap, while it can only lift a restore/raise further towards the stock limit. Never
+    # fail-closed: refusing the filler would drop PEARL from every host without persistence mode.
     cap_can_revert = failure is None and action == "cap" and set_outcome.persistence_enabled is False
     if cap_can_revert:
         message = f"{message} (persistence mode is off after -pm 1; this cap can revert on its own)"
