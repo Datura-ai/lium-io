@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,20 +26,15 @@ class _AxonInfo:
     ip: str = "0.0.0.0"
     port: int = 0
 
-    @property
-    def is_serving(self) -> bool:
-        return self.ip != "0.0.0.0"
-
 
 @dataclass
 class _Neuron:
     uid: int
     hotkey: str
-    coldkey: str = "coldkey"
     axon_info: _AxonInfo = field(default_factory=_AxonInfo)
 
 
-def _portal_miner(hotkey: str = "portal-provider") -> OptedInMiner:
+def _opted_in_miner(hotkey: str = "portal-provider") -> OptedInMiner:
     return OptedInMiner(
         miner_hotkey=hotkey,
         central_miner_ip="192.0.2.10",
@@ -45,29 +42,42 @@ def _portal_miner(hotkey: str = "portal-provider") -> OptedInMiner:
     )
 
 
-def _client(*, miners: list[_Neuron] | None = None) -> SubtensorClient:
+def _make_subtensor_client(
+    *,
+    miners: list[_Neuron] | None = None,
+) -> SubtensorClient:
     client = SubtensorClient.__new__(SubtensorClient)
     client.debug_miner = None
     client.default_extra = {}
     client.miners = miners or []
     client.redis_service = AsyncMock()
     client.redis_service.get.return_value = None
+    client._has_alerted_for_stale_portal_snapshot = False
     return client
 
 
-def _cache_payload(*miners: OptedInMiner, cached_at: float) -> str:
+def _cached_miners_json(*miners: OptedInMiner, cached_at: float) -> str:
     return OptedInMinerSnapshot(
         cached_at=cached_at,
         miners=list(miners),
     ).model_dump_json()
 
 
-def _structured_extra(record: logging.LogRecord) -> dict:
-    return record.msg.extra
+def _structured_extra(record: logging.LogRecord) -> Mapping[str, object]:
+    return cast(Mapping[str, object], getattr(record.msg, "extra"))
+
+
+def _preserve_weights(
+    *,
+    uids: object,
+    weights: object,
+    **_kwargs: object,
+) -> tuple[object, object]:
+    return uids, weights
 
 
 @pytest.mark.asyncio
-async def test_portal_timeout_is_not_reported_as_empty_opt_in_list():
+async def test_portal_timeout_is_not_reported_as_empty_opt_in_list() -> None:
     keypair = MagicMock()
     keypair.ss58_address = "validator-hotkey"
     keypair.sign.return_value = b"signed"
@@ -94,7 +104,7 @@ async def test_portal_timeout_is_not_reported_as_empty_opt_in_list():
 
 
 @pytest.mark.asyncio
-async def test_portal_rejects_response_with_a_malformed_provider():
+async def test_portal_rejects_response_with_a_malformed_provider() -> None:
     keypair = MagicMock(ss58_address="validator-hotkey")
     keypair.sign.return_value = b"signed"
     wallet = MagicMock()
@@ -144,7 +154,10 @@ async def test_portal_rejects_response_with_a_malformed_provider():
         ("central_miner_port", 65536),
     ],
 )
-def test_opted_in_miner_requires_a_usable_endpoint(field_name, invalid_value):
+def test_opted_in_miner_requires_a_usable_endpoint(
+    field_name: str,
+    invalid_value: object,
+) -> None:
     data = {
         "miner_hotkey": "portal-provider",
         "central_miner_ip": "192.0.2.10",
@@ -157,34 +170,39 @@ def test_opted_in_miner_requires_a_usable_endpoint(field_name, invalid_value):
 
 
 @pytest.mark.asyncio
-async def test_live_portal_snapshot_is_cached_and_used(monkeypatch):
+async def test_live_portal_snapshot_is_cached_and_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = _Neuron(uid=100, hotkey="portal-provider")
-    client = _client()
+    client = _make_subtensor_client()
     client.get_metagraph = MagicMock(return_value=MagicMock(neurons=[provider]))
     monkeypatch.setattr(
         ValidatorPortalAPI,
         "get_opted_in_miners",
-        AsyncMock(return_value=[_portal_miner()]),
+        AsyncMock(return_value=[_opted_in_miner()]),
     )
 
     await client.fetch_miners()
 
     assert client.miners == [provider]
     assert provider.axon_info.ip == "192.0.2.10"
+    client.redis_service.get.assert_not_awaited()
     client.redis_service.set.assert_awaited_once()
     cache_key, cache_json = client.redis_service.set.await_args.args
     assert cache_key == PORTAL_MINERS_CACHE_KEY
     cached = OptedInMinerSnapshot.model_validate_json(cache_json)
-    assert cached.miners == [_portal_miner()]
+    assert cached.miners == [_opted_in_miner()]
 
 
 @pytest.mark.asyncio
-async def test_failed_portal_refresh_uses_redis_snapshot_after_restart(monkeypatch):
+async def test_failed_portal_refresh_uses_redis_snapshot_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = _Neuron(uid=100, hotkey="portal-provider")
-    client = _client()
+    client = _make_subtensor_client()
     client.get_metagraph = MagicMock(return_value=MagicMock(neurons=[provider]))
-    client.redis_service.get.return_value = _cache_payload(
-        _portal_miner(),
+    client.redis_service.get.return_value = _cached_miners_json(
+        _opted_in_miner(),
         cached_at=1_000,
     )
     monkeypatch.setattr(
@@ -202,7 +220,9 @@ async def test_failed_portal_refresh_uses_redis_snapshot_after_restart(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_failed_portal_and_cache_refresh_keeps_in_memory_snapshot(monkeypatch):
+async def test_failed_portal_and_cache_refresh_keeps_in_memory_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     previous_snapshot = [
         _Neuron(
             uid=100,
@@ -210,7 +230,7 @@ async def test_failed_portal_and_cache_refresh_keeps_in_memory_snapshot(monkeypa
             axon_info=_AxonInfo("192.0.2.10", 8091),
         )
     ]
-    client = _client(miners=previous_snapshot)
+    client = _make_subtensor_client(miners=previous_snapshot)
     client.redis_service.get.side_effect = RuntimeError("redis unavailable")
     monkeypatch.setattr(
         ValidatorPortalAPI,
@@ -224,8 +244,10 @@ async def test_failed_portal_and_cache_refresh_keeps_in_memory_snapshot(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_portal_failure_without_any_snapshot_is_explicit(monkeypatch):
-    client = _client()
+async def test_portal_failure_without_any_snapshot_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _make_subtensor_client()
     monkeypatch.setattr(
         ValidatorPortalAPI,
         "get_opted_in_miners",
@@ -237,7 +259,9 @@ async def test_portal_failure_without_any_snapshot_is_explicit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sync_skips_cleanly_when_no_provider_snapshot_exists(caplog):
+async def test_sync_skips_cleanly_when_no_provider_snapshot_exists(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     validator = Validator.__new__(Validator)
     validator.default_extra = {}
     validator.miner_scores = {"portal-provider": 1.0}
@@ -258,12 +282,15 @@ async def test_sync_skips_cleanly_when_no_provider_snapshot_exists(caplog):
 
 
 @pytest.mark.asyncio
-async def test_stale_redis_snapshot_is_used_and_pages_once(monkeypatch, caplog):
+async def test_stale_redis_snapshot_is_used_and_pages_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     provider = _Neuron(uid=100, hotkey="portal-provider")
-    client = _client()
+    client = _make_subtensor_client()
     client.get_metagraph = MagicMock(return_value=MagicMock(neurons=[provider]))
-    client.redis_service.get.return_value = _cache_payload(
-        _portal_miner(),
+    client.redis_service.get.return_value = _cached_miners_json(
+        _opted_in_miner(),
         cached_at=1_000,
     )
     monkeypatch.setattr(
@@ -291,8 +318,11 @@ async def test_stale_redis_snapshot_is_used_and_pages_once(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
-async def test_live_provider_count_transition_to_zero_warns_and_caches_empty(monkeypatch, caplog):
-    client = _client()
+async def test_live_provider_count_transition_to_zero_warns_and_caches_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _make_subtensor_client()
     opted_out_provider = _Neuron(
         uid=100,
         hotkey="opted-out-provider",
@@ -301,8 +331,8 @@ async def test_live_provider_count_transition_to_zero_warns_and_caches_empty(mon
     client.get_metagraph = MagicMock(
         return_value=MagicMock(neurons=[opted_out_provider])
     )
-    client.redis_service.get.return_value = _cache_payload(
-        _portal_miner(),
+    client.redis_service.get.return_value = _cached_miners_json(
+        _opted_in_miner(),
         cached_at=1_000,
     )
     monkeypatch.setattr(
@@ -336,13 +366,13 @@ async def test_live_provider_count_transition_to_zero_warns_and_caches_empty(mon
 )
 @pytest.mark.asyncio
 async def test_missing_scored_provider_is_diagnosed_without_blocking_submission(
-    monkeypatch,
-    caplog,
-    active_hotkeys,
-    expected_level,
-    expected_active,
-    expected_inactive,
-):
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    active_hotkeys: set[str],
+    expected_level: int,
+    expected_active: list[str],
+    expected_inactive: list[str],
+) -> None:
     provider_hotkey = "portal-provider"
     snapshot_miner = _Neuron(
         uid=2,
@@ -350,7 +380,7 @@ async def test_missing_scored_provider_is_diagnosed_without_blocking_submission(
         axon_info=_AxonInfo("192.0.2.2", 8091),
     )
     registered_provider = _Neuron(uid=100, hotkey=provider_hotkey)
-    client = _client()
+    client = _make_subtensor_client()
     client.netuid = 1
     client.version_key = 10000
     client.wallet = MagicMock()
@@ -365,12 +395,9 @@ async def test_missing_scored_provider_is_diagnosed_without_blocking_submission(
     subtensor.set_weights.return_value = (True, "ok")
     monkeypatch.setattr(SubtensorClient, "_subtensor", subtensor)
 
-    def preserve_weights(*, uids, weights, **_kwargs):
-        return uids, weights
-
     monkeypatch.setattr(
         "clients.subtensor_client.process_weights_for_netuid",
-        preserve_weights,
+        _preserve_weights,
     )
 
     with caplog.at_level(expected_level):
@@ -395,7 +422,9 @@ async def test_missing_scored_provider_is_diagnosed_without_blocking_submission(
 
 
 @pytest.mark.asyncio
-async def test_legitimate_opt_out_keeps_preexisting_vector_behavior(monkeypatch):
+async def test_legitimate_opt_out_keeps_preexisting_vector_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     snapshot_miner = _Neuron(
         uid=2,
         hotkey="snapshot-miner",
@@ -406,7 +435,7 @@ async def test_legitimate_opt_out_keeps_preexisting_vector_behavior(monkeypatch)
         hotkey="opted-out-provider",
         axon_info=_AxonInfo("192.0.2.100", 8091),
     )
-    client = _client()
+    client = _make_subtensor_client()
     client.netuid = 1
     client.version_key = 10000
     client.wallet = MagicMock()
@@ -422,7 +451,7 @@ async def test_legitimate_opt_out_keeps_preexisting_vector_behavior(monkeypatch)
     monkeypatch.setattr(SubtensorClient, "_subtensor", subtensor)
     monkeypatch.setattr(
         "clients.subtensor_client.process_weights_for_netuid",
-        lambda *, uids, weights, **_kwargs: (uids, weights),
+        _preserve_weights,
     )
 
     await client.set_weights(

@@ -1,21 +1,23 @@
 import asyncio
-import bittensor
 import contextlib
-import numpy as np
-import time
-from typing import Self, TYPE_CHECKING
-from bittensor.utils.weight_utils import process_weights_for_netuid
-from websockets.protocol import State as WebSocketClientState
-from datetime import datetime
 import json
-import aiohttp
-from pydantic import BaseModel, Field, ValidationError
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Self
 
+import aiohttp
+import bittensor
+import numpy as np
+from bittensor.utils.weight_utils import process_weights_for_netuid
+from pydantic import BaseModel, Field, ValidationError
+from websockets.protocol import State as WebSocketClientState
+
+from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
-
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
-from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -25,8 +27,8 @@ logger = get_logger(__name__)
 SYNC_CYCLE = 12
 SUBTENSOR_BACKOFF_INITIAL = 12
 SUBTENSOR_BACKOFF_MAX = 300
-PORTAL_MINERS_CACHE_KEY = "validator:portal:opted_in_miners:last_good"
-PORTAL_MINERS_CACHE_ALERT_SECONDS = 60 * 60
+PORTAL_MINERS_CACHE_KEY: str = "validator:portal:opted_in_miners:last_good"
+PORTAL_MINERS_CACHE_ALERT_SECONDS: int = 60 * 60
 
 
 class OptedInMinerSnapshot(BaseModel):
@@ -34,8 +36,14 @@ class OptedInMinerSnapshot(BaseModel):
     miners: list[OptedInMiner]
 
 
+@dataclass(frozen=True)
+class MissingScoredHotkeys:
+    active_in_last_cycle: list[str]
+    inactive_in_last_cycle: list[str]
+
+
 class ProviderPortalDataUnavailable(RuntimeError):
-    """No live, Redis-cached, or in-memory provider snapshot is available."""
+    """No live or Redis-cached provider snapshot is available."""
 
 
 @contextlib.contextmanager
@@ -155,7 +163,7 @@ def _classify_missing_scored_hotkeys(
     snapshot_miner_hotkeys: set[str],
     registered_hotkeys: set[str],
     active_hotkeys: set[str],
-) -> tuple[list[str], list[str]]:
+) -> MissingScoredHotkeys:
     missing_hotkeys = sorted(
         hotkey
         for hotkey, score in miner_scores.items()
@@ -169,7 +177,10 @@ def _classify_missing_scored_hotkeys(
     inactive_missing_hotkeys = [
         hotkey for hotkey in missing_hotkeys if hotkey not in active_hotkeys
     ]
-    return active_missing_hotkeys, inactive_missing_hotkeys
+    return MissingScoredHotkeys(
+        active_in_last_cycle=active_missing_hotkeys,
+        inactive_in_last_cycle=inactive_missing_hotkeys,
+    )
 
 
 class SubtensorClient:
@@ -201,7 +212,7 @@ class SubtensorClient:
         self.netuid = settings.BITTENSOR_NETUID
         self.config = settings.get_bittensor_config()
         self.redis_service = RedisService()
-        self._portal_cache_stale_alerted = False
+        self._has_alerted_for_stale_portal_snapshot = False
 
         # Calculate version key
         major, minor, patch = map(int, settings.VERSION.split('.'))
@@ -358,7 +369,9 @@ class SubtensorClient:
     def get_tempo(self):
         return self.subtensor.tempo(self.netuid)
 
-    async def _load_cached_opted_in_miners(self) -> OptedInMinerSnapshot | None:
+    async def _load_cached_opted_in_miners_snapshot(
+        self,
+    ) -> OptedInMinerSnapshot | None:
         try:
             cached_json = await self.redis_service.get(PORTAL_MINERS_CACHE_KEY)
         except Exception as exc:
@@ -377,7 +390,7 @@ class SubtensorClient:
 
         try:
             return OptedInMinerSnapshot.model_validate_json(cached_json)
-        except (ValidationError, TypeError, ValueError) as exc:
+        except (ValidationError, TypeError) as exc:
             logger.error(
                 _m(
                     "[fetch_miners] invalid provider snapshot cache",
@@ -388,7 +401,10 @@ class SubtensorClient:
             )
             return None
 
-    async def _cache_opted_in_miners(self, miners: list[OptedInMiner]) -> None:
+    async def _store_opted_in_miners_snapshot(
+        self,
+        miners: list[OptedInMiner],
+    ) -> None:
         snapshot = OptedInMinerSnapshot(cached_at=time.time(), miners=miners)
         try:
             await self.redis_service.set(
@@ -405,25 +421,46 @@ class SubtensorClient:
                 )
             )
 
-    async def fetch_miners(self):
-        logger.info(
+    def _report_cached_opted_in_miners_usage(
+        self,
+        snapshot: OptedInMinerSnapshot,
+    ) -> None:
+        cache_age_seconds = int(max(0, time.time() - snapshot.cached_at))
+        log_context = {
+            **self.default_extra,
+            "provider_count": len(snapshot.miners),
+            "cache_age_seconds": cache_age_seconds,
+            "snapshot_source": "redis_cache",
+        }
+        logger.warning(
             _m(
-                "[fetch_miners] Fetching miners",
-                extra=get_extra_info(self.default_extra),
-            ),
+                "[fetch_miners] using cached provider snapshot",
+                extra=get_extra_info(log_context),
+            )
         )
+        if (
+            cache_age_seconds >= PORTAL_MINERS_CACHE_ALERT_SECONDS
+            and not self._has_alerted_for_stale_portal_snapshot
+        ):
+            logger.critical(
+                _m(
+                    "[fetch_miners] provider snapshot cache exceeded alert threshold",
+                    extra=get_extra_info(
+                        {
+                            **log_context,
+                            "alert_threshold_seconds": PORTAL_MINERS_CACHE_ALERT_SECONDS,
+                        }
+                    ),
+                )
+            )
+            self._has_alerted_for_stale_portal_snapshot = True
 
-        if self.debug_miner:
-            miners = [self.debug_miner]
-        else:
-            portal_miners = await ValidatorPortalAPI.get_opted_in_miners()
-            if portal_miners is not None:
-                previous_snapshot = await self._load_cached_opted_in_miners()
-                if (
-                    previous_snapshot is not None
-                    and previous_snapshot.miners
-                    and not portal_miners
-                ):
+    async def _resolve_opted_in_miners(self) -> list[OptedInMiner]:
+        live_miners = await ValidatorPortalAPI.get_opted_in_miners()
+        if live_miners is not None:
+            if not live_miners:
+                previous_snapshot = await self._load_cached_opted_in_miners_snapshot()
+                if previous_snapshot is not None and previous_snapshot.miners:
                     logger.warning(
                         _m(
                             "[fetch_miners] opted-in provider count dropped to zero",
@@ -436,94 +473,73 @@ class SubtensorClient:
                             ),
                         )
                     )
-                await self._cache_opted_in_miners(portal_miners)
-                self._portal_cache_stale_alerted = False
-                snapshot_source = "portal"
-            else:
-                cached_snapshot = await self._load_cached_opted_in_miners()
-                if cached_snapshot is not None:
-                    portal_miners = cached_snapshot.miners
-                    cache_age_seconds = int(
-                        max(0, time.time() - cached_snapshot.cached_at)
-                    )
-                    snapshot_source = "redis_cache"
-                    logger.warning(
-                        _m(
-                            "[fetch_miners] using cached provider snapshot",
-                            extra=get_extra_info(
-                                {
-                                    **self.default_extra,
-                                    "provider_count": len(portal_miners),
-                                    "cache_age_seconds": cache_age_seconds,
-                                }
-                            ),
-                        )
-                    )
-                    if (
-                        cache_age_seconds >= PORTAL_MINERS_CACHE_ALERT_SECONDS
-                        and not getattr(self, "_portal_cache_stale_alerted", False)
-                    ):
-                        logger.critical(
-                            _m(
-                                "[fetch_miners] provider snapshot cache exceeded alert threshold",
-                                extra=get_extra_info(
-                                    {
-                                        **self.default_extra,
-                                        "provider_count": len(portal_miners),
-                                        "cache_age_seconds": cache_age_seconds,
-                                        "alert_threshold_seconds": PORTAL_MINERS_CACHE_ALERT_SECONDS,
-                                    }
-                                ),
-                            )
-                        )
-                        self._portal_cache_stale_alerted = True
-                elif self.miners:
-                    logger.warning(
-                        _m(
-                            "[fetch_miners] using in-memory provider snapshot",
-                            extra=get_extra_info(
-                                {
-                                    **self.default_extra,
-                                    "provider_count": len(self.miners),
-                                }
-                            ),
-                        )
-                    )
-                    return
-                else:
-                    raise ProviderPortalDataUnavailable(
-                        "provider portal unavailable and no cached snapshot exists"
-                    )
-
+            await self._store_opted_in_miners_snapshot(live_miners)
+            self._has_alerted_for_stale_portal_snapshot = False
             logger.info(
                 _m(
                     "[fetch_miners] resolved opted-in providers",
                     extra=get_extra_info(
                         {
                             **self.default_extra,
-                            "provider_count": len(portal_miners),
-                            "snapshot_source": snapshot_source,
+                            "provider_count": len(live_miners),
+                            "snapshot_source": "portal",
                         }
                     ),
                 )
             )
+            return live_miners
 
-            metagraph = self.get_metagraph()
-            hotkey_to_opt_in = {
-                opt_in.miner_hotkey: opt_in for opt_in in portal_miners
-            }
-            for miner in metagraph.neurons:
-                opt_in = hotkey_to_opt_in.get(miner.hotkey)
-                if opt_in is not None:
-                    miner.axon_info.ip = opt_in.central_miner_ip
-                    miner.axon_info.port = opt_in.central_miner_port
+        cached_snapshot = await self._load_cached_opted_in_miners_snapshot()
+        if cached_snapshot is None:
+            raise ProviderPortalDataUnavailable(
+                "provider portal unavailable and no cached snapshot exists"
+            )
+        self._report_cached_opted_in_miners_usage(cached_snapshot)
+        return cached_snapshot.miners
 
-            miners = [
-                neuron
-                for neuron in metagraph.neurons
-                if neuron.hotkey in hotkey_to_opt_in
-                or neuron.uid in (settings.BURNERS + settings.NEW_BURNERS)
-            ]
+    def _build_miners_from_opted_in_snapshot(
+        self,
+        opted_in_miners: Sequence[OptedInMiner],
+    ) -> list[bittensor.NeuronInfo]:
+        metagraph = self.get_metagraph()
+        opted_in_by_hotkey = {
+            opted_in.miner_hotkey: opted_in for opted_in in opted_in_miners
+        }
+        for neuron in metagraph.neurons:
+            opted_in = opted_in_by_hotkey.get(neuron.hotkey)
+            if opted_in is not None:
+                neuron.axon_info.ip = opted_in.central_miner_ip
+                neuron.axon_info.port = opted_in.central_miner_port
+
+        burner_uids = {*settings.BURNERS, *settings.NEW_BURNERS}
+        return [
+            neuron
+            for neuron in metagraph.neurons
+            if neuron.hotkey in opted_in_by_hotkey or neuron.uid in burner_uids
+        ]
+
+    async def fetch_miners(self) -> None:
+        if self.debug_miner:
+            miners = [self.debug_miner]
+        else:
+            try:
+                opted_in_miners = await self._resolve_opted_in_miners()
+            except ProviderPortalDataUnavailable:
+                if not self.miners:
+                    raise
+                logger.warning(
+                    _m(
+                        "[fetch_miners] using in-memory provider snapshot",
+                        extra=get_extra_info(
+                            {
+                                **self.default_extra,
+                                "provider_count": len(self.miners),
+                            }
+                        ),
+                    )
+                )
+                return
+            miners = self._build_miners_from_opted_in_snapshot(opted_in_miners)
 
         logger.info(
             _m(
@@ -567,7 +583,48 @@ class SubtensorClient:
         except Exception as e:
             logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
-    async def set_weights(self, miner_scores: dict[str, float], active_hotkeys: set[str] | None = None):
+    def _log_scored_hotkeys_missing_from_snapshot(
+        self,
+        miner_scores: dict[str, float],
+        snapshot_miners: Sequence[bittensor.NeuronInfo],
+        registered_miners: Sequence[bittensor.NeuronInfo],
+        active_hotkeys: set[str],
+    ) -> None:
+        missing_hotkeys = _classify_missing_scored_hotkeys(
+            miner_scores=miner_scores,
+            snapshot_miner_hotkeys={miner.hotkey for miner in snapshot_miners},
+            registered_hotkeys={miner.hotkey for miner in registered_miners},
+            active_hotkeys=active_hotkeys,
+        )
+        if not (
+            missing_hotkeys.active_in_last_cycle
+            or missing_hotkeys.inactive_in_last_cycle
+        ):
+            return
+
+        log_diagnostic = (
+            logger.critical
+            if missing_hotkeys.active_in_last_cycle
+            else logger.warning
+        )
+        log_diagnostic(
+            _m(
+                "[set_weights] scored miners missing from provider snapshot",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "active_missing_hotkeys": missing_hotkeys.active_in_last_cycle,
+                        "inactive_missing_hotkeys": missing_hotkeys.inactive_in_last_cycle,
+                    }
+                ),
+            ),
+        )
+
+    async def set_weights(
+        self,
+        miner_scores: dict[str, float],
+        active_hotkeys: set[str] | None = None,
+    ) -> None:
         """Set weights using accumulated scores with burning already applied.
 
         The miner_scores dict already includes burning logic from calculate_final_weights
@@ -599,32 +656,12 @@ class SubtensorClient:
             return
 
         metagraph = self.get_metagraph()
-        snapshot_miner_hotkeys = {miner.hotkey for miner in miners}
-        registered_hotkeys = {neuron.hotkey for neuron in metagraph.neurons}
-        active_missing_hotkeys, inactive_missing_hotkeys = (
-            _classify_missing_scored_hotkeys(
-                miner_scores,
-                snapshot_miner_hotkeys,
-                registered_hotkeys,
-                active_hotkeys or set(),
-            )
+        self._log_scored_hotkeys_missing_from_snapshot(
+            miner_scores=miner_scores,
+            snapshot_miners=miners,
+            registered_miners=metagraph.neurons,
+            active_hotkeys=active_hotkeys or set(),
         )
-        if active_missing_hotkeys or inactive_missing_hotkeys:
-            log_diagnostic = (
-                logger.critical if active_missing_hotkeys else logger.warning
-            )
-            log_diagnostic(
-                _m(
-                    "[set_weights] scored miners missing from provider snapshot",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "active_missing_hotkeys": active_missing_hotkeys,
-                            "inactive_missing_hotkeys": inactive_missing_hotkeys,
-                        }
-                    ),
-                ),
-            )
 
         # Build uids and weights arrays
         uids = np.zeros(len(miners), dtype=np.int64)
@@ -883,17 +920,14 @@ class SubtensorClient:
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL
                 await asyncio.sleep(SYNC_CYCLE)
-            except ProviderPortalDataUnavailable as e:
+            except ProviderPortalDataUnavailable as exc:
                 logger.error(
                     _m(
                         "[_warm_up_subtensor] Provider portal snapshot unavailable",
-                        extra=get_extra_info({
-                            **self.default_extra,
-                            "error": str(e),
-                            "backoff": backoff,
-                        }),
+                        extra=get_extra_info(
+                            {**self.default_extra, "error": str(exc), "backoff": backoff}
+                        ),
                     ),
-                    exc_info=True,
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
