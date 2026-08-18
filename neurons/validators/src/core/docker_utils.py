@@ -124,6 +124,9 @@ class ContainerDeathDiagnostics:
     logs_tail: str | None = None
     host_context: dict[str, str] | None = None
     capture_error: str | None = None
+    # DAH-2703: the container is not on the host at all any more. Distinguishes a container that
+    # something removed from one that merely died — only the former accuses the host.
+    container_missing: bool = False
 
     def to_log_fields(self) -> dict[str, object]:
         """Flatten into the shared Loki field shape used at both call sites."""
@@ -137,6 +140,7 @@ class ContainerDeathDiagnostics:
             "container_logs_tail": self.logs_tail,
             "container_host_context": self.host_context,
             "diagnostics_capture_error": self.capture_error,
+            "container_missing": self.container_missing,
         }
 
 
@@ -167,6 +171,15 @@ async def df_available_bytes(ssh_client: asyncssh.SSHClientConnection, host_path
     if len(columns) < 4 or not columns[3].isdigit():
         raise Exception(f"Unexpected df output: {result.stdout!r}")
     return int(columns[3])
+
+
+# Docker's two ways of saying the container is not on this host any more.
+_MISSING_CONTAINER_MARKERS = ("no such object", "no such container")
+
+
+def _reports_missing_container(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _MISSING_CONTAINER_MARKERS)
 
 
 async def collect_container_death_diagnostics(
@@ -203,6 +216,7 @@ async def collect_container_death_diagnostics(
                 capture_errors.append(f"inspect: non-object state JSON: {parsed_state!r}")
         else:
             stderr = (getattr(inspect_result, "stderr", "") or "").strip()
+            diagnostics.container_missing = _reports_missing_container(stderr)
             capture_errors.append(f"inspect: {stderr or 'empty stdout'}")
     except asyncio.CancelledError:
         raise

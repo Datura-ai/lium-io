@@ -673,6 +673,10 @@ class FailedContainerErrorCodes(enum.Enum):
     RentingInProgress = "RentingInProgress"
     NoJupyterPortMapping = "NoJupyterPortMapping"
     AttestationError = "AttestationError"
+    # DAH-2703: the container we created was gone from the host before creation finished — a
+    # host-side reaper, not a container that failed on its own. The backend counts these per
+    # executor and withholds unrented incentive once they stop looking like a race.
+    ContainerVanished = "ContainerVanished"
 
 
 class FailedContainerErrorTypes(enum.Enum):

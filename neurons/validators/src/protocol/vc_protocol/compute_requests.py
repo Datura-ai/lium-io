@@ -115,6 +115,12 @@ class RentedExecutorsResponse(BaseModel):
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
     spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
     new_rentals_paused_executor_ids: list[str] = []  # executor_ids paused from unrented incentives
+    # DAH-2703: executor_ids whose Lium filler container was destroyed during create often enough
+    # to be a host-side reaper rather than a race. Such a run never reaches RUNNING, so the node
+    # reports no filler container and the ISSUE-050 liveness probe has nothing to check — the
+    # streak is the only evidence the default job is being killed. Additive with an empty default:
+    # a backend that does not send it simply penalizes nobody.
+    filler_create_kill_executor_ids: list[str] = []
     provider_discord_connected_executor_ids: list[str] | None = None  # executor_ids whose provider has connected Discord
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).

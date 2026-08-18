@@ -1121,3 +1121,102 @@ async def test_cpu_count_is_not_sent_for_a_tdx_host():
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] is None
+
+
+# DAH-2703: a host reaper that removes the filler seconds after `docker run` leaves no container
+# to probe, so the liveness check above never runs. The backend reports the kill streak instead.
+
+
+def _create_kill_context(
+    *,
+    backend_client: DummyBackendClient,
+    ssh_client: FillerSSHClient,
+    rented_pods: list[RentedPod] | None = None,
+) -> Context:
+    executors = (
+        {
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8000",
+                pods=rented_pods,
+            )
+        }
+        if rented_pods
+        else {}
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={"verified_ports": [8080]},
+        rented_data=RentedExecutorsResponse(
+            executors=executors,
+            filler_create_kill_executor_ids=["executor-123"],
+        ),
+    )
+    from tests.helpers import make_context
+
+    return make_context(services=services, state=state, ssh=ssh_client)
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_create_kill_shadow_mode_passes_but_logs():
+    """Shadow mode: the create-kill streak is logged with enforced=False, incentive untouched."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _create_kill_context(backend_client=backend_client, ssh_client=FillerSSHClient())
+
+    result = await _run_filler_check(ctx, enforcement=False)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
+    assert result.event.what_we_saw["enforced"] is False
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_create_kill_enforcement_fails():
+    """Enforcement mode: the streak fails the fatal check -> no unrented incentive."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _create_kill_context(backend_client=backend_client, ssh_client=FillerSSHClient())
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
+    assert result.event.what_we_saw["enforced"] is True
+    # The node is never contacted for a health check once the streak decides the verdict.
+    assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_create_kill_ignored_when_check_disabled():
+    """CHECK_ENABLED off is the master kill switch here too: normal verification runs."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _create_kill_context(backend_client=backend_client, ssh_client=FillerSSHClient())
+
+    result = await _run_filler_check(ctx, check_enabled=False, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFIED.reason
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_create_kill_ignored_for_a_customer_rental():
+    """A paying customer's pod is never punished for the node's default-job history."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _create_kill_context(
+        backend_client=backend_client,
+        ssh_client=FillerSSHClient(),
+        rented_pods=[RentedPod(pod_id="pod-1", container_name="pod_1")],
+    )
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFIED.reason

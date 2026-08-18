@@ -2040,16 +2040,24 @@ class DockerService:
         container_name: str,
         volume_name: str | None = None,
         remove_volume: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Remove the failed container's artifacts; report whether it was already gone.
+
+        DAH-2703: "already gone" is the host-reaper signature — the container existed (we created
+        it) and something outside the platform removed it before this cleanup ran. Unproven cases
+        (SSH dead, diagnostics failed) report False: never accuse a host on missing evidence.
+        """
+        container_missing = False
         try:
             # DAH-2395: read the death evidence before `rm -fv` destroys it —
             # without this line, "why did the container die" (OOM vs entrypoint
             # crash) is unanswerable: the host is the miner's, not ours.
-            await self.capture_failed_container_diagnostics(
+            diagnostics = await self.capture_failed_container_diagnostics(
                 ssh_client=ssh_client,
                 default_extra=default_extra,
                 container_name=container_name,
             )
+            container_missing = diagnostics.container_missing
 
             container = shlex.quote(container_name)
             await retry_ssh_command(
@@ -2081,6 +2089,7 @@ class DockerService:
                 ),
                 exc_info=True,
             )
+        return container_missing
 
     async def _image_has_encrypted_volume_label(
         self,
@@ -3863,6 +3872,12 @@ class DockerService:
 
         log_tag = "container_creation"
         current_step = "start"
+        # DAH-2703: the container reached the host and then disappeared from it — the host-reaper
+        # signature, and the error code the failure is reported with. `container_created` is what
+        # keeps it honest: before `docker run` succeeds there is nothing to remove, so a missing
+        # container there is an ordinary create failure, not a kill.
+        container_created = False
+        container_vanished = False
         volume_encryption_status = VolumeEncryptionStatus.DISABLED
 
         # DAH-2211: a custom-build payload carries `dockerfile_content` (may be
@@ -4569,6 +4584,7 @@ class DockerService:
                         log_tag=log_tag,
                     )
 
+                    container_created = True
                     logger.info("Container creation step finished")
 
                     # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
@@ -4623,13 +4639,14 @@ class DockerService:
 
                         raise Exception("Run docker run command but container is not running")
                 except Exception:
-                    await self.cleanup_failed_container_creation(
+                    container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                     )
+                    container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
                     if is_custom_build:
                         await self._cleanup_custom_build_artifacts(
@@ -4782,13 +4799,14 @@ class DockerService:
                     )
                     prev_timestamp = now_ms()
                 except Exception:
-                    await self.cleanup_failed_container_creation(
+                    container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                     )
+                    container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on post-run failure.
                     if is_custom_build:
                         await self._cleanup_custom_build_artifacts(
@@ -4904,7 +4922,11 @@ class DockerService:
                 msg=str(log_text),
                 detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
-                error_code=FailedContainerErrorCodes.UnknownError,
+                error_code=(
+                    FailedContainerErrorCodes.ContainerVanished
+                    if container_vanished
+                    else FailedContainerErrorCodes.UnknownError
+                ),
                 failure_step=current_step,
                 volume_encryption_status=(
                     VolumeEncryptionStatus.FAILED

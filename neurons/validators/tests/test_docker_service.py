@@ -6113,3 +6113,105 @@ async def test_recover_pod_reports_failure_when_start_raises(docker_service, mon
     # the container may already be up with no plaintext mount, and no later cycle revisits a
     # running pod — put it back down so POD_NOT_RUNNING keeps matching what the customer sees
     assert "docker stop pod_pod-1" in ssh_client.run.await_args.args[0]
+
+
+# DAH-2703: a create that fails because the container was removed from the host mid-creation is
+# reported with its own error code, so the backend can count host kills separately from ordinary
+# create failures.
+
+
+def _filler_create_payload() -> ContainerCreateRequest:
+    return ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        docker_image="daturaai/pearl-miner:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+
+def _filler_executor_info(payload: ContainerCreateRequest) -> ExecutorSSHInfo:
+    return ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+
+@pytest.mark.parametrize(
+    "container_was_removed,expected_error_code",
+    [
+        (True, FailedContainerErrorCodes.ContainerVanished),
+        (False, FailedContainerErrorCodes.UnknownError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_create_failure_reports_a_container_removed_by_the_host(
+    docker_service, monkeypatch, container_was_removed, expected_error_code
+):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    # The container is created, then the next step finds it gone.
+    monkeypatch.setattr(
+        docker_service,
+        "add_ssh_public_keys_with_rental_docker",
+        AsyncMock(side_effect=RuntimeError("404 No such container")),
+    )
+    monkeypatch.setattr(
+        docker_service,
+        "cleanup_failed_container_creation",
+        AsyncMock(return_value=container_was_removed),
+    )
+    payload = _filler_create_payload()
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == expected_error_code
+
+
+@pytest.mark.asyncio
+async def test_create_failure_before_the_container_exists_is_not_a_host_kill(
+    docker_service, monkeypatch
+):
+    """`docker run` itself failed: there was never a container, so "gone" proves nothing."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service,
+        "_run_rental_docker_create_with_port_retry",
+        AsyncMock(side_effect=RuntimeError("no such image")),
+    )
+    cleanup = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
+    payload = _filler_create_payload()
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    # The verdict must never cost us the cleanup itself — volumes and leftovers still go.
+    cleanup.assert_awaited_once()

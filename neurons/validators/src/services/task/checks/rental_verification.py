@@ -117,6 +117,18 @@ class RentalVerificationCheck:
                 ctx, filler_containers, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
             )
 
+        # DAH-2703: same offence, earlier kill. A host reaper that removes the filler seconds after
+        # `docker run` leaves no RUNNING run and no container, so the probe above never sees it and
+        # the node collects unrented incentive while never running a default job. The backend counts
+        # those create-time kills per executor and lists the ones past the streak threshold here.
+        create_killed: bool = bool(
+            rented_data and ctx.executor.uuid in rented_data.filler_create_kill_executor_ids
+        )
+        if create_killed and not has_customer_rental and settings.FILLER_LIVENESS_CHECK_ENABLED:
+            return self._filler_create_kill_result(
+                ctx, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
+            )
+
         # Get required info from context
         backend_client = ctx.services.backend
         executor = ctx.executor
@@ -480,6 +492,22 @@ class RentalVerificationCheck:
                 "run_age_seconds": run_age.total_seconds(),
                 "enforced": enforce,
                 **death_fields,
+            },
+        )
+        return CheckResult(passed=not enforce, event=event, updates={})
+
+    def _filler_create_kill_result(self, ctx: Context, *, enforce: bool) -> CheckResult:
+        """Render the create-time kill verdict for a node with no filler container to probe."""
+        event = render_message(
+            Msg.FILLER_KILLED_AT_CREATE,
+            ctx=ctx,
+            check_id=self.check_id,
+            severity=None if enforce else "warning",
+            impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
+            what={
+                "verified": False,
+                "executor_uuid": ctx.executor.uuid,
+                "enforced": enforce,
             },
         )
         return CheckResult(passed=not enforce, event=event, updates={})
