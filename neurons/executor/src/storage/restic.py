@@ -31,17 +31,13 @@ TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
 RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
-REPOSITORY_RETRY_DELAYS_SECONDS: tuple[float, ...] = (
-    2.0,
-    4.0,
-    8.0,
-    16.0,
-    30.0,
-    30.0,
-    30.0,
-    30.0,
-    30.0,
-)
+# Newly issued backup credentials can take a short time to become usable in AWS.
+# This budget covers repository probing, initialization, and confirmation together.
+REPOSITORY_READINESS_TIMEOUT_SECONDS: float = 180.0
+# Retry quickly at first, then cap the delay so readiness is still checked regularly.
+REPOSITORY_RETRY_INITIAL_DELAY_SECONDS: float = 2.0
+REPOSITORY_RETRY_MAX_DELAY_SECONDS: float = 30.0
+# Short waits keep cancellation and operation heartbeats responsive during backoff.
 REPOSITORY_RETRY_POLL_SECONDS: float = 1.0
 RETRYABLE_REPOSITORY_ERROR_MARKERS: tuple[str, ...] = (
     "access denied",
@@ -214,9 +210,13 @@ class ResticStorageRunner:
         return result
 
     def _ensure_repository_for_backup(self) -> None:
+        repository_readiness_deadline = (
+            time.monotonic() + REPOSITORY_READINESS_TIMEOUT_SECONDS
+        )
         repository_probe = self._run_repository_command_with_retry(
             ["snapshots", "--json"],
             repository_command_name="probe",
+            retry_deadline=repository_readiness_deadline,
             accepted_exit_codes=(0, 10),
         )
         if repository_probe.returncode == 0:
@@ -231,6 +231,7 @@ class ResticStorageRunner:
         repository_initialization = self._run_repository_command_with_retry(
             ["init", "--json"],
             repository_command_name="initialization",
+            retry_deadline=repository_readiness_deadline,
         )
         if repository_initialization.returncode == 0:
             return
@@ -240,6 +241,7 @@ class ResticStorageRunner:
         repository_confirmation = self._run_repository_command_with_retry(
             ["snapshots", "--json"],
             repository_command_name="post-initialization probe",
+            retry_deadline=repository_readiness_deadline,
             accepted_exit_codes=(0, 10),
         )
         if repository_confirmation.returncode != 0:
@@ -253,9 +255,10 @@ class ResticStorageRunner:
         restic_arguments: list[str],
         *,
         repository_command_name: str,
+        retry_deadline: float,
         accepted_exit_codes: tuple[int, ...] = (0,),
     ) -> subprocess.CompletedProcess[str]:
-        remaining_retry_delays = iter(REPOSITORY_RETRY_DELAYS_SECONDS)
+        retry_delay_seconds = REPOSITORY_RETRY_INITIAL_DELAY_SECONDS
         while True:
             self._raise_if_cancellation_requested()
             repository_command_result = subprocess.run(
@@ -270,9 +273,8 @@ class ResticStorageRunner:
             failure_detail = self._redacted_repository_failure_detail(repository_command_result)
             if not _is_retryable_repository_failure(failure_detail):
                 return repository_command_result
-            try:
-                retry_delay_seconds = next(remaining_retry_delays)
-            except StopIteration:
+            remaining_retry_seconds = retry_deadline - time.monotonic()
+            if remaining_retry_seconds <= 0:
                 self._log_transient_repository_failure(
                     repository_command_name,
                     failure_detail,
@@ -281,12 +283,17 @@ class ResticStorageRunner:
                 raise ResticOperationError(
                     "backup storage is not ready yet; please retry shortly"
                 ) from None
+            wait_seconds = min(retry_delay_seconds, remaining_retry_seconds)
             self._log_transient_repository_failure(
                 repository_command_name,
                 failure_detail,
-                retry_delay_seconds=retry_delay_seconds,
+                retry_delay_seconds=wait_seconds,
             )
-            self._wait_before_repository_retry(retry_delay_seconds)
+            self._wait_before_repository_retry(wait_seconds)
+            retry_delay_seconds = min(
+                retry_delay_seconds * 2,
+                REPOSITORY_RETRY_MAX_DELAY_SECONDS,
+            )
 
     def _redacted_repository_failure_detail(
         self,

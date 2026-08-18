@@ -189,8 +189,6 @@ def test_backup_repository_probe_retries_transient_access_denied(
     monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
     monkeypatch.setattr("storage.restic.time.monotonic", clock)
     monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
-    monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_DELAYS_SECONDS", (2.0,))
-
     runner._ensure_repository_for_backup()
 
     assert [command[2] for command in repository_command_sequence.commands] == [
@@ -221,8 +219,6 @@ def test_backup_repository_initialization_retries_transient_access_denied(
     monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
     monkeypatch.setattr("storage.restic.time.monotonic", clock)
     monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
-    monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_DELAYS_SECONDS", (2.0,))
-
     runner._ensure_repository_for_backup()
 
     assert [command[2] for command in repository_command_sequence.commands] == [
@@ -257,8 +253,6 @@ def test_backup_repository_retry_stops_on_cancellation(
     )
     monkeypatch.setattr("storage.restic.time.monotonic", clock)
     monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
-    monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_DELAYS_SECONDS", (2.0,))
-
     with pytest.raises(StorageOperationCancelled, match="cancellation requested"):
         runner._ensure_repository_for_backup()
 
@@ -280,7 +274,9 @@ def test_backup_repository_retry_exhaustion_returns_customer_safe_error(
     monkeypatch.setattr("storage.restic.subprocess.run", run_repository_command)
     monkeypatch.setattr("storage.restic.time.monotonic", clock)
     monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
-    monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_DELAYS_SECONDS", (1.0, 2.0))
+    monkeypatch.setattr("storage.restic.REPOSITORY_READINESS_TIMEOUT_SECONDS", 3.0)
+    monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_INITIAL_DELAY_SECONDS", 1.0)
+    monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_MAX_DELAY_SECONDS", 2.0)
 
     with pytest.raises(ResticOperationError, match="backup storage is not ready"):
         runner._ensure_repository_for_backup()
