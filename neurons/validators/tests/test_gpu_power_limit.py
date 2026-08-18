@@ -1,13 +1,16 @@
 import json
+import logging
 import time
 from unittest.mock import AsyncMock
 
 import pytest
 from neurons.validators.src.payload_models.payloads import GpuPowerLimit
 from neurons.validators.src.services.gpu_power_limit import (
+    GpuPowerReadback,
     GpuPowerRestoreRecord,
     GpuPowerState,
     _clamp_watts,
+    _parse_power_readback_csv,
     _parse_power_state_csv,
     _pod_index_key,
     _restore_key,
@@ -53,9 +56,22 @@ def _commands(ssh: AsyncMock) -> list[str]:
     return [call.args[0] for call in ssh.run.call_args_list]
 
 
-def _set_ok(readback_watts: int) -> list[FakeRun]:
+def _warning_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.levelno == logging.WARNING]
+
+
+def _logged_field(caplog: pytest.LogCaptureFixture, field: str) -> list[object]:
+    """Values of one structured field across every log record that carries it."""
+    return [
+        record.msg.extra[field]
+        for record in caplog.records
+        if hasattr(record.msg, "extra") and field in record.msg.extra
+    ]
+
+
+def _set_ok(readback_watts: int, persistence: str = "Enabled") -> list[FakeRun]:
     """SSH responses for one successful verified set: -pm 1, -pl, readback confirming the target."""
-    return [FakeRun(), FakeRun(), FakeRun(stdout=f"{readback_watts}.00\n")]
+    return [FakeRun(), FakeRun(), FakeRun(stdout=f"{readback_watts}.00, {persistence}\n")]
 
 
 def _set_commands(gpu_uuid: str, watts: int) -> list[str]:
@@ -63,7 +79,7 @@ def _set_commands(gpu_uuid: str, watts: int) -> list[str]:
     return [
         f"nvidia-smi -i {gpu_uuid} -pm 1",
         f"nvidia-smi -i {gpu_uuid} -pl {watts}",
-        f"nvidia-smi -i {gpu_uuid} --query-gpu=power.limit --format=csv,noheader,nounits",
+        f"nvidia-smi -i {gpu_uuid} --query-gpu=power.limit,persistence_mode --format=csv,noheader,nounits",
     ]
 
 
@@ -135,6 +151,116 @@ def test_clamp_watts_skips_na_bounds() -> None:
     # bounds that came back "[N/A]" (None) are not applied — the target passes through unclamped.
     state = GpuPowerState(current_watts=350, min_watts=None, max_watts=None)
     assert _clamp_watts(217, state) == 217
+
+
+# ---------------------------- _parse_power_readback_csv (pure) ----------------------------
+
+
+def test_parse_power_readback_reads_watts_and_enabled_persistence() -> None:
+    assert _parse_power_readback_csv("315.00, Enabled\n") == GpuPowerReadback(
+        watts=315, persistence_enabled=True
+    )
+
+
+def test_parse_power_readback_reads_disabled_persistence() -> None:
+    assert _parse_power_readback_csv("315.00, Disabled\n") == GpuPowerReadback(
+        watts=315, persistence_enabled=False
+    )
+
+
+def test_parse_power_readback_keeps_watts_when_persistence_unreported() -> None:
+    # A GPU that does not expose persistence_mode must still yield a usable readback.
+    assert _parse_power_readback_csv("315.00, [N/A]\n") == GpuPowerReadback(
+        watts=315, persistence_enabled=None
+    )
+
+
+def test_parse_power_readback_unreadable_watts_is_none() -> None:
+    assert _parse_power_readback_csv("[N/A], Enabled\n") == GpuPowerReadback(
+        watts=None, persistence_enabled=True
+    )
+
+
+# ---------------------------- persistence-mode verdict (DAH-2702) ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_cap_logs_persistence_enabled_and_does_not_warn(caplog: pytest.LogCaptureFixture) -> None:
+    ssh = fake_ssh(FakeRun(stdout=STATE_CSV), *_set_ok(209, persistence="Enabled"))
+
+    with caplog.at_level(logging.DEBUG):
+        ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209), FakeRedis(), POD_ID, EXECUTOR_ID)
+
+    assert ok is True
+    assert set(_logged_field(caplog, "persistence_enabled")) == {True}
+    assert not _warning_records(caplog)
+
+
+@pytest.mark.asyncio
+async def test_cap_with_persistence_off_still_succeeds_but_warns(caplog: pytest.LogCaptureFixture) -> None:
+    # Not fail-closed on purpose: a host that cannot hold persistence mode would lose PEARL entirely.
+    ssh = fake_ssh(FakeRun(stdout=STATE_CSV), *_set_ok(209, persistence="Disabled"))
+
+    with caplog.at_level(logging.DEBUG):
+        ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209), FakeRedis(), POD_ID, EXECUTOR_ID)
+
+    assert ok is True
+    # ONE event, raised to WARNING — not a second log line, so counting capped GPUs still works.
+    cap_warnings = _warning_records(caplog)
+    assert len(cap_warnings) == 1
+    assert cap_warnings[0].msg.extra["persistence_enabled"] is False
+    assert cap_warnings[0].msg.extra["gpu_power_action"] == "cap"
+    assert cap_warnings[0].msg.extra["status"] == "ok"
+    assert "persistence mode is off" in str(cap_warnings[0].msg)
+
+
+@pytest.mark.asyncio
+async def test_cap_warns_when_pm_failed_and_the_gpu_confirms_persistence_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The production shape: -pm 1 itself fails and the readback then confirms persistence is off.
+    ssh = fake_ssh(
+        FakeRun(stdout=STATE_CSV),
+        FakeRun(exit_status=3, stderr="pm not supported"),
+        FakeRun(),
+        FakeRun(stdout="209.00, Disabled\n"),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209), FakeRedis(), POD_ID, EXECUTOR_ID)
+
+    assert ok is True
+    cap_warnings = [record for record in _warning_records(caplog) if record.msg.extra.get("gpu_power_action")]
+    assert len(cap_warnings) == 1
+    assert cap_warnings[0].msg.extra["persistence_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_cap_does_not_warn_when_persistence_is_unreported(caplog: pytest.LogCaptureFixture) -> None:
+    # Unreported ("[N/A]", no column) is not the same as off: only an explicit Disabled warns,
+    # otherwise every GPU that cannot report the field would look like a revert risk.
+    ssh = fake_ssh(FakeRun(stdout=STATE_CSV), *_set_ok(209, persistence="[N/A]"))
+
+    with caplog.at_level(logging.DEBUG):
+        ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209), FakeRedis(), POD_ID, EXECUTOR_ID)
+
+    assert ok is True
+    assert _logged_field(caplog, "persistence_enabled") == [None]
+    assert not _warning_records(caplog)
+
+
+@pytest.mark.asyncio
+async def test_restore_with_persistence_off_does_not_warn(caplog: pytest.LogCaptureFixture) -> None:
+    # Only a cap is at risk from a lost persistence mode: a restore sets the limit back UP, and a
+    # driver unload lands on the default anyway. Warning here would inflate the cap-side signal.
+    ssh = fake_ssh(FakeRun(stdout=STATE_CSV), *_set_ok(400, persistence="Disabled"))
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+
+    with caplog.at_level(logging.DEBUG):
+        restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
+
+    assert restored == 1
+    assert not _warning_records(caplog)
 
 
 # ---------------------------- apply_filler_gpu_power_limits (fail-closed) ----------------------------
