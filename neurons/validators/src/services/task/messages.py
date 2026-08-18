@@ -1058,8 +1058,8 @@ class RentalVerificationMessages:
         severity="error",
         category="policy",
         impact=(
-            "Unrented incentive withheld: every Lium default job assigned to this machine is "
-            "destroyed seconds after it starts, so the machine never runs the job it is paid for"
+            "Unrented incentive withheld: Lium default jobs assigned to this machine were "
+            "destroyed seconds after they started, repeatedly over the last 24 hours"
         ),
         remediation=(
             "Stop the host-side process that removes containers it does not recognise, or "
