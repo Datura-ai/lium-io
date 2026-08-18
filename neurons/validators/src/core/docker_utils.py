@@ -173,7 +173,9 @@ async def df_available_bytes(ssh_client: asyncssh.SSHClientConnection, host_path
     return int(columns[3])
 
 
-# Docker's two ways of saying the container is not on this host any more.
+# Docker's two ways of saying the container is not on this host any more. Kept separate from
+# services.docker_service._is_missing_docker_container_error, which reads an exception and matches
+# case-sensitively; this one reads `docker inspect` stderr, which says "No such object".
 _MISSING_CONTAINER_MARKERS = ("no such object", "no such container")
 
 

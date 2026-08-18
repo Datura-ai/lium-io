@@ -2043,9 +2043,8 @@ class DockerService:
     ) -> bool:
         """Remove the failed container's artifacts; report whether it was already gone.
 
-        DAH-2703: "already gone" is the host-reaper signature — the container existed (we created
-        it) and something outside the platform removed it before this cleanup ran. Unproven cases
-        (SSH dead, diagnostics failed) report False: never accuse a host on missing evidence.
+        DAH-2703: unproven cases (SSH dead, diagnostics failed) report False — never accuse a host
+        on missing evidence.
         """
         container_missing = False
         try:
@@ -3873,9 +3872,8 @@ class DockerService:
         log_tag = "container_creation"
         current_step = "start"
         # DAH-2703: the container reached the host and then disappeared from it — the host-reaper
-        # signature, and the error code the failure is reported with. `container_created` is what
-        # keeps it honest: before `docker run` succeeds there is nothing to remove, so a missing
-        # container there is an ordinary create failure, not a kill.
+        # signature. `container_created` keeps it honest: before `docker run` succeeds there is
+        # nothing to remove, so a missing container there is an ordinary create failure.
         container_created = False
         container_vanished = False
         volume_encryption_status = VolumeEncryptionStatus.DISABLED

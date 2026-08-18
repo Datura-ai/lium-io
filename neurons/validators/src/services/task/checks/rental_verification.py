@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import asyncssh
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
@@ -108,14 +109,27 @@ class RentalVerificationCheck:
         )
         if create_killed and not has_customer_rental and settings.FILLER_LIVENESS_CHECK_ENABLED:
             if settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED:
-                return self._filler_create_kill_result(ctx)
+                event = render_message(
+                    Msg.FILLER_KILLED_AT_CREATE,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"verified": False, "executor_uuid": ctx.executor.uuid, "enforced": True},
+                )
+                return CheckResult(passed=False, event=event, updates={})
             # Shadow: observe and fall through to the normal verification. Returning a pass here
             # would hand the node a free pass — it skips the backend health check the node would
             # otherwise have to survive, so shadow mode would be an upgrade, not an observation.
+            # A check owns one event and the fall-through path writes it, so the shadow verdict
+            # rides a log line carrying the same reason code the enforced event uses.
             logger.warning(
-                "%s (shadow): executor %s is destroying its Lium default job during create",
-                Msg.FILLER_KILLED_AT_CREATE.reason,
-                ctx.executor.uuid,
+                _m(
+                    "Lium default job is destroyed during create (shadow)",
+                    extra=get_extra_info({
+                        "reason_code": Msg.FILLER_KILLED_AT_CREATE.reason,
+                        "executor_uuid": ctx.executor.uuid,
+                        "enforced": False,
+                    }),
+                )
             )
 
         if filler_containers and not has_customer_rental:
@@ -508,20 +522,6 @@ class RentalVerificationCheck:
             },
         )
         return CheckResult(passed=not enforce, event=event, updates={})
-
-    def _filler_create_kill_result(self, ctx: Context) -> CheckResult:
-        """Render the create-time kill verdict. Enforcement only — shadow never lands here."""
-        event = render_message(
-            Msg.FILLER_KILLED_AT_CREATE,
-            ctx=ctx,
-            check_id=self.check_id,
-            what={
-                "verified": False,
-                "executor_uuid": ctx.executor.uuid,
-                "enforced": True,
-            },
-        )
-        return CheckResult(passed=False, event=event, updates={})
 
     def _filler_state_unknown_result(
         self,
