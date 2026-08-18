@@ -515,7 +515,7 @@ class SubtensorClient:
         return [
             neuron
             for neuron in metagraph.neurons
-            if neuron.hotkey in opted_in_by_hotkey or neuron.uid in burner_uids
+            if neuron.axon_info.is_serving or neuron.uid in burner_uids
         ]
 
     async def fetch_miners(self) -> None:

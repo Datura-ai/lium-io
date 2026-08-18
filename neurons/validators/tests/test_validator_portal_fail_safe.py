@@ -26,6 +26,10 @@ class _AxonInfo:
     ip: str = "0.0.0.0"
     port: int = 0
 
+    @property
+    def is_serving(self) -> bool:
+        return self.ip != "0.0.0.0"
+
 
 @dataclass
 class _Neuron:
@@ -323,13 +327,16 @@ async def test_live_provider_count_transition_to_zero_warns_and_caches_empty(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = _make_subtensor_client()
-    opted_out_provider = _Neuron(
+    serving_non_opted_in_provider = _Neuron(
         uid=100,
-        hotkey="opted-out-provider",
+        hotkey="serving-non-opted-in-provider",
         axon_info=_AxonInfo("192.0.2.100", 8091),
     )
+    non_serving_provider = _Neuron(uid=101, hotkey="non-serving-provider")
     client.get_metagraph = MagicMock(
-        return_value=MagicMock(neurons=[opted_out_provider])
+        return_value=MagicMock(
+            neurons=[serving_non_opted_in_provider, non_serving_provider]
+        )
     )
     client.redis_service.get.return_value = _cached_miners_json(
         _opted_in_miner(),
@@ -354,7 +361,7 @@ async def test_live_provider_count_transition_to_zero_warns_and_caches_empty(
         client.redis_service.set.await_args.args[1]
     )
     assert cached.miners == []
-    assert client.miners == []
+    assert client.miners == [serving_non_opted_in_provider]
 
 
 @pytest.mark.parametrize(
