@@ -279,15 +279,11 @@ def test_backup_repository_retry_exhaustion_preserves_redacted_error(
     monkeypatch.setattr("storage.restic.subprocess.run", run_repository_command)
     monkeypatch.setattr("storage.restic.time.monotonic", clock)
     monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
-    monkeypatch.setattr("storage.restic.REPOSITORY_READINESS_TIMEOUT_SECONDS", 3.0)
-    monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_INITIAL_DELAY_SECONDS", 1.0)
-    monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_MAX_DELAY_SECONDS", 2.0)
-
     with pytest.raises(ResticOperationError, match="Backup storage was not ready") as raised:
         runner._ensure_repository_for_backup()
 
-    assert run_repository_command.call_count == 3
-    assert clock.now == 3.0
+    assert run_repository_command.call_count == 10
+    assert clock.now == 180.0
     expected_error = "Stat(<config/>) failed: Stat: Access Denied for [REDACTED]"
     assert expected_error in str(raised.value)
     assert expected_error in capsys.readouterr().err

@@ -31,17 +31,6 @@ TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 MEBIBYTE = 1024 * 1024
 RESTIC_TMPFS_BYTES = 512 * MEBIBYTE
-# Newly issued backup credentials can take a short time to become usable in AWS.
-# This budget covers repository probing, initialization, and confirmation together.
-REPOSITORY_READINESS_TIMEOUT_SECONDS: float = 180.0
-# Retry quickly at first, then cap the delay so readiness is still checked regularly.
-REPOSITORY_RETRY_INITIAL_DELAY_SECONDS: float = 2.0
-REPOSITORY_RETRY_MAX_DELAY_SECONDS: float = 30.0
-# Short waits keep cancellation and operation heartbeats responsive during backoff.
-REPOSITORY_RETRY_POLL_SECONDS: float = 1.0
-# Restic treats AccessDenied as permanent, but a newly attached IAM policy can
-# return it briefly while AWS propagates the policy to S3.
-IAM_POLICY_PROPAGATION_ERROR_MARKER = "accessdenied"
 ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
 ENCRYPTED_BOOTSTRAP_SCRIPT = r"""
 set -eu
@@ -203,9 +192,9 @@ class ResticStorageRunner:
         return result
 
     def _ensure_repository_for_backup(self) -> None:
-        repository_readiness_deadline = (
-            time.monotonic() + REPOSITORY_READINESS_TIMEOUT_SECONDS
-        )
+        # A newly attached IAM policy can briefly return Access Denied while AWS
+        # propagates it. Share one three-minute readiness window across setup.
+        repository_readiness_deadline = time.monotonic() + 180.0
         repository_probe = self._run_repository_command_with_retry(
             ["snapshots", "--json"],
             repository_command_name="probe",
@@ -251,7 +240,8 @@ class ResticStorageRunner:
         retry_deadline: float,
         accepted_exit_codes: tuple[int, ...] = (0,),
     ) -> subprocess.CompletedProcess[str]:
-        retry_delay_seconds = REPOSITORY_RETRY_INITIAL_DELAY_SECONDS
+        # Start with a short delay so newly propagated permissions recover quickly.
+        retry_delay_seconds = 2.0
         while True:
             self._raise_if_cancellation_requested()
             repository_command_result = subprocess.run(
@@ -284,10 +274,8 @@ class ResticStorageRunner:
                 retry_delay_seconds=wait_seconds,
             )
             self._wait_before_repository_retry(wait_seconds)
-            retry_delay_seconds = min(
-                retry_delay_seconds * 2,
-                REPOSITORY_RETRY_MAX_DELAY_SECONDS,
-            )
+            # Avoid hammering S3 while still checking readiness at least every 30 seconds.
+            retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
 
     def _redacted_repository_failure_detail(
         self,
@@ -304,7 +292,8 @@ class ResticStorageRunner:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
                 return
-            time.sleep(min(REPOSITORY_RETRY_POLL_SECONDS, remaining_seconds))
+            # Wake every second so cancellation and heartbeats remain responsive.
+            time.sleep(min(1.0, remaining_seconds))
 
     def _raise_if_cancellation_requested(self) -> None:
         if self._events.cancellation_requested:
@@ -783,8 +772,12 @@ class ResticStorageRunner:
 
 
 def _is_retryable_repository_failure(failure_detail: str) -> bool:
-    normalized_detail = failure_detail.casefold().replace(" ", "")
-    return IAM_POLICY_PROPAGATION_ERROR_MARKER in normalized_detail
+    # Restic treats AccessDenied as permanent and does not retry it, but AWS can
+    # return it temporarily while a newly attached IAM policy is propagating.
+    retryable_failure_markers = ("accessdenied",)
+    # Normalization matches both "Access Denied" and compact "AccessDenied" forms.
+    normalized_detail = "".join(failure_detail.casefold().split())
+    return any(marker in normalized_detail for marker in retryable_failure_markers)
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:
