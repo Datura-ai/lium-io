@@ -2015,6 +2015,100 @@ async def test_create_customer_rental_skips_inspector_collector_when_disabled(
     assert inspector_step.skipped is True
 
 
+def _cvm_socket_payload(workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerCreateRequest:
+    return ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=workload_kind,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+
+def _executor_info_for(payload: ContainerCreateRequest, *, tdx_quote: str | None) -> ExecutorSSHInfo:
+    return ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+        tdx_quote=tdx_quote,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_container_mounts_dstack_socket_on_cvm_node(docker_service, monkeypatch):
+    # The executor answered the SSH-key upload with a TDX quote → it runs in a dstack CVM guest →
+    # the customer's pod gets the guest agent socket so its TEE tooling can quote from inside.
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    run_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_spy)
+    payload = _cvm_socket_payload()
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote='{"quote": "0xdeadbeef"}'),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    run_spec = run_spy.await_args.kwargs["run_spec"]
+    binds = [(m.source, m.target, m.read_only) for m in run_spec.volumes]
+    assert ("/var/run/dstack.sock", "/var/run/dstack.sock", False) in binds
+    # The existing CVM quirk stays: no --cpus inside a CVM.
+    assert run_spec.cpu_count is None
+
+
+@pytest.mark.asyncio
+async def test_create_container_no_dstack_socket_on_bare_metal(docker_service, monkeypatch):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    run_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_spy)
+    payload = _cvm_socket_payload()
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    run_spec = run_spy.await_args.kwargs["run_spec"]
+    assert "/var/run/dstack.sock" not in {m.target for m in run_spec.volumes}
+    assert run_spec.cpu_count == 1
+
+
+@pytest.mark.asyncio
+async def test_create_container_no_dstack_socket_for_filler_on_cvm_node(docker_service, monkeypatch):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    run_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_spy)
+    payload = _cvm_socket_payload(WorkloadKind.FILLER)
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote='{"quote": "0xdeadbeef"}'),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    run_spec = run_spy.await_args.kwargs["run_spec"]
+    assert "/var/run/dstack.sock" not in {m.target for m in run_spec.volumes}
+
+
 @pytest.mark.asyncio
 async def test_create_filler_starts_inspector_collector(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)

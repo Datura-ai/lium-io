@@ -521,6 +521,25 @@ def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets
     return mounts
 
 
+# The dstack guest agent's Unix socket inside a dstack CVM guest — the path the dstack SDK dials by
+# default (`DstackClient()`), and the path renter tooling that says "Lium Confidential Computing"
+# expects to find in the pod. The executor's own compose (docker-compose.app.yml) already bind-mounts
+# it from the guest for the executor's TDX quotes; a rental container on the same guest gets the same
+# bind (source == target) so the renter can call GetQuote/Info from inside the pod.
+DSTACK_GUEST_SOCKET_PATH = "/var/run/dstack.sock"
+
+
+def _build_dstack_socket_mounts(payload: ContainerCreateRequest, *, in_cvm: bool) -> list[VolumeMount]:
+    # Only a customer rental on a dstack CVM guest gets the socket. `in_cvm` is the validator's
+    # existing CVM marker (the executor answered the SSH-key upload with a TDX quote it could only
+    # have obtained through this very socket) — outside a CVM the source path does not exist and
+    # dockerd would silently create an empty DIRECTORY there. A FILLER (DPHN/PEARL) has no
+    # attestation use and the socket is one shared per guest, so it never receives it.
+    if not in_cvm or payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+        return []
+    return [VolumeMount(source=DSTACK_GUEST_SOCKET_PATH, target=DSTACK_GUEST_SOCKET_PATH)]
+
+
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
@@ -990,6 +1009,7 @@ class DockerService:
         gpu_devices,
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
+        in_cvm: bool = False,
     ) -> ContainerRunSpec:
         environment = {
             key: str(value)
@@ -1019,6 +1039,9 @@ class DockerService:
             occupied_targets.add("/mnt")
         # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
         volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
+        # Customer-rental-only, CVM-only: the dstack guest agent socket, so a TEE workload can fetch
+        # its own TDX quote from inside the pod. No-op on bare metal and for fillers.
+        volumes.extend(_build_dstack_socket_mounts(payload, in_cvm=in_cvm))
 
         device_mounts = [DeviceMount(path_on_host="/dev/net/tun", path_in_container="/dev/net/tun")]
         if encrypted_local_volume:
@@ -4673,7 +4696,8 @@ class DockerService:
                 # CPU and memory restriction flags
                 # --cpus flag isn't working inside cvm. skip to use it when tdx_quote is present
                 # TODO: remove this when cvm is fixed
-                cpu_count = None if executor_info.tdx_quote else payload.cpu_count
+                in_cvm = bool(executor_info.tdx_quote)
+                cpu_count = None if in_cvm else payload.cpu_count
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -4686,6 +4710,9 @@ class DockerService:
                     gpu_devices=gpu_config,
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
+                    # A CVM rental gets the dstack guest-agent socket bind-mounted so the workload
+                    # can take TDX quotes from inside the pod (renter-reported gap on CC nodes).
+                    in_cvm=in_cvm,
                 )
 
                 logger.info(
