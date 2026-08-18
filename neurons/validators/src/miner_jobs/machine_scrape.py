@@ -1039,6 +1039,8 @@ def check_storage_limit_ability() -> tuple[bool, str]:
 
 NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+PROC_SELF_STATUS_PATH = "/proc/self/status"
+NVIDIACTL_PATH = "/dev/nvidiactl"
 INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
 # Enough of the GID table to carry both the link-local entries and the IPv4-mapped one. Its index
 # is driver-specific - mlx5 puts it at 2-3, Intel irdma at 1 - so consumers must match on the
@@ -1079,6 +1081,43 @@ def check_ncu_profiling_access() -> NcuProfilingObservation:
     return NcuProfilingObservation(
         "unknown", f"Unexpected RmProfilingAdminOnly value: {flag_value}"
     )
+
+
+class GpuPowerCapProbe:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, cap_eff: str, nvidiactl_owner_uid: int | None, scrape_error: str) -> None:
+        self.cap_eff = cap_eff
+        self.nvidiactl_owner_uid = nvidiactl_owner_uid
+        self.scrape_error = scrape_error
+
+
+def probe_gpu_power_cap_ability() -> GpuPowerCapProbe:
+    # DAH-2704: `nvidia-smi -pl` (the PEARL filler's power cap) exits 4 unless the executor container
+    # holds CAP_SYS_ADMIN *and* its root owns /dev/nvidiactl - a sysbox userns maps the device to
+    # nobody while keeping every capability, so neither reading alone tells the two apart. Report both
+    # raw values and let the backend decide; an unreadable one stays empty/None, never a guess.
+    scrape_errors: list[str] = []
+
+    cap_eff: str = ""
+    try:
+        with open(PROC_SELF_STATUS_PATH) as status_file:
+            status_content = status_file.read()
+        match = re.search(r"^CapEff:\s*([0-9a-fA-F]+)\s*$", status_content, re.M)
+        if match is None:
+            scrape_errors.append(f"CapEff not present in {PROC_SELF_STATUS_PATH}")
+        else:
+            cap_eff = match.group(1)
+    except Exception as e:
+        scrape_errors.append(f"Cannot read {PROC_SELF_STATUS_PATH}: {e}")
+
+    nvidiactl_owner_uid: int | None = None
+    try:
+        nvidiactl_owner_uid = os.stat(NVIDIACTL_PATH).st_uid
+    except Exception as e:
+        scrape_errors.append(f"Cannot stat {NVIDIACTL_PATH}: {e}")
+
+    return GpuPowerCapProbe(cap_eff, nvidiactl_owner_uid, "; ".join(scrape_errors))
 
 
 def get_host_boot_id() -> str:
@@ -1344,6 +1383,13 @@ def get_machine_specs():
     if ncu_profiling.scrape_error:
         data["data_ncu_profiling_scrape_error"] = ncu_profiling.scrape_error
     data["data_boot_id"] = get_host_boot_id()
+
+    power_cap_probe = probe_gpu_power_cap_ability()
+    data["data_container_cap_eff"] = power_cap_probe.cap_eff
+    data["data_nvidiactl_owner_uid"] = power_cap_probe.nvidiactl_owner_uid
+    if power_cap_probe.scrape_error:
+        data["data_power_cap_probe_error"] = power_cap_probe.scrape_error
+
     infiniband = get_infiniband_ports()
     data["data_infiniband_ports"] = [port.as_payload() for port in infiniband.ports]
     if infiniband.scrape_error:
