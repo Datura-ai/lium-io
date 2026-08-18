@@ -201,9 +201,12 @@ async def test_cap_with_persistence_off_still_succeeds_but_warns(caplog) -> None
         ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209), FakeRedis(), POD_ID, EXECUTOR_ID)
 
     assert ok is True
-    assert set(_logged_field(caplog, "persistence_enabled")) == {False}
+    # ONE event, raised to WARNING — not a second log line, so counting capped GPUs still works.
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 1
+    assert warnings[0].msg.extra["persistence_enabled"] is False
+    assert warnings[0].msg.extra["gpu_power_action"] == "cap"
+    assert warnings[0].msg.extra["status"] == "ok"
     assert "persistence mode is off" in str(warnings[0].msg)
 
 
