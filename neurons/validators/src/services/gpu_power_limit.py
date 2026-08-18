@@ -120,6 +120,8 @@ class PowerLimitSetOutcome:
 
 # nvidia-smi's own labels; anything else means the GPU did not report the field.
 _PERSISTENCE_BY_LABEL: dict[str, bool] = {"enabled": True, "disabled": False}
+# nvidia-smi could not be read at all — not "the limit is unset", just no answer.
+_UNREADABLE_READBACK = GpuPowerReadback(watts=None, persistence_enabled=None)
 
 
 def _restore_key(gpu_uuid: str) -> str:
@@ -228,9 +230,9 @@ async def _read_back_power_state(ssh: asyncssh.SSHClientConnection, uuid: str) -
     try:
         result = await ssh.run(readback_command, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS)
     except Exception:
-        return GpuPowerReadback(watts=None, persistence_enabled=None)
+        return _UNREADABLE_READBACK
     if result.exit_status != 0:
-        return GpuPowerReadback(watts=None, persistence_enabled=None)
+        return _UNREADABLE_READBACK
     return _parse_power_readback_csv(str(result.stdout))
 
 
