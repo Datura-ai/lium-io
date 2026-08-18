@@ -1,10 +1,10 @@
-import aiohttp
 import asyncio
-import json
 import logging
 import time
 
+import aiohttp
 import bittensor
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -13,29 +13,40 @@ from core.utils import _m, get_extra_info
 logger = logging.getLogger(__name__)
 
 
+class OptedInMiner(BaseModel):
+    miner_hotkey: str = Field(min_length=1)
+    central_miner_ip: str = Field(min_length=1)
+    central_miner_port: int = Field(strict=True, ge=1, le=65535)
+
+    @field_validator("miner_hotkey", "central_miner_ip")
+    @classmethod
+    def validate_nonempty_string(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("central_miner_ip")
+    @classmethod
+    def validate_serving_ip(cls, value: str) -> str:
+        if value == "0.0.0.0":
+            raise ValueError("must identify a serving endpoint")
+        return value
+
+
 class ValidatorPortalAPI:
     @staticmethod
-    async def get_opted_in_miners() -> list[dict] | None:
-        """Fetch list of miners that have opted in.
-
-        Returns list of dicts with shape:
-            [
-                {
-                    "miner_hotkey": str,
-                    "miner_coldkey": str,
-                    "central_miner_ip": str,
-                    "central_miner_port": int,
-                },
-                ...
-            ]
-        Returns None on error so callers can distinguish portal unavailability
-        from a successful response with no opted-in miners.
-        """
+    async def get_opted_in_miners() -> list[OptedInMiner] | None:
+        """Return None on failure and an empty list for a successful empty response."""
         try:
             keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
             validator_hotkey = keypair.ss58_address
 
-            api_base = settings.MINER_PORTAL_REST_API_URL.rstrip("/") if settings.MINER_PORTAL_REST_API_URL else ""
+            api_base = (
+                settings.MINER_PORTAL_REST_API_URL.rstrip("/")
+                if settings.MINER_PORTAL_REST_API_URL
+                else ""
+            )
             if not api_base:
                 return None
 
@@ -80,13 +91,43 @@ class ValidatorPortalAPI:
                                 )
                             )
                             return None
-                        return data
+                        try:
+                            return [OptedInMiner.model_validate(item) for item in data]
+                        except ValidationError as exc:
+                            logger.error(
+                                _m(
+                                    "Invalid opted-in miner record from portal",
+                                    extra=get_extra_info(
+                                        {
+                                            "url": url,
+                                            "record_count": len(data),
+                                            "error": str(exc),
+                                        }
+                                    ),
+                                )
+                            )
+                            return None
                 except asyncio.TimeoutError:
-                    logger.error(_m("Timeout fetching opted-in miners from portal", extra=get_extra_info({"url": url})))
+                    logger.error(
+                        _m(
+                            "Timeout fetching opted-in miners from portal",
+                            extra=get_extra_info({"url": url}),
+                        )
+                    )
                     return None
                 except Exception as e:
-                    logger.error(_m("Error fetching opted-in miners from portal", extra=get_extra_info({"url": url, "error": str(e)})))
+                    logger.error(
+                        _m(
+                            "Error fetching opted-in miners from portal",
+                            extra=get_extra_info({"url": url, "error": str(e)}),
+                        )
+                    )
                     return None
         except Exception as e:
-            logger.error(_m("Unexpected error during opted-in miners fetch", extra=get_extra_info({"error": str(e)})))
+            logger.error(
+                _m(
+                    "Unexpected error during opted-in miners fetch",
+                    extra=get_extra_info({"error": str(e)}),
+                )
+            )
             return None
