@@ -160,7 +160,7 @@ def _apply_eligibility_floor(
 
 def _classify_missing_scored_hotkeys(
     miner_scores: dict[str, float],
-    snapshot_miner_hotkeys: set[str],
+    selected_miner_hotkeys: set[str],
     registered_hotkeys: set[str],
     active_hotkeys: set[str],
 ) -> MissingScoredHotkeys:
@@ -169,7 +169,7 @@ def _classify_missing_scored_hotkeys(
         for hotkey, score in miner_scores.items()
         if score > 0
         and hotkey in registered_hotkeys
-        and hotkey not in snapshot_miner_hotkeys
+        and hotkey not in selected_miner_hotkeys
     )
     active_missing_hotkeys = [
         hotkey for hotkey in missing_hotkeys if hotkey in active_hotkeys
@@ -497,7 +497,7 @@ class SubtensorClient:
         self._report_cached_opted_in_miners_usage(cached_snapshot)
         return cached_snapshot.miners
 
-    def _build_miners_from_opted_in_snapshot(
+    def _build_serving_miners_with_opted_in_routing(
         self,
         opted_in_miners: Sequence[OptedInMiner],
     ) -> list[bittensor.NeuronInfo]:
@@ -539,7 +539,7 @@ class SubtensorClient:
                     )
                 )
                 return
-            miners = self._build_miners_from_opted_in_snapshot(opted_in_miners)
+            miners = self._build_serving_miners_with_opted_in_routing(opted_in_miners)
 
         logger.info(
             _m(
@@ -583,16 +583,16 @@ class SubtensorClient:
         except Exception as e:
             logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
-    def _log_scored_hotkeys_missing_from_snapshot(
+    def _log_scored_hotkeys_missing_from_selected_miners(
         self,
         miner_scores: dict[str, float],
-        snapshot_miners: Sequence[bittensor.NeuronInfo],
+        selected_miners: Sequence[bittensor.NeuronInfo],
         registered_miners: Sequence[bittensor.NeuronInfo],
         active_hotkeys: set[str],
     ) -> None:
         missing_hotkeys = _classify_missing_scored_hotkeys(
             miner_scores=miner_scores,
-            snapshot_miner_hotkeys={miner.hotkey for miner in snapshot_miners},
+            selected_miner_hotkeys={miner.hotkey for miner in selected_miners},
             registered_hotkeys={miner.hotkey for miner in registered_miners},
             active_hotkeys=active_hotkeys,
         )
@@ -609,7 +609,7 @@ class SubtensorClient:
         )
         log_diagnostic(
             _m(
-                "[set_weights] scored miners missing from provider snapshot",
+                "[set_weights] scored miners missing from selected miner set",
                 extra=get_extra_info(
                     {
                         **self.default_extra,
@@ -656,9 +656,9 @@ class SubtensorClient:
             return
 
         metagraph = self.get_metagraph()
-        self._log_scored_hotkeys_missing_from_snapshot(
+        self._log_scored_hotkeys_missing_from_selected_miners(
             miner_scores=miner_scores,
-            snapshot_miners=miners,
+            selected_miners=miners,
             registered_miners=metagraph.neurons,
             active_hotkeys=active_hotkeys or set(),
         )

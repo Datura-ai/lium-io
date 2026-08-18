@@ -60,6 +60,24 @@ def _make_subtensor_client(
     return client
 
 
+def _make_weight_submission_client(
+    *,
+    selected_miners: list[_Neuron],
+    registered_miners: list[_Neuron],
+) -> SubtensorClient:
+    client = _make_subtensor_client()
+    client.netuid = 1
+    client.version_key = 10000
+    client.wallet = MagicMock()
+    client.send_weights_to_lium = AsyncMock()
+    client.get_current_block = MagicMock(return_value=100)
+    client.get_miners = AsyncMock(return_value=selected_miners)
+    client.get_metagraph = MagicMock(
+        return_value=MagicMock(neurons=registered_miners)
+    )
+    return client
+
+
 def _cached_miners_json(*miners: OptedInMiner, cached_at: float) -> str:
     return OptedInMinerSnapshot(
         cached_at=cached_at,
@@ -69,6 +87,13 @@ def _cached_miners_json(*miners: OptedInMiner, cached_at: float) -> str:
 
 def _structured_extra(record: logging.LogRecord) -> Mapping[str, object]:
     return cast(Mapping[str, object], getattr(record.msg, "extra"))
+
+
+def _records_with_message(
+    caplog: pytest.LogCaptureFixture,
+    message: str,
+) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.getMessage() == message]
 
 
 def _preserve_weights(
@@ -381,21 +406,15 @@ async def test_missing_scored_provider_is_diagnosed_without_blocking_submission(
     expected_inactive: list[str],
 ) -> None:
     provider_hotkey = "portal-provider"
-    snapshot_miner = _Neuron(
+    selected_miner = _Neuron(
         uid=2,
-        hotkey="snapshot-miner",
+        hotkey="selected-miner",
         axon_info=_AxonInfo("192.0.2.2", 8091),
     )
     registered_provider = _Neuron(uid=100, hotkey=provider_hotkey)
-    client = _make_subtensor_client()
-    client.netuid = 1
-    client.version_key = 10000
-    client.wallet = MagicMock()
-    client.send_weights_to_lium = AsyncMock()
-    client.get_current_block = MagicMock(return_value=100)
-    client.get_miners = AsyncMock(return_value=[snapshot_miner])
-    client.get_metagraph = MagicMock(
-        return_value=MagicMock(neurons=[snapshot_miner, registered_provider])
+    client = _make_weight_submission_client(
+        selected_miners=[selected_miner],
+        registered_miners=[selected_miner, registered_provider],
     )
 
     subtensor = MagicMock()
@@ -409,15 +428,14 @@ async def test_missing_scored_provider_is_diagnosed_without_blocking_submission(
 
     with caplog.at_level(expected_level):
         await client.set_weights(
-            miner_scores={"snapshot-miner": 0.5, provider_hotkey: 0.5},
+            miner_scores={"selected-miner": 0.5, provider_hotkey: 0.5},
             active_hotkeys=active_hotkeys,
         )
 
-    diagnostics = [
-        record
-        for record in caplog.records
-        if record.getMessage() == "[set_weights] scored miners missing from provider snapshot"
-    ]
+    diagnostics = _records_with_message(
+        caplog,
+        "[set_weights] scored miners missing from selected miner set",
+    )
     assert len(diagnostics) == 1
     diagnostic = diagnostics[0]
     assert diagnostic.levelno == expected_level
@@ -429,28 +447,21 @@ async def test_missing_scored_provider_is_diagnosed_without_blocking_submission(
 
 
 @pytest.mark.asyncio
-async def test_legitimate_opt_out_keeps_preexisting_vector_behavior(
+async def test_registered_non_serving_provider_is_omitted_from_weight_vector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot_miner = _Neuron(
+    selected_miner = _Neuron(
         uid=2,
-        hotkey="snapshot-miner",
+        hotkey="selected-miner",
         axon_info=_AxonInfo("192.0.2.2", 8091),
     )
-    opted_out_provider = _Neuron(
+    non_serving_provider = _Neuron(
         uid=100,
-        hotkey="opted-out-provider",
-        axon_info=_AxonInfo("192.0.2.100", 8091),
+        hotkey="non-serving-provider",
     )
-    client = _make_subtensor_client()
-    client.netuid = 1
-    client.version_key = 10000
-    client.wallet = MagicMock()
-    client.send_weights_to_lium = AsyncMock()
-    client.get_current_block = MagicMock(return_value=100)
-    client.get_miners = AsyncMock(return_value=[snapshot_miner])
-    client.get_metagraph = MagicMock(
-        return_value=MagicMock(neurons=[snapshot_miner, opted_out_provider])
+    client = _make_weight_submission_client(
+        selected_miners=[selected_miner],
+        registered_miners=[selected_miner, non_serving_provider],
     )
 
     subtensor = MagicMock()
@@ -462,7 +473,7 @@ async def test_legitimate_opt_out_keeps_preexisting_vector_behavior(
     )
 
     await client.set_weights(
-        miner_scores={"snapshot-miner": 0.5, "opted-out-provider": 0.5},
+        miner_scores={"selected-miner": 0.5, "non-serving-provider": 0.5},
     )
 
     assert list(subtensor.set_weights.call_args.kwargs["uids"]) == [2]
