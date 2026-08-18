@@ -39,16 +39,9 @@ REPOSITORY_RETRY_INITIAL_DELAY_SECONDS: float = 2.0
 REPOSITORY_RETRY_MAX_DELAY_SECONDS: float = 30.0
 # Short waits keep cancellation and operation heartbeats responsive during backoff.
 REPOSITORY_RETRY_POLL_SECONDS: float = 1.0
-RETRYABLE_REPOSITORY_ERROR_MARKERS: tuple[str, ...] = (
-    "access denied",
-    "request timeout",
-    "slow down",
-    "status code: 429",
-    "status code: 500",
-    "status code: 502",
-    "status code: 503",
-    "status code: 504",
-)
+# Restic treats AccessDenied as permanent, but a newly attached IAM policy can
+# return it briefly while AWS propagates the policy to S3.
+IAM_POLICY_PROPAGATION_ERROR_MARKER = "accessdenied"
 ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
 ENCRYPTED_BOOTSTRAP_SCRIPT = r"""
 set -eu
@@ -281,7 +274,8 @@ class ResticStorageRunner:
                     retry_delay_seconds=None,
                 )
                 raise ResticOperationError(
-                    "backup storage is not ready yet; please retry shortly"
+                    "Backup storage was not ready after retrying: "
+                    f"{failure_detail}"
                 ) from None
             wait_seconds = min(retry_delay_seconds, remaining_retry_seconds)
             self._log_transient_repository_failure(
@@ -790,10 +784,7 @@ class ResticStorageRunner:
 
 def _is_retryable_repository_failure(failure_detail: str) -> bool:
     normalized_detail = failure_detail.casefold().replace(" ", "")
-    return any(
-        marker.replace(" ", "") in normalized_detail
-        for marker in RETRYABLE_REPOSITORY_ERROR_MARKERS
-    )
+    return IAM_POLICY_PROPAGATION_ERROR_MARKER in normalized_detail
 
 
 def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:

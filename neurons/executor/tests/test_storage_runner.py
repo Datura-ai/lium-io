@@ -259,7 +259,7 @@ def test_backup_repository_retry_stops_on_cancellation(
     assert clock.now == 1.0
 
 
-def test_backup_repository_retry_exhaustion_returns_customer_safe_error(
+def test_backup_repository_retry_exhaustion_preserves_redacted_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -268,7 +268,12 @@ def test_backup_repository_retry_exhaustion_returns_customer_safe_error(
     runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
     clock = _RetryClock()
     run_repository_command = MagicMock(
-        return_value=_repository_command_result(1, standard_error="S3 StatusCode: 503")
+        return_value=_repository_command_result(
+            1,
+            standard_error=(
+                "Stat(<config/>) failed: Stat: Access Denied for secret-key"
+            ),
+        )
     )
 
     monkeypatch.setattr("storage.restic.subprocess.run", run_repository_command)
@@ -278,12 +283,15 @@ def test_backup_repository_retry_exhaustion_returns_customer_safe_error(
     monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_INITIAL_DELAY_SECONDS", 1.0)
     monkeypatch.setattr("storage.restic.REPOSITORY_RETRY_MAX_DELAY_SECONDS", 2.0)
 
-    with pytest.raises(ResticOperationError, match="backup storage is not ready"):
+    with pytest.raises(ResticOperationError, match="Backup storage was not ready") as raised:
         runner._ensure_repository_for_backup()
 
     assert run_repository_command.call_count == 3
     assert clock.now == 3.0
-    assert "StatusCode: 503" in capsys.readouterr().err
+    expected_error = "Stat(<config/>) failed: Stat: Access Denied for [REDACTED]"
+    assert expected_error in str(raised.value)
+    assert expected_error in capsys.readouterr().err
+    assert "secret-key" not in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -291,9 +299,11 @@ def test_backup_repository_retry_exhaustion_returns_customer_safe_error(
     (
         "Fatal: wrong password or no key found",
         "dial tcp: lookup invalid.example: no such host",
+        "The AWS Access Key Id you provided does not exist in our records.",
+        "503 Service Unavailable",
     ),
 )
-def test_backup_repository_does_not_retry_permanent_failure(
+def test_backup_repository_does_not_retry_other_failures(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     detail: str,
