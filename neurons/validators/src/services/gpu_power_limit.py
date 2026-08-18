@@ -99,6 +99,15 @@ class GpuPowerState:
     default_watts: int | None = None
 
 
+@dataclass(frozen=True)
+class GpuPowerReadback:
+    """What one GPU reports right after a set: the limit that stuck, and whether persistence mode
+    is on. ``persistence_enabled=None`` means nvidia-smi did not report the field."""
+
+    watts: int | None
+    persistence_enabled: bool | None
+
+
 def _restore_key(gpu_uuid: str) -> str:
     return f"{_RESTORE_KEY_PREFIX}{gpu_uuid}"
 
@@ -132,6 +141,16 @@ def _parse_power_state_csv(stdout: str) -> dict[str, GpuPowerState]:
             default_watts=_watts_or_none(default_raw),
         )
     return state_by_uuid
+
+
+def _parse_power_readback_csv(stdout: str) -> GpuPowerReadback:
+    fields = [field.strip() for field in str(stdout).strip().split(",")]
+    watts = _watts_or_none(fields[0]) if fields else None
+    persistence_raw = fields[1].lower() if len(fields) > 1 else ""
+    persistence_enabled: bool | None = None
+    if persistence_raw in ("enabled", "disabled"):
+        persistence_enabled = persistence_raw == "enabled"
+    return GpuPowerReadback(watts=watts, persistence_enabled=persistence_enabled)
 
 
 def _clamp_watts(target_watts: int, state: GpuPowerState) -> int:
@@ -186,43 +205,65 @@ async def _enable_persistence_mode(
         )
 
 
-async def _read_back_power_limit(ssh: asyncssh.SSHClientConnection, uuid: str) -> int | None:
-    """Read one GPU's current power.limit in watts. Returns None when it cannot be read (never raises)."""
-    cmd = f"nvidia-smi -i {shlex.quote(uuid)} --query-gpu=power.limit --format=csv,noheader,nounits"
+async def _read_back_power_state(ssh: asyncssh.SSHClientConnection, uuid: str) -> GpuPowerReadback:
+    """Read one GPU's power.limit and persistence mode. Both come from the same nvidia-smi query, so
+    verifying persistence costs no extra round trip. Unreadable -> all-None (never raises)."""
+    cmd = (
+        f"nvidia-smi -i {shlex.quote(uuid)} --query-gpu=power.limit,persistence_mode "
+        f"--format=csv,noheader,nounits"
+    )
     try:
         result = await ssh.run(cmd, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS)
     except Exception:
-        return None
+        return GpuPowerReadback(watts=None, persistence_enabled=None)
     if result.exit_status != 0:
-        return None
-    return _watts_or_none(str(result.stdout).strip())
+        return GpuPowerReadback(watts=None, persistence_enabled=None)
+    return _parse_power_readback_csv(str(result.stdout))
+
+
+@dataclass(frozen=True)
+class PowerLimitSetResult:
+    """Outcome of one verified set: why it failed (None = success) and the persistence verdict the
+    readback saw. A successful set with persistence off can still revert on its own later."""
+
+    failure: str | None
+    persistence_enabled: bool | None
 
 
 async def _set_power_limit(
     ssh: asyncssh.SSHClientConnection,
     uuid: str,
     watts: int,
-) -> str | None:
-    """Set one GPU's power limit and VERIFY it stuck. Returns None on success, else the failure
-    detail (never raises). nvidia-smi can report success while the limit silently reverts
-    (persistence mode off, driver unloads) — only the readback proves the cap exists."""
+) -> PowerLimitSetResult:
+    """Set one GPU's power limit and VERIFY it stuck (never raises). nvidia-smi can report success
+    while the limit silently reverts (persistence mode off, driver unloads) — only the readback
+    proves the cap exists."""
     try:
         result = await ssh.run(
             f"nvidia-smi -i {shlex.quote(uuid)} -pl {watts}", timeout=_NVIDIA_SMI_TIMEOUT_SECONDS
         )
     except Exception as exc:
-        return f"nvidia-smi -pl errored: {exc}"
+        return PowerLimitSetResult(failure=f"nvidia-smi -pl errored: {exc}", persistence_enabled=None)
     if result.exit_status != 0:
-        return f"nvidia-smi -pl failed: exit={result.exit_status}, stderr={result.stderr!r}"
-    observed_watts = await _read_back_power_limit(ssh, uuid)
-    if observed_watts is None:
-        return "nvidia-smi -pl reported success but the limit could not be read back for verification"
-    if observed_watts != watts:
-        return (
-            f"nvidia-smi -pl reported success but the limit did not stick: "
-            f"readback {observed_watts}W != target {watts}W (persistence mode unavailable?)"
+        return PowerLimitSetResult(
+            failure=f"nvidia-smi -pl failed: exit={result.exit_status}, stderr={result.stderr!r}",
+            persistence_enabled=None,
         )
-    return None
+    readback = await _read_back_power_state(ssh, uuid)
+    if readback.watts is None:
+        return PowerLimitSetResult(
+            failure="nvidia-smi -pl reported success but the limit could not be read back for verification",
+            persistence_enabled=readback.persistence_enabled,
+        )
+    if readback.watts != watts:
+        return PowerLimitSetResult(
+            failure=(
+                f"nvidia-smi -pl reported success but the limit did not stick: "
+                f"readback {readback.watts}W != target {watts}W (persistence mode unavailable?)"
+            ),
+            persistence_enabled=readback.persistence_enabled,
+        )
+    return PowerLimitSetResult(failure=None, persistence_enabled=readback.persistence_enabled)
 
 
 async def _set_and_log_power_limit(
@@ -236,24 +277,33 @@ async def _set_and_log_power_limit(
 ) -> bool:
     # Reviewer contract (PR #1115): every PL change is logged with executor, GPU, before/after, status.
     await _enable_persistence_mode(ssh, gpu_uuid, log_extra)
-    failure = await _set_power_limit(ssh, gpu_uuid, watts_after)
+    set_result = await _set_power_limit(ssh, gpu_uuid, watts_after)
+    failure = set_result.failure
     status = "ok" if failure is None else "failed"
     message = f"gpu power limit {action} {status}: executor={executor_id} gpu={gpu_uuid} watts {watts_before} -> {watts_after}"
     if failure is not None:
         message = f"{message} ({failure})"
-    _log(
-        logging.INFO if failure is None else logging.ERROR,
-        message,
-        {
-            "gpu_power_action": action,
-            "executor_uuid": executor_id,
-            "gpu_uuid": gpu_uuid,
-            "watts_before": watts_before,
-            "watts_after": watts_after,
-            "status": status,
-        },
-        log_extra,
-    )
+    fields: dict[str, object] = {
+        "gpu_power_action": action,
+        "executor_uuid": executor_id,
+        "gpu_uuid": gpu_uuid,
+        "watts_before": watts_before,
+        "watts_after": watts_after,
+        "status": status,
+        "persistence_enabled": set_result.persistence_enabled,
+    }
+    _log(logging.INFO if failure is None else logging.ERROR, message, fields, log_extra)
+    # DAH-2702: a verified set with persistence off holds only until the driver unloads on an idle
+    # GPU, which is how a cap reverts with nobody touching the host. Observability only — refusing
+    # the filler here would drop PEARL from every host that cannot hold persistence mode.
+    if failure is None and set_result.persistence_enabled is False:
+        _log(
+            logging.WARNING,
+            f"gpu power limit {action}: persistence mode is off for {gpu_uuid} after -pm 1; "
+            f"the {watts_after}W limit can revert on its own when the driver unloads",
+            fields,
+            log_extra,
+        )
     return failure is None
 
 
