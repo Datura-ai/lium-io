@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -19,6 +20,8 @@ from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,8 +107,15 @@ class RentalVerificationCheck:
             rented_data and ctx.executor.uuid in rented_data.filler_create_kill_executor_ids
         )
         if create_killed and not has_customer_rental and settings.FILLER_LIVENESS_CHECK_ENABLED:
-            return self._filler_create_kill_result(
-                ctx, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
+            if settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED:
+                return self._filler_create_kill_result(ctx)
+            # Shadow: observe and fall through to the normal verification. Returning a pass here
+            # would hand the node a free pass — it skips the backend health check the node would
+            # otherwise have to survive, so shadow mode would be an upgrade, not an observation.
+            logger.warning(
+                "%s (shadow): executor %s is destroying its Lium default job during create",
+                Msg.FILLER_KILLED_AT_CREATE.reason,
+                ctx.executor.uuid,
             )
 
         if filler_containers and not has_customer_rental:
@@ -499,21 +509,19 @@ class RentalVerificationCheck:
         )
         return CheckResult(passed=not enforce, event=event, updates={})
 
-    def _filler_create_kill_result(self, ctx: Context, *, enforce: bool) -> CheckResult:
-        """Render the create-time kill verdict for a node with no filler container to probe."""
+    def _filler_create_kill_result(self, ctx: Context) -> CheckResult:
+        """Render the create-time kill verdict. Enforcement only — shadow never lands here."""
         event = render_message(
             Msg.FILLER_KILLED_AT_CREATE,
             ctx=ctx,
             check_id=self.check_id,
-            severity=None if enforce else "warning",
-            impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
             what={
                 "verified": False,
                 "executor_uuid": ctx.executor.uuid,
-                "enforced": enforce,
+                "enforced": True,
             },
         )
-        return CheckResult(passed=not enforce, event=event, updates={})
+        return CheckResult(passed=False, event=event, updates={})
 
     def _filler_state_unknown_result(
         self,

@@ -1159,18 +1159,24 @@ def _create_kill_context(
 
 
 @pytest.mark.asyncio
-async def test_rental_verification_filler_create_kill_shadow_mode_passes_but_logs():
-    """Shadow mode: the create-kill streak is logged with enforced=False, incentive untouched."""
+async def test_rental_verification_filler_create_kill_shadow_mode_only_observes():
+    """Shadow mode observes and then verifies as usual — it must never replace the normal check."""
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, details={})
     )
     ctx = _create_kill_context(backend_client=backend_client, ssh_client=FillerSSHClient())
 
-    result = await _run_filler_check(ctx, enforcement=False)
+    with patch("neurons.validators.src.services.task.checks.rental_verification.logger") as mock_logger:
+        result = await _run_filler_check(ctx, enforcement=False)
 
     assert result.passed is True
-    assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
-    assert result.event.what_we_saw["enforced"] is False
+    assert result.event.reason_code == Msg.VERIFIED.reason
+    # The node still went through the backend health check it would have had without this feature.
+    assert backend_client.called_with is not None
+    assert any(
+        Msg.FILLER_KILLED_AT_CREATE.reason in str(call)
+        for call in mock_logger.warning.call_args_list
+    )
 
 
 @pytest.mark.asyncio
