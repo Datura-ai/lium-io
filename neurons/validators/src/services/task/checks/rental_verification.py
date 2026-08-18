@@ -93,6 +93,21 @@ class RentalVerificationCheck:
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
         # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
         filler_containers: list[str] = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        # DAH-2703: same offence, earlier kill. A host reaper that removes the filler seconds after
+        # `docker run` leaves no RUNNING run and no container, so the liveness probe below never
+        # sees it and the node collects unrented incentive while never running a default job. The
+        # backend counts those create-time kills per executor and lists the ones past the streak
+        # threshold. Judged BEFORE the liveness probe on purpose: a GPU-split node runs one filler
+        # per bundle, and one surviving bundle would otherwise return a clean verdict for a host
+        # that destroys every other bundle it is given.
+        create_killed: bool = bool(
+            rented_data and ctx.executor.uuid in rented_data.filler_create_kill_executor_ids
+        )
+        if create_killed and not has_customer_rental and settings.FILLER_LIVENESS_CHECK_ENABLED:
+            return self._filler_create_kill_result(
+                ctx, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
+            )
+
         if filler_containers and not has_customer_rental:
             # ISSUE-050: the backend's word alone is not proof the filler is alive — some hosts
             # remove Lium filler containers while the run stays RUNNING and keep earning
@@ -115,18 +130,6 @@ class RentalVerificationCheck:
 
             return await self._verify_every_filler_alive(
                 ctx, filler_containers, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
-            )
-
-        # DAH-2703: same offence, earlier kill. A host reaper that removes the filler seconds after
-        # `docker run` leaves no RUNNING run and no container, so the probe above never sees it and
-        # the node collects unrented incentive while never running a default job. The backend counts
-        # those create-time kills per executor and lists the ones past the streak threshold here.
-        create_killed: bool = bool(
-            rented_data and ctx.executor.uuid in rented_data.filler_create_kill_executor_ids
-        )
-        if create_killed and not has_customer_rental and settings.FILLER_LIVENESS_CHECK_ENABLED:
-            return self._filler_create_kill_result(
-                ctx, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
             )
 
         # Get required info from context

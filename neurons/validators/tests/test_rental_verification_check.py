@@ -1220,3 +1220,30 @@ async def test_rental_verification_filler_create_kill_ignored_for_a_customer_ren
 
     assert result.passed is True
     assert result.event.reason_code == Msg.VERIFIED.reason
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_create_kill_is_not_masked_by_a_surviving_filler():
+    """A split node that lets one bundle run while killing the others is still killing them."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    surviving = "filler_11111111-2222-3333-4444-555555555555"
+    state = build_state(
+        specs={"verified_ports": [8080]},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            filler_containers_by_executor={"executor-123": surviving},
+            all_filler_containers_by_executor={"executor-123": [surviving]},
+            filler_create_kill_executor_ids=["executor-123"],
+        ),
+    )
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state, ssh=FillerSSHClient(running=True))
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
