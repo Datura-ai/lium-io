@@ -1,4 +1,5 @@
 import logging
+import random
 import threading
 import time
 
@@ -48,7 +49,8 @@ class SharedConfigClient:
         """Background daemon thread: sleep + fetch."""
         logger.info("Started shared config refresh loop")
         while self._running:
-            time.sleep(self._refresh_interval)
+            # jitter desynchronizes co-located processes so they don't hit the per-IP rate limit together
+            time.sleep(self._refresh_interval * random.uniform(0.8, 1.2))
             try:
                 new_config = self._fetch()
                 with self._lock:
