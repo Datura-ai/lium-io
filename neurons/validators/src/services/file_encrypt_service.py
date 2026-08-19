@@ -142,6 +142,9 @@ ORIGINAL_KEYS = {
     'ib_pkey': "pkey",
     'ib_gids': "gids",
     'data_boot_id': "boot_id",
+    'data_container_cap_eff': "container_cap_eff",
+    'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
+    'data_power_cap_probe_error': "power_cap_probe_error",
 }
 
 
@@ -315,6 +318,9 @@ class FileEncryptService:
             'ib_pkey': "",
             'ib_gids': "",
             'data_boot_id': "",
+            'data_container_cap_eff': "",
+            'data_nvidiactl_owner_uid': "",
+            'data_power_cap_probe_error': "",
         }
 
         # Generate dictionary key mapping on validator side
