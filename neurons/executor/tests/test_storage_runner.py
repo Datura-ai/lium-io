@@ -100,6 +100,14 @@ def test_restore_requires_snapshot_id() -> None:
         StorageOperationSpec.from_mapping(payload)
 
 
+def test_restore_rejects_snapshot_id_options() -> None:
+    payload = _operation_payload(action="restore")
+    payload["snapshot_id"] = "--password-command=malicious-command"
+
+    with pytest.raises(OperationSpecError, match="hexadecimal restic snapshot ID"):
+        StorageOperationSpec.from_mapping(payload)
+
+
 def test_restore_missing_repository_never_initializes_it(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -118,6 +126,7 @@ def test_restore_missing_repository_never_initializes_it(
 
     assert raised.value.error_code == "RESTIC_REPOSITORY_MISSING"
     assert commands
+    assert commands[0][-4:] == ["snapshots", "--json", "--", SNAPSHOT_ID]
     assert all("init" not in command for command in commands)
 
 
@@ -605,7 +614,7 @@ def test_docker_restore_uses_native_json_restore_to_requested_directory() -> Non
 
     assert "customer-volume:/workspace:rw" in command
     assert "--workdir" not in command
-    assert SNAPSHOT_ID in command
+    assert command[-2:] == ["--", SNAPSHOT_ID]
     assert "/workspace/restored" in command
     assert "restore" in command
     assert "--json" in command
