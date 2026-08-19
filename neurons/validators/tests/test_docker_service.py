@@ -3444,56 +3444,12 @@ def _private_registry_create_payload() -> ContainerCreateRequest:
     )
 
 
-def _patch_private_registry_create_happy_path(docker_service, monkeypatch) -> None:
-    # image inspect reports ABSENT so the pull runs; everything else succeeds
-    ssh_client = AsyncMock()
-
-    def _ssh_run_side(cmd, *args, **kwargs):
-        if "image inspect" in cmd:
-            return _make_ssh_command_result(exit_status=1)
-        return _make_ssh_command_result()
-
-    ssh_client.run = AsyncMock(side_effect=_ssh_run_side)
-    monkeypatch.setattr(
-        "services.docker_service.asyncssh.connect",
-        Mock(return_value=DummySSHConnectionManager(ssh_client)),
-    )
-    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr(
-        "services.docker_service.build_gpu_docker_config_for_executor",
-        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
-    )
-    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
-    docker_service.redis_service.add_pending_pod = AsyncMock()
-    docker_service.redis_service.remove_pending_pod = AsyncMock()
-    docker_service.redis_service.add_rented_pod = AsyncMock()
-    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
-    monkeypatch.setattr(
-        docker_service,
-        "generate_portMappings",
-        AsyncMock(return_value=([(22, 20001, 20001)], None)),
-    )
-    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
-    monkeypatch.setattr(docker_service, "clean_existing_containers", AsyncMock())
-    monkeypatch.setattr(docker_service, "clean_stale_vloopback_volumes", AsyncMock())
-    monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
-    monkeypatch.setattr(
-        docker_service,
-        "wait_for_port_check_containers",
-        AsyncMock(return_value=(True, "ok")),
-    )
-    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
-    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-    monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
-    monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
-
-
 @pytest.mark.asyncio
 async def test_create_container_reports_docker_login_failure_step_when_pull_also_fails(
     docker_service,
     monkeypatch,
 ):
-    _patch_private_registry_create_happy_path(docker_service, monkeypatch)
+    _patch_create_container_happy_path(docker_service, monkeypatch)
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.login_error = Exception(
         "Docker SDK login for registry.digitalocean.com failed: unauthorized"
@@ -3529,7 +3485,7 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
     docker_service,
     monkeypatch,
 ):
-    _patch_private_registry_create_happy_path(docker_service, monkeypatch)
+    _patch_create_container_happy_path(docker_service, monkeypatch)
     docker_client = docker_service.rental_docker_client_factory.client
     docker_client.login_error = Exception(
         "Docker SDK login for registry.digitalocean.com failed: unauthorized"

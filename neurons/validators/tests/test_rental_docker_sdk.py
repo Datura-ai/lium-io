@@ -356,46 +356,22 @@ async def test_login_passes_credentials_as_sdk_data():
     ]
 
 
+@pytest.mark.parametrize(
+    ("image", "expected_registry"),
+    [
+        ("registry.digitalocean.com/team/app:1.0", "registry.digitalocean.com"),
+        ("daturaai/pytorch:test", None),
+        ("localhost:5000/team/app:1", "localhost:5000"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_login_resolves_registry_from_private_image():
+async def test_login_resolves_registry_from_image(image, expected_registry):
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
 
-    await client.login(
-        username="team-user",
-        password=INCIDENT_DOCKER_PASSWORD,
-        image="registry.digitalocean.com/team/app:1.0",
-    )
+    await client.login(username="team-user", password=INCIDENT_DOCKER_PASSWORD, image=image)
 
-    assert api_client.login_calls[0]["registry"] == "registry.digitalocean.com"
-
-
-@pytest.mark.asyncio
-async def test_login_uses_no_registry_for_docker_hub_image():
-    api_client = FakeApiClient()
-    client = RentalDockerSdkClient(api_client)
-
-    await client.login(
-        username="hub-user",
-        password=INCIDENT_DOCKER_PASSWORD,
-        image="daturaai/pytorch:test",
-    )
-
-    assert api_client.login_calls[0]["registry"] is None
-
-
-@pytest.mark.asyncio
-async def test_login_resolves_registry_with_port_from_image():
-    api_client = FakeApiClient()
-    client = RentalDockerSdkClient(api_client)
-
-    await client.login(
-        username="local-user",
-        password=INCIDENT_DOCKER_PASSWORD,
-        image="localhost:5000/team/app:1",
-    )
-
-    assert api_client.login_calls[0]["registry"] == "localhost:5000"
+    assert api_client.login_calls[0]["registry"] == expected_registry
 
 
 @pytest.mark.parametrize(

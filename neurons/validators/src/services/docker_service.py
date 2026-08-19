@@ -97,6 +97,7 @@ from services.rental_docker_sdk import (
     DeviceMount,
     PortBinding,
     RentalDockerConnectionError,
+    RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
@@ -4205,12 +4206,22 @@ class DockerService:
                             "success",
                             log_tag,
                         )
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="pull",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.pull(image=payload.docker_image),
-                            image=payload.docker_image,
-                        )
+                        try:
+                            await run_logged_rental_docker_sdk_operation(
+                                operation="pull",
+                                log_extra=default_extra,
+                                call=lambda: docker_client.pull(image=payload.docker_image),
+                                image=payload.docker_image,
+                            )
+                        except Exception as exc:
+                            if login_error is None:
+                                raise
+                            # docker-py pulls anonymously after a failed login, so the
+                            # pull failure is most likely the login's fault — attribute it
+                            current_step = "docker_login"
+                            raise RentalDockerOperationError(
+                                f"{exc} (earlier login failure: {login_error})"
+                            ) from exc
 
                         # Add profiler for docker pull
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
@@ -4893,10 +4904,6 @@ class DockerService:
                     volume_encryption_status=volume_encryption_status,
                 )
         except Exception as e:
-            # a pull that fails after a failed registry login is most likely the
-            # login's fault (docker-py silently pulls anonymously) — attribute it
-            if current_step == "docker_pull" and login_error is not None:
-                current_step = "docker_login"
             log_text = _m(
                 "Failed create_container",
                 extra=get_extra_info({
@@ -4920,8 +4927,6 @@ class DockerService:
                 and isinstance(e, RentalDockerConnectionError)
             ):
                 failure_detail = f"{failure_detail}: {e}"
-            if current_step == "docker_login" and login_error is not None:
-                failure_detail = f"{failure_detail} (earlier login failure: {login_error})"
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
