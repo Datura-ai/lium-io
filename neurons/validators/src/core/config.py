@@ -278,6 +278,13 @@ class Settings(BaseSettings):
     # (shadow mode) so prod impact can be observed before enforcing.
     ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT: bool = Field(env="ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", default=False)
 
+    # DAH-2715 — GPU power cap capability gate. When True, an unrented executor whose
+    # container provably cannot apply a GPU power cap (no CAP_SYS_ADMIN, or /dev/nvidiactl
+    # not owned by root - see DAH-2705) loses the unrented rental incentive while staying
+    # active. When False, the breach is only logged (shadow mode) so prod impact can be
+    # observed before enforcing. A node whose probe is missing is never penalized.
+    ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=False)
+
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )

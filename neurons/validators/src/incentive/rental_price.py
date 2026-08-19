@@ -11,7 +11,7 @@ rental subsidy. See `incentive/config.py:MAX_UNRENTED_GPUS_BY_TYPE`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import bittensor
 from pydantic import BaseModel, Field
@@ -52,6 +52,13 @@ FLAGSHIP_CAPABILITY_GPU_COUNT = 8
 # Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
 NCU_PROFILING_UNRESTRICTED = "unrestricted"
 
+# DAH-2715 — GPU power cap capability gate. An unrented executor whose container provably
+# cannot apply a GPU power cap forfeits the unrented incentive but stays active. The scrape
+# (DAH-2705) reports the two readings `nvidia-smi -pl` needs: the container's effective
+# capability mask and the owner of /dev/nvidiactl, which sysbox maps away from root.
+CAP_SYS_ADMIN_BIT = 21
+NVIDIACTL_ROOT_UID = 0
+
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
@@ -69,6 +76,17 @@ class MissingFlagshipCapability(BaseModel):
 
     ncu_profiling_access: str | None  # None = the scrape carries no observation at all
     ncu_profiling_scrape_error: str | None  # set when the probe could not read the driver params
+
+
+class PowerCapIncapable(BaseModel):
+    """The two scrape readings that prove a container cannot apply a GPU power cap.
+
+    Both are carried verbatim so the miner is shown the numbers that were judged, and a
+    sysbox host (full caps, device owned by 65534) reads differently from a host that
+    simply dropped CAP_SYS_ADMIN. Sole owner of these scrape keys."""
+
+    container_cap_eff: str  # effective capability mask of the executor container, hex
+    nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -377,6 +395,49 @@ class RentalPriceIncentive(DefaultIncentive):
                     "tdx_quote_present": bool(result.executor_info.tdx_quote),
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _power_cap_incapable(self, result: JobResult) -> PowerCapIncapable | None:
+        # None whenever the scrape does not PROVE the container cannot cap: a missing or
+        # unreadable probe (validator older than DAH-2705, probe error) must never cost a
+        # miner the incentive, so every unknown fails open
+        if result.spec is None:
+            # no scrape at all: a synthetic or estimated job result, nothing to measure
+            return None
+        cap_eff: Any = result.spec.get("container_cap_eff")
+        owner_uid: Any = result.spec.get("nvidiactl_owner_uid")
+        # the scrape is written on the miner's machine: a wrong JSON type is a missing
+        # reading, not a breach. bool is excluded explicitly - it passes isinstance(int)
+        # and would otherwise read as uid 1, i.e. "not root", i.e. a penalty.
+        if not isinstance(cap_eff, str) or not isinstance(owner_uid, int) or isinstance(owner_uid, bool):
+            return None
+        try:
+            capability_mask: int = int(cap_eff, 16)
+        except ValueError:
+            return None
+        has_sys_admin: bool = bool(capability_mask >> CAP_SYS_ADMIN_BIT & 1)
+        if has_sys_admin and owner_uid == NVIDIACTL_ROOT_UID:
+            return None
+        return PowerCapIncapable(container_cap_eff=cap_eff, nvidiactl_owner_uid=owner_uid)
+
+    def _log_power_cap_limit(self, result: JobResult, incapable: PowerCapIncapable) -> None:
+        # structured log for every rental-eligible unrented executor that cannot be capped
+        enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_LIMIT
+        logger.info(
+            _m(
+                "Unrented executor cannot apply a GPU power cap"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "container_cap_eff": incapable.container_cap_eff,
+                    "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -759,6 +820,21 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
                     job_result, missing_capability
+                )
+                job_result.record_incentive_log(reason)
+
+        # DAH-2715 power cap gate: an idle machine whose container cannot apply a GPU power
+        # cap is not fully usable for Lium's own jobs, so it forfeits the unrented incentive
+        # (node stays active). While the flag is off we only log the would-be exclusion.
+        power_cap_incapable: PowerCapIncapable | None = (
+            self._power_cap_incapable(job_result) if eligible_for_rental_share else None
+        )
+        if power_cap_incapable is not None:
+            self._log_power_cap_limit(job_result, power_cap_incapable)
+            if settings.ENABLE_UNRENTED_POWER_CAP_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_cannot_apply_gpu_power_cap(
+                    job_result, power_cap_incapable
                 )
                 job_result.record_incentive_log(reason)
 

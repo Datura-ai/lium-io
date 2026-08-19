@@ -9,7 +9,7 @@ WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
 HOW A NODE PICKS A POOL:
   rented?                                              -> mining pool (always earns)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
-       AND (not flagship-8x OR NCU/split/attested-CVM offered)
+       AND (not flagship-8x OR NCU/split/attested-CVM offered) AND power cap appliable
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
@@ -26,6 +26,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      total disk below 1.5x total GPU VRAM (add disk to earn),
      8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
        attestation (offer any of the three to earn),
+     container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -53,7 +54,7 @@ from pydantic import BaseModel, Field
 from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
-    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability
+    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, PowerCapIncapable
     from services.task_service import JobResult
 
 
@@ -78,6 +79,7 @@ class ZeroIncentiveReason(StrEnum):
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
+    CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
 
 
 class IncentiveReason(BaseModel):
@@ -359,6 +361,27 @@ class MinerLogLine(BaseModel):
                 "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
                 "supports_gpu_splitting": result.supports_gpu_splitting,
                 "gpu_splitting_min_count": result.gpu_splitting_min_count,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_cannot_apply_gpu_power_cap(
+        result: JobResult, incapable: PowerCapIncapable
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
+            message=(
+                "No unrented incentive: this executor's container cannot set a GPU power limit "
+                "(nvidia-smi -pl), which Lium's own idle jobs need. Run the executor container "
+                "with privileged: true (or add CAP_SYS_ADMIN) and make sure /dev/nvidiactl is "
+                "owned by root inside it - under sysbox the device is mapped to an unprivileged "
+                "uid, so the executor must run outside the sysbox user namespace. Fix it, or "
+                "rent this executor out to earn."
+            ),
+            extra_fields={
+                "container_cap_eff": incapable.container_cap_eff,
+                "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
             },
         )
 

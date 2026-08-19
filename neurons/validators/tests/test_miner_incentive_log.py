@@ -7,7 +7,12 @@ fields, and that a line actually lands in JobResult.incentive_logs.
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
-from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, RentalPriceIncentive
+from incentive.rental_price import (
+    InsufficientDisk,
+    MissingFlagshipCapability,
+    PowerCapIncapable,
+    RentalPriceIncentive,
+)
 from services.task_service import JobResult
 
 H200 = "NVIDIA H200"
@@ -29,6 +34,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "sysbox_not_enabled",
         "insufficient_disk_for_vram",
         "flagship_without_ncu_or_split",
+        "cannot_apply_gpu_power_cap",
     }
 
 
@@ -128,6 +134,14 @@ def _job(**overrides) -> JobResult:
             ),
             "flagship_without_ncu_or_split",
             "NCU profiling",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_cannot_apply_gpu_power_cap(
+                job,
+                PowerCapIncapable(container_cap_eff="00000000a80425fb", nvidiactl_owner_uid=0),
+            ),
+            "cannot_apply_gpu_power_cap",
+            "CAP_SYS_ADMIN",
         ),
     ],
 )
