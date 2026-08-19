@@ -51,6 +51,12 @@ nothing forwards is refused up front, because it would leave the launch with no 
 at all. On a host with no `ssh-keyscan` installed, readiness degrades to a TCP accept and the
 report's fingerprint is null; the note in the report says which happened.
 
+What answers on that guest port is the same for both kinds of CVM by fleet convention (2200):
+the executor's sshd in a validation CVM, and in a renter CVM the platform's guest-SSH service
+(DAH-2684, `neurons/executor/cvm-ssh/`) — the sshd the renter logs into the CVM through, which
+the backend injects into every renter compose with the renter's keys. The fingerprint in the
+launch report is therefore the one the renter pins.
+
 ### The measurement gate
 
 cvmd imports `dstacktee/scripts/dstack.py` **as a library** and calls the same functions its CLI

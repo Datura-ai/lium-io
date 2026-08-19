@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# A renter compose is a customer's docker-compose with one service injected, so it is far larger
-# than a validation body's three hashes — but it is still a compose file, and a request carrying
+# A renter compose is a customer's docker-compose with the platform's services injected (the
+# attest-agent and the guest-SSH service), so it is far larger than a validation body's three hashes — but it is still a compose file, and a request carrying
 # megabytes of one is not an order. The daemon's own `max_body_bytes` (64 KiB by default) is the
 # hard cap; this bound sits under it so an oversized compose is refused by name rather than as an
 # unexplained 413.

@@ -13,6 +13,9 @@ What one run proves, in order:
     1. the host starts idle and its port range cannot touch the production port
     2. a renter order derived by the backend launches, and the host MEASURES the same
        compose hash the backend derived (the DAH-2632 golden loop, on hardware)
+    2b. the renter's own key logs into the CVM ITSELF as root — the guest OS, not the sshd
+       container — through the forwarded guest SSH port (DAH-2684), and the host-key
+       fingerprint the renter sees is the one the launch reported
     3. the validator key cannot create or destroy a renter CVM (403 by scope)
     4. teardown is verified, and the switch window is observed as SWITCHING with a
        readable start time — the exact facts DAH-2630's grace decides on
@@ -32,16 +35,18 @@ Usage (from a lium-io checkout, with the validators venv):
     neurons/validators/.venv/bin/python tools/cvm-local-e2e/run.py \\
         --host ubuntu@203.98.89.178 --ssh-key ~/.ssh/waris_local \\
         --backend-src ../lium-io-backend/apps/server/src \\
-        --agent-image "$CVM_ATTEST_AGENT_IMAGE"
+        --agent-image "$CVM_ATTEST_AGENT_IMAGE" --ssh-image "$CVM_SSH_IMAGE"
 """
 
 import argparse
 import atexit
 import json
+import shutil
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -52,18 +57,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "neurons" / "validators" / "src"))
 
-# The customer's own half of the order. It must open the guest SSH port cvmd's readiness
-# gate waits on (2200 by fleet convention — `cvm_ssh_guest_port`): a compose with nothing
-# listening there launches a guest that is never declared ready and the create answers 504.
-# That is also what a real customer ships — SSH access to their CVM is the product.
+# The customer's own half of the order — optional since DAH-2684, and no longer where SSH
+# comes from. The platform injects the guest-SSH service on guest port 2200 (the port cvmd's
+# readiness gate waits on, `cvm_ssh_guest_port`) with the renter's keys, so the customer's
+# compose is just their workload. Kept here so the harness proves both halves coexist.
 CUSTOMER_COMPOSE = """services:
-  ssh:
+  workload:
     image: alpine:3.20
-    command: sh -c "apk add --no-cache openssh && ssh-keygen -A && /usr/sbin/sshd -D -e"
-    ports:
-      - "2200:22"
+    command: sleep infinity
     restart: unless-stopped
 """
+
+# The guest port the platform's SSH service binds. Mirrors services/cvm_compose.py.
+SSH_GUEST_PORT = 2200
 
 FORBIDDEN_PORT = 32000
 
@@ -161,6 +167,7 @@ def main() -> int:
     parser.add_argument("--ssh-key", required=True)
     parser.add_argument("--backend-src", required=True, help="path to lium-io-backend/apps/server/src")
     parser.add_argument("--agent-image", required=True, help="attest-agent image, pinned by digest")
+    parser.add_argument("--ssh-image", required=True, help="guest-SSH image (DAH-2684), pinned by digest")
     parser.add_argument("--local-port", type=int, default=18443)
     parser.add_argument("--remote-port", type=int, default=8443)
     parser.add_argument("--platform-uri", default="//Bob", help="renter-scope key (dev key of the test daemon)")
@@ -181,7 +188,19 @@ def main() -> int:
     backend_cvm_compose = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(backend_cvm_compose)
     AgentSpec = backend_cvm_compose.AgentSpec
+    SshSpec = backend_cvm_compose.SshSpec
     derive = backend_cvm_compose.derive
+
+    # A throwaway renter identity: the harness IS the renter, and the point of DAH-2684 is
+    # that this key — and only this key — opens the CVM itself.
+    renter_key_dir = Path(tempfile.mkdtemp(prefix="cvm-e2e-renter-"))
+    atexit.register(shutil.rmtree, renter_key_dir, True)
+    renter_key = renter_key_dir / "id_ed25519"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(renter_key), "-C", "cvm-e2e-renter"],
+        check=True,
+    )
+    renter_pubkey = (renter_key_dir / "id_ed25519.pub").read_text().strip()
 
     platform = Keypair.create_from_uri(args.platform_uri)
     validator = Keypair.create_from_uri(args.validator_uri)
@@ -223,7 +242,11 @@ def main() -> int:
         return summary()
 
     print("== 3. a renter order, derived by the backend's own code")
-    injected, compose_hash = derive(CUSTOMER_COMPOSE, AgentSpec(image=args.agent_image))
+    injected, compose_hash = derive(
+        CUSTOMER_COMPOSE,
+        AgentSpec(image=args.agent_image),
+        SshSpec(image=args.ssh_image, authorized_keys=(renter_pubkey,)),
+    )
     order = {
         "kind": "renter",
         "qemu": base["qemu"],
@@ -255,6 +278,57 @@ def main() -> int:
         all(p.get("host_port") != FORBIDDEN_PORT for p in ports),
         f"no forwarded port is {FORBIDDEN_PORT}",
     )
+
+    print("== 3b. the renter logs into the CVM itself (DAH-2684)")
+    ssh_host_port = next(
+        (p.get("host_port") for p in ports if p.get("guest_port") == SSH_GUEST_PORT and p.get("host_port")), None
+    )
+    if check(ssh_host_port is not None, f"the host forwards the guest SSH port {SSH_GUEST_PORT}", str(ssh_host_port)):
+        # Through the host's own sshd as a jump, so the check does not depend on the DC
+        # firewall exposing the forwarded port to this machine.
+        def as_renter(command: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [
+                    "ssh",
+                    "-i", str(renter_key),
+                    "-o", "BatchMode=yes",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", f"UserKnownHostsFile={renter_key_dir / 'known_hosts'}",
+                    "-o", f"ProxyCommand=ssh -i {args.ssh_key} -o BatchMode=yes -W %h:%p {args.host}",
+                    "-p", str(ssh_host_port),
+                    "root@127.0.0.1",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+
+        session = as_renter("echo uid=$(id -u) host=$(hostname); test -d /host && echo IN_CONTAINER || echo IN_GUEST")
+        check(
+            session.returncode == 0 and "uid=0" in session.stdout,
+            "the renter's key logs in as root",
+            (session.stdout or session.stderr).strip()[:120],
+        )
+        check(
+            "IN_GUEST" in session.stdout,
+            "the session is in the guest OS, not in the sshd container",
+            session.stdout.strip()[:120],
+        )
+        guest_docker = as_renter("docker ps --format '{{.Names}}'")
+        check(
+            guest_docker.returncode == 0 and "lium-attest-agent" in guest_docker.stdout,
+            "the guest's docker daemon is the renter's, and shows the platform services",
+            guest_docker.stdout.replace(chr(10), " ").strip()[:120],
+        )
+        reported_fp = report.get("ssh_host_key_fingerprint")
+        scanned = ssh(args, f"ssh-keyscan -T 10 -p {ssh_host_port} -t ed25519 127.0.0.1 2>/dev/null")
+        if reported_fp and scanned.returncode == 0 and scanned.stdout.strip():
+            keyfile = renter_key_dir / "scanned.pub"
+            keyfile.write_text(scanned.stdout)
+            fp = subprocess.run(["ssh-keygen", "-lf", str(keyfile)], capture_output=True, text=True)
+            seen = fp.stdout.split()[1] if fp.returncode == 0 and len(fp.stdout.split()) > 1 else ""
+            check(seen == reported_fp, "the fingerprint the renter sees is the one the launch reported", seen[:30])
 
     print("== 4. the validator key cannot destroy it either")
     status, _ = call(base_url, validator, "DELETE", "/v1/cvm")
