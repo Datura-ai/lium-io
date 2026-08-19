@@ -2964,7 +2964,7 @@ class DockerService:
 
             command = (
                 f"/usr/bin/docker exec -i -u 0 {container_q} sh -c "
-                f"{shlex.quote(f'read JUPYTER_PASSWORD; export JUPYTER_PASSWORD; {script_q} --password=$JUPYTER_PASSWORD --port={jupyter_port}')}"
+                f"{shlex.quote(f'read JUPYTER_PASSWORD; {script_q} --password=$JUPYTER_PASSWORD --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -3017,7 +3017,7 @@ class DockerService:
             )
             command = (
                 f"/usr/bin/docker exec -i -u 0 {container_q} sh -c "
-                f"{shlex.quote(f'read JUPYTER_PASSWORD; export JUPYTER_PASSWORD; {target_q}/run_jupyter.sh --password=$JUPYTER_PASSWORD --port={jupyter_port}')}"
+                f"{shlex.quote(f'read JUPYTER_PASSWORD; {target_q}/run_jupyter.sh --password=$JUPYTER_PASSWORD --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,

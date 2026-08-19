@@ -18,9 +18,11 @@ class _RecordingDockerService(DockerService):
 
     def __init__(self) -> None:
         self.commands: list[str] = []
+        self.stdin_datas: list[str | None] = []
 
-    async def execute_and_stream_logs(self, *, command: str, **_) -> tuple[bool, str]:
+    async def execute_and_stream_logs(self, *, command: str, stdin_data: str | None = None, **_) -> tuple[bool, str]:
         self.commands.append(command)
+        self.stdin_datas.append(stdin_data)
         return True, ""
 
     async def stream_log(self, *_, **__) -> None:
@@ -58,3 +60,8 @@ async def test_renter_volume_path_stays_one_token_at_both_layers(encrypted: bool
         # the renter path must stay inside single quotes so its ';' never splits commands
         assert f"'{HOSTILE_PATH}" in inner_script, f"path not quoted: {inner_script!r}"
         assert "tok" not in command, "jupyter token leaked into the exec command"
+
+    for command, stdin_data in zip(service.commands, service.stdin_datas):
+        if stdin_data is not None:
+            assert " -i " in command, "docker exec needs -i or the container's read gets EOF"
+            assert stdin_data == "tok\n"
