@@ -141,6 +141,53 @@ async def test_malformed_scrape_never_breaks_scoring(monkeypatch, spec):
     assert result.eligible_for_rental_share is True
 
 
+def _logged_reasons(caplog) -> list[str]:
+    # the reason codes of the structured lines captured so far; _m keeps them off the message
+    return [r.msg.extra.get("reason") for r in caplog.records if hasattr(r.msg, "extra")]
+
+
+def test_estimated_job_result_is_not_logged_as_unmeasured(caplog):
+    # estimate_executor builds a spec-less JobResult for every GPU model every cycle;
+    # warning on those would drown the shadow measurement this log exists to feed.
+    incentive = _build_incentive()
+    job = _make_job()
+    job.spec = None
+
+    with caplog.at_level(logging.WARNING):
+        incentive._power_cap_incapable(job)
+
+    assert "power_cap_capability_unmeasured" not in _logged_reasons(caplog)
+
+
+def test_scrape_without_the_probe_keys_is_logged_as_unmeasured(caplog):
+    # A real scrape that carries no probe (validator older than DAH-2705) is a measurable
+    # fact and belongs in the denominator, unlike a synthetic spec-less result.
+    incentive = _build_incentive()
+
+    with caplog.at_level(logging.WARNING):
+        incentive._power_cap_incapable(_make_job(spec={}))
+
+    assert "power_cap_capability_unmeasured" in _logged_reasons(caplog)
+
+
+def test_broken_probe_is_logged_as_unmeasured(caplog):
+    # A node whose probe failed must be distinguishable from one that passed the gate,
+    # or the shadow window has no denominator. The probe's own error rides along.
+    incentive = _build_incentive()
+
+    with caplog.at_level(logging.WARNING):
+        incentive._power_cap_incapable(
+            _make_job(spec={"container_cap_eff": "", "nvidiactl_owner_uid": 0,
+                            "power_cap_probe_error": "cannot read /proc/self/status"})
+        )
+
+    unmeasured = next(
+        r.msg for r in caplog.records
+        if hasattr(r.msg, "extra") and r.msg.extra.get("reason") == "power_cap_capability_unmeasured"
+    )
+    assert unmeasured.extra["power_cap_probe_error"] == "cannot read /proc/self/status"
+
+
 def test_enforcement_defaults_to_shadow_mode():
     # Rollout contract: first deploy must be shadow-only, so the flag default
     # (not the env-resolved value) must stay False.

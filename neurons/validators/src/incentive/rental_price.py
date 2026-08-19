@@ -413,18 +413,38 @@ class RentalPriceIncentive(DefaultIncentive):
         # reading, not a breach. bool is excluded explicitly - it passes isinstance(int)
         # and would otherwise read as uid 1, i.e. "not root", i.e. a penalty.
         if not isinstance(cap_eff, str) or not isinstance(owner_uid, int) or isinstance(owner_uid, bool):
+            self._log_power_cap_unmeasured(result, "cap_eff or nvidiactl owner missing from the scrape")
             return None
         try:
             capability_mask: int = int(cap_eff, 16)
         except ValueError:
+            self._log_power_cap_unmeasured(result, f"unreadable capability mask: {cap_eff!r}")
             return None
         has_sys_admin: bool = bool(capability_mask >> CAP_SYS_ADMIN_BIT & 1)
         if has_sys_admin and owner_uid == NVIDIACTL_ROOT_UID:
             return None
         return PowerCapIncapable(container_cap_eff=cap_eff, nvidiactl_owner_uid=owner_uid)
 
+    def _log_power_cap_unmeasured(self, result: JobResult, cause: str) -> None:
+        # gate could not run: a shadow report must not read this executor as "can be capped".
+        # The probe's own error is carried so a broken probe is separable from a host that
+        # simply never reported the readings.
+        logger.warning(
+            _m(
+                "Cannot measure whether the executor container can apply a GPU power cap; "
+                "unrented incentive kept",
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "cause": cause,
+                    "power_cap_probe_error": (result.spec or {}).get("power_cap_probe_error"),
+                    "reason": "power_cap_capability_unmeasured",
+                },
+            )
+        )
+
     def _log_power_cap_limit(self, result: JobResult, incapable: PowerCapIncapable) -> None:
-        # structured log for every rental-eligible unrented executor that cannot be capped
         enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_LIMIT
         logger.info(
             _m(
@@ -826,6 +846,8 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2715 power cap gate: an idle machine whose container cannot apply a GPU power
         # cap is not fully usable for Lium's own jobs, so it forfeits the unrented incentive
         # (node stays active). While the flag is off we only log the would-be exclusion.
+        # Last in the chain, so a node already excluded by an ENFORCED gate above is not
+        # measured here - read the shadow numbers against the flags that were on that cycle.
         power_cap_incapable: PowerCapIncapable | None = (
             self._power_cap_incapable(job_result) if eligible_for_rental_share else None
         )
