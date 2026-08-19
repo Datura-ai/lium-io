@@ -505,17 +505,40 @@ def _filler_context(
     ssh_client: FillerSSHClient,
     filler_container: str = "filler_11111111-2222-3333-4444-555555555555",
     filler_containers: list[str] | None = None,
+    running_fillers: bool = True,
+    create_killed: bool = False,
+    rented_pods: list[RentedPod] | None = None,
 ) -> Context:
     # filler_containers = a GPU-split node's full bundle list (DAH-2465); the legacy single map is
-    # still populated so the protocol's fallback path stays covered.
-    all_containers: list[str] = filler_containers or [filler_container]
+    # still populated so the protocol's fallback path stays covered. running_fillers=False is the
+    # DAH-2703 shape: the node reports no filler container because none ever survived its create.
+    all_containers: list[str] = filler_containers if filler_containers else [filler_container]
+    legacy_filler_by_executor: dict[str, str] = (
+        {"executor-123": all_containers[0]} if running_fillers else {}
+    )
+    all_fillers_by_executor: dict[str, list[str]] = (
+        {"executor-123": all_containers} if running_fillers else {}
+    )
+    executors: dict[str, RentedExecutor] = (
+        {
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8000",
+                pods=rented_pods,
+            )
+        }
+        if rented_pods
+        else {}
+    )
     services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(
         specs={"verified_ports": [8080]},
         rented_data=RentedExecutorsResponse(
-            executors={},
-            filler_containers_by_executor={"executor-123": all_containers[0]},
-            all_filler_containers_by_executor={"executor-123": all_containers},
+            executors=executors,
+            filler_containers_by_executor=legacy_filler_by_executor,
+            all_filler_containers_by_executor=all_fillers_by_executor,
+            filler_create_kill_executor_ids=["executor-123"] if create_killed else [],
         ),
     )
     from tests.helpers import make_context
@@ -1121,3 +1144,112 @@ async def test_cpu_count_is_not_sent_for_a_tdx_host():
         await RentalVerificationCheck().run(ctx)
 
     assert backend_client.called_with["cpu_count"] is None
+
+
+# DAH-2703: a host reaper that removes the filler seconds after `docker run` leaves no container
+# to probe, so the liveness check above never runs. The backend reports the kill streak instead.
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_create_kill_shadow_mode_only_observes():
+    """Shadow mode observes and then verifies as usual — it must never replace the normal check."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=FillerSSHClient(),
+        running_fillers=False,
+        create_killed=True,
+    )
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.logger") as mock_logger:
+        result = await _run_filler_check(ctx, enforcement=False)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFIED.reason
+    # The node still went through the backend health check it would have had without this feature.
+    assert backend_client.called_with is not None
+    assert any(
+        Msg.FILLER_KILLED_AT_CREATE.reason in str(call.args[0].extra)
+        for call in mock_logger.warning.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_create_kill_enforcement_fails():
+    """Enforcement mode: the streak fails the fatal check -> no unrented incentive."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=FillerSSHClient(),
+        running_fillers=False,
+        create_killed=True,
+    )
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
+    assert result.event.what_we_saw["enforced"] is True
+    # The node is never contacted for a health check once the streak decides the verdict.
+    assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_create_kill_ignored_when_check_disabled():
+    """CHECK_ENABLED off is the master kill switch here too: normal verification runs."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=FillerSSHClient(),
+        running_fillers=False,
+        create_killed=True,
+    )
+
+    result = await _run_filler_check(ctx, check_enabled=False, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFIED.reason
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_create_kill_ignored_for_a_customer_rental():
+    """A paying customer's pod is never punished for the node's default-job history."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=FillerSSHClient(),
+        running_fillers=False,
+        create_killed=True,
+        rented_pods=[RentedPod(pod_id="pod-1", container_name="pod_1")],
+    )
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFIED.reason
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_create_kill_is_not_masked_by_a_surviving_filler():
+    """A split node that lets one bundle run while killing the others is still killing them."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=FillerSSHClient(running=True),
+        create_killed=True,
+    )
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason

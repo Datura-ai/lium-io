@@ -1052,6 +1052,22 @@ class RentalVerificationMessages:
             "Contact Lium support if this container was not removed by you."
         ),
     )
+    FILLER_KILLED_AT_CREATE = MessageTemplate(
+        event="Lium default job container is removed on the host right after it is created",
+        reason="FILLER_KILLED_AT_CREATE",
+        severity="error",
+        category="policy",
+        impact=(
+            "Unrented incentive withheld: Lium default jobs assigned to this machine were "
+            "destroyed seconds after they started, repeatedly over the last 24 hours"
+        ),
+        remediation=(
+            "Stop the host-side process that removes containers it does not recognise, or "
+            "allow-list Lium default-job (filler_*) containers in it. "
+            "Incentive resumes once a default job runs undisturbed. "
+            "Contact Lium support if nothing on this host removes containers."
+        ),
+    )
     FILLER_STATE_UNKNOWN = MessageTemplate(
         event="Lium default job state could not be verified",
         reason="FILLER_STATE_UNKNOWN",

@@ -214,3 +214,80 @@ async def test_diagnostics_propagates_cancellation(docker_service):
             default_extra=DEFAULT_EXTRA,
             container_name=CONTAINER_NAME,
         )
+
+
+# DAH-2703: a create failure whose container is already gone from the host is a different
+# offence from a container that failed on its own — the backend counts only the former.
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_flag_a_container_that_vanished_from_the_host(docker_service):
+    # Arrange: inspect says the object does not exist any more
+    ssh_client = _FakeSSHClient()
+    ssh_client.results_by_substring["docker inspect"] = _SSHRunResult(
+        exit_status=1, stderr=f"Error: No such object: {CONTAINER_NAME}"
+    )
+
+    # Act
+    diagnostics = await docker_service.capture_failed_container_diagnostics(
+        ssh_client=ssh_client,
+        default_extra=DEFAULT_EXTRA,
+        container_name=CONTAINER_NAME,
+    )
+
+    # Assert
+    assert diagnostics.container_missing is True
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_do_not_flag_a_container_that_died_on_its_own(docker_service):
+    # Arrange: the container is still there, it just exited
+    ssh_client = _FakeSSHClient()
+    ssh_client.results_by_substring["docker inspect"] = _SSHRunResult(stdout=INSPECT_STATE_JSON)
+
+    # Act
+    diagnostics = await docker_service.capture_failed_container_diagnostics(
+        ssh_client=ssh_client,
+        default_extra=DEFAULT_EXTRA,
+        container_name=CONTAINER_NAME,
+    )
+
+    # Assert
+    assert diagnostics.container_missing is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_whether_the_container_was_already_gone(docker_service):
+    # Arrange
+    ssh_client = _FakeSSHClient()
+    ssh_client.results_by_substring["docker inspect"] = _SSHRunResult(
+        exit_status=1, stderr=f"Error: No such object: {CONTAINER_NAME}"
+    )
+
+    # Act
+    container_missing = await docker_service.cleanup_failed_container_creation(
+        ssh_client=ssh_client,
+        default_extra=DEFAULT_EXTRA,
+        container_name=CONTAINER_NAME,
+    )
+
+    # Assert: the cleanup still runs, and it reports what it found
+    assert container_missing is True
+    assert ssh_client.command_index("docker rm -fv") >= 0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_no_kill_when_diagnostics_cannot_be_captured(docker_service):
+    # Arrange: SSH is broken, so "gone" is unproven — fail open, never accuse the host
+    ssh_client = _FakeSSHClient()
+    ssh_client.errors_by_substring["docker inspect"] = ConnectionError("ssh channel died")
+
+    # Act
+    container_missing = await docker_service.cleanup_failed_container_creation(
+        ssh_client=ssh_client,
+        default_extra=DEFAULT_EXTRA,
+        container_name=CONTAINER_NAME,
+    )
+
+    # Assert
+    assert container_missing is False

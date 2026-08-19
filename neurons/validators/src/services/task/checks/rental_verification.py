@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
@@ -19,6 +21,8 @@ from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,41 @@ class RentalVerificationCheck:
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
         # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
         filler_containers: list[str] = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        # DAH-2703: same offence, earlier kill. A host reaper that removes the filler seconds after
+        # `docker run` leaves no RUNNING run and no container, so the liveness probe below never
+        # sees it and the node collects unrented incentive while never running a default job. The
+        # backend counts those create-time kills per executor and lists the ones past the streak
+        # threshold. Judged BEFORE the liveness probe on purpose: a GPU-split node runs one filler
+        # per bundle, and one surviving bundle would otherwise return a clean verdict for a host
+        # that destroys every other bundle it is given.
+        create_killed: bool = bool(
+            rented_data and ctx.executor.uuid in rented_data.filler_create_kill_executor_ids
+        )
+        if create_killed and not has_customer_rental and settings.FILLER_LIVENESS_CHECK_ENABLED:
+            if settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED:
+                event = render_message(
+                    Msg.FILLER_KILLED_AT_CREATE,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"verified": False, "executor_uuid": ctx.executor.uuid, "enforced": True},
+                )
+                return CheckResult(passed=False, event=event, updates={})
+            # Shadow: observe and fall through to the normal verification. Returning a pass here
+            # would hand the node a free pass — it skips the backend health check the node would
+            # otherwise have to survive, so shadow mode would be an upgrade, not an observation.
+            # A check owns one event and the fall-through path writes it, so the shadow verdict
+            # rides a log line carrying the same reason code the enforced event uses.
+            logger.warning(
+                _m(
+                    "Lium default job is destroyed during create (shadow)",
+                    extra=get_extra_info({
+                        "reason_code": Msg.FILLER_KILLED_AT_CREATE.reason,
+                        "executor_uuid": ctx.executor.uuid,
+                        "enforced": False,
+                    }),
+                )
+            )
+
         if filler_containers and not has_customer_rental:
             # ISSUE-050: the backend's word alone is not proof the filler is alive — some hosts
             # remove Lium filler containers while the run stays RUNNING and keep earning
