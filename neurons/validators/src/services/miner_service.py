@@ -366,17 +366,6 @@ class MinerService:
                             ),
                         ),
                     )
-                    if len(msg.executors) == 0 and not self._has_manual_rental_executors(
-                        payload, rented_data
-                    ):
-                        # Zero executors is normally a miner failure. It is the *expected* shape when
-                        # every executor this miner has is under a manual rental, though -- the miner
-                        # drops each one because it can no longer install our key. Only fail when
-                        # there is genuinely nothing to score; otherwise fall through to synthesis.
-                        return self._build_failed_job_result(
-                            payload,
-                            "Miner returned zero executors in AcceptSSHKeyRequest",
-                        )
                     tasks = [
                         asyncio.create_task(
                             asyncio.wait_for(
@@ -402,11 +391,28 @@ class MinerService:
                     results.extend(
                         self._build_manual_rental_results(payload, rented_data, existing=results)
                     )
-                    # DAH-2629/2630: record this cycle's cvmd hosts, grace the ones inside a
-                    # budgeted switch window, and bring empty ones back up.
+                    # DAH-2629/2630/2674: record this cycle's cvmd hosts, grace the ones inside
+                    # a budgeted switch window, score the ones a renter holds, and bring empty
+                    # ones back up.
                     results.extend(
-                        await self._record_and_grace_cvm_hosts(payload, existing=results)
+                        await self._record_and_grace_cvm_hosts(
+                            payload, existing=results, rented_data=rented_data
+                        )
                     )
+                    if len(msg.executors) == 0 and not results:
+                        # The zero-executor decision, made AFTER every synthesis has had its
+                        # chance. Zero executors is normally a miner failure, but it is the
+                        # *expected* shape when every executor this miner has is under a manual
+                        # rental, or is a cvmd host mid-rental or mid-switch (DAH-2674) — the
+                        # miner drops each one because it can no longer install our key.
+                        # Deciding on "did anything synthesize?" rather than predicting what
+                        # could means a new synthesis source needs no gate edit here, and a
+                        # genuinely broken miner still gets its failure record exactly as
+                        # it always did.
+                        return self._build_failed_job_result(
+                            payload,
+                            "Miner returned zero executors in AcceptSSHKeyRequest",
+                        )
 
                     logger.info(
                         _m(
@@ -562,8 +568,8 @@ class MinerService:
     ):
         """Yield (executor_uuid, info, rented_executor) for this miner's force-passable rentals.
 
-        Shared by the cheap `_has_manual_rental_executors` probe and the actual synthesis so the
-        two can never disagree about which executors qualify.
+        One home for the qualification rules, so every consumer of the candidate list agrees
+        about which executors qualify.
         """
         if not rented_data or not rented_data.manual_rental_executors:
             return
@@ -604,17 +610,64 @@ class MinerService:
 
             yield executor_uuid, info, rented_executor
 
-    def _has_manual_rental_executors(
+    @staticmethod
+    def _incentive_gates(
+        rented_data: RentedExecutorsResponse, executor_uuid: str
+    ) -> tuple[bool, bool]:
+        """(is_spot, provider_discord_connected) for one executor, read off rented_data.
+
+        One home for the tri-state contract every synthesis must honor: ``None`` for the
+        Discord list means "the backend sent no exclusions", which passes — a re-derivation
+        that read it as "not connected" would silently cut scores fleet-wide. Every caller
+        has already proven the backend record exists, so ``rented_data`` is required here.
+        """
+        is_spot = executor_uuid in (rented_data.spot_executor_ids or [])
+        discord_connected_ids = rented_data.provider_discord_connected_executor_ids
+        provider_discord_connected = (
+            True if discord_connected_ids is None else executor_uuid in discord_connected_ids
+        )
+        return is_spot, provider_discord_connected
+
+    def _forced_pass_result(
         self,
         payload: MinerJobRequestPayload,
-        rented_data: RentedExecutorsResponse | None,
-    ) -> bool:
-        """Whether this miner has any force-passable manual rental, without building anything.
-
-        Used to decide whether a zero-executor AcceptSSHKeyRequest is a genuine miner failure or
-        the expected shape when every executor has been handed to a renter.
-        """
-        return any(self._iter_manual_rental_candidates(payload, rented_data))
+        *,
+        executor_uuid: str,
+        address: str,
+        port: int,
+        gpu_model: str | None,
+        gpu_count: int,
+        log_text: str,
+        **flags,
+    ) -> JobResult:
+        """The one forced-pass shape every synthesis shares (manual rental, switch grace,
+        CVM rental): a full score with ``spec=None`` so the backend's executor upsert is
+        untouched, and a synthesized ExecutorSSHInfo because the node was never contacted.
+        Each caller states its own incentive flags explicitly — the flag sets differ by
+        design, and hiding them here is how the three copies drifted apart before this
+        helper existed."""
+        return JobResult(
+            spec=None,
+            executor_info=ExecutorSSHInfo(
+                uuid=executor_uuid,
+                address=address,
+                port=port,
+                ssh_username="",
+                ssh_port=0,
+                python_path="",
+                root_dir="",
+            ),
+            score=1.0,
+            job_score=1.0,
+            job_batch_id=payload.job_batch_id,
+            log_status="success",
+            log_text=log_text,
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+            # Not measurable without the node; a false reading would silently cut the score.
+            sysbox_runtime=True,
+            **flags,
+        )
 
     def _build_manual_rental_results(
         self,
@@ -652,24 +705,11 @@ class MinerService:
             except (TypeError, ValueError):
                 executor_port = 0
 
-            executor_info = ExecutorSSHInfo(
-                uuid=executor_uuid,
-                address=rented_executor.executor_ip_address,
-                port=executor_port,
-                # No SSH is attempted for a manual rental; these exist only to satisfy the model.
-                ssh_username="",
-                ssh_port=0,
-                python_path="",
-                root_dir="",
-            )
-
             # Read the incentive-layer gates off rented_data exactly as ResultHandler does, rather
             # than hardcoding them: forcing score=1.0 buys a place in the mining pool, it does not
             # exempt the node from spot-tier or Discord exclusions.
-            is_spot = executor_uuid in (rented_data.spot_executor_ids or [])
-            discord_connected_ids = rented_data.provider_discord_connected_executor_ids
-            provider_discord_connected = (
-                True if discord_connected_ids is None else executor_uuid in discord_connected_ids
+            is_spot, provider_discord_connected = self._incentive_gates(
+                rented_data, executor_uuid
             )
 
             log_text = _m(
@@ -686,20 +726,16 @@ class MinerService:
             ).to_full_string()
 
             results.append(
-                JobResult(
-                    spec=None,
-                    executor_info=executor_info,
-                    score=1.0,
-                    job_score=1.0,
-                    job_batch_id=payload.job_batch_id,
-                    log_status="success",
-                    log_text=log_text,
+                self._forced_pass_result(
+                    payload,
+                    executor_uuid=executor_uuid,
+                    address=rented_executor.executor_ip_address,
+                    port=executor_port,
                     gpu_model=info.gpu_model,
                     gpu_count=info.gpu_count,
+                    log_text=log_text,
                     # Rented exempts the minimum-driver gate, which we cannot measure here.
                     is_rented=True,
-                    # Not measurable without the node; a false reading would silently cut the score.
-                    sysbox_runtime=True,
                     is_spot=is_spot,
                     provider_discord_connected=provider_discord_connected,
                 )
@@ -724,9 +760,10 @@ class MinerService:
         self,
         payload: MinerJobRequestPayload,
         existing: list[JobResult],
+        rented_data: RentedExecutorsResponse | None = None,
     ) -> list[JobResult]:
         """Record this cycle's attested cvmd hosts, then account for the ones that are
-        switching or empty (DAH-2629 + DAH-2630).
+        switching, rented, or empty (DAH-2629 + DAH-2630 + DAH-2674).
 
         Runs after the real results, exactly like the manual-rental synthesis: a node that
         answered normally is already scored and is skipped. Everything here is best-effort
@@ -810,6 +847,25 @@ class MinerService:
                 lifecycle.schedule_ensure(host)
                 continue
 
+            if assessment.renter_running:
+                # DAH-2674: a renter holds this node's CVM, so it cannot answer a normal
+                # validation for the whole rental. Score it from the host-side signal that
+                # just arrived (cvmd's signed state read), never from anything inside the
+                # guest — the renter has root there.
+                rental_result = await self._build_cvm_rental_result(
+                    payload,
+                    host,
+                    lifecycle,
+                    assessment=assessment,
+                    rented_data=rented_data,
+                    extra=extra,
+                )
+                if rental_result is not None:
+                    graces.append(rental_result)
+                # DAH-2675, log-only: read the attest-agent's /health for rollout data.
+                lifecycle.schedule_attest_probe(host, assessment)
+                continue
+
             if not assessment.switching:
                 continue
 
@@ -852,28 +908,14 @@ class MinerService:
             ).to_full_string()
             logger.info(log_text)
             graces.append(
-                JobResult(
-                    # spec=None on purpose: the backend skips its executor upsert on a null
-                    # spec, so a graced cycle cannot flip the stored row.
-                    spec=None,
-                    executor_info=ExecutorSSHInfo(
-                        uuid=host.executor_uuid,
-                        address=host.address,
-                        port=0,
-                        ssh_username="",
-                        ssh_port=0,
-                        python_path="",
-                        root_dir="",
-                    ),
-                    score=1.0,
-                    job_score=1.0,
-                    job_batch_id=payload.job_batch_id,
-                    log_status="success",
-                    log_text=log_text,
+                self._forced_pass_result(
+                    payload,
+                    executor_uuid=host.executor_uuid,
+                    address=host.address,
+                    port=0,
                     gpu_model=host.gpu_model,
                     gpu_count=host.gpu_count,
-                    # Not measurable mid-switch; a false reading would silently cut the score.
-                    sysbox_runtime=True,
+                    log_text=log_text,
                     tdx_attestation_passed=True,
                 )
             )
@@ -889,6 +931,108 @@ class MinerService:
                 }),
             ))
         return graces
+
+    async def _build_cvm_rental_result(
+        self,
+        payload: MinerJobRequestPayload,
+        host,
+        lifecycle,
+        *,
+        assessment,
+        rented_data: RentedExecutorsResponse | None,
+        extra: dict,
+    ) -> JobResult | None:
+        """Forced pass for a node whose CVM a renter holds (DAH-2674), or None.
+
+        The same shape and the same standard of proof as the special-manual-rental synthesis:
+        the pass needs TWO independent parties to agree. cvmd (host-side, outside the guest)
+        says RENTER_RUNNING, and the BACKEND's own rented-executors list says this executor
+        really is under a paid rental for this miner. Either alone is refusable — a host that
+        fabricates its state answer earns nothing without a rental the platform is billing,
+        and nothing read from inside the guest participates at all, so a root renter cannot
+        move the provider's score either (the DAH-2676 rule).
+
+        The host must also still be holding its guest: cvmd reports `supervisor_alive` from
+        its own /proc read, and a dead QEMU mid-rental is a host-side failure, not a scored
+        cycle. `spec` is None, like every synthesis here, so the backend's executor upsert is
+        untouched.
+
+        The registry entry is refreshed only for a backend-confirmed rental — a rental can run
+        720 hours against a 7-day registry TTL, and without the refresh the host would age out
+        of the very sweep that scores it. Gating the refresh the same way as the pass means a
+        fabricated state answer cannot keep its own registry entry alive either.
+        """
+        from services.cvm_lifecycle import (
+            CVM_RENTAL_BACKEND_MISMATCH_EVENT,
+            CVM_RENTAL_PASS_EVENT,
+            CVM_RENTAL_PASS_OBSERVED_EVENT,
+            CVM_RENTAL_SUPERVISOR_DEAD_EVENT,
+        )
+
+        executor_uuid = host.executor_uuid
+        rented_executor = rented_data.executors.get(executor_uuid) if rented_data else None
+        if rented_executor is None or rented_executor.miner_hotkey != payload.miner_hotkey:
+            # cvmd claims a rental the platform is not billing. Nothing to score — and worth
+            # a loud event: it is either a backend/relay lag or a host inventing its state.
+            logger.warning(_m(CVM_RENTAL_BACKEND_MISMATCH_EVENT, extra=extra))
+            return None
+
+        if assessment.supervisor_alive is False:
+            # The state document says RENTER_RUNNING but the host's own /proc read says the
+            # supervisor is gone — QEMU died mid-rental and nothing relaunched it. That is a
+            # host-side failure; paying it would score a rental the customer cannot reach.
+            logger.warning(_m(CVM_RENTAL_SUPERVISOR_DEAD_EVENT, extra=extra))
+            return None
+
+        await lifecycle.touch_host(host)
+
+        if host.gpu_model not in BASE_GPU_MAP:
+            # Same guard as the manual-rental and switch-grace syntheses, same reason: an
+            # unknown model reaching the incentive layer aborts weight-setting subnet-wide.
+            logger.warning(_m(
+                "Rented CVM node's GPU model is not in BASE_GPU_MAP; skipping its forced pass",
+                extra=extra,
+            ))
+            return None
+
+        if not settings.ENABLE_CVM_RENTAL_SCORING:
+            logger.info(_m(CVM_RENTAL_PASS_OBSERVED_EVENT, extra=extra))
+            return None
+
+        # The incentive-layer gates come off rented_data exactly as the manual-rental synthesis
+        # reads them: a forced pass buys a place in the mining pool, not an exemption from the
+        # spot-tier or Discord exclusions.
+        is_spot, provider_discord_connected = self._incentive_gates(rented_data, executor_uuid)
+
+        # The rented executor's real address and port, like the manual-rental synthesis:
+        # the uptime ledger is keyed on "address:port", and a synthesized port of 0 would
+        # miss it every cycle.
+        try:
+            executor_port = int(rented_executor.executor_ip_port)
+        except (TypeError, ValueError):
+            executor_port = 0
+
+        log_text = _m(
+            CVM_RENTAL_PASS_EVENT,
+            extra={**extra, "gpu_count": host.gpu_count, "reason": "cvm_rental"},
+        ).to_full_string()
+        logger.info(log_text)
+        return self._forced_pass_result(
+            payload,
+            executor_uuid=executor_uuid,
+            address=rented_executor.executor_ip_address,
+            port=executor_port,
+            gpu_model=host.gpu_model,
+            gpu_count=host.gpu_count,
+            log_text=log_text,
+            # Rented exempts the minimum-driver gate, which we cannot measure here.
+            is_rented=True,
+            is_spot=is_spot,
+            provider_discord_connected=provider_discord_connected,
+            # This is a CVM-class node: the registry entry that got us here was recorded by an
+            # attested cycle, and the sweep's own state read is the host-side continuation of it.
+            tdx_attestation_passed=True,
+        )
 
     def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
         executor_info = ExecutorSSHInfo(
@@ -2163,15 +2307,6 @@ class MinerService:
                         ),
                     ),
                 )
-                if len(msg.executors) == 0 and not self._has_manual_rental_executors(
-                    payload, rented_data
-                ):
-                    # See the WebSocket path: zero executors is the expected shape when every
-                    # executor is under a manual rental, so only fail when nothing can be scored.
-                    return self._build_failed_job_result(
-                        payload,
-                        "Miner returned zero executors in AcceptSSHKeyRequest",
-                    )
                 tasks = [
                     asyncio.create_task(
                         asyncio.wait_for(
@@ -2197,10 +2332,19 @@ class MinerService:
                 results.extend(
                     self._build_manual_rental_results(payload, rented_data, existing=results)
                 )
-                # DAH-2629/2630 — same accounting as the WebSocket path.
+                # DAH-2629/2630/2674 — same accounting as the WebSocket path, including the
+                # after-the-sweep zero-executor decision: if no synthesis produced anything
+                # either, the failure record is emitted exactly as before.
                 results.extend(
-                    await self._record_and_grace_cvm_hosts(payload, existing=results)
+                    await self._record_and_grace_cvm_hosts(
+                        payload, existing=results, rented_data=rented_data
+                    )
                 )
+                if len(msg.executors) == 0 and not results:
+                    return self._build_failed_job_result(
+                        payload,
+                        "Miner returned zero executors in AcceptSSHKeyRequest",
+                    )
 
                 logger.info(
                     _m(

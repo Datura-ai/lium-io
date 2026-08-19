@@ -118,6 +118,34 @@ class TestDetachment:
         assert wait_until(lambda: supervisor._process_group_gone(pid))
 
 
+class TestSpawnOverASurvivingDirectory:
+    def test_a_stale_pid_file_from_a_previous_life_never_wins(self, tmp_path, monkeypatch):
+        """DAH-2679: a renter relaunch spawns over a directory that still holds the OLD
+        life's pid file, and `_await_pid_file` returns the first pid it can parse — so
+        `spawn` must remove the stale file before the child that writes the new one exists.
+        Without the unlink, the very first poll would return the dead (or recycled) pid."""
+        monkeypatch.setattr(supervisor, "CHILD_MODULE", FIXTURE_MODULE)
+        existing = os.environ.get("PYTHONPATH", "")
+        monkeypatch.setenv(
+            "PYTHONPATH", os.pathsep.join(filter(None, [str(Path(__file__).parent), existing]))
+        )
+        vm_dir = tmp_path / "instance"
+        vm_dir.mkdir()
+        stale = 999_999_999
+        (vm_dir / supervisor.PID_FILE).write_text(f"{stale}\n")
+
+        pid = supervisor.spawn(scripts_dir=tmp_path, vm_dir=vm_dir, kp_port=3443)
+        try:
+            assert pid != stale
+            assert int((vm_dir / supervisor.PID_FILE).read_text().strip()) == pid
+            assert process_field(pid, "state") is not None
+        finally:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 class TestTheUnitLetsItSurvive:
     """Detaching is not enough on its own — systemd kills by cgroup, not by session.
 
@@ -156,6 +184,6 @@ class TestConsoleLog:
         _pid, vm_dir = detached
         log = supervisor.console_log_path(vm_dir)
 
-        assert wait_until(lambda: "detached" in log.read_text()), (
-            f"the console log is empty while the supervisor runs: {log.read_text()!r}"
-        )
+        assert wait_until(
+            lambda: "detached" in log.read_text()
+        ), f"the console log is empty while the supervisor runs: {log.read_text()!r}"

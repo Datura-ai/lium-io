@@ -31,13 +31,13 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.cvmd_client import CvmdClient
-from services.cvmd_relay import CvmdRelayError
+from services.cvmd_relay import CvmdRelay, CvmdRelayError
 from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,15 @@ CVM_SWITCH_BUDGET_EXCEEDED_EVENT = "CVM_SWITCH_BUDGET_EXCEEDED"
 CVM_LAUNCH_STARTED_EVENT = "CVM_VALIDATION_LAUNCH_STARTED"
 CVM_LAUNCH_VERIFIED_EVENT = "CVM_VALIDATION_LAUNCH_VERIFIED"
 CVM_LAUNCH_FAILED_EVENT = "CVM_VALIDATION_LAUNCH_FAILED"
+# DAH-2674 — the rental forced pass, its observe-mode twin, and the two refusals: the
+# backend has no record of the rental cvmd claims, or the host reports its own guest dead.
+CVM_RENTAL_PASS_EVENT = "CVM_RENTAL_FORCED_PASS"
+CVM_RENTAL_PASS_OBSERVED_EVENT = "CVM_RENTAL_FORCED_PASS_OBSERVED"
+CVM_RENTAL_BACKEND_MISMATCH_EVENT = "CVM_RENTAL_BACKEND_MISMATCH"
+CVM_RENTAL_SUPERVISOR_DEAD_EVENT = "CVM_RENTAL_SUPERVISOR_DEAD"
+# DAH-2675 — what the log-only attest-agent probe reports.
+CVM_ATTEST_PROBE_OK_EVENT = "CVM_RENTER_ATTEST_PROBE_OK"
+CVM_ATTEST_PROBE_FAILED_EVENT = "CVM_RENTER_ATTEST_PROBE_FAILED"
 
 
 @dataclass(frozen=True)
@@ -109,18 +118,70 @@ class CvmdHost:
 
 
 @dataclass(frozen=True)
+class PortForward:
+    """One host-side port forward from cvmd's state answer, reduced to what callers decide on."""
+
+    host_port: int
+    address: str
+
+    @property
+    def is_loopback(self) -> bool:
+        return self.address.startswith("127.") or self.address == "localhost"
+
+
+@dataclass(frozen=True)
 class SwitchAssessment:
-    """What one state read says about a possibly-switching node."""
+    """What one state read says about a possibly-switching node.
+
+    `assess` is the only reader of cvmd's wire format: every fact a caller decides on
+    (has_cvm, supervisor_alive, a port forward) is folded here, so no other module carries
+    the state answer's key names or their absent-means-what conventions.
+    """
 
     reachable: bool
     state: str | None = None
-    has_cvm: bool = False
     switching: bool = False
     elapsed_seconds: float | None = None
+    # The state answer's `cvm` object, verbatim. Carried so the renter-CVM handling can read
+    # the forward list (the attest-agent probe needs a host port) without a second state call.
+    cvm: dict | None = None
+    # cvmd's own /proc read of its supervisor. Tri-state on purpose: None means the state
+    # answer did not carry the field (an older cvmd), which must never read as "dead".
+    supervisor_alive: bool | None = None
+
+    @property
+    def has_cvm(self) -> bool:
+        return self.cvm is not None
 
     @property
     def idle_without_cvm(self) -> bool:
         return self.state == STATE_RECONCILING and not self.has_cvm
+
+    @property
+    def renter_running(self) -> bool:
+        """A renter holds this node's CVM — the state cvmd reports for the whole rental."""
+        return self.state == STATE_RENTER_RUNNING and self.has_cvm
+
+    def forward_for(self, guest_port: int) -> PortForward | None:
+        """The host-side forward for one guest port, or None when the list carries nothing
+        this validator could dial — a missing, portless, or malformed entry all read as
+        "no forward"."""
+        ports = (self.cvm or {}).get("ports") or []
+        entry = next(
+            (
+                item
+                for item in ports
+                if isinstance(item, dict) and item.get("guest_port") == guest_port
+            ),
+            None,
+        )
+        if entry is None or not entry.get("host_port"):
+            return None
+        try:
+            host_port = int(entry["host_port"])
+        except (TypeError, ValueError):
+            return None
+        return PortForward(host_port=host_port, address=str(entry.get("address") or ""))
 
 
 def _parse_started_at(last_switch: dict | None) -> datetime | None:
@@ -145,9 +206,18 @@ class CvmLifecycleService:
         self.redis_service = redis_service
         self.whitelist_source = whitelist_source
         self.client = CvmdClient(keypair)
+        # The attest-agent is not cvmd: its /health takes no signature (it answers anyone who
+        # reaches its port) and its TLS certificate is the self-signed one whose key the quote
+        # binds — so the transport stance is the relay's, and the call is unsigned.
+        self.agent_relay = CvmdRelay()
         # Hosts with a launch in flight in THIS process, so one slow launch is not joined
         # by a second from the next cycle. The Redis cooldown covers everything else.
         self._launching: set[str] = set()
+        # Strong references to fire-and-forget tasks. The event loop holds only a weak
+        # reference to a task, so an unreferenced create_task can be garbage-collected
+        # mid-flight — a dropped launch or probe with no trace. The done-callback both
+        # releases the reference and surfaces an exception nothing else would await.
+        self._background_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ registry
 
@@ -184,6 +254,26 @@ class CvmLifecycleService:
             logger.warning(_m(
                 "Could not record a cvmd host",
                 extra=get_extra_info({"executor_uuid": executor_uuid, "error": str(exc)}),
+            ))
+
+    async def touch_host(self, host: CvmdHost) -> None:
+        """Refresh one host's registry TTL from a record the caller just read out of it.
+
+        Write-only on purpose: `record_host`'s merge re-read exists for callers holding
+        fresh payload data, and this caller's fields ARE the stored record, so a re-read
+        could never contribute anything. A rental can run 720 hours against a 7-day TTL;
+        without the refresh the host would age out of the very sweep that scores it.
+        """
+        try:
+            await self.redis_service.hset(
+                CVMD_HOSTS_KEY,
+                host.executor_uuid,
+                replace(host, updated_at=time.time()).to_json(),
+            )
+        except Exception as exc:  # noqa: BLE001 - registry writes must never break a cycle
+            logger.warning(_m(
+                "Could not refresh a cvmd host's registry entry",
+                extra=get_extra_info({"executor_uuid": host.executor_uuid, "error": str(exc)}),
             ))
 
     async def hosts_for_miner(self, miner_hotkey: str) -> list[CvmdHost]:
@@ -227,7 +317,16 @@ class CvmLifecycleService:
 
         body = result.body
         state = body.get("state")
-        has_cvm = body.get("cvm") is not None
+        # Normalized once, here: everything downstream — has_cvm, renter_running, and the
+        # probe's forward lookup — reads the SAME value, so an out-of-contract body (a string
+        # where the cvm object belongs) cannot make the scoring decision and its evidence
+        # disagree about whether a CVM exists.
+        cvm = body.get("cvm")
+        if not isinstance(cvm, dict):
+            cvm = None
+        supervisor_alive = cvm.get("supervisor_alive") if cvm else None
+        if not isinstance(supervisor_alive, bool):
+            supervisor_alive = None
         switching = state in (STATE_TEARDOWN, STATE_SWITCHING)
         elapsed = None
         if switching:
@@ -237,9 +336,10 @@ class CvmLifecycleService:
         return SwitchAssessment(
             reachable=True,
             state=state,
-            has_cvm=has_cvm,
             switching=switching,
             elapsed_seconds=elapsed,
+            cvm=cvm,
+            supervisor_alive=supervisor_alive,
         )
 
     # ------------------------------------------------------------------ DAH-2629: launch
@@ -359,6 +459,116 @@ class CvmLifecycleService:
         finally:
             self._launching.discard(host.executor_uuid)
 
+    def _spawn_background(self, coro) -> None:
+        """create_task with a held reference and an exception drain — see `_background_tasks`."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._reap_background)
+
+    def _reap_background(self, task: asyncio.Task) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(_m(
+                "A CVM lifecycle background task failed",
+                extra=get_extra_info({"error": repr(exc)}),
+            ))
+
     def schedule_ensure(self, host: CvmdHost, *, assessment: SwitchAssessment | None = None) -> None:
         """Fire the launch as its own task — a boot must never extend a validation cycle."""
-        asyncio.create_task(self.ensure_validation_cvm(host, assessment=assessment))
+        self._spawn_background(self.ensure_validation_cvm(host, assessment=assessment))
+
+    # ------------------------------------------------------------------ DAH-2675: attest probe
+
+    async def probe_attest_agent(self, host: CvmdHost, assessment: SwitchAssessment) -> None:
+        """Read the renter CVM's attest-agent /health and LOG what it says. Nothing else.
+
+        Log-only by construction: this method's whole output is two Loki events, so it cannot
+        touch a score no matter what it finds. That is deliberate — the renter has root in the
+        guest and can kill or firewall the agent, so until the renter-fault attribution rules
+        (DAH-2676) decide what an unreachable agent MEANS, acting on one would let the renter
+        (or a provider running the mirror image of that attack) move a score. What this buys
+        now is the rollout data: how often the agent answers, with which identity, across the
+        fleet — the same observe-before-enforce path every other CVM flag has taken.
+
+        The nonce-bound quote (`POST /v1/attest`) is deliberately NOT called here. A quote is
+        only worth requesting when something verifies it, and quote verification against a real
+        TDX host is the hardware half of DAH-2675.
+        """
+        if not settings.ENABLE_CVM_ATTEST_PROBE:
+            return
+
+        extra = get_extra_info({
+            "executor_uuid": host.executor_uuid,
+            "miner_hotkey": host.miner_hotkey,
+        })
+        forward = assessment.forward_for(settings.CVM_ATTEST_AGENT_GUEST_PORT)
+        if forward is None:
+            # The fleet forward list does not carry the agent's port — a config gap worth
+            # a log line, not an error: the probe is optional until enforcement exists.
+            logger.info(_m(
+                f"{CVM_ATTEST_PROBE_FAILED_EVENT} — no forward for the agent's guest port",
+                extra={**extra, "guest_port": settings.CVM_ATTEST_AGENT_GUEST_PORT},
+            ))
+            return
+
+        if forward.is_loopback:
+            # cvmd's port parser defaults the bind address to 127.0.0.1, and a loopback
+            # forward is reachable from the CVM host alone. Dialing the public address would
+            # time out every cycle and read, fleet-wide, as "the agent is never up" — the
+            # exact wrong rollout signal. Named as its own condition so Loki can tell a
+            # config gap from a dead agent.
+            logger.info(_m(
+                f"{CVM_ATTEST_PROBE_FAILED_EVENT} — the agent's forward is bound to loopback "
+                f"on the host, so this validator cannot reach it",
+                extra={**extra, "bind_address": forward.address, "host_port": forward.host_port},
+            ))
+            return
+
+        # Only the network call can raise, and the relay funnels every transport failure
+        # into CvmdRelayError — a wider net here would relabel code bugs as agent flakiness.
+        # Anything truly unexpected surfaces through `_reap_background`.
+        try:
+            result = await self.agent_relay.forward(
+                base_url=f"https://{host.address}:{forward.host_port}",
+                method="GET",
+                path="/health",
+                body="",
+                headers={},
+                timeout_seconds=settings.CVM_ATTEST_PROBE_TIMEOUT_SECONDS,
+            )
+        except CvmdRelayError as exc:
+            logger.info(_m(
+                f"{CVM_ATTEST_PROBE_FAILED_EVENT} — the agent was not reached",
+                extra={**extra, "error": str(exc)},
+            ))
+            return
+
+        if not result.ok:
+            logger.info(_m(
+                f"{CVM_ATTEST_PROBE_FAILED_EVENT} — the agent answered an error",
+                extra={**extra, "status": result.status, "detail": result.reason()},
+            ))
+            return
+
+        body = result.body
+        logger.info(_m(
+            CVM_ATTEST_PROBE_OK_EVENT,
+            extra={
+                **extra,
+                "agent_version": body.get("version"),
+                "tls_public_key": body.get("tls_public_key"),
+                "gpu_uuid_digest": body.get("gpu_uuid_digest"),
+                "gpu_count": len(body.get("gpu_uuids") or []),
+            },
+        ))
+
+    def schedule_attest_probe(self, host: CvmdHost, assessment: SwitchAssessment) -> None:
+        """Fire the probe as its own task — a slow agent must never extend a validation cycle."""
+        if not settings.ENABLE_CVM_ATTEST_PROBE:
+            # The coroutine guards itself too (for direct callers); checking here as well keeps
+            # the default-off configuration from allocating a task just to throw it away.
+            return
+        self._spawn_background(self.probe_attest_agent(host, assessment))

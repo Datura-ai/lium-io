@@ -156,6 +156,15 @@ def spawn(*, scripts_dir: Path, vm_dir: Path, kp_port: int) -> int:
     reaps the intermediate; the real pid comes from the file the grandchild writes once it has
     detached.
     """
+    # A surviving directory (a renter relaunch after a host reboot) still holds the previous
+    # life's pid file, and `_await_pid_file` returns the first pid it can parse — so the stale
+    # file must be gone before the child that writes the new one exists. Fresh directories
+    # make this a no-op, which is why it lives here and not at any single call site.
+    try:
+        (vm_dir / PID_FILE).unlink(missing_ok=True)
+    except OSError as exc:
+        raise SupervisorError(f"cannot remove the stale pid file in {vm_dir}: {exc}") from exc
+
     log_path = console_log_path(vm_dir)
     try:
         log_handle = log_path.open("ab", buffering=0)

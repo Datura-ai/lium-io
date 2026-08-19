@@ -41,6 +41,11 @@ RUNNING_STATE = {
 
 READINESS_POLL_SECONDS = 5
 
+# DAH-2679: how many supervisor re-spawns one renter CVM gets over its whole life. The count
+# is cumulative in the instance record and never reset (see `Instance.relaunch_attempts`), so
+# this bounds a guest that keeps dying, not a host that rebooted once.
+RELAUNCH_MAX_ATTEMPTS = 3
+
 # Probing localhost, not the mapping's bind address: 0.0.0.0 is not a destination, and a
 # forward bound to a public address is still reachable from the host it runs on.
 PROBE_HOST = "127.0.0.1"
@@ -155,6 +160,9 @@ class CvmManager:
                         f"CVM {instance.instance_id} has unknown kind {instance.kind!r}"
                     )
                 return self._settle(state)
+            relaunched = self._try_relaunch(instance, vm_dir)
+            if relaunched is not None:
+                return relaunched
             return self._fail(
                 f"the supervisor for CVM {instance.instance_id} (pid {instance.supervisor_pid}) "
                 f"is gone but its directory {vm_dir} remains"
@@ -183,6 +191,90 @@ class CvmManager:
     def _stray_directories(self) -> list[Path]:
         run_dir = self._config.run_dir
         return supervisor.vm_directories(run_dir) if run_dir else []
+
+    def _try_relaunch(self, instance: Instance, vm_dir: Path) -> NodeState | None:
+        """Boot a renter CVM's surviving directory again instead of failing the node (DAH-2679).
+
+        The shape this answers is the one a host reboot leaves: the instance record and the VM
+        directory — `hda.img` included — survived on disk, and the supervisor did not. Today
+        that is a hard FAILED and the renter's data is stranded on a disk nothing will ever
+        boot. Re-spawning the supervisor over the SAME directory is safe to attempt precisely
+        because of what protects that disk: it is encrypted, and its key is released by the key
+        provider only to a guest measuring as the same triple that created it. So an unmodified
+        directory boots back into the renter's data, and a tampered one fails to unlock rather
+        than booting into something else — which is why no local re-measurement happens here.
+
+        Renter CVMs only. A validation CVM's disk is deliberately not durable state (it must
+        measure identically on every fresh launch, and the validator relaunches it itself), so
+        for every non-renter shape this method declines and the caller fails the node exactly
+        as before.
+
+        No readiness probe, on purpose. Reconciliation runs at daemon startup and must not hold
+        for the minutes a guest takes to boot; a live supervisor is the same evidence the adopt
+        branch accepts for a CVM cvmd did not start. A guest that dies while booting leaves the
+        supervisor gone again, and the attempt cap turns that into FAILED instead of a loop.
+        """
+        if not self._config.relaunch_renter or instance.kind != KIND_RENTER:
+            return None
+        if self._store.state is not NodeState.RENTER_RUNNING:
+            # Only a rental that was LIVE relaunches. An interrupted teardown persists
+            # TEARDOWN or SWITCHING before it kills anything, so this is the guard that
+            # keeps a cvmd restart from resurrecting a CVM the platform already destroyed —
+            # over hardware `destroy` was in the middle of verifiably releasing.
+            return None
+        if not (vm_dir / supervisor.DISK_IMAGE).exists():
+            # Whatever removed the disk, there is nothing left to boot — the fail branch's
+            # message about a directory with no supervisor is the honest answer.
+            return None
+        if instance.relaunch_attempts >= RELAUNCH_MAX_ATTEMPTS:
+            logger.error(
+                "not relaunching CVM %s: %d relaunch attempts already spent",
+                instance.instance_id,
+                instance.relaunch_attempts,
+            )
+            return None
+        if self._config.missing():
+            return None
+        if supervisor.running_cvms():
+            # Some other TDX guest holds this host's GPUs — launching over it would double-book
+            # them. The stray-guest handling in the caller is the right refusal. Checked last:
+            # it is the one guard that walks /proc, and the in-memory refusals above decide
+            # most declines for free.
+            return None
+
+        # Spent before the spawn, not after: a spawn that dies between starting a process and
+        # the pid file would otherwise retry unbounded, and an attempt that consumed host
+        # resources is an attempt whether or not it produced a supervisor.
+        attempt = instance.relaunch_attempts + 1
+        self._instances.update(relaunch_attempts=attempt)
+
+        try:
+            pid = supervisor.spawn(
+                scripts_dir=self._config.dstack_scripts_dir,
+                vm_dir=vm_dir,
+                kp_port=self._config.key_provider_port,
+            )
+        except supervisor.SupervisorError as exc:
+            logger.error(
+                "relaunch %d/%d of CVM %s failed: %s",
+                attempt,
+                RELAUNCH_MAX_ATTEMPTS,
+                instance.instance_id,
+                exc,
+            )
+            return None
+
+        self._instances.update(supervisor_pid=pid)
+        logger.info(
+            "relaunched the renter CVM %s over its surviving directory %s (attempt %d/%d, "
+            "supervisor pid %d)",
+            instance.instance_id,
+            vm_dir,
+            attempt,
+            RELAUNCH_MAX_ATTEMPTS,
+            pid,
+        )
+        return self._settle(NodeState.RENTER_RUNNING)
 
     def _sweep_staging(self) -> None:
         """Remove every renter staging directory left on this host.

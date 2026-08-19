@@ -16,76 +16,28 @@ recognize the window instead of reading it as downtime. The claims pinned here:
 
 import json
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from datura.requests.miner_requests import ExecutorSSHInfo
+from cvm_helpers import PAYLOAD, cvmd_host, make_miner_service, scored_result
 
 from core.config import settings
 from services.cvm_lifecycle import (
-    CvmdHost,
     CvmLifecycleService,
     SwitchAssessment,
 )
 from services.cvmd_relay import RelayResult
-from services.miner_service import MinerService
-from services.task.models import JobResult
 
-HOST = CvmdHost(
-    executor_uuid="e-switch",
-    address="203.0.113.7",
-    miner_hotkey="5Miner",
-    gpu_model="NVIDIA H200",
-    gpu_count=8,
-    updated_at=0.0,
-)
-
-PAYLOAD = SimpleNamespace(miner_hotkey="5Miner", miner_coldkey="5Cold", job_batch_id="batch-1")
-
-
-def make_miner_service(hosts, assessment):
-    service = MinerService.__new__(MinerService)
-    service.redis_service = MagicMock()
-    lifecycle = MagicMock(spec=CvmLifecycleService)
-    lifecycle.record_host = AsyncMock()
-    lifecycle.hosts_for_miner = AsyncMock(return_value=hosts)
-    lifecycle.assess = AsyncMock(return_value=assessment)
-    lifecycle.schedule_ensure = MagicMock()
-    service._cvm_lifecycle_service = lifecycle
-    return service, lifecycle
+HOST = cvmd_host("e-switch")
 
 
 def switching(elapsed_seconds):
     return SwitchAssessment(
         reachable=True,
         state="SWITCHING",
-        has_cvm=True,
+        cvm={"instance_id": "s-1"},
         switching=True,
         elapsed_seconds=elapsed_seconds,
-    )
-
-
-def scored_result(executor_uuid="already-scored", tdx=False):
-    return JobResult(
-        spec=None,
-        executor_info=ExecutorSSHInfo(
-            uuid=executor_uuid,
-            address="198.51.100.3",
-            port=1,
-            ssh_username="",
-            ssh_port=0,
-            python_path="",
-            root_dir="",
-        ),
-        score=1.0,
-        job_score=1.0,
-        job_batch_id="batch-1",
-        log_status="success",
-        log_text="ok",
-        gpu_model="NVIDIA H200",
-        gpu_count=8,
-        tdx_attestation_passed=tdx,
     )
 
 
@@ -155,9 +107,9 @@ class TestTheBudgetIsAHardEdge:
         monkeypatch.setattr(
             settings, "CVM_SWITCH_BUDGET_SECONDS_BY_GPU_MODEL", "not json", raising=False
         )
-        assert settings.get_cvm_switch_budget_seconds("NVIDIA H200") == 300, (
-            "bad config falls back rather than failing the cycle"
-        )
+        assert (
+            settings.get_cvm_switch_budget_seconds("NVIDIA H200") == 300
+        ), "bad config falls back rather than failing the cycle"
 
 
 class TestObserveMode:
@@ -184,7 +136,7 @@ class TestLifecycleHandoff:
     @pytest.mark.asyncio
     async def test_an_empty_idle_host_is_scheduled_for_a_launch_not_graced(self, grace_on):
         service, lifecycle = make_miner_service(
-            [HOST], SwitchAssessment(reachable=True, state="RECONCILING", has_cvm=False)
+            [HOST], SwitchAssessment(reachable=True, state="RECONCILING")
         )
 
         results = await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[])
@@ -196,14 +148,7 @@ class TestLifecycleHandoff:
     async def test_an_unknown_gpu_model_is_never_graced(self, grace_on):
         """Same guard as the manual-rental synthesis: an unknown model reaching the
         incentive layer aborts weight-setting for the whole subnet."""
-        odd_host = CvmdHost(
-            executor_uuid="e-odd",
-            address="203.0.113.9",
-            miner_hotkey="5Miner",
-            gpu_model="Prototype GPU X",
-            gpu_count=1,
-            updated_at=0.0,
-        )
+        odd_host = cvmd_host("e-odd", "203.0.113.9", gpu_model="Prototype GPU X", gpu_count=1)
         service, _ = make_miner_service([odd_host], switching(10.0))
 
         assert await service._record_and_grace_cvm_hosts(PAYLOAD, existing=[]) == []
@@ -261,10 +206,57 @@ class TestAssessmentParsing:
         service = CvmLifecycleService(redis, whitelist, Keypair.create_from_uri("//Alice"))
         service.client = MagicMock()
         service.client.state = AsyncMock(
-            return_value=RelayResult(status=200, body={"state": "RECONCILING", "cvm": None, "last_switch": None})
+            return_value=RelayResult(
+                status=200, body={"state": "RECONCILING", "cvm": None, "last_switch": None}
+            )
         )
 
         assessment = await service.assess(HOST)
 
         assert assessment.idle_without_cvm
         assert not assessment.switching
+        assert (
+            assessment.supervisor_alive is None
+        ), "no cvm object means no supervisor fact — absent must never read as dead"
+
+    @pytest.mark.asyncio
+    async def test_the_wire_facts_are_folded_here_and_nowhere_else(self):
+        """`assess` is the only reader of cvmd's wire format: supervisor_alive and the
+        forward list come off the state answer HERE, so no other module carries the wire
+        key names or their absent-means-what conventions."""
+        redis = MagicMock()
+        whitelist = MagicMock()
+        from bittensor_wallet import Keypair
+
+        service = CvmLifecycleService(redis, whitelist, Keypair.create_from_uri("//Alice"))
+        service.client = MagicMock()
+        service.client.state = AsyncMock(
+            return_value=RelayResult(
+                status=200,
+                body={
+                    "state": "RENTER_RUNNING",
+                    "cvm": {
+                        "instance_id": "r-1",
+                        "supervisor_alive": False,
+                        "ports": [
+                            {
+                                "protocol": "tcp",
+                                "address": "0.0.0.0",
+                                "host_port": 18451,
+                                "guest_port": 8451,
+                            }
+                        ],
+                    },
+                },
+            )
+        )
+
+        assessment = await service.assess(HOST)
+
+        assert assessment.has_cvm and assessment.renter_running
+        assert assessment.supervisor_alive is False
+        forward = assessment.forward_for(8451)
+        assert forward is not None
+        assert forward.host_port == 18451
+        assert not forward.is_loopback
+        assert assessment.forward_for(9999) is None

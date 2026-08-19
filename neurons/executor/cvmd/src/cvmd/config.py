@@ -109,6 +109,13 @@ class LaunchConfig:
     ssh_guest_port: int | None = None
     pin_numa: bool = False
     hugepages: bool = False
+    # DAH-2679, opt-in: when reconciliation finds a RENTER CVM whose supervisor is gone but
+    # whose directory (disk included) survived — the shape a host reboot leaves — re-spawn the
+    # supervisor over the same directory instead of failing the node. Renter only: a validation
+    # CVM's disk is deliberately not durable state (it must measure identically on every fresh
+    # launch), while a renter's disk IS the customer's data. Default off so a fleet that has
+    # not decided its durability posture keeps today's fail-loudly behavior exactly.
+    relaunch_renter: bool = False
 
     # Required for a launch. `gpus` is deliberately absent: a CVM with no GPUs is a legal
     # configuration, so an empty list cannot be distinguished from an unset one and must not
@@ -266,6 +273,7 @@ def _load_launch(table: dict, state_dir: Path) -> LaunchConfig:
         ssh_guest_port=_as_optional_int(_get(table, "cvm_ssh_guest_port"), "cvm_ssh_guest_port"),
         pin_numa=_as_bool(_get(table, "cvm_pin_numa"), "cvm_pin_numa"),
         hugepages=_as_bool(_get(table, "cvm_hugepages"), "cvm_hugepages"),
+        relaunch_renter=_as_bool(_get(table, "cvm_relaunch_renter"), "cvm_relaunch_renter"),
     )
     # Parsed with the launch path's own parser, not re-described here. Without this a mapping
     # like "tcp:0.0.0.0:0:22" is well-formed TOML, so the daemon starts looking configured and
