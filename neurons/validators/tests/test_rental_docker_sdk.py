@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import socket
 import struct
@@ -6,6 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from docker import auth as docker_auth
 from docker.errors import APIError
 from docker.types import ContainerConfig
 
@@ -308,6 +311,27 @@ class PullApiClient(FakeApiClient):
         return self.pull_events
 
 
+class LoginThenPullApiClient(PullApiClient):
+    def __init__(self):
+        super().__init__()
+        self.credstore_env = None
+        self._auth_configs = docker_auth.AuthConfig({"auths": {}})
+
+    def login(self, *, username, password, registry=None, reauth=False):
+        self.login_calls.append(
+            {
+                "username": username,
+                "password": password,
+                "registry": registry,
+                "reauth": reauth,
+            }
+        )
+        self._auth_configs.add_auth(
+            registry or docker_auth.INDEX_NAME,
+            {"username": username, "password": password, "serveraddress": registry},
+        )
+
+
 class ImageNotFound(Exception):
     pass
 
@@ -318,15 +342,60 @@ async def test_login_passes_credentials_as_sdk_data():
     client = RentalDockerSdkClient(api_client)
     username = "user'; rm -rf / #"
 
-    await client.login(username=username, password=INCIDENT_DOCKER_PASSWORD)
+    await client.login(
+        username=username, password=INCIDENT_DOCKER_PASSWORD, image="ubuntu:latest"
+    )
 
     assert api_client.login_calls == [
         {
             "username": username,
             "password": INCIDENT_DOCKER_PASSWORD,
+            "registry": None,
             "reauth": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_login_resolves_registry_from_private_image():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    await client.login(
+        username="team-user",
+        password=INCIDENT_DOCKER_PASSWORD,
+        image="registry.digitalocean.com/team/app:1.0",
+    )
+
+    assert api_client.login_calls[0]["registry"] == "registry.digitalocean.com"
+
+
+@pytest.mark.asyncio
+async def test_login_uses_no_registry_for_docker_hub_image():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    await client.login(
+        username="hub-user",
+        password=INCIDENT_DOCKER_PASSWORD,
+        image="daturaai/pytorch:test",
+    )
+
+    assert api_client.login_calls[0]["registry"] is None
+
+
+@pytest.mark.asyncio
+async def test_login_resolves_registry_with_port_from_image():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    await client.login(
+        username="local-user",
+        password=INCIDENT_DOCKER_PASSWORD,
+        image="localhost:5000/team/app:1",
+    )
+
+    assert api_client.login_calls[0]["registry"] == "localhost:5000"
 
 
 @pytest.mark.parametrize(
@@ -343,9 +412,29 @@ async def test_login_preserves_legitimate_password_metacharacters(password):
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
 
-    await client.login(username="registry-user", password=password)
+    await client.login(
+        username="registry-user", password=password, image="daturaai/pytorch:test"
+    )
 
     assert api_client.login_calls[0]["password"] == password
+
+
+@pytest.mark.asyncio
+async def test_pull_sends_registry_auth_header_for_private_registry_login():
+    api_client = LoginThenPullApiClient()
+    client = RentalDockerSdkClient(api_client, pull_timeout_seconds=123)
+    image = "registry.digitalocean.com/team/app:1.0"
+
+    await client.login(
+        username="team-user", password=INCIDENT_DOCKER_PASSWORD, image=image
+    )
+    await client.pull(image=image)
+
+    headers = api_client.post_calls[0]["kwargs"]["headers"]
+    assert "X-Registry-Auth" in headers
+    decoded = json.loads(base64.urlsafe_b64decode(headers["X-Registry-Auth"]))
+    assert decoded["serveraddress"] == "registry.digitalocean.com"
+    assert decoded["username"] == "team-user"
 
 
 @pytest.mark.asyncio

@@ -86,8 +86,8 @@ class RecordingRentalDockerClient:
         self.pruned_images = 0
         self.run_container_error = None
 
-    async def login(self, *, username: str, password: str) -> None:
-        self.login_calls.append({"username": username, "password": password})
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        self.login_calls.append({"username": username, "password": password, "image": image})
 
     async def image_exists(self, *, image: str) -> bool:
         self.inspected_images.append(image)
@@ -410,7 +410,7 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
         ],
     )
     assert docker_client.login_calls == [
-        {"username": HOSTILE_USERNAME, "password": HOSTILE_PASSWORD}
+        {"username": HOSTILE_USERNAME, "password": HOSTILE_PASSWORD, "image": HOSTILE_IMAGE}
     ]
     assert docker_client.pulled_images == [HOSTILE_IMAGE]
     assert run_spec.image == HOSTILE_IMAGE

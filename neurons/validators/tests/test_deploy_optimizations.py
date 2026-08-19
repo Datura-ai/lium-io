@@ -99,8 +99,8 @@ class _FakeRentalDockerClient:
         self.exec_specs = []
         self.login_calls = []
 
-    async def login(self, *, username: str, password: str) -> None:
-        self.login_calls.append({"username": username, "password": password})
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        self.login_calls.append({"username": username, "password": password, "image": image})
 
     async def image_exists(self, *, image: str) -> bool:
         self.image_exists_calls.append(image)
@@ -842,7 +842,9 @@ async def test_docker_login_runs_for_non_default_image_with_credentials(svc, mon
     )
 
     assert isinstance(result, ContainerCreated)
-    assert _docker_client(svc).login_calls == [{"username": "renter", "password": "renter-secret"}]
+    assert _docker_client(svc).login_calls == [
+        {"username": "renter", "password": "renter-secret", "image": "private/repo:1.0.0"}
+    ]
     assert _login_step(result).skipped is False
 
 
@@ -856,7 +858,9 @@ async def test_docker_login_runs_when_ships_sshd_is_none(svc, monkeypatch):
     result = await _run(svc, _payload(docker_image="private/repo:1.0.0", **_CREDS))
 
     assert isinstance(result, ContainerCreated)
-    assert _docker_client(svc).login_calls == [{"username": "renter", "password": "renter-secret"}]
+    assert _docker_client(svc).login_calls == [
+        {"username": "renter", "password": "renter-secret", "image": "private/repo:1.0.0"}
+    ]
     assert _login_step(result).skipped is False
 
 
@@ -876,9 +880,10 @@ async def test_docker_login_step_marked_skipped_when_no_credentials(svc, monkeyp
 
 @pytest.mark.asyncio
 async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
-    """A custom build's `FROM` may pull a private base image, so the login stays. The
-    backend guarantees this by forcing is_cached=False (→ ships_sshd=False) for custom
-    builds, even when the base image happens to be a default ref."""
+    """Custom builds keep ships_sshd=False (the backend forces is_cached=False for them,
+    even when the base image happens to be a default ref), so they keep the login path
+    as-is. The DinD `docker build` never sees this SDK login; passing credentials into
+    it is a separate task."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
     monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None)))
@@ -894,5 +899,7 @@ async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
     )
 
     assert isinstance(result, ContainerCreated)
-    assert _docker_client(svc).login_calls == [{"username": "renter", "password": "renter-secret"}]
+    assert _docker_client(svc).login_calls == [
+        {"username": "renter", "password": "renter-secret", "image": _DEFAULT_IMAGE}
+    ]
     assert _login_step(result).skipped is False

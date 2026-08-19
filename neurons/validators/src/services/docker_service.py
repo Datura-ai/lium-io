@@ -3877,6 +3877,7 @@ class DockerService:
         # nothing to remove, so a missing container there is an ordinary create failure.
         container_created = False
         container_vanished = False
+        login_error: str | None = None
         volume_encryption_status = VolumeEncryptionStatus.DISABLED
 
         # DAH-2211: a custom-build payload carries `dockerfile_content` (may be
@@ -4082,8 +4083,9 @@ class DockerService:
                 # `ships_sshd` IS the "renter selected a default image" signal — the
                 # backend sets it from the same check that resolves the recommended image
                 # for this executor's GPU+driver (executor.py: `ships_sshd=is_cached`,
-                # with `is_cached=False` forced for custom builds, whose `FROM` may pull a
-                # private base image and so must keep the login). Don't re-derive it here:
+                # with `is_cached=False` forced for custom builds, so they keep this login
+                # path as-is; the DinD `docker build` never sees this SDK login, and
+                # passing credentials into it is a separate task). Don't re-derive it here:
                 # a second, validator-side notion of "is this a default image?" could
                 # disagree with the backend's and skip a login that was actually needed.
                 has_credentials = bool(payload.docker_username and payload.docker_password)
@@ -4105,11 +4107,13 @@ class DockerService:
                             call=lambda: docker_client.login(
                                 username=payload.docker_username,
                                 password=payload.docker_password,
+                                image=payload.docker_image,
                             ),
                             username_present=True,
                             username_len=len(payload.docker_username),
                         )
                     except Exception as exc:
+                        login_error = str(exc)
                         logger.warning(
                             _m(
                                 "Docker registry login failed",
@@ -4889,6 +4893,10 @@ class DockerService:
                     volume_encryption_status=volume_encryption_status,
                 )
         except Exception as e:
+            # a pull that fails after a failed registry login is most likely the
+            # login's fault (docker-py silently pulls anonymously) — attribute it
+            if current_step == "docker_pull" and login_error is not None:
+                current_step = "docker_login"
             log_text = _m(
                 "Failed create_container",
                 extra=get_extra_info({
@@ -4912,6 +4920,8 @@ class DockerService:
                 and isinstance(e, RentalDockerConnectionError)
             ):
                 failure_detail = f"{failure_detail}: {e}"
+            if current_step == "docker_login" and login_error is not None:
+                failure_detail = f"{failure_detail} (earlier login failure: {login_error})"
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,

@@ -35,6 +35,7 @@ from services.rental_docker_sdk import (
 )
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    ContainerCreated,
     ContainerCreateRequest,
     CustomOptions,
     ContainerDeleteRequest,
@@ -86,6 +87,7 @@ class _FakeRentalDockerClient:
         self.created_volumes = []
         self.removed_volumes = []
         self.pruned_images = 0
+        self.login_error = None
         self.pull_error = None
         self.run_error = None
         self.start_error = None
@@ -94,8 +96,10 @@ class _FakeRentalDockerClient:
         self.remove_volume_error = None
         self.prune_images_error = None
 
-    async def login(self, *, username: str, password: str) -> None:
-        self.login_calls.append({"username": username, "password": password})
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        self.login_calls.append({"username": username, "password": password, "image": image})
+        if self.login_error is not None:
+            raise self.login_error
 
     async def image_exists(self, *, image: str) -> bool:
         self.inspected_images.append(image)
@@ -3417,6 +3421,140 @@ async def test_create_container_reports_docker_pull_failure_step(
         payload.executor_id,
         payload.pod_id,
     )
+
+
+def _private_registry_create_payload() -> ContainerCreateRequest:
+    return ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="registry.digitalocean.com/team/app:1.0",
+        docker_username="team-user",
+        docker_password="team-secret",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+
+def _patch_private_registry_create_happy_path(docker_service, monkeypatch) -> None:
+    # image inspect reports ABSENT so the pull runs; everything else succeeds
+    ssh_client = AsyncMock()
+
+    def _ssh_run_side(cmd, *args, **kwargs):
+        if "image inspect" in cmd:
+            return _make_ssh_command_result(exit_status=1)
+        return _make_ssh_command_result()
+
+    ssh_client.run = AsyncMock(side_effect=_ssh_run_side)
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.add_pending_pod = AsyncMock()
+    docker_service.redis_service.remove_pending_pod = AsyncMock()
+    docker_service.redis_service.add_rented_pod = AsyncMock()
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        docker_service,
+        "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], None)),
+    )
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(docker_service, "clean_existing_containers", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
+    monkeypatch.setattr(
+        docker_service,
+        "wait_for_port_check_containers",
+        AsyncMock(return_value=(True, "ok")),
+    )
+    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_create_container_reports_docker_login_failure_step_when_pull_also_fails(
+    docker_service,
+    monkeypatch,
+):
+    _patch_private_registry_create_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+    )
+    docker_client.pull_error = Exception("blocked")
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_login"
+    assert "registry.digitalocean.com" in result.detail
+    assert "unauthorized" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_create_container_login_failure_does_not_block_successful_pull(
+    docker_service,
+    monkeypatch,
+):
+    _patch_private_registry_create_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+    )
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated)
+    assert docker_client.pulled_images == [payload.docker_image]
 
 
 @pytest.mark.asyncio
