@@ -325,7 +325,7 @@ class ResticStorageRunner:
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
         probe = subprocess.run(
-            self._restic_command(["snapshots", "--json", snapshot_id]),
+            self._restic_command(["snapshots", "--json", "--", snapshot_id]),
             env=self._environment,
             capture_output=True,
             text=True,
@@ -589,7 +589,7 @@ class ResticStorageRunner:
             # User xattrs belong to customer data; only host-managed namespaces
             # that cannot be written from the rental user namespace are skipped.
             arguments.extend(["--exclude-xattr", "security.*", "--exclude-xattr", "trusted.*"])
-        arguments.append(snapshot_id)
+        arguments.extend(["--", snapshot_id])
         return self._execution_command(arguments, working_directory=False)
 
     def _legacy_restore_execution_command(self, object_key: str) -> tuple[list[str], str | None]:
