@@ -77,8 +77,8 @@ class _FakeRentalDockerClient:
         self.pull_error = None
         self.run_error = None
 
-    async def login(self, *, username: str, password: str) -> None:
-        self.login_calls.append({"username": username, "password": password})
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        self.login_calls.append({"username": username, "password": password, "image": image})
 
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)

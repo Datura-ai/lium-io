@@ -97,6 +97,7 @@ from services.rental_docker_sdk import (
     DeviceMount,
     PortBinding,
     RentalDockerConnectionError,
+    RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
@@ -3877,6 +3878,7 @@ class DockerService:
         # nothing to remove, so a missing container there is an ordinary create failure.
         container_created = False
         container_vanished = False
+        login_error: str | None = None
         volume_encryption_status = VolumeEncryptionStatus.DISABLED
 
         # DAH-2211: a custom-build payload carries `dockerfile_content` (may be
@@ -4082,8 +4084,9 @@ class DockerService:
                 # `ships_sshd` IS the "renter selected a default image" signal — the
                 # backend sets it from the same check that resolves the recommended image
                 # for this executor's GPU+driver (executor.py: `ships_sshd=is_cached`,
-                # with `is_cached=False` forced for custom builds, whose `FROM` may pull a
-                # private base image and so must keep the login). Don't re-derive it here:
+                # with `is_cached=False` forced for custom builds, so they keep this login
+                # path as-is; the DinD `docker build` never sees this SDK login, and
+                # passing credentials into it is a separate task). Don't re-derive it here:
                 # a second, validator-side notion of "is this a default image?" could
                 # disagree with the backend's and skip a login that was actually needed.
                 has_credentials = bool(payload.docker_username and payload.docker_password)
@@ -4105,11 +4108,13 @@ class DockerService:
                             call=lambda: docker_client.login(
                                 username=payload.docker_username,
                                 password=payload.docker_password,
+                                image=payload.docker_image,
                             ),
                             username_present=True,
                             username_len=len(payload.docker_username),
                         )
                     except Exception as exc:
+                        login_error = str(exc)
                         logger.warning(
                             _m(
                                 "Docker registry login failed",
@@ -4201,12 +4206,22 @@ class DockerService:
                             "success",
                             log_tag,
                         )
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="pull",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.pull(image=payload.docker_image),
-                            image=payload.docker_image,
-                        )
+                        try:
+                            await run_logged_rental_docker_sdk_operation(
+                                operation="pull",
+                                log_extra=default_extra,
+                                call=lambda: docker_client.pull(image=payload.docker_image),
+                                image=payload.docker_image,
+                            )
+                        except Exception as exc:
+                            if login_error is None:
+                                raise
+                            # docker-py pulls anonymously after a failed login, so the
+                            # pull failure is most likely the login's fault — attribute it
+                            current_step = "docker_login"
+                            raise RentalDockerOperationError(
+                                f"{exc} (earlier login failure: {login_error})"
+                            ) from exc
 
                         # Add profiler for docker pull
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
