@@ -1336,6 +1336,7 @@ class DockerService:
         log_extra: dict = {},
         timeout: int = 0,
         raise_exception: bool = True,
+        stdin_data: str | None = None,
     ) -> tuple[bool, str]:
         logger.info(
             _m(
@@ -1354,6 +1355,9 @@ class DockerService:
         error = ''
         try:
             async with ssh_client.create_process(command) as process:
+                if stdin_data is not None:
+                    process.stdin.write(stdin_data)
+                    process.stdin.write_eof()
                 if timeout != 0:
                     status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
                 else:
@@ -2959,8 +2963,8 @@ class DockerService:
             )
 
             command = (
-                f"/usr/bin/docker exec -u 0 {container_q} sh -c "
-                f"{shlex.quote(f'{script_q} --password={jupyter_token} --port={jupyter_port}')}"
+                f"/usr/bin/docker exec -i -u 0 {container_q} sh -c "
+                f"{shlex.quote(f'read JUPYTER_PASSWORD; export JUPYTER_PASSWORD; {script_q} --password=$JUPYTER_PASSWORD --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2969,6 +2973,7 @@ class DockerService:
                 log_text="Running jupyter from volume",
                 log_extra=log_extra,
                 raise_exception=False,
+                stdin_data=f"{jupyter_token}\n",
             )
         else:
             target_path = local_volume_path if encrypted_local_volume else "/root"
@@ -3011,8 +3016,8 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec -u 0 {container_q} sh -c "
-                f"{shlex.quote(f'{target_q}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}')}"
+                f"/usr/bin/docker exec -i -u 0 {container_q} sh -c "
+                f"{shlex.quote(f'read JUPYTER_PASSWORD; export JUPYTER_PASSWORD; {target_q}/run_jupyter.sh --password=$JUPYTER_PASSWORD --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -3021,6 +3026,7 @@ class DockerService:
                 log_text="Running jupyter",
                 log_extra=log_extra,
                 raise_exception=False,
+                stdin_data=f"{jupyter_token}\n",
             )
 
         # Only raise exception for actual errors, not warnings or info messages
@@ -5872,7 +5878,6 @@ class DockerService:
                         extra=get_extra_info({
                             **default_extra,
                             "container_name": payload.container_name,
-                            "jupyter_token": jupyter_token,
                             "jupyter_port": jupyter_port,
                         }),
                     ),

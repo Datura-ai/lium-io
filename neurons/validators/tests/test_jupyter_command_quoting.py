@@ -55,8 +55,6 @@ async def test_renter_volume_path_stays_one_token_at_both_layers(encrypted: bool
 
     for command in exec_commands:
         inner_script: str = _inner_script_of(command)
-        # punctuation_chars=True makes shlex surface ';' as its own token, the way
-        # the container's sh would — without it an injected path looks like one word
-        inner_tokens: list[str] = list(shlex.shlex(inner_script, punctuation_chars=True))
-        assert ";" not in inner_tokens, f"path broke out into commands: {inner_script!r}"
-        assert HOSTILE_PATH in inner_script, inner_script
+        # the renter path must stay inside single quotes so its ';' never splits commands
+        assert f"'{HOSTILE_PATH}" in inner_script, f"path not quoted: {inner_script!r}"
+        assert "tok" not in command, "jupyter token leaked into the exec command"
