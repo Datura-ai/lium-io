@@ -147,16 +147,21 @@ def create_app(config: Config) -> FastAPI:
             logger.error("no quote: %s", exc)
             return JSONResponse(status_code=503, content={"detail": NO_QUOTE_DETAIL})
 
-        gpu = collect_gpu_evidence(uuids, request.nonce)
+        gpu = collect_gpu_evidence(uuids, request.nonce, arch=config.gpu_arch)
         answer = {
             "version": __version__,
             "report_data": data.hex(),
+            # The TLS SubjectPublicKeyInfo DER, hex — the exact bytes the quote's identity
+            # half is taken over, so a verifier reproduces the digest without re-encoding.
             "tls_public_key": identity.public_key_hex,
+            # What NVML reported, bound into the quote. An observation, not an attested
+            # identity: the ueids inside `gpu_evidence` are what decide the GPU set.
             "gpu_uuids": gpu.uuids,
             "gpu_uuid_digest": gpu_uuid_digest(uuids).hex(),
             "gpu_detail": gpu_detail,
             "quote": quote,
-            "gpu_evidence": gpu.evidence,
+            # Ready to submit to NRAS as-is: {"nonce", "evidence_list", "arch"}.
+            "gpu_evidence": gpu.payload,
             "gpu_evidence_detail": gpu.detail,
         }
         app.state.ledger.put(request.nonce, answer)

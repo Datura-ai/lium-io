@@ -13,6 +13,7 @@ properties of this code, and both are where a bug would be silent on hardware.
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 from attest_agent import evidence
@@ -24,6 +25,7 @@ from attest_agent.app import (
 )
 from attest_agent.config import Config
 from attest_agent.identity import (
+    RENTER_IDENTITY_DOMAIN_V1,
     IdentityError,
     gpu_uuid_digest,
     identity_digest,
@@ -63,7 +65,11 @@ def gpus(monkeypatch):
     )
     monkeypatch.setattr(
         "attest_agent.app.collect_gpu_evidence",
-        lambda uuids, nonce: evidence.GpuEvidence(uuids, [{"nonce": nonce}], "stub evidence"),
+        lambda uuids, nonce, *, arch: evidence.GpuEvidence(
+            uuids,
+            {"nonce": nonce, "evidence_list": [{"gpu": 0}, {"gpu": 1}], "arch": arch},
+            "stub evidence",
+        ),
     )
 
 
@@ -92,8 +98,34 @@ class TestReportData:
         assert identity_digest(b"key-a", UUIDS) != identity_digest(b"key-b", UUIDS)
 
     def test_the_identity_half_binds_the_gpus(self):
-        """FR-G6: a node must not be able to claim GPUs it does not hold."""
+        """FR-G6: the GPU claim travels inside the signature, so the host cannot rewrite it.
+        (What it does NOT do is authenticate the GPUs — that is the ueids' job.)"""
         assert identity_digest(b"key", UUIDS) != identity_digest(b"key", UUIDS[:1])
+
+    def test_the_identity_half_is_domain_separated_and_versioned(self):
+        """The exact bytes, spelled out. A verifier reproduces this digest from the wire and
+        nothing else, so the tag, the key encoding and the order are the wire contract — and
+        the version lives INSIDE the hash, which is what makes a future recipe a new tag
+        rather than the same 32 bytes read a second way."""
+        key = b"\x01" * 91
+
+        assert identity_digest(key, UUIDS) == hashlib.sha256(
+            b"LIUM_RENTER_ATTEST_TLS_V1\x00" + key + gpu_uuid_digest(UUIDS)
+        ).digest()
+
+    def test_the_domain_tag_is_terminated(self):
+        """Without the NUL, a longer future tag starting with this one could be made to
+        collide by shifting bytes across the boundary between tag and key."""
+        assert RENTER_IDENTITY_DOMAIN_V1.endswith(b"\x00")
+
+    def test_an_untagged_digest_is_not_accepted_as_this_one(self):
+        """The whole point of the tag: the same key material hashed without a stated purpose
+        is a different value, so nothing hashed for another purpose can be read as this."""
+        key = b"\x01" * 91
+
+        assert identity_digest(key, UUIDS) != hashlib.sha256(
+            key + gpu_uuid_digest(UUIDS)
+        ).digest()
 
     def test_the_gpu_digest_does_not_depend_on_enumeration_order(self):
         """NVML's order varies with PCI topology; the same node must not attest differently
@@ -170,7 +202,16 @@ class TestAttesting:
         the shape of a replay."""
         answer = client.post("/v1/attest", json={"nonce": NONCE}).json()
 
-        assert answer["gpu_evidence"][0]["nonce"] == NONCE
+        assert answer["gpu_evidence"]["nonce"] == NONCE
+
+    def test_the_gpu_evidence_is_submittable_to_nras_as_returned(self, client):
+        """The ueids inside NRAS's answer are what decide the GPU set, and NRAS will not
+        answer a bare evidence list. An agent that returned one would leave the validator
+        holding evidence it cannot get judged."""
+        answer = client.post("/v1/attest", json={"nonce": NONCE}).json()
+
+        assert set(answer["gpu_evidence"]) == {"nonce", "evidence_list", "arch"}
+        assert answer["gpu_evidence"]["evidence_list"]
 
     def test_a_different_nonce_gets_a_different_quote(self, client, quoted):
         client.post("/v1/attest", json={"nonce": NONCE})
@@ -307,15 +348,70 @@ class TestDegradingHonestly:
         decisions on the validator's side, so they must not share an encoding."""
         result = evidence.collect_gpu_evidence([], "aa" * 32)
 
-        assert result.evidence is None
+        assert result.payload is None
         assert "no GPUs" in result.detail
 
     def test_a_build_without_the_nvidia_stack_says_so(self, monkeypatch):
         monkeypatch.setitem(__import__("sys").modules, "nv_attestation_sdk", None)
         result = evidence.collect_gpu_evidence(UUIDS, "aa" * 32)
 
-        assert result.evidence is None
+        assert result.payload is None
         assert result.uuids == UUIDS
+
+    def test_a_stack_that_fails_while_loading_degrades_instead_of_raising(self, monkeypatch):
+        """Importing the NVIDIA stack does real work — it opens a log file in the working
+        directory — so it can fail on a read-only rootfs for reasons that are not ImportError.
+        An exception escaping here would 500 the route, which the validator reads as a broken
+        agent rather than as one half of one answer being unavailable."""
+
+        class Exploding:
+            def __getattr__(self, name):
+                raise PermissionError("verifier.log")
+
+        monkeypatch.setitem(__import__("sys").modules, "nv_attestation_sdk", Exploding())
+        result = evidence.collect_gpu_evidence(UUIDS, "aa" * 32)
+
+        assert result.payload is None
+        assert "could not be loaded" in result.detail
+
+    def test_a_collector_that_returns_nothing_is_no_evidence_not_empty_evidence(
+        self, monkeypatch
+    ):
+        """An empty evidence_list submitted to NRAS would come back describing zero GPUs,
+        which reads as "this CVM holds none" — the opposite of "the collector came up
+        empty"."""
+
+        class FakeAttester:
+            def set_name(self, name): ...
+            def set_nonce(self, nonce): ...
+            def set_claims_version(self, version): ...
+            def set_ocsp_nonce_disabled(self, disabled): ...
+            def add_verifier(self, **kwargs): ...
+
+            def get_evidence(self, options=None):
+                return []
+
+        modules = __import__("sys").modules
+        monkeypatch.setitem(
+            modules,
+            "nv_attestation_sdk",
+            SimpleNamespace(
+                attestation=SimpleNamespace(
+                    Attestation=FakeAttester,
+                    Devices=SimpleNamespace(GPU="gpu"),
+                    Environment={"REMOTE": "remote"},
+                )
+            ),
+        )
+        monkeypatch.setitem(
+            modules,
+            "verifier",
+            SimpleNamespace(cc_admin=SimpleNamespace(collect_gpu_evidence_remote=lambda n: [])),
+        )
+        result = evidence.collect_gpu_evidence(UUIDS, "aa" * 32)
+
+        assert result.payload is None
+        assert "returned nothing" in result.detail
 
     def test_no_nvml_is_not_a_crash(self, monkeypatch):
         monkeypatch.setitem(__import__("sys").modules, "pynvml", None)

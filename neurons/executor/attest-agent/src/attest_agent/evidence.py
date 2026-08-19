@@ -26,14 +26,19 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+# The architecture NRAS is asked to verify this CVM's evidence as. A property of the cards
+# passed into the guest rather than of this agent, so it is configurable — with the fleet's
+# current default, which is what the executor's own collector uses.
+DEFAULT_GPU_ARCH = "HOPPER"
+
+
 @dataclass(frozen=True)
 class GpuEvidence:
     uuids: list[str]
-    evidence: list | None
+    # The NRAS request payload — {"nonce", "evidence_list", "arch"} — not the bare evidence
+    # list. See `collect_gpu_evidence`.
+    payload: dict | None
     detail: str
-
-    def report(self) -> dict:
-        return {"gpu_uuids": self.uuids, "evidence": self.evidence, "detail": self.detail}
 
 
 class EvidenceError(Exception):
@@ -75,32 +80,78 @@ def gpu_uuids() -> tuple[list[str], str]:
             pass
 
 
-def collect_gpu_evidence(uuids: list[str], nonce_hex: str) -> GpuEvidence:
+def collect_gpu_evidence(
+    uuids: list[str], nonce_hex: str, *, arch: str = DEFAULT_GPU_ARCH
+) -> GpuEvidence:
     """NVIDIA CC evidence for this CVM's GPUs, bound to the caller's nonce.
+
+    Returned as the payload NRAS takes — `{"nonce", "evidence_list", "arch"}` — rather than
+    the bare evidence list. This is the half that carries the per-GPU `ueid` claims, and the
+    ueids are what actually settle how many GPUs this CVM holds and whether they are genuine;
+    the NVML UUIDs in the quote's identity half cannot settle either (see `identity.py`). A
+    list with no nonce and no arch beside it is not submittable, so an agent returning one
+    would leave that question permanently open.
 
     The same nonce as the TDX quote's, so the two halves of one trust check cannot be
     assembled from two different moments — which is the whole shape of a replay.
+
+    The collection flow mirrors `executor/src/services/gpu_attestation_service.py`, single-GPU
+    branch included: that flow is the one NRAS is known to accept on this fleet, and a second
+    dialect of the same call is a second thing that can silently stop being accepted.
     """
     if not uuids:
         return GpuEvidence([], None, "this CVM holds no GPUs that NVML could identify")
 
     try:
         from nv_attestation_sdk import attestation
+        from verifier import cc_admin
     except ImportError:
-        return GpuEvidence(uuids, None, "the NVIDIA attestation SDK is not installed in this build")
+        return GpuEvidence(
+            uuids, None, "the NVIDIA attestation stack is not installed in this build"
+        )
+    except Exception as exc:  # noqa: BLE001 - importing it does real work, see below
+        # The verifier package opens its own log file in the process's working directory the
+        # moment it is imported, so an unwritable CWD raises here rather than at collection —
+        # and this agent runs unprivileged on a read-only rootfs, where most directories are.
+        # The Dockerfile therefore starts it in the one writable path it has. Degraded rather
+        # than raised: an exception out of this route reads to the validator as a broken
+        # agent, when what is broken is one half of one answer.
+        logger.warning("the NVIDIA attestation stack could not be loaded: %s", exc)
+        return GpuEvidence(uuids, None, "the NVIDIA attestation stack could not be loaded")
 
     try:
-        client = attestation.Attestation()
-        client.set_name("lium-attest-agent")
-        client.set_nonce(nonce_hex)
-        client.add_verifier(attestation.Devices.GPU, attestation.Environment.REMOTE, "", "", "")
-        return GpuEvidence(uuids, client.get_evidence(), f"evidence for {len(uuids)} GPU(s)")
+        if len(uuids) == 1:
+            # The count comes from the NVML read above rather than a second nvmlInit: one
+            # enumeration per request, so the two halves cannot disagree about it.
+            evidence_list = cc_admin.collect_gpu_evidence_remote(nonce_hex)
+        else:
+            attester = attestation.Attestation()
+            attester.set_name(arch)
+            attester.set_nonce(nonce_hex)
+            attester.set_claims_version("2.0")
+            attester.set_ocsp_nonce_disabled(True)
+            attester.add_verifier(
+                dev=attestation.Devices.GPU,
+                env=attestation.Environment["REMOTE"],
+                url=None,
+                evidence="",
+            )
+            evidence_list = attester.get_evidence(options={"ppcie_mode": False})
     except Exception as exc:  # noqa: BLE001 - the SDK raises broadly
         # Not fatal here. The validator decides what a missing half means; an agent that
         # refused to answer at all would leave it unable to tell "no evidence" from
         # "no agent".
         logger.warning("GPU evidence collection failed: %s", exc)
         return GpuEvidence(uuids, None, "GPU evidence collection failed")
+
+    if not evidence_list:
+        return GpuEvidence(uuids, None, "GPU evidence collection returned nothing")
+
+    return GpuEvidence(
+        uuids,
+        {"nonce": nonce_hex, "evidence_list": evidence_list, "arch": arch},
+        f"evidence for {len(uuids)} GPU(s)",
+    )
 
 
 def tdx_quote(report_data: bytes, *, timeout: int) -> str:

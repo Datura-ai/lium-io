@@ -31,7 +31,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from core.config import settings
@@ -71,6 +71,13 @@ CVM_RENTAL_SUPERVISOR_DEAD_EVENT = "CVM_RENTAL_SUPERVISOR_DEAD"
 # DAH-2675 — what the log-only attest-agent probe reports.
 CVM_ATTEST_PROBE_OK_EVENT = "CVM_RENTER_ATTEST_PROBE_OK"
 CVM_ATTEST_PROBE_FAILED_EVENT = "CVM_RENTER_ATTEST_PROBE_FAILED"
+# DAH-2675 — the live quote check on a rented CVM. VERIFIED scores on hardware evidence;
+# REJECTED is a quote (or an answer) the verifier examined and refused, which earns nothing;
+# UNAVAILABLE means no quote could be examined at all — what THAT means is DAH-2676's
+# question, so the node falls back to the flag-gated host-side pass.
+CVM_RENTAL_QUOTE_VERIFIED_EVENT = "CVM_RENTAL_QUOTE_VERIFIED"
+CVM_RENTAL_QUOTE_REJECTED_EVENT = "CVM_RENTAL_QUOTE_REJECTED"
+CVM_RENTAL_QUOTE_UNAVAILABLE_EVENT = "CVM_RENTAL_QUOTE_UNAVAILABLE"
 
 
 @dataclass(frozen=True)
@@ -254,26 +261,6 @@ class CvmLifecycleService:
             logger.warning(_m(
                 "Could not record a cvmd host",
                 extra=get_extra_info({"executor_uuid": executor_uuid, "error": str(exc)}),
-            ))
-
-    async def touch_host(self, host: CvmdHost) -> None:
-        """Refresh one host's registry TTL from a record the caller just read out of it.
-
-        Write-only on purpose: `record_host`'s merge re-read exists for callers holding
-        fresh payload data, and this caller's fields ARE the stored record, so a re-read
-        could never contribute anything. A rental can run 720 hours against a 7-day TTL;
-        without the refresh the host would age out of the very sweep that scores it.
-        """
-        try:
-            await self.redis_service.hset(
-                CVMD_HOSTS_KEY,
-                host.executor_uuid,
-                replace(host, updated_at=time.time()).to_json(),
-            )
-        except Exception as exc:  # noqa: BLE001 - registry writes must never break a cycle
-            logger.warning(_m(
-                "Could not refresh a cvmd host's registry entry",
-                extra=get_extra_info({"executor_uuid": host.executor_uuid, "error": str(exc)}),
             ))
 
     async def hosts_for_miner(self, miner_hotkey: str) -> list[CvmdHost]:
@@ -572,3 +559,38 @@ class CvmLifecycleService:
             # the default-off configuration from allocating a task just to throw it away.
             return
         self._spawn_background(self.probe_attest_agent(host, assessment))
+
+    # ------------------------------------------------------------------ DAH-2675: live quote
+
+    async def request_renter_quote(
+        self, host: CvmdHost, *, nonce_hex: str, agent_port: int | None = None
+    ) -> dict | None:
+        """One nonce-bound quote from the renter CVM's agent, relayed through cvmd, or None.
+
+        Through cvmd rather than dialed directly, because the agent's forward is loopback-bound
+        by default — only the host itself can reach it, and cvmd IS the host. The relay adds no
+        trust: the quote binds this call's nonce, so cvmd can withhold an answer but cannot
+        substitute one that verifies. Every no-answer outcome is None here; what None MEANS for
+        the score is the caller's decision, not this transport's.
+        """
+        extra = get_extra_info({
+            "executor_uuid": host.executor_uuid,
+            "miner_hotkey": host.miner_hotkey,
+        })
+        try:
+            result = await self.client.attest_renter(
+                host.cvmd_url(), nonce_hex=nonce_hex, agent_port=agent_port
+            )
+        except CvmdRelayError as exc:
+            logger.info(_m(
+                f"{CVM_RENTAL_QUOTE_UNAVAILABLE_EVENT} — cvmd was not reached",
+                extra={**extra, "error": str(exc)},
+            ))
+            return None
+        if not result.ok:
+            logger.info(_m(
+                f"{CVM_RENTAL_QUOTE_UNAVAILABLE_EVENT} — no quote came back",
+                extra={**extra, "status": result.status, "detail": result.reason()},
+            ))
+            return None
+        return result.body

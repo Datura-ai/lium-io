@@ -36,12 +36,20 @@ def cvmd_host(
 
 
 def make_miner_service(hosts, assessments):
-    """A miner service whose lifecycle answers `assessments` (one value, or one per host)."""
+    """A miner service whose lifecycle answers `assessments` (one value, or one per host).
+
+    The quote leg defaults to "nothing came back" (`request_renter_quote` -> None), which is
+    the verdict that preserves the DAH-2674 flag-gated behavior — a suite exercising the
+    live-quote path overrides the mock and the attestation service's verdict explicitly.
+    """
     service = MinerService.__new__(MinerService)
     service.redis_service = MagicMock()
+    service.attestation_service = MagicMock()
+    service.attestation_service.verify_rented_cvm_quote = AsyncMock(
+        return_value=("unavailable", "no verifier in this test")
+    )
     lifecycle = MagicMock(spec=CvmLifecycleService)
     lifecycle.record_host = AsyncMock()
-    lifecycle.touch_host = AsyncMock()
     lifecycle.hosts_for_miner = AsyncMock(return_value=hosts)
     if isinstance(assessments, list):
         lifecycle.assess = AsyncMock(side_effect=assessments)
@@ -49,6 +57,7 @@ def make_miner_service(hosts, assessments):
         lifecycle.assess = AsyncMock(return_value=assessments)
     lifecycle.schedule_ensure = MagicMock()
     lifecycle.schedule_attest_probe = MagicMock()
+    lifecycle.request_renter_quote = AsyncMock(return_value=None)
     service._cvm_lifecycle_service = lifecycle
     return service, lifecycle
 
@@ -77,8 +86,19 @@ def scored_result(executor_uuid="already-scored", tdx=False):
     )
 
 
-def rented_data_for(executor_uuid="e-rented", *, miner_hotkey="5Miner", spot=(), discord=None):
-    """The backend's half of the two-party proof: this executor is under a paid rental."""
+def rented_data_for(
+    executor_uuid="e-rented",
+    *,
+    miner_hotkey="5Miner",
+    spot=(),
+    discord=None,
+    expectations=None,
+):
+    """The backend's half of the two-party proof: this executor is under a paid rental.
+
+    `expectations` is the per-executor CvmExpectations side-map entry (any object with the
+    right attributes); None models a backend that carries no CVM facts for this node.
+    """
     return SimpleNamespace(
         executors={
             executor_uuid: SimpleNamespace(
@@ -87,6 +107,7 @@ def rented_data_for(executor_uuid="e-rented", *, miner_hotkey="5Miner", spot=(),
                 executor_ip_port="4001",
             )
         },
+        cvm_expectations={executor_uuid: expectations} if expectations is not None else {},
         spot_executor_ids=list(spot),
         provider_discord_connected_executor_ids=discord,
     )
