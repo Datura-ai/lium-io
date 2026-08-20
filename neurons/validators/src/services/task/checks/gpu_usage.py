@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -10,6 +11,9 @@ from services.const import (
     POD_CONTAINER_PREFIX,
 )
 from services.gpu_wedge import (
+    COMPUTE_APPS_QUERY_COMMAND,
+    GPU_QUERY_COMMAND,
+    NVIDIA_SMI_QUERY_TIMEOUT_SECONDS,
     GpuCureOutcome,
     cure_wedged_gpus,
     matches_wedge_utilization,
@@ -61,9 +65,9 @@ class GpuUsageCheck:
         if ghost_result is not None:
             return ghost_result
 
-        return self._judge_process_based_usage(ctx, gpu_details, gpu_processes)
+        return await self._judge_process_based_usage(ctx, gpu_details, gpu_processes)
 
-    def _judge_foreign_occupancy(
+    async def _judge_foreign_occupancy(
         self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
     ) -> CheckResult | None:
         """Judge an idle card by WHO holds it, not by how hard it is being used (DAH-2735).
@@ -104,6 +108,8 @@ class GpuUsageCheck:
             what = {"foreign_processes": foreign_processes, "process_count": len(gpu_processes)}
             template = Msg.FOREIGN_PROCESS
         elif held_vram := _held_vram_without_owner(gpu_details, gpu_processes, workload_containers):
+            if not await self._card_still_holds_vram_with_no_owner(ctx, held_vram):
+                return None
             what = {"held_vram": held_vram}
             template = Msg.VRAM_HELD
         else:
@@ -119,14 +125,44 @@ class GpuUsageCheck:
         )
         return CheckResult(passed=not enforce, event=event)
 
-    def _judge_process_based_usage(
+    async def _card_still_holds_vram_with_no_owner(
+        self, ctx: Context, held_vram: list[HeldVram]
+    ) -> bool:
+        """Re-sample the live card before calling its memory ownerless.
+
+        The scrape reads NVML memory first and walks `/proc` after, so a GPU process that exits
+        in between leaves its memory figure behind with nothing to attribute it to — a clean
+        node would then be judged as hiding a workload. The verdict comes from the card itself,
+        the same rule the ghost-GPU path above follows. Fail-open on any error: an unreadable
+        card is an inability to measure, which never withholds money.
+        """
+        try:
+            gpu_query, compute_apps = await asyncio.gather(
+                ctx.runner.run(GPU_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False),
+                ctx.runner.run(COMPUTE_APPS_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False),
+            )
+            if compute_apps.stdout.strip():
+                return False
+
+            live_memory_mb: dict[str, float] = _parse_gpu_memory_used_mb(gpu_query.stdout)
+            if not live_memory_mb:
+                return False
+            return any(
+                live_memory_mb.get(held.gpu_uuid or "", 0) > GPU_HELD_VRAM_MB_LIMIT
+                for held in held_vram
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Live VRAM re-sample failed, not judging the card: %s", exc)
+            return False
+
+    async def _judge_process_based_usage(
         self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
     ) -> CheckResult:
         """The legacy guard: flag GPU load owned by live processes outside our workloads."""
         violation = _find_violation(gpu_details, gpu_processes)
 
         if violation is None:
-            foreign_result = self._judge_foreign_occupancy(ctx, gpu_details, gpu_processes)
+            foreign_result = await self._judge_foreign_occupancy(ctx, gpu_details, gpu_processes)
             if foreign_result is not None:
                 return foreign_result
 
@@ -263,6 +299,21 @@ def _lium_workload_containers(ctx: Context) -> set[str]:
         containers.update(pod.container_name for pod in rented_executor.pods)
     containers.discard("")
     return containers
+
+
+def _parse_gpu_memory_used_mb(gpu_query_csv: str) -> dict[str, float]:
+    """uuid -> memory.used MiB, from GPU_QUERY_COMMAND's `uuid, utilization, memory.used` rows."""
+    memory_by_uuid: dict[str, float] = {}
+    for line in gpu_query_csv.strip().splitlines():
+        parts: list[str] = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        gpu_uuid, _utilization, memory_raw = parts
+        try:
+            memory_by_uuid[gpu_uuid] = float(memory_raw)
+        except ValueError:
+            continue
+    return memory_by_uuid
 
 
 def _runs_in_the_executors_own_cgroup(process: dict) -> bool:

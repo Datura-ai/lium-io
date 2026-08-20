@@ -179,7 +179,9 @@ def _ssh_result(exit_code: int = 0, stdout: str = "", stderr: str = "") -> Magic
     return MagicMock(exit_code=exit_code, stdout=stdout, stderr=stderr, error_message=None)
 
 
-def _mock_runner(requery_gpu_csv: str = "", cure_exit_code: int = 0) -> MagicMock:
+def _mock_runner(
+    requery_gpu_csv: str = "", cure_exit_code: int = 0, compute_apps_csv: str = ""
+) -> MagicMock:
     """Route the three commands the ghost path can issue: cure, GPU re-query, compute apps."""
 
     async def route(command: str, **_kwargs) -> MagicMock:
@@ -188,7 +190,7 @@ def _mock_runner(requery_gpu_csv: str = "", cure_exit_code: int = 0) -> MagicMoc
         if command.startswith(GPU_QUERY_PREFIX):
             return _ssh_result(stdout=requery_gpu_csv)
         if command.startswith(COMPUTE_APPS_PREFIX):
-            return _ssh_result(stdout="")
+            return _ssh_result(stdout=compute_apps_csv)
         raise AssertionError(f"unexpected command: {command}")
 
     runner = MagicMock()
@@ -434,13 +436,20 @@ async def test_bare_host_gpu_process_fails(context_factory):
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
 
 
+HELD_UUID = "GPU-6ffd30d2-26cb-22b7-bdc5-1b6c8e994339"
+
+
 @pytest.mark.asyncio
 async def test_held_vram_with_no_visible_processes_fails(context_factory):
     state = _idle_state(
-        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [{"uuid": HELD_UUID, "gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
         [],
     )
-    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+    # The live card confirms the memory is still held and still has no compute app.
+    runner = _mock_runner(requery_gpu_csv=f"{HELD_UUID}, 0, 22400\n")
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, runner=runner
+    )
 
     with foreign_gate():
         result = await GpuUsageCheck().run(ctx)
@@ -448,6 +457,45 @@ async def test_held_vram_with_no_visible_processes_fails(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.VRAM_HELD.reason
     assert result.event.what_we_saw["held_vram"][0].memory_used_mb == 22400
+
+
+@pytest.mark.asyncio
+async def test_stale_vram_snapshot_is_not_judged(context_factory):
+    # The scrape reads NVML memory before it walks /proc: a process that exits in between
+    # leaves its memory behind with no owner. The live card is the authority, not the snapshot.
+    state = _idle_state(
+        [{"uuid": HELD_UUID, "gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [],
+    )
+    runner = _mock_runner(requery_gpu_csv=f"{HELD_UUID}, 0, 120\n")
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, runner=runner
+    )
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_vram_with_a_live_compute_app_is_not_judged(context_factory):
+    # An owner is visible on the card right now, so the empty process list was the stale half.
+    state = _idle_state(
+        [{"uuid": HELD_UUID, "gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [],
+    )
+    runner = _mock_runner(requery_gpu_csv=f"{HELD_UUID}, 0, 22400\n", compute_apps_csv="12345\n")
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, runner=runner
+    )
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
 
 
 @pytest.mark.asyncio
