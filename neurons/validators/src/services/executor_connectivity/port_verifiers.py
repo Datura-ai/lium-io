@@ -106,8 +106,8 @@ class BatchVerifier:
             return [], ports
 
         try:
-            async with aiohttp.ClientSession() as session:
-                successful, failed = await self.port_tester.test_many(session, host, ports, token)
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as session:
+                successful, failed = await self.port_tester.test_many(session, host, ports, token, log_ctx)
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
@@ -290,8 +290,8 @@ class SemiBatchVerifier:
                 return [], ports
 
             started = True
-            async with aiohttp.ClientSession() as session:
-                return await self.port_tester.test_many(session, host, ports, token)
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as session:
+                return await self.port_tester.test_many(session, host, ports, token, log_ctx)
 
         except Exception as e:
             logger.error(

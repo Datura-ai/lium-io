@@ -62,7 +62,7 @@ async def test_semi_batch_caps_at_max_ports(mocker):
     runner.cleanup = mocker.AsyncMock()
 
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token: (tested, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token, log_ctx=None: (tested, []))
 
     verifier = SemiBatchVerifier(port_tester, runner)
 
@@ -110,7 +110,7 @@ async def test_semi_batch_busy_port_fails_only_its_own_chunk(mocker):
     runner.cleanup = mocker.AsyncMock()
 
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token: (tested, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token, log_ctx=None: (tested, []))
 
     verifier = SemiBatchVerifier(port_tester, runner)
 
