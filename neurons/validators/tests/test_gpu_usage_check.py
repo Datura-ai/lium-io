@@ -575,3 +575,37 @@ async def test_foreign_event_payload_serializes_to_json(context_factory):
     dumped = result.event.model_dump(mode="json")["what_we_saw"]
     assert dumped["foreign_processes"][0]["cgroup"] == "0::/../pm2-lichsl.service"
     assert dumped["foreign_processes"][0]["pid"] == 4242
+
+
+@pytest.mark.asyncio
+async def test_validator_own_gpu_work_in_the_executors_cgroup_passes(context_factory):
+    # A VerifyX run that outlived its SSH command timeout shares the scrape's cgroup namespace,
+    # so it carries no container id and no name — it must not read as a competitor's workload.
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 3000}],
+        [{"pid": 91011, "info": "0::/init.scope", "container_name": None}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_host_process_escaping_the_cgroup_namespace_still_fails(context_factory):
+    # Every real GPU process on the prod fleet escapes the scrape's namespace (`0::/../…`);
+    # Nodexo's bare host workers are exactly that shape.
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 686}],
+        [{"pid": 2844137, "info": "0::/../../user.slice/user-1000.slice/session-1.scope", "container_name": None}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason

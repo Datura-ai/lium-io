@@ -97,6 +97,7 @@ class GpuUsageCheck:
             )
             for process in gpu_processes
             if process.get("container_name") not in allowed_containers
+            and not _runs_in_the_executors_own_cgroup(process)
         ]
 
         if foreign_processes:
@@ -264,6 +265,20 @@ def _lium_workload_containers(ctx: Context) -> set[str]:
     return containers
 
 
+def _runs_in_the_executors_own_cgroup(process: dict) -> bool:
+    """True when the process shares the cgroup namespace of the scrape — i.e. it is the executor.
+
+    The scrape reads `/proc/<pid>/cgroup` from inside the executor container, so anything
+    living elsewhere escapes that namespace and reads as `0::/../docker-<id>.scope` (another
+    container) or `0::/../../user.slice/...` (a host process); every one of the 692 GPU
+    processes on the prod fleet has that shape. The executor's own GPU work — a VerifyX run
+    the validator starts over SSH, which can outlive its command timeout — reads as a plain
+    `0::/…` instead, and carries no container id for the scrape to resolve a name from.
+    """
+    cgroup: str = process.get("info") or ""
+    return bool(cgroup) and ".." not in cgroup
+
+
 def _executor_container_names(ctx: Context) -> set[str]:
     """The executor's own container — the cgroup validator-started GPU work (VerifyX) runs under.
 
@@ -283,7 +298,7 @@ def _executor_container_names(ctx: Context) -> set[str]:
 
 
 def _held_vram_without_owner(
-    gpu_details: list[dict], gpu_processes: list[dict], expected_containers: set[str]
+    gpu_details: list[dict], gpu_processes: list[dict], workload_containers: set[str]
 ) -> list[HeldVram]:
     """VRAM held above the driver-reserve floor while no process is visible to account for it.
 
@@ -293,7 +308,7 @@ def _held_vram_without_owner(
     ponytail: node-level, not per-GPU — the scrape does not record which GPU a PID sits on;
     record the GPU uuid in get_gpu_processes if per-card attribution ever matters.
     """
-    if gpu_processes or expected_containers:
+    if gpu_processes or workload_containers:
         return []
     return [
         HeldVram(gpu_uuid=detail.get("uuid"), memory_used_mb=detail.get("memory_used_mb") or 0)
