@@ -377,6 +377,47 @@ def _exception_texts(exc: Exception) -> list[str]:
     return texts
 
 
+class _CreateCancelledByDelete(Exception):
+    """Raised at a create checkpoint when this pod's delete has already reported it gone."""
+
+
+class _InflightCreateRegistry:
+    """Creates running right now, and whether a delete has already cancelled them.
+
+    DAH-2728: a delete that lands while the create for the same pod is still in flight finds no
+    container yet ("No such container"), reports the pod deleted, and the create goes on to bind
+    the host ports minutes later. That orphan then blocks the next paying rental with "port is
+    already allocated". Only the create can undo itself, so the delete flips the flag here and the
+    create tears itself down at its next checkpoint.
+    """
+
+    def __init__(self) -> None:
+        self._cancelled_by_delete: dict[str, bool] = {}
+
+    @contextlib.contextmanager
+    def track(self, pod_id: str) -> Iterator[None]:
+        self._cancelled_by_delete[pod_id] = False
+        try:
+            yield
+        finally:
+            self._cancelled_by_delete.pop(pod_id, None)
+
+    def cancel(self, pod_id: str) -> bool:
+        """Flag the in-flight create for this pod. False when no create is running."""
+        if pod_id not in self._cancelled_by_delete:
+            return False
+        self._cancelled_by_delete[pod_id] = True
+        return True
+
+    def is_cancelled(self, pod_id: str) -> bool:
+        return self._cancelled_by_delete.get(pod_id, False)
+
+
+# ponytail: in-process — a pod's create and delete are driven by the same validator event loop.
+# Move it to Redis if the two ever land in different processes.
+inflight_creates = _InflightCreateRegistry()
+
+
 def _is_missing_docker_container_error(exc: Exception) -> bool:
     return any(_DOCKER_NO_SUCH_CONTAINER_PHRASE in text for text in _exception_texts(exc))
 
@@ -3833,6 +3874,38 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        # DAH-2728: register before any work, so a delete arriving mid-create can cancel it.
+        with inflight_creates.track(payload.pod_id):
+            return await self._create_container(payload, executor_info, keypair, private_key)
+
+    async def _abort_create_cancelled_by_delete(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        container_name: str,
+        default_extra: dict,
+    ) -> None:
+        logger.warning(
+            _m(
+                "Create cancelled by an in-flight delete",
+                extra=get_extra_info({**default_extra, "container_name": container_name}),
+            )
+        )
+        if payload.workload_kind == WorkloadKind.FILLER:
+            # DAH-2356: the power cap is applied before `docker run`, and the delete that cancelled
+            # us restored nothing — at that point this pod had no record yet.
+            await restore_filler_pod_gpu_power_limits(
+                ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
+            )
+        raise _CreateCancelledByDelete(container_name)
+
+    async def _create_container(
+        self,
+        payload: ContainerCreateRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
         warnings = []
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
@@ -4593,6 +4666,12 @@ class DockerService:
 
                 try:
                     current_step = "docker_run"
+                    # DAH-2728: last look before the host ports get bound.
+                    if inflight_creates.is_cancelled(payload.pod_id):
+                        current_step = "cancelled_by_delete"
+                        await self._abort_create_cancelled_by_delete(
+                            ssh_client, payload, container_name, default_extra
+                        )
                     await self.stream_log("Creating docker container", "success", log_tag)
                     await self._run_rental_docker_create_with_port_retry(
                         docker_client=docker_client,
@@ -4658,6 +4737,14 @@ class DockerService:
                             logger.error(_m("docker run failed", extra=log_extra))
 
                         raise Exception("Run docker run command but container is not running")
+
+                    # DAH-2728: the delete may have landed while `docker run` was in progress —
+                    # the container we just started is exactly the orphan it could not see.
+                    if inflight_creates.is_cancelled(payload.pod_id):
+                        current_step = "cancelled_by_delete"
+                        await self._abort_create_cancelled_by_delete(
+                            ssh_client, payload, container_name, default_extra
+                        )
                 except Exception:
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
@@ -5679,6 +5766,11 @@ class DockerService:
         log = _BoundLog(default_extra)
 
         log.info("Deleting Docker Container", payload=str(payload))
+
+        # DAH-2728: a create still in flight for this pod would otherwise finish behind our back and
+        # leave an orphan container holding the ports.
+        if inflight_creates.cancel(payload.pod_id):
+            log.info("Cancelled the in-flight create for this pod")
 
         try:
             _validate_delete_volume_names(payload)
