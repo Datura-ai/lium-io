@@ -1354,3 +1354,20 @@ async def test_container_caught_mid_removal_is_still_a_kill():
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
+
+
+@pytest.mark.parametrize("docker_status", ["created", "restarting", "paused", "dead", None])
+@pytest.mark.asyncio
+async def test_states_that_do_not_prove_a_death_are_never_punished(docker_status):
+    """Only a recorded exit is an exit; every other state stays unproven and unpunished."""
+    backend_client = _killed_filler_backend()
+    ctx = _filler_context(backend_client=backend_client, ssh_client=FillerSSHClient(running=False))
+
+    with patch(
+        "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
+        return_value=ContainerDeathDiagnostics(status=docker_status),
+    ):
+        result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason

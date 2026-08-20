@@ -48,10 +48,15 @@ _GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
 # bundle but the pipeline emits a single event, so the node must be judged by its worst container:
 # a confirmed kill outranks an indeterminate probe, which outranks a healthy one. Anything
 # unlisted sorts as healthy.
-# States `docker inspect --format '{{json .State}}'` reports. "removing" is a removal already in
-# flight — the offence itself, caught a moment early (seen in prod on the ISSUE-050 class).
-_DOCKER_STATUS_RUNNING = "running"
+# Every state `docker inspect --format '{{json .State}}'` can report, mapped to what it proves about
+# the filler. Listed exhaustively on purpose: a state that fell through to a default is how this
+# check mislabeled deaths before (DAH-2730).
+# "removing" is the offence itself caught a moment early — a removal already in flight (observed in
+# prod on the ISSUE-050 class). "dead" means docker failed to remove the container, so it is not
+# proof the host succeeded either — it stays unproven rather than punished.
 _DOCKER_STATUS_REMOVING = "removing"
+_DOCKER_STATUS_EXITED = "exited"
+_DOCKER_STATES_PROVING_NO_DEATH = frozenset({"running", "created", "restarting", "paused", "dead"})
 
 _FILLER_VERDICT_SEVERITY: dict[str, int] = {
     Msg.FILLER_KILLED.reason: 3,
@@ -531,22 +536,18 @@ class RentalVerificationCheck:
             diagnostics.container_missing or diagnostics.status == _DOCKER_STATUS_REMOVING
         )
         if not container_was_removed:
-            if diagnostics.status == _DOCKER_STATUS_RUNNING:
-                # Filler containers carry `restart: unless-stopped`, so docker can bring one back
-                # between the ps probe and this inspect. A running container is neither death.
+            if diagnostics.status != _DOCKER_STATUS_EXITED:
+                # Anything but a recorded exit is unproven: the container may be running again
+                # (fillers carry `restart: unless-stopped`, so docker can bring one back between
+                # the ps probe and this inspect), mid-transition, or unreadable.
                 return self._filler_state_unknown_result(
                     ctx,
                     filler_container,
-                    reason="container is running again",
-                    details=diagnostics.to_log_fields(),
-                )
-            if diagnostics.status is None:
-                # Docker answered neither "gone" nor a state: claiming the container is still there
-                # would be as unproven as calling it a kill.
-                return self._filler_state_unknown_result(
-                    ctx,
-                    filler_container,
-                    reason="container state could not be read",
+                    reason=(
+                        f"container state {diagnostics.status} is not a death"
+                        if diagnostics.status in _DOCKER_STATES_PROVING_NO_DEATH
+                        else "container state could not be read"
+                    ),
                     details=diagnostics.to_log_fields(),
                 )
             event = render_message(
