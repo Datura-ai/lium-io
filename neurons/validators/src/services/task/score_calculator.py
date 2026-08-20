@@ -69,6 +69,15 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Advertised CPU cores exceed the host's physical cores")
 
+    # Provider-side load gate (DAH-2734): the host burns CPU or disk outside Lium's containers
+    # while it sells that capacity — the CPU/disk twin of the foreign-GPU gate. Same mechanics
+    # as the CPU-truth gate above: the check is non-fatal, so only this line zeroes the score,
+    # and shadow leaves the flag True.
+    if not ctx.provider_side_load_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Provider-side workload consumes the machine's CPU or disk")
+
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"
