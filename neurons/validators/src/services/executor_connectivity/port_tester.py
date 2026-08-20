@@ -56,12 +56,12 @@ class PortTester:
         successful = [p for p, ok in zip(ports, results) if ok]
         failed = [p for p, ok in zip(ports, results) if not ok]
 
-        ordered = sorted(durations)
-        p95 = ordered[min(int(len(ordered) * 0.95), len(ordered) - 1)]
+        sorted_durations = sorted(durations)
+        p95 = sorted_durations[min(int(len(sorted_durations) * 0.95), len(sorted_durations) - 1)]
         logger.info(
             _m(
                 f"probed {len(ports)} ports in {wall:.2f}s: {len(successful)} ok, "
-                f"per-probe med={statistics.median(ordered):.2f}s p95={p95:.2f}s max={ordered[-1]:.2f}s",
+                f"per-probe med={statistics.median(sorted_durations):.2f}s p95={p95:.2f}s max={sorted_durations[-1]:.2f}s",
                 extra=get_extra_info(log_ctx or {}),
             )
         )
