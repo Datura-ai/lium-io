@@ -373,11 +373,13 @@ class MinerLogLine(BaseModel):
             reason=ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
             message=(
                 "No unrented incentive: this executor's container cannot set a GPU power limit "
-                "(nvidia-smi -pl), which Lium's own idle jobs need. Run the executor container "
-                "with privileged: true (or add CAP_SYS_ADMIN) and make sure /dev/nvidiactl is "
-                "owned by root inside it - under sysbox the device is mapped to an unprivileged "
-                "uid, so the executor must run outside the sysbox user namespace. Fix it, or "
-                "rent this executor out to earn."
+                "(nvidia-smi -pl), which Lium's own idle jobs need. The official executor stack "
+                "already runs privileged, so first update it: 'docker compose pull && docker "
+                "compose up -d' in neurons/executor. If you run a custom compose, give the "
+                "executor container privileged: true (or CAP_SYS_ADMIN) and make sure "
+                "/dev/nvidiactl is owned by root inside it - under sysbox the device is mapped "
+                "to an unprivileged uid, so the executor must run outside the sysbox user "
+                "namespace. Fix it, or rent this executor out to earn."
             ),
             extra_fields={
                 "container_cap_eff": incapable.container_cap_eff,
