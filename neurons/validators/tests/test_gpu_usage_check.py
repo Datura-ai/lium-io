@@ -429,3 +429,46 @@ async def test_filler_holding_vram_passes(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_validator_own_gpu_work_in_the_executor_container_passes(context_factory):
+    # VerifyX runs over SSH inside the executor container, so its cgroup is the executor's.
+    executor_container_id = "58b5771305ac0f2d1a1f0c8f7c2b9d2e"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 3000}],
+        gpu_processes=[
+            {"pid": 91011, "info": f"0::/../docker-{executor_container_id}.scope", "container_name": None}
+        ],
+        specs={"docker": {"container_id": executor_container_id, "containers": []}},
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_held_vram_passes_when_the_node_runs_a_filler(context_factory):
+    # Seen in prod: NVML returned no processes on a node whose filler was working at 34%.
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 34, "memory_utilization": 2, "memory_used_mb": 2371}],
+        gpu_processes=[],
+        specs={
+            "docker": {
+                "container_id": "eb81479ab6cc",
+                "containers": [
+                    {"name": "filler_6b53241b-79ba-403b-a486-802dd975506b"},
+                    {"name": "executor-executor-1"},
+                ],
+            }
+        },
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason

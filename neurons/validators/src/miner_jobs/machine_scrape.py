@@ -946,12 +946,16 @@ def get_gpu_processes(pids: set, containers: list[dict]):
 
     processes = []
     for pid in pids:
-        # DAH-2735: a host-namespace PID is invisible in /proc from inside the executor
-        # container. Keep it unattributed instead of dropping it — an empty process list
-        # reads as a clean card while a foreign host workload holds the GPU.
+        # DAH-2735: an unreadable PID must stay in the list, unattributed — an empty
+        # process list reads as a clean card while a foreign workload holds the GPU.
+        # A PID whose /proc entry is gone died between the NVML snapshot and this read
+        # (e.g. a filler restarting) and is not a workload — dropping it avoids a
+        # one-cycle false "foreign process" verdict.
         try:
             info = run_cmd(f'cat /proc/{pid}/cgroup').strip()
         except Exception:
+            if not psutil.pid_exists(pid):
+                continue
             info = ""
 
         # Find the container name by checking if the container ID is in the info
