@@ -48,8 +48,10 @@ _GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
 # bundle but the pipeline emits a single event, so the node must be judged by its worst container:
 # a confirmed kill outranks an indeterminate probe, which outranks a healthy one. Anything
 # unlisted sorts as healthy.
-# `docker inspect --format '{{json .State}}'` reports this while the container is up.
+# States `docker inspect --format '{{json .State}}'` reports. "removing" is a removal already in
+# flight — the offence itself, caught a moment early (seen in prod on the ISSUE-050 class).
 _DOCKER_STATUS_RUNNING = "running"
+_DOCKER_STATUS_REMOVING = "removing"
 
 _FILLER_VERDICT_SEVERITY: dict[str, int] = {
     Msg.FILLER_KILLED.reason: 3,
@@ -525,7 +527,10 @@ class RentalVerificationCheck:
             **diagnostics.to_log_fields(),
         }
 
-        if not diagnostics.container_missing:
+        container_was_removed = (
+            diagnostics.container_missing or diagnostics.status == _DOCKER_STATUS_REMOVING
+        )
+        if not container_was_removed:
             if diagnostics.status == _DOCKER_STATUS_RUNNING:
                 # Filler containers carry `restart: unless-stopped`, so docker can bring one back
                 # between the ps probe and this inspect. A running container is neither death.
