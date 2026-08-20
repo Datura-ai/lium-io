@@ -946,30 +946,31 @@ def get_gpu_processes(pids: set, containers: list[dict]):
 
     processes = []
     for pid in pids:
-        # DAH-2735: an unreadable PID must stay in the list, unattributed — an empty
-        # process list reads as a clean card while a foreign workload holds the GPU.
-        # A PID whose /proc entry is gone died between the NVML snapshot and this read
-        # (e.g. a filler restarting) and is not a workload — dropping it avoids a
-        # one-cycle false "foreign process" verdict.
         try:
-            info = run_cmd(f'cat /proc/{pid}/cgroup').strip()
-        except Exception:
-            if not psutil.pid_exists(pid):
-                continue
-            info = ""
+            cmd = f'cat /proc/{pid}/cgroup'
+            info = run_cmd(cmd).strip()
 
-        # Find the container name by checking if the container ID is in the info
-        container_name = None
-        for container in containers:
-            if container['each_container_id'] in info:
-                container_name = container['each_name']
-                break
+            # Find the container name by checking if the container ID is in the info
+            container_name = None
+            # if info == "0::/":
+            #     container_name = "executor"
+            # else:
+            #     for container in containers:
+            #         if container['id'] in info:
+            #             container_name = container['name']
+            #             break
+            for container in containers:
+                if container['each_container_id'] in info:
+                    container_name = container['each_name']
+                    break
 
-        processes.append({
-            "processes_pid": pid,
-            "processes_info": info,
-            "processes_container_name": container_name
-        })
+            processes.append({
+                "processes_pid": pid,
+                "processes_info": info,
+                "processes_container_name": container_name
+            })
+        except:
+            pass
 
     return processes
 

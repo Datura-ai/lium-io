@@ -1,4 +1,5 @@
-from unittest.mock import AsyncMock, MagicMock
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -7,6 +8,15 @@ from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 
 from tests.helpers import build_context_config, build_services, build_state
+
+
+@contextmanager
+def foreign_gate(*, enforce: bool = True, check_enabled: bool = True):
+    """DAH-2735: the ownership gate ships shadow-first, like every money-withholding gate."""
+    with patch("neurons.validators.src.services.task.checks.gpu_usage.settings") as s:
+        s.FOREIGN_GPU_WORKLOAD_CHECK_ENABLED = check_enabled
+        s.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED = enforce
+        yield s
 
 
 @pytest.mark.parametrize(
@@ -19,12 +29,12 @@ from tests.helpers import build_context_config, build_services, build_state
             True,
             Msg.USAGE_OK.reason,
         ),
-        # Usage within limits but the process belongs to no Lium container — foreign (DAH-2735)
+        # Usage within limits, owner unreadable — inability to measure is not a violation
         (
             [{"gpu_utilization": 3, "memory_utilization": 4}],
             [{"pid": 1234, "name": "test"}],
-            False,
-            Msg.FOREIGN_PROCESS.reason,
+            True,
+            Msg.USAGE_OK.reason,
         ),
         # GPU utilization at limit (>= 5%) - should fail
         (
@@ -349,34 +359,76 @@ async def test_gpu_usage_allows_multiple_filler_bundles_on_split_node(context_fa
 
 # --- DAH-2735: foreign GPU workloads (Nodexo/SN106) that idle below the percentage gates ---
 # A competitor's rental holds 22.4 GB of VRAM at 0% reported load; its GPU workers run as bare
-# host processes outside any container. Ownership, not utilization, is the signal.
+# host processes outside any container. Ownership decides, and the expected owners come from
+# the backend, so `docker rename` buys nothing.
+
+EXECUTOR_CONTAINER_ID = "58b5771305ac0f2d1a1f0c8f7c2b9d2e"
+FILLER = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+
+
+def _specs(*extra_containers: str) -> dict[str, object]:
+    containers = [{"container_id": EXECUTOR_CONTAINER_ID, "name": "executor-executor-1"}]
+    containers += [{"container_id": f"id-{name}", "name": name} for name in extra_containers]
+    return {"docker": {"container_id": EXECUTOR_CONTAINER_ID, "containers": containers}}
+
+
+def _idle_state(gpu_details, gpu_processes, *, fillers: list[str] | None = None) -> object:
+    return build_state(
+        gpu_details=gpu_details,
+        gpu_processes=gpu_processes,
+        specs=_specs(*(fillers or [])),
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": fillers} if fillers else {},
+        ),
+    )
 
 
 @pytest.mark.asyncio
 async def test_foreign_container_at_idle_utilization_fails(context_factory):
-    state = build_state(
-        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
-        gpu_processes=[{"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [{"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    result = await GpuUsageCheck().run(ctx)
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
-    assert result.event.what_we_saw["foreign_processes"][0]["container_name"] == "nodexo-rental-1cd1ba2b"
+    assert result.event.what_we_saw["foreign_processes"][0].container_name == "nodexo-rental-1cd1ba2b"
+
+
+@pytest.mark.asyncio
+async def test_container_renamed_to_look_like_a_filler_still_fails(context_factory):
+    # The ticket's core requirement: a verdict `docker rename` cannot defeat. The node's real
+    # filler set comes from the backend, so an unknown `filler_*` name is still foreign.
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [{"pid": 4242, "container_name": "filler_not-ours"}],
+        fillers=[FILLER],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
 
 
 @pytest.mark.asyncio
 async def test_bare_host_gpu_process_fails(context_factory):
     # PM2-supervised gpu_worker.py from a plain user session: no container at all.
-    state = build_state(
-        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 686}],
-        gpu_processes=[{"pid": 2844137, "info": "0::/user.slice/user-1000.slice/session-1.scope", "container_name": None}],
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 686}],
+        [{"pid": 2844137, "info": "0::/../../user.slice/user-1000.slice/session-1.scope", "container_name": None}],
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    result = await GpuUsageCheck().run(ctx)
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -384,48 +436,44 @@ async def test_bare_host_gpu_process_fails(context_factory):
 
 @pytest.mark.asyncio
 async def test_held_vram_with_no_visible_processes_fails(context_factory):
-    state = build_state(
-        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
-        gpu_processes=[],
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [],
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    result = await GpuUsageCheck().run(ctx)
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.VRAM_HELD.reason
+    assert result.event.what_we_saw["held_vram"][0].memory_used_mb == 22400
 
 
 @pytest.mark.asyncio
 async def test_driver_reserve_vram_with_no_processes_passes(context_factory):
     # NVML counts the driver-reserved block (up to ~728 MB measured on B200) — not a workload.
-    state = build_state(
-        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 728}],
-        gpu_processes=[],
-    )
+    state = _idle_state([{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 728}], [])
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    result = await GpuUsageCheck().run(ctx)
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
 
 
 @pytest.mark.asyncio
-async def test_filler_holding_vram_passes(context_factory):
-    # Dolphin fillers legitimately hold most of the card; ownership makes them clean.
-    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
-    state = build_state(
-        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 69000}],
-        gpu_processes=[{"pid": 3217038, "container_name": filler_container}],
-        rented_data=RentedExecutorsResponse(
-            executors={},
-            all_filler_containers_by_executor={"executor-123": [filler_container]},
-        ),
+async def test_the_nodes_own_filler_holding_vram_passes(context_factory):
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 69000}],
+        [{"pid": 3217038, "container_name": FILLER}],
+        fillers=[FILLER],
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    result = await GpuUsageCheck().run(ctx)
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -434,17 +482,14 @@ async def test_filler_holding_vram_passes(context_factory):
 @pytest.mark.asyncio
 async def test_validator_own_gpu_work_in_the_executor_container_passes(context_factory):
     # VerifyX runs over SSH inside the executor container, so its cgroup is the executor's.
-    executor_container_id = "58b5771305ac0f2d1a1f0c8f7c2b9d2e"
-    state = build_state(
-        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 3000}],
-        gpu_processes=[
-            {"pid": 91011, "info": f"0::/../docker-{executor_container_id}.scope", "container_name": None}
-        ],
-        specs={"docker": {"container_id": executor_container_id, "containers": []}},
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 3000}],
+        [{"pid": 91011, "container_name": "executor-executor-1"}],
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    result = await GpuUsageCheck().run(ctx)
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -453,22 +498,80 @@ async def test_validator_own_gpu_work_in_the_executor_container_passes(context_f
 @pytest.mark.asyncio
 async def test_held_vram_passes_when_the_node_runs_a_filler(context_factory):
     # Seen in prod: NVML returned no processes on a node whose filler was working at 34%.
-    state = build_state(
-        gpu_details=[{"gpu_utilization": 34, "memory_utilization": 2, "memory_used_mb": 2371}],
-        gpu_processes=[],
-        specs={
-            "docker": {
-                "container_id": "eb81479ab6cc",
-                "containers": [
-                    {"name": "filler_6b53241b-79ba-403b-a486-802dd975506b"},
-                    {"name": "executor-executor-1"},
-                ],
-            }
-        },
+    state = _idle_state(
+        [{"gpu_utilization": 34, "memory_utilization": 2, "memory_used_mb": 2371}],
+        [],
+        fillers=[FILLER],
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    result = await GpuUsageCheck().run(ctx)
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_foreign_process_only_warns_while_enforcement_is_off(context_factory):
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [{"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate(enforce=False):
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+    assert result.event.severity == "warning"
+
+
+@pytest.mark.asyncio
+async def test_disabled_check_leaves_the_legacy_verdict_untouched(context_factory):
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [{"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate(check_enabled=False):
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_missing_backend_truth_never_judges(context_factory):
+    # No rented_data means no allowlist — an inability to measure, not a violation.
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        gpu_processes=[{"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
+        specs=_specs(),
+        rented_data=None,
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_foreign_event_payload_serializes_to_json(context_factory):
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [{"pid": 4242, "info": "0::/../pm2-lichsl.service", "container_name": None}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    dumped = result.event.model_dump(mode="json")["what_we_saw"]
+    assert dumped["foreign_processes"][0]["cgroup"] == "0::/../pm2-lichsl.service"
+    assert dumped["foreign_processes"][0]["pid"] == 4242

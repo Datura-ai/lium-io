@@ -1,8 +1,8 @@
 import logging
 from dataclasses import dataclass
 
+from core.config import settings
 from services.const import (
-    FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
@@ -21,6 +21,19 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ForeignGpuProcess:
+    pid: int | None
+    container_name: str | None
+    cgroup: str | None
+
+
+@dataclass(frozen=True)
+class HeldVram:
+    gpu_uuid: str | None
+    memory_used_mb: float
 
 
 @dataclass(frozen=True)
@@ -50,6 +63,61 @@ class GpuUsageCheck:
 
         return self._judge_process_based_usage(ctx, gpu_details, gpu_processes)
 
+    def _judge_foreign_occupancy(
+        self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
+    ) -> CheckResult | None:
+        """Judge an idle card by WHO holds it, not by how hard it is being used (DAH-2735).
+
+        Competitor marketplaces (Nodexo/SN106) idle below the percentage limits on purpose: a
+        rental holding 22.4 GB at 0% load passes every utilization gate. The expected holders
+        come from the backend (`rented_data`), never from a container-name prefix — the whole
+        point of the ticket is a verdict `docker rename` cannot defeat. Shadow by default like
+        every other money-withholding gate: without FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
+        the verdict is logged, not scored. Returns None when the card is clean, leaving the
+        legacy verdict to the caller.
+        """
+        if not settings.FOREIGN_GPU_WORKLOAD_CHECK_ENABLED:
+            return None
+
+        # No backend truth this cycle means no allowlist to judge against — an inability to
+        # measure, which never withholds money here.
+        if ctx.state.rented_data is None:
+            return None
+
+        enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
+        workload_containers: set[str] = _lium_workload_containers(ctx)
+        # The executor's own container may hold the card without being a workload that exempts
+        # the node from the VRAM belt below.
+        allowed_containers: set[str] = workload_containers | _executor_container_names(ctx)
+        foreign_processes: list[ForeignGpuProcess] = [
+            ForeignGpuProcess(
+                pid=process.get("pid"),
+                container_name=process.get("container_name"),
+                cgroup=process.get("info"),
+            )
+            for process in gpu_processes
+            if process.get("container_name") not in allowed_containers
+        ]
+
+        if foreign_processes:
+            what = {"foreign_processes": foreign_processes, "process_count": len(gpu_processes)}
+            template = Msg.FOREIGN_PROCESS
+        elif held_vram := _held_vram_without_owner(gpu_details, gpu_processes, workload_containers):
+            what = {"held_vram": held_vram}
+            template = Msg.VRAM_HELD
+        else:
+            return None
+
+        event = render_message(
+            template,
+            ctx=ctx,
+            check_id=self.check_id,
+            severity=None if enforce else "warning",
+            impact=None if enforce else "Shadow observation only: score was NOT changed",
+            what=what,
+        )
+        return CheckResult(passed=not enforce, event=event)
+
     def _judge_process_based_usage(
         self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
     ) -> CheckResult:
@@ -57,40 +125,9 @@ class GpuUsageCheck:
         violation = _find_violation(gpu_details, gpu_processes)
 
         if violation is None:
-            # DAH-2735: ownership gate. Foreign GPU consumers (competitor marketplaces like
-            # Nodexo/SN106) idle below the percentage limits on purpose — a held card at 0%
-            # load passes every utilization check. Anything holding the GPU outside our own
-            # pod_/filler_ containers is foreign, whatever it is named.
-            executor_container_id = _executor_container_id(ctx.state.specs)
-            foreign_processes = [
-                process
-                for process in gpu_processes
-                if not _is_lium_process(process, executor_container_id)
-            ]
-            if foreign_processes:
-                event = render_message(
-                    Msg.FOREIGN_PROCESS,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={
-                        "foreign_processes": foreign_processes,
-                        "process_count": len(gpu_processes),
-                    },
-                )
-                return CheckResult(passed=False, event=event)
-
-            # Belt for PIDs the scrape cannot enumerate at all: VRAM occupied with no visible
-            # owner. memory_used_mb is absolute (NVML memory-utilization is bus load and reads
-            # ~0 on a loaded-but-idle card).
-            held_vram = _held_vram_without_owner(gpu_details, gpu_processes, ctx.state.specs)
-            if held_vram:
-                event = render_message(
-                    Msg.VRAM_HELD,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={"held_vram": held_vram},
-                )
-                return CheckResult(passed=False, event=event)
+            foreign_result = self._judge_foreign_occupancy(ctx, gpu_details, gpu_processes)
+            if foreign_result is not None:
+                return foreign_result
 
             event = render_message(
                 Msg.USAGE_OK,
@@ -212,55 +249,54 @@ class GpuUsageCheck:
             return None
 
 
-def _executor_container_id(specs: dict) -> str:
-    """Container id of the executor itself, as the scrape identified it by image."""
-    return str((specs.get("docker") or {}).get("container_id") or "")
+def _lium_workload_containers(ctx: Context) -> set[str]:
+    """This node's fillers and pods, as the BACKEND knows them — not as the node names them.
 
-
-def _lium_container_names(specs: dict) -> list[str]:
-    containers = (specs.get("docker") or {}).get("containers") or []
-    return [
-        name
-        for container in containers
-        if (name := container.get("name", "")).startswith(
-            (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)
-        )
-    ]
-
-
-def _is_lium_process(process: dict, executor_container_id: str) -> bool:
-    """Our legitimate GPU consumers run in a pod_/filler_ container, or in the executor itself.
-
-    Orphaned pod_ containers are judged separately by the orphan branch above; here the
-    prefix only answers "is this ours at all". A process with no container (bare host
-    process, or a host-namespace PID whose cgroup the scrape could not read) is foreign.
-    The executor-container branch covers GPU work the validator itself starts over SSH
-    (VerifyX), whose cgroup is the executor's, not a pod's.
+    A container-name prefix would hand a pass to anything the provider renames `filler_*`,
+    and the ticket's whole requirement is a verdict `docker rename` cannot defeat.
     """
-    container_name = process.get("container_name")
-    if container_name:
-        return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
-    if executor_container_id:
-        return executor_container_id in (process.get("info") or "")
-    return False
+    rented_data = ctx.state.rented_data
+    containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
+    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    if rented_executor:
+        containers.update(pod.container_name for pod in rented_executor.pods)
+    containers.discard("")
+    return containers
+
+
+def _executor_container_names(ctx: Context) -> set[str]:
+    """The executor's own container — the cgroup validator-started GPU work (VerifyX) runs under.
+
+    The scrape is the only source that knows which container the executor is; it marks it by
+    image digest while enumerating `docker ps`.
+    """
+    docker = ctx.state.specs.get("docker") or {}
+    executor_container_id = docker.get("container_id") or ""
+    if not executor_container_id:
+        return set()
+    return {
+        name
+        for container in docker.get("containers") or []
+        if container.get("container_id") == executor_container_id
+        and (name := container.get("name") or "")
+    }
 
 
 def _held_vram_without_owner(
-    gpu_details: list[dict], gpu_processes: list[dict], specs: dict
-) -> list[dict]:
-    """VRAM held above the driver-reserve floor while no process is visible at all.
+    gpu_details: list[dict], gpu_processes: list[dict], expected_containers: set[str]
+) -> list[HeldVram]:
+    """VRAM held above the driver-reserve floor while no process is visible to account for it.
 
-    Only meaningful when the node runs none of our GPU containers: NVML sometimes returns
-    no processes on a node whose filler is demonstrably working (seen in prod at 34% GPU
-    utilization), and that must not read as a hidden foreign workload.
+    A node running one of our GPU containers is exempt: NVML sometimes returns no processes at
+    all on a node whose filler is demonstrably working (seen in prod at 34% GPU utilization).
 
     ponytail: node-level, not per-GPU — the scrape does not record which GPU a PID sits on;
     record the GPU uuid in get_gpu_processes if per-card attribution ever matters.
     """
-    if gpu_processes or _lium_container_names(specs):
+    if gpu_processes or expected_containers:
         return []
     return [
-        {"uuid": detail.get("uuid"), "memory_used_mb": detail.get("memory_used_mb", 0)}
+        HeldVram(gpu_uuid=detail.get("uuid"), memory_used_mb=detail.get("memory_used_mb") or 0)
         for detail in gpu_details
         if (detail.get("memory_used_mb") or 0) > GPU_HELD_VRAM_MB_LIMIT
     ]

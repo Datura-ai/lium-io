@@ -244,6 +244,15 @@ class Settings(BaseSettings):
     # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
     RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
     RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
+    # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
+    # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
+    # defaults off like every other money-withholding gate above: a replay over the live fleet
+    # flags 5 nodes, and that population deserves a shadow week before the first payout is cut.
+    FOREIGN_GPU_WORKLOAD_CHECK_ENABLED: bool = Field(env="FOREIGN_GPU_WORKLOAD_CHECK_ENABLED", default=True)
+    FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
+        env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
+    )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
