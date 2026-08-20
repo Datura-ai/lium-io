@@ -2,9 +2,9 @@
 
 An unrented executor whose container provably cannot apply a GPU power cap
 (no CAP_SYS_ADMIN, or /dev/nvidiactl not owned by root — see DAH-2705) forfeits
-the unrented rental incentive while staying active. Enforcement is gated by
-ENABLE_UNRENTED_POWER_CAP_LIMIT; while the flag is off the breach is only logged
-(shadow mode) and the payout is unchanged.
+the unrented rental incentive while staying active. Enforcement is ON by default
+and can be switched off with ENABLE_UNRENTED_POWER_CAP_LIMIT; with the flag off
+the breach is only logged (shadow mode) and the payout is unchanged.
 """
 
 import logging
@@ -188,12 +188,12 @@ def test_broken_probe_is_logged_as_unmeasured(caplog):
     assert unmeasured.extra["power_cap_probe_error"] == "cannot read /proc/self/status"
 
 
-def test_enforcement_defaults_to_shadow_mode():
-    # Rollout contract: first deploy must be shadow-only, so the flag default
-    # (not the env-resolved value) must stay False.
+def test_enforcement_is_on_by_default():
+    # Rollout contract: this gate ships enforced (the provider fix is one compose flag),
+    # so the flag default - not the env-resolved value - must stay True.
     default = type(settings).model_fields["ENABLE_UNRENTED_POWER_CAP_LIMIT"].default
 
-    assert default is False
+    assert default is True
 
 
 @pytest.mark.asyncio

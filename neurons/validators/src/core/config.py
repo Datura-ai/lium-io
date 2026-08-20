@@ -281,9 +281,11 @@ class Settings(BaseSettings):
     # DAH-2715 — GPU power cap capability gate. When True, an unrented executor whose
     # container provably cannot apply a GPU power cap (no CAP_SYS_ADMIN, or /dev/nvidiactl
     # not owned by root - see DAH-2705) loses the unrented rental incentive while staying
-    # active. When False, the breach is only logged (shadow mode) so prod impact can be
-    # observed before enforcing. A node whose probe is missing is never penalized.
-    ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=False)
+    # active. A node whose probe is missing or unreadable is never penalized.
+    # Unlike the gates above this one ships ENFORCED: the fix is one compose flag on the
+    # provider's side, and the shadow window would only delay it. Set to False to fall back
+    # to logging the breach without withholding anything.
+    ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
