@@ -90,9 +90,6 @@ class GpuUsageCheck:
 
         enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
         workload_containers: set[str] = _lium_workload_containers(ctx)
-        # The executor's own container may hold the card without being a workload that exempts
-        # the node from the VRAM belt below.
-        allowed_containers: set[str] = workload_containers | _executor_container_names(ctx)
         foreign_processes: list[ForeignGpuProcess] = [
             ForeignGpuProcess(
                 pid=process.get("pid"),
@@ -100,7 +97,7 @@ class GpuUsageCheck:
                 cgroup=process.get("info"),
             )
             for process in gpu_processes
-            if process.get("container_name") not in allowed_containers
+            if process.get("container_name") not in workload_containers
             and not _runs_in_the_executors_own_cgroup(process)
         ]
 
@@ -141,6 +138,9 @@ class GpuUsageCheck:
                 ctx.runner.run(GPU_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False),
                 ctx.runner.run(COMPUTE_APPS_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False),
             )
+            # A failed query returns empty stdout, which would otherwise read as "no owner".
+            if not gpu_query.success or not compute_apps.success:
+                return False
             if compute_apps.stdout.strip():
                 return False
 
@@ -328,24 +328,6 @@ def _runs_in_the_executors_own_cgroup(process: dict) -> bool:
     """
     cgroup: str = process.get("info") or ""
     return bool(cgroup) and ".." not in cgroup
-
-
-def _executor_container_names(ctx: Context) -> set[str]:
-    """The executor's own container — the cgroup validator-started GPU work (VerifyX) runs under.
-
-    The scrape is the only source that knows which container the executor is; it marks it by
-    image digest while enumerating `docker ps`.
-    """
-    docker = ctx.state.specs.get("docker") or {}
-    executor_container_id = docker.get("container_id") or ""
-    if not executor_container_id:
-        return set()
-    return {
-        name
-        for container in docker.get("containers") or []
-        if container.get("container_id") == executor_container_id
-        and (name := container.get("name") or "")
-    }
 
 
 def _held_vram_without_owner(

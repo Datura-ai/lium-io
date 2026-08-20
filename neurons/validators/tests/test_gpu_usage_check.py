@@ -176,7 +176,9 @@ def _wedged_detail(uuid: str = WEDGED_UUID) -> dict:
 
 
 def _ssh_result(exit_code: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
-    return MagicMock(exit_code=exit_code, stdout=stdout, stderr=stderr, error_message=None)
+    return MagicMock(
+        exit_code=exit_code, stdout=stdout, stderr=stderr, error_message=None, success=exit_code == 0
+    )
 
 
 def _mock_runner(
@@ -528,19 +530,20 @@ async def test_the_nodes_own_filler_holding_vram_passes(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_validator_own_gpu_work_in_the_executor_container_passes(context_factory):
-    # VerifyX runs over SSH inside the executor container, so its cgroup is the executor's.
+async def test_a_container_running_the_executor_image_is_still_foreign(context_factory):
+    # The scrape marks the executor container by image digest and the monitor shares that image,
+    # so a provider container built from it must not inherit a pass — only the cgroup rule may.
     state = _idle_state(
         [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 3000}],
-        [{"pid": 91011, "container_name": "executor-executor-1"}],
+        [{"pid": 91011, "info": "0::/../docker-abc.scope", "container_name": "executor-executor-1"}],
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
     with foreign_gate():
         result = await GpuUsageCheck().run(ctx)
 
-    assert result.passed is True
-    assert result.event.reason_code == Msg.USAGE_OK.reason
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
 
 
 @pytest.mark.asyncio
@@ -657,3 +660,25 @@ async def test_host_process_escaping_the_cgroup_namespace_still_fails(context_fa
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+
+
+@pytest.mark.asyncio
+async def test_failed_live_query_never_withholds(context_factory):
+    # A failed nvidia-smi returns empty stdout, which must not read as "no owner on the card".
+    state = _idle_state(
+        [{"uuid": HELD_UUID, "gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [],
+    )
+    runner = MagicMock()
+    runner.run = AsyncMock(
+        return_value=MagicMock(exit_code=9, stdout="", stderr="Unable to determine the device handle", success=False)
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, runner=runner
+    )
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
