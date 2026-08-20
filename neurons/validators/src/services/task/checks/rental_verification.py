@@ -52,6 +52,9 @@ _FILLER_VERDICT_SEVERITY: dict[str, int] = {
     Msg.FILLER_KILLED.reason: 3,
     Msg.FILLER_TRANSPORT_UNREACHABLE.reason: 2,
     Msg.FILLER_STATE_UNKNOWN.reason: 1,
+    # DAH-2730: ranks with STATE_UNKNOWN — the node lost its job either way, and neither outcome
+    # is an offence.
+    Msg.FILLER_CONTAINER_EXITED.reason: 1,
     Msg.FILLER_VERIFIED.reason: 0,
 }
 
@@ -447,9 +450,10 @@ class RentalVerificationCheck:
         # still starting mid-cycle) — re-check the live run state before penalizing, like the pod
         # flow does with get_pod_rental_active.
         filler_run_id: str = filler_container.removeprefix(FILLER_CONTAINER_PREFIX)
-        # container_missing carries the observation to the backend: this re-check only ever happens
-        # when the container is gone from the host, and the backend uses the accumulated reports to
-        # close zombie RUNNING runs (DAH-2471).
+        # container_missing carries the probe's observation — no RUNNING container by that name —
+        # which is what the backend needs to close zombie RUNNING runs (DAH-2471). It is NOT the
+        # removal verdict: whether the host removed it or it exited on its own is decided below,
+        # from the death diagnostics (DAH-2730).
         filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
             filler_run_id, container_missing=True
         )
@@ -506,31 +510,33 @@ class RentalVerificationCheck:
         withholds incentive for. An unprovable state (SSH lost, diagnostics failed) is never a
         penalty.
         """
-        try:
-            diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
-        except Exception as exc:
-            return self._filler_state_unknown_result(
-                ctx,
-                filler_container,
-                reason="container death diagnostics unavailable",
-                details={"diagnostics_capture_error": repr(exc)},
-            )
+        # collect_container_death_diagnostics folds every failure into capture_error and never
+        # raises (cancellation excepted), so an unreadable state arrives as empty fields below.
+        diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
+        what_we_saw: dict[str, object] = {
+            "verified": False,
+            "filler_container": filler_container,
+            "executor_uuid": ctx.executor.uuid,
+            "filler_run_status": filler_run_status,
+            "run_age_seconds": run_age.total_seconds(),
+            **diagnostics.to_log_fields(),
+        }
 
-        death_fields: dict[str, object] = diagnostics.to_log_fields()
         if not diagnostics.container_missing:
+            if diagnostics.status is None:
+                # Docker answered neither "gone" nor a state: claiming the container is still there
+                # would be as unproven as calling it a kill.
+                return self._filler_state_unknown_result(
+                    ctx,
+                    filler_container,
+                    reason="container state could not be read",
+                    details=diagnostics.to_log_fields(),
+                )
             event = render_message(
                 Msg.FILLER_CONTAINER_EXITED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={
-                    "verified": False,
-                    "filler_container": filler_container,
-                    "executor_uuid": ctx.executor.uuid,
-                    "filler_run_status": filler_run_status,
-                    "run_age_seconds": run_age.total_seconds(),
-                    "enforced": False,
-                    **death_fields,
-                },
+                what={**what_we_saw, "enforced": False},
             )
             return CheckResult(passed=True, event=event, updates={})
 
@@ -540,15 +546,7 @@ class RentalVerificationCheck:
             check_id=self.check_id,
             severity=None if enforce else "warning",
             impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
-            what={
-                "verified": False,
-                "filler_container": filler_container,
-                "executor_uuid": ctx.executor.uuid,
-                "filler_run_status": filler_run_status,
-                "run_age_seconds": run_age.total_seconds(),
-                "enforced": enforce,
-                **death_fields,
-            },
+            what={**what_we_saw, "enforced": enforce},
         )
         return CheckResult(passed=not enforce, event=event, updates={})
 

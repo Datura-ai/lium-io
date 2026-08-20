@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 
 import asyncssh
 import pytest
+from neurons.validators.src.core.docker_utils import ContainerDeathDiagnostics
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
     GPU_RUNTIME_DEVICE_FAULT_REASON,
@@ -475,8 +476,7 @@ class FillerSSHClient:
         unreachable_containers: set[str] | None = None,
         removed_from_host: bool = True,
     ):
-        # DAH-2730: what `docker inspect` answers for a container the ps probe did not list.
-        # True = the object is gone (a removal); False = it is still there and merely exited.
+        # True = `docker inspect` says "No such object" (a removal); False = still there, exited.
         self.removed_from_host = removed_from_host
         self.running = running
         self.exit_status = exit_status
@@ -636,7 +636,7 @@ async def test_rental_verification_filler_killed_shadow_mode_passes_but_logs():
 async def test_rental_verification_filler_killed_enforcement_fails():
     """Enforcement mode: a killed filler fails the fatal check -> no unrented incentive."""
     backend_client = _killed_filler_backend()
-    ssh_client = FillerSSHClient(running=False)
+    ssh_client = FillerSSHClient(running=False, removed_from_host=True)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
     result = await _run_filler_check(ctx, enforcement=True)
@@ -1269,10 +1269,6 @@ async def test_rental_verification_create_kill_is_not_masked_by_a_surviving_fill
     assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
 
 
-# DAH-2730: `docker ps` lists running containers only, so a filler that exited on its own reads
-# exactly like one the host removed. Only a removal is an offence.
-
-
 @pytest.mark.asyncio
 async def test_filler_that_exited_on_the_host_is_not_a_kill():
     """Container still on the host, exit code 255: the node crashed the job, it did not remove it."""
@@ -1289,30 +1285,36 @@ async def test_filler_that_exited_on_the_host_is_not_a_kill():
 
 
 @pytest.mark.asyncio
-async def test_filler_removed_from_the_host_still_fails_under_enforcement():
-    """The real offence keeps its verdict: no state at all means the container was removed."""
-    backend_client = _killed_filler_backend()
-    ssh_client = FillerSSHClient(running=False, removed_from_host=True)
-    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
-
-    result = await _run_filler_check(ctx, enforcement=True)
-
-    assert result.passed is False
-    assert result.event.reason_code == Msg.FILLER_KILLED.reason
-
-
-@pytest.mark.asyncio
-async def test_unprovable_container_state_is_never_a_penalty():
-    """Diagnostics unreachable: we cannot prove a removal, so nobody is punished for it."""
+async def test_container_state_without_evidence_is_unknown_not_exited():
+    """Docker answered nothing useful: we cannot claim the container is still there either."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(running=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
 
     with patch(
         "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
-        side_effect=OSError("ssh channel died"),
+        return_value=ContainerDeathDiagnostics(capture_error="inspect: Cannot connect to the Docker daemon"),
     ):
         result = await _run_filler_check(ctx, enforcement=True)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+
+
+@pytest.mark.asyncio
+async def test_exited_bundle_outranks_a_healthy_sibling_on_a_split_node():
+    """DAH-2465 split node: the bundle that lost its job decides the node's logged verdict."""
+    backend_client = _killed_filler_backend()
+    healthy_container = "filler_11111111-2222-3333-4444-555555555555"
+    exited_container = "filler_99999999-8888-7777-6666-555555555555"
+    ssh_client = FillerSSHClient(dead_containers={exited_container}, removed_from_host=False)
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=ssh_client,
+        filler_containers=[healthy_container, exited_container],
+    )
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
