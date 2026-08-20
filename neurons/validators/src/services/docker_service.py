@@ -5758,6 +5758,14 @@ class DockerService:
         default_extra = _delete_container_log_extra(payload, executor_info)
         log = _BoundLog(default_extra)
 
+        # DAH-2728: the backend has no container name until the create answers, so a delete that
+        # races an in-flight create arrives without one. The name is ours to derive — the create
+        # builds it from the same pod id.
+        if not payload.container_name:
+            payload.container_name = self.get_container_name(payload)
+            log.info("Derived the container name for a delete that carried none",
+                     container_name=payload.container_name)
+
         log.info("Deleting Docker Container", payload=str(payload))
 
         try:

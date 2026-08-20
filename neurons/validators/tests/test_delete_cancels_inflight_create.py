@@ -12,7 +12,12 @@ from uuid import uuid4
 
 import pytest
 import services.docker_service as ds_module
-from payload_models.payloads import ContainerCreateRequest, PayloadPortMapping, WorkloadKind
+from payload_models.payloads import (
+    ContainerCreateRequest,
+    ContainerDeleteRequest,
+    PayloadPortMapping,
+    WorkloadKind,
+)
 from services.docker_service import DockerService, _CreateCancelledByDelete, inflight_creates
 from services.miner_service import MinerService
 
@@ -109,3 +114,20 @@ async def test_a_create_nobody_cancelled_runs_on(svc: DockerService) -> None:
 
     with inflight_creates.track(payload.pod_id):
         assert await svc._abort_if_cancelled_by_delete(Mock(), payload, {}) is None
+
+
+@pytest.mark.parametrize(
+    ("workload_kind", "prefix"),
+    [(WorkloadKind.CUSTOMER_RENTAL, "pod_"), (WorkloadKind.FILLER, "filler_")],
+)
+def test_container_name_is_derived_when_the_delete_carries_none(
+    svc: DockerService, workload_kind: WorkloadKind, prefix: str
+) -> None:
+    # A delete racing an in-flight create arrives before the backend knows the name.
+    pod_id = str(uuid4())
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner", executor_id=str(uuid4()), pod_id=pod_id,
+        workload_kind=workload_kind, container_name="",
+    )
+
+    assert svc.get_container_name(payload) == f"{prefix}{pod_id}"
