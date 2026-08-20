@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass
 
 from services.const import (
+    FILLER_CONTAINER_PREFIX,
+    GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     GPU_WEDGE_MEMORY_MAX,
@@ -55,6 +57,38 @@ class GpuUsageCheck:
         violation = _find_violation(gpu_details, gpu_processes)
 
         if violation is None:
+            # DAH-2735: ownership gate. Foreign GPU consumers (competitor marketplaces like
+            # Nodexo/SN106) idle below the percentage limits on purpose — a held card at 0%
+            # load passes every utilization check. Anything holding the GPU outside our own
+            # pod_/filler_ containers is foreign, whatever it is named.
+            foreign_processes = [
+                process for process in gpu_processes if not _is_lium_process(process)
+            ]
+            if foreign_processes:
+                event = render_message(
+                    Msg.FOREIGN_PROCESS,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "foreign_processes": foreign_processes,
+                        "process_count": len(gpu_processes),
+                    },
+                )
+                return CheckResult(passed=False, event=event)
+
+            # Belt for PIDs the scrape cannot enumerate at all: VRAM occupied with no visible
+            # owner. memory_used_mb is absolute (NVML memory-utilization is bus load and reads
+            # ~0 on a loaded-but-idle card).
+            held_vram = _held_vram_without_owner(gpu_details, gpu_processes)
+            if held_vram:
+                event = render_message(
+                    Msg.VRAM_HELD,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"held_vram": held_vram},
+                )
+                return CheckResult(passed=False, event=event)
+
             event = render_message(
                 Msg.USAGE_OK,
                 ctx=ctx,
@@ -173,6 +207,34 @@ class GpuUsageCheck:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Ghost GPU detection failed, falling back to the usage guard: %s", exc)
             return None
+
+
+def _is_lium_process(process: dict) -> bool:
+    """Our legitimate GPU consumers always run in a pod_/filler_ container.
+
+    Orphaned pod_ containers are judged separately by the orphan branch above; here the
+    prefix only answers "is this ours at all". A process with no container (bare host
+    process, or a host-namespace PID whose cgroup the scrape could not read) is foreign.
+    """
+    container_name = process.get("container_name")
+    if not container_name:
+        return False
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+
+
+def _held_vram_without_owner(gpu_details: list[dict], gpu_processes: list[dict]) -> list[dict]:
+    """VRAM held above the driver-reserve floor while no process is visible at all.
+
+    ponytail: node-level, not per-GPU — the scrape does not record which GPU a PID sits on;
+    record the GPU uuid in get_gpu_processes if per-card attribution ever matters.
+    """
+    if gpu_processes:
+        return []
+    return [
+        {"uuid": detail.get("uuid"), "memory_used_mb": detail.get("memory_used_mb", 0)}
+        for detail in gpu_details
+        if (detail.get("memory_used_mb") or 0) > GPU_HELD_VRAM_MB_LIMIT
+    ]
 
 
 def _find_violation(gpu_details: list[dict], gpu_processes: list[dict]) -> dict | None:

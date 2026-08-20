@@ -946,31 +946,26 @@ def get_gpu_processes(pids: set, containers: list[dict]):
 
     processes = []
     for pid in pids:
+        # DAH-2735: a host-namespace PID is invisible in /proc from inside the executor
+        # container. Keep it unattributed instead of dropping it — an empty process list
+        # reads as a clean card while a foreign host workload holds the GPU.
         try:
-            cmd = f'cat /proc/{pid}/cgroup'
-            info = run_cmd(cmd).strip()
+            info = run_cmd(f'cat /proc/{pid}/cgroup').strip()
+        except Exception:
+            info = ""
 
-            # Find the container name by checking if the container ID is in the info
-            container_name = None
-            # if info == "0::/":
-            #     container_name = "executor"
-            # else:
-            #     for container in containers:
-            #         if container['id'] in info:
-            #             container_name = container['name']
-            #             break
-            for container in containers:
-                if container['each_container_id'] in info:
-                    container_name = container['each_name']
-                    break
+        # Find the container name by checking if the container ID is in the info
+        container_name = None
+        for container in containers:
+            if container['each_container_id'] in info:
+                container_name = container['each_name']
+                break
 
-            processes.append({
-                "processes_pid": pid,
-                "processes_info": info,
-                "processes_container_name": container_name
-            })
-        except:
-            pass
+        processes.append({
+            "processes_pid": pid,
+            "processes_info": info,
+            "processes_container_name": container_name
+        })
 
     return processes
 

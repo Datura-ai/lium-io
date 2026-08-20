@@ -19,12 +19,12 @@ from tests.helpers import build_context_config, build_services, build_state
             True,
             Msg.USAGE_OK.reason,
         ),
-        # Usage within limits - should pass
+        # Usage within limits but the process belongs to no Lium container — foreign (DAH-2735)
         (
             [{"gpu_utilization": 3, "memory_utilization": 4}],
             [{"pid": 1234, "name": "test"}],
-            True,
-            Msg.USAGE_OK.reason,
+            False,
+            Msg.FOREIGN_PROCESS.reason,
         ),
         # GPU utilization at limit (>= 5%) - should fail
         (
@@ -345,3 +345,87 @@ async def test_gpu_usage_allows_multiple_filler_bundles_on_split_node(context_fa
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
     assert result.event.what_we_saw["filler_containers"] == sorted([bundle_a, bundle_b])
+
+
+# --- DAH-2735: foreign GPU workloads (Nodexo/SN106) that idle below the percentage gates ---
+# A competitor's rental holds 22.4 GB of VRAM at 0% reported load; its GPU workers run as bare
+# host processes outside any container. Ownership, not utilization, is the signal.
+
+
+@pytest.mark.asyncio
+async def test_foreign_container_at_idle_utilization_fails(context_factory):
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        gpu_processes=[{"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+    assert result.event.what_we_saw["foreign_processes"][0]["container_name"] == "nodexo-rental-1cd1ba2b"
+
+
+@pytest.mark.asyncio
+async def test_bare_host_gpu_process_fails(context_factory):
+    # PM2-supervised gpu_worker.py from a plain user session: no container at all.
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 686}],
+        gpu_processes=[{"pid": 2844137, "info": "0::/user.slice/user-1000.slice/session-1.scope", "container_name": None}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+
+
+@pytest.mark.asyncio
+async def test_held_vram_with_no_visible_processes_fails(context_factory):
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        gpu_processes=[],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VRAM_HELD.reason
+
+
+@pytest.mark.asyncio
+async def test_driver_reserve_vram_with_no_processes_passes(context_factory):
+    # NVML counts the driver-reserved block (up to ~728 MB measured on B200) — not a workload.
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 728}],
+        gpu_processes=[],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_filler_holding_vram_passes(context_factory):
+    # Dolphin fillers legitimately hold most of the card; ownership makes them clean.
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 69000}],
+        gpu_processes=[{"pid": 3217038, "container_name": filler_container}],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
