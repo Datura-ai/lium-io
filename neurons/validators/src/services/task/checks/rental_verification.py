@@ -48,6 +48,9 @@ _GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
 # bundle but the pipeline emits a single event, so the node must be judged by its worst container:
 # a confirmed kill outranks an indeterminate probe, which outranks a healthy one. Anything
 # unlisted sorts as healthy.
+# `docker inspect --format '{{json .State}}'` reports this while the container is up.
+_DOCKER_STATUS_RUNNING = "running"
+
 _FILLER_VERDICT_SEVERITY: dict[str, int] = {
     Msg.FILLER_KILLED.reason: 3,
     Msg.FILLER_TRANSPORT_UNREACHABLE.reason: 2,
@@ -523,6 +526,15 @@ class RentalVerificationCheck:
         }
 
         if not diagnostics.container_missing:
+            if diagnostics.status == _DOCKER_STATUS_RUNNING:
+                # Filler containers carry `restart: unless-stopped`, so docker can bring one back
+                # between the ps probe and this inspect. A running container is neither death.
+                return self._filler_state_unknown_result(
+                    ctx,
+                    filler_container,
+                    reason="container is running again",
+                    details=diagnostics.to_log_fields(),
+                )
             if diagnostics.status is None:
                 # Docker answered neither "gone" nor a state: claiming the container is still there
                 # would be as unproven as calling it a kill.

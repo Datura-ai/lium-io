@@ -1318,3 +1318,21 @@ async def test_exited_bundle_outranks_a_healthy_sibling_on_a_split_node():
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
+
+
+@pytest.mark.asyncio
+async def test_container_running_again_by_the_time_we_inspect_is_not_a_death():
+    """Filler containers run with `restart: unless-stopped`, so docker can bring one back
+    between the ps probe and the inspect. A running container is not an exit and not a kill."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    with patch(
+        "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
+        return_value=ContainerDeathDiagnostics(status="running"),
+    ):
+        result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
