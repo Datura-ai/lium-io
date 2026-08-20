@@ -5758,9 +5758,9 @@ class DockerService:
         default_extra = _delete_container_log_extra(payload, executor_info)
         log = _BoundLog(default_extra)
 
-        # DAH-2728: the backend has no container name until the create answers, so a delete that
-        # races an in-flight create arrives without one. The name is ours to derive — the create
-        # builds it from the same pod id.
+        # DAH-2728: a delete that races an in-flight create can arrive before any container name
+        # exists. The create built its name from the pod id, so the same rule reconstructs it here
+        # rather than letting the teardown run against an empty name.
         if not payload.container_name:
             payload.container_name = self.get_container_name(payload)
             log.info("Derived the container name for a delete that carried none",
