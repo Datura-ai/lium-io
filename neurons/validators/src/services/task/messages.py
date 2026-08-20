@@ -1147,6 +1147,37 @@ class CpuTruthMessages:
     )
 
 
+class ProviderSideLoadMessages:
+    """DAH-2734 — provider-side CPU/disk on a rented machine, as triage signals. The check always
+    passes: these numbers guide triage (an SN13 miner eating 9 cores and 1.5 TB), never money."""
+
+    LOAD_RECORDED = MessageTemplate(
+        event="Provider-side load recorded",
+        reason="PROVIDER_SIDE_LOAD_RECORDED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    LOAD_HIGH = MessageTemplate(
+        event="Provider-side workload is consuming a rented machine's CPU/disk",
+        reason="PROVIDER_SIDE_LOAD_ON_RENTED_EXECUTOR",
+        severity="warning",
+        category="env",
+        impact="Triage signal only: score was NOT changed",
+        remediation=(
+            "Stop or constrain workloads running outside Lium containers on this host; "
+            "the machine is rented and its CPU/disk belong to the renter."
+        ),
+    )
+    NOT_MEASURABLE = MessageTemplate(
+        event="Provider-side load not measurable this cycle",
+        reason="PROVIDER_SIDE_LOAD_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class FinalizeMessages:
     COMPLETED = MessageTemplate(
         event="Validation task completed",
