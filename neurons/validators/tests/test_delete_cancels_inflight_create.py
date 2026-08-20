@@ -19,7 +19,7 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 from services.docker_service import DockerService, _CreateCancelledByDelete, inflight_creates
-from services.miner_service import MinerService
+from services.miner_service import MinerService, _bypasses_renting_in_progress
 
 
 @pytest.fixture
@@ -131,3 +131,41 @@ def test_container_name_is_derived_when_the_delete_carries_none(
     )
 
     assert svc.get_container_name(payload) == f"{prefix}{pod_id}"
+
+
+def test_a_customer_delete_passes_the_pending_rent_guard_only_while_its_create_runs() -> None:
+    # The guard reads the pending-pod flag the create itself set, so declining the delete would
+    # leave that create to finish and orphan its container.
+    pod_id = str(uuid4())
+    delete = ContainerDeleteRequest(
+        miner_hotkey="miner", executor_id=str(uuid4()), pod_id=pod_id,
+        container_name=f"pod_{pod_id}",
+    )
+
+    assert _bypasses_renting_in_progress(delete) is False
+    with inflight_creates.track(pod_id):
+        assert _bypasses_renting_in_progress(delete) is True
+
+
+@pytest.mark.asyncio
+async def test_a_retried_create_does_not_untrack_the_one_still_running() -> None:
+    # The rent retry can put a second create on the same pod; when it leaves, the first must stay
+    # cancellable, or the delete goes back to seeing "no container" and the orphan returns.
+    pod_id = str(uuid4())
+
+    with inflight_creates.track(pod_id):
+        with inflight_creates.track(pod_id):
+            pass
+        assert inflight_creates.is_running(pod_id) is True
+        assert inflight_creates.cancel(pod_id) is True
+
+    assert inflight_creates.is_running(pod_id) is False
+
+
+def test_a_second_create_does_not_clear_a_cancel_already_raised() -> None:
+    pod_id = str(uuid4())
+
+    with inflight_creates.track(pod_id):
+        inflight_creates.cancel(pod_id)
+        with inflight_creates.track(pod_id):
+            assert inflight_creates.is_cancelled(pod_id) is True

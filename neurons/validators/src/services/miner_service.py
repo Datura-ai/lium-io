@@ -159,10 +159,14 @@ def _parse_miner_response(response_data: dict) -> AcceptSSHKeyRequest | FailedRe
 
 
 def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
-    return (
-        isinstance(payload, ContainerDeleteRequest)
-        and payload.workload_kind == WorkloadKind.FILLER
-    )
+    if not isinstance(payload, ContainerDeleteRequest):
+        return False
+    if payload.workload_kind == WorkloadKind.FILLER:
+        return True
+    # DAH-2728: the pending-pod flag this guard reads is set by the very create this delete is
+    # about to cancel, so declining here would leave that create to finish and orphan its
+    # container — the exact failure the delete was sent to prevent.
+    return inflight_creates.is_running(payload.pod_id)
 
 
 JOB_LENGTH = 30

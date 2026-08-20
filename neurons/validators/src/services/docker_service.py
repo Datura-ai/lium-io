@@ -381,6 +381,14 @@ class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
 
 
+@dataclass
+class _InflightCreate:
+    # A retried rent can put a second create on the same pod while the first still runs, so the
+    # entry outlives any single one of them and only the last to leave clears it.
+    running: int = 0
+    cancelled_by_delete: bool = False
+
+
 class _InflightCreateRegistry:
     """Creates running right now, and whether a delete has already cancelled them.
 
@@ -392,25 +400,33 @@ class _InflightCreateRegistry:
     """
 
     def __init__(self) -> None:
-        self._cancelled_by_pod_id: dict[str, bool] = {}
+        self._creates_by_pod_id: dict[str, _InflightCreate] = {}
 
     @contextlib.contextmanager
     def track(self, pod_id: str) -> Iterator[None]:
-        self._cancelled_by_pod_id[pod_id] = False
+        create = self._creates_by_pod_id.setdefault(pod_id, _InflightCreate())
+        create.running += 1
         try:
             yield
         finally:
-            self._cancelled_by_pod_id.pop(pod_id, None)
+            create.running -= 1
+            if create.running <= 0:
+                self._creates_by_pod_id.pop(pod_id, None)
 
     def cancel(self, pod_id: str) -> bool:
         """Flag the in-flight create for this pod. False when no create is running."""
-        if pod_id not in self._cancelled_by_pod_id:
+        create = self._creates_by_pod_id.get(pod_id)
+        if create is None:
             return False
-        self._cancelled_by_pod_id[pod_id] = True
+        create.cancelled_by_delete = True
         return True
 
     def is_cancelled(self, pod_id: str) -> bool:
-        return self._cancelled_by_pod_id.get(pod_id, False)
+        create = self._creates_by_pod_id.get(pod_id)
+        return create is not None and create.cancelled_by_delete
+
+    def is_running(self, pod_id: str) -> bool:
+        return pod_id in self._creates_by_pod_id
 
 
 # In-process: a pod's create and delete are driven by the same validator event loop. Move it to
@@ -3885,8 +3901,16 @@ class DockerService:
             )
         )
         if payload.workload_kind == WorkloadKind.FILLER:
-            # DAH-2356: the power cap is applied before `docker run`, and the delete that cancelled
-            # us restored nothing — at that point this pod had no record yet.
+            # Remove the container BEFORE lifting the cap. The enclosing handler removes it again
+            # (both are idempotent), but restoring full power while a filler is still running is
+            # the DAH-2356 hard-ban failure — an uncapped PEARL miner.
+            await self.cleanup_failed_container_creation(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                container_name=container_name,
+            )
+            # DAH-2356: the cap is applied before `docker run`, and the delete that cancelled us
+            # restored nothing — at that point this pod had no record yet.
             await restore_filler_pod_gpu_power_limits(
                 ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
             )
