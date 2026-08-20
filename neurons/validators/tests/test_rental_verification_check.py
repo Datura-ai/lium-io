@@ -473,7 +473,11 @@ class FillerSSHClient:
         raise_on_run: BaseException | None = None,
         dead_containers: set[str] | None = None,
         unreachable_containers: set[str] | None = None,
+        removed_from_host: bool = True,
     ):
+        # DAH-2730: what `docker inspect` answers for a container the ps probe did not list.
+        # True = the object is gone (a removal); False = it is still there and merely exited.
+        self.removed_from_host = removed_from_host
         self.running = running
         self.exit_status = exit_status
         self.raise_on_run = raise_on_run
@@ -496,6 +500,16 @@ class FillerSSHClient:
         container_running = self.running and not probed_container_is_dead
         result.stdout = "container_id_123" if container_running and "docker ps" in command else ""
         result.stderr = ""
+        if "docker inspect" in command and not container_running:
+            if self.removed_from_host:
+                result.exit_status = 1
+                result.stderr = f"Error: No such object: {command.split()[-1]}"
+            else:
+                result.stdout = (
+                    '{"Status": "exited", "ExitCode": 255, "OOMKilled": false,'
+                    ' "Error": "error while mounting volume", "StartedAt": "2026-08-18T06:45:54Z",'
+                    ' "FinishedAt": "2026-08-18T22:44:30Z"}'
+                )
         return result
 
 
@@ -1253,3 +1267,52 @@ async def test_rental_verification_create_kill_is_not_masked_by_a_surviving_fill
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_KILLED_AT_CREATE.reason
+
+
+# DAH-2730: `docker ps` lists running containers only, so a filler that exited on its own reads
+# exactly like one the host removed. Only a removal is an offence.
+
+
+@pytest.mark.asyncio
+async def test_filler_that_exited_on_the_host_is_not_a_kill():
+    """Container still on the host, exit code 255: the node crashed the job, it did not remove it."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False, removed_from_host=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
+    assert result.event.what_we_saw["container_exit_code"] == 255
+    assert result.event.what_we_saw["container_status"] == "exited"
+
+
+@pytest.mark.asyncio
+async def test_filler_removed_from_the_host_still_fails_under_enforcement():
+    """The real offence keeps its verdict: no state at all means the container was removed."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False, removed_from_host=True)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+
+
+@pytest.mark.asyncio
+async def test_unprovable_container_state_is_never_a_penalty():
+    """Diagnostics unreachable: we cannot prove a removal, so nobody is punished for it."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    with patch(
+        "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
+        side_effect=OSError("ssh channel died"),
+    ):
+        result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason

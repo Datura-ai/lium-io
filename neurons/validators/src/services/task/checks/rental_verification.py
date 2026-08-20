@@ -498,12 +498,41 @@ class RentalVerificationCheck:
         run_age: timedelta,
         enforce: bool,
     ) -> CheckResult:
-        """Render the confirmed-kill verdict: capture death diagnostics and emit FILLER_KILLED."""
+        """Judge why the container is not running, and emit FILLER_KILLED only for a removal.
+
+        DAH-2730: `docker ps` lists RUNNING containers only, so a filler that exited on its own
+        looks exactly like one the host removed. The death diagnostics already know the difference
+        — a removed container has no state at all — and only a removal is the offence this check
+        withholds incentive for. An unprovable state (SSH lost, diagnostics failed) is never a
+        penalty.
+        """
         try:
             diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
-            death_fields: dict[str, object] = diagnostics.to_log_fields()
         except Exception as exc:
-            death_fields = {"diagnostics_capture_error": repr(exc)}
+            return self._filler_state_unknown_result(
+                ctx,
+                filler_container,
+                reason="container death diagnostics unavailable",
+                details={"diagnostics_capture_error": repr(exc)},
+            )
+
+        death_fields: dict[str, object] = diagnostics.to_log_fields()
+        if not diagnostics.container_missing:
+            event = render_message(
+                Msg.FILLER_CONTAINER_EXITED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "verified": False,
+                    "filler_container": filler_container,
+                    "executor_uuid": ctx.executor.uuid,
+                    "filler_run_status": filler_run_status,
+                    "run_age_seconds": run_age.total_seconds(),
+                    "enforced": False,
+                    **death_fields,
+                },
+            )
+            return CheckResult(passed=True, event=event, updates={})
 
         event = render_message(
             Msg.FILLER_KILLED,

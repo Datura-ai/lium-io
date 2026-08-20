@@ -1068,6 +1068,17 @@ class RentalVerificationMessages:
             "Contact Lium support if nothing on this host removes containers."
         ),
     )
+    FILLER_CONTAINER_EXITED = MessageTemplate(
+        event="Lium default job container exited on its own",
+        reason="FILLER_CONTAINER_EXITED",
+        severity="warning",
+        category="runtime",
+        impact="No penalty: the container is still on the host, so nobody removed it",
+        remediation=(
+            "The Lium default job stopped by itself on this machine. Check the container's exit "
+            "code and logs; incentive is unaffected."
+        ),
+    )
     FILLER_STATE_UNKNOWN = MessageTemplate(
         event="Lium default job state could not be verified",
         reason="FILLER_STATE_UNKNOWN",
