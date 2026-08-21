@@ -132,6 +132,11 @@ class GpuUsageCheck:
         node would then be judged as hiding a workload. The verdict comes from the card itself,
         the same rule the ghost-GPU path above follows. Fail-open on any error: an unreadable
         card is an inability to measure, which never withholds money.
+
+        The two readings are not the same number: the scrape's NVML figure includes the
+        driver-reserved block and `nvidia-smi memory.used` does not (measured on an A6000:
+        1899 vs 1299 MB). Both are compared against the same floor, which makes this
+        confirmation the stricter of the two — deliberately, since it only ever withholds.
         """
         try:
             gpu_query, compute_apps = await asyncio.gather(
