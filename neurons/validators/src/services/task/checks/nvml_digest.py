@@ -44,6 +44,10 @@ class NvmlDigestCheck:
                         "actual_md5": lib_digest,
                     },
                 )
+                # DAH-2742: no clear_verified_job_info. An unrecognized driver only means the
+                # digest map has not caught up with a newer NVIDIA release, and the reactive
+                # report above already refers it to the backend. Tampering is DIGEST_MISMATCH.
+                updates = {}
             else:
                 # Driver is known but digest doesn't match - possible tampering
                 event = render_message(
@@ -56,10 +60,11 @@ class NvmlDigestCheck:
                         "actual_md5": lib_digest,
                     },
                 )
+                updates = {"clear_verified_job_info": True}
             return CheckResult(
                 passed=False,
                 event=event,
-                updates={"clear_verified_job_info": True},
+                updates=updates,
             )
 
         event = render_message(

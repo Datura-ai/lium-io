@@ -36,10 +36,14 @@ class SysboxRequiredCheck:
                 check_id=self.check_id,
                 what={"sysbox_runtime": ctx.state.sysbox_runtime, "is_rented": is_rented},
             )
+            # DAH-2742: no clear_verified_job_info. The DinD probe is forced to False on ANY
+            # probe failure (executor_connectivity/orchestrator.py:78-83), not only on a genuinely
+            # missing runtime, so a transient miss must not flip the executor instantly. A real
+            # missing runtime fails every cycle and the stale-executor sweep deactivates it.
             return CheckResult(
                 passed=False,
                 event=event,
-                updates={"clear_verified_job_info": True},
+                updates={},
             )
 
         event = render_message(

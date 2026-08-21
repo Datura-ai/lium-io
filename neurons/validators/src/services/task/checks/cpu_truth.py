@@ -77,14 +77,10 @@ class CpuTruthCheck:
             # The check is non-fatal, so passed=False alone changes nothing in the pipeline, and
             # zeroing `score` here would be overwritten by ScoreCheck further down. The verdict
             # travels as a context flag that calculate_scores gates on, like the TDX one.
-            updates = (
-                {
-                    "cpu_truth_passed": False,
-                    "clear_verified_job_info": True,
-                }
-                if enforce
-                else {}
-            )
+            # DAH-2742: no clear_verified_job_info. The kernel-present read can race a
+            # measurement window inside CPU_TRUTH_MARGIN_CORES, so an instant flip on a benign
+            # race is not warranted; a real understatement fails every cycle.
+            updates = {"cpu_truth_passed": False} if enforce else {}
             return CheckResult(passed=not enforce, event=event, updates=updates)
 
         event = render_message(Msg.CPU_OK, ctx=ctx, check_id=self.check_id, what=what)

@@ -28,14 +28,14 @@ def _rented_data() -> RentedExecutorsResponse:
 
 @pytest.mark.asyncio
 async def test_no_sysbox_unrented_fails(context_factory):
-    """Unrented executor without sysbox is rejected and its verification is cleared."""
+    """Unrented executor without sysbox is rejected, but its verification is NOT cleared."""
     ctx = context_factory(state=build_state(sysbox_runtime=False))
 
     result = await SysboxRequiredCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
-    assert result.updates["clear_verified_job_info"] is True
+    assert "clear_verified_job_info" not in result.updates
 
 
 @pytest.mark.asyncio

@@ -312,7 +312,7 @@ class NvmlDigestMessages:
         reason="NVML_DRIVER_UNKNOWN",
         severity="error",
         category="env",
-        impact="Score set to 0; previous verification cleared",
+        impact="Score set to 0 for this cycle; the previous verification is kept",
         remediation="Update to a supported NVIDIA driver version. Your current driver version is not recognized.",
     )
     DIGEST_OK = MessageTemplate(
@@ -410,7 +410,7 @@ class SysboxRequiredMessages:
         reason="SYSBOX_REQUIRED_MISSING",
         severity="warning",
         category="policy",
-        impact="Score set to 0; verification cleared; executor kept off the network",
+        impact="Score set to 0 for this cycle; the previous verification is kept; repeated failures take the executor off the network",
         remediation="Install the sysbox runtime; unrented machines without sysbox are not allowed on the network.",
     )
     SYSBOX_OK = MessageTemplate(
