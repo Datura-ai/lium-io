@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from core.config import settings
 from services.const import (
+    FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
@@ -102,7 +103,17 @@ class GpuUsageCheck:
         ]
 
         if foreign_processes:
-            what = {"foreign_processes": foreign_processes, "process_count": len(gpu_processes)}
+            what = {
+                "foreign_processes": foreign_processes,
+                "process_count": len(gpu_processes),
+                # Review ask (PR #1242): the backend can start a filler AFTER this cycle's
+                # rented_data snapshot. Such a container carries our own prefix but is absent
+                # from the allowlist, so it reads as foreign. Count it separately, so the
+                # shadow week measures how often that race happens before enforcement goes on.
+                "lium_named_outside_snapshot": [
+                    process for process in foreign_processes if _carries_a_lium_prefix(process)
+                ],
+            }
             template = Msg.FOREIGN_PROCESS
         elif held_vram := _held_vram_without_owner(gpu_details, gpu_processes, workload_containers):
             if not await self._card_still_holds_vram_with_no_owner(ctx, held_vram):
@@ -319,6 +330,12 @@ def _parse_gpu_memory_used_mb(gpu_query_csv: str) -> dict[str, float]:
         except ValueError:
             continue
     return memory_by_uuid
+
+
+def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
+    """The container is named like one of ours, but the backend did not report it this cycle."""
+    container_name: str = process.container_name or ""
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
 
 
 def _runs_in_the_executors_own_cgroup(process: dict) -> bool:

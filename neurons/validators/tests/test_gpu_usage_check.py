@@ -682,3 +682,26 @@ async def test_failed_live_query_never_withholds(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_filler_started_after_the_snapshot_is_counted_separately(context_factory):
+    # Review ask (PR #1242): the backend can start a filler after this cycle's rented_data
+    # snapshot. It still reads as foreign, but the shadow week must be able to count the case.
+    late_filler = "filler_9622d623-dcb3-27dc-52c6-ef6c937df3ae"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [
+            {"pid": 111, "info": "0::/../docker-a.scope", "container_name": late_filler},
+            {"pid": 222, "info": "0::/../docker-b.scope", "container_name": "nodexo-rental-1cd1ba2b"},
+        ],
+        fillers=[FILLER],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    seen = result.event.what_we_saw
+    assert [p.container_name for p in seen["foreign_processes"]] == [late_filler, "nodexo-rental-1cd1ba2b"]
+    assert [p.container_name for p in seen["lium_named_outside_snapshot"]] == [late_filler]
