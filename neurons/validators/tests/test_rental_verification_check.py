@@ -475,9 +475,13 @@ class FillerSSHClient:
         dead_containers: set[str] | None = None,
         unreachable_containers: set[str] | None = None,
         removed_from_host: bool = True,
+        exit_code: int = 255,
+        oom_killed: bool = False,
     ):
         # True = `docker inspect` says "No such object" (a removal); False = still there, exited.
         self.removed_from_host = removed_from_host
+        self.exit_code = exit_code
+        self.oom_killed = oom_killed
         self.running = running
         self.exit_status = exit_status
         self.raise_on_run = raise_on_run
@@ -506,7 +510,8 @@ class FillerSSHClient:
                 result.stderr = f"Error: No such object: {command.split()[-1]}"
             else:
                 result.stdout = (
-                    '{"Status": "exited", "ExitCode": 255, "OOMKilled": false,'
+                    f'{{"Status": "exited", "ExitCode": {self.exit_code},'
+                    f' "OOMKilled": {str(self.oom_killed).lower()},'
                     ' "Error": "error while mounting volume", "StartedAt": "2026-08-18T06:45:54Z",'
                     ' "FinishedAt": "2026-08-18T22:44:30Z"}'
                 )
@@ -1282,6 +1287,72 @@ async def test_filler_that_exited_on_the_host_is_not_a_kill():
     assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
     assert result.event.what_we_saw["container_exit_code"] == 255
     assert result.event.what_we_saw["container_status"] == "exited"
+
+
+@pytest.mark.asyncio
+async def test_filler_terminated_by_a_signal_is_a_kill():
+    """Exit 143 = SIGTERM, i.e. `docker stop`. Fillers carry `restart: unless-stopped`, so a
+    container that is still exited was stopped deliberately — the restart policy would have brought
+    back anything else. Prod: all 4 such runs in 7 days came from the one host with a container
+    auto-killer."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=143)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_STOPPED_BY_HOST.reason
+    assert result.event.what_we_saw["container_exit_code"] == 143
+
+
+@pytest.mark.asyncio
+async def test_filler_killed_by_sigkill_is_a_kill():
+    """Exit 137 = SIGKILL from outside the container."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=137)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_STOPPED_BY_HOST.reason
+
+
+@pytest.mark.asyncio
+async def test_out_of_memory_kill_is_not_a_host_kill():
+    """Same exit 137, but the kernel reclaimed memory — the host did not choose to stop the job."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(
+        running=False, removed_from_host=False, exit_code=137, oom_killed=True
+    )
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
+
+
+@pytest.mark.asyncio
+async def test_signal_killed_bundle_outranks_a_healthy_sibling_on_a_split_node():
+    """A stopped bundle must decide the node even when its siblings are fine (DAH-2465)."""
+    backend_client = _killed_filler_backend()
+    healthy_container = "filler_11111111-2222-3333-4444-555555555555"
+    stopped_container = "filler_99999999-8888-7777-6666-555555555555"
+    ssh_client = FillerSSHClient(
+        dead_containers={stopped_container}, removed_from_host=False, exit_code=143
+    )
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=ssh_client,
+        filler_containers=[healthy_container, stopped_container],
+    )
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_STOPPED_BY_HOST.reason
 
 
 @pytest.mark.asyncio

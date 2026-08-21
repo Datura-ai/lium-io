@@ -8,7 +8,11 @@ import asyncssh
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from core.docker_utils import DockerCommand, collect_container_death_diagnostics
+from core.docker_utils import (
+    ContainerDeathDiagnostics,
+    DockerCommand,
+    collect_container_death_diagnostics,
+)
 from protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
     GPU_RUNTIME_DEVICE_FAULT_REASON,
@@ -58,8 +62,28 @@ _DOCKER_STATUS_REMOVING = "removing"
 _DOCKER_STATUS_EXITED = "exited"
 _DOCKER_STATES_PROVING_NO_DEATH = frozenset({"running", "created", "restarting", "paused", "dead"})
 
+# Docker reports 128 + signal number when something outside the container terminated its PID 1:
+# `docker stop` sends SIGTERM (143), `docker kill` sends SIGKILL (137). A job that died on its own
+# exits with the code its own process chose, never with these.
+_EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL = frozenset({137, 143})
+
+
+def _was_deliberately_stopped_on_the_host(diagnostics: ContainerDeathDiagnostics) -> bool:
+    """Whether someone on the host terminated the filler rather than the job dying by itself.
+
+    Fillers run with `restart: unless-stopped`, so anything that merely killed the process would be
+    back up by the next probe; a container still sitting in `exited` after an external signal was
+    stopped on purpose. An out-of-memory kill carries the same exit code but is the kernel
+    reclaiming memory, not a choice the host made, so it is excluded.
+    """
+    if diagnostics.exit_code not in _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL:
+        return False
+    return not diagnostics.oom_killed
+
 _FILLER_VERDICT_SEVERITY: dict[str, int] = {
     Msg.FILLER_KILLED.reason: 3,
+    # Removed or stopped, the node took the job down either way — same rank, same penalty.
+    Msg.FILLER_STOPPED_BY_HOST.reason: 3,
     Msg.FILLER_TRANSPORT_UNREACHABLE.reason: 2,
     Msg.FILLER_STATE_UNKNOWN.reason: 1,
     # DAH-2730: ranks with STATE_UNKNOWN — the node lost its job either way, and neither outcome
@@ -550,6 +574,16 @@ class RentalVerificationCheck:
                     ),
                     details=diagnostics.to_log_fields(),
                 )
+            if _was_deliberately_stopped_on_the_host(diagnostics):
+                event = render_message(
+                    Msg.FILLER_STOPPED_BY_HOST,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    severity=None if enforce else "warning",
+                    impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
+                    what={**what_we_saw, "enforced": enforce},
+                )
+                return CheckResult(passed=not enforce, event=event, updates={})
             event = render_message(
                 Msg.FILLER_CONTAINER_EXITED,
                 ctx=ctx,
