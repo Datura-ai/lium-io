@@ -390,12 +390,14 @@ class RentalVerificationCheck:
                 "details": details,
             },
         )
+        # DAH-2742: no clear_verified_job_info. Zeroing the score already fails the cycle, and a
+        # host that really overstates its cores fails every cycle, so the ordinary stale-executor
+        # sweep deactivates it without an instant flip.
         updates = (
             {
                 "score": 0.0,
                 "job_score": 0.0,
                 "score_warning": "Advertised CPU cores exceed the host's physical cores",
-                "clear_verified_job_info": True,
             }
             if enforce
             else {}

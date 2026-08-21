@@ -1079,7 +1079,7 @@ async def test_cpu_quota_verdict_zeroes_score_under_enforcement():
     assert result.event.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON
     assert result.updates["score"] == 0.0
     assert result.updates["job_score"] == 0.0
-    assert result.updates["clear_verified_job_info"] is True
+    assert "clear_verified_job_info" not in result.updates
 
 
 @pytest.mark.asyncio
