@@ -310,9 +310,6 @@ class RentalVerificationCheck:
                     },
                     extra={"gpu_runtime_issue_code": response.reason_code},
                 )
-                # DAH-2742: no clear_verified_job_info. The backend health probe creates a real
-                # container and can lose that race transiently, so zeroing the score is warranted
-                # but an instant executor flip is not.
                 return CheckResult(
                     passed=False,
                     event=event,
@@ -320,6 +317,7 @@ class RentalVerificationCheck:
                         "score": 0.0,
                         "job_score": 0.0,
                         "score_warning": quarantine.score_warning,
+                        "clear_verified_job_info": True,
                     },
                 )
             else:
@@ -392,14 +390,12 @@ class RentalVerificationCheck:
                 "details": details,
             },
         )
-        # DAH-2742: no clear_verified_job_info. The docker --cpus verdict comes from a real
-        # container the probe has to win a race for, so zeroing the score is warranted but an
-        # instant executor flip on a transient loss is not.
         updates = (
             {
                 "score": 0.0,
                 "job_score": 0.0,
                 "score_warning": "Advertised CPU cores exceed the host's physical cores",
+                "clear_verified_job_info": True,
             }
             if enforce
             else {}

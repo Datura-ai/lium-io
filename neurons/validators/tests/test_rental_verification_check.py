@@ -193,7 +193,7 @@ async def test_rental_verification_failed():
 
 
 @pytest.mark.asyncio
-async def test_rental_verification_nvml_mismatch_quarantines_without_clearing_verified_job():
+async def test_rental_verification_nvml_mismatch_clears_verified_job_info():
     """Exact GPU runtime mismatch should mark the executor unhealthy."""
     stderr = (
         "docker: Error response from daemon: failed to create task for container: "
@@ -221,7 +221,7 @@ async def test_rental_verification_nvml_mismatch_quarantines_without_clearing_ve
     assert result.event.reason_code == GPU_RUNTIME_NVML_MISMATCH_REASON
     assert result.event.what_we_saw["source"] == "rental_verification"
     assert "failed to initialize NVML" in result.event.what_we_saw["stderr"]
-    assert "clear_verified_job_info" not in result.updates
+    assert result.updates["clear_verified_job_info"] is True
     assert "clear_verified_job_reason" not in result.updates
 
 
@@ -251,7 +251,7 @@ async def test_rental_verification_device_fault_quarantines_the_host_too():
     assert result.passed is False
     assert result.event.reason_code == GPU_RUNTIME_DEVICE_FAULT_REASON
     assert result.updates["score"] == 0.0
-    assert "clear_verified_job_info" not in result.updates
+    assert result.updates["clear_verified_job_info"] is True
     assert "unknown device" in result.event.what_we_saw["stderr"]
 
 
@@ -1079,7 +1079,7 @@ async def test_cpu_quota_verdict_zeroes_score_under_enforcement():
     assert result.event.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON
     assert result.updates["score"] == 0.0
     assert result.updates["job_score"] == 0.0
-    assert "clear_verified_job_info" not in result.updates
+    assert result.updates["clear_verified_job_info"] is True
 
 
 @pytest.mark.asyncio

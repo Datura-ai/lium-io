@@ -118,7 +118,7 @@ async def test_mismatch_fails_under_enforcement(context_factory):
     # The check is non-fatal and ScoreCheck runs after it, so the verdict travels as a context
     # flag calculate_scores gates on — see test_mismatch_zeroes_the_final_score.
     assert result.updates["cpu_truth_passed"] is False
-    assert "clear_verified_job_info" not in result.updates
+    assert result.updates["clear_verified_job_info"] is True
 
 
 @pytest.mark.asyncio
