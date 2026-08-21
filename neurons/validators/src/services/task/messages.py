@@ -714,6 +714,29 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
     )
+    FOREIGN_PROCESS = MessageTemplate(
+        event="Foreign GPU process on idle executor",
+        reason="GPU_FOREIGN_PROCESS",
+        severity="error",
+        category="runtime",
+        impact="Validation skipped; score set to 0",
+        remediation=(
+            "A GPU process outside Lium pod/filler containers is holding the card "
+            "(foreign container or bare host process). Stop all non-Lium GPU workloads "
+            "and re-run your node."
+        ),
+    )
+    VRAM_HELD = MessageTemplate(
+        event="VRAM held on idle executor with no visible owner",
+        reason="GPU_VRAM_HELD",
+        severity="error",
+        category="runtime",
+        impact="Validation skipped; score set to 0",
+        remediation=(
+            "GPU memory is occupied but no owning process is visible to the validator. "
+            "Free the VRAM (stop hidden or host-side GPU workloads) and re-run your node."
+        ),
+    )
     GPU_WEDGE_CURED = MessageTemplate(
         event="Ghost GPU cured in place",
         reason="GPU_WEDGE_CURED",
