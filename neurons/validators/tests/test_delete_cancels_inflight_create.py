@@ -7,6 +7,7 @@ the next paying rental.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -169,3 +170,50 @@ def test_a_second_create_does_not_clear_a_cancel_already_raised() -> None:
         inflight_creates.cancel(pod_id)
         with inflight_creates.track(pod_id):
             assert inflight_creates.is_cancelled(pod_id) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_at_once_when_no_create_runs() -> None:
+    """Nothing to wait for: the delete goes straight to its own teardown."""
+    pod_id = str(uuid4())
+
+    finished: bool = await inflight_creates.wait_until_done(pod_id, timeout=0.01)
+
+    assert finished is True
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_when_the_create_leaves() -> None:
+    """The delete holds until the cancelled create has torn itself down."""
+    pod_id = str(uuid4())
+
+    async def create() -> None:
+        with inflight_creates.track(pod_id):
+            await asyncio.sleep(0.05)
+
+    create_task: asyncio.Task[None] = asyncio.create_task(create())
+    await asyncio.sleep(0)  # let the create register itself
+
+    finished: bool = await inflight_creates.wait_until_done(pod_id, timeout=5)
+
+    assert finished is True
+    assert inflight_creates.is_running(pod_id) is False
+    await create_task
+
+
+@pytest.mark.asyncio
+async def test_wait_gives_up_on_a_create_that_does_not_stop() -> None:
+    """A create stuck between checkpoints must not hold the delete forever."""
+    pod_id = str(uuid4())
+
+    async def create() -> None:
+        with inflight_creates.track(pod_id):
+            await asyncio.sleep(5)
+
+    create_task: asyncio.Task[None] = asyncio.create_task(create())
+    await asyncio.sleep(0)
+
+    finished: bool = await inflight_creates.wait_until_done(pod_id, timeout=0.05)
+
+    assert finished is False
+    create_task.cancel()

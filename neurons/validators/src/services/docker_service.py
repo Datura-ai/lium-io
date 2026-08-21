@@ -10,7 +10,7 @@ import secrets
 import shlex
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID, uuid4
@@ -387,6 +387,7 @@ class _InflightCreate:
     # entry outlives any single one of them and only the last to leave clears it.
     running: int = 0
     cancelled_by_delete: bool = False
+    done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class _InflightCreateRegistry:
@@ -412,6 +413,7 @@ class _InflightCreateRegistry:
             create.running -= 1
             if create.running <= 0:
                 self._creates_by_pod_id.pop(pod_id, None)
+                create.done.set()
 
     def cancel(self, pod_id: str) -> bool:
         """Flag the in-flight create for this pod. False when no create is running."""
@@ -428,10 +430,26 @@ class _InflightCreateRegistry:
     def is_running(self, pod_id: str) -> bool:
         return pod_id in self._creates_by_pod_id
 
+    async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
+        """Wait for the create(s) on this pod to leave. False when the wait ran out."""
+        create = self._creates_by_pod_id.get(pod_id)
+        if create is None:
+            return True
+        try:
+            await asyncio.wait_for(create.done.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
 
 # In-process: a pod's create and delete are driven by the same validator event loop. Move it to
 # Redis if the two ever land in different processes.
 inflight_creates = _InflightCreateRegistry()
+
+# How long a delete waits for the create it just cancelled. The create reads the flag at its next
+# checkpoint, and the only checkpoint gap that can orphan a container is the short one before
+# `docker run` — a pull-length wait would hold the customer's delete for nothing.
+CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS = 30.0
 
 
 def _is_missing_docker_container_error(exc: Exception) -> bool:
@@ -5803,6 +5821,14 @@ class DockerService:
         # refuses cannot kill a healthy create.
         if inflight_creates.cancel(payload.pod_id):
             log.info("Cancelled the in-flight create for this pod")
+            # Let the create finish tearing itself down before this teardown runs, so the last
+            # actor on the host is never a create that ran after we answered "deleted". On timeout
+            # we tear the container down ourselves, which is what this delete did before DAH-2728.
+            create_aborted = await inflight_creates.wait_until_done(
+                payload.pod_id, CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS
+            )
+            if not create_aborted:
+                log.warning("The cancelled create is still running; deleting without it")
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
