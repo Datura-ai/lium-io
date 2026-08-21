@@ -12,8 +12,8 @@ class SysboxRequiredCheck:
 
     DAH-2313: sysbox is required to be allowed on the network. A machine that has no sysbox
     AND is not currently rented is rejected here (fatal) so the pipeline halts before scoring
-    and the executor is reported with a zero score / cleared verification. Already-rented
-    no-sysbox machines are left untouched so live rentals are never disrupted.
+    and the executor is reported with a zero score. Already-rented no-sysbox machines are left
+    untouched so live rentals are never disrupted.
     """
 
     check_id = "executor.validate.sysbox_required"
@@ -36,15 +36,10 @@ class SysboxRequiredCheck:
                 check_id=self.check_id,
                 what={"sysbox_runtime": ctx.state.sysbox_runtime, "is_rented": is_rented},
             )
-            # DAH-2742: no clear_verified_job_info. The DinD probe is forced to False on ANY
-            # probe failure (executor_connectivity/orchestrator.py:78-83), not only on a genuinely
-            # missing runtime, so a transient miss must not flip the executor instantly. A real
-            # missing runtime fails every cycle and the stale-executor sweep deactivates it.
-            return CheckResult(
-                passed=False,
-                event=event,
-                updates={},
-            )
+            # DAH-2742: the verification is deliberately kept. ConnectivityOrchestrator.verify
+            # forces sysbox_runtime=False whenever the DinD probe fails at all, not only on a
+            # genuinely missing runtime, so a transient miss must not flip the executor instantly.
+            return CheckResult(passed=False, event=event)
 
         event = render_message(
             Msg.SYSBOX_OK,

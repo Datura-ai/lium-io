@@ -77,9 +77,8 @@ class CpuTruthCheck:
             # The check is non-fatal, so passed=False alone changes nothing in the pipeline, and
             # zeroing `score` here would be overwritten by ScoreCheck further down. The verdict
             # travels as a context flag that calculate_scores gates on, like the TDX one.
-            # DAH-2742: no clear_verified_job_info. The verdict still zeroes the score through
-            # cpu_truth_passed, and a host that really understates its cores fails every cycle, so
-            # the ordinary stale-executor sweep deactivates it without an instant flip.
+            # DAH-2742: the verification is deliberately kept — a host that really overstates its
+            # cores fails every cycle and the stale-executor sweep deactivates it anyway.
             updates = {"cpu_truth_passed": False} if enforce else {}
             return CheckResult(passed=not enforce, event=event, updates=updates)
 

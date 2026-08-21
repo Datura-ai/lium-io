@@ -367,8 +367,9 @@ class RentalVerificationCheck:
         """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.
 
         Shadow (enforcement off) logs the verdict as a warning and keeps passed=True so scoring is
-        unchanged; enforcement zeroes the score and clears the verified job, the same quarantine the
-        GPU runtime faults use.
+        unchanged; enforcement zeroes the score. DAH-2742: unlike the GPU runtime quarantine, the
+        previous verification is kept — a host that really overstates its cores fails every cycle
+        and the stale-executor sweep deactivates it without an instant flip.
         """
         enforce = settings.RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED
         details = response.details or {}
@@ -390,9 +391,6 @@ class RentalVerificationCheck:
                 "details": details,
             },
         )
-        # DAH-2742: no clear_verified_job_info. Zeroing the score already fails the cycle, and a
-        # host that really overstates its cores fails every cycle, so the ordinary stale-executor
-        # sweep deactivates it without an instant flip.
         updates = (
             {
                 "score": 0.0,
