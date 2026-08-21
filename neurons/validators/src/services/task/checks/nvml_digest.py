@@ -33,7 +33,8 @@ class NvmlDigestCheck:
                 # have never seen against NVIDIA's official installer. Skip versions already
                 # confirmed as spoofs so we don't re-report a known-invalid driver.
                 invalid_drivers = ctx.config.nvml_invalid_drivers or []
-                if driver_version not in invalid_drivers:
+                confirmed_spoof = driver_version in invalid_drivers
+                if not confirmed_spoof:
                     await ctx.services.backend.report_unknown_driver(driver_version)
                 event = render_message(
                     Msg.DRIVER_UNKNOWN,
@@ -44,10 +45,12 @@ class NvmlDigestCheck:
                         "actual_md5": lib_digest,
                     },
                 )
-                # DAH-2742: no clear_verified_job_info. An unrecognized driver only means the
-                # digest map has not caught up with a newer NVIDIA release, and the reactive
-                # report above already refers it to the backend. Tampering is DIGEST_MISMATCH.
-                updates = {}
+                # DAH-2742: an unrecognized driver only means the digest map has not caught up
+                # with a newer NVIDIA release, and the reactive report above already refers it to
+                # the backend, so it waits out the ordinary four-strike path instead of flipping
+                # the executor instantly. A driver the backend already confirmed as a spoof is a
+                # hard fact and keeps the instant reset, like DIGEST_MISMATCH.
+                updates = {"clear_verified_job_info": True} if confirmed_spoof else {}
             else:
                 # Driver is known but digest doesn't match - possible tampering
                 event = render_message(

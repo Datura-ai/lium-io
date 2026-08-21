@@ -139,6 +139,9 @@ async def test_known_spoof_driver_is_not_reported(context_factory):
 
     assert result.event.reason_code == Msg.DRIVER_UNKNOWN.reason
     services.backend.report_unknown_driver.assert_not_awaited()
+    # DAH-2742: a confirmed spoof is a hard fact, so it keeps the instant reset that an
+    # unrecognized-but-innocent driver no longer gets.
+    assert result.updates["clear_verified_job_info"] is True
 
 
 @pytest.mark.asyncio
