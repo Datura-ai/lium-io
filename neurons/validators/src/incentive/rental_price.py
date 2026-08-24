@@ -568,9 +568,8 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _merge_partially_rented_split_results(split_portions: list[_PartiallyRentedSplitPortions]) -> None:
-        # Fold the free portion back into the executor's single result: full gpu_count restored,
-        # incentives summed (miner_incentives already accumulated both during post-processing),
-        # both pools' calculation logs kept for the miner.
+        # miner_incentives already accumulated both portions during post-processing, so summing
+        # here only restores the per-executor view the downstream consumers read.
         for portions in split_portions:
             portions.rented_portion.gpu_count += portions.free_portion.gpu_count
             portions.rented_portion.incentive = (portions.rented_portion.incentive or 0.0) + (
