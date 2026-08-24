@@ -35,6 +35,7 @@ from services.rental_docker_sdk import (
 )
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    ContainerCreated,
     ContainerCreateRequest,
     CustomOptions,
     ContainerDeleteRequest,
@@ -86,6 +87,7 @@ class _FakeRentalDockerClient:
         self.created_volumes = []
         self.removed_volumes = []
         self.pruned_images = 0
+        self.login_error = None
         self.pull_error = None
         self.run_error = None
         self.start_error = None
@@ -94,8 +96,10 @@ class _FakeRentalDockerClient:
         self.remove_volume_error = None
         self.prune_images_error = None
 
-    async def login(self, *, username: str, password: str) -> None:
-        self.login_calls.append({"username": username, "password": password})
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        self.login_calls.append({"username": username, "password": password, "image": image})
+        if self.login_error is not None:
+            raise self.login_error
 
     async def image_exists(self, *, image: str) -> bool:
         self.inspected_images.append(image)
@@ -3419,10 +3423,103 @@ async def test_create_container_reports_docker_pull_failure_step(
     )
 
 
+def _private_registry_create_payload() -> ContainerCreateRequest:
+    return ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="registry.digitalocean.com/team/app:1.0",
+        docker_username="team-user",
+        docker_password="team-secret",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_container_reports_docker_login_failure_step_when_pull_also_fails(
+    docker_service,
+    monkeypatch,
+):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+    )
+    docker_client.pull_error = Exception("blocked")
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_login"
+    assert (
+        "earlier login failure: Docker SDK login for registry.digitalocean.com failed: unauthorized"
+        in result.detail
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_container_login_failure_does_not_block_successful_pull(
+    docker_service,
+    monkeypatch,
+):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        "Docker SDK login for registry.digitalocean.com failed: unauthorized"
+    )
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated)
+    assert docker_client.pulled_images == [payload.docker_image]
+
+
 @pytest.mark.asyncio
 async def test_create_container_reports_set_environment_failure_step(
     docker_service,
     monkeypatch,
+    caplog,
 ):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
@@ -3469,7 +3566,7 @@ async def test_create_container_reports_set_environment_failure_step(
     monkeypatch.setattr(
         docker_service,
         "add_environment_variables_with_rental_docker",
-        AsyncMock(return_value=False),
+        AsyncMock(return_value="exit_status=1; stderr=cannot write /etc/environment; stdout="),
     )
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
     monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
@@ -3503,15 +3600,21 @@ async def test_create_container_reports_set_environment_failure_step(
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
-    result = await docker_service.create_container(
-        payload=payload,
-        executor_info=executor_info,
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
+    with caplog.at_level(logging.ERROR, logger="services.docker_service"):
+        result = await docker_service.create_container(
+            payload=payload,
+            executor_info=executor_info,
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "set_environment"
+    # the logged cause is what lium-stats classifies, so the bare wrapper must not swallow it
+    failure_extra = next(
+        record.msg.extra for record in caplog.records if str(record.msg) == "Failed create_container"
+    )
+    assert "cannot write /etc/environment" in failure_extra["error"]
     docker_service.redis_service.add_rented_pod.assert_not_awaited()
     docker_service.redis_service.remove_pending_pod.assert_awaited_once_with(
         payload.miner_hotkey,
@@ -6113,3 +6216,105 @@ async def test_recover_pod_reports_failure_when_start_raises(docker_service, mon
     # the container may already be up with no plaintext mount, and no later cycle revisits a
     # running pod — put it back down so POD_NOT_RUNNING keeps matching what the customer sees
     assert "docker stop pod_pod-1" in ssh_client.run.await_args.args[0]
+
+
+# DAH-2703: a create that fails because the container was removed from the host mid-creation is
+# reported with its own error code, so the backend can count host kills separately from ordinary
+# create failures.
+
+
+def _filler_create_payload() -> ContainerCreateRequest:
+    return ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        docker_image="daturaai/pearl-miner:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+
+def _filler_executor_info(payload: ContainerCreateRequest) -> ExecutorSSHInfo:
+    return ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+
+@pytest.mark.parametrize(
+    "container_was_removed,expected_error_code",
+    [
+        (True, FailedContainerErrorCodes.ContainerVanished),
+        (False, FailedContainerErrorCodes.UnknownError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_create_failure_reports_a_container_removed_by_the_host(
+    docker_service, monkeypatch, container_was_removed, expected_error_code
+):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    # The container is created, then the next step finds it gone.
+    monkeypatch.setattr(
+        docker_service,
+        "add_ssh_public_keys_with_rental_docker",
+        AsyncMock(side_effect=RuntimeError("404 No such container")),
+    )
+    monkeypatch.setattr(
+        docker_service,
+        "cleanup_failed_container_creation",
+        AsyncMock(return_value=container_was_removed),
+    )
+    payload = _filler_create_payload()
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == expected_error_code
+
+
+@pytest.mark.asyncio
+async def test_create_failure_before_the_container_exists_is_not_a_host_kill(
+    docker_service, monkeypatch
+):
+    """`docker run` itself failed: there was never a container, so "gone" proves nothing."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service,
+        "_run_rental_docker_create_with_port_retry",
+        AsyncMock(side_effect=RuntimeError("no such image")),
+    )
+    cleanup = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
+    payload = _filler_create_payload()
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    # The verdict must never cost us the cleanup itself — volumes and leftovers still go.
+    cleanup.assert_awaited_once()

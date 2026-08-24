@@ -1,13 +1,20 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 
+from core.config import settings
 from services.const import (
+    FILLER_CONTAINER_PREFIX,
+    GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     GPU_WEDGE_MEMORY_MAX,
     POD_CONTAINER_PREFIX,
 )
 from services.gpu_wedge import (
+    COMPUTE_APPS_QUERY_COMMAND,
+    GPU_QUERY_COMMAND,
+    NVIDIA_SMI_QUERY_TIMEOUT_SECONDS,
     GpuCureOutcome,
     cure_wedged_gpus,
     matches_wedge_utilization,
@@ -19,6 +26,19 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ForeignGpuProcess:
+    pid: int | None
+    container_name: str | None
+    cgroup: str | None
+
+
+@dataclass(frozen=True)
+class HeldVram:
+    gpu_uuid: str | None
+    memory_used_mb: float
 
 
 @dataclass(frozen=True)
@@ -46,15 +66,122 @@ class GpuUsageCheck:
         if ghost_result is not None:
             return ghost_result
 
-        return self._judge_process_based_usage(ctx, gpu_details, gpu_processes)
+        return await self._judge_process_based_usage(ctx, gpu_details, gpu_processes)
 
-    def _judge_process_based_usage(
+    async def _judge_foreign_occupancy(
+        self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
+    ) -> CheckResult | None:
+        """Judge an idle card by WHO holds it, not by how hard it is being used (DAH-2735).
+
+        Competitor marketplaces (Nodexo/SN106) idle below the percentage limits on purpose: a
+        rental holding 22.4 GB at 0% load passes every utilization gate. The expected holders
+        come from the backend (`rented_data`), never from a container-name prefix — the whole
+        point of the ticket is a verdict `docker rename` cannot defeat. Shadow by default like
+        every other money-withholding gate: without FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
+        the verdict is logged, not scored. Returns None when the card is clean, leaving the
+        legacy verdict to the caller.
+        """
+        if not settings.FOREIGN_GPU_WORKLOAD_CHECK_ENABLED:
+            return None
+
+        # No backend truth this cycle means no allowlist to judge against — an inability to
+        # measure, which never withholds money here.
+        if ctx.state.rented_data is None:
+            return None
+
+        enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
+        workload_containers: set[str] = _lium_workload_containers(ctx)
+        foreign_processes: list[ForeignGpuProcess] = [
+            ForeignGpuProcess(
+                pid=process.get("pid"),
+                container_name=process.get("container_name"),
+                cgroup=process.get("info"),
+            )
+            for process in gpu_processes
+            if process.get("container_name") not in workload_containers
+            and not _runs_in_the_executors_own_cgroup(process)
+        ]
+
+        if foreign_processes:
+            what = {
+                "foreign_processes": foreign_processes,
+                "process_count": len(gpu_processes),
+                # Review ask (PR #1242): the backend can start a filler AFTER this cycle's
+                # rented_data snapshot. Such a container carries our own prefix but is absent
+                # from the allowlist, so it reads as foreign. Count it separately, so the
+                # shadow week measures how often that race happens before enforcement goes on.
+                "lium_named_outside_snapshot": [
+                    process for process in foreign_processes if _carries_a_lium_prefix(process)
+                ],
+            }
+            template = Msg.FOREIGN_PROCESS
+        elif held_vram := _held_vram_without_owner(gpu_details, gpu_processes, workload_containers):
+            if not await self._card_still_holds_vram_with_no_owner(ctx, held_vram):
+                return None
+            what = {"held_vram": held_vram}
+            template = Msg.VRAM_HELD
+        else:
+            return None
+
+        event = render_message(
+            template,
+            ctx=ctx,
+            check_id=self.check_id,
+            severity=None if enforce else "warning",
+            impact=None if enforce else "Shadow observation only: score was NOT changed",
+            what=what,
+        )
+        return CheckResult(passed=not enforce, event=event)
+
+    async def _card_still_holds_vram_with_no_owner(
+        self, ctx: Context, held_vram: list[HeldVram]
+    ) -> bool:
+        """Re-sample the live card before calling its memory ownerless.
+
+        The scrape reads NVML memory first and walks `/proc` after, so a GPU process that exits
+        in between leaves its memory figure behind with nothing to attribute it to — a clean
+        node would then be judged as hiding a workload. The verdict comes from the card itself,
+        the same rule the ghost-GPU path above follows. Fail-open on any error: an unreadable
+        card is an inability to measure, which never withholds money.
+
+        The two readings are not the same number: the scrape's NVML figure includes the
+        driver-reserved block and `nvidia-smi memory.used` does not (measured on an A6000:
+        1899 vs 1299 MB). Both are compared against the same floor, which makes this
+        confirmation the stricter of the two — deliberately, since it only ever withholds.
+        """
+        try:
+            gpu_query, compute_apps = await asyncio.gather(
+                ctx.runner.run(GPU_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False),
+                ctx.runner.run(COMPUTE_APPS_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False),
+            )
+            # A failed query returns empty stdout, which would otherwise read as "no owner".
+            if not gpu_query.success or not compute_apps.success:
+                return False
+            if compute_apps.stdout.strip():
+                return False
+
+            live_memory_mb: dict[str, float] = _parse_gpu_memory_used_mb(gpu_query.stdout)
+            if not live_memory_mb:
+                return False
+            return any(
+                live_memory_mb.get(held.gpu_uuid or "", 0) > GPU_HELD_VRAM_MB_LIMIT
+                for held in held_vram
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Live VRAM re-sample failed, not judging the card: %s", exc)
+            return False
+
+    async def _judge_process_based_usage(
         self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
     ) -> CheckResult:
         """The legacy guard: flag GPU load owned by live processes outside our workloads."""
         violation = _find_violation(gpu_details, gpu_processes)
 
         if violation is None:
+            foreign_result = await self._judge_foreign_occupancy(ctx, gpu_details, gpu_processes)
+            if foreign_result is not None:
+                return foreign_result
+
             event = render_message(
                 Msg.USAGE_OK,
                 ctx=ctx,
@@ -173,6 +300,76 @@ class GpuUsageCheck:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Ghost GPU detection failed, falling back to the usage guard: %s", exc)
             return None
+
+
+def _lium_workload_containers(ctx: Context) -> set[str]:
+    """This node's fillers and pods, as the BACKEND knows them — not as the node names them.
+
+    A container-name prefix would hand a pass to anything the provider renames `filler_*`,
+    and the ticket's whole requirement is a verdict `docker rename` cannot defeat.
+    """
+    rented_data = ctx.state.rented_data
+    containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
+    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    if rented_executor:
+        containers.update(pod.container_name for pod in rented_executor.pods)
+    containers.discard("")
+    return containers
+
+
+def _parse_gpu_memory_used_mb(gpu_query_csv: str) -> dict[str, float]:
+    """uuid -> memory.used MiB, from GPU_QUERY_COMMAND's `uuid, utilization, memory.used` rows."""
+    memory_by_uuid: dict[str, float] = {}
+    for line in gpu_query_csv.strip().splitlines():
+        parts: list[str] = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        gpu_uuid, _utilization, memory_raw = parts
+        try:
+            memory_by_uuid[gpu_uuid] = float(memory_raw)
+        except ValueError:
+            continue
+    return memory_by_uuid
+
+
+def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
+    """The container is named like one of ours, but the backend did not report it this cycle."""
+    container_name: str = process.container_name or ""
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+
+
+def _runs_in_the_executors_own_cgroup(process: dict) -> bool:
+    """True when the process shares the cgroup namespace of the scrape — i.e. it is the executor.
+
+    The scrape reads `/proc/<pid>/cgroup` from inside the executor container, so anything
+    living elsewhere escapes that namespace and reads as `0::/../docker-<id>.scope` (another
+    container) or `0::/../../user.slice/...` (a host process); every one of the 692 GPU
+    processes on the prod fleet has that shape. The executor's own GPU work — a VerifyX run
+    the validator starts over SSH, which can outlive its command timeout — reads as a plain
+    `0::/…` instead, and carries no container id for the scrape to resolve a name from.
+    """
+    cgroup: str = process.get("info") or ""
+    return bool(cgroup) and ".." not in cgroup
+
+
+def _held_vram_without_owner(
+    gpu_details: list[dict], gpu_processes: list[dict], workload_containers: set[str]
+) -> list[HeldVram]:
+    """VRAM held above the driver-reserve floor while no process is visible to account for it.
+
+    A node running one of our GPU containers is exempt: NVML sometimes returns no processes at
+    all on a node whose filler is demonstrably working (seen in prod at 34% GPU utilization).
+
+    ponytail: node-level, not per-GPU — the scrape does not record which GPU a PID sits on;
+    record the GPU uuid in get_gpu_processes if per-card attribution ever matters.
+    """
+    if gpu_processes or workload_containers:
+        return []
+    return [
+        HeldVram(gpu_uuid=detail.get("uuid"), memory_used_mb=detail.get("memory_used_mb") or 0)
+        for detail in gpu_details
+        if (detail.get("memory_used_mb") or 0) > GPU_HELD_VRAM_MB_LIMIT
+    ]
 
 
 def _find_violation(gpu_details: list[dict], gpu_processes: list[dict]) -> dict | None:

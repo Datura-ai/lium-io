@@ -110,6 +110,11 @@ UNRENTED_MULTIPLIER = 1
 GPU_UTILIZATION_LIMIT = 5  # percent
 GPU_MEMORY_UTILIZATION_LIMIT = 5  # percent
 
+# DAH-2735: NVML memory-utilization is bus load, not VRAM fill — a foreign rental holding
+# 22 GB at idle reads ~0%. Judge held VRAM in absolute MB instead; the floor sits above the
+# driver-reserved block NVML counts (measured up to 728 MB on B200).
+GPU_HELD_VRAM_MB_LIMIT = 2048
+
 # DAH-2427 ghost GPU: an orphaned CUDA kernel left by a hard-killed GPU process pins the
 # card at full utilization with no memory and no process attached (observed for days on
 # RTX PRO 6000 nodes). The "no memory" half is expressed in whichever unit each data source

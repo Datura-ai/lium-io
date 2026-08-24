@@ -5,7 +5,7 @@ import time
 from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient
-from clients.subtensor_client import SubtensorClient
+from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
 from incentive.eligibility import is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
@@ -161,8 +161,18 @@ class Validator:
                 ),
             )
 
-            # fetch miners
-            miners = await self.subtensor_client.get_miners()
+            try:
+                miners = await self.subtensor_client.get_miners()
+            except ProviderPortalDataUnavailable as exc:
+                logger.error(
+                    _m(
+                        "[sync] No reliable provider snapshot, skipping iteration",
+                        extra=get_extra_info(
+                            {**self.default_extra, "error": str(exc)}
+                        ),
+                    )
+                )
+                return
 
             try:
                 if await self.subtensor_client.should_set_weights():

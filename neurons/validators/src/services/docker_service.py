@@ -97,6 +97,7 @@ from services.rental_docker_sdk import (
     DeviceMount,
     PortBinding,
     RentalDockerConnectionError,
+    RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
@@ -1336,6 +1337,7 @@ class DockerService:
         log_extra: dict = {},
         timeout: int = 0,
         raise_exception: bool = True,
+        stdin_data: str | None = None,
     ) -> tuple[bool, str]:
         logger.info(
             _m(
@@ -1354,6 +1356,9 @@ class DockerService:
         error = ''
         try:
             async with ssh_client.create_process(command) as process:
+                if stdin_data is not None:
+                    process.stdin.write(stdin_data)
+                    process.stdin.write_eof()
                 if timeout != 0:
                     status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
                 else:
@@ -2040,16 +2045,23 @@ class DockerService:
         container_name: str,
         volume_name: str | None = None,
         remove_volume: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Remove the failed container's artifacts; report whether it was already gone.
+
+        DAH-2703: unproven cases (SSH dead, diagnostics failed) report False — never accuse a host
+        on missing evidence.
+        """
+        container_missing = False
         try:
             # DAH-2395: read the death evidence before `rm -fv` destroys it —
             # without this line, "why did the container die" (OOM vs entrypoint
             # crash) is unanswerable: the host is the miner's, not ours.
-            await self.capture_failed_container_diagnostics(
+            diagnostics = await self.capture_failed_container_diagnostics(
                 ssh_client=ssh_client,
                 default_extra=default_extra,
                 container_name=container_name,
             )
+            container_missing = diagnostics.container_missing
 
             container = shlex.quote(container_name)
             await retry_ssh_command(
@@ -2081,6 +2093,7 @@ class DockerService:
                 ),
                 exc_info=True,
             )
+        return container_missing
 
     async def _image_has_encrypted_volume_label(
         self,
@@ -2693,13 +2706,14 @@ class DockerService:
         environment: dict[str, str] | None,
         log_tag: str,
         log_extra: dict,
-    ) -> bool:
+    ) -> str | None:
+        # returns the failure cause, or None when the environment was applied
         exec_spec = build_environment_exec_spec(
             container_name=container_name,
             environment=environment,
         )
         if exec_spec is None:
-            return True
+            return None
 
         try:
             result = await exec_logged_rental_docker_sdk_operation(
@@ -2721,7 +2735,7 @@ class DockerService:
                 ),
                 exc_info=True,
             )
-            return False
+            return str(exc)
 
         if result.exit_status != 0:
             await self.stream_log(
@@ -2741,9 +2755,9 @@ class DockerService:
                     }),
                 )
             )
-            return False
+            return f"exit_status={result.exit_status}; stderr={result.stderr}; stdout={result.stdout}"
 
-        return True
+        return None
 
     async def resolve_sysbox_subuid_base(
         self,
@@ -2959,8 +2973,8 @@ class DockerService:
             )
 
             command = (
-                f"/usr/bin/docker exec -u 0 {container_q} sh -c "
-                f"{shlex.quote(f'{script_q} --password={jupyter_token} --port={jupyter_port}')}"
+                f"/usr/bin/docker exec -i -u 0 {container_q} sh -c "
+                f"{shlex.quote(f'read JUPYTER_PASSWORD; {script_q} --password=$JUPYTER_PASSWORD --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2969,6 +2983,7 @@ class DockerService:
                 log_text="Running jupyter from volume",
                 log_extra=log_extra,
                 raise_exception=False,
+                stdin_data=f"{jupyter_token}\n",
             )
         else:
             target_path = local_volume_path if encrypted_local_volume else "/root"
@@ -3011,8 +3026,8 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec -u 0 {container_q} sh -c "
-                f"{shlex.quote(f'{target_q}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}')}"
+                f"/usr/bin/docker exec -i -u 0 {container_q} sh -c "
+                f"{shlex.quote(f'read JUPYTER_PASSWORD; {target_q}/run_jupyter.sh --password=$JUPYTER_PASSWORD --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -3021,6 +3036,7 @@ class DockerService:
                 log_text="Running jupyter",
                 log_extra=log_extra,
                 raise_exception=False,
+                stdin_data=f"{jupyter_token}\n",
             )
 
         # Only raise exception for actual errors, not warnings or info messages
@@ -3863,6 +3879,12 @@ class DockerService:
 
         log_tag = "container_creation"
         current_step = "start"
+        # DAH-2703: the container reached the host and then disappeared from it — the host-reaper
+        # signature. `container_created` keeps it honest: before `docker run` succeeds there is
+        # nothing to remove, so a missing container there is an ordinary create failure.
+        container_created = False
+        container_vanished = False
+        login_error: str | None = None
         volume_encryption_status = VolumeEncryptionStatus.DISABLED
 
         # DAH-2211: a custom-build payload carries `dockerfile_content` (may be
@@ -4068,8 +4090,9 @@ class DockerService:
                 # `ships_sshd` IS the "renter selected a default image" signal — the
                 # backend sets it from the same check that resolves the recommended image
                 # for this executor's GPU+driver (executor.py: `ships_sshd=is_cached`,
-                # with `is_cached=False` forced for custom builds, whose `FROM` may pull a
-                # private base image and so must keep the login). Don't re-derive it here:
+                # with `is_cached=False` forced for custom builds, so they keep this login
+                # path as-is; the DinD `docker build` never sees this SDK login, and
+                # passing credentials into it is a separate task). Don't re-derive it here:
                 # a second, validator-side notion of "is this a default image?" could
                 # disagree with the backend's and skip a login that was actually needed.
                 has_credentials = bool(payload.docker_username and payload.docker_password)
@@ -4091,11 +4114,13 @@ class DockerService:
                             call=lambda: docker_client.login(
                                 username=payload.docker_username,
                                 password=payload.docker_password,
+                                image=payload.docker_image,
                             ),
                             username_present=True,
                             username_len=len(payload.docker_username),
                         )
                     except Exception as exc:
+                        login_error = str(exc)
                         logger.warning(
                             _m(
                                 "Docker registry login failed",
@@ -4187,12 +4212,22 @@ class DockerService:
                             "success",
                             log_tag,
                         )
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="pull",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.pull(image=payload.docker_image),
-                            image=payload.docker_image,
-                        )
+                        try:
+                            await run_logged_rental_docker_sdk_operation(
+                                operation="pull",
+                                log_extra=default_extra,
+                                call=lambda: docker_client.pull(image=payload.docker_image),
+                                image=payload.docker_image,
+                            )
+                        except Exception as exc:
+                            if login_error is None:
+                                raise
+                            # docker-py pulls anonymously after a failed login, so the
+                            # pull failure is most likely the login's fault — attribute it
+                            current_step = "docker_login"
+                            raise RentalDockerOperationError(
+                                f"{exc} (earlier login failure: {login_error})"
+                            ) from exc
 
                         # Add profiler for docker pull
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
@@ -4569,6 +4604,7 @@ class DockerService:
                         log_tag=log_tag,
                     )
 
+                    container_created = True
                     logger.info("Container creation step finished")
 
                     # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
@@ -4623,13 +4659,14 @@ class DockerService:
 
                         raise Exception("Run docker run command but container is not running")
                 except Exception:
-                    await self.cleanup_failed_container_creation(
+                    container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                     )
+                    container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
                     if is_custom_build:
                         await self._cleanup_custom_build_artifacts(
@@ -4739,15 +4776,15 @@ class DockerService:
 
                     # add environment variables
                     current_step = "set_environment"
-                    environment_ok = await self.add_environment_variables_with_rental_docker(
+                    environment_error = await self.add_environment_variables_with_rental_docker(
                         docker_client=docker_client,
                         container_name=container_name,
                         environment=custom_options.environment if custom_options else None,
                         log_tag=log_tag,
                         log_extra=default_extra,
                     )
-                    if not environment_ok:
-                        raise RuntimeError("Failed to set environment variables")
+                    if environment_error:
+                        raise RuntimeError(f"Failed to set environment variables: {environment_error}")
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
@@ -4782,13 +4819,14 @@ class DockerService:
                     )
                     prev_timestamp = now_ms()
                 except Exception:
-                    await self.cleanup_failed_container_creation(
+                    container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                     )
+                    container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on post-run failure.
                     if is_custom_build:
                         await self._cleanup_custom_build_artifacts(
@@ -4904,7 +4942,11 @@ class DockerService:
                 msg=str(log_text),
                 detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
-                error_code=FailedContainerErrorCodes.UnknownError,
+                error_code=(
+                    FailedContainerErrorCodes.ContainerVanished
+                    if container_vanished
+                    else FailedContainerErrorCodes.UnknownError
+                ),
                 failure_step=current_step,
                 volume_encryption_status=(
                     VolumeEncryptionStatus.FAILED
@@ -5872,7 +5914,6 @@ class DockerService:
                         extra=get_extra_info({
                             **default_extra,
                             "container_name": payload.container_name,
-                            "jupyter_token": jupyter_token,
                             "jupyter_port": jupyter_port,
                         }),
                     ),

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -18,7 +20,13 @@ from storage.models import (
     StorageOperationSpec,
 )
 from storage.reporting import ReportingLeaseExpired, StorageEventReporter
-from storage.restic import JsonEventWriter, ResticOperationError, ResticStorageRunner, RestoreStats
+from storage.restic import (
+    JsonEventWriter,
+    ResticOperationError,
+    ResticStorageRunner,
+    RestoreStats,
+    StorageOperationCancelled,
+)
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
     DockerVolumeWorkspace,
@@ -92,6 +100,14 @@ def test_restore_requires_snapshot_id() -> None:
         StorageOperationSpec.from_mapping(payload)
 
 
+def test_restore_rejects_snapshot_id_options() -> None:
+    payload = _operation_payload(action="restore")
+    payload["snapshot_id"] = "--password-command=malicious-command"
+
+    with pytest.raises(OperationSpecError, match="hexadecimal restic snapshot ID"):
+        StorageOperationSpec.from_mapping(payload)
+
+
 def test_restore_missing_repository_never_initializes_it(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -110,7 +126,208 @@ def test_restore_missing_repository_never_initializes_it(
 
     assert raised.value.error_code == "RESTIC_REPOSITORY_MISSING"
     assert commands
+    assert commands[0][-4:] == ["snapshots", "--json", "--", SNAPSHOT_ID]
     assert all("init" not in command for command in commands)
+
+
+class _RetryClock:
+    def __init__(self) -> None:
+        self.now: float = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _repository_command_result(
+    exit_code: int,
+    *,
+    standard_output: str = "",
+    standard_error: str = "",
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=["restic"],
+        returncode=exit_code,
+        stdout=standard_output,
+        stderr=standard_error,
+    )
+
+
+class _RepositoryCommandSequence:
+    def __init__(self, responses: list[subprocess.CompletedProcess[str]]) -> None:
+        self.commands: list[list[str]] = []
+        self._responses: Iterator[subprocess.CompletedProcess[str]] = iter(responses)
+
+    def __call__(
+        self,
+        command: list[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        self.commands.append(command)
+        return next(self._responses)
+
+
+def test_backup_repository_probe_retries_transient_access_denied(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    clock = _RetryClock()
+    event_output = io.StringIO()
+    event_writer = JsonEventWriter(
+        str(OPERATION_ID),
+        0,
+        heartbeat_interval_seconds=1.0,
+        output=event_output,
+        clock=clock,
+    )
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path), event_writer=event_writer)
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(
+                1,
+                standard_error="Stat(<config/>) failed: Stat: Access Denied",
+            ),
+            _repository_command_result(10, standard_error="repository does not exist"),
+            _repository_command_result(0, standard_output="{}"),
+        ]
+    )
+
+    monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
+    monkeypatch.setattr("storage.restic.time.monotonic", clock)
+    monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
+    runner._ensure_repository_for_backup()
+
+    assert [command[2] for command in repository_command_sequence.commands] == [
+        "snapshots",
+        "snapshots",
+        "init",
+    ]
+    assert clock.now == 2.0
+    assert '"event":"heartbeat"' in event_output.getvalue()
+
+
+def test_backup_repository_initialization_retries_transient_access_denied(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    clock = _RetryClock()
+    repository_command_sequence = _RepositoryCommandSequence(
+        [
+            _repository_command_result(10, standard_error="repository does not exist"),
+            _repository_command_result(1, standard_error="S3 error: AccessDenied"),
+            _repository_command_result(1, standard_error="repository already initialized"),
+            _repository_command_result(0, standard_output="[]"),
+        ]
+    )
+
+    monkeypatch.setattr("storage.restic.subprocess.run", repository_command_sequence)
+    monkeypatch.setattr("storage.restic.time.monotonic", clock)
+    monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
+    runner._ensure_repository_for_backup()
+
+    assert [command[2] for command in repository_command_sequence.commands] == [
+        "snapshots",
+        "init",
+        "init",
+        "snapshots",
+    ]
+    assert clock.now == 2.0
+
+
+def test_backup_repository_retry_stops_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    clock = _RetryClock()
+    event_writer = JsonEventWriter(
+        str(OPERATION_ID),
+        0,
+        clock=clock,
+        cancellation_probe=lambda: clock.now >= 1.0,
+    )
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path), event_writer=event_writer)
+
+    monkeypatch.setattr(
+        "storage.restic.subprocess.run",
+        lambda *args, **kwargs: _repository_command_result(
+            1,
+            standard_error="Stat: Access Denied",
+        ),
+    )
+    monkeypatch.setattr("storage.restic.time.monotonic", clock)
+    monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
+    with pytest.raises(StorageOperationCancelled, match="cancellation requested"):
+        runner._ensure_repository_for_backup()
+
+    assert clock.now == 1.0
+
+
+def test_backup_repository_retry_exhaustion_preserves_redacted_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    clock = _RetryClock()
+    run_repository_command = MagicMock(
+        return_value=_repository_command_result(
+            1,
+            standard_error=(
+                "Stat(<config/>) failed: Stat: Access Denied for secret-key"
+            ),
+        )
+    )
+
+    monkeypatch.setattr("storage.restic.subprocess.run", run_repository_command)
+    monkeypatch.setattr("storage.restic.time.monotonic", clock)
+    monkeypatch.setattr("storage.restic.time.sleep", clock.sleep)
+    with pytest.raises(ResticOperationError, match="Backup storage was not ready") as raised:
+        runner._ensure_repository_for_backup()
+
+    assert run_repository_command.call_count == 10
+    assert clock.now == 180.0
+    expected_error = "Stat(<config/>) failed: Stat: Access Denied for [REDACTED]"
+    assert expected_error in str(raised.value)
+    assert expected_error in capsys.readouterr().err
+    assert "secret-key" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "detail",
+    (
+        "Fatal: wrong password or no key found",
+        "dial tcp: lookup invalid.example: no such host",
+        "The AWS Access Key Id you provided does not exist in our records.",
+        "503 Service Unavailable",
+    ),
+)
+def test_backup_repository_does_not_retry_other_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    detail: str,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path))
+    run_repository_command = MagicMock(
+        return_value=_repository_command_result(1, standard_error=detail)
+    )
+    sleep_mock = MagicMock()
+
+    monkeypatch.setattr("storage.restic.subprocess.run", run_repository_command)
+    monkeypatch.setattr("storage.restic.time.sleep", sleep_mock)
+
+    with pytest.raises(ResticOperationError, match="repository probe failed"):
+        runner._ensure_repository_for_backup()
+
+    run_repository_command.assert_called_once()
+    sleep_mock.assert_not_called()
 
 
 def test_requested_path_must_stay_inside_volume() -> None:
@@ -397,7 +614,7 @@ def test_docker_restore_uses_native_json_restore_to_requested_directory() -> Non
 
     assert "customer-volume:/workspace:rw" in command
     assert "--workdir" not in command
-    assert SNAPSHOT_ID in command
+    assert command[-2:] == ["--", SNAPSHOT_ID]
     assert "/workspace/restored" in command
     assert "restore" in command
     assert "--json" in command

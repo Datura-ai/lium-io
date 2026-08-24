@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from neurons.validators.tests.helpers import build_scrape_namespace
+from neurons.validators.tests.helpers import build_scrape_namespace, dict_literal_keys
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -256,18 +256,6 @@ def test_unreadable_attribute_leaves_an_empty_field(scrape: dict[str, Any], tmp_
     assert ports[0].state == "4: ACTIVE"
 
 
-def _dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
-    """Keys of the single dict literal assigned to `dict_name`, in source order."""
-    for node in ast.walk(module):
-        if (
-            isinstance(node, ast.Assign)
-            and getattr(node.targets[0], "id", "") == dict_name
-            and isinstance(node.value, ast.Dict)
-        ):
-            return [key.value for key in node.value.keys]
-    raise AssertionError(f"{dict_name} dict literal not found")
-
-
 def test_infiniband_keys_are_wired_through_both_obfuscation_tables() -> None:
     """A key missing from either table ships un-renamed/un-mapped."""
     # Arrange
@@ -291,8 +279,8 @@ def test_infiniband_keys_are_wired_through_both_obfuscation_tables() -> None:
     ]
 
     # Act
-    original_keys = _dict_literal_keys(service_module, "ORIGINAL_KEYS")
-    all_keys = _dict_literal_keys(service_module, "all_keys")
+    original_keys = dict_literal_keys(service_module, "ORIGINAL_KEYS")
+    all_keys = dict_literal_keys(service_module, "all_keys")
 
     # Assert
     for key in new_keys:

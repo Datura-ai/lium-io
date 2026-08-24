@@ -312,7 +312,7 @@ class NvmlDigestMessages:
         reason="NVML_DRIVER_UNKNOWN",
         severity="error",
         category="env",
-        impact="Score set to 0; previous verification cleared",
+        impact="Score set to 0 for this cycle",
         remediation="Update to a supported NVIDIA driver version. Your current driver version is not recognized.",
     )
     DIGEST_OK = MessageTemplate(
@@ -410,7 +410,7 @@ class SysboxRequiredMessages:
         reason="SYSBOX_REQUIRED_MISSING",
         severity="warning",
         category="policy",
-        impact="Score set to 0; verification cleared; executor kept off the network",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
         remediation="Install the sysbox runtime; unrented machines without sysbox are not allowed on the network.",
     )
     SYSBOX_OK = MessageTemplate(
@@ -713,6 +713,29 @@ class GpuUsageMessages:
         category="runtime",
         impact="Validation skipped; score set to 0",
         remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
+    )
+    FOREIGN_PROCESS = MessageTemplate(
+        event="Foreign GPU process on idle executor",
+        reason="GPU_FOREIGN_PROCESS",
+        severity="error",
+        category="runtime",
+        impact="Validation skipped; score set to 0",
+        remediation=(
+            "A GPU process outside Lium pod/filler containers is holding the card "
+            "(foreign container or bare host process). Stop all non-Lium GPU workloads "
+            "and re-run your node."
+        ),
+    )
+    VRAM_HELD = MessageTemplate(
+        event="VRAM held on idle executor with no visible owner",
+        reason="GPU_VRAM_HELD",
+        severity="error",
+        category="runtime",
+        impact="Validation skipped; score set to 0",
+        remediation=(
+            "GPU memory is occupied but no owning process is visible to the validator. "
+            "Free the VRAM (stop hidden or host-side GPU workloads) and re-run your node."
+        ),
     )
     GPU_WEDGE_CURED = MessageTemplate(
         event="Ghost GPU cured in place",
@@ -1050,6 +1073,48 @@ class RentalVerificationMessages:
             "Do not stop or remove Lium default-job (filler_*) containers. "
             "Incentive resumes once a default job runs undisturbed. "
             "Contact Lium support if this container was not removed by you."
+        ),
+    )
+    FILLER_KILLED_AT_CREATE = MessageTemplate(
+        event="Lium default job container is removed on the host right after it is created",
+        reason="FILLER_KILLED_AT_CREATE",
+        severity="error",
+        category="policy",
+        impact=(
+            "Unrented incentive withheld: Lium default jobs assigned to this machine were "
+            "destroyed seconds after they started, repeatedly over the last 24 hours"
+        ),
+        remediation=(
+            "Stop the host-side process that removes containers it does not recognise, or "
+            "allow-list Lium default-job (filler_*) containers in it. "
+            "Incentive resumes once a default job runs undisturbed. "
+            "Contact Lium support if nothing on this host removes containers."
+        ),
+    )
+    FILLER_STOPPED_BY_HOST = MessageTemplate(
+        event="Lium default job container was stopped on the host",
+        reason="FILLER_STOPPED_BY_HOST",
+        severity="error",
+        category="policy",
+        impact=(
+            "Unrented incentive withheld: something on this machine stopped the Lium default job "
+            "while its run is active"
+        ),
+        remediation=(
+            "Do not stop or remove Lium default-job (filler_*) containers. "
+            "Incentive resumes once a default job runs undisturbed. "
+            "Contact Lium support if this container was not stopped by you."
+        ),
+    )
+    FILLER_CONTAINER_EXITED = MessageTemplate(
+        event="Lium default job container exited on its own",
+        reason="FILLER_CONTAINER_EXITED",
+        severity="warning",
+        category="runtime",
+        impact="No penalty: the container is still on the host, so nobody removed it",
+        remediation=(
+            "The Lium default job stopped by itself on this machine. Check the container's exit "
+            "code and logs; incentive is unaffected."
         ),
     )
     FILLER_STATE_UNKNOWN = MessageTemplate(

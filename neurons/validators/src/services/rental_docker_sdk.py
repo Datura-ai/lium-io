@@ -154,12 +154,20 @@ class RentalDockerSdkClient:
         self._api_client = api_client
         self._pull_timeout_seconds = pull_timeout_seconds
 
-    async def login(self, *, username: str, password: str) -> None:
+    async def login(self, *, username: str, password: str, image: str) -> None:
+        # docker-py stores the credential under docker.io unless the registry
+        # is passed explicitly, so resolve it from the image the pull will use.
+        from docker import auth, utils
+
+        repository, _ = utils.parse_repository_tag(image)
+        registry, _ = auth.resolve_repository_name(repository)
+        registry = None if registry == auth.INDEX_NAME else registry
         await self._call_api(
-            operation_label="login",
+            operation_label="login" if registry is None else f"login for {registry}",
             api_method=self._api_client.login,
             username=username,
             password=password,
+            registry=registry,
             reauth=True,
         )
 

@@ -38,6 +38,18 @@ def build_scrape_namespace(
     return namespace
 
 
+def dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
+    """Keys of the single dict literal assigned to `dict_name`, in source order."""
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Assign)
+            and getattr(node.targets[0], "id", "") == dict_name
+            and isinstance(node.value, ast.Dict)
+        ):
+            return [key.value for key in node.value.keys]
+    raise AssertionError(f"{dict_name} dict literal not found")
+
+
 class DummyScoreCalc:
     def __call__(self, *args, **kwargs):  # pragma: no cover
         return 0.0, 0.0, ""

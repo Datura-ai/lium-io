@@ -244,6 +244,15 @@ class Settings(BaseSettings):
     # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
     RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
     RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
+    # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
+    # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
+    # defaults off like every other money-withholding gate above: a replay over the live fleet
+    # flags 5 nodes, and that population deserves a shadow week before the first payout is cut.
+    FOREIGN_GPU_WORKLOAD_CHECK_ENABLED: bool = Field(env="FOREIGN_GPU_WORKLOAD_CHECK_ENABLED", default=True)
+    FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
+        env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
+    )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
@@ -277,6 +286,15 @@ class Settings(BaseSettings):
     # When False, the breach is only logged
     # (shadow mode) so prod impact can be observed before enforcing.
     ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT: bool = Field(env="ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", default=False)
+
+    # DAH-2715 — GPU power cap capability gate. When True, an unrented executor whose
+    # container provably cannot apply a GPU power cap (no CAP_SYS_ADMIN, or /dev/nvidiactl
+    # not owned by root - see DAH-2705) loses the unrented rental incentive while staying
+    # active. A node whose probe is missing or unreadable is never penalized.
+    # Unlike the gates above this one ships ENFORCED: the fix is one compose flag on the
+    # provider's side, and the shadow window would only delay it. Set to False to fall back
+    # to logging the breach without withholding anything.
+    ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'

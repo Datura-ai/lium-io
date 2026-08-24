@@ -43,7 +43,7 @@ from tests.helpers import build_context_config, build_services, build_state
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
             Msg.DRIVER_UNKNOWN.reason,
-            True,
+            False,  # DAH-2742: unknown driver is not tampering
         ),
         # Real-world unknown driver case - 535.274.02
         (
@@ -52,7 +52,7 @@ from tests.helpers import build_context_config, build_services, build_state
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
             Msg.DRIVER_UNKNOWN.reason,
-            True,
+            False,  # DAH-2742: unknown driver is not tampering
         ),
         # Empty digest - should fail if driver version is known
         (
@@ -139,6 +139,9 @@ async def test_known_spoof_driver_is_not_reported(context_factory):
 
     assert result.event.reason_code == Msg.DRIVER_UNKNOWN.reason
     services.backend.report_unknown_driver.assert_not_awaited()
+    # DAH-2742: a confirmed spoof keeps the instant reset that an unrecognized-but-innocent
+    # driver no longer gets.
+    assert result.updates["clear_verified_job_info"] is True
 
 
 @pytest.mark.asyncio
