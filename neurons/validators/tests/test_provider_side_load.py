@@ -322,3 +322,27 @@ async def test_a_custom_image_build_is_not_the_providers_load(context_factory):
 
     assert result.passed is True
     assert result.event.what_we_saw["provider_cpu_cores"] == 0.0  # 6.4 host - 0.4 pod - 6.0 build
+
+
+@pytest.mark.asyncio
+async def test_the_monitor_container_shares_the_executor_image_and_is_ours(context_factory):
+    # The executor stack runs the same image twice (executor + monitor). docker.container_id
+    # names only one of them, so the other must be found by digest.
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "container_id": "executor-id",
+            "host_cpu_percent": 20.0,
+            "containers": [
+                {"container_id": "executor-id", "digest": "sha256:exec", "cpu_percent": 300.0},
+                {"container_id": "monitor-id", "digest": "sha256:exec", "cpu_percent": 300.0},
+            ],
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["provider_cpu_cores"] == 0.4  # 6.4 host - 3.0 - 3.0

@@ -74,9 +74,34 @@ def lium_containers(ctx: Context) -> set[str] | None:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     docker_info = (ctx.state.specs or {}).get("docker")
     if isinstance(docker_info, dict):
-        containers.add(str(docker_info.get("container_id") or ""))
+        containers.update(executor_stack_container_ids(docker_info))
     containers.discard("")
     return containers
+
+
+def executor_stack_container_ids(docker_info: dict[str, Any]) -> set[str]:
+    """Ids of the containers running the executor's own image.
+
+    `docker.container_id` names one of them, but the stack runs that image TWICE - `executor`
+    and `monitor` - so the id alone leaves the second one looking like a stranger's workload.
+    They are matched by image digest instead. The stack's other containers (postgres, autoheal)
+    run other images and stay on the provider's side, where their idle load belongs.
+    """
+    entries = [entry for entry in (docker_info.get("containers") or []) if isinstance(entry, dict)]
+    executor_id = str(docker_info.get("container_id") or "")
+    executor_digest = next(
+        (entry.get("digest") for entry in entries if entry.get("container_id") == executor_id),
+        None,
+    )
+    ids: set[str] = {executor_id}
+    if executor_digest:
+        ids.update(
+            str(entry.get("container_id") or "")
+            for entry in entries
+            if entry.get("digest") == executor_digest
+        )
+    ids.discard("")
+    return ids
 
 
 def compute_provider_side_load(
