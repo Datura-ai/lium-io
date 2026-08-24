@@ -36,7 +36,7 @@ class _Psutil:
         return self._readings.pop(0)
 
 
-def _fake_run_cmd(outputs: dict[str, str]):
+def _fake_run_cmd(outputs: dict[str, str | Exception]):
     """Match a docker call by the subcommand in it, so the temp binary path does not matter."""
 
     def run_cmd(cmd: str) -> str:
@@ -50,7 +50,7 @@ def _fake_run_cmd(outputs: dict[str, str]):
     return run_cmd
 
 
-def _scrape(outputs: dict[str, str], host_percent: float = 40.0) -> dict:
+def _scrape(outputs: dict[str, str | Exception], host_percent: float = 40.0) -> dict:
     namespace = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         CPU_HELPERS,
@@ -60,7 +60,7 @@ def _scrape(outputs: dict[str, str], host_percent: float = 40.0) -> dict:
     return namespace
 
 
-def _docker_outputs(stats: str | Exception, ps_ids: list[str]) -> dict:
+def _docker_outputs(stats: str | Exception, ps_ids: list[str]) -> dict[str, str | Exception]:
     return {
         "version --format": "24.0.7\n",
         "stats --no-stream": stats,

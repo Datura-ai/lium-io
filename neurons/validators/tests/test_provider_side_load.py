@@ -108,6 +108,11 @@ def test_a_foreign_container_counts_against_the_provider():
     assert load.cpu_cores == 9.0  # the miner's 7 cores stay on the provider's side
 
 
+def _no_rentals() -> RentedExecutorsResponse:
+    """The backend answered, and this node holds nothing."""
+    return RentedExecutorsResponse(executors={}, banned_guids=[])
+
+
 def _rented_state(specs: dict[str, object]) -> ContextState:
     return build_state(
         specs=specs,
@@ -154,13 +159,14 @@ async def test_enforcement_zeroes_the_score_on_a_rented_machine(context_factory)
 @pytest.mark.asyncio
 async def test_idle_machine_is_judged_the_same_as_a_rented_one(context_factory):
     # The provider cheats the renter when rented and the marketplace when idle — same verdict.
-    ctx = context_factory(state=build_state(specs=SN13_SPECS))
+    ctx = context_factory(state=build_state(specs=SN13_SPECS, rented_data=_no_rentals()))
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.what_we_saw["is_rented"] is False
+    assert result.event.what_we_saw["provider_cpu_cores"] == 10.6  # nothing of Lium's to subtract
 
 
 @pytest.mark.asyncio
@@ -228,7 +234,7 @@ async def test_the_executor_container_is_subtracted_without_being_rented(context
             "containers": [{"container_id": "executor-container-id", "cpu_percent": 300.0}],
         },
     }
-    ctx = context_factory(state=build_state(specs=specs))
+    ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
@@ -259,3 +265,37 @@ async def test_a_foreign_container_zeroes_the_score_of_a_rented_machine(context_
     assert result.passed is False
     assert result.updates["provider_side_load_passed"] is False
     assert result.event.what_we_saw["provider_cpu_cores"] == 9.0
+
+
+@pytest.mark.asyncio
+async def test_no_backend_truth_voids_the_cpu_verdict(context_factory):
+    # Without the backend's container list every filler reads as a foreign workload. The
+    # foreign-GPU twin gives no verdict in that case and neither does this gate.
+    cpu_only_specs = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
+    ctx = context_factory(state=build_state(specs=cpu_only_specs))  # rented_data defaults to None
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.NOT_MEASURABLE.reason
+
+
+@pytest.mark.asyncio
+async def test_a_pod_started_after_the_snapshot_is_counted_and_reported(context_factory):
+    # The backend can start a pod after this cycle's rented_data snapshot. It still counts
+    # against the provider - a name is not proof - but the shadow week has to see the race.
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "host_cpu_percent": 20.0,
+            "containers": [{"name": "pod_fresh", "cpu_percent": 300.0}],
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.event.what_we_saw["provider_cpu_cores"] == 6.4
+    assert result.event.what_we_saw["lium_named_outside_snapshot_cores"] == 3.0

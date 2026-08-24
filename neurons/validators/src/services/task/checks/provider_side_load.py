@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Any
 
 from core.config import settings
+from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
 from .gpu_usage import _lium_workload_containers
 from ..messages import ProviderSideLoadMessages as Msg
@@ -51,16 +52,19 @@ class ProviderSideLoad:
         return fields
 
 
-def lium_containers(ctx: Context) -> set[str]:
+def lium_containers(ctx: Context) -> set[str] | None:
     """Every container Lium itself put on this host, by name or by id.
 
     The node's fillers and pods as the BACKEND knows them - the same set the foreign-GPU twin
     judges by, so a `docker rename` defeats neither gate - plus the executor's own container,
     which is on no rental list but is still ours.
+
+    None when the backend sent no truth this cycle: every filler would then read as a foreign
+    workload. The twin returns no verdict in that case and so does this gate.
     """
-    containers: set[str] = set()
-    if ctx.state.rented_data is not None:
-        containers = _lium_workload_containers(ctx)
+    if ctx.state.rented_data is None:
+        return None
+    containers: set[str] = _lium_workload_containers(ctx)
     docker_info = (ctx.state.specs or {}).get("docker")
     if isinstance(docker_info, dict):
         containers.add(str(docker_info.get("container_id") or ""))
@@ -68,7 +72,9 @@ def lium_containers(ctx: Context) -> set[str]:
     return containers
 
 
-def compute_provider_side_load(specs: dict[str, Any], lium_container_keys: set[str]) -> ProviderSideLoad:
+def compute_provider_side_load(
+    specs: dict[str, Any], lium_container_keys: set[str] | None
+) -> ProviderSideLoad:
     """CPU: host utilization over the `docker stats` window (docker.host_cpu_percent, 0-100
     across all cores) minus the core-percents of LIUM's containers only, in cores. A container
     Lium did not put there is the provider's own workload and stays in the total - subtracting
@@ -93,7 +99,8 @@ def compute_provider_side_load(specs: dict[str, Any], lium_container_keys: set[s
         host_percent = float(docker_info.get("host_cpu_percent"))
         raw_percents = [container.get("cpu_percent") for container in containers]
         if (
-            math.isfinite(host_percent)
+            lium_container_keys is not None
+            and math.isfinite(host_percent)
             and host_percent >= 0
             and core_count > 0
             and raw_percents
@@ -124,6 +131,33 @@ def compute_provider_side_load(specs: dict[str, Any], lium_container_keys: set[s
     return ProviderSideLoad(cpu_cores=cpu_cores, disk_kb=disk_kb)
 
 
+def lium_named_cores_outside_snapshot(
+    specs: dict[str, Any], lium_container_keys: set[str] | None
+) -> float | None:
+    """CPU of containers that carry one of our prefixes but are absent from the allowlist.
+
+    The backend can start a filler or a pod AFTER this cycle's rented_data snapshot. That
+    container is ours, yet it reads as the provider's workload. It still counts against the
+    provider - a name is not proof, and the twin gate refuses the same shortcut - but it is
+    reported on its own, so the shadow week measures how often the race happens.
+    """
+    if lium_container_keys is None:
+        return None
+    try:
+        containers = (specs.get("docker") or {}).get("containers") or []
+        cores = sum(
+            float(container.get("cpu_percent") or 0)
+            for container in containers
+            if str(container.get("name") or "").startswith(
+                (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)
+            )
+            and container.get("name") not in lium_container_keys
+        )
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        return None
+    return round(cores / 100, 1)
+
+
 class ProviderSideLoadCheck:
     """Judge a machine by what its OWNER takes from it, not only by what Lium runs on it.
 
@@ -150,7 +184,9 @@ class ProviderSideLoadCheck:
             event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             return CheckResult(passed=True, event=event)
 
-        provider_side_load = compute_provider_side_load(ctx.state.specs or {}, lium_containers(ctx))
+        lium_container_keys = lium_containers(ctx)
+        specs = ctx.state.specs or {}
+        provider_side_load = compute_provider_side_load(specs, lium_container_keys)
         if not provider_side_load.is_measured:
             event = render_message(
                 Msg.NOT_MEASURABLE,
@@ -182,6 +218,9 @@ class ProviderSideLoadCheck:
             "cpu_cores_limit": PROVIDER_SIDE_CPU_CORES_LIMIT,
             "disk_gb_limit": PROVIDER_SIDE_DISK_LIMIT_KB // (1024 * 1024),
             "is_rented": is_rented,
+            "lium_named_outside_snapshot_cores": lium_named_cores_outside_snapshot(
+                specs, lium_container_keys
+            ),
         }
 
         if not provider_side_load.is_above_limits:
