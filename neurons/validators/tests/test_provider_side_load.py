@@ -25,6 +25,7 @@ GB_KB = 1024 * 1024
 SN13_SPECS = {
     "cpu": {"count": 32},
     "docker": {
+        "container_id": "executor-container-id",
         "host_cpu_percent": 33.0,
         "containers": [{"name": "pod_renter", "cpu_percent": 158.0}],
     },
@@ -38,7 +39,7 @@ SN13_SPECS = {
 
 
 def test_provider_side_load_attributes_cpu_and_disk():
-    load = compute_provider_side_load(SN13_SPECS)
+    load = compute_provider_side_load(SN13_SPECS, {"pod_renter"})
     assert load.cpu_cores == 9.0  # 33% * 32 cores - 1.58 cores
     assert load.disk_kb == 1528 * GB_KB  # 1700 - (100 + 12 + 60)
 
@@ -48,9 +49,13 @@ def test_provider_side_load_clamps_negative_to_zero():
         {
             "cpu": {"count": 4},
             # 0.4 host cores over the stats window; container jitter above host clamps to zero
-            "docker": {"host_cpu_percent": 10.0, "containers": [{"cpu_percent": 90.0}]},
+            "docker": {
+                "host_cpu_percent": 10.0,
+                "containers": [{"name": "pod_a", "cpu_percent": 90.0}],
+            },
             "hard_disk": {"used": 10 * GB_KB, "images": 20 * GB_KB, "containers": 0, "volumes": 0},
-        }
+        },
+        {"pod_a"},
     )
     assert load == ProviderSideLoad(cpu_cores=0.0, disk_kb=0)
 
@@ -62,7 +67,8 @@ def test_provider_side_load_skips_parts_with_missing_or_bad_inputs():
             "cpu": {"count": "thirty-two"},
             "docker": {"host_cpu_percent": 33.0, "containers": [{"name": "pod_x"}]},
             "hard_disk": {"used": 1700 * GB_KB},
-        }
+        },
+        {"pod_x"},
     ).is_measured is False
 
 
@@ -74,11 +80,32 @@ def test_provider_side_load_requires_cpu_percent_on_every_container():
             "cpu": {"count": 32},
             "docker": {
                 "host_cpu_percent": 33.0,
-                "containers": [{"cpu_percent": 158.0}, {"name": "no_stats_row"}],
+                "containers": [{"name": "pod_renter", "cpu_percent": 158.0}, {"name": "no_stats_row"}],
             },
-        }
+        },
+        {"pod_renter", "no_stats_row"},
     )
     assert load.cpu_cores is None
+
+
+def test_a_foreign_container_counts_against_the_provider():
+    # The evasion the GPU twin already blocks: the provider runs the other subnet with
+    # `docker run`, so its CPU would be subtracted as if Lium put it there.
+    load = compute_provider_side_load(
+        {
+            "cpu": {"count": 32},
+            "docker": {
+                "container_id": "executor-container-id",
+                "host_cpu_percent": 33.0,
+                "containers": [
+                    {"name": "pod_renter", "cpu_percent": 158.0},
+                    {"name": "sn13_miner", "cpu_percent": 700.0},
+                ],
+            },
+        },
+        {"pod_renter"},
+    )
+    assert load.cpu_cores == 9.0  # the miner's 7 cores stay on the provider's side
 
 
 def _rented_state(specs: dict[str, object]) -> ContextState:
@@ -187,3 +214,48 @@ async def test_disabled_check_skips_entirely(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.SKIPPED.reason
+
+
+@pytest.mark.asyncio
+async def test_the_executor_container_is_subtracted_without_being_rented(context_factory):
+    # Lium's own agent is on no rental list, but Lium put it there: the check has to find it
+    # through docker.container_id, or every idle node reads as a cheating one.
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "container_id": "executor-container-id",
+            "host_cpu_percent": 10.0,
+            "containers": [{"container_id": "executor-container-id", "cpu_percent": 300.0}],
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["provider_cpu_cores"] == 0.2  # 3.2 host cores - 3.0 ours
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_container_zeroes_the_score_of_a_rented_machine(context_factory):
+    # The whole point of the ticket, end to end: the provider mines another subnet with
+    # `docker run` while a renter holds the pod.
+    specs = {
+        **SN13_SPECS,
+        "docker": {
+            **SN13_SPECS["docker"],
+            "containers": [
+                {"name": "pod_renter", "cpu_percent": 158.0},
+                {"name": "sn13_miner", "cpu_percent": 700.0},
+            ],
+        },
+    }
+    ctx = context_factory(state=_rented_state(specs))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.updates["provider_side_load_passed"] is False
+    assert result.event.what_we_saw["provider_cpu_cores"] == 9.0

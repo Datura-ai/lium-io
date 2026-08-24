@@ -7,6 +7,7 @@ from typing import Any
 
 from core.config import settings
 
+from .gpu_usage import _lium_workload_containers
 from ..messages import ProviderSideLoadMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -50,9 +51,28 @@ class ProviderSideLoad:
         return fields
 
 
-def compute_provider_side_load(specs: dict[str, Any]) -> ProviderSideLoad:
+def lium_containers(ctx: Context) -> set[str]:
+    """Every container Lium itself put on this host, by name or by id.
+
+    The node's fillers and pods as the BACKEND knows them - the same set the foreign-GPU twin
+    judges by, so a `docker rename` defeats neither gate - plus the executor's own container,
+    which is on no rental list but is still ours.
+    """
+    containers: set[str] = set()
+    if ctx.state.rented_data is not None:
+        containers = _lium_workload_containers(ctx)
+    docker_info = (ctx.state.specs or {}).get("docker")
+    if isinstance(docker_info, dict):
+        containers.add(str(docker_info.get("container_id") or ""))
+    containers.discard("")
+    return containers
+
+
+def compute_provider_side_load(specs: dict[str, Any], lium_container_keys: set[str]) -> ProviderSideLoad:
     """CPU: host utilization over the `docker stats` window (docker.host_cpu_percent, 0-100
-    across all cores) minus the sum of per-container core-percents, in cores. Disk:
+    across all cores) minus the core-percents of LIUM's containers only, in cores. A container
+    Lium did not put there is the provider's own workload and stays in the total - subtracting
+    it would let the provider mine another subnet with `docker run` and read as idle. Disk:
     hard_disk.used minus the docker breakdown (images+containers+volumes, DAH-2514), in kB —
     includes the OS baseline, so thresholds must leave room for it.
 
@@ -81,8 +101,14 @@ def compute_provider_side_load(specs: dict[str, Any]) -> ProviderSideLoad:
         ):
             container_percents = [float(percent) for percent in raw_percents]
             if all(math.isfinite(percent) and percent >= 0 for percent in container_percents):
+                lium_percent = sum(
+                    float(container["cpu_percent"])
+                    for container in containers
+                    if container.get("name") in lium_container_keys
+                    or container.get("container_id") in lium_container_keys
+                )
                 host_cores = host_percent / 100 * core_count
-                cpu_cores = round(max(0.0, host_cores - sum(container_percents) / 100), 1)
+                cpu_cores = round(max(0.0, host_cores - lium_percent / 100), 1)
     except (TypeError, ValueError, AttributeError, OverflowError):
         pass
 
@@ -124,7 +150,7 @@ class ProviderSideLoadCheck:
             event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             return CheckResult(passed=True, event=event)
 
-        provider_side_load = compute_provider_side_load(ctx.state.specs or {})
+        provider_side_load = compute_provider_side_load(ctx.state.specs or {}, lium_containers(ctx))
         if not provider_side_load.is_measured:
             event = render_message(
                 Msg.NOT_MEASURABLE,
