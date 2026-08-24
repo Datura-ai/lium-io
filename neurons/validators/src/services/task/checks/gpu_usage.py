@@ -5,6 +5,7 @@ from uuid import UUID
 
 from core.config import settings
 from protocol.vc_protocol.compute_requests import (
+    LIVE_FILLER_RUN_STATUSES,
     FillerRunActiveResponse,
     PodRentalActiveResponse,
 )
@@ -14,7 +15,6 @@ from services.const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     GPU_WEDGE_MEMORY_MAX,
-    LIVE_FILLER_RUN_STATUSES,
     POD_CONTAINER_PREFIX,
 )
 from services.gpu_wedge import (
@@ -356,36 +356,46 @@ async def _drop_containers_the_backend_still_owns(
     as foreign at 0% load — 7 honest nodes hit this in the first prod shadow day. The name on
     its own still proves nothing, because `docker rename` forges it, so the id inside the name
     is confirmed against the backend, which disowns an id it never issued.
+
+    One question per container, not per process: a single container holds as many GPU processes
+    as it has workers (8 in one prod pod), and this check sits on the healthy path of every
+    executor in every cycle.
     """
-    confirmed: list[ForeignGpuProcess] = []
-    for process in foreign_processes:
-        if _carries_a_lium_prefix(process) and await _the_backend_still_owns(ctx, process):
-            continue
-        confirmed.append(process)
-    return confirmed
+    lium_named_containers: list[str] = sorted(
+        {process.container_name for process in foreign_processes if _carries_a_lium_prefix(process)}
+    )
+    if not lium_named_containers:
+        return foreign_processes
+
+    ownership_verdicts: list[bool] = await asyncio.gather(
+        *(_the_backend_still_owns(ctx, name) for name in lium_named_containers)
+    )
+    still_ours: set[str] = {
+        name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
+    }
+    return [process for process in foreign_processes if process.container_name not in still_ours]
 
 
-async def _the_backend_still_owns(ctx: Context, process: ForeignGpuProcess) -> bool:
+async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     """True when the backend confirms the id inside the container name as a live run of ours.
 
     Mirrors the filler re-check in rental_verification. Fail-open on an unreachable backend
     (a None response): an inability to measure never withholds money here.
     """
-    container_name: str = process.container_name or ""
     is_filler: bool = container_name.startswith(FILLER_CONTAINER_PREFIX)
     prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
-    lium_id: str | None = _uuid_after_prefix(container_name, prefix)
-    if lium_id is None:
+    backend_issued_id: str | None = _uuid_after_prefix(container_name, prefix)
+    if backend_issued_id is None:
         return False
 
     if is_filler:
         filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
-            lium_id
+            backend_issued_id
         )
         return filler_run is None or filler_run.status in LIVE_FILLER_RUN_STATUSES
 
     pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(
-        lium_id
+        backend_issued_id
     )
     return pod_rental is None or pod_rental.active
 

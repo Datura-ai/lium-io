@@ -206,6 +206,14 @@ class FillerRunActiveResponse(BaseModel):
     started_at: datetime | None = None
 
 
+# DAH-2757: the states in which the backend still owns the container. `active` is not enough — the
+# backend sets it for RUNNING alone, and a filler the snapshot missed is usually still STARTING.
+# The terminal states (STOPPED, FAILED, STOP_FAILED, CLEANUP_FAILED) are absent on purpose: a
+# container that outlives its run is an orphan, not a workload we started. Mirrors FillerRunStatus
+# in the backend (models/filler_run.py) — a new transitional state there belongs here too.
+LIVE_FILLER_RUN_STATUSES = frozenset({"STARTING", "RUNNING", "STOPPING"})
+
+
 class ExecutorUptimeResponse(BaseModel):
     executor_ip_address: str
     executor_ip_port: str
