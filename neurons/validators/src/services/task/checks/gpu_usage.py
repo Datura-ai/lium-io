@@ -361,8 +361,13 @@ async def _drop_containers_the_backend_still_owns(
     as it has workers (8 in one prod pod), and this check sits on the healthy path of every
     executor in every cycle.
     """
+    claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
     lium_named_containers: list[str] = sorted(
-        {process.container_name for process in foreign_processes if _carries_a_lium_prefix(process)}
+        {
+            process.container_name
+            for process in foreign_processes
+            if _carries_a_lium_prefix(process) and process.container_name not in claimed_elsewhere
+        }
     )
     if not lium_named_containers:
         return foreign_processes
@@ -392,7 +397,12 @@ async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
         filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
             backend_issued_id
         )
-        return filler_run is None or filler_run.status in LIVE_FILLER_RUN_STATUSES
+        # `active` alone means RUNNING. The status carries the two transitional states, which is
+        # where a filler the snapshot missed usually sits — but a backend that sends no status
+        # must not turn a run it calls active into a foreign workload.
+        if filler_run is None or filler_run.active:
+            return True
+        return filler_run.status in LIVE_FILLER_RUN_STATUSES
 
     pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(
         backend_issued_id
@@ -401,11 +411,44 @@ async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
 
 
 def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:
-    """The uuid the backend issued, or None when the name carries something else."""
+    """The uuid the backend issued, or None when the name carries something else.
+
+    Only the canonical spelling counts. `UUID()` also reads an upper-case or dash-less form of
+    the same id, and both are legal docker names — without this test a provider could point a
+    second container at a live run of their own node and have the re-check clear it.
+    """
+    suffix: str = container_name.removeprefix(prefix)
     try:
-        return str(UUID(container_name.removeprefix(prefix)))
+        canonical_uuid: str = str(UUID(suffix))
     except ValueError:
         return None
+    return canonical_uuid if canonical_uuid == suffix else None
+
+
+def _containers_claimed_by_another_executor(ctx: Context) -> set[str]:
+    """Container names this cycle's snapshot gives to a DIFFERENT node of the fleet.
+
+    A run id is public on its own host (`docker ps`), and the backend answers about the RUN, not
+    about where it runs. So a provider with two nodes could name a foreign container after a live
+    filler of their honest node and have the re-check clear it. The snapshot is what separates
+    them: a name another executor already holds is never ours to clear.
+    """
+    rented_data = ctx.state.rented_data
+    our_executor_uuid: str = str(ctx.executor.uuid)
+    claimed: set[str] = set()
+
+    filler_executor_uuids: set[str] = set(rented_data.all_filler_containers_by_executor) | set(
+        rented_data.filler_containers_by_executor
+    )
+    for executor_uuid in filler_executor_uuids - {our_executor_uuid}:
+        claimed.update(rented_data.get_filler_containers(executor_uuid))
+
+    for executor_uuid, rented_executor in rented_data.executors.items():
+        if executor_uuid != our_executor_uuid:
+            claimed.update(pod.container_name for pod in rented_executor.pods)
+
+    claimed.discard("")
+    return claimed
 
 
 def _runs_in_the_executors_own_cgroup(process: dict) -> bool:

@@ -7,7 +7,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
     RentedExecutorsResponse,
 )
-from neurons.validators.src.services.const import POD_CONTAINER_PREFIX
+from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 
@@ -796,3 +796,83 @@ async def test_a_lium_name_without_a_uuid_is_never_asked_about(context_factory):
         "filler_not-a-uuid"
     ]
     services.backend.get_filler_run_active.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "container_name",
+    [
+        f"{FILLER_CONTAINER_PREFIX}9622D623-DCB3-4A7C-92C6-EF6C937DF3AE",
+        f"{FILLER_CONTAINER_PREFIX}9622d623dcb34a7c92c6ef6c937df3ae",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_non_canonical_spelling_of_a_live_run_id_is_still_foreign(
+    context_factory, container_name
+):
+    # Both spellings are legal docker names and both parse to the id of a live run, so without a
+    # canonical test a provider could point a second container at their own filler.
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": container_name}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=True, status="RUNNING"
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    services.backend.get_filler_run_active.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_live_run_of_another_executor_is_still_foreign(context_factory):
+    # The backend answers about the run, not about where it runs. A provider with two nodes can
+    # read a live filler id off the honest one and name a foreign container after it.
+    neighbours_filler = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        gpu_processes=[
+            {"pid": 111, "info": "0::/../docker-a.scope", "container_name": neighbours_filler}
+        ],
+        specs=_specs(),
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"another-executor": [neighbours_filler]},
+        ),
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=True, status="RUNNING"
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+    services.backend.get_filler_run_active.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_filler_the_backend_calls_active_without_a_status_is_ours(context_factory):
+    # The schema permits a status-free response. A backend that sends one must not have its own
+    # live filler turned into a foreign workload.
+    late_filler = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": late_filler}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=True)
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
