@@ -1,6 +1,6 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -108,6 +108,17 @@ def test_a_foreign_container_counts_against_the_provider():
     assert load.cpu_cores == 9.0  # the miner's 7 cores stay on the provider's side
 
 
+def confirming_ssh(host_busy_cores: float, core_count: int, rows: list[tuple[str, str, float]]):
+    """An ssh whose second reading repeats what the scrape saw — the load is real, not a spike."""
+    total_jiffies = 100_000
+    busy = int(total_jiffies * host_busy_cores / core_count)
+    body = "\n".join(f"{container_id}|{name}|{percent:.2f}%" for container_id, name, percent in rows)
+    stdout = f"0 0\n---\n{body}\n---\n{total_jiffies} {total_jiffies - busy}"
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout))
+    return ssh
+
+
 def _no_rentals() -> RentedExecutorsResponse:
     """The backend answered, and this node holds nothing."""
     return RentedExecutorsResponse(executors={}, banned_guids=[])
@@ -141,7 +152,10 @@ def provider_load_gate(*, enforce: bool = True, check_enabled: bool = True):
 
 @pytest.mark.asyncio
 async def test_enforcement_zeroes_the_score_on_a_rented_machine(context_factory):
-    ctx = context_factory(state=_rented_state(SN13_SPECS))
+    ctx = context_factory(
+        state=_rented_state(SN13_SPECS),
+        ssh=confirming_ssh(10.56, 32, [("c1", "pod_renter", 158.0)]),
+    )
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
@@ -159,7 +173,10 @@ async def test_enforcement_zeroes_the_score_on_a_rented_machine(context_factory)
 @pytest.mark.asyncio
 async def test_idle_machine_is_judged_the_same_as_a_rented_one(context_factory):
     # The provider cheats the renter when rented and the marketplace when idle — same verdict.
-    ctx = context_factory(state=build_state(specs=SN13_SPECS, rented_data=_no_rentals()))
+    ctx = context_factory(
+        state=build_state(specs=SN13_SPECS, rented_data=_no_rentals()),
+        ssh=confirming_ssh(10.56, 32, [("c1", "pod_renter", 158.0)]),
+    )
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
@@ -257,7 +274,10 @@ async def test_a_foreign_container_zeroes_the_score_of_a_rented_machine(context_
             ],
         },
     }
-    ctx = context_factory(state=_rented_state(specs))
+    ctx = context_factory(
+        state=_rented_state(specs),
+        ssh=confirming_ssh(10.56, 32, [("c1", "pod_renter", 158.0), ("c2", "sn13_miner", 700.0)]),
+    )
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
@@ -292,7 +312,10 @@ async def test_a_pod_started_after_the_snapshot_is_counted_and_reported(context_
             "containers": [{"name": "pod_fresh", "cpu_percent": 300.0}],
         },
     }
-    ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))
+    ctx = context_factory(
+        state=build_state(specs=specs, rented_data=_no_rentals()),
+        ssh=confirming_ssh(6.4, 32, [("c1", "pod_fresh", 300.0)]),
+    )
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
@@ -346,3 +369,34 @@ async def test_the_monitor_container_shares_the_executor_image_and_is_ours(conte
 
     assert result.passed is True
     assert result.event.what_we_saw["provider_cpu_cores"] == 0.4  # 6.4 host - 3.0 - 3.0
+
+
+@pytest.mark.asyncio
+async def test_a_spike_that_is_gone_on_the_second_look_costs_nothing(context_factory):
+    # Lium's own watchtower pulling an image can hold two cores for a second. It is gone by the
+    # second reading, and an honest machine keeps its score.
+    cpu_only_specs = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
+    ctx = context_factory(
+        state=_rented_state(cpu_only_specs),
+        ssh=confirming_ssh(1.9, 32, [("c1", "pod_renter", 30.0)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.LOAD_OK.reason
+    assert result.event.what_we_saw["provider_cpu_cores"] == 1.6
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_second_look_withholds_nothing(context_factory):
+    # ssh is down, so the load cannot be confirmed. The CPU verdict voids.
+    cpu_only_specs = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
+    ctx = context_factory(state=_rented_state(cpu_only_specs))  # ssh defaults to None
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.NOT_MEASURABLE.reason

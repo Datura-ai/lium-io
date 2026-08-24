@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any
 
+import asyncssh
+
 from core.config import settings
 from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
@@ -20,6 +22,21 @@ from ..pipeline import CheckResult, Context
 # nodes land above them before enforcement withholds the first payout.
 PROVIDER_SIDE_CPU_CORES_LIMIT = 2.0
 PROVIDER_SIDE_DISK_LIMIT_KB = 100 * 1024 * 1024  # 100 GB outside docker
+
+# A second look before any money is withheld, the same rule the foreign-GPU twin follows with
+# the live card. The scrape's window is about two seconds, and Lium's own housekeeping
+# (watchtower pulling an image, autoheal restarting a container) can hold two cores inside it.
+# A provider mining another subnet holds them all day, so the second reading keeps him and
+# drops the spike. An unreadable second reading withholds nothing.
+CPU_RESAMPLE_TIMEOUT_SECONDS = 45
+_HOST_CPU_JIFFIES = (
+    "awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat"
+)
+CPU_RESAMPLE_COMMAND = (
+    f"{_HOST_CPU_JIFFIES}; echo ---; "
+    "timeout 30 /usr/bin/docker stats --no-stream --format '{{.ID}}|{{.Name}}|{{.CPUPerc}}'; "
+    f"echo ---; {_HOST_CPU_JIFFIES}"
+)
 
 
 @dataclass(frozen=True)
@@ -190,6 +207,37 @@ def lium_named_cores_outside_snapshot(
     return round(cores / 100, 1)
 
 
+def parse_resampled_cpu_cores(
+    stdout: str, core_count: int, lium_container_keys: set[str]
+) -> float | None:
+    """Provider-side cores from CPU_RESAMPLE_COMMAND's output, or None if it is not readable.
+
+    Host busy time comes from the /proc/stat jiffies on either side of the `docker stats` call,
+    so both readings cover the same seconds - the pairing the whole subtraction rests on.
+    """
+    try:
+        before, container_rows, after = stdout.split("---")
+        first_total, first_idle = (int(part) for part in before.split())
+        last_total, last_idle = (int(part) for part in after.split())
+        total_delta = last_total - first_total
+        if total_delta <= 0:
+            return None
+        host_cores = (total_delta - (last_idle - first_idle)) / total_delta * core_count
+        lium_percent = 0.0
+        for row in container_rows.strip().splitlines():
+            short_id, name, raw_percent = row.split("|")
+            is_ours = name.strip() in lium_container_keys or any(
+                key.startswith(short_id.strip()) for key in lium_container_keys
+            )
+            # An unparsable percent voids the reading instead of under-counting Lium's side
+            percent = float(raw_percent.strip().rstrip("%"))
+            if is_ours:
+                lium_percent += percent
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return round(max(0.0, host_cores - lium_percent / 100), 1)
+
+
 class ProviderSideLoadCheck:
     """Judge a machine by what its OWNER takes from it, not only by what Lium runs on it.
 
@@ -211,6 +259,25 @@ class ProviderSideLoadCheck:
     check_id = "host.validate.provider_side_load"
     fatal = False
 
+    async def _resample_cpu_cores(
+        self, ctx: Context, specs: dict[str, Any], lium_container_keys: set[str] | None
+    ) -> float | None:
+        """Read the load once more over ssh. None on anything unreadable, which withholds nothing."""
+        if lium_container_keys is None:
+            return None
+        try:
+            core_count = int((specs.get("cpu") or {}).get("count"))
+            result = await ctx.ssh.run(
+                CPU_RESAMPLE_COMMAND, timeout=CPU_RESAMPLE_TIMEOUT_SECONDS, check=False
+            )
+        except (asyncssh.Error, OSError, TypeError, ValueError, AttributeError):
+            return None
+        if getattr(result, "exit_status", 1) != 0:
+            return None
+        return parse_resampled_cpu_cores(
+            getattr(result, "stdout", "") or "", core_count, lium_container_keys
+        )
+
     async def run(self, ctx: Context) -> CheckResult:
         if not settings.PROVIDER_SIDE_LOAD_CHECK_ENABLED:
             event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
@@ -219,6 +286,11 @@ class ProviderSideLoadCheck:
         lium_container_keys = lium_containers(ctx)
         specs = ctx.state.specs or {}
         provider_side_load = compute_provider_side_load(specs, lium_container_keys)
+        if (provider_side_load.cpu_cores or 0.0) >= PROVIDER_SIDE_CPU_CORES_LIMIT:
+            provider_side_load = replace(
+                provider_side_load,
+                cpu_cores=await self._resample_cpu_cores(ctx, specs, lium_container_keys),
+            )
         if not provider_side_load.is_measured:
             event = render_message(
                 Msg.NOT_MEASURABLE,
