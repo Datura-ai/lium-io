@@ -8,6 +8,7 @@ from typing import Any
 from core.config import settings
 from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
+from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
 from .gpu_usage import _lium_workload_containers
 from ..messages import ProviderSideLoadMessages as Msg
 from ..messages import render_message
@@ -65,6 +66,12 @@ def lium_containers(ctx: Context) -> set[str] | None:
     if ctx.state.rented_data is None:
         return None
     containers: set[str] = _lium_workload_containers(ctx)
+    # A custom image builds in `lium-dind-build-<pod_id>`, which is on no rental list and burns
+    # cores. The pod id keeps the name rename-proof: it has to match a pod the BACKEND reports
+    # here, the same rule the orphan sweep removes such a container by.
+    rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid)
+    if rented_executor:
+        containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     docker_info = (ctx.state.specs or {}).get("docker")
     if isinstance(docker_info, dict):
         containers.add(str(docker_info.get("container_id") or ""))

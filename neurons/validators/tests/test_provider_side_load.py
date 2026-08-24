@@ -299,3 +299,26 @@ async def test_a_pod_started_after_the_snapshot_is_counted_and_reported(context_
 
     assert result.event.what_we_saw["provider_cpu_cores"] == 6.4
     assert result.event.what_we_saw["lium_named_outside_snapshot_cores"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_a_custom_image_build_is_not_the_providers_load(context_factory):
+    # `lium-dind-build-<pod_id>` is Lium building a renter's image. It is on no rental list,
+    # and a build takes cores, so without this the gate zeroes an honest machine.
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "host_cpu_percent": 20.0,
+            "containers": [
+                {"name": "pod_renter", "cpu_percent": 40.0},
+                {"name": "lium-dind-build-pod-1", "cpu_percent": 600.0},
+            ],
+        },
+    }
+    ctx = context_factory(state=_rented_state(specs))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["provider_cpu_cores"] == 0.0  # 6.4 host - 0.4 pod - 6.0 build
