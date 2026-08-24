@@ -6,6 +6,10 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 from datura.requests.miner_requests import ExecutorSSHInfo
+from neurons.validators.src.protocol.vc_protocol.compute_requests import (
+    FillerRunActiveResponse,
+    PodRentalActiveResponse,
+)
 from neurons.validators.src.services.task.pipeline import (
     Context,
     ContextConfig,
@@ -96,6 +100,10 @@ def build_services(**overrides) -> ContextServices:
     pod_recovery = AsyncMock()
     # A bare AsyncMock would report every pod as recovered; opt in per test instead.
     pod_recovery.recover_pod_after_stale_vloopback_mount.return_value = False
+    backend = AsyncMock()
+    # A bare AsyncMock would confirm every Lium-named container as ours (DAH-2757); opt in per test.
+    backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False)
+    backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=False)
     base = dict(
         ssh=None,
         redis=None,
@@ -106,7 +114,7 @@ def build_services(**overrides) -> ContextServices:
         connectivity=None,
         shell=None,
         score_calculator=DummyScoreCalc(),
-        backend=AsyncMock(),
+        backend=backend,
         container_cleanup=None,
         pod_recovery=pod_recovery,
     )

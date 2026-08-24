@@ -237,6 +237,10 @@ PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 2
 
 POD_CONTAINER_PREFIX = "pod_"
 FILLER_CONTAINER_PREFIX = "filler_"
+# DAH-2757: filler-run states in which the backend still owns the container. The terminal states
+# (STOPPED, FAILED, STOP_FAILED, CLEANUP_FAILED) are absent on purpose: a container that outlives
+# its run is an orphan, not a workload we started.
+LIVE_FILLER_RUN_STATUSES = frozenset({"STARTING", "RUNNING", "STOPPING"})
 # DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.

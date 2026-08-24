@@ -2,7 +2,11 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from neurons.validators.src.protocol.vc_protocol.compute_requests import (
+    FillerRunActiveResponse,
+    PodRentalActiveResponse,
+    RentedExecutorsResponse,
+)
 from neurons.validators.src.services.const import POD_CONTAINER_PREFIX
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
@@ -685,10 +689,10 @@ async def test_failed_live_query_never_withholds(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_a_filler_started_after_the_snapshot_is_counted_separately(context_factory):
-    # Review ask (PR #1242): the backend can start a filler after this cycle's rented_data
-    # snapshot. It still reads as foreign, but the shadow week must be able to count the case.
-    late_filler = "filler_9622d623-dcb3-27dc-52c6-ef6c937df3ae"
+async def test_a_filler_started_after_the_snapshot_is_not_foreign(context_factory):
+    # DAH-2757: the backend can start a filler after this cycle's rented_data snapshot. Its
+    # container is ours, so the backend re-check must clear it and leave only the squatter.
+    late_filler = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
     state = _idle_state(
         [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
         [
@@ -697,11 +701,133 @@ async def test_a_filler_started_after_the_snapshot_is_counted_separately(context
         ],
         fillers=[FILLER],
     )
-    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=True, status="RUNNING"
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
 
     with foreign_gate():
         result = await GpuUsageCheck().run(ctx)
 
     seen = result.event.what_we_saw
-    assert [p.container_name for p in seen["foreign_processes"]] == [late_filler, "nodexo-rental-1cd1ba2b"]
-    assert [p.container_name for p in seen["lium_named_outside_snapshot"]] == [late_filler]
+    assert [p.container_name for p in seen["foreign_processes"]] == ["nodexo-rental-1cd1ba2b"]
+    assert seen["lium_named_outside_snapshot"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_filler_mid_transition_is_not_foreign(context_factory):
+    # STARTING is exactly the state the race produces: the run exists, the container is up, and
+    # the cycle's snapshot predates both.
+    late_filler = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": late_filler}],
+        fillers=[FILLER],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=False, status="STARTING"
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_pod_started_after_the_snapshot_is_not_foreign(context_factory):
+    late_pod = f"{POD_CONTAINER_PREFIX}bfc8838d-7967-43b0-90b9-2917ffbffe5a"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": late_pod}],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=True)
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_filler_container_is_still_foreign(context_factory):
+    # A container that outlives its run is an orphan. Only the live states buy a pass, or an old
+    # run id of the provider's own node would launder any workload they like.
+    stale_filler = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": stale_filler}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=False, status="STOPPED"
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+    assert [p.container_name for p in result.event.what_we_saw["lium_named_outside_snapshot"]] == [
+        stale_filler
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_forged_filler_id_the_backend_never_issued_still_fails(context_factory):
+    forged = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [{"pid": 4242, "info": "0::/../docker-a.scope", "container_name": forged}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_lium_name_without_a_uuid_is_never_asked_about(context_factory):
+    # `filler_whatever` cannot be a run the backend issued, and asking would only earn a 422 —
+    # which the client reports as "unreachable" and the gate reads as a pass.
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
+        [{"pid": 4242, "info": "0::/../docker-a.scope", "container_name": "filler_not-a-uuid"}],
+    )
+    services = build_services()
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    services.backend.get_filler_run_active.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_backend_never_judges_a_lium_named_container(context_factory):
+    late_filler = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": late_filler}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = None
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
