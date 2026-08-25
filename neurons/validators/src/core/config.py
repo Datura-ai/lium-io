@@ -202,6 +202,10 @@ class Settings(BaseSettings):
         default=True,
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
+    # DAH-2667: measure a RoCE fabric with ib_write_bw between two free hosts of one segment,
+    # rather than inferring it from the addresses alone. Off until the probe has run on real RoCE
+    # hardware: it takes the cards of two idle hosts for a few seconds.
+    ROCE_LINK_PROBE_ENABLED: bool = Field(env="ROCE_LINK_PROBE_ENABLED", default=False)
     # ISSUE-050 filler liveness. CHECK_ENABLED is the master switch: shadow mode runs the SSH
     # probe + backend re-check and logs the verdict, but never withholds incentive; switching it
     # off disables the probe entirely. ENFORCEMENT (only effective while CHECK_ENABLED is on)

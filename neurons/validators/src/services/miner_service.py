@@ -64,6 +64,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService, inflight_creates
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
+from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
@@ -371,6 +372,17 @@ class MinerService:
                     results = self._filter_task_results(msg.executors, raw_results, default_extra)
                     results.extend(
                         self._build_manual_rental_results(payload, rented_data, existing=results)
+                    )
+
+                    # DAH-2667: while the miner's key is still installed and its idle hosts are
+                    # free, measure every RoCE pair. Best effort — an unmeasured pair is simply not
+                    # sold as a cluster.
+                    await measure_and_attach(
+                        results,
+                        self.ssh_service.decrypt_payload(
+                            my_key.ss58_address, private_key.decode("utf-8")
+                        ),
+                        default_extra,
                     )
 
                     logger.info(
@@ -1938,6 +1950,17 @@ class MinerService:
                 results = self._filter_task_results(msg.executors, raw_results, default_extra)
                 results.extend(
                     self._build_manual_rental_results(payload, rented_data, existing=results)
+                )
+
+                # DAH-2667: while the miner's key is still installed and its idle hosts are free,
+                # measure every RoCE pair. Best effort — an unmeasured pair is simply not sold as a
+                # cluster.
+                await measure_and_attach(
+                    results,
+                    self.ssh_service.decrypt_payload(
+                        my_key.ss58_address, private_key.decode("utf-8")
+                    ),
+                    default_extra,
                 )
 
                 logger.info(
