@@ -154,3 +154,43 @@ async def test_calculate_mining_scores_whole_box_when_backend_lacks_gpu_counts(m
     assert incentive.job_results[MINER_HOTKEY] == [job]
     assert job.mining_score == pytest.approx(1.0 * 0.3 * 8 / 8)
     assert incentive.unrented_count_by_bucket == {}
+
+
+def test_expand_marks_the_free_portion_as_a_split_remainder():
+    # Arrange
+    job = _make_job(gpu_count=8, rented_gpu_count=1)
+    incentive = _build_incentive(job)
+
+    # Act
+    incentive._expand_partially_rented_split_results()
+
+    # Assert
+    _, free_portion = incentive.job_results[MINER_HOTKEY]
+    assert free_portion.is_split_remainder is True
+    assert job.is_split_remainder is False
+
+
+def test_remainder_is_bucketed_one_card_at_a_time_even_when_its_size_has_a_price():
+    # Arrange — 8 free GPUs of a 16x node: 8 IS a priced tier, but the rest of the node is
+    # rented, so the remainder must still be rated at the minimum-split tier.
+    remainder = _make_job(gpu_count=8, rented_gpu_count=None, is_rented=False)
+    remainder.is_split_remainder = True
+    cap_spec = {1: 10, 8: 4}
+
+    # Act
+    bucket = RentalPriceIncentive._resolve_bucket(remainder, cap_spec)
+
+    # Assert
+    assert bucket == 1
+
+
+def test_a_normal_idle_split_node_still_uses_its_own_priced_bucket():
+    # Arrange
+    idle_node = _make_job(gpu_count=8, rented_gpu_count=None, is_rented=False)
+    cap_spec = {1: 10, 8: 4}
+
+    # Act
+    bucket = RentalPriceIncentive._resolve_bucket(idle_node, cap_spec)
+
+    # Assert
+    assert bucket == 8
