@@ -506,8 +506,8 @@ class RentalPriceIncentive(DefaultIncentive):
         """
         if not (result.supports_gpu_splitting and result.gpu_splitting_min_count):
             return result.gpu_count
-        # A remainder is not sellable as a bundle of its own size — the rest of the node is
-        # rented — so it is always rated one card at a time (DAH-2467).
+        # DAH-2467: a remainder never claims a bundle tier that whole-node providers compete for.
+        # Its own size IS rentable as one bundle — this is a pricing decision, not a limitation.
         if result.is_split_remainder:
             return result.gpu_splitting_min_count
         if cap_spec.get(result.gpu_count, 0) > 0:
@@ -566,7 +566,12 @@ class RentalPriceIncentive(DefaultIncentive):
     @staticmethod
     def _free_gpu_count_of_partially_rented_split(result: JobResult) -> int | None:
         """Free-GPU count when the result is a partially rented split node, else None."""
-        if not (result.is_rented and result.supports_gpu_splitting and result.rented_gpu_count):
+        if not (
+            result.is_rented
+            and result.supports_gpu_splitting
+            and result.gpu_splitting_min_count
+            and result.rented_gpu_count
+        ):
             return None
         free_gpu_count: int = result.gpu_count - result.rented_gpu_count
         return free_gpu_count if free_gpu_count > 0 else None
@@ -611,8 +616,7 @@ class RentalPriceIncentive(DefaultIncentive):
         #  calculate unrented gpu count that's eligible for rental price incentive
         if result.eligible_for_rental_share:
             # update result state
-            # A remainder is priced one card at a time for the same reason it is bucketed that
-            # way — the rest of the node is rented, so its own size is not a sellable bundle.
+            # Priced one card at a time, matching the tier it was bucketed into above.
             rated_gpu_count: int = (
                 result.gpu_splitting_min_count if result.is_split_remainder else result.gpu_count
             )
@@ -621,7 +625,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
             )
             # GPU splitting: always pick the best of the bundle rate vs min-count rate
-            if result.supports_gpu_splitting and result.gpu_splitting_min_count and not result.is_split_remainder:
+            if result.supports_gpu_splitting and result.gpu_splitting_min_count:
                 rate_for_min = get_hourly_rate(
                     result.gpu_model, result.gpu_splitting_min_count,
                     self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
