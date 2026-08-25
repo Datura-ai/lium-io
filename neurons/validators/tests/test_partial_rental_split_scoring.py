@@ -90,6 +90,9 @@ def test_expand_splits_partially_rented_split_node():
     [
         _make_job(rented_gpu_count=None),  # backend doesn't report per-pod gpu_count
         _make_job(rented_gpu_count=8),  # fully rented
+        # executor_gpu rows and the scrape drift apart, so the pods claim more GPUs than
+        # the box reports: score the whole box as rented instead of inventing free GPUs.
+        _make_job(gpu_count=8, rented_gpu_count=9),
         _make_job(supports_gpu_splitting=False),  # no split opt-in
         _make_job(is_rented=False, rented_gpu_count=None),  # idle node
     ],
