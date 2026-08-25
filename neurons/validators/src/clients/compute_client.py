@@ -68,6 +68,7 @@ from websockets.asyncio.client import ClientConnection
 from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
+from services.docker_service import inflight_creates
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
@@ -746,6 +747,29 @@ class ComputeClient:
         return miner.axon_info
 
     async def miner_driver(
+        self,
+        job_request: ContainerCreateRequest
+        | ContainerDeleteRequest
+        | ContainerStopRequest
+        | ContainerStartRequest
+        | AddSshPublicKeyRequest
+        | RemoveSshPublicKeysRequest
+        | ExecutorRentFinishedRequest
+        | GetPodLogsRequestFromServer
+        | AddDebugSshKeyRequest
+        | BackupContainerRequest
+        | RestoreContainerRequest
+        | InstallJupyterServerRequest
+    ):
+        # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
+        # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
+        # past it and find nothing to cancel — and the create it raced then orphans its container.
+        if not isinstance(job_request, ContainerCreateRequest):
+            return await self._drive_miner_job(job_request)
+        with inflight_creates.track(job_request.pod_id):
+            return await self._drive_miner_job(job_request)
+
+    async def _drive_miner_job(
         self,
         job_request: ContainerCreateRequest
         | ContainerDeleteRequest

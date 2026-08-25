@@ -62,7 +62,7 @@ from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService
+from services.docker_service import DockerService, inflight_creates
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from incentive.config import BASE_GPU_MAP
@@ -159,10 +159,14 @@ def _parse_miner_response(response_data: dict) -> AcceptSSHKeyRequest | FailedRe
 
 
 def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
-    return (
-        isinstance(payload, ContainerDeleteRequest)
-        and payload.workload_kind == WorkloadKind.FILLER
-    )
+    if not isinstance(payload, ContainerDeleteRequest):
+        return False
+    if payload.workload_kind == WorkloadKind.FILLER:
+        return True
+    # DAH-2728: the pending-pod flag this guard reads is set by the very create this delete is
+    # about to cancel, so declining here would leave that create to finish and orphan its
+    # container — the exact failure the delete was sent to prevent.
+    return inflight_creates.is_running(payload.pod_id)
 
 
 JOB_LENGTH = 30
@@ -855,7 +859,16 @@ class MinerService:
             )
 
     async def handle_container(self, payload: ContainerBaseRequest):
-        """Handle container request - uses REST API if configured, otherwise WebSocket."""
+        """Handle container request, tracking the create so its own delete can cancel it."""
+        # DAH-2728: register the create BEFORE the miner handshake — a delete whose handshake is
+        # quicker would otherwise reach the executor first and see a pod that does not exist yet.
+        if not isinstance(payload, ContainerCreateRequest):
+            return await self._route_container(payload)
+        with inflight_creates.track(payload.pod_id):
+            return await self._route_container(payload)
+
+    async def _route_container(self, payload: ContainerBaseRequest):
+        """Route a container request - uses REST API if configured, otherwise WebSocket."""
         if settings.USE_REST_API:
             logger.info(
                 _m(
