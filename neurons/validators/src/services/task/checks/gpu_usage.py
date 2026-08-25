@@ -397,17 +397,21 @@ async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
         filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
             backend_issued_id
         )
+        if filler_run is None:
+            return True
+        if not _the_answer_is_about_this_node(ctx, filler_run.executor_id):
+            return False
         # `active` alone means RUNNING. The status carries the two transitional states, which is
         # where a filler the snapshot missed usually sits — but a backend that sends no status
         # must not turn a run it calls active into a foreign workload.
-        if filler_run is None or filler_run.active:
-            return True
-        return filler_run.status in LIVE_FILLER_RUN_STATUSES
+        return filler_run.active or filler_run.status in LIVE_FILLER_RUN_STATUSES
 
     pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(
         backend_issued_id
     )
-    return pod_rental is None or pod_rental.active
+    if pod_rental is None:
+        return True
+    return _the_answer_is_about_this_node(ctx, pod_rental.executor_id) and pod_rental.active
 
 
 def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:
@@ -423,6 +427,18 @@ def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:
     except ValueError:
         return None
     return canonical_uuid if canonical_uuid == suffix else None
+
+
+def _the_answer_is_about_this_node(ctx: Context, owning_executor_id: str | None) -> bool:
+    """Whether the run the backend described lives on the node the check is looking at.
+
+    The endpoints answer about a run id, which is public on its own host, so a provider with two
+    nodes could name a squatter container after a live run of their honest one. A backend that
+    predates the field sends nothing, and then the fleet snapshot is the only owner test we have.
+    """
+    if owning_executor_id is None:
+        return True
+    return str(owning_executor_id) == str(ctx.executor.uuid)
 
 
 def _containers_claimed_by_another_executor(ctx: Context) -> set[str]:

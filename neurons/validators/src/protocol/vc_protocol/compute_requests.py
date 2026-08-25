@@ -188,6 +188,11 @@ class RentedExecutorsResponse(BaseModel):
 
 class PodRentalActiveResponse(BaseModel):
     active: bool
+    # DAH-2757: the executor the pod belongs to. The answer is about the POD, not about where it
+    # runs, so without this a provider can name a squatter container after a live pod of their
+    # second node. Absent means a backend that predates the field — then the fleet snapshot is the
+    # only owner test we have.
+    executor_id: str | None = None
     rental_closed_at: datetime | None = None
     # DAH-2545: where an encrypted rental volume is mounted in plaintext inside the container.
     # Nothing on the host records it, so without this the validator cannot remount gocryptfs when
@@ -202,6 +207,7 @@ class PodHostRebootRecoveredResponse(BaseModel):
 
 class FillerRunActiveResponse(BaseModel):
     active: bool
+    executor_id: str | None = None  # DAH-2757: the executor the run belongs to, as for the pod above
     status: str | None = None
     started_at: datetime | None = None
 

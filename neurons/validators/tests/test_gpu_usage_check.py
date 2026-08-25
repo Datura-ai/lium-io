@@ -11,7 +11,7 @@ from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX, POD_C
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from tests.helpers import build_context_config, build_services, build_state, default_executor
 
 
 @contextmanager
@@ -876,3 +876,65 @@ async def test_a_filler_the_backend_calls_active_without_a_status_is_ours(contex
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_run_the_backend_places_on_another_node_is_foreign(context_factory):
+    # DAH-2757 follow-up: a run wedged in STARTING leaves the fleet snapshot after 15 minutes, so
+    # the snapshot check cannot see who owns it. The backend now names the owner itself.
+    neighbours_filler = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": neighbours_filler}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=True, status="RUNNING", executor_id="another-executor"
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_run_the_backend_places_on_this_node_is_ours(context_factory):
+    late_filler = "filler_9622d623-dcb3-4a7c-92c6-ef6c937df3ae"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": late_filler}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+        active=False, status="STARTING", executor_id=default_executor().uuid
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_pod_the_backend_places_on_another_node_is_foreign(context_factory):
+    neighbours_pod = f"{POD_CONTAINER_PREFIX}bfc8838d-7967-43b0-90b9-2917ffbffe5a"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": neighbours_pod}],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=True, executor_id="another-executor"
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
