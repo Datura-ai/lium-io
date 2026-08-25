@@ -111,7 +111,7 @@ def test_two_hosts_claiming_one_address_are_not_paired():
     assert pairs_to_measure(results) == []
 
 
-def test_four_hosts_on_one_segment_make_two_pairs():
+def test_four_hosts_on_one_segment_measure_every_pair():
     results = [
         job_result("d", [roce_port("ac10:0509")]),
         job_result("a", [roce_port("ac10:0506")]),
@@ -123,18 +123,22 @@ def test_four_hosts_on_one_segment_make_two_pairs():
 
     assert [(server.executor_info.uuid, client.executor_info.uuid) for server, client in pairs] == [
         ("a", "b"),
+        ("a", "c"),
+        ("a", "d"),
+        ("b", "c"),
+        ("b", "d"),
         ("c", "d"),
     ]
 
 
-def test_an_odd_host_on_a_segment_waits_for_a_partner():
+def test_an_odd_host_on_a_segment_is_still_measured_against_both_others():
     results = [
         job_result("a", [roce_port("ac10:0506")]),
         job_result("b", [roce_port("ac10:0507")]),
         job_result("c", [roce_port("ac10:0508")]),
     ]
 
-    assert len(pairs_to_measure(results)) == 1
+    assert len(pairs_to_measure(results)) == 3
 
 
 def test_the_clients_table_yields_the_average_gigabits():

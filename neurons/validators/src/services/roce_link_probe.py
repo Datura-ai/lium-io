@@ -43,10 +43,12 @@ PROBE_CONTAINER_NAME = "lium_roce_probe"
 # Both sides open this for the out-of-band handshake; the data path is card to card and never
 # touches it. Well above the ephemeral range so it cannot collide with a renter's published port.
 PROBE_HANDSHAKE_PORT = 18515
-PROBE_SECONDS = 5
-# The client has to pull a 38 MB image on a host that has never seen it, hand the handshake to the
-# server and push traffic. Generous, because the cost of a timeout is a pair we refuse to sell.
-PROBE_TIMEOUT_SECONDS = 300
+# A write count, not a duration: the probe proves the wire carries RDMA at all, and a validator
+# cycle has seconds for a miner's whole segment, not minutes. 1000 writes of 64 KiB finish in well
+# under a second on any wire worth selling; the reported rate is a side effect kept for the logs.
+PROBE_ITERATIONS = 1000
+# Covers the one slow step — the first pull of the 38 MB image on a host that has never seen it.
+PROBE_TIMEOUT_SECONDS = 120
 SPEC_KEY = "roce_link_measurement"
 
 ROCE_LINK_LAYER = "ethernet"
@@ -131,11 +133,13 @@ def roce_fabric_host_of(result: JobResult) -> RoceFabricHost | None:
 
 
 def pairs_to_measure(results: list[JobResult]) -> list[tuple[JobResult, JobResult]]:
-    """Disjoint pairs of free hosts on one segment, in the order they will be measured.
+    """EVERY pair of free hosts on one segment, in the order they will be measured.
 
-    Free only: a rented host is carrying someone's job, and the pair could not be sold anyway. Two
-    hosts claiming ONE address are not neighbours but two machines behind different NATs, so both
-    are dropped — the same rule the backend's grouping applies, and for the same reason.
+    Every pair, because the backend sells the whole segment as one cluster — proving a-b and c-d
+    says nothing about a-c, and each run costs well under a second. Free hosts only: a rented host
+    is carrying someone's job, and the pair could not be sold anyway. Two hosts claiming ONE
+    address are not neighbours but two machines behind different NATs, so both are dropped — the
+    same rule the backend's grouping applies, and for the same reason.
     """
     hosts_by_segment: dict[str, list[tuple[JobResult, RoceFabricHost]]] = {}
     for result in results:
@@ -150,8 +154,9 @@ def pairs_to_measure(results: list[JobResult]) -> list[tuple[JobResult, JobResul
     for members in hosts_by_segment.values():
         addressed = _without_addresses_claimed_twice(members)
         addressed.sort(key=lambda member: member[1].roce_address)
-        for first, second in zip(addressed[::2], addressed[1::2]):
-            pairs.append((first[0], second[0]))
+        for index, (server, _) in enumerate(addressed):
+            for client, _ in addressed[index + 1 :]:
+                pairs.append((server, client))
     return pairs
 
 
@@ -183,14 +188,14 @@ def _server_command() -> str:
     return (
         f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1; "
         f"docker run --rm -d --name {PROBE_CONTAINER_NAME} --network host --device /dev/infiniband "
-        f"{PROBE_IMAGE} server {PROBE_HANDSHAKE_PORT} {PROBE_SECONDS}"
+        f"{PROBE_IMAGE} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}"
     )
 
 
 def _client_command(server_roce_address: str) -> str:
     return (
         f"docker run --rm --network host --device /dev/infiniband {PROBE_IMAGE} "
-        f"client {PROBE_HANDSHAKE_PORT} {PROBE_SECONDS} {shlex.quote(server_roce_address)}"
+        f"client {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS} {shlex.quote(server_roce_address)}"
     )
 
 
