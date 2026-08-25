@@ -19,15 +19,17 @@ idle executors, and never touches a rented one.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import shlex
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from ipaddress import IPv4Address, IPv6Address, ip_network
 
 import asyncssh
+from datura.requests.miner_requests import ExecutorSSHInfo
 from pydantic import BaseModel
 
 from core.config import settings
@@ -204,10 +206,10 @@ async def _measure_pair(
         return None
 
     pkey = asyncssh.import_private_key(decrypted_private_key)
-    async with _connect(server.executor_info, pkey) as server_ssh:
+    async with _connected(server.executor_info, pkey) as server_ssh:
         await server_ssh.run(_server_command(), check=False, timeout=PROBE_TIMEOUT_SECONDS)
         try:
-            async with _connect(client.executor_info, pkey) as client_ssh:
+            async with _connected(client.executor_info, pkey) as client_ssh:
                 completed = await client_ssh.run(
                     _client_command(server_host.roce_address),
                     check=False,
@@ -240,14 +242,18 @@ async def _measure_pair(
     return gigabits
 
 
-def _connect(executor_info, pkey):
-    return asyncssh.connect(
+@asynccontextmanager
+async def _connected(
+    executor_info: ExecutorSSHInfo, pkey: asyncssh.SSHKey
+) -> AsyncIterator[asyncssh.SSHClientConnection]:
+    async with asyncssh.connect(
         host=executor_info.address,
         port=executor_info.ssh_port,
         username=executor_info.ssh_username,
         client_keys=[pkey],
         known_hosts=None,
-    )
+    ) as connection:
+        yield connection
 
 
 async def measure_and_attach(
