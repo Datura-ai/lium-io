@@ -261,9 +261,10 @@ class PipelineFactory:
                 # advertised specs already populated by the scrape; it only reads over SSH, mutates
                 # no executor state, and never zeroes score outside CPU_TRUTH_ENFORCEMENT_ENABLED.
                 CpuTruthCheck(),
-                # DAH-2734: non-fatal, signals-only provider-side CPU/disk triage. Pure specs
-                # arithmetic (no SSH), before the rented short-circuit because rented machines
-                # are exactly where the signal matters.
+                # DAH-2734: non-fatal gate on the load the PROVIDER puts on a listed machine.
+                # Specs arithmetic, plus one read-only SSH reading when the load is above the
+                # floor. Before the rented short-circuit: a rented machine is exactly where the
+                # provider's own workload robs someone.
                 ProviderSideLoadCheck(),
                 GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
@@ -334,7 +335,7 @@ class PipelineFactory:
                 GpuVramPrecheck(),
                 # DAH-2671 item 2a: read-only SSH corroboration, safe in dry run (mutates nothing).
                 CpuTruthCheck(),
-                # DAH-2734: pure specs arithmetic, signals-only — safe in dry run.
+                # DAH-2734: specs arithmetic plus a read-only SSH reading — safe in dry run.
                 ProviderSideLoadCheck(),
                 # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.

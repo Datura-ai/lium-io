@@ -888,9 +888,8 @@ def get_docker_info(content: bytes):
         # (fail-safe) instead of silently counting that container's CPU as provider-side.
         try:
             host_cpu_percent, cpu_percents = get_container_cpu_percents(docker_path)
-            data["docker_host_cpu_percent"] = host_cpu_percent
         except Exception:
-            cpu_percents = {}
+            host_cpu_percent, cpu_percents = None, {}
 
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
@@ -898,8 +897,11 @@ def get_docker_info(content: bytes):
         # A stats row whose container is gone from ps burned CPU inside the sampled window but
         # cannot be listed -- the subtraction would book that CPU to the provider, so the host
         # sample is dropped and the CPU signal voids for this cycle (fail-safe).
-        if set(cpu_percents) - {container_id[:12] for container_id in container_ids}:
-            data.pop("docker_host_cpu_percent", None)
+        stats_rows_without_a_container = set(cpu_percents) - {
+            container_id[:12] for container_id in container_ids
+        }
+        if host_cpu_percent is not None and not stats_rows_without_a_container:
+            data["docker_host_cpu_percent"] = host_cpu_percent
 
         containers = []
 

@@ -38,8 +38,12 @@ SN13_SPECS = {
 }
 
 
+# the same machine with the disk part removed, to judge the CPU verdict on its own
+CPU_ONLY_SPECS = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
+
+
 def test_provider_side_load_attributes_cpu_and_disk():
-    load = compute_provider_side_load(SN13_SPECS, {"pod_renter"})
+    load = compute_provider_side_load(SN13_SPECS, 32, {"pod_renter"})
     assert load.cpu_cores == 9.0  # 33% * 32 cores - 1.58 cores
     assert load.disk_kb == 1528 * GB_KB  # 1700 - (100 + 12 + 60)
 
@@ -55,6 +59,7 @@ def test_provider_side_load_clamps_negative_to_zero():
             },
             "hard_disk": {"used": 10 * GB_KB, "images": 20 * GB_KB, "containers": 0, "volumes": 0},
         },
+        4,
         {"pod_a"},
     )
     assert load == ProviderSideLoad(cpu_cores=0.0, disk_kb=0)
@@ -68,6 +73,7 @@ def test_provider_side_load_skips_parts_with_missing_or_bad_inputs():
             "docker": {"host_cpu_percent": 33.0, "containers": [{"name": "pod_x"}]},
             "hard_disk": {"used": 1700 * GB_KB},
         },
+        None,
         {"pod_x"},
     ).is_measured is False
 
@@ -83,6 +89,7 @@ def test_provider_side_load_requires_cpu_percent_on_every_container():
                 "containers": [{"name": "pod_renter", "cpu_percent": 158.0}, {"name": "no_stats_row"}],
             },
         },
+        32,
         {"pod_renter", "no_stats_row"},
     )
     assert load.cpu_cores is None
@@ -103,20 +110,25 @@ def test_a_foreign_container_counts_against_the_provider():
                 ],
             },
         },
+        32,
         {"pod_renter"},
     )
     assert load.cpu_cores == 9.0  # the miner's 7 cores stay on the provider's side
 
 
-def confirming_ssh(host_busy_cores: float, core_count: int, rows: list[tuple[str, str, float]]):
-    """An ssh whose second reading repeats what the scrape saw — the load is real, not a spike."""
+def confirming_runner(host_busy_cores: float, core_count: int, rows: list[tuple[str, str, float]]):
+    """A runner whose second reading repeats what the scrape saw — a real load, not a spike."""
     total_jiffies = 100_000
     busy = int(total_jiffies * host_busy_cores / core_count)
     body = "\n".join(f"{container_id}|{name}|{percent:.2f}%" for container_id, name, percent in rows)
-    stdout = f"0 0\n---\n{body}\n---\n{total_jiffies} {total_jiffies - busy}"
-    ssh = AsyncMock()
-    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout))
-    return ssh
+    replies = [
+        MagicMock(success=True, stdout="0 0"),
+        MagicMock(success=True, stdout=body),
+        MagicMock(success=True, stdout=f"{total_jiffies} {total_jiffies - busy}"),
+    ]
+    runner = AsyncMock()
+    runner.run = AsyncMock(side_effect=replies)
+    return runner
 
 
 def _no_rentals() -> RentedExecutorsResponse:
@@ -154,7 +166,7 @@ def provider_load_gate(*, enforce: bool = True, check_enabled: bool = True):
 async def test_enforcement_zeroes_the_score_on_a_rented_machine(context_factory):
     ctx = context_factory(
         state=_rented_state(SN13_SPECS),
-        ssh=confirming_ssh(10.56, 32, [("c1", "pod_renter", 158.0)]),
+        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)]),
     )
 
     with provider_load_gate(enforce=True):
@@ -175,7 +187,7 @@ async def test_idle_machine_is_judged_the_same_as_a_rented_one(context_factory):
     # The provider cheats the renter when rented and the marketplace when idle — same verdict.
     ctx = context_factory(
         state=build_state(specs=SN13_SPECS, rented_data=_no_rentals()),
-        ssh=confirming_ssh(10.56, 32, [("c1", "pod_renter", 158.0)]),
+        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)]),
     )
 
     with provider_load_gate(enforce=True):
@@ -276,7 +288,7 @@ async def test_a_foreign_container_zeroes_the_score_of_a_rented_machine(context_
     }
     ctx = context_factory(
         state=_rented_state(specs),
-        ssh=confirming_ssh(10.56, 32, [("c1", "pod_renter", 158.0), ("c2", "sn13_miner", 700.0)]),
+        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0), ("c2", "sn13_miner", 700.0)]),
     )
 
     with provider_load_gate(enforce=True):
@@ -291,8 +303,7 @@ async def test_a_foreign_container_zeroes_the_score_of_a_rented_machine(context_
 async def test_no_backend_truth_voids_the_cpu_verdict(context_factory):
     # Without the backend's container list every filler reads as a foreign workload. The
     # foreign-GPU twin gives no verdict in that case and neither does this gate.
-    cpu_only_specs = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
-    ctx = context_factory(state=build_state(specs=cpu_only_specs))  # rented_data defaults to None
+    ctx = context_factory(state=build_state(specs=CPU_ONLY_SPECS))  # rented_data defaults to None
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
@@ -314,7 +325,7 @@ async def test_a_pod_started_after_the_snapshot_is_counted_and_reported(context_
     }
     ctx = context_factory(
         state=build_state(specs=specs, rented_data=_no_rentals()),
-        ssh=confirming_ssh(6.4, 32, [("c1", "pod_fresh", 300.0)]),
+        runner=confirming_runner(6.4, 32, [("c1", "pod_fresh", 300.0)]),
     )
 
     with provider_load_gate(enforce=True):
@@ -375,10 +386,9 @@ async def test_the_monitor_container_shares_the_executor_image_and_is_ours(conte
 async def test_a_spike_that_is_gone_on_the_second_look_costs_nothing(context_factory):
     # Lium's own watchtower pulling an image can hold two cores for a second. It is gone by the
     # second reading, and an honest machine keeps its score.
-    cpu_only_specs = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
     ctx = context_factory(
-        state=_rented_state(cpu_only_specs),
-        ssh=confirming_ssh(1.9, 32, [("c1", "pod_renter", 30.0)]),
+        state=_rented_state(CPU_ONLY_SPECS),
+        runner=confirming_runner(1.9, 32, [("c1", "pod_renter", 30.0)]),
     )
 
     with provider_load_gate(enforce=True):
@@ -392,8 +402,26 @@ async def test_a_spike_that_is_gone_on_the_second_look_costs_nothing(context_fac
 @pytest.mark.asyncio
 async def test_an_unreadable_second_look_withholds_nothing(context_factory):
     # ssh is down, so the load cannot be confirmed. The CPU verdict voids.
-    cpu_only_specs = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
-    ctx = context_factory(state=_rented_state(cpu_only_specs))  # ssh defaults to None
+    ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS))  # runner defaults to None
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.NOT_MEASURABLE.reason
+
+
+@pytest.mark.asyncio
+async def test_a_docker_that_does_not_answer_the_second_look_withholds_nothing(context_factory):
+    # An empty container section means docker did not answer. Reading it as "Lium runs nothing
+    # here" would charge the machine's whole load to the provider.
+    runner = AsyncMock()
+    runner.run = AsyncMock(side_effect=[
+        MagicMock(success=True, stdout="0 0"),
+        MagicMock(success=True, stdout=""),
+        MagicMock(success=True, stdout="1000 0"),
+    ])
+    ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS), runner=runner)
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)

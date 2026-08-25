@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from neurons.validators.tests.helpers import build_scrape_namespace
+from neurons.validators.tests.test_scrape_disk_breakdown import _obfuscation_tables
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -50,7 +51,7 @@ def _fake_run_cmd(outputs: dict[str, str | Exception]):
     return run_cmd
 
 
-def _scrape(outputs: dict[str, str | Exception], host_percent: float = 40.0) -> dict:
+def _scrape(outputs: dict[str, str | Exception], host_percent: float = 40.0) -> dict[str, object]:
     namespace = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         CPU_HELPERS,
@@ -118,3 +119,14 @@ def test_an_unparsable_stats_row_raises_so_the_caller_voids_the_reading():
     # Act / Assert
     with pytest.raises(ValueError):
         scrape["get_container_cpu_percents"]("/tmp/docker")
+
+
+def test_the_cpu_keys_are_registered_in_both_obfuscation_tables():
+    # A key missing from ORIGINAL_KEYS arrives under its raw scrape name and the backend model
+    # strips it; missing from generate_key_mappings it ships in the clear. DAH-2514 shipped
+    # nulls to 347 executors this way.
+    original_keys, mapped_keys = _obfuscation_tables()
+    emitted = {"docker_host_cpu_percent", "each_cpu_percent"}
+
+    assert emitted <= original_keys, f"missing from ORIGINAL_KEYS: {sorted(emitted - original_keys)}"
+    assert emitted <= mapped_keys, f"missing from generate_key_mappings: {sorted(emitted - mapped_keys)}"
