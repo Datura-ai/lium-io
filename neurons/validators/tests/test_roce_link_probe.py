@@ -5,6 +5,7 @@ link layer and carries the host's address as the IPv4-mapped entry of the GID ta
 """
 
 import asyncio
+import time
 
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -15,6 +16,7 @@ from services.roce_link_probe import (
     _server_command,
     RoceLinkMeasurement,
     attach_measurement,
+    budget_left_for_probe,
     measure_and_attach,
     measured_gigabits_per_second,
     pairs_to_measure,
@@ -232,12 +234,44 @@ async def test_a_sweep_that_hangs_gives_up_instead_of_failing_the_miners_cycle(
 
     monkeypatch.setattr(roce_link_probe.settings, "ROCE_LINK_PROBE_ENABLED", True)
     monkeypatch.setattr(roce_link_probe, "PROBE_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(roce_link_probe, "PROBE_MINIMUM_BUDGET_SECONDS", 0.0)
     monkeypatch.setattr(roce_link_probe, "_measure_every_pair", never_finishes)
     results = [job_result("a", [roce_port("ac10:0506")]), job_result("b", [roce_port("ac10:0507")])]
 
-    await measure_and_attach(results, "private-key", {})
+    await measure_and_attach(results, "private-key", {}, time.monotonic())
 
     assert all(result.spec.get("roce_link_measurements") is None for result in results)
+
+
+def test_a_fresh_job_gets_the_whole_probe_budget():
+    assert budget_left_for_probe(time.monotonic()) == roce_link_probe.PROBE_BUDGET_SECONDS
+
+
+def test_a_job_that_already_spent_the_cycle_gets_no_budget_left():
+    """The cycle cancels the miner's whole job at its own wait, so a late sweep must be a short one."""
+    spent_seconds = roce_link_probe.settings.JOB_TIME_OUT - roce_link_probe.CYCLE_JOB_WAIT_SECONDS
+
+    assert budget_left_for_probe(time.monotonic() - spent_seconds) < 0
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_is_skipped_when_the_cycle_has_no_room_for_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Started and cut off halfway costs the cards for nothing — better not to start at all."""
+    measured: list[str] = []
+
+    async def record(*_args: object, **_kwargs: object) -> None:
+        measured.append("ran")
+
+    monkeypatch.setattr(roce_link_probe.settings, "ROCE_LINK_PROBE_ENABLED", True)
+    monkeypatch.setattr(roce_link_probe, "_measure_every_pair", record)
+    results = [job_result("a", [roce_port("ac10:0506")]), job_result("b", [roce_port("ac10:0507")])]
+    spent_seconds = roce_link_probe.settings.JOB_TIME_OUT - roce_link_probe.CYCLE_JOB_WAIT_SECONDS
+
+    await measure_and_attach(results, "private-key", {}, time.monotonic() - spent_seconds)
+
+    assert measured == []
 
 
 def test_both_probe_containers_can_pin_the_memory_a_real_card_registers():
@@ -245,6 +279,14 @@ def test_both_probe_containers_can_pin_the_memory_a_real_card_registers():
     for command in (_server_command(), _client_command("10.0.0.5")):
         assert "--cap-add IPC_LOCK" in command
         assert "--ulimit memlock=-1:-1" in command
+
+
+def test_the_server_container_ends_itself_if_no_client_ever_comes():
+    """A cancelled sweep skips the cleanup, and a probe must not outlive its own measurement."""
+    command = _server_command()
+
+    assert f"--entrypoint timeout {roce_link_probe.PROBE_IMAGE}" in command
+    assert f"{roce_link_probe.PROBE_TIMEOUT_SECONDS} {roce_link_probe.PROBE_ENTRYPOINT} server" in command
 
 
 @pytest.mark.asyncio
@@ -257,4 +299,6 @@ async def test_a_probe_that_raises_never_reaches_the_caller(monkeypatch: pytest.
     monkeypatch.setattr(roce_link_probe.settings, "ROCE_LINK_PROBE_ENABLED", True)
     monkeypatch.setattr(roce_link_probe, "pairs_to_measure", explode)
 
-    await measure_and_attach([job_result("a", [roce_port("ac10:0506")])], "private-key", {})
+    await measure_and_attach(
+        [job_result("a", [roce_port("ac10:0506")])], "private-key", {}, time.monotonic()
+    )

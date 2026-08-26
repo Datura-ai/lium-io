@@ -249,6 +249,9 @@ class MinerService:
             )
         
         loop = asyncio.get_event_loop()
+        # DAH-2667: what the RoCE probe subtracts from the cycle's own wait, so a job that already
+        # spent most of it takes a shorter sweep instead of overrunning and scoring the miner zero.
+        job_started_at: float = time.monotonic()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
             "job_batch_id": payload.job_batch_id,
@@ -383,6 +386,7 @@ class MinerService:
                             my_key.ss58_address, private_key.decode("utf-8")
                         ),
                         default_extra,
+                        job_started_at,
                     )
 
                     logger.info(
@@ -1853,6 +1857,9 @@ class MinerService:
         default_docker_image_digests: dict[str, str],
     ):
         """REST API version of request_job_to_miner."""
+        # DAH-2667: see the WebSocket path — the RoCE probe measures the cycle's remaining time
+        # from here.
+        job_started_at: float = time.monotonic()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
             "job_batch_id": payload.job_batch_id,
@@ -1961,6 +1968,7 @@ class MinerService:
                         my_key.ss58_address, private_key.decode("utf-8")
                     ),
                     default_extra,
+                    job_started_at,
                 )
 
                 logger.info(

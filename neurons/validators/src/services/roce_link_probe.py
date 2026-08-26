@@ -23,6 +23,7 @@ import asyncio
 import logging
 import re
 import shlex
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ from services.task.models import JobResult
 logger = logging.getLogger(__name__)
 
 PROBE_IMAGE = "daturaai/lium-rdma-probe:0.0.1"
+# The image's own entrypoint, named again because the server run replaces it with `timeout`.
+PROBE_ENTRYPOINT = "/usr/local/bin/lium-roce-probe"
 PROBE_CONTAINER_NAME = "lium_roce_probe"
 # Both sides open this for the out-of-band handshake; the data path is card to card and never
 # touches it. Well above the ephemeral range so it cannot collide with a renter's published port.
@@ -50,10 +53,19 @@ PROBE_HANDSHAKE_PORT = 18515
 PROBE_ITERATIONS = 1000
 # Covers the one slow step — the first pull of the 38 MB image on a host that has never seen it.
 PROBE_TIMEOUT_SECONDS = 120
-# The whole sweep's budget. The caller's timeout cancels the miner's entire job and scores it
-# zero, so the probe stops itself well before that: a cycle is 15 minutes and every other check
-# has run by now.
+# The whole sweep's ceiling. The real budget is whatever the cycle still has left (see
+# `budget_left_for_probe`), because the caller's timeout cancels the miner's entire job and scores
+# it zero.
 PROBE_BUDGET_SECONDS = 180
+# What `core/validator.py` subtracts from `JOB_TIME_OUT` for its own `asyncio.wait`: every job
+# still running then is cancelled and that miner scores zero. Keep the two in step.
+CYCLE_JOB_WAIT_SECONDS = 50
+# What the sweep leaves behind for the rest of the job: removing the validator's key from every
+# host and returning the results still have to happen inside the cycle's wait.
+PROBE_TAIL_MARGIN_SECONDS = 30
+# Below this there is no room for even one pair, so the sweep is skipped rather than started and
+# cut off halfway.
+PROBE_MINIMUM_BUDGET_SECONDS = 20
 # `ibv_reg_mr` pins the buffer it registers, so a real card needs both of these or the
 # registration fails and no pair ever measures (DAH-2571). Soft-RoCE does not need them,
 # which is why an emulated device hides the gap.
@@ -210,10 +222,14 @@ def attach_measurement(result: JobResult, measurement: RoceLinkMeasurement) -> N
 
 
 def _server_command() -> str:
+    # `timeout` in front of the probe, because the server waits for a client forever and the
+    # cleanup below can be cancelled with the sweep. A container that outlives its measurement
+    # holds a card a renter is about to take, so it ends itself even if nobody comes back for it.
     return (
         f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1; "
         f"docker run --rm -d --name {PROBE_CONTAINER_NAME} --network host --device /dev/infiniband "
-        f"{RDMA_DOCKER_FLAGS} {PROBE_IMAGE} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}"
+        f"{RDMA_DOCKER_FLAGS} --entrypoint timeout {PROBE_IMAGE} {PROBE_TIMEOUT_SECONDS} "
+        f"{PROBE_ENTRYPOINT} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}"
     )
 
 
@@ -286,19 +302,37 @@ async def _connected(
         yield connection
 
 
+def budget_left_for_probe(job_started_at: float) -> float:
+    """How long the sweep may run: its own ceiling, or the time this job has left if that is less.
+
+    A miner whose executor tasks took most of the cycle has no room for a full sweep, and taking it
+    anyway would push the job past the wait in `core/validator.py` — which cancels it and scores
+    that miner zero. Fewer measured pairs is the cheap failure; a lost cycle is not.
+    """
+    seconds_spent: float = time.monotonic() - job_started_at
+    seconds_left: float = (
+        settings.JOB_TIME_OUT - CYCLE_JOB_WAIT_SECONDS - seconds_spent - PROBE_TAIL_MARGIN_SECONDS
+    )
+    return min(float(PROBE_BUDGET_SECONDS), seconds_left)
+
+
 async def measure_and_attach(
-    results: list[JobResult], decrypted_private_key: str, log_extra: dict
+    results: list[JobResult], decrypted_private_key: str, log_extra: dict, job_started_at: float
 ) -> None:
     """Measure every free RoCE pair of this miner and record each result in both hosts' specs.
 
-    Bounded by `PROBE_BUDGET_SECONDS` and best effort throughout. The whole sweep sits inside one
-    `asyncio.wait_for`, because the caller's own timeout cancels the miner's ENTIRE job and scores
-    it zero for the cycle — a probe must never cost a miner its score. Pairs measured before the
-    budget ran out keep their entries; the rest are simply not proven this cycle.
+    Best effort throughout. The whole sweep sits inside one `asyncio.wait_for`, because the caller's
+    own timeout cancels the miner's ENTIRE job and scores it zero for the cycle — a probe must never
+    cost a miner its score. Pairs measured before the budget ran out keep their entries; the rest
+    are simply not proven this cycle.
+
+    `job_started_at` is `time.monotonic()` taken when this miner's job began, and it is what keeps
+    the sweep inside the cycle that is already running.
     """
     if not settings.ROCE_LINK_PROBE_ENABLED:
         return
 
+    budget_seconds: float = 0.0
     # Nothing in here may reach the caller: an exception in the probe would abort the miner's whole
     # job and score it zero for the cycle, which is a far worse outcome than an unmeasured pair.
     try:
@@ -306,21 +340,33 @@ async def measure_and_attach(
         if not pairs:
             return
 
+        budget_seconds = budget_left_for_probe(job_started_at)
+        if budget_seconds < PROBE_MINIMUM_BUDGET_SECONDS:
+            logger.info(
+                _m(
+                    "RoCE link probe skipped, the cycle has no time left",
+                    extra=get_extra_info({**log_extra, "budget_seconds": budget_seconds}),
+                ),
+            )
+            return
+
         logger.info(
             _m(
                 "Measuring RoCE links before the backend sells them",
-                extra=get_extra_info({**log_extra, "pairs": len(pairs)}),
+                extra=get_extra_info(
+                    {**log_extra, "pairs": len(pairs), "budget_seconds": budget_seconds}
+                ),
             ),
         )
         await asyncio.wait_for(
             _measure_every_pair(pairs, decrypted_private_key, log_extra),
-            timeout=PROBE_BUDGET_SECONDS,
+            timeout=budget_seconds,
         )
     except asyncio.TimeoutError:
         logger.warning(
             _m(
                 "RoCE link probe ran out of its budget",
-                extra=get_extra_info({**log_extra, "budget_seconds": PROBE_BUDGET_SECONDS}),
+                extra=get_extra_info({**log_extra, "budget_seconds": budget_seconds}),
             ),
         )
     except Exception as error:
