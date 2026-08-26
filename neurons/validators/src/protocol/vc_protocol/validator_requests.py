@@ -76,6 +76,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     netuid: int | None = None
     scored_at: datetime | None = None
     incentive: float | None = None
+    # DAH-2467: how `incentive` splits across the two pools; both None on an old publisher.
+    incentive_rented: float | None = None
+    incentive_idle: float | None = None
     incentive_source: str | None = None
     node_state_at_cycle: str | None = None
     incentive_formula_version: str | None = None

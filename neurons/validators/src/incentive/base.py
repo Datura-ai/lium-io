@@ -60,8 +60,22 @@ class BaseIncentive(ABC):
         for hotkey, results in self.job_results.items():
             for result in results:
                 await self._post_process_job_result(hotkey, result)
+                self._split_incentive_across_pools(result)
 
         log_for_monitoring(self.job_results, t1, getattr(self, "unrented_count_by_bucket", None))
+
+    @staticmethod
+    def _split_incentive_across_pools(result: JobResult) -> None:
+        """DAH-2467: the single place a scored result gets its rented/idle breakdown.
+
+        A whole node earns from one pool only, so the pair is just its incentive on the
+        side it was scored on. A partially rented split node is merged from two portions
+        afterwards, which overwrites the pair with the real two-pool split.
+        """
+        if result.incentive is None:
+            return
+        rented: float = result.incentive if result.is_rented else 0.0
+        result.set_incentive_split(rented, result.incentive - rented)
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Callback before post-processing a job result.

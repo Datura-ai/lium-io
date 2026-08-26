@@ -532,6 +532,8 @@ class RentalPriceIncentive(DefaultIncentive):
         self._merge_partially_rented_split_results(split_portions)
 
     def _expand_partially_rented_split_results(self) -> list[_PartiallyRentedSplitPortions]:
+        if not settings.ENABLE_SPLIT_PARTIAL_RENTAL_SCORING:
+            return []
         split_portions: list[_PartiallyRentedSplitPortions] = []
         for sibling_results in self.job_results.values():
             for result in list(sibling_results):
@@ -581,17 +583,25 @@ class RentalPriceIncentive(DefaultIncentive):
         # miner_incentives already accumulated both portions during post-processing, so summing
         # here only restores the per-executor view the downstream consumers read.
         for portions in split_portions:
-            portions.rented_portion.gpu_count += portions.free_portion.gpu_count
-            portions.rented_portion.incentive = (portions.rented_portion.incentive or 0.0) + (
-                portions.free_portion.incentive or 0.0
-            )
-            portions.rented_portion.incentive_logs.extend(portions.free_portion.incentive_logs)
+            merged: JobResult = portions.rented_portion
+            free: JobResult = portions.free_portion
+            # Both formula snapshots must be taken while each portion still carries the GPU
+            # count its own formula was computed on.
+            merged._split_formula_inputs = {
+                "rented_gpu_count": merged.gpu_count,
+                "free_gpu_count": free.gpu_count,
+                "mining": merged.incentive_formula_inputs,
+                "unrented": free.incentive_formula_inputs,
+            }
+            merged.gpu_count += free.gpu_count
+            merged.set_incentive_split(merged.incentive or 0.0, free.incentive or 0.0)
+            merged.incentive_logs.extend(free.incentive_logs)
             # DAH-2340 reasons ride a separate list — the unrented portion's zero reasons would
             # otherwise never reach the backend.
-            portions.rented_portion.zero_incentive_reasons.extend(portions.free_portion.zero_incentive_reasons)
+            merged.zero_incentive_reasons.extend(free.zero_incentive_reasons)
             # Drop by identity: two portions of one executor can compare equal as pydantic models.
             portions.sibling_results[:] = [
-                result for result in portions.sibling_results if result is not portions.free_portion
+                result for result in portions.sibling_results if result is not free
             ]
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:

@@ -313,6 +313,8 @@ class ComputeClient:
                             netuid=data.get("netuid"),
                             scored_at=data.get("scored_at"),
                             incentive=data.get("incentive"),
+                            incentive_rented=data.get("incentive_rented"),
+                            incentive_idle=data.get("incentive_idle"),
                             incentive_source=data.get("incentive_source"),
                             node_state_at_cycle=data.get("node_state_at_cycle"),
                             incentive_formula_version=data.get("incentive_formula_version"),

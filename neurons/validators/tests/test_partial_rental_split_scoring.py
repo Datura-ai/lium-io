@@ -14,6 +14,8 @@ from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.task_service import JobResult
 
+from core.config import settings
+
 H200 = "NVIDIA H200"  # base model H200 is rental-eligible by default
 MINER_HOTKEY = "miner-hotkey-1"
 
@@ -197,3 +199,88 @@ def test_a_normal_idle_split_node_still_uses_its_own_priced_bucket():
 
     # Assert
     assert bucket == 8
+
+
+@pytest.mark.asyncio
+async def test_merged_result_reports_a_mixed_two_pool_breakdown(monkeypatch):
+    # Arrange
+    job = _make_job(gpu_count=8, rented_gpu_count=1)
+    incentive = _build_incentive(job)
+    monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
+
+    # Act
+    await incentive.calculate_mining_scores()
+
+    # Assert — the pair splits the two pools and sums back to the stored incentive.
+    assert job.incentive_rented == pytest.approx(incentive.mining_share)
+    assert job.incentive_idle == pytest.approx(0.1)
+    assert job.incentive == pytest.approx(job.incentive_rented + job.incentive_idle)
+    assert job.incentive_source == "mixed"
+    assert job.node_state_at_cycle == "mixed"
+
+    # The formula reproduces both halves: mining on the rented GPU, rental price on the free ones.
+    assert job.incentive_formula_version == "mixed_v1"
+    inputs = job.incentive_formula_inputs
+    assert inputs["rented_gpu_count"] == 1
+    assert inputs["free_gpu_count"] == 7
+    assert inputs["mining"]["gpu_count"] == 1
+    assert inputs["mining"]["mining_score"] == pytest.approx(job.mining_score)
+    assert inputs["unrented"]["gpu_count"] == 7
+    assert inputs["unrented"]["max_cap"] is not None
+
+    # The miner-facing log ends with the total.
+    assert job.full_log_text.splitlines()[-1] == (
+        f"Partially rented split node total: rented {job.incentive_rented} "
+        f"+ idle {job.incentive_idle} = {job.incentive}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plain_rented_node_keeps_its_single_pool_labels(monkeypatch):
+    # Arrange — fully rented, so nothing is expanded.
+    job = _make_job(gpu_count=8, rented_gpu_count=8)
+    incentive = _build_incentive(job)
+    monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
+
+    # Act
+    await incentive.calculate_mining_scores()
+
+    # Assert
+    assert job.incentive_rented == pytest.approx(job.incentive)
+    assert job.incentive_idle == 0.0
+    assert job.incentive_source == "rented_emission"
+    assert job.node_state_at_cycle == "rented"
+    assert job.incentive_formula_version == "mining_v1"
+
+
+@pytest.mark.asyncio
+async def test_plain_idle_node_earns_only_in_the_unrented_pool(monkeypatch):
+    # Arrange
+    job = _make_job(gpu_count=8, rented_gpu_count=None, is_rented=False)
+    incentive = _build_incentive(job)
+    monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
+
+    # Act
+    await incentive.calculate_mining_scores()
+
+    # Assert
+    assert job.incentive_rented == 0.0
+    assert job.incentive_idle == pytest.approx(job.incentive)
+    assert job.incentive_source == "idle_incentive"
+    assert job.node_state_at_cycle == "idle"
+    assert job.incentive_formula_version == "rental_price_v2"
+
+
+def test_expansion_is_off_when_the_feature_flag_is_off(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(settings, "ENABLE_SPLIT_PARTIAL_RENTAL_SCORING", False)
+    job = _make_job(gpu_count=8, rented_gpu_count=1)
+    incentive = _build_incentive(job)
+
+    # Act
+    split_portions = incentive._expand_partially_rented_split_results()
+
+    # Assert — whole-box scoring, exactly as before DAH-2467.
+    assert split_portions == []
+    assert incentive.job_results[MINER_HOTKEY] == [job]
+    assert job.gpu_count == 8

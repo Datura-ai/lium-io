@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -63,6 +63,9 @@ class JobResult(BaseModel):
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
     incentive: float | None = None                      # Incentive score for the executor in this cycle
+    # DAH-2467: how `incentive` splits across the two pools. Always sums to `incentive`.
+    incentive_rented: float | None = None
+    incentive_idle: float | None = None
     mining_share: float | None = None
     total_mining_score: float | None = None
 
@@ -96,6 +99,16 @@ class JobResult(BaseModel):
     # DAH-2340 wire reasons for the backend; [] when no catalogued reason was recorded.
     zero_incentive_reasons: list[IncentiveReason] = Field(default_factory=list, exclude=True)
 
+    # DAH-2467: set only on a merged split node — the assembled "mixed_v1" formula inputs,
+    # snapshotted from both portions before the merge restored the whole-box gpu_count.
+    _split_formula_inputs: dict[str, Any] | None = PrivateAttr(default=None)
+
+    def set_incentive_split(self, rented: float, idle: float) -> None:
+        """Record the two-pool breakdown and keep `incentive` equal to their sum."""
+        self.incentive_rented = rented
+        self.incentive_idle = idle
+        self.incentive = rented + idle
+
     def record_incentive_log(self, line: "MinerLogLine") -> None:
         """Append the line to the miner-facing log; zero-incentive lines also become data for the backend."""
         self.incentive_logs.append(line.to_log_line())
@@ -109,19 +122,32 @@ class JobResult(BaseModel):
             return "unknown"
         if self.incentive <= 0:
             return "zero_incentive"
+        if self._is_mixed:
+            return "mixed"
         return "rented_emission" if self.is_rented else "idle_incentive"
 
     @property
+    def _is_mixed(self) -> bool:
+        """True when this cycle paid the executor from both pools (DAH-2467)."""
+        return (self.incentive_rented or 0.0) > 0 and (self.incentive_idle or 0.0) > 0
+
+    @property
     def node_state_at_cycle(self) -> str:
+        if self._is_mixed:
+            return "mixed"
         return "rented" if self.is_rented else "idle"
 
     @property
     def incentive_formula_version(self) -> str:
+        if self._split_formula_inputs is not None:
+            return "mixed_v1"
         return "rental_price_v2" if self.eligible_for_rental_share else "mining_v1"
 
     @property
     def incentive_formula_inputs(self) -> dict[str, Any]:
         """Snapshot the exact scalar inputs needed to explain this cycle's incentive."""
+        if self._split_formula_inputs is not None:
+            return self._split_formula_inputs
         if self.eligible_for_rental_share:
             return {
                 "rental_share": self.rental_share,
@@ -174,11 +200,17 @@ class JobResult(BaseModel):
         }
 
     @property
-    def full_log_text(self):
+    def full_log_text(self) -> str:
         """Return the full log text including the incentive logs."""
         if not self.log_text or not self.incentive_logs:
             return self.log_text
-        return self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
+        text: str = self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
+        if self._split_formula_inputs is not None:
+            text += (
+                f"\n\nPartially rented split node total: rented {self.incentive_rented} "
+                f"+ idle {self.incentive_idle} = {self.incentive}"
+            )
+        return text
 
     @property
     def is_successful(self):
