@@ -169,17 +169,21 @@ def docker_containers(specs: dict[str, Any]) -> list[ContainerRow]:
     ]
 
 
-def infra_container_names(specs: dict[str, Any]) -> set[str]:
-    """Lium's own probes, matched by name because they carry no backend-issued id.
+def infra_container_names(specs: dict[str, Any], excused_by_digest: set[str]) -> set[str]:
+    """Lium's probes and the rest of the executor stack, matched by name because they carry no
+    backend-issued id.
 
-    A name is free to forge, so the whole tier is capped TOGETHER at the gate's own floor:
-    six containers wearing our probe names can never excuse a nine-core miner. The honest case
-    is a link probe busy-polling one core while the port and health probes idle.
+    A name is free to forge, so the whole tier is capped TOGETHER at the gate's own floor: six
+    containers wearing our names can never excuse a nine-core miner. The honest case is a link
+    probe busy-polling one core beside an idle runner, watchtower, autoheal and postgres. What
+    the image digest already excuses is left out of the sum - the executor container runs the
+    scrape itself and must not spend the probes' budget.
     """
     infra_rows = [
         row
         for row in docker_containers(specs)
         if row.name.startswith(LIUM_INFRA_CONTAINER_PREFIXES)
+        and row.container_id not in excused_by_digest
     ]
     if sum(row.cpu_percent or 0.0 for row in infra_rows) > CLAIMED_EXCUSE_CORES * 100:
         return set()
@@ -232,8 +236,9 @@ async def lium_containers(ctx: Context) -> set[str] | None:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
-    containers.update(executor_stack_container_ids(specs))
-    containers.update(infra_container_names(specs))
+    stack_ids: set[str] = executor_stack_container_ids(specs)
+    containers.update(stack_ids)
+    containers.update(infra_container_names(specs, stack_ids))
     containers.discard("")
     return containers
 
@@ -255,6 +260,8 @@ def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
     ids: set[str] = {executor_id}
     if executor_digest:
         ids.update(row.container_id for row in rows if row.digest == executor_digest)
+    # an empty id is "the scrape did not say", never a container to excuse
+    ids.discard("")
     return ids
 
 

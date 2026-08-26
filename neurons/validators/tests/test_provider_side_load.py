@@ -580,3 +580,26 @@ async def test_a_disk_only_verdict_never_withholds_money(context_factory):
     assert result.event.severity == "warning"
     assert result.event.what_we_saw["provider_disk_gb"] == 1528.0
     assert result.event.impact == "Disk is observed only: score was NOT changed"
+
+
+@pytest.mark.asyncio
+async def test_the_rest_of_the_executor_stack_is_not_the_providers_load(context_factory):
+    # watchtower, autoheal, the runner and postgres run beside the executor under the same
+    # compose project. They are Lium's, and at two cores they would zero an honest node.
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "host_cpu_percent": 8.0,
+            "containers": [
+                {"name": "executor-watchtower-1", "cpu_percent": 100.0},
+                {"name": "executor-autoheal-1", "cpu_percent": 50.0},
+            ],
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["provider_cpu_cores"] == 1.0  # 2.56 host - 1.5 the stack

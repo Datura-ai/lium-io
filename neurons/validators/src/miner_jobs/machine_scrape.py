@@ -825,7 +825,7 @@ def get_vloopback_volume_bytes(docker_root_dir):
     return total
 
 
-def get_container_log_bytes(docker_root_dir):
+def get_container_log_bytes(docker_root_dir: str) -> int:
     # json logs are NOT in /system/df: `SizeRw` counts the writable layer only, and nothing
     # rotates the logs on an executor. Left out, a chatty renter pod's log reads as the
     # provider's own data (review ask, PR #1245). Blocks actually held, like the volume walk.

@@ -282,7 +282,15 @@ PROBE_CONTAINER_NAME = "lium_roce_probe"
 # them BY NAME. A name is forgeable, which is why this tier only ever excuses load and never
 # grants the rental status `pod_*` and `filler_*` get from the backend.
 # Add a new Lium infra container here and the gate inherits it.
-LIUM_INFRA_CONTAINER_PREFIXES = ("container_", "health_check_", PROBE_CONTAINER_NAME)
+# `executor-` is the compose project the executor stack runs under: the runner, watchtower,
+# autoheal and postgres beside the executor itself. They are Lium's, they idle, and the gate
+# caps this whole tier, so the name buys a forger nothing.
+LIUM_INFRA_CONTAINER_PREFIXES = (
+    "container_",
+    "health_check_",
+    "executor-",
+    PROBE_CONTAINER_NAME,
+)
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
 TDX_WHITELIST = {
