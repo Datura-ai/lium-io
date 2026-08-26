@@ -204,6 +204,7 @@ class ResultHandler:
             gpu_splitting_min_count=context.state.gpu_splitting_min_count,
             ssh_pub_keys=context.ssh_pub_keys,
             is_rented=context.rented,
+            rented_gpu_count=self._get_rented_gpu_count(context),
             is_spot=is_spot,
             is_new_rentals_paused=is_new_rentals_paused,
             is_provider_banned=context.is_provider_banned,
@@ -214,6 +215,24 @@ class ResultHandler:
             gpu_attestation_passed=context.gpu_attestation_passed,
             inspector_outcome=inspector_outcome,
         )
+
+    @staticmethod
+    def _get_rented_gpu_count(context: Context) -> int | None:
+        """Total GPUs held by rented pods (DAH-2467), or None when unknown.
+
+        None (not rented, no pod data, or a backend that doesn't report per-pod gpu_count yet)
+        keeps today's whole-box rented scoring.
+        """
+        rented_data = context.state.rented_data
+        if not rented_data or not context.rented:
+            return None
+        rented_executor = rented_data.executors.get(context.executor.uuid)
+        if not rented_executor or not rented_executor.pods:
+            return None
+        pod_gpu_counts: list[int | None] = [pod.gpu_count for pod in rented_executor.pods]
+        if any(count is None or count <= 0 for count in pod_gpu_counts):
+            return None
+        return sum(pod_gpu_counts)
 
     @staticmethod
     def _get_rental_created_at(context: Context) -> datetime | None:

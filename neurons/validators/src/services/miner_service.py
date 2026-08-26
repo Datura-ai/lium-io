@@ -761,6 +761,8 @@ class MinerService:
                         "netuid": settings.BITTENSOR_NETUID,
                         "scored_at": result.scored_at.isoformat() if result.scored_at else None,
                         "incentive": result.incentive if result.incentive is not None else 0.0,
+                        "incentive_rented": result.incentive_rented,
+                        "incentive_idle": result.incentive_idle,
                         "incentive_source": result.incentive_source,
                         "node_state_at_cycle": result.node_state_at_cycle,
                         "incentive_formula_version": result.incentive_formula_version,

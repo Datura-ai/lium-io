@@ -11,6 +11,7 @@ rental subsidy. See `incentive/config.py:MAX_UNRENTED_GPUS_BY_TYPE`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import bittensor
@@ -29,6 +30,7 @@ from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
 from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, DEFAULT_JOB_OWNER_MINER
+from services.task.models import MixedFormulaInputs
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
@@ -161,6 +163,19 @@ class RentalPriceEstimate(BaseModel):
     rental_share: float | None = None                   # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                     # Burn share for the executor in this cycle for scoring logic
     total_rental_cost: float | None = None              # Total rental cost for the executor in this cycle for scoring logic
+
+
+@dataclass
+class _PartiallyRentedSplitPortions:
+    """The two virtual JobResults a partially rented split node is scored as (DAH-2467).
+
+    `sibling_results` is the miner's own list that both portions live in during scoring, so the
+    free portion can be folded back out of it once both are scored.
+    """
+
+    sibling_results: list[JobResult]
+    rented_portion: JobResult
+    free_portion: JobResult
 
 
 class RentalPriceIncentive(DefaultIncentive):
@@ -492,6 +507,10 @@ class RentalPriceIncentive(DefaultIncentive):
         """
         if not (result.supports_gpu_splitting and result.gpu_splitting_min_count):
             return result.gpu_count
+        # DAH-2467: a remainder never claims a bundle tier that whole-node providers compete for.
+        # Its own size IS rentable as one bundle — this is a pricing decision, not a limitation.
+        if result.is_split_remainder:
+            return result.gpu_splitting_min_count
         if cap_spec.get(result.gpu_count, 0) > 0:
             return result.gpu_count
         return result.gpu_splitting_min_count
@@ -499,6 +518,108 @@ class RentalPriceIncentive(DefaultIncentive):
     @staticmethod
     def _bucket_key_str(base_model: str, bucket: int) -> str:
         return f"{base_model}·{bucket}"
+
+    async def calculate_mining_scores(self) -> None:
+        """Score all job results, first expanding partially rented split nodes (DAH-2467).
+
+        A split-opted-in executor with only part of its GPUs rented earns in BOTH pools: the
+        rented GPUs in the mining pool, the free GPUs in the unrented (rental-share) pool. It is
+        modeled as two virtual JobResults so every existing eligibility and formula rule applies
+        to each portion unchanged, then merged back into the single executor result — downstream
+        consumers (machine-spec publish, backend accounting) expect one message per executor.
+        """
+        split_portions: list[_PartiallyRentedSplitPortions] = self._expand_partially_rented_split_results()
+        await super().calculate_mining_scores()
+        self._merge_partially_rented_split_results(split_portions)
+
+    def _expand_partially_rented_split_results(self) -> list[_PartiallyRentedSplitPortions]:
+        if not settings.ENABLE_SPLIT_PARTIAL_RENTAL_SCORING:
+            return []
+        split_portions: list[_PartiallyRentedSplitPortions] = []
+        for sibling_results in self.job_results.values():
+            for result in list(sibling_results):
+                free_gpu_count: int | None = self._free_gpu_count_of_partially_rented_split(result)
+                if free_gpu_count is None:
+                    continue
+                rented_gpu_count: int = result.rented_gpu_count
+                free_portion: JobResult = result.model_copy(deep=True)
+                free_portion.gpu_count = free_gpu_count
+                free_portion.is_rented = False
+                free_portion.is_split_remainder = True
+                free_portion.rental_created_at = None
+                free_portion.rented_gpu_count = None
+                free_portion.incentive_logs = []
+                free_portion.zero_incentive_reasons = []
+                result.gpu_count = rented_gpu_count
+                sibling_results.append(free_portion)
+                split_portions.append(_PartiallyRentedSplitPortions(sibling_results, result, free_portion))
+                logger.info(
+                    _m(
+                        "Partially rented split node scored in both pools",
+                        extra={
+                            "executor_id": str(result.executor_info.uuid),
+                            "gpu_model": result.gpu_model,
+                            "rented_gpu_count": rented_gpu_count,
+                            "free_gpu_count": free_gpu_count,
+                        },
+                    )
+                )
+        return split_portions
+
+    @staticmethod
+    def _free_gpu_count_of_partially_rented_split(result: JobResult) -> int | None:
+        """Free-GPU count when the result is a partially rented split node, else None."""
+        if not (
+            result.is_rented
+            and result.supports_gpu_splitting
+            and result.gpu_splitting_min_count
+            and result.rented_gpu_count
+        ):
+            return None
+        free_gpu_count: int = result.gpu_count - result.rented_gpu_count
+        return free_gpu_count if free_gpu_count > 0 else None
+
+    @staticmethod
+    def _merge_partially_rented_split_results(split_portions: list[_PartiallyRentedSplitPortions]) -> None:
+        # miner_incentives already accumulated both portions during post-processing, so summing
+        # here only restores the per-executor view the downstream consumers read.
+        for portions in split_portions:
+            merged: JobResult = portions.rented_portion
+            free: JobResult = portions.free_portion
+            # Both formula snapshots must be taken while each portion still carries the GPU
+            # count its own formula was computed on.
+            merged.record_mixed_formula_inputs(
+                MixedFormulaInputs(
+                    rented_gpu_count=merged.gpu_count,
+                    free_gpu_count=free.gpu_count,
+                    mining=merged.incentive_formula_inputs,
+                    unrented=free.incentive_formula_inputs,
+                )
+            )
+            merged.gpu_count += free.gpu_count
+            merged.set_incentive_split(merged.incentive or 0.0, free.incentive or 0.0)
+            merged.incentive_logs.extend(free.incentive_logs)
+            # DAH-2340 reasons ride a separate list — the unrented portion's zero reasons would
+            # otherwise never reach the backend.
+            merged.zero_incentive_reasons.extend(free.zero_incentive_reasons)
+            # Drop by identity: two portions of one executor can compare equal as pydantic models.
+            portions.sibling_results[:] = [
+                result for result in portions.sibling_results if result is not free
+            ]
+            logger.info(
+                _m(
+                    "Partially rented split node paid from both pools",
+                    extra={
+                        "executor_id": str(merged.executor_info.uuid),
+                        "gpu_model": merged.gpu_model,
+                        "rented_gpu_count": merged.rented_gpu_count,
+                        "free_gpu_count": free.gpu_count,
+                        "incentive_rented": merged.incentive_rented,
+                        "incentive_idle": merged.incentive_idle,
+                        "incentive": merged.incentive,
+                    },
+                )
+            )
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:
         """Aggregate per-`(base_model, bucket)` metrics for the rental-share
@@ -522,8 +643,12 @@ class RentalPriceIncentive(DefaultIncentive):
         #  calculate unrented gpu count that's eligible for rental price incentive
         if result.eligible_for_rental_share:
             # update result state
+            # Priced one card at a time, matching the tier it was bucketed into above.
+            rated_gpu_count: int = (
+                result.gpu_splitting_min_count if result.is_split_remainder else result.gpu_count
+            )
             result.hourly_rate = get_hourly_rate(
-                result.gpu_model, result.gpu_count,
+                result.gpu_model, rated_gpu_count,
                 self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
             )
             # GPU splitting: always pick the best of the bundle rate vs min-count rate

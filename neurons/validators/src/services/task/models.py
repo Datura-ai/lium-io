@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -10,6 +10,20 @@ from incentive.miner_incentive_log import IncentiveReason
 
 if TYPE_CHECKING:
     from incentive.miner_incentive_log import MinerLogLine
+
+
+class MixedFormulaInputs(BaseModel):
+    """DAH-2467: what a partially rented split node's incentive was computed from.
+
+    The two blocks are whole `JobResult.incentive_formula_inputs` payloads — the mining
+    one for the rented GPUs, the unrented one for the free GPUs — so the stored numbers
+    reproduce the paid incentive, which one flattened block cannot do.
+    """
+
+    rented_gpu_count: int
+    free_gpu_count: int
+    mining: dict[str, Any]
+    unrented: dict[str, Any]
 
 
 class JobResult(BaseModel):
@@ -32,6 +46,13 @@ class JobResult(BaseModel):
     gpu_splitting_min_count: int | None = None
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
+    # GPUs held by rented pods (DAH-2467). None = unknown (old backend or not rented) — the
+    # executor is then scored whole-box; set and below gpu_count on a split node, the incentive
+    # engine scores the free GPUs in the unrented pool.
+    rented_gpu_count: int | None = None
+    # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
+    # minimum-split tier and rate, never as a bundle of its own size.
+    is_split_remainder: bool = False
     is_spot: bool = False
     is_new_rentals_paused: bool = False
     is_provider_banned: bool = False
@@ -56,6 +77,9 @@ class JobResult(BaseModel):
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
     incentive: float | None = None                      # Incentive score for the executor in this cycle
+    # DAH-2467: how `incentive` splits across the two pools. Always sums to `incentive`.
+    incentive_rented: float | None = None
+    incentive_idle: float | None = None
     mining_share: float | None = None
     total_mining_score: float | None = None
 
@@ -89,6 +113,19 @@ class JobResult(BaseModel):
     # DAH-2340 wire reasons for the backend; [] when no catalogued reason was recorded.
     zero_incentive_reasons: list[IncentiveReason] = Field(default_factory=list, exclude=True)
 
+    _mixed_formula_inputs: "MixedFormulaInputs | None" = PrivateAttr(default=None)
+
+    def set_incentive_split(self, rented: float, idle: float) -> None:
+        """Record the two-pool breakdown and keep `incentive` equal to their sum."""
+        self.incentive_rented = rented
+        self.incentive_idle = idle
+        self.incentive = rented + idle
+
+    def record_mixed_formula_inputs(self, inputs: "MixedFormulaInputs") -> None:
+        """Take both portions' formula snapshots — call it while each portion still holds
+        the GPU count its own formula ran on, before the merge restores the whole box."""
+        self._mixed_formula_inputs = inputs
+
     def record_incentive_log(self, line: "MinerLogLine") -> None:
         """Append the line to the miner-facing log; zero-incentive lines also become data for the backend."""
         self.incentive_logs.append(line.to_log_line())
@@ -102,19 +139,38 @@ class JobResult(BaseModel):
             return "unknown"
         if self.incentive <= 0:
             return "zero_incentive"
+        if self._is_mixed:
+            return "mixed"
         return "rented_emission" if self.is_rented else "idle_incentive"
 
     @property
+    def _is_mixed(self) -> bool:
+        """True when the merge produced this row from a rented and a free portion (DAH-2467).
+
+        Keyed on the snapshot, not on the two amounts: a free portion that scored 0 still
+        went through the mixed formula, and every label must agree on one answer.
+        """
+        return self._mixed_formula_inputs is not None
+
+    @property
     def node_state_at_cycle(self) -> str:
+        if self._is_mixed:
+            return "mixed"
         return "rented" if self.is_rented else "idle"
 
     @property
     def incentive_formula_version(self) -> str:
+        if self._is_mixed:
+            return "mixed_v1"
         return "rental_price_v2" if self.eligible_for_rental_share else "mining_v1"
 
     @property
     def incentive_formula_inputs(self) -> dict[str, Any]:
         """Snapshot the exact scalar inputs needed to explain this cycle's incentive."""
+        if self._mixed_formula_inputs is not None:
+            # The property's contract is a plain JSON-ready dict, and the payload is
+            # published straight into a JSON message.
+            return self._mixed_formula_inputs.model_dump()
         if self.eligible_for_rental_share:
             return {
                 "rental_share": self.rental_share,
@@ -167,11 +223,17 @@ class JobResult(BaseModel):
         }
 
     @property
-    def full_log_text(self):
+    def full_log_text(self) -> str:
         """Return the full log text including the incentive logs."""
         if not self.log_text or not self.incentive_logs:
             return self.log_text
-        return self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
+        text: str = self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
+        if self._is_mixed:
+            text += (
+                f"\n\nPartially rented split node total: rented {self.incentive_rented} "
+                f"+ idle {self.incentive_idle} = {self.incentive}"
+            )
+        return text
 
     @property
     def is_successful(self):

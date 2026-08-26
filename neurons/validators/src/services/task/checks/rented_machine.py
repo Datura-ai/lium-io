@@ -118,7 +118,11 @@ class TenantEnforcementCheck:
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
+        # EVERY filler on the node: a partially rented split node keeps one filler per free VRAM
+        # bundle running beside the renter (DAH-2465/DAH-2467), and allowlisting only the first
+        # makes its siblings' GPU processes read as usage outside the tenant.
+        filler_containers = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        filler_container = filler_containers[0] if filler_containers else None
 
         if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}
@@ -151,6 +155,11 @@ class TenantEnforcementCheck:
             "rented": True,
             "rented_pods": [{"name": p.container_name, "pod_id": p.pod_id} for p in rented_pods],
         }
+        # DAH-2467: hints that only part of a split box is rented; omitted when any pod's
+        # count is unknown, matching the whole-box fallback the incentive engine uses.
+        known_pod_gpu_counts: list[int] = [pod.gpu_count for pod in rented_pods if pod.gpu_count]
+        if rented_pods and len(known_pod_gpu_counts) == len(rented_pods):
+            extra["rented_gpu_count"] = sum(known_pod_gpu_counts)
 
         for pod in rented_pods:
             pod_container_name = pod.container_name
@@ -211,8 +220,7 @@ class TenantEnforcementCheck:
                 continue
 
         container_names = [pod.container_name for pod in rented_pods]
-        if filler_container:
-            container_names.append(filler_container)
+        container_names.extend(filler_containers)
         gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
 

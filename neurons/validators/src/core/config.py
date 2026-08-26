@@ -296,6 +296,11 @@ class Settings(BaseSettings):
     # to logging the breach without withholding anything.
     ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
+    # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
+    # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
+    # scoring the whole box as rented.
+    ENABLE_SPLIT_PARTIAL_RENTAL_SCORING: bool = Field(env="ENABLE_SPLIT_PARTIAL_RENTAL_SCORING", default=True)
+
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )
