@@ -45,7 +45,7 @@ CPU_ONLY_SPECS = {key: value for key, value in SN13_SPECS.items() if key != "har
 
 def test_provider_side_load_attributes_cpu_and_disk():
     load = compute_provider_side_load(SN13_SPECS, 32, {"pod_renter"})
-    assert load.cpu_cores == 9.0  # 33% * 32 cores - 1.58 cores
+    assert load.cpu_cores == 8.9  # 33% * 32 cores - 1.58 cores, floored
     assert load.disk_kb == 1528 * GB_KB  # 1700 - (100 + 12 + 60)
 
 
@@ -114,7 +114,7 @@ def test_a_foreign_container_counts_against_the_provider():
         32,
         {"pod_renter"},
     )
-    assert load.cpu_cores == 9.0  # the miner's 7 cores stay on the provider's side
+    assert load.cpu_cores == 8.9  # the miner's 7 cores stay on the provider's side
 
 
 def confirming_runner(
@@ -182,9 +182,9 @@ async def test_enforcement_zeroes_the_score_on_a_rented_machine(context_factory)
     assert result.passed is False
     assert result.updates["provider_side_load_passed"] is False
     assert result.event.reason_code == Msg.LOAD_ABOVE_LIMIT.reason
-    assert result.event.what_we_saw["provider_cpu_cores"] == 9.0
+    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
     assert result.updates["state"].specs["provider_side_load"] == {
-        "cpu_cores": 9.0,
+        "cpu_cores": 8.9,
         "disk_kb": 1528 * GB_KB,
     }
 
@@ -202,7 +202,7 @@ async def test_idle_machine_is_judged_the_same_as_a_rented_one(context_factory):
 
     assert result.passed is False
     assert result.event.what_we_saw["is_rented"] is False
-    assert result.event.what_we_saw["provider_cpu_cores"] == 10.6  # nothing of Lium's to subtract
+    assert result.event.what_we_saw["provider_cpu_cores"] == 10.5  # nothing of Lium's to subtract
 
 
 @pytest.mark.asyncio
@@ -303,7 +303,7 @@ async def test_a_foreign_container_zeroes_the_score_of_a_rented_machine(context_
 
     assert result.passed is False
     assert result.updates["provider_side_load_passed"] is False
-    assert result.event.what_we_saw["provider_cpu_cores"] == 9.0
+    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
 
 
 @pytest.mark.asyncio

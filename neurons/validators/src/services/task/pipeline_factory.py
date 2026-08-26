@@ -261,11 +261,6 @@ class PipelineFactory:
                 # advertised specs already populated by the scrape; it only reads over SSH, mutates
                 # no executor state, and never zeroes score outside CPU_TRUTH_ENFORCEMENT_ENABLED.
                 CpuTruthCheck(),
-                # DAH-2734: non-fatal gate on the load the PROVIDER puts on a listed machine.
-                # Specs arithmetic, plus one read-only SSH reading when the load is above the
-                # floor. Before the rented short-circuit: a rented machine is exactly where the
-                # provider's own workload robs someone.
-                ProviderSideLoadCheck(),
                 GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
@@ -281,6 +276,11 @@ class PipelineFactory:
                 # cycle; otherwise PortCountCheck (fatal) halts the pipeline before the cleanup
                 # that used to live in TenantEnforcementCheck ever runs -> executor stuck at 0.
                 StaleContainerCleanupCheck(),
+                # DAH-2734: non-fatal gate on the load the PROVIDER puts on a listed machine.
+                # Specs arithmetic, plus one read-only SSH reading when the load is above the
+                # floor. AFTER the cleanup above: a pod Lium has just ended is our leftover to
+                # remove, not a workload to bill the provider for.
+                ProviderSideLoadCheck(),
                 # DAH-2211 Phase 3.4(ii): orphan sweep for `lium-build-*`
                 # image/scratch artifacts left behind by validator crashes or
                 # aborted releases. Internally throttled to once-per-6h per

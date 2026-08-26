@@ -27,12 +27,11 @@ from ..pipeline import CheckResult, Context
 PROVIDER_SIDE_CPU_CORES_LIMIT = 2.0
 PROVIDER_SIDE_DISK_LIMIT_KB = 100 * 1024 * 1024  # 100 GB outside docker
 
-# Lium's infra containers are excused by NAME, and a name is forgeable. The excuse is therefore
-# capped IN TOTAL, not per container - six forged names at a core each are still a miner. The
-# heaviest honest case is the RoCE link probe, whose `ib_write_bw` busy-polls one core, and the
-# port/health probes are near idle, so all of them together stay under this. Above it, no name
-# is excused and the whole load stays on the provider's bill.
-INFRA_CONTAINER_CORES_EXCUSED = 1.5
+# A probe is excused by its NAME, which anyone can copy, so the name tier is capped together at
+# the gate's own floor: names can never excuse enough load to hide a violation. The executor's
+# own stack is matched by image digest instead and stays uncapped - the scrape itself runs in
+# that container and can hold several cores, and zeroing an honest node is the worse error.
+CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
 # the live card. The scrape's window is about two seconds, and Lium's own housekeeping
@@ -105,7 +104,10 @@ def provider_cores_outside_lium(
         for row in rows
         if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
     )
-    return round(max(0.0, host_cores - lium_percent / 100), 1)
+    # Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
+    # inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5.
+    provider_cores = max(0.0, host_cores - lium_percent / 100)
+    return math.floor(round(provider_cores, 3) * 10) / 10
 
 
 @dataclass(frozen=True)
@@ -168,16 +170,18 @@ def docker_containers(specs: dict[str, Any]) -> list[ContainerRow]:
 
 
 def infra_container_names(specs: dict[str, Any]) -> set[str]:
-    """Lium's own short-lived probes, which carry no backend-issued id to confirm them by.
+    """Lium's own probes, matched by name because they carry no backend-issued id.
 
-    Only while they collectively behave like probes: past INFRA_CONTAINER_CORES_EXCUSED in
-    total they are doing something probes do not, and no name is excused at all.
+    A name is free to forge, so the whole tier is capped TOGETHER at the gate's own floor:
+    six containers wearing our probe names can never excuse a nine-core miner. The honest case
+    is a link probe busy-polling one core while the port and health probes idle.
     """
     infra_rows = [
-        row for row in docker_containers(specs) if row.name.startswith(LIUM_INFRA_CONTAINER_PREFIXES)
+        row
+        for row in docker_containers(specs)
+        if row.name.startswith(LIUM_INFRA_CONTAINER_PREFIXES)
     ]
-    total_percent = sum(row.cpu_percent or 0.0 for row in infra_rows)
-    if total_percent > INFRA_CONTAINER_CORES_EXCUSED * 100:
+    if sum(row.cpu_percent or 0.0 for row in infra_rows) > CLAIMED_EXCUSE_CORES * 100:
         return set()
     return {row.name for row in infra_rows}
 
@@ -227,9 +231,9 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     if rented_executor:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
+    containers.update(await late_started_containers_the_backend_owns(ctx, containers))
     containers.update(executor_stack_container_ids(specs))
     containers.update(infra_container_names(specs))
-    containers.update(await late_started_containers_the_backend_owns(ctx, containers))
     containers.discard("")
     return containers
 
