@@ -825,6 +825,20 @@ def get_vloopback_volume_bytes(docker_root_dir):
     return total
 
 
+def get_container_log_bytes(docker_root_dir):
+    # json logs are NOT in /system/df: `SizeRw` counts the writable layer only, and nothing
+    # rotates the logs on an executor. Left out, a chatty renter pod's log reads as the
+    # provider's own data (review ask, PR #1245). Blocks actually held, like the volume walk.
+    # No match is a normal answer, not a miss: a host on the journald driver writes no json log.
+    total = 0
+    for path in glob.glob(f"/proc/1/root{docker_root_dir}/containers/*/*.log"):
+        try:
+            total += os.stat(path).st_blocks * 512
+        except OSError:
+            continue
+    return total
+
+
 def get_docker_disk_usage():
     # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
     df = docker_api_get("/system/df")
@@ -837,6 +851,7 @@ def get_docker_disk_usage():
     )
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     volumes += get_vloopback_volume_bytes(docker_root_dir)
+    containers += get_container_log_bytes(docker_root_dir)
 
     return {
         "hard_disk_images": int(df.get("LayersSize") or 0) // 1024,
