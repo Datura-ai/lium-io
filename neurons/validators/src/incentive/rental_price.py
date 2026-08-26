@@ -606,6 +606,20 @@ class RentalPriceIncentive(DefaultIncentive):
             portions.sibling_results[:] = [
                 result for result in portions.sibling_results if result is not free
             ]
+            logger.info(
+                _m(
+                    "Partially rented split node paid from both pools",
+                    extra={
+                        "executor_id": str(merged.executor_info.uuid),
+                        "gpu_model": merged.gpu_model,
+                        "rented_gpu_count": merged.rented_gpu_count,
+                        "free_gpu_count": free.gpu_count,
+                        "incentive_rented": merged.incentive_rented,
+                        "incentive_idle": merged.incentive_idle,
+                        "incentive": merged.incentive,
+                    },
+                )
+            )
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:
         """Aggregate per-`(base_model, bucket)` metrics for the rental-share
