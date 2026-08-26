@@ -4,12 +4,16 @@ Port shapes are the ones prod executors report (measured 2026-08-05): mlx5 answe
 link layer and carries the host's address as the IPv4-mapped entry of the GID table.
 """
 
+import asyncio
+
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 
+from services import roce_link_probe
 from services.roce_link_probe import (
     RoceLinkMeasurement,
     attach_measurement,
+    measure_and_attach,
     measured_gigabits_per_second,
     pairs_to_measure,
     roce_fabric_host_of,
@@ -213,3 +217,22 @@ def test_a_pair_that_could_not_talk_is_recorded_as_a_failure():
     attach_measurement(result, _measurement("b", "172.16.5.7", None))
 
     assert result.spec["roce_link_measurements"][0]["gigabits_per_second"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_that_hangs_gives_up_instead_of_failing_the_miners_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller's timeout cancels the whole job and scores the miner zero, so the probe stops first."""
+
+    async def never_finishes(*_args: object, **_kwargs: object) -> None:
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(roce_link_probe.settings, "ROCE_LINK_PROBE_ENABLED", True)
+    monkeypatch.setattr(roce_link_probe, "PROBE_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(roce_link_probe, "_measure_every_pair", never_finishes)
+    results = [job_result("a", [roce_port("ac10:0506")]), job_result("b", [roce_port("ac10:0507")])]
+
+    await measure_and_attach(results, "private-key", {})
+
+    assert all(result.spec.get("roce_link_measurements") is None for result in results)
