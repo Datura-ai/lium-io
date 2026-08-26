@@ -28,9 +28,10 @@ PROVIDER_SIDE_CPU_CORES_LIMIT = 2.0
 PROVIDER_SIDE_DISK_LIMIT_KB = 100 * 1024 * 1024  # 100 GB outside docker
 
 # Lium's infra containers are excused by NAME, and a name is forgeable. The excuse is therefore
-# capped: the heaviest of them is the RoCE link probe, whose `ib_write_bw` busy-polls one core,
-# while a subnet miner wearing the name `container_sn13` holds many. Everything above the cap
-# stays on the provider's bill.
+# capped IN TOTAL, not per container - six forged names at a core each are still a miner. The
+# heaviest honest case is the RoCE link probe, whose `ib_write_bw` busy-polls one core, and the
+# port/health probes are near idle, so all of them together stay under this. Above it, no name
+# is excused and the whole load stays on the provider's bill.
 INFRA_CONTAINER_CORES_EXCUSED = 1.5
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
@@ -164,15 +165,16 @@ def docker_containers(specs: dict[str, Any]) -> list[ContainerRow]:
 def infra_container_names(specs: dict[str, Any]) -> set[str]:
     """Lium's own short-lived probes, which carry no backend-issued id to confirm them by.
 
-    Only while they behave like probes: past INFRA_CONTAINER_CORES_EXCUSED the container is
-    doing something a probe does not, and the name alone will not excuse it.
+    Only while they collectively behave like probes: past INFRA_CONTAINER_CORES_EXCUSED in
+    total they are doing something probes do not, and no name is excused at all.
     """
-    return {
-        row.name
-        for row in docker_containers(specs)
-        if row.name.startswith(LIUM_INFRA_CONTAINER_PREFIXES)
-        and (row.cpu_percent or 0.0) <= INFRA_CONTAINER_CORES_EXCUSED * 100
-    }
+    infra_rows = [
+        row for row in docker_containers(specs) if row.name.startswith(LIUM_INFRA_CONTAINER_PREFIXES)
+    ]
+    total_percent = sum(row.cpu_percent or 0.0 for row in infra_rows)
+    if total_percent > INFRA_CONTAINER_CORES_EXCUSED * 100:
+        return set()
+    return {row.name for row in infra_rows}
 
 
 async def late_started_containers_the_backend_owns(

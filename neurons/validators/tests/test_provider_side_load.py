@@ -537,3 +537,28 @@ async def test_a_lium_image_pull_is_not_the_providers_load(context_factory):
 
     assert result.passed is True
     assert result.event.what_we_saw["provider_cpu_cores"] == 0.0  # 10.56 - 1.58 - 9.0
+
+
+@pytest.mark.asyncio
+async def test_many_forged_infra_names_do_not_stack_the_excuse(context_factory):
+    # The cap is on the SUM: six forged `container_*` names at 1.5 cores each are a 9-core
+    # miner, not six probes.
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "host_cpu_percent": 30.0,
+            "containers": [
+                {"name": f"container_sn13_{worker}", "cpu_percent": 150.0} for worker in range(6)
+            ],
+        },
+    }
+    ctx = context_factory(
+        state=build_state(specs=specs, rented_data=_no_rentals()),
+        runner=confirming_runner(9.6, 32, [(f"c{worker}", f"container_sn13_{worker}", 150.0) for worker in range(6)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["provider_cpu_cores"] == 9.6
