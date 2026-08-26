@@ -1178,7 +1178,8 @@ class ProviderSideLoadMessages:
     subnet's miner on a listed machine sells capacity he already uses himself. Shadow
     (PROVIDER_SIDE_LOAD_CHECK_ENABLED without enforcement) renders LOAD_ABOVE_LIMIT as a
     warning and keeps passed=True; only PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED zeroes the
-    score."""
+    score, and only for the CPU half — a disk figure above the limit is reported, never
+    scored, because it is read once and carries every docker category nobody enumerated."""
 
     LOAD_OK = MessageTemplate(
         event="Provider-side load within limits",

@@ -124,10 +124,15 @@ class ProviderSideLoad:
 
     @property
     def is_above_limits(self) -> bool:
-        return (
-            (self.cpu_cores or 0.0) >= PROVIDER_SIDE_CPU_CORES_LIMIT
-            or (self.disk_kb or 0) >= PROVIDER_SIDE_DISK_LIMIT_KB
-        )
+        return self.is_cpu_above_limit or self.is_disk_above_limit
+
+    @property
+    def is_cpu_above_limit(self) -> bool:
+        return (self.cpu_cores or 0.0) >= PROVIDER_SIDE_CPU_CORES_LIMIT
+
+    @property
+    def is_disk_above_limit(self) -> bool:
+        return (self.disk_kb or 0) >= PROVIDER_SIDE_DISK_LIMIT_KB
 
     def to_specs_fields(self) -> dict[str, float | int]:
         # specs travel to the backend as raw JSON, so the boundary needs a plain dict
@@ -470,13 +475,26 @@ class ProviderSideLoadCheck:
             event = render_message(Msg.LOAD_OK, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=True, event=event, updates=updates)
 
-        enforce: bool = settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED
+        # Only the CPU half withholds money. A high disk figure is reported and never scored:
+        # it is read once, with no second look, and every docker category nobody enumerated
+        # (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
+        # node. The shadow week measures the disk numbers before that half is armed.
+        enforce: bool = (
+            settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED
+            and provider_side_load.is_cpu_above_limit
+        )
+        if enforce:
+            impact = None
+        elif not provider_side_load.is_cpu_above_limit:
+            impact = "Disk is observed only: score was NOT changed"
+        else:
+            impact = "Shadow observation only: score was NOT changed"
         event = render_message(
             Msg.LOAD_ABOVE_LIMIT,
             ctx=ctx,
             check_id=self.check_id,
             severity=None if enforce else "warning",
-            impact=None if enforce else "Shadow observation only: score was NOT changed",
+            impact=impact,
             what=what,
         )
         # The check is non-fatal, so passed=False alone changes nothing: the verdict travels as

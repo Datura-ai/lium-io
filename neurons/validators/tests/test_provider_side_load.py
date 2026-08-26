@@ -562,3 +562,21 @@ async def test_many_forged_infra_names_do_not_stack_the_excuse(context_factory):
 
     assert result.passed is False
     assert result.event.what_we_saw["provider_cpu_cores"] == 9.6
+
+
+@pytest.mark.asyncio
+async def test_a_disk_only_verdict_never_withholds_money(context_factory):
+    # Rustam's call, after the review: the disk figure is read once with no second look, and
+    # every docker category nobody enumerated lands in it. It is reported, never scored.
+    disk_only_specs = {"hard_disk": SN13_SPECS["hard_disk"]}
+    ctx = context_factory(state=_rented_state(disk_only_specs))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert "provider_side_load_passed" not in result.updates
+    assert result.event.reason_code == Msg.LOAD_ABOVE_LIMIT.reason
+    assert result.event.severity == "warning"
+    assert result.event.what_we_saw["provider_disk_gb"] == 1528.0
+    assert result.event.impact == "Disk is observed only: score was NOT changed"
