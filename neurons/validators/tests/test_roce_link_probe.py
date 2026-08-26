@@ -155,20 +155,61 @@ def test_a_run_that_printed_no_table_measured_nothing():
     assert measured_gigabits_per_second("Unable to open device mlx5_0\n") is None
 
 
-def test_the_measurement_lands_in_the_spec_of_the_host():
-    result = job_result("a", [roce_port("ac10:0506")])
-    measurement = RoceLinkMeasurement(
-        peer_executor_uuid="b",
-        peer_address="172.16.5.7",
-        gigabits_per_second=92.51,
+def _measurement(peer_uuid: str, peer_address: str, gigabits: float | None) -> RoceLinkMeasurement:
+    return RoceLinkMeasurement(
+        peer_executor_uuid=peer_uuid,
+        peer_address=peer_address,
+        gigabits_per_second=gigabits,
         measured_at="2026-08-25T13:00:00+00:00",
     )
 
-    attach_measurement(result, measurement)
 
-    assert result.spec["roce_link_measurement"] == {
-        "peer_executor_uuid": "b",
-        "peer_address": "172.16.5.7",
-        "gigabits_per_second": 92.51,
-        "measured_at": "2026-08-25T13:00:00+00:00",
-    }
+def test_the_measurement_lands_in_the_spec_of_the_host():
+    result = job_result("a", [roce_port("ac10:0506")])
+
+    attach_measurement(result, _measurement("b", "172.16.5.7", 92.51))
+
+    assert result.spec["roce_link_measurements"] == [
+        {
+            "peer_executor_uuid": "b",
+            "peer_address": "172.16.5.7",
+            "gigabits_per_second": 92.51,
+            "measured_at": "2026-08-25T13:00:00+00:00",
+        }
+    ]
+
+
+def test_every_peer_of_the_segment_keeps_its_own_entry():
+    result = job_result("a", [roce_port("ac10:0506")])
+
+    attach_measurement(result, _measurement("b", "172.16.5.7", 92.51))
+    attach_measurement(result, _measurement("c", "172.16.5.8", 91.02))
+
+    assert [entry["peer_address"] for entry in result.spec["roce_link_measurements"]] == [
+        "172.16.5.7",
+        "172.16.5.8",
+    ]
+
+
+def test_a_second_run_against_one_peer_replaces_that_peers_entry():
+    result = job_result("a", [roce_port("ac10:0506")])
+
+    attach_measurement(result, _measurement("b", "172.16.5.7", 92.51))
+    attach_measurement(result, _measurement("b", "172.16.5.7", None))
+
+    assert result.spec["roce_link_measurements"] == [
+        {
+            "peer_executor_uuid": "b",
+            "peer_address": "172.16.5.7",
+            "gigabits_per_second": None,
+            "measured_at": "2026-08-25T13:00:00+00:00",
+        }
+    ]
+
+
+def test_a_pair_that_could_not_talk_is_recorded_as_a_failure():
+    result = job_result("a", [roce_port("ac10:0506")])
+
+    attach_measurement(result, _measurement("b", "172.16.5.7", None))
+
+    assert result.spec["roce_link_measurements"][0]["gigabits_per_second"] is None

@@ -19,6 +19,7 @@ idle executors, and never touches a rented one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import shlex
@@ -49,7 +50,11 @@ PROBE_HANDSHAKE_PORT = 18515
 PROBE_ITERATIONS = 1000
 # Covers the one slow step — the first pull of the 38 MB image on a host that has never seen it.
 PROBE_TIMEOUT_SECONDS = 120
-SPEC_KEY = "roce_link_measurement"
+# The whole sweep's budget. The caller's timeout cancels the miner's entire job and scores it
+# zero, so the probe stops itself well before that: a cycle is 15 minutes and every other check
+# has run by now.
+PROBE_BUDGET_SECONDS = 180
+SPEC_KEY = "roce_link_measurements"
 
 ROCE_LINK_LAYER = "ethernet"
 # The prefix length is reported nowhere, so a segment is taken as a /24 — the same guess the
@@ -60,11 +65,16 @@ _BANDWIDTH_ROW = re.compile(r"^\s*\d+\s+\d+\s+[\d.]+\s+([\d.]+)\s+[\d.]+\s*$", r
 
 
 class RoceLinkMeasurement(BaseModel):
-    """What one host measured against its neighbour, as it travels in that host's specs."""
+    """What one host measured against ONE neighbour, as it travels in that host's specs.
+
+    `gigabits_per_second` is None when the run failed: a pair that could not talk is a fact the
+    backend needs, not an absence. Every pair of the segment gets an entry, so the backend can ask
+    whether the exact nodes a renter picked have been proven against each other.
+    """
 
     peer_executor_uuid: str
     peer_address: str
-    gigabits_per_second: float
+    gigabits_per_second: float | None
     measured_at: str
 
 
@@ -178,10 +188,21 @@ def measured_gigabits_per_second(ib_write_bw_output: str) -> float | None:
 
 
 def attach_measurement(result: JobResult, measurement: RoceLinkMeasurement) -> None:
-    """Carry the measurement to the backend in this host's specs, where the grouping reads it."""
+    """Add one peer's result to this host's specs, where the backend's grouping reads them.
+
+    Appended, never assigned: a host is measured against every other host of its segment in one
+    cycle, and keeping only the last of those would leave the backend unable to tell whether the
+    two nodes a renter picked were ever proven against EACH OTHER. An entry for a peer already
+    listed replaces that peer's entry, so the list holds this cycle's answer per peer and no more.
+    """
     if result.spec is None:
         result.spec = {}
-    result.spec[SPEC_KEY] = measurement.model_dump(mode="json")
+    kept: list[dict] = [
+        entry
+        for entry in result.spec.get(SPEC_KEY) or []
+        if entry.get("peer_address") != measurement.peer_address
+    ]
+    result.spec[SPEC_KEY] = kept + [measurement.model_dump(mode="json")]
 
 
 def _server_command() -> str:
@@ -264,10 +285,12 @@ async def _connected(
 async def measure_and_attach(
     results: list[JobResult], decrypted_private_key: str, log_extra: dict
 ) -> None:
-    """Measure every free RoCE pair of this miner and write the result into both hosts' specs.
+    """Measure every free RoCE pair of this miner and record each result in both hosts' specs.
 
-    Best effort by design: a probe that fails leaves the specs without a measurement, the backend
-    then does not sell that pair, and the validation cycle carries on untouched.
+    Bounded by `PROBE_BUDGET_SECONDS` and best effort throughout. The whole sweep sits inside one
+    `asyncio.wait_for`, because the caller's own timeout cancels the miner's ENTIRE job and scores
+    it zero for the cycle — a probe must never cost a miner its score. Pairs measured before the
+    budget ran out keep their entries; the rest are simply not proven this cycle.
     """
     if not settings.ROCE_LINK_PROBE_ENABLED:
         return
@@ -282,10 +305,36 @@ async def measure_and_attach(
             extra=get_extra_info({**log_extra, "pairs": len(pairs)}),
         ),
     )
+    try:
+        await asyncio.wait_for(
+            _measure_every_pair(pairs, decrypted_private_key, log_extra),
+            timeout=PROBE_BUDGET_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            _m(
+                "RoCE link probe ran out of its budget",
+                extra=get_extra_info({**log_extra, "pairs": len(pairs), "budget_seconds": PROBE_BUDGET_SECONDS}),
+            ),
+        )
+
+
+async def _measure_every_pair(
+    pairs: list[tuple[JobResult, JobResult]], decrypted_private_key: str, log_extra: dict
+) -> None:
+    """Run each pair in turn, recording the answer — including a failure — on both hosts."""
     for server, client in pairs:
+        server_host = roce_fabric_host_of(server)
+        client_host = roce_fabric_host_of(client)
+        if server_host is None or client_host is None:
+            continue
+
         try:
-            gigabits = await _measure_pair(server, client, decrypted_private_key, log_extra)
+            gigabits: float | None = await _measure_pair(
+                server, client, decrypted_private_key, log_extra
+            )
         except Exception as error:
+            gigabits = None
             logger.warning(
                 _m(
                     "RoCE link probe failed",
@@ -299,15 +348,8 @@ async def measure_and_attach(
                     ),
                 ),
             )
-            continue
-        if gigabits is None:
-            continue
 
         measured_at: str = datetime.now(timezone.utc).isoformat()
-        server_host = roce_fabric_host_of(server)
-        client_host = roce_fabric_host_of(client)
-        if server_host is None or client_host is None:
-            continue
         attach_measurement(
             server,
             RoceLinkMeasurement(
@@ -328,7 +370,7 @@ async def measure_and_attach(
         )
         logger.info(
             _m(
-                "RoCE link measured",
+                "RoCE link measured" if gigabits is not None else "RoCE link did not answer",
                 extra=get_extra_info(
                     {
                         **log_extra,
