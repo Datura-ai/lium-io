@@ -12,6 +12,20 @@ if TYPE_CHECKING:
     from incentive.miner_incentive_log import MinerLogLine
 
 
+class MixedFormulaInputs(BaseModel):
+    """DAH-2467: what a partially rented split node's incentive was computed from.
+
+    The two blocks are whole `JobResult.incentive_formula_inputs` payloads — the mining
+    one for the rented GPUs, the unrented one for the free GPUs — so the stored numbers
+    reproduce the paid incentive, which one flattened block cannot do.
+    """
+
+    rented_gpu_count: int
+    free_gpu_count: int
+    mining: dict[str, Any]
+    unrented: dict[str, Any]
+
+
 class JobResult(BaseModel):
     spec: dict | None = None
     executor_info: ExecutorSSHInfo
@@ -99,15 +113,18 @@ class JobResult(BaseModel):
     # DAH-2340 wire reasons for the backend; [] when no catalogued reason was recorded.
     zero_incentive_reasons: list[IncentiveReason] = Field(default_factory=list, exclude=True)
 
-    # DAH-2467: set only on a merged split node — the assembled "mixed_v1" formula inputs,
-    # snapshotted from both portions before the merge restored the whole-box gpu_count.
-    _split_formula_inputs: dict[str, Any] | None = PrivateAttr(default=None)
+    _mixed_formula_inputs: "MixedFormulaInputs | None" = PrivateAttr(default=None)
 
     def set_incentive_split(self, rented: float, idle: float) -> None:
         """Record the two-pool breakdown and keep `incentive` equal to their sum."""
         self.incentive_rented = rented
         self.incentive_idle = idle
         self.incentive = rented + idle
+
+    def record_mixed_formula_inputs(self, inputs: "MixedFormulaInputs") -> None:
+        """Take both portions' formula snapshots — call it while each portion still holds
+        the GPU count its own formula ran on, before the merge restores the whole box."""
+        self._mixed_formula_inputs = inputs
 
     def record_incentive_log(self, line: "MinerLogLine") -> None:
         """Append the line to the miner-facing log; zero-incentive lines also become data for the backend."""
@@ -128,8 +145,12 @@ class JobResult(BaseModel):
 
     @property
     def _is_mixed(self) -> bool:
-        """True when this cycle paid the executor from both pools (DAH-2467)."""
-        return (self.incentive_rented or 0.0) > 0 and (self.incentive_idle or 0.0) > 0
+        """True when the merge produced this row from a rented and a free portion (DAH-2467).
+
+        Keyed on the snapshot, not on the two amounts: a free portion that scored 0 still
+        went through the mixed formula, and every label must agree on one answer.
+        """
+        return self._mixed_formula_inputs is not None
 
     @property
     def node_state_at_cycle(self) -> str:
@@ -139,15 +160,17 @@ class JobResult(BaseModel):
 
     @property
     def incentive_formula_version(self) -> str:
-        if self._split_formula_inputs is not None:
+        if self._is_mixed:
             return "mixed_v1"
         return "rental_price_v2" if self.eligible_for_rental_share else "mining_v1"
 
     @property
     def incentive_formula_inputs(self) -> dict[str, Any]:
         """Snapshot the exact scalar inputs needed to explain this cycle's incentive."""
-        if self._split_formula_inputs is not None:
-            return self._split_formula_inputs
+        if self._mixed_formula_inputs is not None:
+            # The property's contract is a plain JSON-ready dict, and the payload is
+            # published straight into a JSON message.
+            return self._mixed_formula_inputs.model_dump()
         if self.eligible_for_rental_share:
             return {
                 "rental_share": self.rental_share,
@@ -205,7 +228,7 @@ class JobResult(BaseModel):
         if not self.log_text or not self.incentive_logs:
             return self.log_text
         text: str = self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
-        if self._split_formula_inputs is not None:
+        if self._is_mixed:
             text += (
                 f"\n\nPartially rented split node total: rented {self.incentive_rented} "
                 f"+ idle {self.incentive_idle} = {self.incentive}"

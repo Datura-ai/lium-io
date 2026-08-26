@@ -30,6 +30,7 @@ from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
 from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, DEFAULT_JOB_OWNER_MINER
+from services.task.models import MixedFormulaInputs
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
@@ -587,12 +588,14 @@ class RentalPriceIncentive(DefaultIncentive):
             free: JobResult = portions.free_portion
             # Both formula snapshots must be taken while each portion still carries the GPU
             # count its own formula was computed on.
-            merged._split_formula_inputs = {
-                "rented_gpu_count": merged.gpu_count,
-                "free_gpu_count": free.gpu_count,
-                "mining": merged.incentive_formula_inputs,
-                "unrented": free.incentive_formula_inputs,
-            }
+            merged.record_mixed_formula_inputs(
+                MixedFormulaInputs(
+                    rented_gpu_count=merged.gpu_count,
+                    free_gpu_count=free.gpu_count,
+                    mining=merged.incentive_formula_inputs,
+                    unrented=free.incentive_formula_inputs,
+                )
+            )
             merged.gpu_count += free.gpu_count
             merged.set_incentive_split(merged.incentive or 0.0, free.incentive or 0.0)
             merged.incentive_logs.extend(free.incentive_logs)
