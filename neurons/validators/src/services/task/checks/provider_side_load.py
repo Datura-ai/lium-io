@@ -10,7 +10,7 @@ from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
-from .gpu_usage import _lium_workload_containers
+from .gpu_usage import lium_workload_containers
 from ..messages import ProviderSideLoadMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -114,7 +114,7 @@ def lium_containers(ctx: Context) -> set[str] | None:
     """
     if ctx.state.rented_data is None:
         return None
-    containers: set[str] = _lium_workload_containers(ctx)
+    containers: set[str] = lium_workload_containers(ctx)
     # A custom image builds in `lium-dind-build-<pod_id>`, which is on no rental list and burns
     # cores. The pod id keeps the name rename-proof: it has to match a pod the BACKEND reports
     # here, the same rule the orphan sweep removes such a container by.

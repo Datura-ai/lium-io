@@ -98,7 +98,7 @@ class GpuUsageCheck:
             return None
 
         enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
-        workload_containers: set[str] = _lium_workload_containers(ctx)
+        workload_containers: set[str] = lium_workload_containers(ctx)
         foreign_processes: list[ForeignGpuProcess] = [
             ForeignGpuProcess(
                 pid=process.get("pid"),
@@ -310,11 +310,14 @@ class GpuUsageCheck:
             return None
 
 
-def _lium_workload_containers(ctx: Context) -> set[str]:
+def lium_workload_containers(ctx: Context) -> set[str]:
     """This node's fillers and pods, as the BACKEND knows them — not as the node names them.
 
     A container-name prefix would hand a pass to anything the provider renames `filler_*`,
     and the ticket's whole requirement is a verdict `docker rename` cannot defeat.
+
+    Public because both gates that judge a foreign workload share it: this one for the card,
+    the provider-side load one for CPU. They must never disagree about whose container it is.
     """
     rented_data = ctx.state.rented_data
     containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
