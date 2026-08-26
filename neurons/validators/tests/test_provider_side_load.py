@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from neurons.validators.src.clients.backend_client import PodRentalActiveResponse
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -121,13 +122,9 @@ def confirming_runner(host_busy_cores: float, core_count: int, rows: list[tuple[
     total_jiffies = 100_000
     busy = int(total_jiffies * host_busy_cores / core_count)
     body = "\n".join(f"{container_id}|{name}|{percent:.2f}%" for container_id, name, percent in rows)
-    replies = [
-        MagicMock(success=True, stdout="0 0"),
-        MagicMock(success=True, stdout=body),
-        MagicMock(success=True, stdout=f"{total_jiffies} {total_jiffies - busy}"),
-    ]
+    stdout = f"0 0\n@@@\n{body}\n@@@\n{total_jiffies} {total_jiffies - busy}"
     runner = AsyncMock()
-    runner.run = AsyncMock(side_effect=replies)
+    runner.run = AsyncMock(return_value=MagicMock(success=True, stdout=stdout))
     return runner
 
 
@@ -313,9 +310,9 @@ async def test_no_backend_truth_voids_the_cpu_verdict(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_a_pod_started_after_the_snapshot_is_counted_and_reported(context_factory):
-    # The backend can start a pod after this cycle's rented_data snapshot. It still counts
-    # against the provider - a name is not proof - but the shadow week has to see the race.
+async def test_a_forged_rental_name_is_counted_and_reported(context_factory):
+    # A name the backend disowns: `pod_fresh` carries no id it ever issued. It counts against
+    # the provider, and the shadow week sees it separately.
     specs = {
         "cpu": {"count": 32},
         "docker": {
@@ -416,11 +413,7 @@ async def test_a_docker_that_does_not_answer_the_second_look_withholds_nothing(c
     # An empty container section means docker did not answer. Reading it as "Lium runs nothing
     # here" would charge the machine's whole load to the provider.
     runner = AsyncMock()
-    runner.run = AsyncMock(side_effect=[
-        MagicMock(success=True, stdout="0 0"),
-        MagicMock(success=True, stdout=""),
-        MagicMock(success=True, stdout="1000 0"),
-    ])
+    runner.run = AsyncMock(return_value=MagicMock(success=True, stdout="0 0\n@@@\n\n@@@\n1000 0"))
     ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS), runner=runner)
 
     with provider_load_gate(enforce=True):
@@ -448,3 +441,29 @@ async def test_the_roce_link_probe_is_not_the_providers_load(context_factory):
 
     assert result.passed is True
     assert result.event.what_we_saw["provider_cpu_cores"] == 0.4  # 6.4 host - 6.0 the probe
+
+
+@pytest.mark.asyncio
+async def test_a_pod_started_after_the_snapshot_is_not_the_providers_load(context_factory):
+    # DAH-2757: rented_data is read once at cycle start, so a pod started later in the same
+    # cycle is ours and missing from it. The backend confirms the id inside the name.
+    pod_id = "0e6f3a2c-1f4d-4a9b-9a51-1f2c3d4e5f60"
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "host_cpu_percent": 20.0,
+            "containers": [{"name": f"pod_{pod_id}", "cpu_percent": 500.0}],
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))
+    ctx.services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=True, executor_id=ctx.executor.uuid
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.LOAD_OK.reason
+    assert result.event.what_we_saw["provider_cpu_cores"] == 1.4  # 6.4 host - 5.0 the fresh pod
+    assert result.event.what_we_saw["lium_named_outside_snapshot_cores"] == 0.0

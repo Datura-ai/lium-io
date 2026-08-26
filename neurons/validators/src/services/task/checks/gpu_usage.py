@@ -343,10 +343,15 @@ def _parse_gpu_memory_used_mb(gpu_query_csv: str) -> dict[str, float]:
     return memory_by_uuid
 
 
+def carries_a_rental_prefix(container_name: str) -> bool:
+    """Named like a rental of ours. Says nothing about who really started it: `docker rename`
+    forges the name, which is why every caller confirms it against the backend."""
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+
+
 def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
     """The container is named like one of ours, but the backend did not report it this cycle."""
-    container_name: str = process.container_name or ""
-    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+    return carries_a_rental_prefix(process.container_name or "")
 
 
 async def _drop_containers_the_backend_still_owns(
@@ -376,7 +381,7 @@ async def _drop_containers_the_backend_still_owns(
         return foreign_processes
 
     ownership_verdicts: list[bool] = await asyncio.gather(
-        *(_the_backend_still_owns(ctx, name) for name in lium_named_containers)
+        *(the_backend_still_owns(ctx, name) for name in lium_named_containers)
     )
     still_ours: set[str] = {
         name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
@@ -384,8 +389,10 @@ async def _drop_containers_the_backend_still_owns(
     return [process for process in foreign_processes if process.container_name not in still_ours]
 
 
-async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
+async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     """True when the backend confirms the id inside the container name as a live run of ours.
+
+    Public because the provider-side load gate asks the same question about the same race.
 
     Mirrors the filler re-check in rental_verification. Fail-open on an unreachable backend
     (a None response): an inability to measure never withholds money here.

@@ -829,9 +829,11 @@ def get_container_log_bytes(docker_root_dir):
     # json logs are NOT in /system/df: `SizeRw` counts the writable layer only, and nothing
     # rotates the logs on an executor. Left out, a chatty renter pod's log reads as the
     # provider's own data (review ask, PR #1245). Blocks actually held, like the volume walk.
+    # `*.log*` also catches the rotated `-json.log.1` files a host with log-opts keeps; without
+    # them those bytes would read as the provider's data too.
     # No match is a normal answer, not a miss: a host on the journald driver writes no json log.
     total = 0
-    for path in glob.glob(f"/proc/1/root{docker_root_dir}/containers/*/*.log"):
+    for path in glob.glob(f"/proc/1/root{docker_root_dir}/containers/*/*.log*"):
         try:
             total += os.stat(path).st_blocks * 512
         except OSError:
@@ -853,8 +855,14 @@ def get_docker_disk_usage():
     volumes += get_vloopback_volume_bytes(docker_root_dir)
     containers += get_container_log_bytes(docker_root_dir)
 
+    # BuildCache rides in the same answer and holds image layers a custom build left behind.
+    # Folded into images: unenumerated docker bytes read as the provider's own data downstream.
+    build_cache = sum(
+        max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or []
+    )
+
     return {
-        "hard_disk_images": int(df.get("LayersSize") or 0) // 1024,
+        "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
     }

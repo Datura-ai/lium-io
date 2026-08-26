@@ -56,6 +56,8 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
                 "LayersSize": 45079943748,
                 "Containers": [{"SizeRw": 282628096}, {"SizeRw": 1024}],
                 "Volumes": [{"UsageData": {"Size": 5454000000}}],
+                # a custom build leaves layers here; docker reports them apart from LayersSize
+                "BuildCache": [{"Size": 2000000000}, {"Size": -1}],
             },
             "/info": {"DockerRootDir": "/var/lib/docker"},
             "/volumes": {"Volumes": []},
@@ -67,7 +69,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
 
     # Assert
     assert usage == {
-        "hard_disk_images": 45079943748 // 1024,
+        "hard_disk_images": (45079943748 + 2000000000) // 1024,
         "hard_disk_containers": (282628096 + 1024) // 1024,
         "hard_disk_volumes": 5454000000 // 1024,
     }
@@ -106,7 +108,7 @@ def test_vloopback_volumes_are_added_to_the_local_driver_total(scrape: dict, mon
         scrape,
         "glob",
         # the container-log walk globs the same root; only the volume pattern has matches here
-        type("_Glob", (), {"glob": staticmethod(lambda pattern: [] if pattern.endswith("*.log") else sorted({path.rsplit("/", 1)[0] for path in blocks_by_path}))}),
+        type("_Glob", (), {"glob": staticmethod(lambda pattern: [] if pattern.endswith("*.log*") else sorted({path.rsplit("/", 1)[0] for path in blocks_by_path}))}),
     )
     monkeypatch.setitem(
         scrape,
@@ -259,11 +261,15 @@ def test_docker_api_rejects_a_non_ok_response(scrape: dict, monkeypatch) -> None
         scrape["docker_api_get"]("/system/df")
 
 
-def test_container_json_logs_count_as_docker_not_as_provider_data(scrape: dict, monkeypatch) -> None:
+def test_container_json_logs_count_as_docker_not_as_provider_data(scrape: dict[str, object], monkeypatch) -> None:
     # Arrange — review ask (PR #1245): `SizeRw` is the writable layer only, json logs sit outside
     # it, and nothing rotates them on an executor. Unsubtracted, a chatty renter pod reads as the
     # provider's own data and the DAH-2734 gate zeroes an honest machine.
-    log_blocks = {"/proc/1/root/var/lib/docker/containers/abc/abc-json.log": 41943040}
+    log_blocks = {
+        "/proc/1/root/var/lib/docker/containers/abc/abc-json.log": 41943040,
+        # a host with log-opts keeps rotated copies; they hold real bytes too
+        "/proc/1/root/var/lib/docker/containers/abc/abc-json.log.1": 20971520,
+    }
     monkeypatch.setitem(
         scrape,
         "glob",
@@ -271,7 +277,7 @@ def test_container_json_logs_count_as_docker_not_as_provider_data(scrape: dict, 
     )
 
     def blocks_for(pattern):
-        return log_blocks if pattern.endswith("*.log") else []
+        return log_blocks if pattern.endswith("*.log*") else []
 
     monkeypatch.setitem(
         scrape,
@@ -302,10 +308,10 @@ def test_container_json_logs_count_as_docker_not_as_provider_data(scrape: dict, 
     usage = scrape["get_docker_disk_usage"]()
 
     # Assert
-    assert usage["hard_disk_containers"] == (1024 + 41943040 * 512) // 1024
+    assert usage["hard_disk_containers"] == (1024 + (41943040 + 20971520) * 512) // 1024
 
 
-def test_a_host_without_json_logs_reports_zero(scrape: dict, monkeypatch) -> None:
+def test_a_host_without_json_logs_reports_zero(scrape: dict[str, object], monkeypatch) -> None:
     # Arrange — the journald log driver writes no json log at all
     monkeypatch.setitem(scrape, "glob", type("_Glob", (), {"glob": staticmethod(lambda pattern: [])}))
 

@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any
 
 from core.config import settings
-from services.const import (
-    FILLER_CONTAINER_PREFIX,
-    POD_CONTAINER_PREFIX,
-    PROBE_CONTAINER_NAME,
-)
+from services.const import LIUM_INFRA_CONTAINER_PREFIXES
 
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
-from .gpu_usage import lium_workload_containers
+from .gpu_usage import (
+    carries_a_rental_prefix,
+    lium_workload_containers,
+    the_backend_still_owns,
+)
 from ..messages import ProviderSideLoadMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -32,32 +33,50 @@ PROVIDER_SIDE_DISK_LIMIT_KB = 100 * 1024 * 1024  # 100 GB outside docker
 # A provider mining another subnet holds them all day, so the second reading keeps him and
 # drops the spike. An unreadable second reading withholds nothing.
 CPU_RESAMPLE_TIMEOUT_SECONDS = 45
-HOST_CPU_JIFFIES_COMMAND = (
+_HOST_CPU_JIFFIES = (
     "awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat"
 )
-CONTAINER_CPU_COMMAND = (
-    "timeout 30 /usr/bin/docker stats --no-stream --format '{{.ID}}|{{.Name}}|{{.CPUPerc}}'"
+# One command, not three: each extra ssh channel costs ~230 ms of dead time INSIDE the jiffies
+# bracket, and the bracket is what makes the host reading comparable to the container sample.
+# `@@@` separates the sections. A docker name holds only [a-zA-Z0-9_.-], so no container can
+# carry the marker and cut the output somewhere else.
+_SECTION_MARKER = "@@@"
+CPU_RESAMPLE_COMMAND = (
+    f"{_HOST_CPU_JIFFIES}; echo {_SECTION_MARKER}; "
+    "timeout 30 /usr/bin/docker stats --no-stream --format '{{.ID}}|{{.Name}}|{{.CPUPerc}}'; "
+    f"echo {_SECTION_MARKER}; {_HOST_CPU_JIFFIES}"
 )
-
-
-def _usable_percent(raw_percent: Any) -> float:
-    percent = float(raw_percent)
-    if not math.isfinite(percent) or percent < 0:
-        raise ValueError(f"unusable container cpu reading: {percent}")
-    return percent
 
 
 @dataclass(frozen=True)
-class ContainerCpuReading:
-    """One `docker stats` row: who the container is, and its CPU in core-percent (300% = 3 cores)."""
+class ContainerRow:
+    """One container as the node reported it, from the scrape or from `docker stats`.
+
+    `cpu_percent` is core-percent (300% = 3 cores) and None when that source carries no CPU
+    reading for the container. `digest` is empty on the ssh path, which does not report it.
+    """
 
     container_id: str
     name: str
-    cpu_percent: float
+    digest: str = ""
+    cpu_percent: float | None = None
+
+    @property
+    def measured_cpu_percent(self) -> float:
+        """The reading, or a ValueError that voids the whole CPU signal for this cycle.
+
+        A container the window cannot account for must never be silently treated as idle: its
+        cores would land on the provider's bill.
+        """
+        if self.cpu_percent is None:
+            raise ValueError(f"no cpu reading for container {self.name or self.container_id}")
+        if not math.isfinite(self.cpu_percent) or self.cpu_percent < 0:
+            raise ValueError(f"unusable cpu reading: {self.cpu_percent}")
+        return self.cpu_percent
 
 
 def provider_cores_outside_lium(
-    host_cores: float, readings: list[ContainerCpuReading], lium_container_keys: set[str]
+    host_cores: float, rows: list[ContainerRow], lium_container_keys: set[str]
 ) -> float:
     """The host's cores minus the containers Lium itself put there.
 
@@ -66,11 +85,9 @@ def provider_cores_outside_lium(
     """
     lium_short_ids: set[str] = {key[:12] for key in lium_container_keys}
     lium_percent: float = sum(
-        reading.cpu_percent
-        for reading in readings
-        if reading.name in lium_container_keys
-        or reading.container_id in lium_container_keys
-        or reading.container_id[:12] in lium_short_ids
+        row.measured_cpu_percent
+        for row in rows
+        if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
     )
     return round(max(0.0, host_cores - lium_percent / 100), 1)
 
@@ -106,12 +123,67 @@ class ProviderSideLoad:
         return fields
 
 
-def lium_containers(ctx: Context) -> set[str] | None:
+def docker_containers(specs: dict[str, Any]) -> list[ContainerRow]:
+    """The container rows of the scrape, or an empty list when the scrape sent none.
+
+    `specs` is the raw JSON the miner's machine produced, so this is the one place that reads
+    its shape; everything above it works on ContainerRow.
+    """
+    docker_info = specs.get("docker")
+    if not isinstance(docker_info, dict):
+        return []
+    return [
+        ContainerRow(
+            container_id=str(entry.get("container_id") or ""),
+            name=str(entry.get("name") or ""),
+            digest=str(entry.get("digest") or ""),
+            cpu_percent=(
+                float(entry["cpu_percent"]) if entry.get("cpu_percent") is not None else None
+            ),
+        )
+        for entry in docker_info.get("containers") or []
+        if isinstance(entry, dict)
+    ]
+
+
+def infra_container_names(specs: dict[str, Any]) -> set[str]:
+    """Lium's own short-lived probes, which carry no backend-issued id to confirm them by."""
+    return {
+        row.name for row in docker_containers(specs) if row.name.startswith(LIUM_INFRA_CONTAINER_PREFIXES)
+    }
+
+
+async def late_started_containers_the_backend_owns(
+    ctx: Context, known_containers: set[str]
+) -> set[str]:
+    """Rental-named containers the snapshot missed, kept only when the backend still owns them.
+
+    DAH-2757: `rented_data` is read once at cycle start, so a filler or pod started later in the
+    same cycle is ours and absent from the allowlist. Its cores are real, so without this the
+    gate bills them to the provider. The twin resolves the same race the same way - the name
+    alone proves nothing, so the id inside it is confirmed against the backend.
+    """
+    candidates: list[str] = sorted(
+        {
+            row.name
+            for row in docker_containers(ctx.state.specs or {})
+            if carries_a_rental_prefix(row.name) and row.name not in known_containers
+        }
+    )
+    if not candidates:
+        return set()
+    verdicts = await asyncio.gather(*(the_backend_still_owns(ctx, name) for name in candidates))
+    return {name for name, is_ours in zip(candidates, verdicts) if is_ours}
+
+
+async def lium_containers(ctx: Context) -> set[str] | None:
     """Every container Lium itself put on this host, by name or by id.
 
-    The node's fillers and pods as the BACKEND knows them - the same set the foreign-GPU twin
-    judges by, so a `docker rename` defeats neither gate - plus the executor's own container,
-    which is on no rental list but is still ours.
+    Three grades of evidence, weakest last: the node's fillers and pods as the BACKEND knows
+    them (the set the foreign-GPU twin judges by, plus the build named after a pod it reports);
+    the executor's own stack, matched by the image digest it runs; and Lium's short-lived infra
+    containers, matched by name. A name is forgeable, so that last tier only excuses load - it
+    never turns a container into a rental.
 
     None when the backend sent no truth this cycle: every filler would then read as a foreign
     workload. The twin returns no verdict in that case and so does this gate.
@@ -125,17 +197,15 @@ def lium_containers(ctx: Context) -> set[str] | None:
     rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid)
     if rented_executor:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
-    # DAH-2667's link probe runs `ib_write_bw` in a container of ours with a fixed name. It
-    # finishes before this check reads anything today, but nothing enforces that order.
-    containers.add(PROBE_CONTAINER_NAME)
-    docker_info = (ctx.state.specs or {}).get("docker")
-    if isinstance(docker_info, dict):
-        containers.update(executor_stack_container_ids(docker_info))
+    specs = ctx.state.specs or {}
+    containers.update(executor_stack_container_ids(specs))
+    containers.update(infra_container_names(specs))
+    containers.update(await late_started_containers_the_backend_owns(ctx, containers))
     containers.discard("")
     return containers
 
 
-def executor_stack_container_ids(docker_info: dict[str, Any]) -> set[str]:
+def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
     """Ids of the containers running the executor's own image.
 
     `docker.container_id` names one of them, but the stack runs that image TWICE - `executor`
@@ -143,20 +213,15 @@ def executor_stack_container_ids(docker_info: dict[str, Any]) -> set[str]:
     They are matched by image digest instead. The stack's other containers (postgres, autoheal)
     run other images and stay on the provider's side, where their idle load belongs.
     """
-    entries = [entry for entry in (docker_info.get("containers") or []) if isinstance(entry, dict)]
-    executor_id = str(docker_info.get("container_id") or "")
-    executor_digest = next(
-        (entry.get("digest") for entry in entries if entry.get("container_id") == executor_id),
-        None,
+    docker_info = specs.get("docker")
+    executor_id = (
+        str(docker_info.get("container_id") or "") if isinstance(docker_info, dict) else ""
     )
+    rows = docker_containers(specs)
+    executor_digest = next((row.digest for row in rows if row.container_id == executor_id), "")
     ids: set[str] = {executor_id}
     if executor_digest:
-        ids.update(
-            str(entry.get("container_id") or "")
-            for entry in entries
-            if entry.get("digest") == executor_digest
-        )
-    ids.discard("")
+        ids.update(row.container_id for row in rows if row.digest == executor_digest)
     return ids
 
 
@@ -181,21 +246,12 @@ def compute_provider_side_load(
 
     try:
         docker_info = specs.get("docker") or {}
-        containers = docker_info.get("containers") or []
+        rows = docker_containers(specs)
         host_percent = float(docker_info.get("host_cpu_percent"))
         readable = math.isfinite(host_percent) and host_percent >= 0
-        if core_count and lium_container_keys is not None and containers and readable:
-            readings = [
-                # a missing or unusable percent raises into the except and voids the CPU part
-                ContainerCpuReading(
-                    container_id=str(container.get("container_id") or ""),
-                    name=str(container.get("name") or ""),
-                    cpu_percent=_usable_percent(container["cpu_percent"]),
-                )
-                for container in containers
-            ]
+        if core_count and lium_container_keys is not None and rows and readable:
             cpu_cores = provider_cores_outside_lium(
-                host_percent / 100 * core_count, readings, lium_container_keys
+                host_percent / 100 * core_count, rows, lium_container_keys
             )
     except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
         pass
@@ -225,14 +281,10 @@ def lium_named_cores_outside_snapshot(
     if lium_container_keys is None:
         return None
     try:
-        containers = (specs.get("docker") or {}).get("containers") or []
         cores = sum(
-            float(container.get("cpu_percent") or 0)
-            for container in containers
-            if str(container.get("name") or "").startswith(
-                (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)
-            )
-            and container.get("name") not in lium_container_keys
+            row.cpu_percent or 0.0
+            for row in docker_containers(specs)
+            if carries_a_rental_prefix(row.name) and row.name not in lium_container_keys
         )
     except (TypeError, ValueError, AttributeError, OverflowError):
         return None
@@ -261,20 +313,18 @@ def parse_resampled_cpu_cores(
         # provider.
         if total_delta <= 0 or not rows:
             return None
-        readings: list[ContainerCpuReading] = []
-        for row in rows:
-            short_id, name, raw_percent = (part.strip() for part in row.split("|"))
-            readings.append(
-                ContainerCpuReading(
-                    container_id=short_id,
-                    name=name,
-                    cpu_percent=_usable_percent(raw_percent.rstrip("%")),
+        stats_rows: list[ContainerRow] = []
+        for line in rows:
+            short_id, name, raw_percent = (part.strip() for part in line.split("|"))
+            stats_rows.append(
+                ContainerRow(
+                    container_id=short_id, name=name, cpu_percent=float(raw_percent.rstrip("%"))
                 )
             )
     except (TypeError, ValueError, OverflowError):
         return None
     host_cores = (total_delta - (last_idle - first_idle)) / total_delta * core_count
-    return provider_cores_outside_lium(host_cores, readings, lium_container_keys)
+    return provider_cores_outside_lium(host_cores, stats_rows, lium_container_keys)
 
 
 class ProviderSideLoadCheck:
@@ -303,50 +353,27 @@ class ProviderSideLoadCheck:
     ) -> float | None:
         """Read the load once more over ssh. None on anything unreadable, which withholds nothing.
 
-        Three plain commands through `ctx.runner`, like the twin gate's second look at the card:
-        the runner owns the timeout, the failure and the timing log, and the two jiffies readings
-        bracket the container sample.
+        Through `ctx.runner`, like the twin gate's second look at the card: the runner owns the
+        timeout, the failure and the timing log.
         """
         if not core_count or lium_container_keys is None or ctx.runner is None:
             return None
-        jiffies_before = await ctx.runner.run(
-            HOST_CPU_JIFFIES_COMMAND, timeout=CPU_RESAMPLE_TIMEOUT_SECONDS, retryable=False
+        result = await ctx.runner.run(
+            CPU_RESAMPLE_COMMAND, timeout=CPU_RESAMPLE_TIMEOUT_SECONDS, retryable=False
         )
-        containers = await ctx.runner.run(
-            CONTAINER_CPU_COMMAND, timeout=CPU_RESAMPLE_TIMEOUT_SECONDS, retryable=False
-        )
-        jiffies_after = await ctx.runner.run(
-            HOST_CPU_JIFFIES_COMMAND, timeout=CPU_RESAMPLE_TIMEOUT_SECONDS, retryable=False
-        )
-        if not (jiffies_before.success and containers.success and jiffies_after.success):
+        if not result.success:
             return None
+        sections = result.stdout.split(_SECTION_MARKER)
+        if len(sections) != 3:
+            return None
+        jiffies_before, container_rows, jiffies_after = sections
         return parse_resampled_cpu_cores(
-            jiffies_before.stdout,
-            containers.stdout,
-            jiffies_after.stdout,
-            core_count,
-            lium_container_keys,
-        )
-
-    async def measure_provider_side_load(
-        self, ctx: Context, lium_container_keys: set[str] | None
-    ) -> ProviderSideLoad:
-        """The scrape's reading, confirmed over ssh whenever it is high enough to cost money."""
-        core_count: int | None = advertised_cpu_count(ctx)
-        measured = compute_provider_side_load(
-            ctx.state.specs or {}, core_count, lium_container_keys
-        )
-        if (measured.cpu_cores or 0.0) < PROVIDER_SIDE_CPU_CORES_LIMIT:
-            return measured
-        return replace(
-            measured,
-            cpu_cores=await self._resample_cpu_cores(ctx, core_count, lium_container_keys),
+            jiffies_before, container_rows, jiffies_after, core_count, lium_container_keys
         )
 
     def _what_we_saw(
         self,
         ctx: Context,
-        specs: dict[str, Any],
         provider_side_load: ProviderSideLoad,
         lium_container_keys: set[str] | None,
     ) -> dict[str, object]:
@@ -368,17 +395,31 @@ class ProviderSideLoadCheck:
             "disk_gb_limit": PROVIDER_SIDE_DISK_LIMIT_KB // (1024 * 1024),
             "is_rented": is_rented,
             "lium_named_outside_snapshot_cores": lium_named_cores_outside_snapshot(
-                specs, lium_container_keys
+                ctx.state.specs or {}, lium_container_keys
             ),
         }
+
+    async def measure_provider_side_load(
+        self, ctx: Context, lium_container_keys: set[str] | None
+    ) -> ProviderSideLoad:
+        """The scrape's reading, confirmed over ssh whenever it is high enough to cost money."""
+        core_count: int | None = advertised_cpu_count(ctx)
+        measured = compute_provider_side_load(
+            ctx.state.specs or {}, core_count, lium_container_keys
+        )
+        if (measured.cpu_cores or 0.0) < PROVIDER_SIDE_CPU_CORES_LIMIT:
+            return measured
+        return replace(
+            measured,
+            cpu_cores=await self._resample_cpu_cores(ctx, core_count, lium_container_keys),
+        )
 
     async def run(self, ctx: Context) -> CheckResult:
         if not settings.PROVIDER_SIDE_LOAD_CHECK_ENABLED:
             event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             return CheckResult(passed=True, event=event)
 
-        lium_container_keys = lium_containers(ctx)
-        specs = ctx.state.specs or {}
+        lium_container_keys = await lium_containers(ctx)
         provider_side_load = await self.measure_provider_side_load(ctx, lium_container_keys)
         if not provider_side_load.is_measured:
             event = render_message(
@@ -395,7 +436,7 @@ class ProviderSideLoadCheck:
         )
         updates: dict[str, object] = {"state": updated_state}
 
-        what = self._what_we_saw(ctx, specs, provider_side_load, lium_container_keys)
+        what = self._what_we_saw(ctx, provider_side_load, lium_container_keys)
         if not provider_side_load.is_above_limits:
             event = render_message(Msg.LOAD_OK, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=True, event=event, updates=updates)
