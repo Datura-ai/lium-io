@@ -1,8 +1,14 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from uuid import UUID
 
 from core.config import settings
+from protocol.vc_protocol.compute_requests import (
+    LIVE_FILLER_RUN_STATUSES,
+    FillerRunActiveResponse,
+    PodRentalActiveResponse,
+)
 from services.const import (
     FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
@@ -76,7 +82,9 @@ class GpuUsageCheck:
         Competitor marketplaces (Nodexo/SN106) idle below the percentage limits on purpose: a
         rental holding 22.4 GB at 0% load passes every utilization gate. The expected holders
         come from the backend (`rented_data`), never from a container-name prefix — the whole
-        point of the ticket is a verdict `docker rename` cannot defeat. Shadow by default like
+        point of the ticket is a verdict `docker rename` cannot defeat. A container named like
+        ours but missing from the snapshot is asked about directly (DAH-2757); the prefix only
+        decides whom to ask, the backend still gives the answer. Shadow by default like
         every other money-withholding gate: without FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
         the verdict is logged, not scored. Returns None when the card is clean, leaving the
         legacy verdict to the caller.
@@ -101,15 +109,15 @@ class GpuUsageCheck:
             if process.get("container_name") not in workload_containers
             and not _runs_in_the_executors_own_cgroup(process)
         ]
+        foreign_processes = await _drop_containers_the_backend_still_owns(ctx, foreign_processes)
 
         if foreign_processes:
             what = {
                 "foreign_processes": foreign_processes,
                 "process_count": len(gpu_processes),
-                # Review ask (PR #1242): the backend can start a filler AFTER this cycle's
-                # rented_data snapshot. Such a container carries our own prefix but is absent
-                # from the allowlist, so it reads as foreign. Count it separately, so the
-                # shadow week measures how often that race happens before enforcement goes on.
+                # Our own name on a container the backend disowns — the id inside it belongs
+                # to no run it ever issued. Counted separately, because that is the shape a
+                # forged name takes once the late-start race (DAH-2757) is out of the way.
                 "lium_named_outside_snapshot": [
                     process for process in foreign_processes if _carries_a_lium_prefix(process)
                 ],
@@ -336,6 +344,127 @@ def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
     """The container is named like one of ours, but the backend did not report it this cycle."""
     container_name: str = process.container_name or ""
     return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+
+
+async def _drop_containers_the_backend_still_owns(
+    ctx: Context, foreign_processes: list[ForeignGpuProcess]
+) -> list[ForeignGpuProcess]:
+    """Ask the backend about a Lium-named container that this cycle's snapshot does not hold.
+
+    DAH-2757: `rented_data` is read once, at cycle start. A filler or pod the backend starts
+    later in the same cycle carries our own name and is absent from the allowlist, so it reads
+    as foreign at 0% load — 7 honest nodes hit this in the first prod shadow day. The name on
+    its own still proves nothing, because `docker rename` forges it, so the id inside the name
+    is confirmed against the backend, which disowns an id it never issued.
+
+    One question per container, not per process: a single container holds as many GPU processes
+    as it has workers (8 in one prod pod), and this check sits on the healthy path of every
+    executor in every cycle.
+    """
+    claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
+    lium_named_containers: list[str] = sorted(
+        {
+            process.container_name
+            for process in foreign_processes
+            if _carries_a_lium_prefix(process) and process.container_name not in claimed_elsewhere
+        }
+    )
+    if not lium_named_containers:
+        return foreign_processes
+
+    ownership_verdicts: list[bool] = await asyncio.gather(
+        *(_the_backend_still_owns(ctx, name) for name in lium_named_containers)
+    )
+    still_ours: set[str] = {
+        name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
+    }
+    return [process for process in foreign_processes if process.container_name not in still_ours]
+
+
+async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
+    """True when the backend confirms the id inside the container name as a live run of ours.
+
+    Mirrors the filler re-check in rental_verification. Fail-open on an unreachable backend
+    (a None response): an inability to measure never withholds money here.
+    """
+    is_filler: bool = container_name.startswith(FILLER_CONTAINER_PREFIX)
+    prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
+    backend_issued_id: str | None = _uuid_after_prefix(container_name, prefix)
+    if backend_issued_id is None:
+        return False
+
+    if is_filler:
+        filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
+            backend_issued_id
+        )
+        if filler_run is None:
+            return True
+        if not _the_answer_is_about_this_node(ctx, filler_run.executor_id):
+            return False
+        # `active` alone means RUNNING. The status carries the two transitional states, which is
+        # where a filler the snapshot missed usually sits — but a backend that sends no status
+        # must not turn a run it calls active into a foreign workload.
+        return filler_run.active or filler_run.status in LIVE_FILLER_RUN_STATUSES
+
+    pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(
+        backend_issued_id
+    )
+    if pod_rental is None:
+        return True
+    return _the_answer_is_about_this_node(ctx, pod_rental.executor_id) and pod_rental.active
+
+
+def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:
+    """The uuid the backend issued, or None when the name carries something else.
+
+    Only the canonical spelling counts. `UUID()` also reads an upper-case or dash-less form of
+    the same id, and both are legal docker names — without this test a provider could point a
+    second container at a live run of their own node and have the re-check clear it.
+    """
+    suffix: str = container_name.removeprefix(prefix)
+    try:
+        canonical_uuid: str = str(UUID(suffix))
+    except ValueError:
+        return None
+    return canonical_uuid if canonical_uuid == suffix else None
+
+
+def _the_answer_is_about_this_node(ctx: Context, owning_executor_id: str | None) -> bool:
+    """Whether the run the backend described lives on the node the check is looking at.
+
+    The endpoints answer about a run id, which is public on its own host, so a provider with two
+    nodes could name a squatter container after a live run of their honest one. A backend that
+    predates the field sends nothing, and then the fleet snapshot is the only owner test we have.
+    """
+    if owning_executor_id is None:
+        return True
+    return str(owning_executor_id) == str(ctx.executor.uuid)
+
+
+def _containers_claimed_by_another_executor(ctx: Context) -> set[str]:
+    """Container names this cycle's snapshot gives to a DIFFERENT node of the fleet.
+
+    A run id is public on its own host (`docker ps`), and the backend answers about the RUN, not
+    about where it runs. So a provider with two nodes could name a foreign container after a live
+    filler of their honest node and have the re-check clear it. The snapshot is what separates
+    them: a name another executor already holds is never ours to clear.
+    """
+    rented_data = ctx.state.rented_data
+    our_executor_uuid: str = str(ctx.executor.uuid)
+    claimed: set[str] = set()
+
+    filler_executor_uuids: set[str] = set(rented_data.all_filler_containers_by_executor) | set(
+        rented_data.filler_containers_by_executor
+    )
+    for executor_uuid in filler_executor_uuids - {our_executor_uuid}:
+        claimed.update(rented_data.get_filler_containers(executor_uuid))
+
+    for executor_uuid, rented_executor in rented_data.executors.items():
+        if executor_uuid != our_executor_uuid:
+            claimed.update(pod.container_name for pod in rented_executor.pods)
+
+    claimed.discard("")
+    return claimed
 
 
 def _runs_in_the_executors_own_cgroup(process: dict) -> bool:
