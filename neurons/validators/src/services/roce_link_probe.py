@@ -54,6 +54,10 @@ PROBE_TIMEOUT_SECONDS = 120
 # zero, so the probe stops itself well before that: a cycle is 15 minutes and every other check
 # has run by now.
 PROBE_BUDGET_SECONDS = 180
+# `ibv_reg_mr` pins the buffer it registers, so a real card needs both of these or the
+# registration fails and no pair ever measures (DAH-2571). Soft-RoCE does not need them,
+# which is why an emulated device hides the gap.
+RDMA_DOCKER_FLAGS = "--cap-add IPC_LOCK --ulimit memlock=-1:-1"
 SPEC_KEY = "roce_link_measurements"
 
 ROCE_LINK_LAYER = "ethernet"
@@ -209,13 +213,13 @@ def _server_command() -> str:
     return (
         f"docker rm -f {PROBE_CONTAINER_NAME} >/dev/null 2>&1; "
         f"docker run --rm -d --name {PROBE_CONTAINER_NAME} --network host --device /dev/infiniband "
-        f"{PROBE_IMAGE} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}"
+        f"{RDMA_DOCKER_FLAGS} {PROBE_IMAGE} server {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS}"
     )
 
 
 def _client_command(server_roce_address: str) -> str:
     return (
-        f"docker run --rm --network host --device /dev/infiniband {PROBE_IMAGE} "
+        f"docker run --rm --network host --device /dev/infiniband {RDMA_DOCKER_FLAGS} {PROBE_IMAGE} "
         f"client {PROBE_HANDSHAKE_PORT} {PROBE_ITERATIONS} {shlex.quote(server_roce_address)}"
     )
 

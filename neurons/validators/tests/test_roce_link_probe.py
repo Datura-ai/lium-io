@@ -11,6 +11,8 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from services import roce_link_probe
 from services.roce_link_probe import (
+    _client_command,
+    _server_command,
     RoceLinkMeasurement,
     attach_measurement,
     measure_and_attach,
@@ -236,3 +238,10 @@ async def test_a_sweep_that_hangs_gives_up_instead_of_failing_the_miners_cycle(
     await measure_and_attach(results, "private-key", {})
 
     assert all(result.spec.get("roce_link_measurements") is None for result in results)
+
+
+def test_both_probe_containers_can_pin_the_memory_a_real_card_registers():
+    """`ibv_reg_mr` fails without these, and Soft-RoCE never shows it (DAH-2571)."""
+    for command in (_server_command(), _client_command("10.0.0.5")):
+        assert "--cap-add IPC_LOCK" in command
+        assert "--ulimit memlock=-1:-1" in command
