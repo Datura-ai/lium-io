@@ -245,3 +245,16 @@ def test_both_probe_containers_can_pin_the_memory_a_real_card_registers():
     for command in (_server_command(), _client_command("10.0.0.5")):
         assert "--cap-add IPC_LOCK" in command
         assert "--ulimit memlock=-1:-1" in command
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_raises_never_reaches_the_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exception here would abort the miner's whole job and score it zero for the cycle."""
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("specs are not what the probe expected")
+
+    monkeypatch.setattr(roce_link_probe.settings, "ROCE_LINK_PROBE_ENABLED", True)
+    monkeypatch.setattr(roce_link_probe, "pairs_to_measure", explode)
+
+    await measure_and_attach([job_result("a", [roce_port("ac10:0506")])], "private-key", {})

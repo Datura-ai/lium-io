@@ -299,17 +299,19 @@ async def measure_and_attach(
     if not settings.ROCE_LINK_PROBE_ENABLED:
         return
 
-    pairs = pairs_to_measure(results)
-    if not pairs:
-        return
-
-    logger.info(
-        _m(
-            "Measuring RoCE links before the backend sells them",
-            extra=get_extra_info({**log_extra, "pairs": len(pairs)}),
-        ),
-    )
+    # Nothing in here may reach the caller: an exception in the probe would abort the miner's whole
+    # job and score it zero for the cycle, which is a far worse outcome than an unmeasured pair.
     try:
+        pairs = pairs_to_measure(results)
+        if not pairs:
+            return
+
+        logger.info(
+            _m(
+                "Measuring RoCE links before the backend sells them",
+                extra=get_extra_info({**log_extra, "pairs": len(pairs)}),
+            ),
+        )
         await asyncio.wait_for(
             _measure_every_pair(pairs, decrypted_private_key, log_extra),
             timeout=PROBE_BUDGET_SECONDS,
@@ -318,8 +320,12 @@ async def measure_and_attach(
         logger.warning(
             _m(
                 "RoCE link probe ran out of its budget",
-                extra=get_extra_info({**log_extra, "pairs": len(pairs), "budget_seconds": PROBE_BUDGET_SECONDS}),
+                extra=get_extra_info({**log_extra, "budget_seconds": PROBE_BUDGET_SECONDS}),
             ),
+        )
+    except Exception as error:
+        logger.warning(
+            _m("RoCE link probe failed", extra=get_extra_info({**log_extra, "error": str(error)})),
         )
 
 
