@@ -6,7 +6,11 @@ from dataclasses import replace
 from typing import Any
 
 from core.config import settings
-from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
+from services.const import (
+    FILLER_CONTAINER_PREFIX,
+    POD_CONTAINER_PREFIX,
+    PROBE_CONTAINER_NAME,
+)
 
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
@@ -121,6 +125,9 @@ def lium_containers(ctx: Context) -> set[str] | None:
     rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid)
     if rented_executor:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
+    # DAH-2667's link probe runs `ib_write_bw` in a container of ours with a fixed name. It
+    # finishes before this check reads anything today, but nothing enforces that order.
+    containers.add(PROBE_CONTAINER_NAME)
     docker_info = (ctx.state.specs or {}).get("docker")
     if isinstance(docker_info, dict):
         containers.update(executor_stack_container_ids(docker_info))

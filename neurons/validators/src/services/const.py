@@ -271,6 +271,10 @@ DEFAULT_JOB_OWNER_LIUM = "lium"
 #   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
 RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 
+# DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
+# without importing the probe service, which imports the checks back.
+PROBE_CONTAINER_NAME = "lium_roce_probe"
+
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
 TDX_WHITELIST = {
     "OS_IMAGE_HASH": set(
