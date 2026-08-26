@@ -56,9 +56,15 @@ _HOST_SAMPLE = (
 # `@@@` separates the sections. A docker name holds only [a-zA-Z0-9_.-], so no container can
 # carry the marker and cut the output somewhere else.
 _SECTION_MARKER = "@@@"
+# The chain's exit status is the last command's, so a `docker stats` that dies after printing
+# half its rows would look like a clean reading with Lium's containers missing - and their CPU
+# would land on the provider. It reports its own failure instead.
+_STATS_FAILED_MARKER = "STATS_FAILED"
 CPU_RESAMPLE_COMMAND = (
     f"{_HOST_SAMPLE}; echo {_SECTION_MARKER}; "
-    "timeout 30 /usr/bin/docker stats --no-stream --format '{{.ID}}|{{.Name}}|{{.CPUPerc}}'; "
+    "{ timeout 30 /usr/bin/docker stats --no-stream "
+    "--format '{{.ID}}|{{.Name}}|{{.CPUPerc}}' "
+    f"|| echo {_STATS_FAILED_MARKER}; }}; "
     f"echo {_SECTION_MARKER}; {_HOST_SAMPLE}"
 )
 
@@ -349,6 +355,8 @@ def parse_resampled_cpu_cores(
         last_total, last_idle, last_docker_usec = (int(part) for part in sample_after.split())
         total_delta = last_total - first_total
         rows = container_rows.strip().splitlines()
+        if any(_STATS_FAILED_MARKER in row for row in rows):
+            return None
         # Every host runs at least the executor's own container, so no rows means docker did not
         # answer. Reading that as "Lium runs nothing here" would charge the whole host to the
         # provider.

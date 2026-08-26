@@ -603,3 +603,23 @@ async def test_the_rest_of_the_executor_stack_is_not_the_providers_load(context_
 
     assert result.passed is True
     assert result.event.what_we_saw["provider_cpu_cores"] == 1.0  # 2.56 host - 1.5 the stack
+
+
+@pytest.mark.asyncio
+async def test_a_half_finished_stats_run_withholds_nothing(context_factory):
+    # `docker stats` can die after printing some rows. The chain's exit status belongs to the
+    # last command, so the run reports its own failure and the reading is dropped.
+    runner = AsyncMock()
+    runner.run = AsyncMock(
+        return_value=MagicMock(
+            success=True,
+            stdout="0 0 0\n@@@\nc1|pod_renter|10.00%\nSTATS_FAILED\n@@@\n1000 0 0",
+        )
+    )
+    ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS), runner=runner)
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.NOT_MEASURABLE.reason

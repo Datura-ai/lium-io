@@ -289,6 +289,9 @@ LIUM_INFRA_CONTAINER_PREFIXES = (
     "container_",
     "health_check_",
     "executor-",
+    # the s3 backup helper (miner_jobs/backup_storage.py) copies a renter's volume, which costs
+    # real CPU while it runs
+    "s3fs-backup",
     PROBE_CONTAINER_NAME,
 )
 
