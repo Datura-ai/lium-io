@@ -27,24 +27,39 @@ from ..pipeline import CheckResult, Context
 PROVIDER_SIDE_CPU_CORES_LIMIT = 2.0
 PROVIDER_SIDE_DISK_LIMIT_KB = 100 * 1024 * 1024  # 100 GB outside docker
 
+# Lium's infra containers are excused by NAME, and a name is forgeable. The excuse is therefore
+# capped: the heaviest of them is the RoCE link probe, whose `ib_write_bw` busy-polls one core,
+# while a subnet miner wearing the name `container_sn13` holds many. Everything above the cap
+# stays on the provider's bill.
+INFRA_CONTAINER_CORES_EXCUSED = 1.5
+
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
 # the live card. The scrape's window is about two seconds, and Lium's own housekeeping
 # (watchtower pulling an image, autoheal restarting a container) can hold two cores inside it.
 # A provider mining another subnet holds them all day, so the second reading keeps him and
 # drops the spike. An unreadable second reading withholds nothing.
 CPU_RESAMPLE_TIMEOUT_SECONDS = 45
-_HOST_CPU_JIFFIES = (
-    "awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat"
+# Linux counts /proc/stat in USER_HZ, 100 everywhere we run.
+_JIFFIES_PER_SECOND = 100
+# `total idle docker_usec` in one line. The third number is dockerd's own CPU: pulling a Lium
+# image is work Lium asked for, it belongs to no container row, and a 60 GB pull outlives both
+# samples - without subtracting it an honest node reads as a cheating one. Zero when the host
+# runs cgroup v1 or names the units differently, which only means nothing gets subtracted.
+_HOST_SAMPLE = (
+    r"""awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; printf "%d %d ", total, idle}' /proc/stat; """
+    r"""cat /sys/fs/cgroup/system.slice/docker.service/cpu.stat """
+    r"""/sys/fs/cgroup/system.slice/containerd.service/cpu.stat 2>/dev/null """
+    r"""| awk '/^usage_usec/{used+=$2} END{printf "%d\n", used+0}'"""
 )
-# One command, not three: each extra ssh channel costs ~230 ms of dead time INSIDE the jiffies
+# One command, not three: each extra ssh channel costs ~230 ms of dead time INSIDE the sample
 # bracket, and the bracket is what makes the host reading comparable to the container sample.
 # `@@@` separates the sections. A docker name holds only [a-zA-Z0-9_.-], so no container can
 # carry the marker and cut the output somewhere else.
 _SECTION_MARKER = "@@@"
 CPU_RESAMPLE_COMMAND = (
-    f"{_HOST_CPU_JIFFIES}; echo {_SECTION_MARKER}; "
+    f"{_HOST_SAMPLE}; echo {_SECTION_MARKER}; "
     "timeout 30 /usr/bin/docker stats --no-stream --format '{{.ID}}|{{.Name}}|{{.CPUPerc}}'; "
-    f"echo {_SECTION_MARKER}; {_HOST_CPU_JIFFIES}"
+    f"echo {_SECTION_MARKER}; {_HOST_SAMPLE}"
 )
 
 
@@ -147,9 +162,16 @@ def docker_containers(specs: dict[str, Any]) -> list[ContainerRow]:
 
 
 def infra_container_names(specs: dict[str, Any]) -> set[str]:
-    """Lium's own short-lived probes, which carry no backend-issued id to confirm them by."""
+    """Lium's own short-lived probes, which carry no backend-issued id to confirm them by.
+
+    Only while they behave like probes: past INFRA_CONTAINER_CORES_EXCUSED the container is
+    doing something a probe does not, and the name alone will not excuse it.
+    """
     return {
-        row.name for row in docker_containers(specs) if row.name.startswith(LIUM_INFRA_CONTAINER_PREFIXES)
+        row.name
+        for row in docker_containers(specs)
+        if row.name.startswith(LIUM_INFRA_CONTAINER_PREFIXES)
+        and (row.cpu_percent or 0.0) <= INFRA_CONTAINER_CORES_EXCUSED * 100
     }
 
 
@@ -292,20 +314,21 @@ def lium_named_cores_outside_snapshot(
 
 
 def parse_resampled_cpu_cores(
-    jiffies_before: str,
+    sample_before: str,
     container_rows: str,
-    jiffies_after: str,
+    sample_after: str,
     core_count: int,
     lium_container_keys: set[str],
 ) -> float | None:
     """Provider-side cores from the second reading, or None if it is not readable.
 
-    Host busy time comes from the /proc/stat jiffies taken on either side of `docker stats`,
-    so both readings cover the same seconds - the pairing the whole subtraction rests on.
+    Host busy time comes from the /proc/stat jiffies taken on either side of `docker stats`, so
+    both cover the same seconds - the pairing the whole subtraction rests on. Out of that come
+    the containers Lium runs and dockerd's own work, and what is left is the provider's.
     """
     try:
-        first_total, first_idle = (int(part) for part in jiffies_before.split())
-        last_total, last_idle = (int(part) for part in jiffies_after.split())
+        first_total, first_idle, first_docker_usec = (int(part) for part in sample_before.split())
+        last_total, last_idle, last_docker_usec = (int(part) for part in sample_after.split())
         total_delta = last_total - first_total
         rows = container_rows.strip().splitlines()
         # Every host runs at least the executor's own container, so no rows means docker did not
@@ -323,8 +346,12 @@ def parse_resampled_cpu_cores(
             )
     except (TypeError, ValueError, OverflowError):
         return None
+    window_seconds = total_delta / (_JIFFIES_PER_SECOND * core_count)
+    dockerd_cores = (last_docker_usec - first_docker_usec) / 1_000_000 / window_seconds
     host_cores = (total_delta - (last_idle - first_idle)) / total_delta * core_count
-    return provider_cores_outside_lium(host_cores, stats_rows, lium_container_keys)
+    return provider_cores_outside_lium(
+        host_cores - max(0.0, dockerd_cores), stats_rows, lium_container_keys
+    )
 
 
 class ProviderSideLoadCheck:

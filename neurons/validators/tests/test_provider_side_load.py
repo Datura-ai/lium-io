@@ -117,12 +117,22 @@ def test_a_foreign_container_counts_against_the_provider():
     assert load.cpu_cores == 9.0  # the miner's 7 cores stay on the provider's side
 
 
-def confirming_runner(host_busy_cores: float, core_count: int, rows: list[tuple[str, str, float]]):
+def confirming_runner(
+    host_busy_cores: float,
+    core_count: int,
+    rows: list[tuple[str, str, float]],
+    dockerd_cores: float = 0.0,
+):
     """A runner whose second reading repeats what the scrape saw — a real load, not a spike."""
     total_jiffies = 100_000
     busy = int(total_jiffies * host_busy_cores / core_count)
+    window_seconds = total_jiffies / (100 * core_count)
+    dockerd_usec = int(dockerd_cores * window_seconds * 1_000_000)
     body = "\n".join(f"{container_id}|{name}|{percent:.2f}%" for container_id, name, percent in rows)
-    stdout = f"0 0\n@@@\n{body}\n@@@\n{total_jiffies} {total_jiffies - busy}"
+    stdout = (
+        f"0 0 0\n@@@\n{body}\n@@@\n"
+        f"{total_jiffies} {total_jiffies - busy} {dockerd_usec}"
+    )
     runner = AsyncMock()
     runner.run = AsyncMock(return_value=MagicMock(success=True, stdout=stdout))
     return runner
@@ -413,7 +423,9 @@ async def test_a_docker_that_does_not_answer_the_second_look_withholds_nothing(c
     # An empty container section means docker did not answer. Reading it as "Lium runs nothing
     # here" would charge the machine's whole load to the provider.
     runner = AsyncMock()
-    runner.run = AsyncMock(return_value=MagicMock(success=True, stdout="0 0\n@@@\n\n@@@\n1000 0"))
+    runner.run = AsyncMock(
+        return_value=MagicMock(success=True, stdout="0 0 0\n@@@\n\n@@@\n1000 0 0")
+    )
     ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS), runner=runner)
 
     with provider_load_gate(enforce=True):
@@ -430,8 +442,9 @@ async def test_the_roce_link_probe_is_not_the_providers_load(context_factory):
     specs = {
         "cpu": {"count": 32},
         "docker": {
-            "host_cpu_percent": 20.0,
-            "containers": [{"name": "lium_roce_probe", "cpu_percent": 600.0}],
+            "host_cpu_percent": 4.4,
+            # `ib_write_bw` busy-polls one core
+            "containers": [{"name": "lium_roce_probe", "cpu_percent": 100.0}],
         },
     }
     ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))
@@ -440,7 +453,7 @@ async def test_the_roce_link_probe_is_not_the_providers_load(context_factory):
         result = await ProviderSideLoadCheck().run(ctx)
 
     assert result.passed is True
-    assert result.event.what_we_saw["provider_cpu_cores"] == 0.4  # 6.4 host - 6.0 the probe
+    assert result.event.what_we_saw["provider_cpu_cores"] == 0.4  # 1.4 host - 1.0 the probe
 
 
 @pytest.mark.asyncio
@@ -467,3 +480,60 @@ async def test_a_pod_started_after_the_snapshot_is_not_the_providers_load(contex
     assert result.event.reason_code == Msg.LOAD_OK.reason
     assert result.event.what_we_saw["provider_cpu_cores"] == 1.4  # 6.4 host - 5.0 the fresh pod
     assert result.event.what_we_saw["lium_named_outside_snapshot_cores"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_miner_wearing_an_infra_name_is_not_excused(context_factory):
+    # The infra tier matches by name, and a name is forgeable. A port probe holds a fraction of
+    # a core; 7 cores under the same name is a workload, not a probe.
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "host_cpu_percent": 25.0,
+            "containers": [{"name": "container_sn13", "cpu_percent": 700.0}],
+        },
+    }
+    ctx = context_factory(
+        state=build_state(specs=specs, rented_data=_no_rentals()),
+        runner=confirming_runner(8.0, 32, [("c1", "container_sn13", 700.0)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["provider_cpu_cores"] == 8.0
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_port_probe_is_still_excused(context_factory):
+    specs = {
+        "cpu": {"count": 32},
+        "docker": {
+            "host_cpu_percent": 5.0,
+            "containers": [{"name": "container_port_check", "cpu_percent": 20.0}],
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs, rented_data=_no_rentals()))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["provider_cpu_cores"] == 1.4  # 1.6 host - 0.2 the probe
+
+
+@pytest.mark.asyncio
+async def test_a_lium_image_pull_is_not_the_providers_load(context_factory):
+    # Pulling a pod's image is work Lium asked for. It runs in dockerd, belongs to no container
+    # row, and a big pull outlives both samples — unsubtracted it zeroes an honest machine.
+    ctx = context_factory(
+        state=_rented_state(CPU_ONLY_SPECS),
+        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)], dockerd_cores=9.0),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["provider_cpu_cores"] == 0.0  # 10.56 - 1.58 - 9.0
