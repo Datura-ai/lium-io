@@ -68,10 +68,11 @@ NVIDIACTL_ROOT_UID = 0
 
 # DAH-2786 — GPU power cap revert gate. An unrented executor whose host raises the GPU power
 # limit back while a Lium idle job runs kills that job and still collects the unrented
-# incentive. It forfeits the incentive after this many observed reverts inside
-# `CAP_REVERT_WINDOW_SECONDS`; one revert is not enough, because a driver reload can undo a
-# cap on its own.
-MIN_POWER_CAP_REVERTS_TO_PENALIZE = 3
+# incentive. It forfeits the incentive after this many reverted JOBS inside
+# `CAP_REVERT_WINDOW_SECONDS`. One is not enough, because a driver reload can undo a cap on
+# its own; two is reachable inside a day even with the backend's 12h backoff after each
+# killed job, and a host running a reset timer breaks every job it is given.
+MIN_POWER_CAP_REVERTS_TO_PENALIZE = 2
 
 
 # ── Spec measurements ────────────────────────────────────────────────────────

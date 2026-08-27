@@ -93,12 +93,16 @@ class GpuPowerRestoreRecord(BaseModel):
 
 
 class GpuPowerCapRevert(BaseModel):
-    """One observation that the host raised the limit again while our verified cap was live."""
+    """One Lium job whose verified cap the host raised again while the job ran.
+
+    One entry per job, not per GPU: a host guard resets every GPU on the node in the same
+    tick, and counting eight of those as eight breaches would zero an 8x node on one event."""
 
     at: float  # unix seconds
-    gpu_uuid: str
+    gpu_uuid: str  # the first GPU seen reverted, as evidence
     capped_to_watts: int
     found_watts: int
+    reverted_gpu_count: int = 1
 
 
 class GpuPowerCapRevertHistory(BaseModel):
@@ -420,22 +424,38 @@ async def read_gpu_power_restore_records(
     return GpuPowerRestoreReadResult(records=records, read_failed=read_failed)
 
 
-def _reverted_cap_target(record: GpuPowerRestoreRecord, watts_before: int | None) -> int | None:
-    """The watts we had applied, when the live limit is back at or above the miner's own value.
+def _revert_floor_watts(record: GpuPowerRestoreRecord, state: GpuPowerState | None) -> int | None:
+    """The limit at which the job counts as having run uncapped.
+
+    ``MIN_POWER_LIMIT_RATIO`` of the card default — the same line the backend guard kills the
+    filler at, and the line the observed host guards deliberately sit one point above (0.91 of
+    default, 4090 409/450, 5090 518/575). Falls back to the miner's own pre-cap limit when the
+    GPU does not report a default.
+    """
+    if state is None or state.default_watts is None:
+        return record.watts
+    return int(MIN_POWER_LIMIT_RATIO * state.default_watts)
+
+
+def _reverted_cap_target(
+    record: GpuPowerRestoreRecord,
+    watts_before: int,
+    state: GpuPowerState | None,
+) -> int | None:
+    """The watts we had applied, when the host raised the limit back past the uncapped line.
     None when nothing proves a revert.
 
-    DAH-2786. Deliberately narrow: 113 of 113 observed reverts landed either exactly on the
-    miner's own pre-cap value or on the card default, so a limit that merely drifted upward
-    is not counted. That also makes a frozen record (an earlier restore failed, so its cap
-    target is older than the live one) unable to invent a breach.
+    DAH-2786. Both conditions are needed. The first says the limit is not where we left it, so
+    a cap that held — or a frozen record carrying an older target — cannot accuse. The second
+    says the job ran at effectively full power, which is what makes the revert cost Lium the
+    job rather than a few watts.
     """
-    if record.capped_to_watts is None or watts_before is None:
+    if record.capped_to_watts is None:
         return None
-    if record.capped_to_watts >= record.watts:
-        # the cap did not lower anything (the miner already ran below our target), so reading
-        # our own target back at restore time proves nothing
+    if watts_before <= record.capped_to_watts:
         return None
-    if watts_before < record.watts:
+    floor_watts: int | None = _revert_floor_watts(record, state)
+    if floor_watts is None or watts_before < floor_watts:
         return None
     return record.capped_to_watts
 
@@ -482,45 +502,40 @@ async def read_gpu_power_cap_reverts(
 
 async def _record_cap_revert(
     redis: RedisService,
-    record: GpuPowerRestoreRecord,
-    capped_to_watts: int,
-    found_watts: int,
+    executor_id: str,
+    reverted_gpus: list[GpuPowerCapRevert],
     log_extra: dict[str, object] | None,
 ) -> None:
-    """Add one revert to the executor's history. Best-effort: teardown must never fail over
-    bookkeeping, so every error only logs."""
-    revert = GpuPowerCapRevert(
-        at=time.time(),
-        gpu_uuid=record.gpu_uuid,
-        capped_to_watts=capped_to_watts,
-        found_watts=found_watts,
-    )
+    """Add ONE revert for this job to the executor's history, whatever the number of GPUs it
+    covered. Best-effort: teardown must never fail over bookkeeping, so every error only logs."""
+    revert = reverted_gpus[0].model_copy(update={"reverted_gpu_count": len(reverted_gpus)})
     _log(
         logging.WARNING,
-        f"gpu power cap reverted on the host: executor={record.executor_id} gpu={record.gpu_uuid} "
-        f"capped to {capped_to_watts}W, found {found_watts}W before restore",
+        f"gpu power cap reverted on the host: executor={executor_id} gpu={revert.gpu_uuid} "
+        f"capped to {revert.capped_to_watts}W, found {revert.found_watts}W before restore "
+        f"({revert.reverted_gpu_count} GPU(s))",
         {
             "gpu_power_action": "revert_detected",
-            "executor_uuid": record.executor_id,
-            "gpu_uuid": record.gpu_uuid,
-            "capped_to_watts": capped_to_watts,
-            "found_watts": found_watts,
-            "pre_cap_watts": record.watts,
+            "executor_uuid": executor_id,
+            "gpu_uuid": revert.gpu_uuid,
+            "capped_to_watts": revert.capped_to_watts,
+            "found_watts": revert.found_watts,
+            "reverted_gpu_count": revert.reverted_gpu_count,
         },
         log_extra,
     )
-    history = await _read_revert_history(redis, record.executor_id, log_extra)
+    history = await _read_revert_history(redis, executor_id, log_extra)
     if history is None:
-        history = GpuPowerCapRevertHistory(executor_id=record.executor_id)
+        history = GpuPowerCapRevertHistory(executor_id=executor_id)
     kept = _reverts_inside_window(history.reverts, revert.at)
     history.reverts = [*kept, revert][-MAX_TRACKED_CAP_REVERTS:]
     try:
-        await redis.set(_revert_key(record.executor_id), history.model_dump_json(), ex=CAP_REVERT_WINDOW_SECONDS)
+        await redis.set(_revert_key(executor_id), history.model_dump_json(), ex=CAP_REVERT_WINDOW_SECONDS)
     except Exception as exc:
         _log(
             logging.ERROR,
-            f"gpu power cap revert: could not store the revert for {record.executor_id}: {exc}",
-            {"gpu_uuid": record.gpu_uuid},
+            f"gpu power cap revert: could not store the revert for {executor_id}: {exc}",
+            {"gpu_uuid": revert.gpu_uuid},
             log_extra,
         )
 
@@ -542,14 +557,24 @@ async def _restore_records(
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
     (a failed restore keeps it for the safety nets to retry). Returns the restored count."""
     restored = 0
+    # DAH-2786: the limit we read here is the only place we learn the host undid our cap.
+    # Grouped per executor - one host can carry several, and a whole-host restore sweeps them all.
+    reverted_gpus_by_executor: dict[str, list[GpuPowerCapRevert]] = {}
+    now = time.time()
     for record in records:
         state = state_by_uuid.get(record.gpu_uuid)
         watts_before = state.current_watts if state else None
-        # DAH-2786: the limit we find here is the only place we learn the host undid our cap
         if watts_before is not None:
-            reverted_cap_target: int | None = _reverted_cap_target(record, watts_before)
+            reverted_cap_target: int | None = _reverted_cap_target(record, watts_before, state)
             if reverted_cap_target is not None:
-                await _record_cap_revert(redis, record, reverted_cap_target, watts_before, log_extra)
+                reverted_gpus_by_executor.setdefault(record.executor_id, []).append(
+                    GpuPowerCapRevert(
+                        at=now,
+                        gpu_uuid=record.gpu_uuid,
+                        capped_to_watts=reverted_cap_target,
+                        found_watts=watts_before,
+                    )
+                )
         changed = await _set_and_log_power_limit(
             ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
         )
@@ -566,6 +591,8 @@ async def _restore_records(
                 {"gpu_uuid": record.gpu_uuid},
                 log_extra,
             )
+    for executor_id, reverted_gpus in reverted_gpus_by_executor.items():
+        await _record_cap_revert(redis, executor_id, reverted_gpus, log_extra)
     return restored
 
 
