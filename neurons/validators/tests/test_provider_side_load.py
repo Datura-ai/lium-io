@@ -127,11 +127,11 @@ def confirming_runner(
     total_jiffies = 100_000
     busy = int(total_jiffies * host_busy_cores / core_count)
     window_seconds = total_jiffies / (100 * core_count)
-    dockerd_usec = int(dockerd_cores * window_seconds * 1_000_000)
+    dockerd_jiffies = int(dockerd_cores * window_seconds * 100)
     body = "\n".join(f"{container_id}|{name}|{percent:.2f}%" for container_id, name, percent in rows)
     stdout = (
         f"0 0 0\n@@@\n{body}\n@@@\n"
-        f"{total_jiffies} {total_jiffies - busy} {dockerd_usec}"
+        f"{total_jiffies} {total_jiffies - busy} {dockerd_jiffies}"
     )
     runner = AsyncMock()
     runner.run = AsyncMock(return_value=MagicMock(success=True, stdout=stdout))

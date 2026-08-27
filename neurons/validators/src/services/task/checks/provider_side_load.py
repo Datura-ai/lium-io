@@ -41,15 +41,15 @@ CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 CPU_RESAMPLE_TIMEOUT_SECONDS = 45
 # Linux counts /proc/stat in USER_HZ, 100 everywhere we run.
 _JIFFIES_PER_SECOND = 100
-# `total idle docker_usec` in one line. The third number is dockerd's own CPU: pulling a Lium
-# image is work Lium asked for, it belongs to no container row, and a 60 GB pull outlives both
-# samples - without subtracting it an honest node reads as a cheating one. Zero when the host
-# runs cgroup v1 or names the units differently, which only means nothing gets subtracted.
+# `total idle dockerd_jiffies` in one line. The third number is dockerd's and containerd's own
+# CPU: pulling a Lium image is work Lium asked for, it belongs to no container row, and a 60 GB
+# pull outlives both samples - without subtracting it an honest node reads as a cheating one.
+# Read from /proc, not from a cgroup path: the executor container has its own cgroup namespace
+# and cannot see the host's. Zero when neither process is running, which subtracts nothing.
 _HOST_SAMPLE = (
     r"""awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; printf "%d %d ", total, idle}' /proc/stat; """
-    r"""cat /sys/fs/cgroup/system.slice/docker.service/cpu.stat """
-    r"""/sys/fs/cgroup/system.slice/containerd.service/cpu.stat 2>/dev/null """
-    r"""| awk '/^usage_usec/{used+=$2} END{printf "%d\n", used+0}'"""
+    r"""pgrep -x 'dockerd|containerd' | while read pid; do cat /proc/$pid/stat 2>/dev/null; done """
+    r"""| awk '{used+=$14+$15} END{printf "%d\n", used+0}'"""
 )
 # One command, not three: each extra ssh channel costs ~230 ms of dead time INSIDE the sample
 # bracket, and the bracket is what makes the host reading comparable to the container sample.
@@ -351,8 +351,8 @@ def parse_resampled_cpu_cores(
     the containers Lium runs and dockerd's own work, and what is left is the provider's.
     """
     try:
-        first_total, first_idle, first_docker_usec = (int(part) for part in sample_before.split())
-        last_total, last_idle, last_docker_usec = (int(part) for part in sample_after.split())
+        first_total, first_idle, first_dockerd = (int(part) for part in sample_before.split())
+        last_total, last_idle, last_dockerd = (int(part) for part in sample_after.split())
         total_delta = last_total - first_total
         rows = container_rows.strip().splitlines()
         if any(_STATS_FAILED_MARKER in row for row in rows):
@@ -373,7 +373,7 @@ def parse_resampled_cpu_cores(
     except (TypeError, ValueError, OverflowError):
         return None
     window_seconds = total_delta / (_JIFFIES_PER_SECOND * core_count)
-    dockerd_cores = (last_docker_usec - first_docker_usec) / 1_000_000 / window_seconds
+    dockerd_cores = (last_dockerd - first_dockerd) / _JIFFIES_PER_SECOND / window_seconds
     host_cores = (total_delta - (last_idle - first_idle)) / total_delta * core_count
     return provider_cores_outside_lium(
         host_cores - max(0.0, dockerd_cores), stats_rows, lium_container_keys
