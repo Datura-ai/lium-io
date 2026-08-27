@@ -111,17 +111,17 @@ class FillerContainerEntry(BaseModel):
     command: str
 
     @staticmethod
-    def from_scrape(reported: Any) -> FillerContainerEntry | None:
+    def from_scrape(reported_entry: Any) -> FillerContainerEntry | None:
         # The scrape is written on the miner's machine: a missing or wrongly typed reading is an
         # inability to measure, not a breach, so every unknown shape fails open. bool is excluded
         # explicitly - it passes isinstance(int) and would otherwise read as pid 1.
-        if not isinstance(reported, dict):
+        if not isinstance(reported_entry, dict):
             return None
-        container_name: Any = reported.get("container")
-        kind: Any = reported.get("kind")
-        pid: Any = reported.get("pid")
-        seconds_after_start: Any = reported.get("seconds_after_start")
-        command: Any = reported.get("command")
+        container_name: Any = reported_entry.get("container")
+        kind: Any = reported_entry.get("kind")
+        pid: Any = reported_entry.get("pid")
+        seconds_after_start: Any = reported_entry.get("seconds_after_start")
+        command: Any = reported_entry.get("command")
         if not isinstance(container_name, str) or not container_name:
             return None
         if kind not in FILLER_ENTRY_KINDS:
@@ -538,8 +538,8 @@ class RentalPriceIncentive(DefaultIncentive):
             return None
         grace_seconds: float = settings.FILLER_ENTRY_GRACE_SECONDS
         entries: list[FillerContainerEntry] = []
-        for reported in reported_entries:
-            entry: FillerContainerEntry | None = FillerContainerEntry.from_scrape(reported)
+        for reported_entry in reported_entries:
+            entry: FillerContainerEntry | None = FillerContainerEntry.from_scrape(reported_entry)
             if entry is not None and entry.seconds_after_start >= grace_seconds:
                 entries.append(entry)
         if not entries:
@@ -1061,8 +1061,8 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2715 power cap gate: an idle machine whose container cannot apply a GPU power
         # cap is not fully usable for Lium's own jobs, so it forfeits the unrented incentive
         # (node stays active). While the flag is off we only log the would-be exclusion.
-        # Last in the chain, so a node already excluded by an ENFORCED gate above is not
-        # measured here - read the shadow numbers against the flags that were on that cycle.
+        # A node already excluded by an ENFORCED gate above is not measured here - read the
+        # shadow numbers against the flags that were on that cycle.
         power_cap_incapable: PowerCapIncapable | None = (
             self._power_cap_incapable(job_result) if eligible_for_rental_share else None
         )

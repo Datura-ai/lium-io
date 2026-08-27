@@ -26,8 +26,8 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 PROBE_HELPERS = {
     "PROC_DIR",
     "FILLER_CONTAINER_NAME_PREFIX",
-    "ENTRY_COMMAND_LIMIT",
-    "ENTRY_REPORT_LIMIT",
+    "ENTRY_COMMAND_MAX_CHARS",
+    "MAX_REPORTED_ENTRIES",
     "EXEC_EVENT_WINDOW_SECONDS",
     "EXEC_CREATE_STATUS_PREFIX",
     "FillerEntryProbe",
@@ -35,9 +35,13 @@ PROBE_HELPERS = {
     "read_process_parent_and_start_ticks",
     "read_process_command",
     "read_host_uptime_seconds",
+    "read_processes_by_pid_namespace",
     "find_open_sessions",
     "find_docker_exec_events",
-    "entry_offset_seconds",
+    "seconds_after_container_start",
+    "RunningFillerContainers",
+    "read_running_filler_containers",
+    "find_filler_container_entries",
     "probe_filler_container_entries",
 }
 
@@ -260,7 +264,7 @@ def test_the_newest_visits_are_kept_when_a_guard_script_floods_the_window(proc_d
     entries = _entries(scrape)
 
     # Assert - capped, and the newest visit survives the cap
-    assert len(entries) == scrape["ENTRY_REPORT_LIMIT"]
+    assert len(entries) == scrape["MAX_REPORTED_ENTRIES"]
     assert entries[0]["entry_seconds_after_start"] == pytest.approx(CONTAINER_AGE - 60, abs=1)
 
 
@@ -347,6 +351,21 @@ def test_a_broken_event_log_still_reports_open_sessions(proc_dir: Path) -> None:
     # Assert
     assert [entry["entry_kind"] for entry in probe.entries] == ["open_session"]
     assert "docker events" in probe.scrape_error
+
+
+def test_the_probe_never_raises(proc_dir: Path) -> None:
+    # get_machine_specs has no guard around it: a probe that raises kills the whole scrape, and
+    # the miner then has no specs and scores 0 on every executor.
+    def unreadable_proc() -> dict[str, Any]:
+        raise OSError("/proc is mounted with hidepid=2")
+
+    scrape = _build_probe(proc_dir)
+    scrape["read_processes_by_pid_namespace"] = unreadable_proc
+
+    probe = scrape["probe_filler_container_entries"]()
+
+    assert probe.entries == []
+    assert "hidepid=2" in probe.scrape_error
 
 
 def test_probe_keys_are_wired_through_both_obfuscation_tables() -> None:
