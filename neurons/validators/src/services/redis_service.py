@@ -139,7 +139,7 @@ class RedisService:
             raise
         return pubsub
 
-    async def set(self, key: str, value: str, ex: int | None = None):
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
         """Set a key-value pair in Redis. ``ex`` sets a time-to-live in seconds."""
         async with self.lock:
             await self.redis.set(key, value, ex=ex)

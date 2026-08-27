@@ -113,6 +113,17 @@ class GpuPowerCapRevertHistory(BaseModel):
     reverts: list[GpuPowerCapRevert] = Field(default_factory=list)
 
 
+class GpuPowerCapRevertReadResult(BaseModel):
+    """The stored history plus whether Redis answered at all.
+
+    ``read_failed`` separates "this executor has no reverts" from "we could not look": the
+    reader must fail open on the second, and the writer must NOT overwrite a history it could
+    not read. Mirrors ``GpuPowerRestoreReadResult``."""
+
+    history: GpuPowerCapRevertHistory
+    read_failed: bool
+
+
 class GpuPowerRestoreReadResult(BaseModel):
     """Records found in Redis plus whether any read errored.
 
@@ -141,6 +152,15 @@ class GpuPowerReadback:
 
     watts: int | None
     persistence_enabled: bool | None
+
+
+@dataclass(frozen=True)
+class CappingJob:
+    """The Lium job a cap belongs to. Both halves travel together: the revert is deduplicated
+    per pod and charged to the executor, so a record must never carry one without the other."""
+
+    executor_id: str
+    pod_id: str
 
 
 @dataclass(frozen=True)
@@ -408,7 +428,7 @@ async def _set_applied_cap_on_restore_record(
     redis: RedisService,
     gpu_uuid: str,
     capped_to_watts: int | None,
-    capped_by_pod_id: str | None,
+    capped_by: CappingJob | None,
     log_extra: dict[str, object] | None,
 ) -> None:
     """Write the watts we verifiably applied onto the GPU's restore record, or None to say no
@@ -417,9 +437,11 @@ async def _set_applied_cap_on_restore_record(
     The watts are written only after the readback confirmed the set, which is what lets a later
     restore tell a host-side revert from a cap that never landed; a failed apply clears them
     again, so a record frozen by an earlier failed restore cannot carry a stale claim into the
-    next attempt. The capping pod is refreshed with them, because a frozen record still carries
-    the pod that first capped the GPU and the revert is deduplicated per job. Best-effort: a
-    miss only costs the revert signal, never the way back, so it must not fail the filler.
+    next attempt. The capping job is refreshed with them, because a frozen record still names
+    the executor and pod that FIRST capped the GPU — the revert is deduplicated per pod and
+    charged to the executor, so a stale identity would file the breach against the wrong
+    provider. Best-effort: a miss only costs the revert signal, never the way back, so it must
+    not fail the filler.
     """
     key = _restore_key(gpu_uuid)
     try:
@@ -427,9 +449,10 @@ async def _set_applied_cap_on_restore_record(
         if not raw:
             return
         record = GpuPowerRestoreRecord.model_validate_json(raw)
-        refreshed = record.model_copy(
-            update={"capped_to_watts": capped_to_watts, "pod_id": capped_by_pod_id or record.pod_id}
+        identity = (
+            {"pod_id": capped_by.pod_id, "executor_id": capped_by.executor_id} if capped_by else {}
         )
+        refreshed = record.model_copy(update={"capped_to_watts": capped_to_watts, **identity})
         await redis.set(key, refreshed.model_dump_json())
     except (ValidationError, TypeError, ValueError) as exc:
         _log(logging.ERROR, f"gpu power cap: cannot stamp the applied cap on {gpu_uuid}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
@@ -517,24 +540,27 @@ async def _read_revert_history(
     redis: RedisService,
     executor_id: str,
     log_extra: dict[str, object] | None,
-) -> GpuPowerCapRevertHistory:
-    """The stored history, empty when Redis did not answer or the record is unusable.
+) -> GpuPowerCapRevertReadResult:
+    """The stored history, plus whether Redis answered.
 
     Fail-open by design: this feeds a money gate, so our own outage must never read as a breach.
+    A corrupt record is NOT a failed read — it can never be counted, so it is replaced.
     """
     key = _revert_key(executor_id)
     try:
         raw: str | bytes | None = await redis.get(key)
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap revert: redis read failed for {key}: {exc}", {}, log_extra)
-        return GpuPowerCapRevertHistory()
+        return GpuPowerCapRevertReadResult(history=GpuPowerCapRevertHistory(), read_failed=True)
     if not raw:
-        return GpuPowerCapRevertHistory()
+        return GpuPowerCapRevertReadResult(history=GpuPowerCapRevertHistory(), read_failed=False)
     try:
-        return GpuPowerCapRevertHistory.model_validate_json(raw)
+        return GpuPowerCapRevertReadResult(
+            history=GpuPowerCapRevertHistory.model_validate_json(raw), read_failed=False
+        )
     except (ValidationError, TypeError, ValueError):
         _log(logging.ERROR, f"gpu power cap revert: ignoring corrupt record {raw!r} for {executor_id}", {}, log_extra)
-        return GpuPowerCapRevertHistory()
+        return GpuPowerCapRevertReadResult(history=GpuPowerCapRevertHistory(), read_failed=False)
 
 
 async def read_gpu_power_cap_reverts(
@@ -543,8 +569,8 @@ async def read_gpu_power_cap_reverts(
     log_extra: dict[str, object] | None = None,
 ) -> list[GpuPowerCapRevert]:
     """Every revert observed on this executor inside the window, newest last. Empty on any unknown."""
-    history = await _read_revert_history(redis, executor_id, log_extra)
-    return _reverts_inside_window(history.reverts, time.time())
+    read_result = await _read_revert_history(redis, executor_id, log_extra)
+    return _reverts_inside_window(read_result.history.reverts, time.time())
 
 
 def _reverts_of_jobs_not_already_recorded(
@@ -574,8 +600,11 @@ async def _record_cap_reverts(
 ) -> None:
     """Add the executor's newly reverted jobs to its history. Best-effort: teardown must never
     fail over bookkeeping, so every error only logs."""
-    history = await _read_revert_history(redis, executor_id, log_extra)
-    kept: list[GpuPowerCapRevert] = _reverts_inside_window(history.reverts, time.time())
+    read_result = await _read_revert_history(redis, executor_id, log_extra)
+    if read_result.read_failed:
+        # writing now would replace a history we could not see with just this job's reverts
+        return
+    kept: list[GpuPowerCapRevert] = _reverts_inside_window(read_result.history.reverts, time.time())
     new_reverts: list[GpuPowerCapRevert] = _reverts_of_jobs_not_already_recorded(reverted_gpus, kept)
     if not new_reverts:
         return
@@ -595,9 +624,11 @@ async def _record_cap_reverts(
             },
             log_extra,
         )
-    history.reverts = [*kept, *new_reverts][-MAX_TRACKED_CAP_REVERTS:]
+    read_result.history.reverts = [*kept, *new_reverts][-MAX_TRACKED_CAP_REVERTS:]
     try:
-        await redis.set(_revert_key(executor_id), history.model_dump_json(), ex=CAP_REVERT_WINDOW_SECONDS)
+        await redis.set(
+            _revert_key(executor_id), read_result.history.model_dump_json(), ex=CAP_REVERT_WINDOW_SECONDS
+        )
     except Exception as exc:
         _log(
             logging.ERROR,
@@ -871,6 +902,10 @@ async def apply_filler_gpu_power_limits(
     # GPUs are left unstamped and can never accuse. A cap that failed leaves no target either.
     for gpu_uuid in gpu_uuids_capped_with_persistence:
         await _set_applied_cap_on_restore_record(
-            redis, gpu_uuid, planned.clamped_watts_by_uuid[gpu_uuid], pod_id, log_extra
+            redis,
+            gpu_uuid,
+            planned.clamped_watts_by_uuid[gpu_uuid],
+            CappingJob(executor_id=executor_id, pod_id=pod_id),
+            log_extra,
         )
     return True

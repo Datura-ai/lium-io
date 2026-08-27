@@ -438,6 +438,55 @@ async def test_read_is_empty_without_a_record() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_failed_read_never_overwrites_the_stored_history() -> None:
+    # A transient GET failure used to look like "this executor has no reverts", and the write
+    # that followed replaced the real history with just this job's reverts.
+    class ReadBlindRedis(FakeRedis):
+        async def get(self, key: str) -> str | None:
+            if key == _revert_key(EXECUTOR_ID):
+                raise ConnectionError("redis down")
+            return self.store.get(key)
+
+    earlier = GpuPowerCapRevertHistory(
+        reverts=[
+            GpuPowerCapRevert(
+                observed_at=time.time() - 60, pod_id="pod-earlier", gpu_uuid="GPU-a",
+                capped_to_watts=280, found_watts=400,
+            )
+        ]
+    )
+    redis = ReadBlindRedis({
+        _restore_key("GPU-a"): _stored_restore_record(),
+        _revert_key(EXECUTOR_ID): earlier.model_dump_json(),
+    })
+    ssh = fake_ssh(FakeRun(stdout=REVERTED_STATE_CSV), *_set_ok(400))
+
+    await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
+
+    kept = GpuPowerCapRevertHistory.model_validate_json(redis.store[_revert_key(EXECUTOR_ID)])
+    assert [revert.pod_id for revert in kept.reverts] == ["pod-earlier"]
+
+
+@pytest.mark.asyncio
+async def test_the_stamp_moves_a_frozen_record_onto_the_capping_executor() -> None:
+    # A GPU whose record was frozen under an earlier executor must not file its next breach
+    # against that executor - the provider running it now is the one being judged.
+    state_csv = "GPU-a, 400, 400, 100, 400\n"
+    ssh = fake_ssh(FakeRun(stdout=state_csv), *_set_ok(280))
+    redis = FakeRedis({
+        _restore_key("GPU-a"): _stored_restore_record(executor_id="executor-earlier", pod_id="pod-earlier")
+    })
+
+    await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID
+    )
+
+    stored = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
+    assert stored.executor_id == EXECUTOR_ID
+    assert stored.pod_id == POD_ID
+
+
+@pytest.mark.asyncio
 async def test_read_fails_open_when_redis_is_down() -> None:
     # Redis resilience: our own outage must never zero an innocent provider's incentive.
     assert await read_gpu_power_cap_reverts(BrokenRedis(), EXECUTOR_ID) == []
