@@ -667,6 +667,11 @@ async def _restore_records(
         )
         if cap_revert is not None:
             reverted_gpus_by_executor.setdefault(record.executor_id, []).append(cap_revert)
+        if record.capped_to_watts is not None:
+            # Judged above, and about to be untrue: the restore below raises the limit itself,
+            # so a record that outlives a failed delete must not let OUR raise read as the
+            # host's on the next pass.
+            await _set_applied_cap_on_restore_record(redis, record.gpu_uuid, None, None, log_extra)
         restore_outcome = await _set_and_log_power_limit(
             ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
         )

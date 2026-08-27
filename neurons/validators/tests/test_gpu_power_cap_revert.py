@@ -388,6 +388,27 @@ async def test_the_stamp_moves_a_frozen_record_onto_the_capping_pod() -> None:
 
 
 @pytest.mark.asyncio
+async def test_our_own_restore_is_never_read_as_a_host_revert() -> None:
+    # The restore raises the limit itself. If clearing the record afterwards fails, the record
+    # outlives it — and the next pass would read OUR raise as the provider raising it, taking
+    # the idle payout from a host whose cap held all along.
+    class DeleteBlindRedis(FakeRedis):
+        async def delete(self, key: str) -> None:
+            raise ConnectionError("redis down")
+
+    held_state_csv = "GPU-a, 280, 400, 100, 400\n"   # the cap held for the whole job
+    redis = DeleteBlindRedis({_restore_key("GPU-a"): _stored_restore_record()})
+    ssh = fake_ssh(FakeRun(stdout=held_state_csv), *_set_ok(400))
+    await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
+
+    # second pass: the record survived and the GPU now sits at the 400 W we restored
+    ssh = fake_ssh(FakeRun(stdout=REVERTED_STATE_CSV), *_set_ok(400))
+    await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
+
+    assert _revert_key(EXECUTOR_ID) not in redis.store
+
+
+@pytest.mark.asyncio
 async def test_a_retried_restore_does_not_count_the_same_job_twice() -> None:
     # A failed restore keeps its record on purpose so a safety net can retry it. The retry sees
     # the same high limit and must not turn one killed job into two breaches.
