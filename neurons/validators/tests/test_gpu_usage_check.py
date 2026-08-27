@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -952,7 +953,10 @@ async def test_a_broken_pods_container_is_still_ours(context_factory):
     )
     services = build_services()
     services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
-        active=False, status="BROKEN", executor_id=default_executor().uuid
+        active=False,
+        status="BROKEN",
+        executor_id=default_executor().uuid,
+        rental_closed_at=datetime.utcnow() - timedelta(minutes=5),
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
@@ -972,7 +976,10 @@ async def test_a_broken_pod_of_another_node_is_still_foreign(context_factory):
     )
     services = build_services()
     services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
-        active=False, status="BROKEN", executor_id="another-executor"
+        active=False,
+        status="BROKEN",
+        executor_id="another-executor",
+        rental_closed_at=datetime.utcnow() - timedelta(minutes=5),
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
@@ -1000,3 +1007,72 @@ async def test_a_deleted_pods_container_is_foreign(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_long_broken_pod_no_longer_shields_its_name(context_factory):
+    # The pod row survives 24 h, the container it left behind does not. Without the time box the
+    # provider could run a foreign workload under the name of their own broken pod all day.
+    stale_broken_pod = f"{POD_CONTAINER_PREFIX}bfc8838d-7967-43b0-90b9-2917ffbffe5a"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": stale_broken_pod}],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False,
+        status="BROKEN",
+        executor_id=default_executor().uuid,
+        rental_closed_at=datetime.utcnow() - timedelta(hours=3),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_broken_pod_without_a_close_time_does_not_shield_its_name(context_factory):
+    broken_pod = f"{POD_CONTAINER_PREFIX}bfc8838d-7967-43b0-90b9-2917ffbffe5a"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": broken_pod}],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, status="BROKEN", executor_id=default_executor().uuid
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+
+
+@pytest.mark.asyncio
+async def test_a_close_time_that_arrives_with_a_timezone_is_still_read(context_factory):
+    # The field is a datetime parsed off the wire. An offset in the JSON makes it aware, and mixing
+    # aware with naive raises inside a check that is fatal — the executor would score 0 on a crash.
+    broken_pod = f"{POD_CONTAINER_PREFIX}bfc8838d-7967-43b0-90b9-2917ffbffe5a"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": broken_pod}],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False,
+        status="BROKEN",
+        executor_id=default_executor().uuid,
+        rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
