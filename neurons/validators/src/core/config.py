@@ -301,6 +301,15 @@ class Settings(BaseSettings):
     # to logging the breach without withholding anything.
     ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
+    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
+    # GPU power limit back while a Lium idle job was running, often enough inside the window,
+    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
+    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
+    # are read first. Set to True to enforce.
+    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
+        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
+    )
+
     # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
     # scoring the whole box as rented.
