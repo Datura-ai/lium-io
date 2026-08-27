@@ -91,6 +91,49 @@ class PowerCapIncapable(BaseModel):
     nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
 
 
+class FillerContainerEntry(BaseModel):
+    """One session that was opened inside a filler container from the host (DAH-2787).
+
+    The scrape finds it by parentage: the process runs in the container's PID namespace while
+    its parent stays outside it, which is what `docker exec` and `nsenter` both leave behind.
+    Carried verbatim so the provider is shown the session that cost them the incentive. Sole
+    owner of these scrape keys."""
+
+    container_name: str
+    pid: int
+    parent_pid: int
+    age_seconds: float  # how long the session has been open, at scrape time
+    command: str
+
+    @staticmethod
+    def from_scrape(reported: Any) -> FillerContainerEntry | None:
+        # The scrape is written on the miner's machine: a missing or wrongly typed reading is an
+        # inability to measure, not a breach, so every unknown shape fails open. bool is excluded
+        # explicitly - it passes isinstance(int) and would otherwise read as pid 1.
+        if not isinstance(reported, dict):
+            return None
+        container_name: Any = reported.get("container")
+        pid: Any = reported.get("pid")
+        parent_pid: Any = reported.get("parent_pid")
+        age_seconds: Any = reported.get("age_seconds")
+        command: Any = reported.get("command")
+        if not isinstance(container_name, str) or not container_name:
+            return None
+        if not isinstance(pid, int) or not isinstance(parent_pid, int):
+            return None
+        if isinstance(pid, bool) or isinstance(parent_pid, bool):
+            return None
+        if not isinstance(age_seconds, int | float) or isinstance(age_seconds, bool):
+            return None
+        return FillerContainerEntry(
+            container_name=container_name,
+            pid=pid,
+            parent_pid=parent_pid,
+            age_seconds=float(age_seconds),
+            command=command if isinstance(command, str) else "",
+        )
+
+
 # ── Snapshot models ──────────────────────────────────────────────────────────
 
 class GpuBucketRentalState(BaseModel):
@@ -473,6 +516,48 @@ class RentalPriceIncentive(DefaultIncentive):
                     "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _filler_container_entry(self, result: JobResult) -> FillerContainerEntry | None:
+        # The oldest session still open in a filler container, or None when the scrape does not
+        # PROVE one. Sessions younger than the threshold are ours: the validator execs into a
+        # fresh filler itself (public keys, sshd bootstrap) and those commands live seconds.
+        if result.spec is None:
+            # no scrape at all: a synthetic or estimated job result, nothing to measure
+            return None
+        reported_entries: Any = result.spec.get("filler_entries")
+        if not isinstance(reported_entries, list):
+            return None
+        minimum_age_seconds: float = settings.FILLER_ENTRY_MIN_AGE_SECONDS
+        entries: list[FillerContainerEntry] = []
+        for reported in reported_entries:
+            entry: FillerContainerEntry | None = FillerContainerEntry.from_scrape(reported)
+            if entry is not None and entry.age_seconds >= minimum_age_seconds:
+                entries.append(entry)
+        if not entries:
+            return None
+        return max(entries, key=lambda open_session: open_session.age_seconds)
+
+    def _log_filler_container_entry(self, result: JobResult, entry: FillerContainerEntry) -> None:
+        enforced: bool = settings.ENABLE_UNRENTED_FILLER_ENTRY_LIMIT
+        logger.info(
+            _m(
+                "Somebody entered the filler container of an unrented executor"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "filler_container": entry.container_name,
+                    "entry_pid": entry.pid,
+                    "entry_parent_pid": entry.parent_pid,
+                    "entry_age_seconds": entry.age_seconds,
+                    "entry_command": entry.command,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.FILLER_CONTAINER_ENTERED,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -982,6 +1067,22 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_cannot_apply_gpu_power_cap(
                     job_result, power_cap_incapable
+                )
+                job_result.record_incentive_log(reason)
+
+        # DAH-2787 filler entry gate: an idle machine is paid to run Lium's own job untouched,
+        # so a session opened inside that job's container from the host forfeits the unrented
+        # incentive (node stays active). Ships in shadow mode - while the flag is off we only
+        # log the would-be exclusion.
+        filler_entry: FillerContainerEntry | None = (
+            self._filler_container_entry(job_result) if eligible_for_rental_share else None
+        )
+        if filler_entry is not None:
+            self._log_filler_container_entry(job_result, filler_entry)
+            if settings.ENABLE_UNRENTED_FILLER_ENTRY_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_filler_container_entered(
+                    job_result, filler_entry
                 )
                 job_result.record_incentive_log(reason)
 

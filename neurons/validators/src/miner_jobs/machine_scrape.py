@@ -1041,6 +1041,9 @@ NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 PROC_SELF_STATUS_PATH = "/proc/self/status"
 NVIDIACTL_PATH = "/dev/nvidiactl"
+PROC_DIR = "/proc"
+FILLER_CONTAINER_NAME_PREFIX = "filler_"
+ENTRY_COMMAND_LIMIT = 200
 INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
 # Enough of the GID table to carry both the link-local entries and the IPv4-mapped one. Its index
 # is driver-specific - mlx5 puts it at 2-3, Intel irdma at 1 - so consumers must match on the
@@ -1120,6 +1123,116 @@ def probe_gpu_power_cap_ability() -> GpuPowerCapProbe:
         scrape_errors.append(f"Cannot stat {NVIDIACTL_PATH}: {e}")
 
     return GpuPowerCapProbe(cap_eff, nvidiactl_owner_uid, "; ".join(scrape_errors))
+
+
+class FillerEntryProbe:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, entries: list, scrape_error: str) -> None:
+        self.entries = entries
+        self.scrape_error = scrape_error
+
+
+def read_pid_namespace(pid: int) -> str:
+    # The kernel prints one identifier per namespace ("pid:[4026532817]"), so two processes are in
+    # the same PID namespace when this string matches.
+    return os.readlink(f"{PROC_DIR}/{pid}/ns/pid")
+
+
+def read_process_parent_and_start_ticks(pid: int) -> tuple:
+    # /proc/<pid>/stat holds the command name in brackets, and it may contain spaces and brackets
+    # of its own, so the fields are counted from the LAST bracket: parent pid is the 2nd of them
+    # and the start time the 20th.
+    with open(f"{PROC_DIR}/{pid}/stat") as stat_file:
+        stat_line = stat_file.read()
+    fields = stat_line[stat_line.rindex(")") + 1:].split()
+    return int(fields[1]), int(fields[19])
+
+
+def read_process_command(pid: int) -> str:
+    try:
+        with open(f"{PROC_DIR}/{pid}/cmdline", "rb") as cmdline_file:
+            command = cmdline_file.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    return command.replace("\0", " ").strip()[:ENTRY_COMMAND_LIMIT]
+
+
+def read_host_uptime_seconds() -> float:
+    with open(f"{PROC_DIR}/uptime") as uptime_file:
+        return float(uptime_file.read().split()[0])
+
+
+def find_processes_entered_from_outside(init_pid: int, container_name: str) -> list:
+    """Processes that run in the container but were started from outside it.
+
+    Everything a container starts itself has a parent in the same PID namespace, or is an orphan
+    the container's own init adopted. `docker exec` and `nsenter` are the two ways in from the
+    host, and both leave the same mark: the new process joins the namespace while its parent
+    stays outside it. Only the session itself is reported - what it then runs has a parent inside.
+    """
+    container_namespace = read_pid_namespace(init_pid)
+    if container_namespace == read_pid_namespace(os.getpid()):
+        # The container shares the host PID namespace, where every process looks like a member
+        # and the parentage tells nothing apart. Report none rather than the whole host.
+        return []
+    uptime_seconds = read_host_uptime_seconds()
+    clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
+
+    members = {}
+    for process_dir in os.listdir(PROC_DIR):
+        if not process_dir.isdigit():
+            continue
+        member_pid = int(process_dir)
+        try:
+            if read_pid_namespace(member_pid) != container_namespace:
+                continue
+            members[member_pid] = read_process_parent_and_start_ticks(member_pid)
+        except Exception:
+            continue  # /proc is a moving target: the process exited during the scan
+
+    found = []
+    for member_pid, (parent_pid, start_ticks) in members.items():
+        if member_pid == init_pid or parent_pid in members:
+            continue
+        found.append({
+            "entry_container": container_name,
+            "entry_pid": member_pid,
+            "entry_parent_pid": parent_pid,
+            "entry_age_seconds": round(uptime_seconds - start_ticks / clock_ticks_per_second, 1),
+            "entry_command": read_process_command(member_pid),
+        })
+    return found
+
+
+def probe_filler_container_entries() -> FillerEntryProbe:
+    # DAH-2787: an idle node earns the unrented incentive while it runs Lium's own job, and
+    # nobody may work inside that job's container. Report the sessions raw - the validator holds
+    # the age threshold that keeps our own setup execs out of the verdict.
+    scrape_errors = []
+    found = []
+    try:
+        containers = docker_api_get("/containers/json") or []
+    except Exception as e:
+        return FillerEntryProbe([], f"Cannot list containers: {e}")
+
+    for container in containers:
+        container_name = ""
+        for name in container.get("Names") or []:
+            if name.lstrip("/").startswith(FILLER_CONTAINER_NAME_PREFIX):
+                container_name = name.lstrip("/")
+                break
+        if not container_name:
+            continue
+        try:
+            details = docker_api_get(f"/containers/{container.get('Id')}/json")
+            init_pid = int(((details or {}).get("State") or {}).get("Pid") or 0)
+            if init_pid > 0:  # 0 means the container is not running
+                found.extend(find_processes_entered_from_outside(init_pid, container_name))
+        except Exception as e:
+            scrape_errors.append(f"Cannot read {container_name}: {e}")
+
+    return FillerEntryProbe(found, "; ".join(scrape_errors))
 
 
 def get_host_boot_id() -> str:
@@ -1391,6 +1504,11 @@ def get_machine_specs():
     data["data_nvidiactl_owner_uid"] = power_cap_probe.nvidiactl_owner_uid
     if power_cap_probe.scrape_error:
         data["data_power_cap_probe_error"] = power_cap_probe.scrape_error
+
+    filler_entry_probe = probe_filler_container_entries()
+    data["data_filler_entries"] = filler_entry_probe.entries
+    if filler_entry_probe.scrape_error:
+        data["data_filler_entry_scrape_error"] = filler_entry_probe.scrape_error
 
     infiniband = get_infiniband_ports()
     data["data_infiniband_ports"] = [port.as_payload() for port in infiniband.ports]

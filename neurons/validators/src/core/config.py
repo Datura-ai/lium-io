@@ -301,6 +301,16 @@ class Settings(BaseSettings):
     # to logging the breach without withholding anything.
     ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
+    # DAH-2787 — filler container entry gate. An idle executor earns the unrented incentive
+    # while it runs Lium's own job in a filler container, and nobody may work inside that
+    # container. A session started there from the host (docker exec / nsenter) costs the
+    # unrented incentive while the node stays active. The detection is new, so it ships in
+    # shadow mode: with the flag off the session is only logged.
+    ENABLE_UNRENTED_FILLER_ENTRY_LIMIT: bool = Field(env="ENABLE_UNRENTED_FILLER_ENTRY_LIMIT", default=False)
+    # The validator execs into a fresh filler itself (public keys, sshd bootstrap). Those
+    # commands live seconds, so only a session that outlives this age is judged.
+    FILLER_ENTRY_MIN_AGE_SECONDS: float = Field(env="FILLER_ENTRY_MIN_AGE_SECONDS", default=120.0)
+
     # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
     # scoring the whole box as rented.

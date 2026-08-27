@@ -54,7 +54,12 @@ from pydantic import BaseModel, Field
 from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
-    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, PowerCapIncapable
+    from incentive.rental_price import (
+        FillerContainerEntry,
+        InsufficientDisk,
+        MissingFlagshipCapability,
+        PowerCapIncapable,
+    )
     from services.task_service import JobResult
 
 
@@ -80,6 +85,7 @@ class ZeroIncentiveReason(StrEnum):
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
+    FILLER_CONTAINER_ENTERED = "filler_container_entered"
 
 
 class IncentiveReason(BaseModel):
@@ -384,6 +390,29 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "container_cap_eff": incapable.container_cap_eff,
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_filler_container_entered(
+        result: JobResult, entry: FillerContainerEntry
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.FILLER_CONTAINER_ENTERED,
+            message=(
+                f"No unrented incentive: somebody opened a session inside Lium's own job "
+                f"container {entry.container_name} from the host (pid {entry.pid}, "
+                f"{int(entry.age_seconds)} seconds old, command: {entry.command!r}). An idle "
+                "executor is paid to run Lium's job untouched, so nobody may enter that "
+                "container - `docker exec` and `nsenter` both count. Close the session and "
+                "keep out of the container, or rent this executor out to earn."
+            ),
+            extra_fields={
+                "filler_container": entry.container_name,
+                "entry_pid": entry.pid,
+                "entry_age_seconds": entry.age_seconds,
+                "entry_command": entry.command,
             },
         )
 
