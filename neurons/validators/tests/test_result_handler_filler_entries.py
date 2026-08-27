@@ -114,6 +114,21 @@ async def test_a_container_the_backend_never_issued_is_dropped(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_a_container_name_that_is_not_a_name_is_dropped(context_factory):
+    # A tampered payload must fail open: an unhashable value would raise on the set lookup and
+    # take the whole result handling with it.
+    ctx = _context(
+        context_factory,
+        entries=[{**_visit(OWN_CONTAINER), "container": []}, _visit(OWN_CONTAINER)],
+        rented_data=_snapshot_with_own_container(),
+    )
+
+    entries = await _published_entries(ctx)
+
+    assert [entry["container"] for entry in entries] == [OWN_CONTAINER]
+
+
+@pytest.mark.asyncio
 async def test_no_backend_snapshot_publishes_no_visit(context_factory):
     # Nothing can be attributed to an executor this cycle, so nothing is judged.
     ctx = _context(context_factory, entries=[_visit(OWN_CONTAINER)], rented_data=None)

@@ -50,10 +50,14 @@ def _visits_into_own_filler_containers(
     if not isinstance(reported_entries, list) or rented_data is None:
         return []
     own_containers = set(rented_data.get_filler_containers(executor_uuid))
+    # The container name is checked for being a name before the lookup: an unhashable value
+    # (a list, a dict) would raise on the set membership, and this must fail open, not fail.
     return [
         entry
         for entry in reported_entries
-        if isinstance(entry, dict) and entry.get("container") in own_containers
+        if isinstance(entry, dict)
+        and isinstance(entry.get("container"), str)
+        and entry["container"] in own_containers
     ]
 
 
