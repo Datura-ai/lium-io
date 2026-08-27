@@ -1302,14 +1302,15 @@ class RunningFillerContainers:
 def read_healthcheck_command(details: dict) -> str:
     # An image HEALTHCHECK is run by the daemon as an exec, so it lands in the event log and in
     # the process list exactly like a person's `docker exec` (verified against a live daemon).
-    # The command is the only thing that tells the two apart.
+    # The command is the only thing that tells the two apart, so it is cut to the same length a
+    # reported command is - a longer healthcheck would otherwise never match its own visit.
     test = (((details or {}).get("Config") or {}).get("Healthcheck") or {}).get("Test") or []
     if not isinstance(test, list) or len(test) < 2:
         return ""
     if test[0] == "CMD-SHELL":
-        return f"/bin/sh -c {test[1]}"
+        return f"/bin/sh -c {test[1]}"[:ENTRY_COMMAND_MAX_CHARS]
     if test[0] == "CMD":
-        return " ".join(str(argument) for argument in test[1:])
+        return " ".join(str(argument) for argument in test[1:])[:ENTRY_COMMAND_MAX_CHARS]
     return ""
 
 
@@ -1344,6 +1345,13 @@ def read_running_filler_containers() -> RunningFillerContainers:
         healthcheck_command_by_container,
         "; ".join(scrape_errors),
     )
+
+
+def is_healthcheck_visit(entry: dict, healthcheck_command_by_container: dict[str, str]) -> bool:
+    # A container with no healthcheck excuses nothing: without this guard a visit whose command
+    # could not be read would match the empty default and vanish from the report.
+    healthcheck_command = healthcheck_command_by_container.get(entry["entry_container"], "")
+    return bool(healthcheck_command) and entry["entry_command"] == healthcheck_command
 
 
 def find_filler_container_entries() -> FillerEntryProbe:
@@ -1386,9 +1394,7 @@ def find_filler_container_entries() -> FillerEntryProbe:
     entries = [
         entry
         for entry in entries
-        if entry["entry_command"] != fillers.healthcheck_command_by_container.get(
-            entry["entry_container"], ""
-        )
+        if not is_healthcheck_visit(entry, fillers.healthcheck_command_by_container)
     ]
 
     # A guard script that execs every few minutes fills a whole window with the same visit, so the

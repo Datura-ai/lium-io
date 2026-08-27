@@ -42,6 +42,7 @@ PROBE_HELPERS = {
     "seconds_after_container_start",
     "RunningFillerContainers",
     "read_healthcheck_command",
+    "is_healthcheck_visit",
     "read_running_filler_containers",
     "find_filler_container_entries",
     "probe_filler_container_entries",
@@ -430,6 +431,30 @@ def test_read_healthcheck_command_reads_both_docker_forms(
     details = {"Config": {"Healthcheck": {"Test": test_field}}}
 
     assert scrape["read_healthcheck_command"](details) == expected
+
+
+def test_a_healthcheck_longer_than_the_report_limit_is_still_excused(proc_dir: Path) -> None:
+    # A reported command is cut to ENTRY_COMMAND_MAX_CHARS; a longer healthcheck would never
+    # match its own visit and every honest node running that image would read as visited.
+    long_command = "curl -fsS http://localhost:8080/health?" + "x" * 300
+    scrape = _build_probe(
+        proc_dir,
+        docker_api_get=_docker_api(healthcheck=["CMD-SHELL", long_command]),
+        events=[_exec_event(command=f"/bin/sh -c {long_command}")],
+    )
+
+    assert _entries(scrape) == []
+
+
+def test_a_visit_with_an_unreadable_command_still_counts(proc_dir: Path) -> None:
+    # /proc/<pid>/cmdline can come back empty. On a container with no healthcheck that empty
+    # string must not match the "no healthcheck" default and swallow the visit.
+    _write_process(proc_dir, 200, 90, FILLER_NAMESPACE, 42, "")
+    scrape = _build_probe(proc_dir)
+
+    entries = _entries(scrape)
+
+    assert [entry["entry_pid"] for entry in entries] == [200]
 
 
 def test_the_probe_never_raises(proc_dir: Path) -> None:

@@ -127,8 +127,12 @@ class FillerContainerEntry(BaseModel):
             return None
         if kind not in FILLER_ENTRY_KINDS:
             return None
-        if pid is not None and (not isinstance(pid, int) or isinstance(pid, bool)):
-            return None
+        if kind == "open_session":
+            # a live session is proven by its process, so it must name a real one
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                return None
+        elif pid is not None:
+            return None  # a finished exec has no process left to name
         if not isinstance(seconds_after_start, int | float) or isinstance(seconds_after_start, bool):
             return None
         try:
