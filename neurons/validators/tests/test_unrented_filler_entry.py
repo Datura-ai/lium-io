@@ -142,6 +142,9 @@ UNPROVEN_SPECS: list[dict] = [
     {"filler_entries": [{**_entry(), "seconds_after_start": None}]},
     {"filler_entries": [{**_entry(), "container": 1}]},    # container name is not a name
     {"filler_entries": [{**_entry(), "pid": "200"}]},      # pid as a string
+    {"filler_entries": [{**_entry(), "seconds_after_start": 10**400}]},  # too large for a float
+    {"filler_entries": [{**_entry(), "seconds_after_start": float("inf")}]},
+    {"filler_entries": [{**_entry(), "seconds_after_start": float("nan")}]},
     {"filler_entry_scrape_error": "docker api /events returned HTTP 500"},
 ]
 

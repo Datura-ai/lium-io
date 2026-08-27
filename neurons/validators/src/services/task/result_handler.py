@@ -42,6 +42,18 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
     return {**specs, "gpu": {**gpu, "details": canonical_details}}
 
 
+def _visits_into_own_filler_containers(context: Context, executor_uuid: str) -> list:
+    reported_entries = (context.state.specs or {}).get("filler_entries")
+    if not isinstance(reported_entries, list) or context.state.rented_data is None:
+        return []
+    own_containers = set(context.state.rented_data.get_filler_containers(executor_uuid))
+    return [
+        entry
+        for entry in reported_entries
+        if isinstance(entry, dict) and entry.get("container") in own_containers
+    ]
+
+
 class ResultHandler:
     """Handles post-pipeline result processing and persistence."""
 
@@ -161,6 +173,13 @@ class ResultHandler:
         # backend types this nested object as MachineSpecs.gpu_metrics.
         if context.state.gpu_metrics is not None:
             specs["gpu_metrics"] = context.state.gpu_metrics
+
+        # DAH-2787: the scrape sees every filler container on the HOST, and a host can carry more
+        # than one executor. Keep only the visits into containers the backend says are THIS
+        # executor's - the same rule DAH-2735 uses to decide whose workload is whose. No backend
+        # snapshot means nothing can be attributed, so nothing is judged.
+        if "filler_entries" in specs:
+            specs["filler_entries"] = _visits_into_own_filler_containers(context, executor_info.uuid)
 
         # DAH-2265 Plan 2: advisory cached-template signal — whether this executor has the
         # recommended default image pre-pulled (so DOCKER_PULL is a no-op for default-template

@@ -11,6 +11,7 @@ rental subsidy. See `incentive/config.py:MAX_UNRENTED_GPUS_BY_TYPE`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -130,11 +131,17 @@ class FillerContainerEntry(BaseModel):
             return None
         if not isinstance(seconds_after_start, int | float) or isinstance(seconds_after_start, bool):
             return None
+        try:
+            visit_seconds_after_start: float = float(seconds_after_start)
+        except OverflowError:
+            return None  # an integer too large for a float is not a reading
+        if not math.isfinite(visit_seconds_after_start):
+            return None  # inf compares greater than every grace, nan than none
         return FillerContainerEntry(
             container_name=container_name,
             kind=kind,
             pid=pid,
-            seconds_after_start=float(seconds_after_start),
+            seconds_after_start=visit_seconds_after_start,
             command=command if isinstance(command, str) else "",
         )
 
