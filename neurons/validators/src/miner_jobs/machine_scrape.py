@@ -1044,6 +1044,9 @@ NVIDIACTL_PATH = "/dev/nvidiactl"
 PROC_DIR = "/proc"
 FILLER_CONTAINER_NAME_PREFIX = "filler_"
 ENTRY_COMMAND_LIMIT = 200
+ENTRY_REPORT_LIMIT = 20
+EXEC_EVENT_WINDOW_SECONDS = 3600
+EXEC_CREATE_STATUS_PREFIX = "exec_create: "
 INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
 # Enough of the GID table to carry both the link-local entries and the IPv4-mapped one. Its index
 # is driver-specific - mlx5 puts it at 2-3, Intel irdma at 1 - so consumers must match on the
@@ -1133,6 +1136,22 @@ class FillerEntryProbe:
         self.scrape_error = scrape_error
 
 
+def docker_api_get_events(path: str) -> list:
+    # The events endpoint answers with one JSON object per line, so it needs its own reader.
+    # A `since`/`until` pair that both lie in the past makes the daemon send its buffered
+    # events and close, instead of streaming new ones forever.
+    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, DOCKER_API_TIMEOUT_SECONDS)
+    try:
+        conn.request("GET", path)
+        response = conn.getresponse()
+        body = response.read()
+        if response.status != 200:
+            raise RuntimeError(f"docker api {path} returned HTTP {response.status}")
+        return [json.loads(line) for line in body.splitlines() if line.strip()]
+    finally:
+        conn.close()
+
+
 def read_pid_namespace(pid: int) -> str:
     # The kernel prints one identifier per namespace ("pid:[4026532817]"), so two processes are in
     # the same PID namespace when this string matches.
@@ -1142,7 +1161,7 @@ def read_pid_namespace(pid: int) -> str:
 def read_process_parent_and_start_ticks(pid: int) -> tuple:
     # /proc/<pid>/stat holds the command name in brackets, and it may contain spaces and brackets
     # of its own, so the fields are counted from the LAST bracket: parent pid is the 2nd of them
-    # and the start time the 20th.
+    # and the start time the 20th. The start time counts clock ticks since the host booted.
     with open(f"{PROC_DIR}/{pid}/stat") as stat_file:
         stat_line = stat_file.read()
     fields = stat_line[stat_line.rindex(")") + 1:].split()
@@ -1163,20 +1182,20 @@ def read_host_uptime_seconds() -> float:
         return float(uptime_file.read().split()[0])
 
 
-def find_processes_entered_from_outside(init_pid: int, container_name: str) -> list:
-    """Processes that run in the container but were started from outside it.
+def find_open_sessions(init_pid: int, container_name: str, container_start_ticks: int) -> list:
+    """Sessions still open in the container that were started from outside it.
 
     Everything a container starts itself has a parent in the same PID namespace, or is an orphan
     the container's own init adopted. `docker exec` and `nsenter` are the two ways in from the
     host, and both leave the same mark: the new process joins the namespace while its parent
     stays outside it. Only the session itself is reported - what it then runs has a parent inside.
+    This is the only way to see an `nsenter`, which never reaches the docker daemon.
     """
     container_namespace = read_pid_namespace(init_pid)
     if container_namespace == read_pid_namespace(os.getpid()):
         # The container shares the host PID namespace, where every process looks like a member
         # and the parentage tells nothing apart. Report none rather than the whole host.
         return []
-    uptime_seconds = read_host_uptime_seconds()
     clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
 
     members = {}
@@ -1197,18 +1216,63 @@ def find_processes_entered_from_outside(init_pid: int, container_name: str) -> l
             continue
         found.append({
             "entry_container": container_name,
+            "entry_kind": "open_session",
             "entry_pid": member_pid,
-            "entry_parent_pid": parent_pid,
-            "entry_age_seconds": round(uptime_seconds - start_ticks / clock_ticks_per_second, 1),
+            "entry_seconds_after_start": round(
+                (start_ticks - container_start_ticks) / clock_ticks_per_second, 1
+            ),
             "entry_command": read_process_command(member_pid),
         })
     return found
 
 
+def find_docker_exec_events(container_start_times: dict) -> list:
+    """Every `docker exec` the daemon recorded for these containers, finished ones included.
+
+    A guard script execs for milliseconds, so the live scan above almost never meets one. The
+    daemon keeps its last events in memory and hands them out with the command line, which turns
+    those short visits into a fact we can read once per cycle. `container_start_times` maps a
+    filler container name to when it started, in seconds since the host booted.
+    """
+    boot_time_unix = psutil.boot_time()
+    now_unix = boot_time_unix + read_host_uptime_seconds()
+    events = docker_api_get_events(
+        f"/events?since={int(now_unix - EXEC_EVENT_WINDOW_SECONDS)}&until={int(now_unix)}"
+    )
+
+    found = []
+    for event in events:
+        status = str(event.get("status") or "")
+        if not status.startswith(EXEC_CREATE_STATUS_PREFIX):
+            continue
+        container_name = ((event.get("Actor") or {}).get("Attributes") or {}).get("name") or ""
+        if container_name not in container_start_times:
+            continue
+        event_unix = event.get("time")
+        if not isinstance(event_unix, (int, float)) or isinstance(event_unix, bool):
+            continue
+        container_start_unix = boot_time_unix + container_start_times[container_name]
+        found.append({
+            "entry_container": container_name,
+            "entry_kind": "docker_exec",
+            "entry_pid": None,  # the session is over; the daemon keeps the command, not the pid
+            "entry_seconds_after_start": round(event_unix - container_start_unix, 1),
+            "entry_command": status[len(EXEC_CREATE_STATUS_PREFIX):][:ENTRY_COMMAND_LIMIT],
+        })
+    return found
+
+
+def entry_offset_seconds(entry: dict) -> float:
+    # A plain function, not a lambda: obfuscator.py renames a lambda's argument only where it is
+    # read, which leaves the packaged scrape referring to a name nothing binds.
+    return entry["entry_seconds_after_start"]
+
+
 def probe_filler_container_entries() -> FillerEntryProbe:
-    # DAH-2787: an idle node earns the unrented incentive while it runs Lium's own job, and
-    # nobody may work inside that job's container. Report the sessions raw - the validator holds
-    # the age threshold that keeps our own setup execs out of the verdict.
+    # DAH-2787: an idle node earns the unrented incentive while it runs Lium's own job, and nobody
+    # may work inside that job's container. Report the visits raw, each with the seconds between
+    # the container's start and the visit - the validator holds the grace that keeps our own setup
+    # execs, which all happen while the container is being created, out of the verdict.
     scrape_errors = []
     found = []
     try:
@@ -1216,6 +1280,8 @@ def probe_filler_container_entries() -> FillerEntryProbe:
     except Exception as e:
         return FillerEntryProbe([], f"Cannot list containers: {e}")
 
+    clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
+    container_start_times = {}
     for container in containers:
         container_name = ""
         for name in container.get("Names") or []:
@@ -1227,12 +1293,24 @@ def probe_filler_container_entries() -> FillerEntryProbe:
         try:
             details = docker_api_get(f"/containers/{container.get('Id')}/json")
             init_pid = int(((details or {}).get("State") or {}).get("Pid") or 0)
-            if init_pid > 0:  # 0 means the container is not running
-                found.extend(find_processes_entered_from_outside(init_pid, container_name))
+            if init_pid <= 0:  # 0 means the container is not running
+                continue
+            container_start_ticks = read_process_parent_and_start_ticks(init_pid)[1]
+            container_start_times[container_name] = container_start_ticks / clock_ticks_per_second
+            found.extend(find_open_sessions(init_pid, container_name, container_start_ticks))
         except Exception as e:
             scrape_errors.append(f"Cannot read {container_name}: {e}")
 
-    return FillerEntryProbe(found, "; ".join(scrape_errors))
+    if container_start_times:
+        try:
+            found.extend(find_docker_exec_events(container_start_times))
+        except Exception as e:
+            scrape_errors.append(f"Cannot read docker events: {e}")
+
+    # A guard script that execs every few minutes fills a whole window with the same visit; the
+    # newest ones carry the same proof in a payload the backend can hold.
+    found.sort(key=entry_offset_seconds, reverse=True)
+    return FillerEntryProbe(found[:ENTRY_REPORT_LIMIT], "; ".join(scrape_errors))
 
 
 def get_host_boot_id() -> str:

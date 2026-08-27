@@ -401,17 +401,17 @@ class MinerLogLine(BaseModel):
             result,
             reason=ZeroIncentiveReason.FILLER_CONTAINER_ENTERED,
             message=(
-                f"No unrented incentive: somebody opened a session inside Lium's own job "
-                f"container {entry.container_name} from the host (pid {entry.pid}, "
-                f"{int(entry.age_seconds)} seconds old, command: {entry.command!r}). An idle "
-                "executor is paid to run Lium's job untouched, so nobody may enter that "
-                "container - `docker exec` and `nsenter` both count. Close the session and "
-                "keep out of the container, or rent this executor out to earn."
+                f"No unrented incentive: somebody entered Lium's own job container "
+                f"{entry.container_name} from the host, {int(entry.seconds_after_start / 60)} "
+                f"minutes after the job started (command: {entry.command!r}). An idle executor "
+                "is paid to run Lium's job untouched, so nobody may enter that container - "
+                "`docker exec` and `nsenter` both count, and a script that does it for you "
+                "counts too. Stop entering the container, or rent this executor out to earn."
             ),
             extra_fields={
                 "filler_container": entry.container_name,
-                "entry_pid": entry.pid,
-                "entry_age_seconds": entry.age_seconds,
+                "entry_kind": entry.kind,
+                "entry_seconds_after_start": entry.seconds_after_start,
                 "entry_command": entry.command,
             },
         )

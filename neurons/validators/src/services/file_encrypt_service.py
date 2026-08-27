@@ -148,9 +148,9 @@ ORIGINAL_KEYS = {
     'data_filler_entries': "filler_entries",
     'data_filler_entry_scrape_error': "filler_entry_scrape_error",
     'entry_container': "container",
+    'entry_kind': "kind",
     'entry_pid': "pid",
-    'entry_parent_pid': "parent_pid",
-    'entry_age_seconds': "age_seconds",
+    'entry_seconds_after_start': "seconds_after_start",
     'entry_command': "command",
 }
 
@@ -331,9 +331,9 @@ class FileEncryptService:
             'data_filler_entries': "",
             'data_filler_entry_scrape_error': "",
             'entry_container': "",
+            'entry_kind': "",
             'entry_pid': "",
-            'entry_parent_pid': "",
-            'entry_age_seconds': "",
+            'entry_seconds_after_start': "",
             'entry_command': "",
         }
 

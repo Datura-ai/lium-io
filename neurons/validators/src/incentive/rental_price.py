@@ -60,6 +60,9 @@ NCU_PROFILING_UNRESTRICTED = "unrestricted"
 # capability mask and the owner of /dev/nvidiactl, which sysbox maps away from root.
 CAP_SYS_ADMIN_BIT = 21
 NVIDIACTL_ROOT_UID = 0
+# DAH-2787: the two ways into a filler container the scrape can report, docker daemon event and
+# live process parentage. Anything else is a reading we do not understand, so it is not judged.
+FILLER_ENTRY_KINDS = ("docker_exec", "open_session")
 
 
 # ── Spec measurements ────────────────────────────────────────────────────────
@@ -92,17 +95,19 @@ class PowerCapIncapable(BaseModel):
 
 
 class FillerContainerEntry(BaseModel):
-    """One session that was opened inside a filler container from the host (DAH-2787).
+    """One visit inside a filler container that came from the host (DAH-2787).
 
-    The scrape finds it by parentage: the process runs in the container's PID namespace while
-    its parent stays outside it, which is what `docker exec` and `nsenter` both leave behind.
-    Carried verbatim so the provider is shown the session that cost them the incentive. Sole
-    owner of these scrape keys."""
+    Two shapes, one meaning. `docker_exec` comes from the docker daemon's own event log and
+    carries finished visits too, which is how a guard script that execs for milliseconds is
+    caught. `open_session` comes from process parentage - a process in the container's PID
+    namespace whose parent is outside it - and is the only way to see an `nsenter`, which never
+    reaches the daemon. Carried verbatim so the provider is shown the visit that cost them the
+    incentive. Sole owner of these scrape keys."""
 
     container_name: str
-    pid: int
-    parent_pid: int
-    age_seconds: float  # how long the session has been open, at scrape time
+    kind: str  # "docker_exec" or "open_session"
+    pid: int | None  # the live process, when the visit is still open
+    seconds_after_start: float  # between the container's start and the visit
     command: str
 
     @staticmethod
@@ -113,23 +118,23 @@ class FillerContainerEntry(BaseModel):
         if not isinstance(reported, dict):
             return None
         container_name: Any = reported.get("container")
+        kind: Any = reported.get("kind")
         pid: Any = reported.get("pid")
-        parent_pid: Any = reported.get("parent_pid")
-        age_seconds: Any = reported.get("age_seconds")
+        seconds_after_start: Any = reported.get("seconds_after_start")
         command: Any = reported.get("command")
         if not isinstance(container_name, str) or not container_name:
             return None
-        if not isinstance(pid, int) or not isinstance(parent_pid, int):
+        if kind not in FILLER_ENTRY_KINDS:
             return None
-        if isinstance(pid, bool) or isinstance(parent_pid, bool):
+        if pid is not None and (not isinstance(pid, int) or isinstance(pid, bool)):
             return None
-        if not isinstance(age_seconds, int | float) or isinstance(age_seconds, bool):
+        if not isinstance(seconds_after_start, int | float) or isinstance(seconds_after_start, bool):
             return None
         return FillerContainerEntry(
             container_name=container_name,
+            kind=kind,
             pid=pid,
-            parent_pid=parent_pid,
-            age_seconds=float(age_seconds),
+            seconds_after_start=float(seconds_after_start),
             command=command if isinstance(command, str) else "",
         )
 
@@ -522,24 +527,24 @@ class RentalPriceIncentive(DefaultIncentive):
         )
 
     def _filler_container_entry(self, result: JobResult) -> FillerContainerEntry | None:
-        # The oldest session still open in a filler container, or None when the scrape does not
-        # PROVE one. Sessions younger than the threshold are ours: the validator execs into a
-        # fresh filler itself (public keys, sshd bootstrap) and those commands live seconds.
+        # The latest visit inside a filler container, or None when the scrape does not PROVE one.
+        # A visit during the container's first minutes is ours: the validator execs into a fresh
+        # filler itself (public keys, sshd bootstrap), and it never enters one again afterwards.
         if result.spec is None:
             # no scrape at all: a synthetic or estimated job result, nothing to measure
             return None
         reported_entries: Any = result.spec.get("filler_entries")
         if not isinstance(reported_entries, list):
             return None
-        minimum_age_seconds: float = settings.FILLER_ENTRY_MIN_AGE_SECONDS
+        grace_seconds: float = settings.FILLER_ENTRY_GRACE_SECONDS
         entries: list[FillerContainerEntry] = []
         for reported in reported_entries:
             entry: FillerContainerEntry | None = FillerContainerEntry.from_scrape(reported)
-            if entry is not None and entry.age_seconds >= minimum_age_seconds:
+            if entry is not None and entry.seconds_after_start >= grace_seconds:
                 entries.append(entry)
         if not entries:
             return None
-        return max(entries, key=lambda open_session: open_session.age_seconds)
+        return max(entries, key=lambda visit: visit.seconds_after_start)
 
     def _log_filler_container_entry(self, result: JobResult, entry: FillerContainerEntry) -> None:
         enforced: bool = settings.ENABLE_UNRENTED_FILLER_ENTRY_LIMIT
@@ -552,9 +557,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     "gpu_model": result.gpu_model,
                     "gpu_count": result.gpu_count,
                     "filler_container": entry.container_name,
+                    "entry_kind": entry.kind,
                     "entry_pid": entry.pid,
-                    "entry_parent_pid": entry.parent_pid,
-                    "entry_age_seconds": entry.age_seconds,
+                    "entry_seconds_after_start": entry.seconds_after_start,
                     "entry_command": entry.command,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.FILLER_CONTAINER_ENTERED,

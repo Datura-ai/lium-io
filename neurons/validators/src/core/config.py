@@ -307,9 +307,11 @@ class Settings(BaseSettings):
     # unrented incentive while the node stays active. The detection is new, so it ships in
     # shadow mode: with the flag off the session is only logged.
     ENABLE_UNRENTED_FILLER_ENTRY_LIMIT: bool = Field(env="ENABLE_UNRENTED_FILLER_ENTRY_LIMIT", default=False)
-    # The validator execs into a fresh filler itself (public keys, sshd bootstrap). Those
-    # commands live seconds, so only a session that outlives this age is judged.
-    FILLER_ENTRY_MIN_AGE_SECONDS: float = Field(env="FILLER_ENTRY_MIN_AGE_SECONDS", default=120.0)
+    # The validator execs into a fresh filler itself (public keys, sshd bootstrap) and never
+    # enters one afterwards, so only a visit this long after the container started is judged.
+    # Generous on purpose: an sshd bootstrap on a slow host can run for minutes, and a guard
+    # script that keeps entering the container is caught on its next visit anyway.
+    FILLER_ENTRY_GRACE_SECONDS: float = Field(env="FILLER_ENTRY_GRACE_SECONDS", default=900.0)
 
     # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
