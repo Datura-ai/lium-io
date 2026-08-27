@@ -1289,11 +1289,27 @@ class RunningFillerContainers:
         self,
         init_pid_by_container: dict[str, int],
         start_ticks_by_container: dict[str, int],
+        healthcheck_command_by_container: dict[str, str],
         scrape_error: str,
     ) -> None:
         self.init_pid_by_container = init_pid_by_container
         self.start_ticks_by_container = start_ticks_by_container
+        self.healthcheck_command_by_container = healthcheck_command_by_container
         self.scrape_error = scrape_error
+
+
+def read_healthcheck_command(details: dict) -> str:
+    # An image HEALTHCHECK is run by the daemon as an exec, so it lands in the event log and in
+    # the process list exactly like a person's `docker exec` (verified against a live daemon).
+    # The command is the only thing that tells the two apart.
+    test = (((details or {}).get("Config") or {}).get("Healthcheck") or {}).get("Test") or []
+    if not isinstance(test, list) or len(test) < 2:
+        return ""
+    if test[0] == "CMD-SHELL":
+        return f"/bin/sh -c {test[1]}"
+    if test[0] == "CMD":
+        return " ".join(str(argument) for argument in test[1:])
+    return ""
 
 
 def read_running_filler_containers() -> RunningFillerContainers:
@@ -1302,6 +1318,7 @@ def read_running_filler_containers() -> RunningFillerContainers:
     scrape_errors = []
     init_pid_by_container = {}
     start_ticks_by_container = {}
+    healthcheck_command_by_container = {}
     for container in docker_api_get("/containers/json") or []:
         container_name = ""
         for name in container.get("Names") or []:
@@ -1317,10 +1334,14 @@ def read_running_filler_containers() -> RunningFillerContainers:
                 continue
             init_pid_by_container[container_name] = init_pid
             start_ticks_by_container[container_name] = read_process_parent_and_start_ticks(init_pid)[1]
+            healthcheck_command_by_container[container_name] = read_healthcheck_command(details)
         except Exception as e:
             scrape_errors.append(f"Cannot read {container_name}: {e}")
     return RunningFillerContainers(
-        init_pid_by_container, start_ticks_by_container, "; ".join(scrape_errors)
+        init_pid_by_container,
+        start_ticks_by_container,
+        healthcheck_command_by_container,
+        "; ".join(scrape_errors),
     )
 
 
@@ -1360,6 +1381,14 @@ def find_filler_container_entries() -> FillerEntryProbe:
         }))
     except Exception as e:
         scrape_errors.append(f"Cannot read docker events: {e}")
+
+    entries = [
+        entry
+        for entry in entries
+        if entry["entry_command"] != fillers.healthcheck_command_by_container.get(
+            entry["entry_container"], ""
+        )
+    ]
 
     # A guard script that execs every few minutes fills a whole window with the same visit; the
     # newest ones carry the same proof in a payload the backend can hold.

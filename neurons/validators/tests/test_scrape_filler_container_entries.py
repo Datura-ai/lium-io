@@ -40,6 +40,7 @@ PROBE_HELPERS = {
     "find_docker_exec_events",
     "seconds_after_container_start",
     "RunningFillerContainers",
+    "read_healthcheck_command",
     "read_running_filler_containers",
     "find_filler_container_entries",
     "probe_filler_container_entries",
@@ -95,7 +96,11 @@ def proc_dir(tmp_path: Path) -> Path:
     return fake_proc
 
 
-def _docker_api(container_name: str = FILLER_CONTAINER_NAME, init_pid: int = FILLER_INIT_PID):
+def _docker_api(
+    container_name: str = FILLER_CONTAINER_NAME,
+    init_pid: int = FILLER_INIT_PID,
+    healthcheck: list[str] | None = None,
+):
     def docker_api_get(path: str) -> Any:
         if path == "/containers/json":
             return [
@@ -103,7 +108,8 @@ def _docker_api(container_name: str = FILLER_CONTAINER_NAME, init_pid: int = FIL
                 {"Id": "cafe", "Names": ["/pod_1234"]},
             ]
         if path == f"/containers/{FILLER_CONTAINER_ID}/json":
-            return {"State": {"Pid": init_pid}}
+            config = {"Healthcheck": {"Test": healthcheck}} if healthcheck else {}
+            return {"State": {"Pid": init_pid}, "Config": config}
         return {"State": {"Pid": 555}}
 
     return docker_api_get
@@ -351,6 +357,64 @@ def test_a_broken_event_log_still_reports_open_sessions(proc_dir: Path) -> None:
     # Assert
     assert [entry["entry_kind"] for entry in probe.entries] == ["open_session"]
     assert "docker events" in probe.scrape_error
+
+
+HEALTHCHECK_COMMAND = "pgrep -x peakminer"
+
+
+def test_the_daemons_own_healthcheck_exec_is_not_a_visit(proc_dir: Path) -> None:
+    # Verified against a live daemon: an image HEALTHCHECK runs as an exec and lands in the event
+    # log as `exec_create: /bin/sh -c <test>`, every few seconds, on every honest node.
+    scrape = _build_probe(
+        proc_dir,
+        docker_api_get=_docker_api(healthcheck=["CMD-SHELL", HEALTHCHECK_COMMAND]),
+        events=[_exec_event(command=f"/bin/sh -c {HEALTHCHECK_COMMAND}")],
+    )
+
+    assert _entries(scrape) == []
+
+
+def test_a_live_healthcheck_process_is_not_a_visit(proc_dir: Path) -> None:
+    # The same command caught mid-run by the live scan: the exec'd shell's parent is the daemon,
+    # outside the container, so parentage alone reads it as a visit.
+    _write_process(proc_dir, 200, 90, FILLER_NAMESPACE, 42, f"/bin/sh -c {HEALTHCHECK_COMMAND}")
+    scrape = _build_probe(
+        proc_dir, docker_api_get=_docker_api(healthcheck=["CMD-SHELL", HEALTHCHECK_COMMAND])
+    )
+
+    assert _entries(scrape) == []
+
+
+def test_a_real_visit_survives_a_container_that_has_a_healthcheck(proc_dir: Path) -> None:
+    # Only the healthcheck's own command is excused, not every exec into that container.
+    scrape = _build_probe(
+        proc_dir,
+        docker_api_get=_docker_api(healthcheck=["CMD-SHELL", HEALTHCHECK_COMMAND]),
+        events=[_exec_event(command="kill -STOP 1584")],
+    )
+
+    entries = _entries(scrape)
+
+    assert [entry["entry_command"] for entry in entries] == ["kill -STOP 1584"]
+
+
+@pytest.mark.parametrize(
+    ("test_field", "expected"),
+    [
+        (["CMD-SHELL", "curl -f localhost"], "/bin/sh -c curl -f localhost"),
+        (["CMD", "curl", "-f", "localhost"], "curl -f localhost"),
+        (["NONE"], ""),
+        ([], ""),
+        (None, ""),
+        ("curl", ""),
+    ],
+)
+def test_read_healthcheck_command_reads_both_docker_forms(
+    scrape: dict[str, Any], test_field: Any, expected: str
+) -> None:
+    details = {"Config": {"Healthcheck": {"Test": test_field}}}
+
+    assert scrape["read_healthcheck_command"](details) == expected
 
 
 def test_the_probe_never_raises(proc_dir: Path) -> None:

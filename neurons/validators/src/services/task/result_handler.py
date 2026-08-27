@@ -15,6 +15,8 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+
 from .models import JobResult
 from .pipeline import Context
 
@@ -42,11 +44,12 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
     return {**specs, "gpu": {**gpu, "details": canonical_details}}
 
 
-def _visits_into_own_filler_containers(context: Context, executor_uuid: str) -> list:
-    reported_entries = (context.state.specs or {}).get("filler_entries")
-    if not isinstance(reported_entries, list) or context.state.rented_data is None:
+def _visits_into_own_filler_containers(
+    reported_entries: object, rented_data: RentedExecutorsResponse | None, executor_uuid: str
+) -> list:
+    if not isinstance(reported_entries, list) or rented_data is None:
         return []
-    own_containers = set(context.state.rented_data.get_filler_containers(executor_uuid))
+    own_containers = set(rented_data.get_filler_containers(executor_uuid))
     return [
         entry
         for entry in reported_entries
@@ -179,7 +182,9 @@ class ResultHandler:
         # executor's - the same rule DAH-2735 uses to decide whose workload is whose. No backend
         # snapshot means nothing can be attributed, so nothing is judged.
         if "filler_entries" in specs:
-            specs["filler_entries"] = _visits_into_own_filler_containers(context, executor_info.uuid)
+            specs["filler_entries"] = _visits_into_own_filler_containers(
+                specs["filler_entries"], context.state.rented_data, executor_info.uuid
+            )
 
         # DAH-2265 Plan 2: advisory cached-template signal — whether this executor has the
         # recommended default image pre-pulled (so DOCKER_PULL is a no-op for default-template
