@@ -28,6 +28,7 @@ PROBE_HELPERS = {
     "FILLER_CONTAINER_NAME_PREFIX",
     "ENTRY_COMMAND_MAX_CHARS",
     "MAX_REPORTED_ENTRIES",
+    "MAX_REPORTED_ENTRIES_PER_CONTAINER",
     "EXEC_EVENT_WINDOW_SECONDS",
     "EXEC_CREATE_STATUS_PREFIX",
     "FillerEntryProbe",
@@ -269,9 +270,23 @@ def test_the_newest_visits_are_kept_when_a_guard_script_floods_the_window(proc_d
     # Act
     entries = _entries(scrape)
 
-    # Assert - capped, and the newest visit survives the cap
-    assert len(entries) == scrape["MAX_REPORTED_ENTRIES"]
+    # Assert - capped per container, and the newest visit survives the cap
+    assert len(entries) == scrape["MAX_REPORTED_ENTRIES_PER_CONTAINER"]
     assert entries[0]["entry_seconds_after_start"] == pytest.approx(CONTAINER_AGE - 60, abs=1)
+
+
+def test_a_flooded_neighbour_container_cannot_push_out_our_only_visit(proc_dir: Path) -> None:
+    # A host can carry a second executor. Visits into ITS filler must not evict the one visit
+    # into ours - that would be a bypass anybody could arrange on their own box.
+    neighbour_flood = [
+        _exec_event(container_name="filler_neighbour", seconds_ago=float(second))
+        for second in range(1, 60)
+    ]
+    scrape = _build_probe(proc_dir, events=[*neighbour_flood, _exec_event(seconds_ago=3000.0)])
+
+    entries = _entries(scrape)
+
+    assert FILLER_CONTAINER_NAME in [entry["entry_container"] for entry in entries]
 
 
 def test_a_process_that_exits_during_the_scan_is_skipped(

@@ -1048,7 +1048,8 @@ NVIDIACTL_PATH = "/dev/nvidiactl"
 PROC_DIR = "/proc"
 FILLER_CONTAINER_NAME_PREFIX = "filler_"
 ENTRY_COMMAND_MAX_CHARS = 200
-MAX_REPORTED_ENTRIES = 20
+MAX_REPORTED_ENTRIES = 100
+MAX_REPORTED_ENTRIES_PER_CONTAINER = 5
 EXEC_EVENT_WINDOW_SECONDS = 3600
 EXEC_CREATE_STATUS_PREFIX = "exec_create: "
 INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
@@ -1390,10 +1391,22 @@ def find_filler_container_entries() -> FillerEntryProbe:
         )
     ]
 
-    # A guard script that execs every few minutes fills a whole window with the same visit; the
-    # newest ones carry the same proof in a payload the backend can hold.
+    # A guard script that execs every few minutes fills a whole window with the same visit, so the
+    # newest few carry the same proof in a payload the backend can hold. The cap is PER CONTAINER:
+    # a host-wide one lets visits into a busy container push another container's only visit out of
+    # the report, which is a bypass on a host that carries more than one executor.
     entries.sort(key=seconds_after_container_start, reverse=True)
-    return FillerEntryProbe(entries[:MAX_REPORTED_ENTRIES], "; ".join(scrape_errors))
+    kept = []
+    kept_per_container = {}
+    for entry in entries:
+        container_name = entry["entry_container"]
+        if kept_per_container.get(container_name, 0) >= MAX_REPORTED_ENTRIES_PER_CONTAINER:
+            continue
+        kept_per_container[container_name] = kept_per_container.get(container_name, 0) + 1
+        kept.append(entry)
+        if len(kept) >= MAX_REPORTED_ENTRIES:
+            break  # a host that shows this many Lium-named containers has a bigger problem
+    return FillerEntryProbe(kept, "; ".join(scrape_errors))
 
 
 def get_host_boot_id() -> str:
