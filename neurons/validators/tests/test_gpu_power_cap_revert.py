@@ -61,7 +61,9 @@ def _state(current_watts: int, default_watts: int | None = 450) -> GpuPowerState
     )
 
 
-def _observe(watts: int, capped_to_watts: int | None, found: int, default: int | None = 450):
+def _observe(
+    watts: int, capped_to_watts: int | None, found: int, default: int | None = 450
+) -> GpuPowerCapRevert | None:
     return _detect_cap_revert(_restore_record(watts, capped_to_watts), _state(found, default), observed_at=1.0)
 
 
@@ -127,7 +129,7 @@ def test_unknown_default_falls_back_to_the_pre_cap_limit() -> None:
 
 
 class FakeRun:
-    def __init__(self, stdout: str = "", stderr: str = "", exit_status: int = 0):
+    def __init__(self, stdout: str = "", stderr: str = "", exit_status: int = 0) -> None:
         self.stdout = stdout
         self.stderr = stderr
         self.exit_status = exit_status
@@ -144,7 +146,7 @@ def _set_ok(readback_watts: int, persistence: str = "Enabled") -> list[FakeRun]:
 
 
 class FakeRedis:
-    def __init__(self, initial: dict[str, str] | None = None):
+    def __init__(self, initial: dict[str, str] | None = None) -> None:
         self.store: dict[str, str] = dict(initial or {})
         self.expiries: dict[str, int] = {}
 
@@ -523,7 +525,7 @@ async def test_read_fails_open_on_a_corrupt_record() -> None:
 # ---------------------------- the incentive gate ----------------------------
 
 
-def _build_incentive(redis) -> RentalPriceIncentive:
+def _build_incentive(redis: FakeRedis) -> RentalPriceIncentive:
     return RentalPriceIncentive(IncentiveConfig(), redis, {}, {})
 
 
