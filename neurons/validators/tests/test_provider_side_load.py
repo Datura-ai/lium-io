@@ -130,8 +130,8 @@ def confirming_runner(
     dockerd_jiffies = int(dockerd_cores * window_seconds * 100)
     body = "\n".join(f"{container_id}|{name}|{percent:.2f}%" for container_id, name, percent in rows)
     stdout = (
-        f"0 0 0\n@@@\n{body}\n@@@\n"
-        f"{total_jiffies} {total_jiffies - busy} {dockerd_jiffies}"
+        f"0 0 {core_count} 0\n@@@\n{body}\n@@@\n"
+        f"{total_jiffies} {total_jiffies - busy} {core_count} {dockerd_jiffies}"
     )
     runner = AsyncMock()
     runner.run = AsyncMock(return_value=MagicMock(success=True, stdout=stdout))
@@ -424,7 +424,7 @@ async def test_a_docker_that_does_not_answer_the_second_look_withholds_nothing(c
     # here" would charge the machine's whole load to the provider.
     runner = AsyncMock()
     runner.run = AsyncMock(
-        return_value=MagicMock(success=True, stdout="0 0 0\n@@@\n\n@@@\n1000 0 0")
+        return_value=MagicMock(success=True, stdout="0 0 32 0\n@@@\n\n@@@\n1000 0 32 0")
     )
     ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS), runner=runner)
 
@@ -529,14 +529,14 @@ async def test_a_lium_image_pull_is_not_the_providers_load(context_factory):
     # row, and a big pull outlives both samples — unsubtracted it zeroes an honest machine.
     ctx = context_factory(
         state=_rented_state(CPU_ONLY_SPECS),
-        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)], dockerd_cores=9.0),
+        runner=confirming_runner(3.5, 32, [("c1", "pod_renter", 158.0)], dockerd_cores=1.9),
     )
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
 
     assert result.passed is True
-    assert result.event.what_we_saw["provider_cpu_cores"] == 0.0  # 10.56 - 1.58 - 9.0
+    assert result.event.what_we_saw["provider_cpu_cores"] == 0.0  # 3.5 - 1.58 - 1.9
 
 
 @pytest.mark.asyncio
@@ -613,7 +613,7 @@ async def test_a_half_finished_stats_run_withholds_nothing(context_factory):
     runner.run = AsyncMock(
         return_value=MagicMock(
             success=True,
-            stdout="0 0 0\n@@@\nc1|pod_renter|10.00%\nSTATS_FAILED\n@@@\n1000 0 0",
+            stdout="0 0 32 0\n@@@\nc1|pod_renter|10.00%\nSTATS_FAILED\n@@@\n1000 0 32 0",
         )
     )
     ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS), runner=runner)
@@ -623,3 +623,19 @@ async def test_a_half_finished_stats_run_withholds_nothing(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.NOT_MEASURABLE.reason
+
+
+@pytest.mark.asyncio
+async def test_a_miner_renamed_dockerd_is_capped_like_every_other_forged_name(context_factory):
+    # `pgrep -x dockerd` matches a process NAME, and a provider owns the host: copying the miner
+    # to `dockerd` would otherwise hide nine cores on the reading that decides money.
+    ctx = context_factory(
+        state=_rented_state(CPU_ONLY_SPECS),
+        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)], dockerd_cores=9.0),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["provider_cpu_cores"] == 6.9  # 10.56 - 1.58 - 2.0 capped

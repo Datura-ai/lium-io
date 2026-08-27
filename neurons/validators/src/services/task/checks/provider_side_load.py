@@ -41,13 +41,18 @@ CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 CPU_RESAMPLE_TIMEOUT_SECONDS = 45
 # Linux counts /proc/stat in USER_HZ, 100 everywhere we run.
 _JIFFIES_PER_SECOND = 100
-# `total idle dockerd_jiffies` in one line. The third number is dockerd's and containerd's own
-# CPU: pulling a Lium image is work Lium asked for, it belongs to no container row, and a 60 GB
-# pull outlives both samples - without subtracting it an honest node reads as a cheating one.
-# Read from /proc, not from a cgroup path: the executor container has its own cgroup namespace
-# and cannot see the host's. Zero when neither process is running, which subtracts nothing.
+# `total idle cores dockerd_jiffies` in one line.
+# `cores` counts the kernel's own cpuN lines, not the `cpu.count` the miner advertises: that
+# value is the one CpuTruthCheck distrusts, and it only catches over-reporting, so a host
+# claiming 8 of its 32 threads would report a quarter of its load (review ask, PR #1245).
+# `dockerd_jiffies` is dockerd's and containerd's own CPU: pulling a Lium image is work Lium
+# asked for, it belongs to no container row, and a 60 GB pull outlives both samples. Read from
+# /proc, not from a cgroup path: the executor container has its own cgroup namespace and cannot
+# see the host's. Matched by process name, which a provider can copy, so the subtraction is
+# capped like every other forgeable excuse.
 _HOST_SAMPLE = (
-    r"""awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; printf "%d %d ", total, idle}' /proc/stat; """
+    r"""awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i} /^cpu[0-9]/{cores++} """
+    r"""END{printf "%d %d %d ", total, idle, cores}' /proc/stat; """
     r"""pgrep -x 'dockerd|containerd' | while read pid; do cat /proc/$pid/stat 2>/dev/null; done """
     r"""| awk '{used+=$14+$15} END{printf "%d\n", used+0}'"""
 )
@@ -341,7 +346,6 @@ def parse_resampled_cpu_cores(
     sample_before: str,
     container_rows: str,
     sample_after: str,
-    core_count: int,
     lium_container_keys: set[str],
 ) -> float | None:
     """Provider-side cores from the second reading, or None if it is not readable.
@@ -351,8 +355,10 @@ def parse_resampled_cpu_cores(
     the containers Lium runs and dockerd's own work, and what is left is the provider's.
     """
     try:
-        first_total, first_idle, first_dockerd = (int(part) for part in sample_before.split())
-        last_total, last_idle, last_dockerd = (int(part) for part in sample_after.split())
+        first_total, first_idle, _, first_dockerd = (int(part) for part in sample_before.split())
+        last_total, last_idle, kernel_cores, last_dockerd = (
+            int(part) for part in sample_after.split()
+        )
         total_delta = last_total - first_total
         rows = container_rows.strip().splitlines()
         if any(_STATS_FAILED_MARKER in row for row in rows):
@@ -360,7 +366,7 @@ def parse_resampled_cpu_cores(
         # Every host runs at least the executor's own container, so no rows means docker did not
         # answer. Reading that as "Lium runs nothing here" would charge the whole host to the
         # provider.
-        if total_delta <= 0 or not rows:
+        if total_delta <= 0 or kernel_cores <= 0 or not rows:
             return None
         stats_rows: list[ContainerRow] = []
         for line in rows:
@@ -372,11 +378,13 @@ def parse_resampled_cpu_cores(
             )
     except (TypeError, ValueError, OverflowError):
         return None
-    window_seconds = total_delta / (_JIFFIES_PER_SECOND * core_count)
+    window_seconds = total_delta / (_JIFFIES_PER_SECOND * kernel_cores)
     dockerd_cores = (last_dockerd - first_dockerd) / _JIFFIES_PER_SECOND / window_seconds
-    host_cores = (total_delta - (last_idle - first_idle)) / total_delta * core_count
+    # `dockerd` is a process name anyone can copy, so its excuse is capped like the name tier
+    excused_dockerd_cores = min(max(0.0, dockerd_cores), CLAIMED_EXCUSE_CORES)
+    host_cores = (total_delta - (last_idle - first_idle)) / total_delta * kernel_cores
     return provider_cores_outside_lium(
-        host_cores - max(0.0, dockerd_cores), stats_rows, lium_container_keys
+        host_cores - excused_dockerd_cores, stats_rows, lium_container_keys
     )
 
 
@@ -402,14 +410,14 @@ class ProviderSideLoadCheck:
     fatal = False
 
     async def _resample_cpu_cores(
-        self, ctx: Context, core_count: int | None, lium_container_keys: set[str] | None
+        self, ctx: Context, lium_container_keys: set[str] | None
     ) -> float | None:
         """Read the load once more over ssh. None on anything unreadable, which withholds nothing.
 
         Through `ctx.runner`, like the twin gate's second look at the card: the runner owns the
         timeout, the failure and the timing log.
         """
-        if not core_count or lium_container_keys is None or ctx.runner is None:
+        if lium_container_keys is None or ctx.runner is None:
             return None
         result = await ctx.runner.run(
             CPU_RESAMPLE_COMMAND, timeout=CPU_RESAMPLE_TIMEOUT_SECONDS, retryable=False
@@ -421,7 +429,7 @@ class ProviderSideLoadCheck:
             return None
         jiffies_before, container_rows, jiffies_after = sections
         return parse_resampled_cpu_cores(
-            jiffies_before, container_rows, jiffies_after, core_count, lium_container_keys
+            jiffies_before, container_rows, jiffies_after, lium_container_keys
         )
 
     def _what_we_saw(
@@ -464,7 +472,7 @@ class ProviderSideLoadCheck:
             return measured
         return replace(
             measured,
-            cpu_cores=await self._resample_cpu_cores(ctx, core_count, lium_container_keys),
+            cpu_cores=await self._resample_cpu_cores(ctx, lium_container_keys),
         )
 
     async def run(self, ctx: Context) -> CheckResult:
