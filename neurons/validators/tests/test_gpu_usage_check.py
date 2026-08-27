@@ -938,3 +938,65 @@ async def test_a_pod_the_backend_places_on_another_node_is_foreign(context_facto
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_broken_pods_container_is_still_ours(context_factory):
+    # DAH-2757: the rental of a BROKEN pod is closed, so the backend reports active=False, but its
+    # container stays on the host until the stale-container reaper collects it. Scoring the provider
+    # for a container our own platform left behind is the thing this whole ticket removes.
+    broken_pod = f"{POD_CONTAINER_PREFIX}bfc8838d-7967-43b0-90b9-2917ffbffe5a"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": broken_pod}],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, status="BROKEN", executor_id=default_executor().uuid
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_broken_pod_of_another_node_is_still_foreign(context_factory):
+    broken_pod = f"{POD_CONTAINER_PREFIX}bfc8838d-7967-43b0-90b9-2917ffbffe5a"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": broken_pod}],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, status="BROKEN", executor_id="another-executor"
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_pods_container_is_foreign(context_factory):
+    # No status at all: the backend never issued this id, so nothing shields the container.
+    unknown_pod = f"{POD_CONTAINER_PREFIX}bfc8838d-7967-43b0-90b9-2917ffbffe5a"
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": unknown_pod}],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=False)
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    with foreign_gate():
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason

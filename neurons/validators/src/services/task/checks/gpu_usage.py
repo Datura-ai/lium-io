@@ -5,6 +5,7 @@ from uuid import UUID
 
 from core.config import settings
 from protocol.vc_protocol.compute_requests import (
+    BROKEN_POD_STATUS,
     LIVE_FILLER_RUN_STATUSES,
     FillerRunActiveResponse,
     PodRentalActiveResponse,
@@ -411,7 +412,9 @@ async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     )
     if pod_rental is None:
         return True
-    return _the_answer_is_about_this_node(ctx, pod_rental.executor_id) and pod_rental.active
+    if not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
+        return False
+    return pod_rental.active or pod_rental.status == BROKEN_POD_STATUS
 
 
 def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:
