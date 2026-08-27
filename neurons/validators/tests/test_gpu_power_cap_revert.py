@@ -139,8 +139,8 @@ def fake_ssh(*responses: FakeRun) -> AsyncMock:
     return ssh
 
 
-def _set_ok(readback_watts: int) -> list[FakeRun]:
-    return [FakeRun(), FakeRun(), FakeRun(stdout=f"{readback_watts}.00, Enabled\n")]
+def _set_ok(readback_watts: int, persistence: str = "Enabled") -> list[FakeRun]:
+    return [FakeRun(), FakeRun(), FakeRun(stdout=f"{readback_watts}.00, {persistence}\n")]
 
 
 class FakeRedis:
@@ -349,6 +349,42 @@ async def test_a_verified_cap_is_stamped_so_a_later_revert_is_attributable() -> 
     stored = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
     assert stored.watts == 400  # the way back is still the miner's own limit
     assert stored.capped_to_watts == 280
+
+
+@pytest.mark.asyncio
+async def test_a_cap_without_persistence_mode_is_never_stamped() -> None:
+    # DAH-2702: with persistence off the driver unloads on an idle GPU and the stock limit
+    # comes back on its own. At teardown that is indistinguishable from a provider raising it,
+    # so two healthy jobs on such a host would cost the provider the idle payout.
+    state_csv = "GPU-a, 400, 400, 100, 400\n"
+    ssh = fake_ssh(FakeRun(stdout=state_csv), *_set_ok(280, persistence="Disabled"))
+    redis = FakeRedis()
+
+    applied = await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID
+    )
+
+    assert applied is True  # the cap holds for now, so the filler still runs
+    stored = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
+    assert stored.capped_to_watts is None
+
+
+@pytest.mark.asyncio
+async def test_the_stamp_moves_a_frozen_record_onto_the_capping_pod() -> None:
+    # A record frozen by an earlier failed restore still names the pod that first capped the
+    # GPU. Reverts are deduplicated per job, so leaving the old pod on it would make every
+    # later reverted job look like one already counted.
+    state_csv = "GPU-a, 400, 400, 100, 400\n"
+    ssh = fake_ssh(FakeRun(stdout=state_csv), *_set_ok(280))
+    redis = FakeRedis({_restore_key("GPU-a"): _stored_restore_record(pod_id="pod-earlier")})
+
+    await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID
+    )
+
+    stored = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
+    assert stored.pod_id == POD_ID
+    assert stored.watts == 400  # the frozen way back is untouched
 
 
 @pytest.mark.asyncio

@@ -329,8 +329,9 @@ async def _set_and_log_power_limit(
     watts_before: int | None,
     watts_after: int,
     log_extra: dict[str, object] | None,
-) -> bool:
+) -> PowerLimitSetOutcome:
     # Reviewer contract (PR #1115): every PL change is logged with executor, GPU, before/after, status.
+    # The outcome, not a bool: DAH-2786 stamps the applied cap only when persistence was verified.
     await _enable_persistence_mode(ssh, gpu_uuid, log_extra)
     set_outcome = await _set_power_limit(ssh, gpu_uuid, watts_after)
     failure = set_outcome.failure
@@ -365,7 +366,7 @@ async def _set_and_log_power_limit(
         },
         log_extra,
     )
-    return failure is None
+    return set_outcome
 
 
 async def _ensure_restore_record(
@@ -407,6 +408,7 @@ async def _set_applied_cap_on_restore_record(
     redis: RedisService,
     gpu_uuid: str,
     capped_to_watts: int | None,
+    capped_by_pod_id: str | None,
     log_extra: dict[str, object] | None,
 ) -> None:
     """Write the watts we verifiably applied onto the GPU's restore record, or None to say no
@@ -415,8 +417,9 @@ async def _set_applied_cap_on_restore_record(
     The watts are written only after the readback confirmed the set, which is what lets a later
     restore tell a host-side revert from a cap that never landed; a failed apply clears them
     again, so a record frozen by an earlier failed restore cannot carry a stale claim into the
-    next attempt. Best-effort: a miss only costs the revert signal, never the way back, so it
-    must not fail the filler.
+    next attempt. The capping pod is refreshed with them, because a frozen record still carries
+    the pod that first capped the GPU and the revert is deduplicated per job. Best-effort: a
+    miss only costs the revert signal, never the way back, so it must not fail the filler.
     """
     key = _restore_key(gpu_uuid)
     try:
@@ -424,7 +427,10 @@ async def _set_applied_cap_on_restore_record(
         if not raw:
             return
         record = GpuPowerRestoreRecord.model_validate_json(raw)
-        await redis.set(key, record.model_copy(update={"capped_to_watts": capped_to_watts}).model_dump_json())
+        refreshed = record.model_copy(
+            update={"capped_to_watts": capped_to_watts, "pod_id": capped_by_pod_id or record.pod_id}
+        )
+        await redis.set(key, refreshed.model_dump_json())
     except (ValidationError, TypeError, ValueError) as exc:
         _log(logging.ERROR, f"gpu power cap: cannot stamp the applied cap on {gpu_uuid}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
     except Exception as exc:
@@ -630,10 +636,10 @@ async def _restore_records(
         )
         if cap_revert is not None:
             reverted_gpus_by_executor.setdefault(record.executor_id, []).append(cap_revert)
-        changed = await _set_and_log_power_limit(
+        restore_outcome = await _set_and_log_power_limit(
             ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
         )
-        if not changed:
+        if restore_outcome.failure is not None:
             continue
         try:
             await redis.delete(_restore_key(record.gpu_uuid))
@@ -718,10 +724,10 @@ async def raise_low_power_limits_to_default(
             continue
         if state.current_watts >= MIN_POWER_LIMIT_RATIO * state.default_watts:
             continue
-        lifted = await _set_and_log_power_limit(
+        raise_outcome = await _set_and_log_power_limit(
             ssh, "raise", executor_id, gpu_uuid, state.current_watts, state.default_watts, log_extra
         )
-        if lifted:
+        if raise_outcome.failure is None:
             raised += 1
     return raised
 
@@ -770,7 +776,7 @@ async def _undo_partial_apply(
     # Clear the applied watts BEFORE restoring: no cap of ours is standing, so the restore about
     # to run must not read a stale claim as the host reverting us (DAH-2786).
     for gpu_uuid in gpu_uuids:
-        await _set_applied_cap_on_restore_record(redis, gpu_uuid, None, log_extra)
+        await _set_applied_cap_on_restore_record(redis, gpu_uuid, None, None, log_extra)
     await restore_tracked_gpu_power_limits(ssh, redis, gpu_uuids, log_extra)
     await _delete_pod_index(redis, pod_id, log_extra)
 
@@ -841,8 +847,9 @@ async def apply_filler_gpu_power_limits(
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
         return False
     all_set = True
+    gpu_uuids_capped_with_persistence: list[str] = []
     for target in gpu_power_limits:
-        was_capped: bool = await _set_and_log_power_limit(
+        cap_outcome = await _set_and_log_power_limit(
             ssh,
             "cap",
             executor_id,
@@ -851,13 +858,19 @@ async def apply_filler_gpu_power_limits(
             planned.clamped_watts_by_uuid[target.gpu_uuid],
             log_extra,
         )
-        if not was_capped:
+        if cap_outcome.failure is not None:
             all_set = False
+        elif cap_outcome.persistence_enabled:
+            gpu_uuids_capped_with_persistence.append(target.gpu_uuid)
     if not all_set:
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
         return False
-    # Only now, with every GPU verifiably capped, is a later high reading attributable to the
-    # host: a cap that failed leaves no target on the record and can never be read as a revert.
-    for gpu_uuid, capped_to_watts in planned.clamped_watts_by_uuid.items():
-        await _set_applied_cap_on_restore_record(redis, gpu_uuid, capped_to_watts, log_extra)
+    # Only a cap that landed AND holds is attributable to the host later. Without persistence
+    # mode the driver unloads on an idle GPU and the stock limit comes back on its own
+    # (DAH-2702), which at teardown is indistinguishable from a provider raising it — so those
+    # GPUs are left unstamped and can never accuse. A cap that failed leaves no target either.
+    for gpu_uuid in gpu_uuids_capped_with_persistence:
+        await _set_applied_cap_on_restore_record(
+            redis, gpu_uuid, planned.clamped_watts_by_uuid[gpu_uuid], pod_id, log_extra
+        )
     return True
