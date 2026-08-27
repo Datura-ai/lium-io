@@ -98,7 +98,7 @@ class GpuUsageCheck:
             return None
 
         enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
-        workload_containers: set[str] = _lium_workload_containers(ctx)
+        workload_containers: set[str] = lium_workload_containers(ctx)
         foreign_processes: list[ForeignGpuProcess] = [
             ForeignGpuProcess(
                 pid=process.get("pid"),
@@ -310,11 +310,14 @@ class GpuUsageCheck:
             return None
 
 
-def _lium_workload_containers(ctx: Context) -> set[str]:
+def lium_workload_containers(ctx: Context) -> set[str]:
     """This node's fillers and pods, as the BACKEND knows them — not as the node names them.
 
     A container-name prefix would hand a pass to anything the provider renames `filler_*`,
     and the ticket's whole requirement is a verdict `docker rename` cannot defeat.
+
+    Public because both gates that judge a foreign workload share it: this one for the card,
+    the provider-side load one for CPU. They must never disagree about whose container it is.
     """
     rented_data = ctx.state.rented_data
     containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
@@ -340,10 +343,15 @@ def _parse_gpu_memory_used_mb(gpu_query_csv: str) -> dict[str, float]:
     return memory_by_uuid
 
 
+def carries_a_rental_prefix(container_name: str) -> bool:
+    """Named like a rental of ours. Says nothing about who really started it: `docker rename`
+    forges the name, which is why every caller confirms it against the backend."""
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+
+
 def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
     """The container is named like one of ours, but the backend did not report it this cycle."""
-    container_name: str = process.container_name or ""
-    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+    return carries_a_rental_prefix(process.container_name or "")
 
 
 async def _drop_containers_the_backend_still_owns(
@@ -373,7 +381,7 @@ async def _drop_containers_the_backend_still_owns(
         return foreign_processes
 
     ownership_verdicts: list[bool] = await asyncio.gather(
-        *(_the_backend_still_owns(ctx, name) for name in lium_named_containers)
+        *(the_backend_still_owns(ctx, name) for name in lium_named_containers)
     )
     still_ours: set[str] = {
         name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
@@ -381,8 +389,10 @@ async def _drop_containers_the_backend_still_owns(
     return [process for process in foreign_processes if process.container_name not in still_ours]
 
 
-async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
+async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     """True when the backend confirms the id inside the container name as a live run of ours.
+
+    Public because the provider-side load gate asks the same question about the same race.
 
     Mirrors the filler re-check in rental_verification. Fail-open on an unreachable backend
     (a None response): an inability to measure never withholds money here.

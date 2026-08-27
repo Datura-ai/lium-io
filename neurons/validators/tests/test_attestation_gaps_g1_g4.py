@@ -524,6 +524,7 @@ def _score_ctx(tdx_quote, attestation_passed):
         executor=executor,
         tdx_attestation_passed=attestation_passed,
         cpu_truth_passed=True,
+        provider_side_load_passed=True,
     )
 
 

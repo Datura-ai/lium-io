@@ -254,6 +254,15 @@ class Settings(BaseSettings):
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
     # defaults off like every other money-withholding gate above: a replay over the live fleet
     # flags 5 nodes, and that population deserves a shadow week before the first payout is cut.
+    # DAH-2734 — the CPU/disk twin of the gate below: a provider who mines another subnet
+    # (SN13/Data Universe) on a listed machine takes CPU and disk from the renter the same way
+    # a foreign GPU workload takes the card. CHECK observes and logs; ENFORCEMENT zeroes the
+    # score. Enforcement defaults off: a provider's own nginx also burns CPU, so the floors
+    # need a shadow week over the live fleet before the first payout is cut.
+    PROVIDER_SIDE_LOAD_CHECK_ENABLED: bool = Field(env="PROVIDER_SIDE_LOAD_CHECK_ENABLED", default=True)
+    PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
+        env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
+    )
     FOREIGN_GPU_WORKLOAD_CHECK_ENABLED: bool = Field(env="FOREIGN_GPU_WORKLOAD_CHECK_ENABLED", default=True)
     FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False

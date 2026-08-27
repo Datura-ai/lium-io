@@ -825,6 +825,22 @@ def get_vloopback_volume_bytes(docker_root_dir):
     return total
 
 
+def get_container_log_bytes(docker_root_dir: str) -> int:
+    # json logs are NOT in /system/df: `SizeRw` counts the writable layer only, and nothing
+    # rotates the logs on an executor. Left out, a chatty renter pod's log reads as the
+    # provider's own data (review ask, PR #1245). Blocks actually held, like the volume walk.
+    # `*.log*` also catches the rotated `-json.log.1` files a host with log-opts keeps; without
+    # them those bytes would read as the provider's data too.
+    # No match is a normal answer, not a miss: a host on the journald driver writes no json log.
+    total = 0
+    for path in glob.glob(f"/proc/1/root{docker_root_dir}/containers/*/*.log*"):
+        try:
+            total += os.stat(path).st_blocks * 512
+        except OSError:
+            continue
+    return total
+
+
 def get_docker_disk_usage():
     # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
     df = docker_api_get("/system/df")
@@ -837,12 +853,40 @@ def get_docker_disk_usage():
     )
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     volumes += get_vloopback_volume_bytes(docker_root_dir)
+    containers += get_container_log_bytes(docker_root_dir)
+
+    # BuildCache rides in the same answer and holds image layers a custom build left behind.
+    # Folded into images: unenumerated docker bytes read as the provider's own data downstream.
+    build_cache = sum(
+        max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or []
+    )
 
     return {
-        "hard_disk_images": int(df.get("LayersSize") or 0) // 1024,
+        "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
     }
+
+
+def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float]]:
+    # per-container CPU in core-percent ("897.45%" = ~9 cores). `stats --no-stream` does its own
+    # two-sample delta, one call for all containers. Keyed by the 12-char id stats prints.
+    # The host CPU is sampled over the SAME window (reset counter -> stats -> read), because the
+    # host-minus-containers attribution is only valid when both sides cover the same seconds —
+    # data_cpu's own sample runs ~10s later, after two `docker run` capability tests.
+    # `timeout 30` bounds a wedged docker daemon: the signal degrades instead of hanging the
+    # whole (fatal) machine scrape.
+    psutil.cpu_percent(interval=None)
+    result = run_cmd(f'timeout 30 {docker_path} stats --no-stream --format "{{{{.ID}}}}|{{{{.CPUPerc}}}}"')
+    host_cpu_percent = psutil.cpu_percent(interval=None)
+    # An unparsable row means a container whose CPU the window cannot account for — let the
+    # ValueError escape so the caller voids the whole CPU signal for this cycle (fail-safe)
+    # instead of silently booking that container's load to the provider.
+    cpu_percent_by_short_id = {}
+    for line in result.strip().splitlines():
+        short_id, _, raw_percent = line.partition('|')
+        cpu_percent_by_short_id[short_id.strip()] = float(raw_percent.strip().rstrip('%'))
+    return host_cpu_percent, cpu_percent_by_short_id
 
 
 def get_docker_info(content: bytes):
@@ -862,8 +906,25 @@ def get_docker_info(content: bytes):
         result = run_cmd(f'{docker_path} version --format "{{{{.Client.Version}}}}"')
         data["docker_version"] = result.strip()
 
+        # stats runs BEFORE ps on purpose: a container started between the two calls then
+        # appears in ps without a stats row, which voids the CPU attribution for the cycle
+        # (fail-safe) instead of silently counting that container's CPU as provider-side.
+        try:
+            host_cpu_percent, cpu_percents = get_container_cpu_percents(docker_path)
+        except Exception:
+            host_cpu_percent, cpu_percents = None, {}
+
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
+
+        # A stats row whose container is gone from ps burned CPU inside the sampled window but
+        # cannot be listed -- the subtraction would book that CPU to the provider, so the host
+        # sample is dropped and the CPU signal voids for this cycle (fail-safe).
+        stats_rows_without_a_container = set(cpu_percents) - {
+            container_id[:12] for container_id in container_ids
+        }
+        if host_cpu_percent is not None and not stats_rows_without_a_container:
+            data["docker_host_cpu_percent"] = host_cpu_percent
 
         containers = []
 
@@ -886,10 +947,11 @@ def get_docker_info(content: bytes):
                 if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
                     data["docker_container_id"] = container_id
 
-            if digest:
-                containers.append({'each_container_id': container_id, 'each_digest': digest, "each_name": container_name})
-            else:
-                containers.append({'each_container_id': container_id, 'each_digest': '', "each_name": container_name})
+            container_entry = {'each_container_id': container_id, 'each_digest': digest or '', "each_name": container_name}
+            cpu_percent = cpu_percents.get(container_id[:12])
+            if cpu_percent is not None:
+                container_entry['each_cpu_percent'] = cpu_percent
+            containers.append(container_entry)
 
         data["docker_containers"] = containers
 

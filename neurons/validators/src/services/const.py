@@ -271,6 +271,30 @@ DEFAULT_JOB_OWNER_LIUM = "lium"
 #   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
 RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 
+# DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
+# without importing the probe service: that module reaches services.task.models, which pulls
+# services/task/__init__ and the checks back in.
+PROBE_CONTAINER_NAME = "lium_roce_probe"
+
+# Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
+# them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
+# provider-side load gate (DAH-2734) must not bill their CPU to the provider, so it excuses
+# them BY NAME. A name is forgeable, which is why this tier only ever excuses load and never
+# grants the rental status `pod_*` and `filler_*` get from the backend.
+# Add a new Lium infra container here and the gate inherits it.
+# `executor-` is the compose project the executor stack runs under: the runner, watchtower,
+# autoheal and postgres beside the executor itself. They are Lium's, they idle, and the gate
+# caps this whole tier, so the name buys a forger nothing.
+LIUM_INFRA_CONTAINER_PREFIXES = (
+    "container_",
+    "health_check_",
+    "executor-",
+    # the s3 backup helper (miner_jobs/backup_storage.py) copies a renter's volume, which costs
+    # real CPU while it runs
+    "s3fs-backup",
+    PROBE_CONTAINER_NAME,
+)
+
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
 TDX_WHITELIST = {
     "OS_IMAGE_HASH": set(
