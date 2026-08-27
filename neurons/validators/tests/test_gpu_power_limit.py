@@ -87,7 +87,7 @@ class FakeRedis:
     def __init__(self, initial: dict[str, str] | None = None):
         self.store: dict[str, str] = dict(initial or {})
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.store[key] = value
 
     async def get(self, key: str) -> str | None:

@@ -19,6 +19,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from core.config import settings
 from incentive.config import IncentiveConfig
 from incentive.rental_price import MIN_POWER_CAP_REVERTS_TO_PENALIZE, RentalPriceIncentive
+from payload_models.payloads import GpuPowerLimit
 from services.gpu_power_limit import (
     CAP_REVERT_WINDOW_SECONDS,
     MAX_TRACKED_CAP_REVERTS,
@@ -28,7 +29,8 @@ from services.gpu_power_limit import (
     GpuPowerState,
     _restore_key,
     _revert_key,
-    _reverted_cap_target,
+    _detect_cap_revert,
+    apply_filler_gpu_power_limits,
     read_gpu_power_cap_reverts,
     restore_tracked_gpu_power_limits,
 )
@@ -39,7 +41,7 @@ POD_ID = "pod-1"
 H200 = "NVIDIA H200"  # base model H200 is rental-eligible by default
 
 
-# ---------------------------- _reverted_cap_target (pure) ----------------------------
+# ---------------------------- _detect_cap_revert (pure) ----------------------------
 
 
 def _restore_record(watts: int, capped_to_watts: int | None) -> GpuPowerRestoreRecord:
@@ -59,72 +61,66 @@ def _state(current_watts: int, default_watts: int | None = 450) -> GpuPowerState
     )
 
 
+def _observe(watts: int, capped_to_watts: int | None, found: int, default: int | None = 450):
+    return _detect_cap_revert(_restore_record(watts, capped_to_watts), _state(found, default), observed_at=1.0)
+
+
 # RTX 4090 numbers throughout: default 450 W, our cap 315 W (0.70), uncapped line 405 W (0.90).
 
 
 def test_limit_pinned_just_above_our_floor_is_a_revert() -> None:
     # The prod shape: the host guard pins 409 W, one point above the 0.9 line we kill at.
-    record = _restore_record(watts=409, capped_to_watts=315)
+    observation = _observe(watts=409, capped_to_watts=315, found=409)
 
-    assert _reverted_cap_target(record, watts_before=409, state=_state(409)) == 315
+    assert observation is not None
+    assert observation.capped_to_watts == 315
+    assert observation.found_watts == 409
+    assert observation.pod_id == POD_ID
 
 
 def test_limit_back_at_the_card_default_is_a_revert() -> None:
-    record = _restore_record(watts=409, capped_to_watts=315)
-
-    assert _reverted_cap_target(record, watts_before=450, state=_state(450)) == 315
+    assert _observe(watts=409, capped_to_watts=315, found=450) is not None
 
 
 def test_host_floor_below_the_pre_cap_reading_is_still_a_revert() -> None:
     # Guard script A restores the DEFAULT every 30 s during cold start, then pins 0.91 of it.
     # The pre-cap reading is then the default and the live limit sits under it - still an
     # uncapped run, and a pre-cap comparison alone would miss it.
-    record = _restore_record(watts=450, capped_to_watts=315)
-
-    assert _reverted_cap_target(record, watts_before=409, state=_state(409)) == 315
+    assert _observe(watts=450, capped_to_watts=315, found=409) is not None
 
 
 def test_cap_that_still_holds_is_not_a_revert() -> None:
-    record = _restore_record(watts=409, capped_to_watts=315)
-
-    assert _reverted_cap_target(record, watts_before=315, state=_state(315)) is None
+    assert _observe(watts=409, capped_to_watts=315, found=315) is None
 
 
 def test_limit_below_the_uncapped_line_is_not_a_revert() -> None:
     # The job still ran capped, so it did the work it is paid for. Drift is not a breach.
-    record = _restore_record(watts=409, capped_to_watts=315)
+    assert _observe(watts=409, capped_to_watts=315, found=350) is None
 
-    assert _reverted_cap_target(record, watts_before=350, state=_state(350)) is None
+
+def test_the_line_is_not_rounded_below_the_backend_kill_ratio() -> None:
+    # 5090: 0.9 x 575 = 517.5. A limit of 517 W is 0.8991 of default, which the backend guard
+    # lets live - penalizing a run nobody killed would be a rule of our own.
+    assert _observe(watts=518, capped_to_watts=402, found=517, default=575) is None
+    assert _observe(watts=518, capped_to_watts=402, found=518, default=575) is not None
 
 
 def test_cap_that_never_lowered_the_limit_is_not_a_revert() -> None:
     # A miner running below our target is capped upwards; reading our own target back at
     # restore time is not the host raising it.
-    record = _restore_record(watts=250, capped_to_watts=315)
-
-    assert _reverted_cap_target(record, watts_before=315, state=_state(315)) is None
+    assert _observe(watts=250, capped_to_watts=315, found=315) is None
 
 
-def test_record_without_a_cap_target_is_not_a_revert() -> None:
-    # Records written before this field existed: fail open, never penalize.
-    record = _restore_record(watts=409, capped_to_watts=None)
-
-    assert _reverted_cap_target(record, watts_before=409, state=_state(409)) is None
+def test_a_cap_that_never_landed_is_not_a_revert() -> None:
+    # The whole DAH-2715 population: the container cannot cap at all, so the failed apply is
+    # undone through the same restore path. No stamped target, no accusation.
+    assert _observe(watts=409, capped_to_watts=None, found=409) is None
 
 
 def test_unknown_default_falls_back_to_the_pre_cap_limit() -> None:
     # Some GPUs report "[N/A]" for the default limit. The miner's own pre-cap value is the line.
-    record = _restore_record(watts=409, capped_to_watts=315)
-    no_default = _state(409, default_watts=None)
-
-    assert _reverted_cap_target(record, watts_before=409, state=no_default) == 315
-    assert _reverted_cap_target(record, watts_before=380, state=no_default) is None
-
-
-def test_unknown_gpu_state_falls_back_to_the_pre_cap_limit() -> None:
-    record = _restore_record(watts=409, capped_to_watts=315)
-
-    assert _reverted_cap_target(record, watts_before=409, state=None) == 315
+    assert _observe(watts=409, capped_to_watts=315, found=409, default=None) is not None
+    assert _observe(watts=409, capped_to_watts=315, found=380, default=None) is None
 
 
 # ---------------------------- recording at restore time ----------------------------
@@ -181,13 +177,13 @@ REVERTED_STATE_CSV = "GPU-a, 400, 400, 100, 400\n"
 HELD_STATE_CSV = "GPU-a, 280, 400, 100, 400\n"
 
 
-def _stored_restore_record(watts: int = 400, capped_to_watts: int | None = 280) -> str:
-    return _restore_record(watts=watts, capped_to_watts=capped_to_watts).model_dump_json()
-
-
-def _restore_record_for(gpu_uuid: str, executor_id: str) -> str:
+def _stored_restore_record(
+    gpu_uuid: str = "GPU-a", executor_id: str = EXECUTOR_ID, pod_id: str = POD_ID
+) -> str:
     record = _restore_record(watts=400, capped_to_watts=280)
-    return record.model_copy(update={"gpu_uuid": gpu_uuid, "executor_id": executor_id}).model_dump_json()
+    return record.model_copy(
+        update={"gpu_uuid": gpu_uuid, "executor_id": executor_id, "pod_id": pod_id}
+    ).model_dump_json()
 
 
 @pytest.mark.asyncio
@@ -198,7 +194,6 @@ async def test_restore_records_a_revert_when_the_limit_came_back() -> None:
     await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
 
     history = _stored_history(redis)
-    assert history.executor_id == EXECUTOR_ID
     assert len(history.reverts) == 1
     assert history.reverts[0].gpu_uuid == "GPU-a"
     assert history.reverts[0].capped_to_watts == 280
@@ -224,14 +219,14 @@ async def test_a_whole_node_revert_counts_once() -> None:
     ssh = fake_ssh(FakeRun(stdout=state_csv), *_set_ok(400), *_set_ok(400))
     redis = FakeRedis({
         _restore_key("GPU-a"): _stored_restore_record(),
-        _restore_key("GPU-b"): _restore_record_for("GPU-b", EXECUTOR_ID),
+        _restore_key("GPU-b"): _stored_restore_record(gpu_uuid="GPU-b"),
     })
 
     await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a", "GPU-b"])
 
     history = _stored_history(redis)
     assert len(history.reverts) == 1
-    assert history.reverts[0].reverted_gpu_count == 2
+    assert history.reverts[0].pod_id == POD_ID
 
 
 @pytest.mark.asyncio
@@ -243,7 +238,7 @@ async def test_two_executors_on_one_host_each_get_their_own_revert() -> None:
     ssh = fake_ssh(FakeRun(stdout=state_csv), *_set_ok(400), *_set_ok(400))
     redis = FakeRedis({
         _restore_key("GPU-a"): _stored_restore_record(),
-        _restore_key("GPU-b"): _restore_record_for("GPU-b", other_executor),
+        _restore_key("GPU-b"): _stored_restore_record(gpu_uuid="GPU-b", executor_id=other_executor),
     })
 
     await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a", "GPU-b"])
@@ -256,13 +251,14 @@ async def test_two_executors_on_one_host_each_get_their_own_revert() -> None:
 @pytest.mark.asyncio
 async def test_reverts_accumulate_and_old_ones_drop_out_of_the_window() -> None:
     stale = GpuPowerCapRevert(
-        at=time.time() - CAP_REVERT_WINDOW_SECONDS - 60,
+        observed_at=time.time() - CAP_REVERT_WINDOW_SECONDS - 60,
+        pod_id="pod-stale",
         gpu_uuid="GPU-a",
         capped_to_watts=280,
         found_watts=400,
     )
-    fresh = GpuPowerCapRevert(at=time.time() - 60, gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400)
-    history = GpuPowerCapRevertHistory(executor_id=EXECUTOR_ID, reverts=[stale, fresh])
+    fresh = GpuPowerCapRevert(observed_at=time.time() - 60, pod_id="pod-fresh", gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400)
+    history = GpuPowerCapRevertHistory(reverts=[stale, fresh])
     ssh = fake_ssh(FakeRun(stdout=REVERTED_STATE_CSV), *_set_ok(400))
     redis = FakeRedis({
         _restore_key("GPU-a"): _stored_restore_record(),
@@ -278,15 +274,15 @@ async def test_reverts_accumulate_and_old_ones_drop_out_of_the_window() -> None:
 async def test_history_is_bounded() -> None:
     now = time.time()
     reverts = [
-        GpuPowerCapRevert(at=now - index, gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400)
+        GpuPowerCapRevert(
+            observed_at=now - index, pod_id=f"seed-{index}", gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400
+        )
         for index in range(MAX_TRACKED_CAP_REVERTS + 10)
     ]
     ssh = fake_ssh(FakeRun(stdout=REVERTED_STATE_CSV), *_set_ok(400))
     redis = FakeRedis({
         _restore_key("GPU-a"): _stored_restore_record(),
-        _revert_key(EXECUTOR_ID): GpuPowerCapRevertHistory(
-            executor_id=EXECUTOR_ID, reverts=reverts
-        ).model_dump_json(),
+        _revert_key(EXECUTOR_ID): GpuPowerCapRevertHistory(reverts=reverts).model_dump_json(),
     })
 
     await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
@@ -295,16 +291,88 @@ async def test_history_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_restore_still_succeeds_when_redis_cannot_store_the_revert(caplog) -> None:
+async def test_a_failed_apply_is_never_recorded_as_a_revert() -> None:
+    # The DAH-2715 population: the container cannot run nvidia-smi -pl at all. The failed apply
+    # is undone through the same restore path, and the undo reads the untouched pre-cap limit.
+    # Without the post-set stamp, every retry of a node that CANNOT cap would count as a node
+    # that WILL NOT cap, and two retries reach the threshold.
+    state_csv = "GPU-a, 400, 400, 100, 400\n"
+    ssh = fake_ssh(
+        FakeRun(stdout=state_csv),          # plan: state query
+        FakeRun(), FakeRun(exit_status=4),  # -pm, then -pl fails (no readback follows)
+        FakeRun(stdout=state_csv),          # undo: state query
+        *_set_ok(400),                      # undo: restore to the recorded 400 W
+    )
+    redis = FakeRedis()
+
+    applied = await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID
+    )
+
+    assert applied is False
+    assert _revert_key(EXECUTOR_ID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_failed_apply_clears_a_stale_claim_from_an_earlier_cap() -> None:
+    # A record frozen by an earlier FAILED restore still carries the watts that cap applied.
+    # If the next attempt cannot cap, the undo restores against an untouched high limit - and
+    # without clearing the claim first, that reads as the host reverting us.
+    state_csv = "GPU-a, 400, 400, 100, 400\n"
+    ssh = fake_ssh(
+        FakeRun(stdout=state_csv),          # plan: state query
+        FakeRun(), FakeRun(exit_status=4),  # -pm, then -pl fails (no readback follows)
+        FakeRun(stdout=state_csv),          # undo: state query
+        *_set_ok(400),                      # undo: restore to the frozen 400 W
+    )
+    redis = FakeRedis({_restore_key("GPU-a"): _stored_restore_record(pod_id="pod-earlier")})
+
+    applied = await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID
+    )
+
+    assert applied is False
+    assert _revert_key(EXECUTOR_ID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_verified_cap_is_stamped_so_a_later_revert_is_attributable() -> None:
+    state_csv = "GPU-a, 400, 400, 100, 400\n"
+    ssh = fake_ssh(FakeRun(stdout=state_csv), *_set_ok(280))
+    redis = FakeRedis()
+
+    applied = await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID
+    )
+
+    assert applied is True
+    stored = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
+    assert stored.watts == 400  # the way back is still the miner's own limit
+    assert stored.capped_to_watts == 280
+
+
+@pytest.mark.asyncio
+async def test_a_retried_restore_does_not_count_the_same_job_twice() -> None:
+    # A failed restore keeps its record on purpose so a safety net can retry it. The retry sees
+    # the same high limit and must not turn one killed job into two breaches.
+    redis = FakeRedis({_restore_key("GPU-a"): _stored_restore_record()})
+
+    for _ in range(2):
+        ssh = fake_ssh(FakeRun(stdout=REVERTED_STATE_CSV), FakeRun(), FakeRun(), FakeRun(stdout="399.00, Enabled\n"))
+        await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
+
+    assert _restore_key("GPU-a") in redis.store  # the failed restore kept its record
+    assert len(_stored_history(redis).reverts) == 1
+
+
+@pytest.mark.asyncio
+async def test_restore_still_succeeds_when_redis_cannot_store_the_revert() -> None:
     # Teardown must never be blocked by the bookkeeping this gate needs.
-
-
     ssh = fake_ssh(FakeRun(stdout=REVERTED_STATE_CSV), *_set_ok(400))
     redis = FakeRedis({_restore_key("GPU-a"): _stored_restore_record()})
     redis.set = BrokenRedis().set
 
-    with caplog.at_level(logging.ERROR):
-        restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
+    restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"])
 
     assert restored == 1
 
@@ -316,10 +384,9 @@ async def test_restore_still_succeeds_when_redis_cannot_store_the_revert(caplog)
 async def test_read_returns_only_reverts_inside_the_window() -> None:
     now = time.time()
     history = GpuPowerCapRevertHistory(
-        executor_id=EXECUTOR_ID,
         reverts=[
-            GpuPowerCapRevert(at=now - CAP_REVERT_WINDOW_SECONDS - 1, gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400),
-            GpuPowerCapRevert(at=now - 10, gpu_uuid="GPU-b", capped_to_watts=280, found_watts=400),
+            GpuPowerCapRevert(observed_at=now - CAP_REVERT_WINDOW_SECONDS - 1, pod_id="pod-old", gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400),
+            GpuPowerCapRevert(observed_at=now - 10, pod_id="pod-new", gpu_uuid="GPU-b", capped_to_watts=280, found_watts=400),
         ],
     )
     redis = FakeRedis({_revert_key(EXECUTOR_ID): history.model_dump_json()})
@@ -357,9 +424,11 @@ def _build_incentive(redis) -> RentalPriceIncentive:
 def _redis_with_reverts(count: int) -> FakeRedis:
     now = time.time()
     history = GpuPowerCapRevertHistory(
-        executor_id=EXECUTOR_ID,
         reverts=[
-            GpuPowerCapRevert(at=now - 60 * index, gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400)
+            GpuPowerCapRevert(
+                observed_at=now - 60 * index, pod_id=f"pod-{index}", gpu_uuid="GPU-a",
+                capped_to_watts=280, found_watts=400,
+            )
             for index in range(count)
         ],
     )

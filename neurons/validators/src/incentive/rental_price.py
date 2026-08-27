@@ -503,9 +503,12 @@ class RentalPriceIncentive(DefaultIncentive):
         )
 
     async def _power_cap_reverted(self, result: JobResult) -> PowerCapReverted | None:
-        # The validator records one revert per GPU whose verified cap was gone by the time the
-        # Lium job ended (services/gpu_power_limit.py). A Redis outage returns no reverts, so
-        # the gate fails open like every other unknown here.
+        # The validator records one revert per Lium job whose verified cap was gone by the time
+        # the job ended (services/gpu_power_limit.py). A Redis outage returns no reverts, so the
+        # gate fails open like every other unknown here.
+        if result.spec is None:
+            # a synthetic or estimated job result: no real executor, so nothing to look up
+            return None
         reverts: list[GpuPowerCapRevert] = await read_gpu_power_cap_reverts(
             self.redis_service, str(result.executor_info.uuid)
         )
