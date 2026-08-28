@@ -1,5 +1,4 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
-import math
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +14,8 @@ from neurons.validators.src.services.task.checks.provider_side_load import (
     ProviderSideLoad,
     ProviderSideLoadCheck,
     compute_provider_side_load,
+    floor_to_tenth,
+    parse_confirmed_cpu_reading,
 )
 from neurons.validators.src.services.task.pipeline import ContextState
 from neurons.validators.src.services.task.messages import ProviderSideLoadMessages as Msg
@@ -43,7 +44,7 @@ SN13_SPECS = {
 # the same machine with the disk part removed, to judge the CPU verdict on its own
 CPU_ONLY_SPECS = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
 # a quiet machine: the floor is never crossed, so no ssh reading is taken
-SN13_SPECS_BELOW_FLOOR = {
+SPECS_BELOW_THE_LIMITS = {
     "cpu": {"count": 32},
     "docker": {"host_cpu_percent": 4.0, "containers": [{"name": "pod_renter", "cpu_percent": 20.0}]},
 }
@@ -397,7 +398,7 @@ async def test_the_monitor_container_shares_the_executor_image_and_is_ours(conte
 
 
 @pytest.mark.asyncio
-async def test_a_spike_that_is_gone_on_the_second_look_costs_nothing(context_factory):
+async def test_a_spike_that_is_gone_on_the_confirmed_reading_costs_nothing(context_factory):
     # Lium's own watchtower pulling an image can hold two cores for a second. It is gone by the
     # second reading, and an honest machine keeps its score.
     ctx = context_factory(
@@ -414,7 +415,7 @@ async def test_a_spike_that_is_gone_on_the_second_look_costs_nothing(context_fac
 
 
 @pytest.mark.asyncio
-async def test_an_unreadable_second_look_withholds_nothing(context_factory):
+async def test_an_unreadable_confirmed_reading_withholds_nothing(context_factory):
     # ssh is down, so the load cannot be confirmed. The CPU verdict voids.
     ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS))  # runner defaults to None
 
@@ -426,7 +427,7 @@ async def test_an_unreadable_second_look_withholds_nothing(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_a_docker_that_does_not_answer_the_second_look_withholds_nothing(context_factory):
+async def test_a_docker_that_does_not_answer_the_confirmed_reading_withholds_nothing(context_factory):
     # An empty container section means docker did not answer. Reading it as "Lium runs nothing
     # here" would charge the machine's whole load to the provider.
     runner = AsyncMock()
@@ -649,7 +650,7 @@ async def test_a_miner_renamed_dockerd_is_capped_like_every_other_forged_name(co
 
 
 @pytest.mark.asyncio
-async def test_the_event_carries_what_the_second_look_measured(context_factory):
+async def test_the_event_carries_what_the_confirmed_reading_measured(context_factory):
     # The verdict alone cannot be argued with. These three numbers add up to it, so a shadow
     # week can separate a foreign workload from a Lium container that was never subtracted.
     ctx = context_factory(
@@ -660,42 +661,71 @@ async def test_the_event_carries_what_the_second_look_measured(context_factory):
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
 
-    second_look = result.event.what_we_saw["second_look"]
-    assert second_look == {"host_cores": 10.56, "lium_container_cores": 1.58, "dockerd_cores": 1.0}
+    confirmed_reading = result.event.what_we_saw["confirmed_reading"]
+    assert confirmed_reading == {"host_cores": 10.56, "lium_container_cores": 1.58, "dockerd_cores": 1.0}
     verdict = result.event.what_we_saw["provider_cpu_cores"]
     assert verdict == 7.9
     # the readings reconstruct the verdict: the only step between them is the final floor
-    reconstructed = (
-        second_look["host_cores"]
-        - second_look["lium_container_cores"]
-        - second_look["dockerd_cores"]
+    readings_difference = (
+        confirmed_reading["host_cores"]
+        - confirmed_reading["lium_container_cores"]
+        - confirmed_reading["dockerd_cores"]
     )
-    assert math.floor(round(reconstructed, 3) * 10) / 10 == verdict
+    assert floor_to_tenth(readings_difference) == verdict
     assert result.updates["state"].specs["provider_side_load"]["host_cores"] == 10.56
 
 
 @pytest.mark.asyncio
-async def test_a_node_below_the_floor_carries_no_second_look(context_factory):
-    ctx = context_factory(state=_rented_state(SN13_SPECS_BELOW_FLOOR))
+async def test_a_node_below_the_floor_carries_no_confirmed_reading(context_factory):
+    ctx = context_factory(state=_rented_state(SPECS_BELOW_THE_LIMITS))
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
 
-    assert result.event.what_we_saw["second_look"] is None
+    assert result.event.what_we_saw["confirmed_reading"] is None
 
 
 def test_the_readings_always_reconstruct_the_verdict():
     # Codex found a boundary where independently rounded readings and the verdict disagreed by
     # a tenth. The verdict is derived from the readings now, so the two cannot drift apart.
-    from neurons.validators.src.services.task.checks.provider_side_load import (
-        floor_to_tenth,
-        parse_second_look,
-    )
-
     for busy_jiffies in range(1, 400):
         before = "0 0 32 0"
         after = f"6400 {6400 - busy_jiffies} 32 0"
-        look = parse_second_look(before, "c1|pod_renter|0.50%", after, {"pod_renter"})
+        look = parse_confirmed_cpu_reading(before, "c1|pod_renter|0.50%", after, {"pod_renter"})
         assert look is not None
-        reconstructed = look.host_cores - look.lium_container_cores - look.dockerd_cores
-        assert floor_to_tenth(max(0.0, reconstructed)) == look.provider_cores
+        readings_difference = look.host_cores - look.lium_container_cores - look.dockerd_cores
+        assert floor_to_tenth(max(0.0, readings_difference)) == look.provider_cores
+
+
+@pytest.mark.asyncio
+async def test_a_confirmation_that_could_not_be_read_still_reports_the_scrape_reading(
+    context_factory,
+):
+    # Without the scrape reading this looks exactly like a machine nobody measured, and the
+    # shadow week has to count how often the confirmation itself fails.
+    runner = AsyncMock()
+    runner.run = AsyncMock(return_value=MagicMock(success=False, stdout=""))
+    ctx = context_factory(state=_rented_state(CPU_ONLY_SPECS), runner=runner)
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.NOT_MEASURABLE.reason
+    assert result.event.what_we_saw["cpu_cores_before_confirmation"] == 8.9
+
+
+@pytest.mark.asyncio
+async def test_the_event_keeps_both_readings_side_by_side(context_factory):
+    # The scrape screams and the confirmation disagrees: that gap is what calibrates the floor.
+    ctx = context_factory(
+        state=_rented_state(CPU_ONLY_SPECS),
+        runner=confirming_runner(2.0, 32, [("c1", "pod_renter", 158.0)]),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    what = result.event.what_we_saw
+    assert what["cpu_cores_before_confirmation"] == 8.9
+    assert what["provider_cpu_cores"] == 0.4  # 2.0 host - 1.58 the renter's pod

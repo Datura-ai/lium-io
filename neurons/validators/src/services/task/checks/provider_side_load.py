@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any
@@ -132,8 +133,8 @@ def provider_cores_outside_lium(
 
 
 @dataclass(frozen=True)
-class SecondLook:
-    """What the ssh reading actually measured, so a shadow week can be judged.
+class ConfirmedCpuReading:
+    """The CPU reading taken over ssh to confirm a load the scrape put above the limit.
 
     The verdict alone cannot be argued with: a provider mining beside a renter and a renter pod
     that was never subtracted both come out as "N provider cores". These three numbers separate
@@ -144,14 +145,16 @@ class SecondLook:
     host_cores: float
     lium_container_cores: float
     dockerd_cores: float
-    provider_cores: float
+
+    @property
+    def provider_cores(self) -> float:
+        """What is left for the provider. Derived, so the readings can never disagree with it."""
+        return floor_to_tenth(
+            max(0.0, self.host_cores - self.lium_container_cores - self.dockerd_cores)
+        )
 
     def to_specs_fields(self) -> dict[str, float]:
-        return {
-            "host_cores": self.host_cores,
-            "lium_container_cores": self.lium_container_cores,
-            "dockerd_cores": self.dockerd_cores,
-        }
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -163,7 +166,11 @@ class ProviderSideLoad:
 
     cpu_cores: float | None
     disk_kb: int | None
-    second_look: SecondLook | None = None
+    # the scrape reading that decided whether to look again. Kept beside the verdict so the
+    # shadow week can count how often the two disagree, the way cpu_truth reports `advertised`
+    # next to `present`.
+    cpu_cores_before_confirmation: float | None = None
+    confirmed_reading: ConfirmedCpuReading | None = None
 
     @property
     def is_measured(self) -> bool:
@@ -188,8 +195,8 @@ class ProviderSideLoad:
             fields["cpu_cores"] = self.cpu_cores
         if self.disk_kb is not None:
             fields["disk_kb"] = self.disk_kb
-        if self.second_look is not None:
-            fields.update(self.second_look.to_specs_fields())
+        if self.confirmed_reading is not None:
+            fields.update(self.confirmed_reading.to_specs_fields())
         return fields
 
 
@@ -378,12 +385,12 @@ def lium_named_cores_outside_snapshot(
     return round(cores / 100, 1)
 
 
-def parse_second_look(
+def parse_confirmed_cpu_reading(
     sample_before: str,
     container_rows: str,
     sample_after: str,
     lium_container_keys: set[str],
-) -> SecondLook | None:
+) -> ConfirmedCpuReading | None:
     """What the second reading measured, or None if it is not readable.
 
     Host busy time comes from the /proc/stat jiffies taken on either side of `docker stats`, so
@@ -419,16 +426,10 @@ def parse_second_look(
     # `dockerd` is a process name anyone can copy, so its excuse is capped like the name tier
     excused_dockerd_cores = min(max(0.0, dockerd_cores), CLAIMED_EXCUSE_CORES)
     host_cores = (total_delta - (last_idle - first_idle)) / total_delta * kernel_cores
-    reported_host_cores = round(host_cores, 2)
-    reported_lium_cores = round(lium_cores_among(stats_rows, lium_container_keys), 2)
-    reported_dockerd_cores = round(excused_dockerd_cores, 2)
-    return SecondLook(
-        host_cores=reported_host_cores,
-        lium_container_cores=reported_lium_cores,
-        dockerd_cores=reported_dockerd_cores,
-        provider_cores=floor_to_tenth(
-            max(0.0, reported_host_cores - reported_lium_cores - reported_dockerd_cores)
-        ),
+    return ConfirmedCpuReading(
+        host_cores=round(host_cores, 2),
+        lium_container_cores=round(lium_cores_among(stats_rows, lium_container_keys), 2),
+        dockerd_cores=round(excused_dockerd_cores, 2),
     )
 
 
@@ -453,9 +454,9 @@ class ProviderSideLoadCheck:
     check_id = "host.validate.provider_side_load"
     fatal = False
 
-    async def _take_a_second_look(
+    async def _confirm_the_cpu_reading_over_ssh(
         self, ctx: Context, lium_container_keys: set[str] | None
-    ) -> SecondLook | None:
+    ) -> ConfirmedCpuReading | None:
         """Read the load once more over ssh. None on anything unreadable, which withholds nothing.
 
         Through `ctx.runner`, like the twin gate's second look at the card: the runner owns the
@@ -472,7 +473,7 @@ class ProviderSideLoadCheck:
         if len(sections) != 3:
             return None
         jiffies_before, container_rows, jiffies_after = sections
-        return parse_second_look(
+        return parse_confirmed_cpu_reading(
             jiffies_before, container_rows, jiffies_after, lium_container_keys
         )
 
@@ -502,11 +503,13 @@ class ProviderSideLoadCheck:
             "lium_named_outside_snapshot_cores": lium_named_cores_outside_snapshot(
                 ctx.state.specs or {}, lium_container_keys
             ),
-            # what the ssh reading measured, so the shadow week can tell a foreign workload from
-            # a Lium container that was never subtracted. None when the floor was never crossed.
-            "second_look": (
-                provider_side_load.second_look.to_specs_fields()
-                if provider_side_load.second_look is not None
+            # what the scrape saw before the confirmation, and what the ssh reading measured.
+            # Together they say how often the cheap screen and the paid-for verdict disagree.
+            # Both None when the floor was never crossed and no second look was taken.
+            "cpu_cores_before_confirmation": provider_side_load.cpu_cores_before_confirmation,
+            "confirmed_reading": (
+                asdict(provider_side_load.confirmed_reading)
+                if provider_side_load.confirmed_reading is not None
                 else None
             ),
         }
@@ -521,11 +524,14 @@ class ProviderSideLoadCheck:
         )
         if (measured.cpu_cores or 0.0) < PROVIDER_SIDE_CPU_CORES_LIMIT:
             return measured
-        second_look = await self._take_a_second_look(ctx, lium_container_keys)
-        if second_look is None:
-            return replace(measured, cpu_cores=None)
+        confirmed_reading = await self._confirm_the_cpu_reading_over_ssh(ctx, lium_container_keys)
         return replace(
-            measured, cpu_cores=second_look.provider_cores, second_look=second_look
+            measured,
+            # None when the second look could not be read: an unconfirmed reading withholds
+            # nothing, and `cpu_cores_before_confirmation` keeps that case countable.
+            cpu_cores=confirmed_reading.provider_cores if confirmed_reading else None,
+            cpu_cores_before_confirmation=measured.cpu_cores,
+            confirmed_reading=confirmed_reading,
         )
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -540,7 +546,12 @@ class ProviderSideLoadCheck:
                 Msg.NOT_MEASURABLE,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"executor_uuid": ctx.executor.uuid},
+                # a scrape reading with no verdict means the second look failed, not that the
+                # machine was never measured; the shadow week needs that rate
+                what={
+                    "executor_uuid": ctx.executor.uuid,
+                    "cpu_cores_before_confirmation": provider_side_load.cpu_cores_before_confirmation,
+                },
             )
             return CheckResult(passed=True, event=event)
 
@@ -555,10 +566,22 @@ class ProviderSideLoadCheck:
             event = render_message(Msg.LOAD_OK, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=True, event=event, updates=updates)
 
-        # Only the CPU half withholds money. A high disk figure is reported and never scored:
-        # it is read once, with no second look, and every docker category nobody enumerated
-        # (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
-        # node. The shadow week measures the disk numbers before that half is armed.
+        return self._verdict_for_a_load_above_the_limits(ctx, provider_side_load, what, updates)
+
+    def _verdict_for_a_load_above_the_limits(
+        self,
+        ctx: Context,
+        provider_side_load: ProviderSideLoad,
+        what: dict[str, object],
+        updates: dict[str, object],
+    ) -> CheckResult:
+        """Render the verdict and, under enforcement, set the flag that zeroes the score.
+
+        Only the CPU half withholds money. A high disk figure is reported and never scored: it
+        is read once, with no second look, and every docker category nobody enumerated
+        (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
+        node. The shadow week measures the disk numbers before that half is armed.
+        """
         enforce: bool = (
             settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED
             and provider_side_load.is_cpu_above_limit
