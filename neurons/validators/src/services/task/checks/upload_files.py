@@ -15,7 +15,7 @@ class UploadFailed(Exception):
     """The validation assets never reached the executor."""
 
 
-async def upload_validation_files(ctx: Context) -> str:
+async def upload_validation_files(ctx: Context, *, attempts: int = MAX_RETRIES) -> str:
     # copy the local validation assets into a fresh random directory on the executor
     local_dir = ctx.state.upload_local_dir
     executor_root = ctx.config.executor_root
@@ -25,7 +25,7 @@ async def upload_validation_files(ctx: Context) -> str:
     remote_dir = f"{executor_root.rstrip('/')}/{uuid.uuid4().hex}"
     last_exc: Exception | None = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, attempts + 1):
         try:
             async with asyncio.timeout(UPLOAD_TIMEOUT):
                 async with ctx.ssh.start_sftp_client() as sftp:
@@ -36,7 +36,7 @@ async def upload_validation_files(ctx: Context) -> str:
             raise UploadFailed(f"Upload timed out after {UPLOAD_TIMEOUT} seconds")
         except Exception as exc:
             last_exc = exc
-            if attempt < MAX_RETRIES:
+            if attempt < attempts:
                 await asyncio.sleep(1.0 * attempt)
 
     raise UploadFailed(str(last_exc)[:200])

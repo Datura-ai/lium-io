@@ -61,8 +61,10 @@ class DummySFTPClient:
         self.should_raise = should_raise
         self.error_message = error_message
         self.put_called_with: dict | None = None
+        self.put_call_count = 0
 
     async def put(self, local_path: str, remote_path: str, recurse: bool = False):
+        self.put_call_count += 1
         self.put_called_with = {
             "local_path": local_path,
             "remote_path": remote_path,

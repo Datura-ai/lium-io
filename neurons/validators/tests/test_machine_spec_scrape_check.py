@@ -356,15 +356,18 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
     assert result.updates["state"].remote_dir == ssh_client.sftp_client.put_called_with["remote_path"]
 
 
+@pytest.mark.parametrize("duration_ms", [60_001, 240_000])
 @pytest.mark.asyncio
 async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_failure_was_slow(
-    context_factory,
+    duration_ms, context_factory
 ):
     # A scrape that dies deep in the run — past the network benchmark — is not an incompatible
     # interpreter, and an upload plus a second full scrape would blow the per-executor budget.
     # Arrange
     runner = DummySSHCommandRunner(
-        result=make_command_result(success=False, exit_code=1, stderr="boom", duration_ms=240_000)
+        result=make_command_result(
+            success=False, exit_code=1, stderr="boom", duration_ms=duration_ms
+        )
     )
     ssh_client = DummySSHClient()
     ctx = context_factory(
@@ -434,7 +437,7 @@ async def test_machine_spec_scrape_falls_back_when_the_stdin_payload_will_not_de
     )
     runner = DummySSHCommandRunner(
         results=[
-            make_command_result(success=True, stdout="unreadable_token", duration_ms=2000),
+            make_command_result(success=True, stdout="unreadable_token", duration_ms=15_000),
             make_command_result(success=True, stdout="encrypted_payload_here"),
         ]
     )
@@ -487,3 +490,6 @@ async def test_machine_spec_scrape_reports_the_stdin_failure_when_the_fallback_u
     assert result.event.reason_code == Msg.SCRAPE_FAILED.reason
     assert "Permission denied" in result.event.what_we_saw["fallback_upload_error"]
     assert result.event.what_we_saw["fallback_from"]["stderr_tail"] == "boom"
+    # One attempt, not two: the retry the legacy path spends is what keeps 60 s + 300 s + 300 s
+    # inside the per-executor timeout.
+    assert ssh_client.sftp_client.put_call_count == 1

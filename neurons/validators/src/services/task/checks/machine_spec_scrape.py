@@ -13,10 +13,12 @@ from services.gpu_spec_table import normalize_gpu_model
 from .network_ema import compute_ema
 from .upload_files import UploadFailed, upload_validation_files
 
-# DAH-2794: how fast the stdin attempt must fail for the binary fallback to still be worth it.
-# An interpreter that cannot run the source rejects it in ~2 s, so this ceiling keeps the fallback
-# path within the flag-off path plus 10 s — and that one already runs against the 780 s budget.
-FALLBACK_AFTER_MS = 10_000
+# DAH-2794: how late a failed stdin attempt may still be retried with the binary. Above a full
+# scrape (~15 s on a real box, so a payload that will not decrypt is only knowable around then),
+# below the point where the retry stops fitting: 60 s here + 300 s upload + 300 s scrape = 660 s
+# against the 780 s per-executor timeout. The upload gets one attempt for exactly that reason.
+FALLBACK_AFTER_MS = 60_000
+FALLBACK_UPLOAD_ATTEMPTS = 1
 
 
 def _update_keys(data: Any, key_mapping: dict[str, str]) -> Any:
@@ -116,9 +118,8 @@ class MachineSpecScrapeCheck:
 
         # The source did not run here: wrong interpreter, no psutil, or a cryptography too old
         # to produce a token this validator can read. The binary carries its own interpreter and
-        # every dependency, so retry with it. Only after a fast failure, though — a slow one
-        # means the scrape got past its cheap part, and a second full attempt plus the upload
-        # would not fit the per-executor budget.
+        # every dependency, so retry with it. Only up to FALLBACK_AFTER_MS, though — past that the
+        # scrape hung rather than failed to start, and the binary runs the very same code.
         if res.duration_ms > FALLBACK_AFTER_MS or not ctx.config.machine_scrape_filename:
             return result
 
@@ -127,7 +128,7 @@ class MachineSpecScrapeCheck:
         fallback_from = {"reason": result.event.reason_code, **result.event.what_we_saw}
 
         try:
-            remote_dir = await upload_validation_files(ctx)
+            remote_dir = await upload_validation_files(ctx, attempts=FALLBACK_UPLOAD_ATTEMPTS)
         except UploadFailed as exc:
             event = render_message(
                 Msg.SCRAPE_FAILED,
