@@ -30,6 +30,11 @@ from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
 from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, DEFAULT_JOB_OWNER_MINER
+from services.gpu_power_limit import (
+    CAP_REVERT_WINDOW_SECONDS,
+    GpuPowerCapRevert,
+    read_gpu_power_cap_reverts,
+)
 from services.task.models import MixedFormulaInputs
 from services.task_service import JobResult
 
@@ -61,6 +66,14 @@ NCU_PROFILING_UNRESTRICTED = "unrestricted"
 CAP_SYS_ADMIN_BIT = 21
 NVIDIACTL_ROOT_UID = 0
 
+# DAH-2786 — GPU power cap revert gate. An unrented executor whose host raises the GPU power
+# limit back while a Lium idle job runs kills that job and still collects the unrented
+# incentive. It forfeits the incentive after this many reverted JOBS inside
+# `CAP_REVERT_WINDOW_SECONDS`. One is not enough, because a driver reload can undo a cap on
+# its own; two is reachable inside a day even with the backend's 12h backoff after each
+# killed job, and a host running a reset timer breaks every job it is given.
+MIN_POWER_CAP_REVERTS_TO_PENALIZE = 2
+
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
@@ -89,6 +102,17 @@ class PowerCapIncapable(BaseModel):
 
     container_cap_eff: str  # effective capability mask of the executor container, hex
     nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
+
+
+class PowerCapReverted(BaseModel):
+    """How often this executor's host undid a verified GPU power cap, and the last evidence.
+
+    The watt readings are carried so the provider is shown the numbers that were judged."""
+
+    revert_count: int
+    window_hours: int
+    capped_to_watts: int  # what the validator applied and read back
+    found_watts: int  # what the host had put back by the time the job ended
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -473,6 +497,47 @@ class RentalPriceIncentive(DefaultIncentive):
                     "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    async def _power_cap_reverted(self, result: JobResult) -> PowerCapReverted | None:
+        # The validator records one revert per Lium job whose verified cap was gone by the time
+        # the job ended (services/gpu_power_limit.py). A Redis outage returns no reverts, so the
+        # gate fails open like every other unknown here.
+        if result.spec is None:
+            # a synthetic or estimated job result: no real executor, so nothing to look up
+            return None
+        reverts: list[GpuPowerCapRevert] = await read_gpu_power_cap_reverts(
+            self.redis_service, str(result.executor_info.uuid)
+        )
+        if len(reverts) < MIN_POWER_CAP_REVERTS_TO_PENALIZE:
+            return None
+        last: GpuPowerCapRevert = reverts[-1]
+        return PowerCapReverted(
+            revert_count=len(reverts),
+            window_hours=CAP_REVERT_WINDOW_SECONDS // 3600,
+            capped_to_watts=last.capped_to_watts,
+            found_watts=last.found_watts,
+        )
+
+    def _log_power_cap_revert_limit(self, result: JobResult, reverted: PowerCapReverted) -> None:
+        enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT
+        logger.info(
+            _m(
+                "Unrented executor reverts the GPU power cap of Lium's own idle jobs"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "power_cap_revert_count": reverted.revert_count,
+                    "power_cap_revert_window_hours": reverted.window_hours,
+                    "capped_to_watts": reverted.capped_to_watts,
+                    "found_watts": reverted.found_watts,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.REVERTS_GPU_POWER_CAP,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -982,6 +1047,21 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_cannot_apply_gpu_power_cap(
                     job_result, power_cap_incapable
+                )
+                job_result.record_incentive_log(reason)
+
+        # DAH-2786 power cap revert gate: an idle machine whose host puts the GPU power limit
+        # back kills the Lium job it is being paid to host, so it forfeits the unrented
+        # incentive (node stays active). Shadow-only while the flag is off.
+        power_cap_reverted: PowerCapReverted | None = (
+            await self._power_cap_reverted(job_result) if eligible_for_rental_share else None
+        )
+        if power_cap_reverted is not None:
+            self._log_power_cap_revert_limit(job_result, power_cap_reverted)
+            if settings.ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_reverts_gpu_power_cap(
+                    job_result, power_cap_reverted
                 )
                 job_result.record_incentive_log(reason)
 

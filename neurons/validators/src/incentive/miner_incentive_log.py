@@ -54,7 +54,12 @@ from pydantic import BaseModel, Field
 from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
-    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, PowerCapIncapable
+    from incentive.rental_price import (
+        InsufficientDisk,
+        MissingFlagshipCapability,
+        PowerCapIncapable,
+        PowerCapReverted,
+    )
     from services.task_service import JobResult
 
 
@@ -80,6 +85,7 @@ class ZeroIncentiveReason(StrEnum):
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
+    REVERTS_GPU_POWER_CAP = "reverts_gpu_power_cap"
 
 
 class IncentiveReason(BaseModel):
@@ -384,6 +390,30 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "container_cap_eff": incapable.container_cap_eff,
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_reverts_gpu_power_cap(
+        result: JobResult, reverted: PowerCapReverted
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.REVERTS_GPU_POWER_CAP,
+            message=(
+                f"No unrented incentive: this executor raised the GPU power limit back "
+                f"{reverted.revert_count} times in the last {reverted.window_hours} hours while a "
+                f"Lium idle job was running. Lium caps the limit for the length of that job only, "
+                f"and restores your own value when it ends. Putting the limit back kills the job, "
+                f"so the node earns the unrented incentive without doing the work. Stop the script "
+                f"or service on the host that re-runs 'nvidia-smi -pl', or rent this executor out "
+                f"to earn."
+            ),
+            extra_fields={
+                "power_cap_revert_count": reverted.revert_count,
+                "power_cap_revert_window_hours": reverted.window_hours,
+                "capped_to_watts": reverted.capped_to_watts,
+                "found_watts": reverted.found_watts,
             },
         )
 

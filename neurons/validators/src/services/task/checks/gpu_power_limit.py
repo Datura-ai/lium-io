@@ -8,8 +8,11 @@ from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
     STALE_CAP_GRACE_SECONDS,
+    GpuPowerCapRevert,
     GpuPowerRestoreRecord,
+    detect_cap_revert,
     read_gpu_power_restore_records,
+    record_cap_reverts,
     restore_tracked_gpu_power_limits,
 )
 
@@ -63,6 +66,10 @@ class GpuPowerLimitCheck:
             rented_data.get_default_job_owner(ctx.executor.uuid) if rented_data else None
         )
         if default_job_owner == DEFAULT_JOB_OWNER_LIUM:
+            # DAH-2786: this is the only moment we can tell a host that raises our cap back
+            # WHILE our job runs from one that merely resets the limit after the job ends. The
+            # first kills the job it is paid to host; the second harms nothing.
+            await self._record_reverts_of_our_live_cap(ctx)
             event = render_message(
                 Msg.SKIPPED_ACTIVE_LIUM_FILLER,
                 ctx=ctx,
@@ -149,6 +156,51 @@ class GpuPowerLimitCheck:
             },
         )
         return CheckResult(passed=True, event=event)
+
+    async def _record_reverts_of_our_live_cap(self, ctx: Context) -> None:
+        """Note every GPU of this executor whose live limit sits above the cap we applied and
+        verified for the Lium job running right now (DAH-2786).
+
+        Read-only towards the host: it changes no limit, it only records what it saw, so the
+        filler keeps running either way. The unrented incentive gate counts these later.
+        """
+        # same reason the stale-cap rescue is gated: the dry-run pipeline must not write shared state
+        if not self.restore_stale_caps:
+            return
+        live_watts_by_uuid: dict[str, GpuPowerMeasurement] = {
+            str(detail.get("uuid")): GpuPowerMeasurement(
+                index=index,
+                name=detail.get("name"),
+                uuid=str(detail.get("uuid")),
+                power_limit=_to_float(detail.get("power_limit")),
+                power_default_limit=_to_float(detail.get("power_default_limit")),
+                power_max_limit=_to_float(detail.get("power_max_limit")),
+            )
+            for index, detail in enumerate(ctx.state.gpu_details or [])
+            if detail.get("uuid")
+        }
+        if not live_watts_by_uuid:
+            return
+        read_result = await read_gpu_power_restore_records(
+            ctx.services.redis, list(live_watts_by_uuid), log_extra=ctx.default_extra
+        )
+        observed_at = time.time()
+        reverts: list[GpuPowerCapRevert] = []
+        for record in read_result.records:
+            if record.executor_id != ctx.executor.uuid:
+                continue
+            measurement = live_watts_by_uuid.get(record.gpu_uuid)
+            if measurement is None or measurement.power_limit is None:
+                continue
+            revert = detect_cap_revert(
+                record, measurement.power_limit, measurement.power_default_limit, observed_at
+            )
+            if revert is not None:
+                reverts.append(revert)
+        if reverts:
+            await record_cap_reverts(
+                ctx.services.redis, ctx.executor.uuid, reverts, ctx.default_extra
+            )
 
     async def _rescue_stale_lium_caps(
         self, ctx: Context, rejected: list[GpuPowerMeasurement]

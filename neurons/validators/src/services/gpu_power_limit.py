@@ -12,6 +12,9 @@ Redis state (all keys written only by this validator):
 - ``gpu_power_restore_pod:<pod_id>`` — the gpu_uuids a filler pod capped, so its delete can restore
   exactly its own GPUs without an SSH enumeration and without sweeping a replacement filler's fresh
   records.
+- ``gpu_power_cap_revert:<executor_id>`` — DAH-2786: the reverts observed on that executor inside
+  ``CAP_REVERT_WINDOW_SECONDS``. A restore that finds the limit already back where the miner had it
+  proves the host raised it while our filler ran; the unrented incentive gate counts these.
 
 A record that outlives its filler (delete failed, SSH broke mid-teardown) is repaired by two safety
 nets, so a reduced limit can never stick:
@@ -45,7 +48,7 @@ from typing import Literal
 
 import asyncssh
 from payload_models.payloads import GpuPowerLimit
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from services.redis_service import RedisService
 
 from core.utils import _m, get_extra_info
@@ -60,6 +63,13 @@ _POWER_STATE_CMD = (
 _NVIDIA_SMI_TIMEOUT_SECONDS = 30
 _RESTORE_KEY_PREFIX = "gpu_power_restore:"
 _POD_INDEX_KEY_PREFIX = "gpu_power_restore_pod:"
+_REVERT_KEY_PREFIX = "gpu_power_cap_revert:"
+# DAH-2786 — how long one observed revert stays on the executor's record. The unrented
+# incentive gate counts the reverts inside this window.
+CAP_REVERT_WINDOW_SECONDS = 24 * 60 * 60
+# The gate only needs a count and the last evidence, so the history is bounded: a host that
+# reverts every filler run would otherwise grow the record for the whole window.
+MAX_TRACKED_CAP_REVERTS = 50
 # A record younger than this may belong to a filler the check's backend snapshot doesn't report yet
 # (backend marks owner="lium" from STARTING, but the snapshot is taken at cycle start) — the check
 # must not uncap it. Comfortably above the backend's 15-minute STARTING/STOPPING transitional window.
@@ -77,6 +87,41 @@ class GpuPowerRestoreRecord(BaseModel):
     pod_id: str
     executor_id: str
     capped_at: float  # unix seconds; lets the check age-gate its restore against STALE_CAP_GRACE_SECONDS
+    # DAH-2786 — the limit we actually applied, so a restore can tell a held cap from a
+    # reverted one. None on records written before this field existed: those never accuse.
+    capped_to_watts: int | None = None
+
+
+class GpuPowerCapRevert(BaseModel):
+    """One Lium job whose verified cap the host raised again while the job ran.
+
+    One entry per job, not per GPU: a host guard resets every GPU on the node in the same tick,
+    and counting eight of those as eight breaches would zero an 8x node on one event.
+    ``pod_id`` is what makes the job the unit — a restore that fails keeps its record and is
+    retried later, and the retry must not count the same job twice."""
+
+    observed_at: float  # unix seconds
+    pod_id: str
+    gpu_uuid: str  # the first GPU seen reverted, as evidence
+    capped_to_watts: int
+    found_watts: int
+
+
+class GpuPowerCapRevertHistory(BaseModel):
+    """The reverts observed on one executor. Written only by this validator."""
+
+    reverts: list[GpuPowerCapRevert] = Field(default_factory=list)
+
+
+class GpuPowerCapRevertReadResult(BaseModel):
+    """The stored history plus whether Redis answered at all.
+
+    ``read_failed`` separates "this executor has no reverts" from "we could not look": the
+    reader must fail open on the second, and the writer must NOT overwrite a history it could
+    not read. Mirrors ``GpuPowerRestoreReadResult``."""
+
+    history: GpuPowerCapRevertHistory
+    read_failed: bool
 
 
 class GpuPowerRestoreReadResult(BaseModel):
@@ -110,6 +155,26 @@ class GpuPowerReadback:
 
 
 @dataclass(frozen=True)
+class CappingJob:
+    """The Lium job a cap belongs to. Both halves travel together: the revert is deduplicated
+    per pod and charged to the executor, so a record must never carry one without the other."""
+
+    executor_id: str
+    pod_id: str
+
+
+@dataclass(frozen=True)
+class PlannedGpuCaps:
+    """What the host reports about the requested GPUs, and the watts we will really apply.
+
+    The clamped target is worked out before anything is written or lowered, so the restore
+    record can store the exact value a later restore compares against (DAH-2786)."""
+
+    state_by_uuid: dict[str, GpuPowerState]
+    clamped_watts_by_uuid: dict[str, int]
+
+
+@dataclass(frozen=True)
 class PowerLimitSetOutcome:
     """Outcome of one verified set: why it failed (None = success) and the persistence verdict the
     readback saw. A successful set with persistence off can still revert on its own later."""
@@ -130,6 +195,10 @@ def _restore_key(gpu_uuid: str) -> str:
 
 def _pod_index_key(pod_id: str) -> str:
     return f"{_POD_INDEX_KEY_PREFIX}{pod_id}"
+
+
+def _revert_key(executor_id: str) -> str:
+    return f"{_REVERT_KEY_PREFIX}{executor_id}"
 
 
 def _watts_or_none(raw: str) -> int | None:
@@ -280,8 +349,9 @@ async def _set_and_log_power_limit(
     watts_before: int | None,
     watts_after: int,
     log_extra: dict[str, object] | None,
-) -> bool:
+) -> PowerLimitSetOutcome:
     # Reviewer contract (PR #1115): every PL change is logged with executor, GPU, before/after, status.
+    # The outcome, not a bool: DAH-2786 stamps the applied cap only when persistence was verified.
     await _enable_persistence_mode(ssh, gpu_uuid, log_extra)
     set_outcome = await _set_power_limit(ssh, gpu_uuid, watts_after)
     failure = set_outcome.failure
@@ -316,7 +386,7 @@ async def _set_and_log_power_limit(
         },
         log_extra,
     )
-    return failure is None
+    return set_outcome
 
 
 async def _ensure_restore_record(
@@ -354,6 +424,42 @@ async def _ensure_restore_record(
         return False
 
 
+async def _set_applied_cap_on_restore_record(
+    redis: RedisService,
+    gpu_uuid: str,
+    capped_to_watts: int | None,
+    capped_by: CappingJob | None,
+    log_extra: dict[str, object] | None,
+) -> None:
+    """Write the watts we verifiably applied onto the GPU's restore record, or None to say no
+    cap of ours is standing (DAH-2786).
+
+    The watts are written only after the readback confirmed the set, which is what lets a later
+    restore tell a host-side revert from a cap that never landed; a failed apply clears them
+    again, so a record frozen by an earlier failed restore cannot carry a stale claim into the
+    next attempt. The capping job is refreshed with them, because a frozen record still names
+    the executor and pod that FIRST capped the GPU — the revert is deduplicated per pod and
+    charged to the executor, so a stale identity would file the breach against the wrong
+    provider. Best-effort: a miss only costs the revert signal, never the way back, so it must
+    not fail the filler.
+    """
+    key = _restore_key(gpu_uuid)
+    try:
+        raw: str | bytes | None = await redis.get(key)
+        if not raw:
+            return
+        record = GpuPowerRestoreRecord.model_validate_json(raw)
+        identity = (
+            {"pod_id": capped_by.pod_id, "executor_id": capped_by.executor_id} if capped_by else {}
+        )
+        refreshed = record.model_copy(update={"capped_to_watts": capped_to_watts, **identity})
+        await redis.set(key, refreshed.model_dump_json())
+    except (ValidationError, TypeError, ValueError) as exc:
+        _log(logging.ERROR, f"gpu power cap: cannot stamp the applied cap on {gpu_uuid}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
+    except Exception as exc:
+        _log(logging.ERROR, f"gpu power cap: redis failed while stamping the applied cap on {gpu_uuid}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
+
+
 async def read_gpu_power_restore_records(
     redis: RedisService,
     gpu_uuids: list[str],
@@ -381,6 +487,165 @@ async def read_gpu_power_restore_records(
     return GpuPowerRestoreReadResult(records=records, read_failed=read_failed)
 
 
+def _uncapped_run_threshold_watts(record: GpuPowerRestoreRecord, default_watts: float | None) -> float:
+    """The limit at which the job counts as having run uncapped.
+
+    ``MIN_POWER_LIMIT_RATIO`` of the card default — the same line the backend guard kills the
+    filler at (``PEARL_POWER_LIMIT_APPLIED_FLOOR_RATIO``, lium-io-backend
+    ``default_job/runner.py``) and the line ``GpuPowerLimitCheck`` scores against, so a node is
+    never penalized for a run the guard would have let live. Kept unrounded for that reason: a
+    5090 pinned at 517 W is 0.8991 of its 575 W default, which the guard passes. The observed
+    host guards sit one point above this line (0.91 of default, 4090 409/450, 5090 518/575).
+    Falls back to the miner's own pre-cap limit when the GPU does not report a default.
+    """
+    if default_watts is None or default_watts <= 0:
+        return record.watts
+    return MIN_POWER_LIMIT_RATIO * default_watts
+
+
+def detect_cap_revert(
+    record: GpuPowerRestoreRecord,
+    current_watts: float,
+    default_watts: float | None,
+    observed_at: float,
+) -> GpuPowerCapRevert | None:
+    """What we saw on one GPU whose live limit the host raised back past the line at which the
+    job runs uncapped. None when nothing proves a revert.
+
+    DAH-2786. Read WHILE the Lium job runs, never at teardown: a host that leaves our cap alone
+    during the job and only resets the limit afterwards has harmed nothing, and the two look
+    identical once the container is gone.
+
+    Three conditions, each ruling out a different innocent case:
+    - ``capped_to_watts`` is stamped only after a verified set with persistence mode on, so a
+      cap that never landed (the DAH-2715 population, whose container cannot cap at all) and a
+      cap that can revert on its own (DAH-2702) can never accuse. It is also absent on records
+      written before this field existed.
+    - the limit is not where we left it, so a cap that held cannot accuse.
+    - the limit is at or above the uncapped line, which is what makes the revert cost Lium the
+      whole job rather than a few watts.
+    """
+    if record.capped_to_watts is None:
+        return None
+    if current_watts <= record.capped_to_watts:
+        return None
+    if current_watts < _uncapped_run_threshold_watts(record, default_watts):
+        return None
+    return GpuPowerCapRevert(
+        observed_at=observed_at,
+        pod_id=record.pod_id,
+        gpu_uuid=record.gpu_uuid,
+        capped_to_watts=record.capped_to_watts,
+        found_watts=int(current_watts),
+    )
+
+
+def _reverts_inside_window(reverts: list[GpuPowerCapRevert], now: float) -> list[GpuPowerCapRevert]:
+    return [revert for revert in reverts if now - revert.observed_at <= CAP_REVERT_WINDOW_SECONDS]
+
+
+async def _read_revert_history(
+    redis: RedisService,
+    executor_id: str,
+    log_extra: dict[str, object] | None,
+) -> GpuPowerCapRevertReadResult:
+    """The stored history, plus whether Redis answered.
+
+    Fail-open by design: this feeds a money gate, so our own outage must never read as a breach.
+    A corrupt record is NOT a failed read — it can never be counted, so it is replaced.
+    """
+    key = _revert_key(executor_id)
+    try:
+        raw: str | bytes | None = await redis.get(key)
+    except Exception as exc:
+        _log(logging.ERROR, f"gpu power cap revert: redis read failed for {key}: {exc}", {}, log_extra)
+        return GpuPowerCapRevertReadResult(history=GpuPowerCapRevertHistory(), read_failed=True)
+    if not raw:
+        return GpuPowerCapRevertReadResult(history=GpuPowerCapRevertHistory(), read_failed=False)
+    try:
+        return GpuPowerCapRevertReadResult(
+            history=GpuPowerCapRevertHistory.model_validate_json(raw), read_failed=False
+        )
+    except (ValidationError, TypeError, ValueError):
+        _log(logging.ERROR, f"gpu power cap revert: ignoring corrupt record {raw!r} for {executor_id}", {}, log_extra)
+        return GpuPowerCapRevertReadResult(history=GpuPowerCapRevertHistory(), read_failed=False)
+
+
+async def read_gpu_power_cap_reverts(
+    redis: RedisService,
+    executor_id: str,
+    log_extra: dict[str, object] | None = None,
+) -> list[GpuPowerCapRevert]:
+    """Every revert observed on this executor inside the window, newest last. Empty on any unknown."""
+    read_result = await _read_revert_history(redis, executor_id, log_extra)
+    return _reverts_inside_window(read_result.history.reverts, time.time())
+
+
+def _reverts_of_jobs_not_already_recorded(
+    reverted_gpus: list[GpuPowerCapRevert],
+    already_recorded: list[GpuPowerCapRevert],
+) -> list[GpuPowerCapRevert]:
+    """One revert per job, and only for jobs the history does not already carry.
+
+    A host guard resets every GPU in the same tick, and a restore that failed keeps its record
+    and is retried later — without this, one killed job would count as eight, then again on
+    every retry."""
+    seen_pod_ids: set[str] = {revert.pod_id for revert in already_recorded}
+    new_reverts: list[GpuPowerCapRevert] = []
+    for revert in reverted_gpus:
+        if revert.pod_id in seen_pod_ids:
+            continue
+        seen_pod_ids.add(revert.pod_id)
+        new_reverts.append(revert)
+    return new_reverts
+
+
+async def record_cap_reverts(
+    redis: RedisService,
+    executor_id: str,
+    reverted_gpus: list[GpuPowerCapRevert],
+    log_extra: dict[str, object] | None,
+) -> None:
+    """Add the executor's newly reverted jobs to its history. Best-effort: teardown must never
+    fail over bookkeeping, so every error only logs."""
+    read_result = await _read_revert_history(redis, executor_id, log_extra)
+    if read_result.read_failed:
+        # writing now would replace a history we could not see with just this job's reverts
+        return
+    kept: list[GpuPowerCapRevert] = _reverts_inside_window(read_result.history.reverts, time.time())
+    new_reverts: list[GpuPowerCapRevert] = _reverts_of_jobs_not_already_recorded(reverted_gpus, kept)
+    if not new_reverts:
+        return
+    for revert in new_reverts:
+        _log(
+            logging.WARNING,
+            f"gpu power cap reverted on the host: executor={executor_id} pod={revert.pod_id} "
+            f"gpu={revert.gpu_uuid} capped to {revert.capped_to_watts}W, "
+            f"found {revert.found_watts}W while the Lium job runs",
+            {
+                "gpu_power_action": "revert_detected",
+                "executor_uuid": executor_id,
+                "pod_id": revert.pod_id,
+                "gpu_uuid": revert.gpu_uuid,
+                "capped_to_watts": revert.capped_to_watts,
+                "found_watts": revert.found_watts,
+            },
+            log_extra,
+        )
+    read_result.history.reverts = [*kept, *new_reverts][-MAX_TRACKED_CAP_REVERTS:]
+    try:
+        await redis.set(
+            _revert_key(executor_id), read_result.history.model_dump_json(), ex=CAP_REVERT_WINDOW_SECONDS
+        )
+    except Exception as exc:
+        _log(
+            logging.ERROR,
+            f"gpu power cap revert: could not store the reverts for {executor_id}: {exc}",
+            {"pod_id": new_reverts[0].pod_id},
+            log_extra,
+        )
+
+
 async def _delete_pod_index(redis: RedisService, pod_id: str, log_extra: dict[str, object] | None) -> None:
     try:
         await redis.delete(_pod_index_key(pod_id))
@@ -401,10 +666,14 @@ async def _restore_records(
     for record in records:
         state = state_by_uuid.get(record.gpu_uuid)
         watts_before = state.current_watts if state else None
-        changed = await _set_and_log_power_limit(
+        if record.capped_to_watts is not None:
+            # DAH-2786: the restore below raises the limit itself, so a record that outlives a
+            # failed delete must not keep claiming a cap of ours is standing.
+            await _set_applied_cap_on_restore_record(redis, record.gpu_uuid, None, None, log_extra)
+        restore_outcome = await _set_and_log_power_limit(
             ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
         )
-        if not changed:
+        if restore_outcome.failure is not None:
             continue
         try:
             await redis.delete(_restore_key(record.gpu_uuid))
@@ -487,10 +756,10 @@ async def raise_low_power_limits_to_default(
             continue
         if state.current_watts >= MIN_POWER_LIMIT_RATIO * state.default_watts:
             continue
-        lifted = await _set_and_log_power_limit(
+        raise_outcome = await _set_and_log_power_limit(
             ssh, "raise", executor_id, gpu_uuid, state.current_watts, state.default_watts, log_extra
         )
-        if lifted:
+        if raise_outcome.failure is None:
             raised += 1
     return raised
 
@@ -536,8 +805,44 @@ async def _undo_partial_apply(
 ) -> None:
     # A failed apply must not leave GPUs capped or state keys behind: with the filler never starting,
     # the backend keeps reporting owner="lium", which blocks the check-side restore indefinitely.
+    # Clear the applied watts BEFORE restoring: no cap of ours is standing, so the restore about
+    # to run must not read a stale claim as the host reverting us (DAH-2786).
+    for gpu_uuid in gpu_uuids:
+        await _set_applied_cap_on_restore_record(redis, gpu_uuid, None, None, log_extra)
     await restore_tracked_gpu_power_limits(ssh, redis, gpu_uuids, log_extra)
     await _delete_pod_index(redis, pod_id, log_extra)
+
+
+async def _plan_gpu_caps(
+    ssh: asyncssh.SSHClientConnection,
+    gpu_power_limits: list[GpuPowerLimit],
+    log_extra: dict[str, object] | None,
+) -> PlannedGpuCaps | None:
+    """Read the host's power state and clamp every requested target to that GPU's hardware
+    bounds. None when the state cannot be read or a requested GPU is not on the host — the
+    caller must then refuse to start the filler rather than run the miner uncapped."""
+    try:
+        state_by_uuid = await _query_power_state(ssh)
+    except Exception as exc:
+        _log(logging.ERROR, f"gpu power cap: state query failed: {exc}; refusing to start filler uncapped", {}, log_extra)
+        return None
+    missing = [target.gpu_uuid for target in gpu_power_limits if target.gpu_uuid not in state_by_uuid]
+    if missing:
+        _log(
+            logging.ERROR,
+            f"gpu power cap: requested GPU(s) {missing} not in nvidia-smi output {sorted(state_by_uuid)}; "
+            f"refusing to start filler uncapped",
+            {},
+            log_extra,
+        )
+        return None
+    return PlannedGpuCaps(
+        state_by_uuid=state_by_uuid,
+        clamped_watts_by_uuid={
+            target.gpu_uuid: _clamp_watts(target.watts, state_by_uuid[target.gpu_uuid])
+            for target in gpu_power_limits
+        },
+    )
 
 
 async def apply_filler_gpu_power_limits(
@@ -554,26 +859,17 @@ async def apply_filler_gpu_power_limits(
     (records, pod index, already-capped GPUs) is undone first. False means the caller must NOT start
     the filler. Every failure path logs an error so it is diagnosable/alertable — no silent skips.
     """
-    try:
-        state_by_uuid = await _query_power_state(ssh)
-    except Exception as exc:
-        _log(logging.ERROR, f"gpu power cap: state query failed: {exc}; refusing to start filler uncapped", {}, log_extra)
-        return False
-    missing = [target.gpu_uuid for target in gpu_power_limits if target.gpu_uuid not in state_by_uuid]
-    if missing:
-        _log(
-            logging.ERROR,
-            f"gpu power cap: requested GPU(s) {missing} not in nvidia-smi output {sorted(state_by_uuid)}; "
-            f"refusing to start filler uncapped",
-            {},
-            log_extra,
-        )
+    planned: PlannedGpuCaps | None = await _plan_gpu_caps(ssh, gpu_power_limits, log_extra)
+    if planned is None:
         return False
     target_uuids = [target.gpu_uuid for target in gpu_power_limits]
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.
     for target in gpu_power_limits:
-        pre_cap_watts = state_by_uuid[target.gpu_uuid].current_watts
-        if not await _ensure_restore_record(redis, target.gpu_uuid, pre_cap_watts, pod_id, executor_id, log_extra):
+        pre_cap_watts = planned.state_by_uuid[target.gpu_uuid].current_watts
+        restore_record_stored: bool = await _ensure_restore_record(
+            redis, target.gpu_uuid, pre_cap_watts, pod_id, executor_id, log_extra
+        )
+        if not restore_record_stored:
             await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
             return False
     try:
@@ -583,13 +879,34 @@ async def apply_filler_gpu_power_limits(
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
         return False
     all_set = True
+    gpu_uuids_capped_with_persistence: list[str] = []
     for target in gpu_power_limits:
-        state = state_by_uuid[target.gpu_uuid]
-        target_watts = _clamp_watts(target.watts, state)
-        if not await _set_and_log_power_limit(
-            ssh, "cap", executor_id, target.gpu_uuid, state.current_watts, target_watts, log_extra
-        ):
+        cap_outcome = await _set_and_log_power_limit(
+            ssh,
+            "cap",
+            executor_id,
+            target.gpu_uuid,
+            planned.state_by_uuid[target.gpu_uuid].current_watts,
+            planned.clamped_watts_by_uuid[target.gpu_uuid],
+            log_extra,
+        )
+        if cap_outcome.failure is not None:
             all_set = False
+        elif cap_outcome.persistence_enabled:
+            gpu_uuids_capped_with_persistence.append(target.gpu_uuid)
     if not all_set:
         await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
-    return all_set
+        return False
+    # Only a cap that landed AND holds is attributable to the host later. Without persistence
+    # mode the driver unloads on an idle GPU and the stock limit comes back on its own
+    # (DAH-2702), which at teardown is indistinguishable from a provider raising it — so those
+    # GPUs are left unstamped and can never accuse. A cap that failed leaves no target either.
+    for gpu_uuid in gpu_uuids_capped_with_persistence:
+        await _set_applied_cap_on_restore_record(
+            redis,
+            gpu_uuid,
+            planned.clamped_watts_by_uuid[gpu_uuid],
+            CappingJob(executor_id=executor_id, pod_id=pod_id),
+            log_extra,
+        )
+    return True

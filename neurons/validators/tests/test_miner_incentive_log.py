@@ -11,6 +11,7 @@ from incentive.rental_price import (
     InsufficientDisk,
     MissingFlagshipCapability,
     PowerCapIncapable,
+    PowerCapReverted,
     RentalPriceIncentive,
 )
 from services.task_service import JobResult
@@ -35,6 +36,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "insufficient_disk_for_vram",
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
+        "reverts_gpu_power_cap",
     }
 
 
@@ -142,6 +144,16 @@ def _job(**overrides) -> JobResult:
             ),
             "cannot_apply_gpu_power_cap",
             "CAP_SYS_ADMIN",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_reverts_gpu_power_cap(
+                job,
+                PowerCapReverted(
+                    revert_count=3, window_hours=24, capped_to_watts=280, found_watts=400
+                ),
+            ),
+            "reverts_gpu_power_cap",
+            "nvidia-smi -pl",
         ),
     ],
 )
