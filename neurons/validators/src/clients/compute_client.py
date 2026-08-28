@@ -63,7 +63,6 @@ from protocol.vc_protocol.validator_requests import (
     RevenuePerGpuTypeRequest,
     ScorePortionPerGpuTypeRequest,
 )
-from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
 from core.config import settings
@@ -443,7 +442,10 @@ class ComputeClient:
         wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
         retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
     )
-    async def send_model(self, msg: BaseModel):
+    async def send_model(self, msg: DeliveryStamps):
+        # stamped inside the retry so a message resent after a reconnect reports its own delay
+        msg.forwarded_at = time.time()
+        msg.queue_depth = len(self.message_queue)
         await self.ws.send(msg.model_dump_json())
 
     async def handle_send_messages(self):
@@ -457,8 +459,6 @@ class ComputeClient:
                     log_to_send = self.message_queue.pop(0)
 
                 if log_to_send:
-                    log_to_send.forwarded_at = time.time()
-                    log_to_send.queue_depth = len(self.message_queue)
                     try:
                         await self.send_model(log_to_send)
                     except Exception as exc:

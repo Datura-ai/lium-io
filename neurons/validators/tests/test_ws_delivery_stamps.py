@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import websockets
 from payload_models.payloads import ContainerCreated, DeliveryStamps
 
 from clients.compute_client import WS_PING_INTERVAL, WS_PING_TIMEOUT, ComputeClient
@@ -139,6 +140,29 @@ async def test_send_loop_stamps_container_responses_too() -> None:
     # Assert
     assert [message["message_type"] for message in sent] == ["ContainerCreated", "RentedMachineRequest"]
     assert [message["queue_depth"] for message in sent] == [1, 0]
+
+
+@pytest.mark.asyncio
+async def test_resent_message_is_stamped_again_by_the_retry() -> None:
+    # Arrange: the first attempt dies on a closed socket, tenacity sends the same object again
+    message = RentedMachineRequest()
+    client = _client()
+    stamps: list[float] = []
+
+    async def send(raw_message: str) -> None:
+        stamps.append(json.loads(raw_message)["forwarded_at"])
+        if len(stamps) == 1:
+            raise websockets.ConnectionClosedError(None, None)
+
+    client.ws = MagicMock(send=send)
+
+    # Act
+    with patch("clients.compute_client.time.time", side_effect=[100.0, 110.0]):
+        await client.send_model(message)
+
+    # Assert: the retry reports its own moment, not the first attempt's
+    assert stamps == [100.0, 110.0]
+    assert message.forwarded_at == 110.0
 
 
 def test_connect_sets_keepalive_ping_interval_and_timeout() -> None:
