@@ -101,24 +101,54 @@ class ContainerRow:
         return self.cpu_percent
 
 
-def provider_cores_outside_lium(
-    host_cores: float, rows: list[ContainerRow], lium_container_keys: set[str]
-) -> float:
-    """The host's cores minus the containers Lium itself put there.
+def lium_cores_among(rows: list[ContainerRow], lium_container_keys: set[str]) -> float:
+    """What Lium's own containers burn, in cores.
 
     Matching by both id and name, because the scrape reports full ids and `docker stats`
     reports the first 12 characters.
     """
     lium_short_ids: set[str] = {key[:12] for key in lium_container_keys}
-    lium_percent: float = sum(
-        row.measured_cpu_percent
-        for row in rows
-        if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
+    return (
+        sum(
+            row.measured_cpu_percent
+            for row in rows
+            if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
+        )
+        / 100
     )
+
+
+def provider_cores_outside_lium(
+    host_cores: float, rows: list[ContainerRow], lium_container_keys: set[str]
+) -> float:
+    """The host's cores minus the containers Lium itself put there."""
+    lium_percent: float = lium_cores_among(rows, lium_container_keys) * 100
     # Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
     # inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5.
     provider_cores = max(0.0, host_cores - lium_percent / 100)
     return math.floor(round(provider_cores, 3) * 10) / 10
+
+
+@dataclass(frozen=True)
+class SecondLook:
+    """What the ssh reading actually measured, so a shadow week can be judged.
+
+    The verdict alone cannot be argued with: a provider mining beside a renter and a renter pod
+    that was never subtracted both come out as "N provider cores". These three numbers separate
+    them - they add up to `provider_cores` by construction.
+    """
+
+    host_cores: float
+    lium_container_cores: float
+    dockerd_cores: float
+    provider_cores: float
+
+    def to_specs_fields(self) -> dict[str, float]:
+        return {
+            "host_cores": self.host_cores,
+            "lium_container_cores": self.lium_container_cores,
+            "dockerd_cores": self.dockerd_cores,
+        }
 
 
 @dataclass(frozen=True)
@@ -130,6 +160,7 @@ class ProviderSideLoad:
 
     cpu_cores: float | None
     disk_kb: int | None
+    second_look: SecondLook | None = None
 
     @property
     def is_measured(self) -> bool:
@@ -154,6 +185,8 @@ class ProviderSideLoad:
             fields["cpu_cores"] = self.cpu_cores
         if self.disk_kb is not None:
             fields["disk_kb"] = self.disk_kb
+        if self.second_look is not None:
+            fields.update(self.second_look.to_specs_fields())
         return fields
 
 
@@ -342,13 +375,13 @@ def lium_named_cores_outside_snapshot(
     return round(cores / 100, 1)
 
 
-def parse_resampled_cpu_cores(
+def parse_second_look(
     sample_before: str,
     container_rows: str,
     sample_after: str,
     lium_container_keys: set[str],
-) -> float | None:
-    """Provider-side cores from the second reading, or None if it is not readable.
+) -> SecondLook | None:
+    """What the second reading measured, or None if it is not readable.
 
     Host busy time comes from the /proc/stat jiffies taken on either side of `docker stats`, so
     both cover the same seconds - the pairing the whole subtraction rests on. Out of that come
@@ -383,8 +416,13 @@ def parse_resampled_cpu_cores(
     # `dockerd` is a process name anyone can copy, so its excuse is capped like the name tier
     excused_dockerd_cores = min(max(0.0, dockerd_cores), CLAIMED_EXCUSE_CORES)
     host_cores = (total_delta - (last_idle - first_idle)) / total_delta * kernel_cores
-    return provider_cores_outside_lium(
-        host_cores - excused_dockerd_cores, stats_rows, lium_container_keys
+    return SecondLook(
+        host_cores=round(host_cores, 1),
+        lium_container_cores=round(lium_cores_among(stats_rows, lium_container_keys), 1),
+        dockerd_cores=round(excused_dockerd_cores, 1),
+        provider_cores=provider_cores_outside_lium(
+            host_cores - excused_dockerd_cores, stats_rows, lium_container_keys
+        ),
     )
 
 
@@ -409,9 +447,9 @@ class ProviderSideLoadCheck:
     check_id = "host.validate.provider_side_load"
     fatal = False
 
-    async def _resample_cpu_cores(
+    async def _take_a_second_look(
         self, ctx: Context, lium_container_keys: set[str] | None
-    ) -> float | None:
+    ) -> SecondLook | None:
         """Read the load once more over ssh. None on anything unreadable, which withholds nothing.
 
         Through `ctx.runner`, like the twin gate's second look at the card: the runner owns the
@@ -428,7 +466,7 @@ class ProviderSideLoadCheck:
         if len(sections) != 3:
             return None
         jiffies_before, container_rows, jiffies_after = sections
-        return parse_resampled_cpu_cores(
+        return parse_second_look(
             jiffies_before, container_rows, jiffies_after, lium_container_keys
         )
 
@@ -458,6 +496,13 @@ class ProviderSideLoadCheck:
             "lium_named_outside_snapshot_cores": lium_named_cores_outside_snapshot(
                 ctx.state.specs or {}, lium_container_keys
             ),
+            # what the ssh reading measured, so the shadow week can tell a foreign workload from
+            # a Lium container that was never subtracted. None when the floor was never crossed.
+            "second_look": (
+                provider_side_load.second_look.to_specs_fields()
+                if provider_side_load.second_look is not None
+                else None
+            ),
         }
 
     async def measure_provider_side_load(
@@ -470,9 +515,11 @@ class ProviderSideLoadCheck:
         )
         if (measured.cpu_cores or 0.0) < PROVIDER_SIDE_CPU_CORES_LIMIT:
             return measured
+        second_look = await self._take_a_second_look(ctx, lium_container_keys)
+        if second_look is None:
+            return replace(measured, cpu_cores=None)
         return replace(
-            measured,
-            cpu_cores=await self._resample_cpu_cores(ctx, lium_container_keys),
+            measured, cpu_cores=second_look.provider_cores, second_look=second_look
         )
 
     async def run(self, ctx: Context) -> CheckResult:

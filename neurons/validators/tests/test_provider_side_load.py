@@ -41,6 +41,11 @@ SN13_SPECS = {
 
 # the same machine with the disk part removed, to judge the CPU verdict on its own
 CPU_ONLY_SPECS = {key: value for key, value in SN13_SPECS.items() if key != "hard_disk"}
+# a quiet machine: the floor is never crossed, so no ssh reading is taken
+SN13_SPECS_BELOW_FLOOR = {
+    "cpu": {"count": 32},
+    "docker": {"host_cpu_percent": 4.0, "containers": [{"name": "pod_renter", "cpu_percent": 20.0}]},
+}
 
 
 def test_provider_side_load_attributes_cpu_and_disk():
@@ -183,10 +188,11 @@ async def test_enforcement_zeroes_the_score_on_a_rented_machine(context_factory)
     assert result.updates["provider_side_load_passed"] is False
     assert result.event.reason_code == Msg.LOAD_ABOVE_LIMIT.reason
     assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
-    assert result.updates["state"].specs["provider_side_load"] == {
-        "cpu_cores": 8.9,
-        "disk_kb": 1528 * GB_KB,
-    }
+    stored = result.updates["state"].specs["provider_side_load"]
+    assert stored["cpu_cores"] == 8.9
+    assert stored["disk_kb"] == 1528 * GB_KB
+    # the readings behind the verdict travel with it
+    assert stored["host_cores"] == 10.6
 
 
 @pytest.mark.asyncio
@@ -639,3 +645,31 @@ async def test_a_miner_renamed_dockerd_is_capped_like_every_other_forged_name(co
 
     assert result.passed is False
     assert result.event.what_we_saw["provider_cpu_cores"] == 6.9  # 10.56 - 1.58 - 2.0 capped
+
+
+@pytest.mark.asyncio
+async def test_the_event_carries_what_the_second_look_measured(context_factory):
+    # The verdict alone cannot be argued with. These three numbers add up to it, so a shadow
+    # week can separate a foreign workload from a Lium container that was never subtracted.
+    ctx = context_factory(
+        state=_rented_state(CPU_ONLY_SPECS),
+        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0)], dockerd_cores=1.0),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    second_look = result.event.what_we_saw["second_look"]
+    assert second_look == {"host_cores": 10.6, "lium_container_cores": 1.6, "dockerd_cores": 1.0}
+    assert result.event.what_we_saw["provider_cpu_cores"] == 7.9  # 10.56 - 1.58 - 1.0
+    assert result.updates["state"].specs["provider_side_load"]["host_cores"] == 10.6
+
+
+@pytest.mark.asyncio
+async def test_a_node_below_the_floor_carries_no_second_look(context_factory):
+    ctx = context_factory(state=_rented_state(SN13_SPECS_BELOW_FLOOR))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.event.what_we_saw["second_look"] is None
