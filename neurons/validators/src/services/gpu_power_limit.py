@@ -621,7 +621,7 @@ async def record_cap_reverts(
             logging.WARNING,
             f"gpu power cap reverted on the host: executor={executor_id} pod={revert.pod_id} "
             f"gpu={revert.gpu_uuid} capped to {revert.capped_to_watts}W, "
-            f"found {revert.found_watts}W before restore",
+            f"found {revert.found_watts}W while the Lium job runs",
             {
                 "gpu_power_action": "revert_detected",
                 "executor_uuid": executor_id,
