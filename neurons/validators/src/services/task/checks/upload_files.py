@@ -63,11 +63,7 @@ class UploadFilesCheck:
                 check_id=self.check_id,
                 what={"python_path": ctx.executor.python_path},
             )
-            return CheckResult(
-                passed=True,
-                event=event,
-                updates={"state": replace(ctx.state, scrape_over_stdin=True)},
-            )
+            return CheckResult(passed=True, event=event)
 
         local_dir = ctx.state.upload_local_dir
         executor_root = ctx.config.executor_root

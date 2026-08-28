@@ -67,12 +67,12 @@ async def test_upload_files_check(
     if has_local_dir and has_executor_root:
         # SFTP should have been called
         assert ssh_client.sftp_client.put_called_with is not None
-        assert ssh_client.sftp_client.put_called_with["local_path"] == "/local/validator/files"
+        assert ssh_client.sftp_client.put_called_with.local_path == "/local/validator/files"
         # Remote path should be executor_root + random hex (32 chars)
-        remote_path = ssh_client.sftp_client.put_called_with["remote_path"]
+        remote_path = ssh_client.sftp_client.put_called_with.remote_path
         assert remote_path.startswith("/root/app/")
         assert len(remote_path) == len("/root/app/") + 32  # UUID hex is 32 chars
-        assert ssh_client.sftp_client.put_called_with["recurse"] is True
+        assert ssh_client.sftp_client.put_called_with.recurse is True
 
         # Verify state update on success
         if expected_pass:
@@ -107,5 +107,4 @@ async def test_upload_files_check_uploads_nothing_when_the_scrape_can_travel_as_
     assert result.passed is True
     assert result.event.reason_code == Msg.UPLOAD_SKIPPED.reason
     assert ssh_client.sftp_client.put_called_with is None
-    assert result.updates["state"].scrape_over_stdin is True
-    assert result.updates["state"].remote_dir is None
+    assert result.updates == {}

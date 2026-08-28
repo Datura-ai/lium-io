@@ -1,5 +1,8 @@
 import json
+from dataclasses import dataclass
 from datetime import datetime, UTC
+from typing import Any
+
 import pytest
 
 from neurons.validators.src.services.task.checks.machine_spec_scrape import (
@@ -9,7 +12,16 @@ from neurons.validators.src.services.task.checks.machine_spec_scrape import (
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
 
-from tests.helpers import DummySSHClient, build_context_config, build_services, build_state
+from tests.helpers import (
+    FERNET_TOKEN,
+    DummySSHClient,
+    build_context_config,
+    build_services,
+    build_state,
+)
+
+RAW_SPECS = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
+UNREADABLE_TOKEN = "gAAAAABnot-ours"
 
 
 # Mock SSH command result matching the real SSHCommandResult
@@ -36,17 +48,32 @@ def make_command_result(
     )
 
 
-# Mock SSHCommandRunner
+@dataclass(frozen=True)
+class RunCall:
+    command: str
+    timeout: int
+    retryable: bool
+    stdin_text: str | None
+
+
 class DummySSHCommandRunner:
-    def __init__(self, *, result: SSHCommandResult | None = None, results: list | None = None):
+    def __init__(
+        self,
+        *,
+        result: SSHCommandResult | None = None,
+        results: list[SSHCommandResult] | None = None,
+    ):
         """
         Args:
             result: The SSHCommandResult to return on every run() call
             results: One result per run() call, in order — for the stdin-then-binary fallback
         """
-        self.results = results if results is not None else [result]
-        self.calls: list[dict] = []
-        self.called_with: dict | None = None
+        self.results = results or [result]
+        self.calls: list[RunCall] = []
+
+    @property
+    def called_with(self) -> RunCall | None:
+        return self.calls[-1] if self.calls else None
 
     async def run(
         self,
@@ -55,21 +82,13 @@ class DummySSHCommandRunner:
         retryable: bool = False,
         stdin_text: str | None = None,
     ) -> SSHCommandResult:
-        """Mock method that mimics the real SSH command runner."""
-        # Track what parameters we were called with
-        self.called_with = {
-            "command": command,
-            "timeout": timeout,
-            "retryable": retryable,
-            "stdin_text": stdin_text,
-        }
-        self.calls.append(self.called_with)
+        self.calls.append(RunCall(command, timeout, retryable, stdin_text))
         return self.results[min(len(self.calls) - 1, len(self.results) - 1)]
 
 
 # Mock SSHService for decryption
 class DummySSHService:
-    def __init__(self, *, decrypted_data: dict, valid_payload: str | None = None):
+    def __init__(self, *, decrypted_data: dict[str, Any], valid_payload: str | None = None):
         """
         Args:
             decrypted_data: The decrypted machine specs to return
@@ -78,9 +97,11 @@ class DummySSHService:
         self.decrypted_data = decrypted_data
         self.valid_payload = valid_payload
         self.decrypt_called_with: dict | None = None
+        self.decrypt_call_count = 0
 
     def decrypt_payload(self, encrypt_key: str, payload: str) -> str:
         """Mock decrypt method - just returns JSON of our mock data."""
+        self.decrypt_call_count += 1
         self.decrypt_called_with = {
             "encrypt_key": encrypt_key,
             "payload": payload,
@@ -102,16 +123,10 @@ def test_normalize_gpu_details_canonicalizes_a10_alias():
 async def test_machine_spec_scrape_preserves_raw_a10_name_for_native_challenge(
     context_factory,
 ):
-    raw_specs = {
-        "gpu": {
-            "count": 1,
-            "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}],
-        },
-    }
     runner = DummySSHCommandRunner(
-        result=make_command_result(success=True, stdout="encrypted_payload_here")
+        result=make_command_result(success=True, stdout=FERNET_TOKEN)
     )
-    services = build_services(ssh=DummySSHService(decrypted_data=raw_specs))
+    services = build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS))
     config = build_context_config(
         machine_scrape_filename="scrape.sh",
         machine_scrape_timeout=300,
@@ -147,9 +162,9 @@ async def test_machine_spec_scrape_preserves_raw_a10_name_for_native_challenge(
         # Scrape succeeds but empty stdout - should fail
         (True, True, True, "", True, False, Msg.SCRAPE_FAILED.reason),
         # Scrape succeeds with valid output - should pass
-        (True, True, True, "encrypted_payload_here", True, True, Msg.SCRAPE_OK.reason),
+        (True, True, True, FERNET_TOKEN, True, True, Msg.SCRAPE_OK.reason),
         # Scrape succeeds but no encrypt_key - should fail (parse error)
-        (True, True, True, "encrypted_payload_here", False, False, Msg.SCRAPE_PARSE_FAILED.reason),
+        (True, True, True, FERNET_TOKEN, False, False, Msg.SCRAPE_PARSE_FAILED.reason),
     ],
 )
 @pytest.mark.asyncio
@@ -225,9 +240,9 @@ async def test_machine_spec_scrape_check(
     # Verify runner was called correctly (if we got that far)
     if has_remote_dir and has_script_filename:
         assert runner.called_with is not None
-        assert "chmod +x /remote/path/scrape.sh && /remote/path/scrape.sh" in runner.called_with["command"]
-        assert runner.called_with["timeout"] == 300
-        assert runner.called_with["retryable"] is False
+        assert "chmod +x /remote/path/scrape.sh && /remote/path/scrape.sh" in runner.called_with.command
+        assert runner.called_with.timeout == 300
+        assert runner.called_with.retryable is False
 
     # Verify state update on success
     if expected_pass:
@@ -252,22 +267,21 @@ async def test_machine_spec_scrape_check(
         # Verify decryption was called
         assert ssh_service.decrypt_called_with is not None
         assert ssh_service.decrypt_called_with["encrypt_key"] == "test-encrypt-key"
-        assert ssh_service.decrypt_called_with["payload"] == "encrypted_payload_here"
+        assert ssh_service.decrypt_called_with["payload"] == FERNET_TOKEN
 
 
 @pytest.mark.asyncio
 async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(context_factory):
     # Arrange
     source = "print('obfuscated scrape')"
-    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
     runner = DummySSHCommandRunner(
-        result=make_command_result(success=True, stdout="encrypted_payload_here")
+        result=make_command_result(success=True, stdout=FERNET_TOKEN)
     )
     ctx = context_factory(
-        services=build_services(ssh=DummySSHService(decrypted_data=raw_specs)),
+        services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
         config=build_context_config(machine_scrape_source=source),
         # No remote_dir: source delivery uploads nothing, so there is no directory to name.
-        state=build_state(scrape_over_stdin=True),
+        state=build_state(),
         runner=runner,
         encrypt_key="test-encrypt-key",
     )
@@ -277,25 +291,24 @@ async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(cont
 
     # Assert
     assert result.passed is True
-    assert runner.called_with["command"] == "/usr/bin/python -I -"
-    assert runner.called_with["stdin_text"] == source
+    assert runner.called_with.command == "/usr/bin/python -I -"
+    assert runner.called_with.stdin_text == source
 
 
 @pytest.mark.asyncio
-async def test_machine_spec_scrape_runs_the_uploaded_binary_when_stdin_was_not_chosen(
+async def test_machine_spec_scrape_runs_the_uploaded_binary_when_no_source_was_delivered(
     context_factory,
 ):
-    # The source is built every cycle, but only a state that says so puts this executor on the
-    # stdin path — with the flag off, UploadFilesCheck uploaded the binary and it is what runs.
+    # With ENABLE_SCRAPE_SOURCE_DELIVERY off the config carries no source, so UploadFilesCheck
+    # uploaded the binary and it is what runs.
     # Arrange
-    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
     runner = DummySSHCommandRunner(
-        result=make_command_result(success=True, stdout="encrypted_payload_here")
+        result=make_command_result(success=True, stdout=FERNET_TOKEN)
     )
     ctx = context_factory(
-        services=build_services(ssh=DummySSHService(decrypted_data=raw_specs)),
-        config=build_context_config(machine_scrape_source="print('scrape')"),
-        state=build_state(remote_dir="/remote/path", scrape_over_stdin=False),
+        services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
+        config=build_context_config(machine_scrape_source=None),
+        state=build_state(remote_dir="/remote/path"),
         runner=runner,
         encrypt_key="test-encrypt-key",
     )
@@ -305,8 +318,8 @@ async def test_machine_spec_scrape_runs_the_uploaded_binary_when_stdin_was_not_c
 
     # Assert
     assert result.passed is True
-    assert runner.called_with["command"] == "chmod +x /remote/path/scrape.sh && /remote/path/scrape.sh"
-    assert runner.called_with["stdin_text"] is None
+    assert runner.called_with.command == "chmod +x /remote/path/scrape.sh && /remote/path/scrape.sh"
+    assert runner.called_with.stdin_text is None
 
 
 @pytest.mark.asyncio
@@ -316,7 +329,6 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
     # DAH-2794: nothing was uploaded, and this executor's interpreter rejects the source —
     # missing psutil, wrong Python, a cryptography too old. The binary carries all of it.
     # Arrange
-    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
     runner = DummySSHCommandRunner(
         results=[
             make_command_result(
@@ -325,14 +337,14 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
                 stderr="ModuleNotFoundError: No module named 'psutil'",
                 duration_ms=1600,
             ),
-            make_command_result(success=True, stdout="encrypted_payload_here"),
+            make_command_result(success=True, stdout=FERNET_TOKEN),
         ]
     )
     ssh_client = DummySSHClient()
     ctx = context_factory(
-        services=build_services(ssh=DummySSHService(decrypted_data=raw_specs)),
+        services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
         config=build_context_config(machine_scrape_source="print('scrape')"),
-        state=build_state(scrape_over_stdin=True, upload_local_dir="/local/validator/files"),
+        state=build_state(upload_local_dir="/local/validator/files"),
         runner=runner,
         ssh=ssh_client,
         encrypt_key="test-encrypt-key",
@@ -344,16 +356,15 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
     # Assert
     assert result.passed is True
     assert result.event.reason_code == Msg.SCRAPE_OK.reason
-    assert [call["command"] for call in runner.calls] == [
+    assert [call.command for call in runner.calls] == [
         "/usr/bin/python -I -",
-        f"chmod +x {ssh_client.sftp_client.put_called_with['remote_path']}/scrape.sh"
-        f" && {ssh_client.sftp_client.put_called_with['remote_path']}/scrape.sh",
+        f"chmod +x {ssh_client.sftp_client.put_called_with.remote_path}/scrape.sh"
+        f" && {ssh_client.sftp_client.put_called_with.remote_path}/scrape.sh",
     ]
     assert result.event.what_we_saw["delivery"] == "upload"
     # The stdin failure is only visible here — its own event was discarded with the retry.
     assert result.event.what_we_saw["fallback_from"]["reason"] == Msg.SCRAPE_FAILED.reason
     assert "psutil" in result.event.what_we_saw["fallback_from"]["stderr_tail"]
-    assert result.updates["state"].remote_dir == ssh_client.sftp_client.put_called_with["remote_path"]
 
 
 @pytest.mark.parametrize("duration_ms", [60_001, 240_000])
@@ -373,7 +384,7 @@ async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_failure_was_
     ctx = context_factory(
         services=build_services(),
         config=build_context_config(machine_scrape_source="print('scrape')"),
-        state=build_state(scrape_over_stdin=True, upload_local_dir="/local/validator/files"),
+        state=build_state(upload_local_dir="/local/validator/files"),
         runner=runner,
         ssh=ssh_client,
         encrypt_key="test-encrypt-key",
@@ -390,28 +401,25 @@ async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_failure_was_
     assert ssh_client.sftp_client.put_called_with is None
 
 
-@pytest.mark.parametrize("over_stdin", [True, False])
+@pytest.mark.parametrize("machine_scrape_source", ["print('scrape')", None])
 @pytest.mark.asyncio
 async def test_machine_spec_scrape_finds_the_payload_among_other_stdout_lines(
-    over_stdin, context_factory
+    machine_scrape_source, context_factory
 ):
     # The image decides what else lands on stdout — a .pth prints before the scrape, an atexit
     # handler after it. Neither the first nor the last line is a safe bet on either path.
     # Arrange
-    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
-    ssh_service = DummySSHService(
-        decrypted_data=raw_specs, valid_payload="encrypted_payload_here"
-    )
+    ssh_service = DummySSHService(decrypted_data=RAW_SPECS, valid_payload=FERNET_TOKEN)
     runner = DummySSHCommandRunner(
         result=make_command_result(
             success=True,
-            stdout="sitecustomize: loaded\nencrypted_payload_here\nExiting worker thread",
+            stdout=f"sitecustomize: loaded\n{FERNET_TOKEN}\nExiting worker thread",
         )
     )
     ctx = context_factory(
         services=build_services(ssh=ssh_service),
-        config=build_context_config(machine_scrape_source="print('scrape')"),
-        state=build_state(scrape_over_stdin=over_stdin, remote_dir="/remote/path"),
+        config=build_context_config(machine_scrape_source=machine_scrape_source),
+        state=build_state(remote_dir="/remote/path"),
         runner=runner,
         encrypt_key="test-encrypt-key",
     )
@@ -431,21 +439,20 @@ async def test_machine_spec_scrape_falls_back_when_the_stdin_payload_will_not_de
     # The failure mode a probe cannot see: the modules import, the scrape runs, and the token it
     # produces is not one this validator can read.
     # Arrange
-    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
     ssh_service = DummySSHService(
-        decrypted_data=raw_specs, valid_payload="encrypted_payload_here"
+        decrypted_data=RAW_SPECS, valid_payload=FERNET_TOKEN
     )
     runner = DummySSHCommandRunner(
         results=[
-            make_command_result(success=True, stdout="unreadable_token", duration_ms=15_000),
-            make_command_result(success=True, stdout="encrypted_payload_here"),
+            make_command_result(success=True, stdout=UNREADABLE_TOKEN, duration_ms=15_000),
+            make_command_result(success=True, stdout=FERNET_TOKEN),
         ]
     )
     ssh_client = DummySSHClient()
     ctx = context_factory(
         services=build_services(ssh=ssh_service),
         config=build_context_config(machine_scrape_source="print('scrape')"),
-        state=build_state(scrape_over_stdin=True, upload_local_dir="/local/validator/files"),
+        state=build_state(upload_local_dir="/local/validator/files"),
         runner=runner,
         ssh=ssh_client,
         encrypt_key="test-encrypt-key",
@@ -461,7 +468,7 @@ async def test_machine_spec_scrape_falls_back_when_the_stdin_payload_will_not_de
     fallback_from = result.event.what_we_saw["fallback_from"]
     # exit 0 and an empty stderr say nothing here — the exception and the output are the evidence.
     assert fallback_from["reason"] == Msg.SCRAPE_PARSE_FAILED.reason
-    assert fallback_from["stdout_head"] == "unreadable_token"
+    assert fallback_from["stdout_head"] == UNREADABLE_TOKEN
 
 
 @pytest.mark.asyncio
@@ -476,7 +483,7 @@ async def test_machine_spec_scrape_reports_the_stdin_failure_when_the_fallback_u
     ctx = context_factory(
         services=build_services(),
         config=build_context_config(machine_scrape_source="print('scrape')"),
-        state=build_state(scrape_over_stdin=True, upload_local_dir="/local/validator/files"),
+        state=build_state(upload_local_dir="/local/validator/files"),
         runner=runner,
         ssh=ssh_client,
         encrypt_key="test-encrypt-key",
@@ -493,3 +500,66 @@ async def test_machine_spec_scrape_reports_the_stdin_failure_when_the_fallback_u
     # One attempt, not two: the retry the legacy path spends is what keeps 60 s + 300 s + 300 s
     # inside the per-executor timeout.
     assert ssh_client.sftp_client.put_call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_decrypts_nothing_but_the_token_on_a_spammed_stdout(
+    context_factory,
+):
+    # The miner decides how many lines land in front of the payload, and every decrypt runs on the
+    # event loop shared with the rest of the cycle — so only token-shaped lines are tried.
+    # Arrange
+    ssh_service = DummySSHService(decrypted_data=RAW_SPECS, valid_payload=FERNET_TOKEN)
+    noise = "\n".join(f"chatter {i}" for i in range(10_000))
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=True, stdout=f"{noise}\n{FERNET_TOKEN}")
+    )
+    ctx = context_factory(
+        services=build_services(ssh=ssh_service),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert ssh_service.decrypt_call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_scrape_reported_its_own_error(
+    context_factory,
+):
+    # The scrape printed its own failure and exited 1: the interpreter ran it, so uploading the
+    # binary would buy 13 MB and a second full run to be told the same thing.
+    # Arrange
+    runner = DummySSHCommandRunner(
+        result=make_command_result(
+            success=False,
+            exit_code=1,
+            stdout='{"error": "no_gpu_details"}',
+            duration_ms=40_000,
+        )
+    )
+    ssh_client = DummySSHClient()
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(upload_local_dir="/local/validator/files"),
+        runner=runner,
+        ssh=ssh_client,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is False
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert len(runner.calls) == 1
+    assert ssh_client.sftp_client.put_called_with is None

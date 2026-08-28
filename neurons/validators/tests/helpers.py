@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -54,22 +55,30 @@ def dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
     raise AssertionError(f"{dict_name} dict literal not found")
 
 
+# Every Fernet token is base64url of a 0x80 version byte, so all of them start with "gAAAAA" —
+# and MachineSpecScrapeCheck only tries to decrypt the stdout lines shaped like that.
+FERNET_TOKEN = "gAAAAABscrape-payload"
+
+
+@dataclass(frozen=True)
+class SFTPPutCall:
+    local_path: str
+    remote_path: str
+    recurse: bool
+
+
 class DummySFTPClient:
     """Mock SFTP client that simulates file upload."""
 
     def __init__(self, *, should_raise: bool = False, error_message: str = ""):
         self.should_raise = should_raise
         self.error_message = error_message
-        self.put_called_with: dict | None = None
+        self.put_called_with: SFTPPutCall | None = None
         self.put_call_count = 0
 
-    async def put(self, local_path: str, remote_path: str, recurse: bool = False):
+    async def put(self, local_path: str, remote_path: str, recurse: bool = False) -> None:
         self.put_call_count += 1
-        self.put_called_with = {
-            "local_path": local_path,
-            "remote_path": remote_path,
-            "recurse": recurse,
-        }
+        self.put_called_with = SFTPPutCall(local_path, remote_path, recurse)
         if self.should_raise:
             raise RuntimeError(self.error_message)
 

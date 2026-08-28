@@ -156,9 +156,9 @@ class MinerJobEnryptedFiles(BaseModel):
     all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
-    # DAH-2794: the same obfuscated source the binary was frozen from, carried alongside it so
-    # an executor that can run it needs no upload and one that cannot still gets the binary.
-    machine_scrape_source: str | None = None
+    # DAH-2794: the same obfuscated source the binary was frozen from, so a pipeline that can
+    # deliver it over stdin needs no upload and one that cannot still has the binary.
+    machine_scrape_source: str
     # score_file_name: str
 
 

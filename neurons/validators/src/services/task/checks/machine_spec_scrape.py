@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shlex
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -13,12 +13,24 @@ from services.gpu_spec_table import normalize_gpu_model
 from .network_ema import compute_ema
 from .upload_files import UploadFailed, upload_validation_files
 
-# DAH-2794: how late a failed stdin attempt may still be retried with the binary. Above a full
-# scrape (~15 s on a real box, so a payload that will not decrypt is only knowable around then),
-# below the point where the retry stops fitting: 60 s here + 300 s upload + 300 s scrape = 660 s
-# against the 780 s per-executor timeout. The upload gets one attempt for exactly that reason.
-FALLBACK_AFTER_MS = 60_000
+# DAH-2794: how long a failed stdin attempt may have taken and still be worth retrying with the
+# binary. Above a full scrape (~15 s on a real box, so a payload that will not decrypt is only
+# knowable around then), below the point where the retry stops fitting: 60 s here + 300 s upload
+# + 300 s scrape = 660 s against the 780 s per-executor timeout. The upload gets one attempt for
+# exactly that reason.
+FALLBACK_MAX_STDIN_DURATION_MS = 60_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
+
+# The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
+# with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
+# a 0x80 version byte, so this prefix separates ours from whatever the miner's image printed.
+FERNET_TOKEN_PREFIX = "gAAAAA"
+
+# How much stdout the miner puts in front of the scrape's own line is his choice, not a bounded
+# amount, so only the tail is searched and only so many candidates are decrypted — both run
+# synchronously on the event loop shared with every other executor in the cycle.
+STDOUT_SEARCH_TAIL_BYTES = 256 * 1024
+MAX_PAYLOAD_DECRYPT_ATTEMPTS = 20
 
 
 def _update_keys(data: Any, key_mapping: dict[str, str]) -> Any:
@@ -54,23 +66,42 @@ def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def _decrypt_payload(ctx: Context, stdout: str) -> str:
-    # find the scrape's ciphertext among the executor's stdout lines and decrypt it
+    # decrypt the scrape's Fernet token out of whatever else the executor printed
     #
-    # The payload is the scrape's own print, but the image decides what else lands on stdout: a
-    # .pth or sitecustomize prints before it, an atexit handler after it. Fernet authenticates, so
-    # a wrong line raises instead of decoding — trying them newest-first costs nothing and beats
+    # The token is the scrape's own print, but the image decides what surrounds it: a .pth or
+    # sitecustomize prints before it, an atexit handler after it. Searching newest-first beats
     # betting on a fixed position.
     if not ctx.encrypt_key:
         raise ValueError("Missing encrypt_key in context")
 
     last_exc: Exception | None = None
-    for line in reversed([ln.strip() for ln in stdout.splitlines() if ln.strip()]):
+    attempts = 0
+    for line in reversed(stdout[-STDOUT_SEARCH_TAIL_BYTES:].splitlines()):
+        candidate = line.strip()
+        if not candidate.startswith(FERNET_TOKEN_PREFIX):
+            continue
         try:
-            return ctx.services.ssh.decrypt_payload(ctx.encrypt_key, line)
+            return ctx.services.ssh.decrypt_payload(ctx.encrypt_key, candidate)
         except Exception as exc:
             last_exc = exc
+        attempts += 1
+        if attempts == MAX_PAYLOAD_DECRYPT_ATTEMPTS:
+            break
 
-    raise last_exc or ValueError("Scrape produced no output to decrypt")
+    raise last_exc or ValueError("No scrape payload on stdout")
+
+
+def _scrape_reported_its_own_failure(stdout: str) -> bool:
+    # the scrape prints {"error": ...} as its last line and exits non-zero when it ran but found
+    # nothing to report; a source the interpreter could not run prints nothing of ours at all
+    lines = [line for line in stdout[-STDOUT_SEARCH_TAIL_BYTES:].splitlines() if line.strip()]
+    if not lines:
+        return False
+    try:
+        report = json.loads(lines[-1])
+    except ValueError:
+        return False
+    return isinstance(report, dict) and "error" in report
 
 
 def _binary_command(remote_dir: str, script_filename: str) -> str:
@@ -94,7 +125,7 @@ class MachineSpecScrapeCheck:
     async def run(self, ctx: Context) -> CheckResult:
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
-        if ctx.state.scrape_over_stdin:
+        if ctx.config.machine_scrape_source:
             return await self._scrape_from_source(ctx, timeout)
         return await self._scrape_uploaded_binary(ctx, timeout)
 
@@ -106,21 +137,29 @@ class MachineSpecScrapeCheck:
         # json. It does not disable site processing: a .pth or sitecustomize inside the image
         # still runs and prints, which is what `_decrypt_payload` searches through.
         command = f"{shlex.quote(ctx.executor.python_path)} -I -"
-        res = await ctx.runner.run(
+        scrape_run = await ctx.runner.run(
             command,
             timeout=timeout,
             retryable=False,
             stdin_text=ctx.config.machine_scrape_source,
         )
-        result = self._result(ctx, res, delivery="stdin")
+        result = self._check_result_from_scrape_run(ctx, scrape_run, delivery="stdin")
         if result.passed:
             return result
 
         # The source did not run here: wrong interpreter, no psutil, or a cryptography too old
         # to produce a token this validator can read. The binary carries its own interpreter and
-        # every dependency, so retry with it. Only up to FALLBACK_AFTER_MS, though — past that the
-        # scrape hung rather than failed to start, and the binary runs the very same code.
-        if res.duration_ms > FALLBACK_AFTER_MS or not ctx.config.machine_scrape_filename:
+        # every dependency, so retry with it — but past FALLBACK_MAX_STDIN_DURATION_MS the scrape
+        # hung rather than failed to start, and the binary runs the very same code.
+        if (
+            scrape_run.duration_ms > FALLBACK_MAX_STDIN_DURATION_MS
+            or not ctx.config.machine_scrape_filename
+        ):
+            return result
+
+        # The scrape reporting its own failure (no GPU details, for one) means the interpreter
+        # ran it, so the binary would print the same thing for the price of a 13 MB upload.
+        if scrape_run.exit_code != 0 and _scrape_reported_its_own_failure(scrape_run.stdout):
             return result
 
         # The stdin attempt's own event is discarded with the retry, so carry it whole: a run that
@@ -142,13 +181,13 @@ class MachineSpecScrapeCheck:
             )
             return CheckResult(passed=False, event=event)
 
-        res = await ctx.runner.run(
+        scrape_run = await ctx.runner.run(
             _binary_command(remote_dir, ctx.config.machine_scrape_filename),
             timeout=timeout,
             retryable=False,
         )
-        return self._result(
-            ctx, res, delivery="upload", remote_dir=remote_dir, fallback_from=fallback_from
+        return self._check_result_from_scrape_run(
+            ctx, scrape_run, delivery="upload", fallback_from=fallback_from
         )
 
     async def _scrape_uploaded_binary(self, ctx: Context, timeout: int) -> CheckResult:
@@ -172,42 +211,40 @@ class MachineSpecScrapeCheck:
             )
             return CheckResult(passed=False, event=event)
 
-        res = await ctx.runner.run(
+        scrape_run = await ctx.runner.run(
             _binary_command(remote_dir, script_filename), timeout=timeout, retryable=False
         )
-        return self._result(ctx, res, delivery="upload")
+        return self._check_result_from_scrape_run(ctx, scrape_run, delivery="upload")
 
-    def _result(
+    def _check_result_from_scrape_run(
         self,
         ctx: Context,
-        res: SSHCommandResult,
+        scrape_run: SSHCommandResult,
         *,
-        delivery: str,
-        remote_dir: str | None = None,
+        delivery: Literal["stdin", "upload"],
         fallback_from: dict[str, Any] | None = None,
     ) -> CheckResult:
-        # turn one scrape run into specs on the state, or into the event that says why not
         what: dict[str, Any] = {"delivery": delivery}
         if fallback_from:
             what["fallback_from"] = fallback_from
 
-        if not res.success or not res.stdout.strip():
+        if not scrape_run.success or not scrape_run.stdout.strip():
             event = render_message(
                 Msg.SCRAPE_FAILED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
                     **what,
-                    "command_id": res.command_id,
-                    "exit_code": res.exit_code,
-                    "duration_ms": res.duration_ms,
-                    "stderr_tail": res.stderr[-400:],
+                    "command_id": scrape_run.command_id,
+                    "exit_code": scrape_run.exit_code,
+                    "duration_ms": scrape_run.duration_ms,
+                    "stderr_tail": scrape_run.stderr[-400:],
                 },
             )
             return CheckResult(passed=False, event=event)
 
         try:
-            decrypted = _decrypt_payload(ctx, res.stdout)
+            decrypted = _decrypt_payload(ctx, scrape_run.stdout)
             raw = json.loads(decrypted)
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)
@@ -276,11 +313,6 @@ class MachineSpecScrapeCheck:
                 gpu_model_count=gpu_model_count,
                 gpu_uuids=gpu_uuids,
             )
-            if remote_dir:
-                updated_state = replace(
-                    updated_state, remote_dir=remote_dir, upload_remote_dir=remote_dir
-                )
-
             updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
             return CheckResult(passed=True, event=event, updates=updates)
 
@@ -289,6 +321,6 @@ class MachineSpecScrapeCheck:
                 Msg.SCRAPE_PARSE_FAILED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={**what, "exception": str(exc)[:300], "stdout_head": res.stdout[:200]},
+                what={**what, "exception": str(exc)[:300], "stdout_head": scrape_run.stdout[:200]},
             )
             return CheckResult(passed=False, event=event)
