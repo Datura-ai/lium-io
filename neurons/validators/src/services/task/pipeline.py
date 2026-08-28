@@ -84,6 +84,9 @@ class ContextConfig:
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
+    # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
+    # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
+    machine_scrape_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,9 @@ class ContextState:
     upload_local_dir: Optional[str] = None
     upload_remote_dir: Optional[str] = None
     remote_dir: Optional[str] = None
+    # DAH-2794: set by UploadFilesCheck once it has established that this executor's own
+    # interpreter can run the scrape. True => nothing was uploaded, the source goes over stdin.
+    scrape_over_stdin: bool = False
     specs: dict[str, Any] = field(default_factory=dict)
     gpu_model: Optional[str] = None
     gpu_count: Optional[int] = None

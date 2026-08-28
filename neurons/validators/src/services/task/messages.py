@@ -98,6 +98,13 @@ class UploadFilesMessages:
         category="prep",
         impact="Proceed to validation",
     )
+    UPLOAD_SKIPPED = MessageTemplate(
+        event="Validation files not uploaded",
+        reason="UPLOAD_SKIPPED",
+        severity="info",
+        category="prep",
+        impact="Proceed to validation",
+    )
     UPLOAD_FAILED = MessageTemplate(
         event="Failed to upload validation files",
         reason="UPLOAD_FAILED",

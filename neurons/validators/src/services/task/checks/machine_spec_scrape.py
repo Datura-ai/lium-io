@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from dataclasses import replace
 from typing import Any
 
@@ -60,30 +61,42 @@ class MachineSpecScrapeCheck:
     async def run(self, ctx: Context) -> CheckResult:
         runner: SSHCommandRunner = ctx.runner
 
-        remote_dir = ctx.state.remote_dir
-
-        if not remote_dir:
-            event = render_message(
-                Msg.REMOTE_DIR_MISSING,
-                ctx=ctx,
-                check_id=self.check_id,
-            )
-            return CheckResult(passed=False, event=event)
-
-        script_filename = ctx.config.machine_scrape_filename
-        if not script_filename:
-            event = render_message(
-                Msg.CONFIG_MISSING,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={"machine_scrape_filename": script_filename},
-            )
-            return CheckResult(passed=False, event=event)
-
-        script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
+        source = ctx.config.machine_scrape_source if ctx.state.scrape_over_stdin else None
 
-        res = await runner.run(f"chmod +x {script_path} && {script_path}", timeout=timeout, retryable=False)
+        if source:
+            # DAH-2794: nothing was uploaded — the source goes down stdin instead. `-I` implies
+            # -E -s -P, which drops PYTHONPATH, the user site-dir and the cwd entry from
+            # sys.path, so a file left next to the SSH login shell cannot shadow psutil or json.
+            # It does not disable site processing: a .pth or sitecustomize inside the image still
+            # runs, which is why the payload is read off the last line rather than the first.
+            command = f"{shlex.quote(ctx.executor.python_path)} -I -"
+        else:
+            remote_dir = ctx.state.remote_dir
+
+            if not remote_dir:
+                event = render_message(
+                    Msg.REMOTE_DIR_MISSING,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                )
+                return CheckResult(passed=False, event=event)
+
+            script_filename = ctx.config.machine_scrape_filename
+            if not script_filename:
+                event = render_message(
+                    Msg.CONFIG_MISSING,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"machine_scrape_filename": script_filename},
+                )
+                return CheckResult(passed=False, event=event)
+
+            script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
+            command = f"chmod +x {script_path} && {script_path}"
+
+        delivery = "stdin" if source else "upload"
+        res = await runner.run(command, timeout=timeout, retryable=False, stdin_text=source)
 
         if not res.success or not res.stdout.strip():
             event = render_message(
@@ -94,13 +107,16 @@ class MachineSpecScrapeCheck:
                     "command_id": res.command_id,
                     "exit_code": res.exit_code,
                     "duration_ms": res.duration_ms,
+                    "delivery": delivery,
                     "stderr_tail": res.stderr[-400:],
                 },
             )
             return CheckResult(passed=False, event=event)
 
         try:
-            line = res.stdout.splitlines()[0].strip()
+            # Last line, not first: the payload is the scrape's final print, and a .pth or
+            # sitecustomize in the executor image can put its own line in front of it.
+            line = [ln for ln in res.stdout.splitlines() if ln.strip()][-1].strip()
             if not ctx.encrypt_key:
                 raise ValueError("Missing encrypt_key in context")
 
@@ -155,6 +171,7 @@ class MachineSpecScrapeCheck:
                 what={
                     "gpu_count": gpu_count,
                     "gpu_model": gpu_model,
+                    "delivery": delivery,
                     "network": specs.get("network"),
                 },
                 extra=extra_info,

@@ -119,7 +119,7 @@ class DummySSHCommandRunner:
         self.machine_specs_encrypted = machine_specs_encrypted
         self.commands_called = []
 
-    async def run(self, command: str, timeout: int = 300, retryable: bool = False):
+    async def run(self, command: str, timeout: int = 300, retryable: bool = False, stdin_text=None):
         self.commands_called.append(command)
 
         from neurons.validators.src.services.task.runner import SSHCommandResult

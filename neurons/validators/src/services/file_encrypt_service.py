@@ -12,6 +12,7 @@ import PyInstaller.__main__
 from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles
 
+from core.config import settings
 from services.ssh_service import SSHService
 
 # ORDER IS LOAD-BEARING: machine_scrape derives its encryption key from the literal key order of
@@ -411,4 +412,8 @@ class FileEncryptService:
             all_keys=all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
+            # DAH-2794: an executor that can run this source needs no upload at all. The binary
+            # stays built because the miner picks the executor image, and one that predates a
+            # dependency the scrape imports has to keep the self-contained path.
+            machine_scrape_source=obfuscated_content if settings.ENABLE_SCRAPE_SOURCE_DELIVERY else None,
         )

@@ -45,13 +45,20 @@ class DummySSHCommandRunner:
         self.result = result
         self.called_with: dict | None = None
 
-    async def run(self, command: str, timeout: int = 300, retryable: bool = False) -> SSHCommandResult:
+    async def run(
+        self,
+        command: str,
+        timeout: int = 300,
+        retryable: bool = False,
+        stdin_text: str | None = None,
+    ) -> SSHCommandResult:
         """Mock method that mimics the real SSH command runner."""
         # Track what parameters we were called with
         self.called_with = {
             "command": command,
             "timeout": timeout,
             "retryable": retryable,
+            "stdin_text": stdin_text,
         }
         return self.result
 
@@ -238,3 +245,57 @@ async def test_machine_spec_scrape_check(
         assert ssh_service.decrypt_called_with is not None
         assert ssh_service.decrypt_called_with["encrypt_key"] == "test-encrypt-key"
         assert ssh_service.decrypt_called_with["payload"] == "encrypted_payload_here"
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(context_factory):
+    # Arrange
+    source = "print('obfuscated scrape')"
+    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=True, stdout="encrypted_payload_here")
+    )
+    ctx = context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data=raw_specs)),
+        config=build_context_config(machine_scrape_source=source),
+        # No remote_dir: source delivery uploads nothing, so there is no directory to name.
+        state=build_state(scrape_over_stdin=True),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert runner.called_with["command"] == "/usr/bin/python -I -"
+    assert runner.called_with["stdin_text"] == source
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_runs_the_uploaded_binary_when_stdin_was_not_chosen(
+    context_factory,
+):
+    # The source is built every cycle, but an executor whose interpreter failed the probe keeps
+    # the uploaded binary — the flag alone must not put it on the stdin path.
+    # Arrange
+    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=True, stdout="encrypted_payload_here")
+    )
+    ctx = context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data=raw_specs)),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(remote_dir="/remote/path", scrape_over_stdin=False),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert runner.called_with["command"] == "chmod +x /remote/path/scrape.sh && /remote/path/scrape.sh"
+    assert runner.called_with["stdin_text"] is None

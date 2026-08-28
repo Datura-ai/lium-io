@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import uuid
 from dataclasses import replace
 
 from ..messages import UploadFilesMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+
+PROBE_TIMEOUT = 30
 
 
 class UploadFilesCheck:
@@ -22,6 +25,22 @@ class UploadFilesCheck:
         local_dir = ctx.state.upload_local_dir
         executor_root = ctx.config.executor_root
         DEFAULT_TIMEOUT = 300
+
+        # DAH-2794: the scrape can travel down stdin instead of being uploaded, but only to an
+        # executor whose interpreter can actually run it. The miner picks the executor image, so
+        # that is a per-node question and it is asked here, not assumed from the flag.
+        if ctx.config.machine_scrape_source and await self._can_run_source(ctx):
+            event = render_message(
+                Msg.UPLOAD_SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"python_path": ctx.executor.python_path},
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={"state": replace(ctx.state, scrape_over_stdin=True)},
+            )
 
         if not local_dir or not executor_root:
             event = render_message(
@@ -83,3 +102,14 @@ class UploadFilesCheck:
             what={"error": str(last_exc)[:200]},
         )
         return CheckResult(passed=False, event=event)
+
+    async def _can_run_source(self, ctx: Context) -> bool:
+        # Cheap, per-cycle: one round trip, no bytes. Names exactly what the scrape imports —
+        # an image predating either dependency cannot run the source and must get the binary.
+        python_path = ctx.executor.python_path
+        if not python_path:
+            return False
+
+        probe = f"{shlex.quote(python_path)} -I -c 'import psutil, cryptography.fernet'"
+        res = await ctx.runner.run(probe, timeout=PROBE_TIMEOUT, retryable=False)
+        return res.success

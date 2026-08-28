@@ -210,6 +210,7 @@ class PipelineFactory:
                 compute_rest_app_url=settings.COMPUTE_REST_API_URL,
                 gpu_monitor_script_relative="src/gpus_utility.py",
                 machine_scrape_filename=encrypted_files.machine_scrape_file_name,
+                machine_scrape_source=encrypted_files.machine_scrape_source,
                 machine_scrape_timeout=JOB_LENGTH,
                 obfuscation_keys=encrypted_files.all_keys,
                 default_docker_image_digests=default_docker_image_digests,
