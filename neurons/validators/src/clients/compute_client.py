@@ -12,6 +12,7 @@ import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
+    DeliveryStamps,
     CancelStorageOperationRequest,
     RestoreContainerRequest,
     BaseServerRequest,
@@ -62,7 +63,6 @@ from protocol.vc_protocol.validator_requests import (
     RevenuePerGpuTypeRequest,
     ScorePortionPerGpuTypeRequest,
 )
-from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
 from core.config import settings
@@ -87,6 +87,11 @@ from clients.handlers.backup_handler import BackupHandler
 
 logger = logging.getLogger(__name__)
 
+# DAH-2792: the keepalive pong queues behind a scoring-cycle burst and missed the 20 s default;
+# mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
+WS_PING_INTERVAL = 20
+WS_PING_TIMEOUT = 40
+
 
 class AuthenticationError(Exception):
     def __init__(self, reason: str, errors: list[Error]):
@@ -108,7 +113,7 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.message_queue = []
+        self.message_queue: list[DeliveryStamps] = []
         self.lock = asyncio.Lock()
 
         self.logging_extra = {
@@ -130,7 +135,11 @@ class ComputeClient:
                 extra=get_extra_info(self.logging_extra)
             )
         )
-        return websockets.connect(self.compute_app_uri)
+        return websockets.connect(
+            self.compute_app_uri,
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
+        )
 
     async def miner_driver_awaiter(self):
         """avoid memory leak by awaiting miner driver tasks"""
@@ -336,6 +345,8 @@ class ComputeClient:
                             attestation_digest=data.get("attestation_digest"),
                             tdx_attestation_passed=data.get("tdx_attestation_passed"),
                             gpu_attestation_passed=data.get("gpu_attestation_passed"),
+                            sent_at=data.get("sent_at"),
+                            batch_total=data.get("batch_total"),
                         )
 
                         async with self.lock:
@@ -431,7 +442,10 @@ class ComputeClient:
         wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
         retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
     )
-    async def send_model(self, msg: BaseModel):
+    async def send_model(self, msg: DeliveryStamps):
+        # stamped inside the retry so a message resent after a reconnect reports its own delay
+        msg.forwarded_at = time.time()
+        msg.queue_depth = len(self.message_queue)
         await self.ws.send(msg.model_dump_json())
 
     async def handle_send_messages(self):

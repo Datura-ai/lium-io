@@ -758,6 +758,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
             ),
         )
+        batch_total = len(results)
         for result in results:
             try:
                 await self.redis_service.publish(
@@ -795,6 +796,8 @@ class MinerService:
                         "tee_type": result.tee_type,
                         "tdx_attestation_passed": result.tdx_attestation_passed,
                         "gpu_attestation_passed": result.gpu_attestation_passed,
+                        "sent_at": time.time(),
+                        "batch_total": batch_total,
                     },
                 )
             except Exception as e:
