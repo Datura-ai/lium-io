@@ -1,76 +1,9 @@
-from datetime import UTC, datetime
-
 import pytest
 
 from neurons.validators.src.services.task.checks.upload_files import UploadFilesCheck
 from neurons.validators.src.services.task.messages import UploadFilesMessages as Msg
-from neurons.validators.src.services.task.runner import SSHCommandResult
 
-from tests.helpers import build_context_config, build_services, build_state
-
-
-class DummySFTPClient:
-    """Mock SFTP client that simulates file upload."""
-
-    def __init__(self, *, should_raise: bool = False, error_message: str = ""):
-        self.should_raise = should_raise
-        self.error_message = error_message
-        self.put_called_with: dict | None = None
-
-    async def put(self, local_path: str, remote_path: str, recurse: bool = False):
-        """Mock method that simulates SFTP put operation."""
-        self.put_called_with = {
-            "local_path": local_path,
-            "remote_path": remote_path,
-            "recurse": recurse,
-        }
-
-        if self.should_raise:
-            raise RuntimeError(self.error_message)
-
-
-class DummyProbeRunner:
-    """Answers the interpreter probe UploadFilesCheck runs before it skips the upload."""
-
-    def __init__(self, *, success: bool):
-        self.success = success
-        self.commands: list[str] = []
-
-    async def run(self, command: str, timeout: int = 300, retryable: bool = False, stdin_text=None):
-        self.commands.append(command)
-        return SSHCommandResult(
-            command=command,
-            command_id="probe",
-            exit_code=0 if self.success else 1,
-            stdout="",
-            stderr="",
-            duration_ms=1,
-            started_at=datetime.now(UTC),
-            finished_at=datetime.now(UTC),
-            success=self.success,
-        )
-
-
-class DummySSHClient:
-    """Mock SSH client that provides SFTP access."""
-
-    def __init__(self, *, sftp_should_raise: bool = False, sftp_error: str = ""):
-        self.sftp_client = DummySFTPClient(
-            should_raise=sftp_should_raise,
-            error_message=sftp_error,
-        )
-
-    def start_sftp_client(self):
-        """Return an async context manager for SFTP."""
-        return self
-
-    async def __aenter__(self):
-        """Enter the async context - return the SFTP client."""
-        return self.sftp_client
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Exit the async context."""
-        pass
+from tests.helpers import DummySSHClient, build_context_config, build_services, build_state
 
 
 @pytest.mark.parametrize(
@@ -152,20 +85,18 @@ async def test_upload_files_check(
         assert ssh_client.sftp_client.put_called_with is None
 
 
-@pytest.mark.parametrize("probe_succeeds", [True, False])
 @pytest.mark.asyncio
-async def test_upload_files_check_uploads_only_when_the_executor_cannot_run_the_source(
-    probe_succeeds,
+async def test_upload_files_check_uploads_nothing_when_the_scrape_can_travel_as_source(
     context_factory,
 ):
+    # DAH-2794: no probe, no round trip — whether this executor can run the source is answered
+    # by MachineSpecScrapeCheck actually running it, and it uploads the binary if it cannot.
     # Arrange
     ssh_client = DummySSHClient()
-    runner = DummyProbeRunner(success=probe_succeeds)
     ctx = context_factory(
         services=build_services(),
         config=build_context_config(machine_scrape_source="print('scrape')"),
         state=build_state(upload_local_dir="/local/validator/files"),
-        runner=runner,
         ssh=ssh_client,
     )
 
@@ -174,14 +105,7 @@ async def test_upload_files_check_uploads_only_when_the_executor_cannot_run_the_
 
     # Assert
     assert result.passed is True
-    assert runner.commands == ["/usr/bin/python -I -c 'import psutil, cryptography.fernet'"]
-    if probe_succeeds:
-        assert result.event.reason_code == Msg.UPLOAD_SKIPPED.reason
-        assert ssh_client.sftp_client.put_called_with is None
-        assert result.updates["state"].scrape_over_stdin is True
-        assert result.updates["state"].remote_dir is None
-    else:
-        assert result.event.reason_code == Msg.UPLOAD_OK.reason
-        assert ssh_client.sftp_client.put_called_with is not None
-        assert result.updates["state"].scrape_over_stdin is False
-        assert result.updates["state"].remote_dir is not None
+    assert result.event.reason_code == Msg.UPLOAD_SKIPPED.reason
+    assert ssh_client.sftp_client.put_called_with is None
+    assert result.updates["state"].scrape_over_stdin is True
+    assert result.updates["state"].remote_dir is None

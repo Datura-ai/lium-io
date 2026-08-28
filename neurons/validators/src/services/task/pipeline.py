@@ -94,8 +94,8 @@ class ContextState:
     upload_local_dir: Optional[str] = None
     upload_remote_dir: Optional[str] = None
     remote_dir: Optional[str] = None
-    # DAH-2794: set by UploadFilesCheck once it has established that this executor's own
-    # interpreter can run the scrape. True => nothing was uploaded, the source goes over stdin.
+    # DAH-2794: set by UploadFilesCheck when the scrape source is available. True => nothing was
+    # uploaded; MachineSpecScrapeCheck pipes the source in and uploads the binary only if it fails.
     scrape_over_stdin: bool = False
     specs: dict[str, Any] = field(default_factory=dict)
     gpu_model: Optional[str] = None

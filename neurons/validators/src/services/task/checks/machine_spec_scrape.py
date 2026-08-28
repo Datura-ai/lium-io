@@ -7,10 +7,15 @@ from typing import Any
 
 from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from ..runner import SSHCommandRunner
+from ..runner import SSHCommandResult
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
 from .network_ema import compute_ema
+from .upload_files import UploadFailed, upload_validation_files
+
+# DAH-2794: how fast the stdin attempt must fail for the binary fallback to still fit the
+# 780 s per-executor budget. An interpreter that cannot run the source rejects it in ~2 s.
+FALLBACK_AFTER_MS = 60_000
 
 
 def _update_keys(data: Any, key_mapping: dict[str, str]) -> Any:
@@ -45,6 +50,11 @@ def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, 
     ]
 
 
+def _binary_command(remote_dir: str, script_filename: str) -> str:
+    script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
+    return f"chmod +x {script_path} && {script_path}"
+
+
 class MachineSpecScrapeCheck:
     """Run the obfuscated scrape script and unpack the executor's hardware profile.
 
@@ -59,44 +69,108 @@ class MachineSpecScrapeCheck:
     DEFAULT_TIMEOUT = 300
 
     async def run(self, ctx: Context) -> CheckResult:
-        runner: SSHCommandRunner = ctx.runner
-
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
-        source = ctx.config.machine_scrape_source if ctx.state.scrape_over_stdin else None
 
-        if source:
-            # DAH-2794: nothing was uploaded — the source goes down stdin instead. `-I` implies
-            # -E -s -P, which drops PYTHONPATH, the user site-dir and the cwd entry from
-            # sys.path, so a file left next to the SSH login shell cannot shadow psutil or json.
-            # It does not disable site processing: a .pth or sitecustomize inside the image still
-            # runs, which is why the payload is read off the last line rather than the first.
-            command = f"{shlex.quote(ctx.executor.python_path)} -I -"
-        else:
-            remote_dir = ctx.state.remote_dir
+        if ctx.state.scrape_over_stdin:
+            return await self._scrape_from_source(ctx, timeout)
+        return await self._scrape_uploaded_binary(ctx, timeout)
 
-            if not remote_dir:
-                event = render_message(
-                    Msg.REMOTE_DIR_MISSING,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                )
-                return CheckResult(passed=False, event=event)
+    async def _scrape_from_source(self, ctx: Context, timeout: int) -> CheckResult:
+        # pipe the obfuscated source into the executor's own interpreter; binary on failure
+        #
+        # `-I` implies -E -s -P, which drops PYTHONPATH, the user site-dir and the cwd entry
+        # from sys.path, so a file left next to the SSH login shell cannot shadow psutil or
+        # json. It does not disable site processing: a .pth or sitecustomize inside the image
+        # still runs, which is why the payload is read off the last line rather than the first.
+        command = f"{shlex.quote(ctx.executor.python_path)} -I -"
+        res = await ctx.runner.run(
+            command,
+            timeout=timeout,
+            retryable=False,
+            stdin_text=ctx.config.machine_scrape_source,
+        )
+        result = self._result(ctx, res, delivery="stdin")
+        if result.passed:
+            return result
 
-            script_filename = ctx.config.machine_scrape_filename
-            if not script_filename:
-                event = render_message(
-                    Msg.CONFIG_MISSING,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={"machine_scrape_filename": script_filename},
-                )
-                return CheckResult(passed=False, event=event)
+        # The source did not run here: wrong interpreter, no psutil, or a cryptography too old
+        # to produce a token this validator can read. The binary carries its own interpreter and
+        # every dependency, so retry with it. Only after a fast failure, though — a slow one
+        # means the scrape got past its cheap part, and a second full attempt plus the upload
+        # would not fit the per-executor budget.
+        if res.duration_ms > FALLBACK_AFTER_MS or not ctx.config.machine_scrape_filename:
+            return result
 
-            script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
-            command = f"chmod +x {script_path} && {script_path}"
+        fallback_from = {
+            "reason": result.event.reason_code,
+            "exit_code": res.exit_code,
+            "duration_ms": res.duration_ms,
+            "stderr_tail": res.stderr[-200:],
+        }
 
-        delivery = "stdin" if source else "upload"
-        res = await runner.run(command, timeout=timeout, retryable=False, stdin_text=source)
+        try:
+            remote_dir = await upload_validation_files(ctx)
+        except UploadFailed as exc:
+            event = render_message(
+                Msg.SCRAPE_FAILED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "delivery": "stdin",
+                    "fallback_from": fallback_from,
+                    "fallback_upload_error": str(exc),
+                },
+            )
+            return CheckResult(passed=False, event=event)
+
+        res = await ctx.runner.run(
+            _binary_command(remote_dir, ctx.config.machine_scrape_filename),
+            timeout=timeout,
+            retryable=False,
+        )
+        return self._result(
+            ctx, res, delivery="upload", remote_dir=remote_dir, fallback_from=fallback_from
+        )
+
+    async def _scrape_uploaded_binary(self, ctx: Context, timeout: int) -> CheckResult:
+        # run the frozen scrape that UploadFilesCheck put on the executor
+        remote_dir = ctx.state.remote_dir
+        if not remote_dir:
+            event = render_message(
+                Msg.REMOTE_DIR_MISSING,
+                ctx=ctx,
+                check_id=self.check_id,
+            )
+            return CheckResult(passed=False, event=event)
+
+        script_filename = ctx.config.machine_scrape_filename
+        if not script_filename:
+            event = render_message(
+                Msg.CONFIG_MISSING,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"machine_scrape_filename": script_filename},
+            )
+            return CheckResult(passed=False, event=event)
+
+        res = await ctx.runner.run(
+            _binary_command(remote_dir, script_filename), timeout=timeout, retryable=False
+        )
+        return self._result(ctx, res, delivery="upload")
+
+    def _result(
+        self,
+        ctx: Context,
+        res: SSHCommandResult,
+        *,
+        delivery: str,
+        remote_dir: str | None = None,
+        fallback_from: dict[str, Any] | None = None,
+    ) -> CheckResult:
+        # turn one scrape run into specs on the state, or into the event that says why not
+        what: dict[str, Any] = {"delivery": delivery}
+        if fallback_from:
+            what["fallback_from"] = fallback_from
 
         if not res.success or not res.stdout.strip():
             event = render_message(
@@ -104,10 +178,10 @@ class MachineSpecScrapeCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
+                    **what,
                     "command_id": res.command_id,
                     "exit_code": res.exit_code,
                     "duration_ms": res.duration_ms,
-                    "delivery": delivery,
                     "stderr_tail": res.stderr[-400:],
                 },
             )
@@ -169,9 +243,9 @@ class MachineSpecScrapeCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
+                    **what,
                     "gpu_count": gpu_count,
                     "gpu_model": gpu_model,
-                    "delivery": delivery,
                     "network": specs.get("network"),
                 },
                 extra=extra_info,
@@ -189,6 +263,10 @@ class MachineSpecScrapeCheck:
                 gpu_model_count=gpu_model_count,
                 gpu_uuids=gpu_uuids,
             )
+            if remote_dir:
+                updated_state = replace(
+                    updated_state, remote_dir=remote_dir, upload_remote_dir=remote_dir
+                )
 
             updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
             return CheckResult(passed=True, event=event, updates=updates)
@@ -198,6 +276,6 @@ class MachineSpecScrapeCheck:
                 Msg.SCRAPE_PARSE_FAILED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"exception": str(exc)[:300], "stdout_head": res.stdout[:200]},
+                what={**what, "exception": str(exc)[:300], "stdout_head": res.stdout[:200]},
             )
             return CheckResult(passed=False, event=event)

@@ -9,7 +9,7 @@ from neurons.validators.src.services.task.checks.machine_spec_scrape import (
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
 
-from tests.helpers import build_context_config, build_services, build_state
+from tests.helpers import DummySSHClient, build_context_config, build_services, build_state
 
 
 # Mock SSH command result matching the real SSHCommandResult
@@ -19,6 +19,7 @@ def make_command_result(
     stderr: str = "",
     exit_code: int = 0,
     command: str = "test command",
+    duration_ms: int = 100,
 ) -> SSHCommandResult:
     """Helper to create mock SSH command results."""
     return SSHCommandResult(
@@ -27,7 +28,7 @@ def make_command_result(
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
-        duration_ms=100,
+        duration_ms=duration_ms,
         started_at=datetime.now(UTC),
         finished_at=datetime.now(UTC),
         success=success,
@@ -37,12 +38,14 @@ def make_command_result(
 
 # Mock SSHCommandRunner
 class DummySSHCommandRunner:
-    def __init__(self, *, result: SSHCommandResult):
+    def __init__(self, *, result: SSHCommandResult | None = None, results: list | None = None):
         """
         Args:
-            result: The SSHCommandResult to return when run() is called
+            result: The SSHCommandResult to return on every run() call
+            results: One result per run() call, in order — for the stdin-then-binary fallback
         """
-        self.result = result
+        self.results = results if results is not None else [result]
+        self.calls: list[dict] = []
         self.called_with: dict | None = None
 
     async def run(
@@ -60,7 +63,8 @@ class DummySSHCommandRunner:
             "retryable": retryable,
             "stdin_text": stdin_text,
         }
-        return self.result
+        self.calls.append(self.called_with)
+        return self.results[min(len(self.calls) - 1, len(self.results) - 1)]
 
 
 # Mock SSHService for decryption
@@ -277,8 +281,8 @@ async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(cont
 async def test_machine_spec_scrape_runs_the_uploaded_binary_when_stdin_was_not_chosen(
     context_factory,
 ):
-    # The source is built every cycle, but an executor whose interpreter failed the probe keeps
-    # the uploaded binary — the flag alone must not put it on the stdin path.
+    # The source is built every cycle, but only a state that says so puts this executor on the
+    # stdin path — with the flag off, UploadFilesCheck uploaded the binary and it is what runs.
     # Arrange
     raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
     runner = DummySSHCommandRunner(
@@ -299,3 +303,81 @@ async def test_machine_spec_scrape_runs_the_uploaded_binary_when_stdin_was_not_c
     assert result.passed is True
     assert runner.called_with["command"] == "chmod +x /remote/path/scrape.sh && /remote/path/scrape.sh"
     assert runner.called_with["stdin_text"] is None
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_run(
+    context_factory,
+):
+    # DAH-2794: nothing was uploaded, and this executor's interpreter rejects the source —
+    # missing psutil, wrong Python, a cryptography too old. The binary carries all of it.
+    # Arrange
+    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
+    runner = DummySSHCommandRunner(
+        results=[
+            make_command_result(
+                success=False,
+                exit_code=1,
+                stderr="ModuleNotFoundError: No module named 'psutil'",
+                duration_ms=1600,
+            ),
+            make_command_result(success=True, stdout="encrypted_payload_here"),
+        ]
+    )
+    ssh_client = DummySSHClient()
+    ctx = context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data=raw_specs)),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(scrape_over_stdin=True, upload_local_dir="/local/validator/files"),
+        runner=runner,
+        ssh=ssh_client,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SCRAPE_OK.reason
+    assert [call["command"] for call in runner.calls] == [
+        "/usr/bin/python -I -",
+        f"chmod +x {ssh_client.sftp_client.put_called_with['remote_path']}/scrape.sh"
+        f" && {ssh_client.sftp_client.put_called_with['remote_path']}/scrape.sh",
+    ]
+    assert result.event.what_we_saw["delivery"] == "upload"
+    # The stdin failure is only visible here — its own event was discarded with the retry.
+    assert result.event.what_we_saw["fallback_from"]["reason"] == Msg.SCRAPE_FAILED.reason
+    assert "psutil" in result.event.what_we_saw["fallback_from"]["stderr_tail"]
+    assert result.updates["state"].remote_dir == ssh_client.sftp_client.put_called_with["remote_path"]
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_failure_was_slow(
+    context_factory,
+):
+    # A scrape that dies deep in the run — past the network benchmark — is not an incompatible
+    # interpreter, and an upload plus a second full scrape would blow the per-executor budget.
+    # Arrange
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=False, exit_code=1, stderr="boom", duration_ms=240_000)
+    )
+    ssh_client = DummySSHClient()
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(scrape_over_stdin=True, upload_local_dir="/local/validator/files"),
+        runner=runner,
+        ssh=ssh_client,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is False
+    assert result.event.reason_code == Msg.SCRAPE_FAILED.reason
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert len(runner.calls) == 1
+    assert ssh_client.sftp_client.put_called_with is None

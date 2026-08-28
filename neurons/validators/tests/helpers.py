@@ -54,6 +54,43 @@ def dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
     raise AssertionError(f"{dict_name} dict literal not found")
 
 
+class DummySFTPClient:
+    """Mock SFTP client that simulates file upload."""
+
+    def __init__(self, *, should_raise: bool = False, error_message: str = ""):
+        self.should_raise = should_raise
+        self.error_message = error_message
+        self.put_called_with: dict | None = None
+
+    async def put(self, local_path: str, remote_path: str, recurse: bool = False):
+        self.put_called_with = {
+            "local_path": local_path,
+            "remote_path": remote_path,
+            "recurse": recurse,
+        }
+        if self.should_raise:
+            raise RuntimeError(self.error_message)
+
+
+class DummySSHClient:
+    """Mock SSH client that provides SFTP access."""
+
+    def __init__(self, *, sftp_should_raise: bool = False, sftp_error: str = ""):
+        self.sftp_client = DummySFTPClient(
+            should_raise=sftp_should_raise,
+            error_message=sftp_error,
+        )
+
+    def start_sftp_client(self):
+        return self
+
+    async def __aenter__(self):
+        return self.sftp_client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
 class DummyScoreCalc:
     def __call__(self, *args, **kwargs):  # pragma: no cover
         return 0.0, 0.0, ""
