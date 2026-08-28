@@ -1,4 +1,5 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
+import math
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -192,7 +193,7 @@ async def test_enforcement_zeroes_the_score_on_a_rented_machine(context_factory)
     assert stored["cpu_cores"] == 8.9
     assert stored["disk_kb"] == 1528 * GB_KB
     # the readings behind the verdict travel with it
-    assert stored["host_cores"] == 10.6
+    assert stored["host_cores"] == 10.56
 
 
 @pytest.mark.asyncio
@@ -660,9 +661,17 @@ async def test_the_event_carries_what_the_second_look_measured(context_factory):
         result = await ProviderSideLoadCheck().run(ctx)
 
     second_look = result.event.what_we_saw["second_look"]
-    assert second_look == {"host_cores": 10.6, "lium_container_cores": 1.6, "dockerd_cores": 1.0}
-    assert result.event.what_we_saw["provider_cpu_cores"] == 7.9  # 10.56 - 1.58 - 1.0
-    assert result.updates["state"].specs["provider_side_load"]["host_cores"] == 10.6
+    assert second_look == {"host_cores": 10.56, "lium_container_cores": 1.58, "dockerd_cores": 1.0}
+    verdict = result.event.what_we_saw["provider_cpu_cores"]
+    assert verdict == 7.9
+    # the readings reconstruct the verdict: the only step between them is the final floor
+    reconstructed = (
+        second_look["host_cores"]
+        - second_look["lium_container_cores"]
+        - second_look["dockerd_cores"]
+    )
+    assert math.floor(round(reconstructed, 3) * 10) / 10 == verdict
+    assert result.updates["state"].specs["provider_side_load"]["host_cores"] == 10.56
 
 
 @pytest.mark.asyncio

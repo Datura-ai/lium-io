@@ -122,10 +122,9 @@ def provider_cores_outside_lium(
     host_cores: float, rows: list[ContainerRow], lium_container_keys: set[str]
 ) -> float:
     """The host's cores minus the containers Lium itself put there."""
-    lium_percent: float = lium_cores_among(rows, lium_container_keys) * 100
     # Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
     # inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5.
-    provider_cores = max(0.0, host_cores - lium_percent / 100)
+    provider_cores = max(0.0, host_cores - lium_cores_among(rows, lium_container_keys))
     return math.floor(round(provider_cores, 3) * 10) / 10
 
 
@@ -135,7 +134,8 @@ class SecondLook:
 
     The verdict alone cannot be argued with: a provider mining beside a renter and a renter pod
     that was never subtracted both come out as "N provider cores". These three numbers separate
-    them - they add up to `provider_cores` by construction.
+    them: `host_cores - lium_container_cores - dockerd_cores` is `provider_cores` before the
+    final floor to one decimal, so they are kept at two so the subtraction reconciles.
     """
 
     host_cores: float
@@ -417,9 +417,9 @@ def parse_second_look(
     excused_dockerd_cores = min(max(0.0, dockerd_cores), CLAIMED_EXCUSE_CORES)
     host_cores = (total_delta - (last_idle - first_idle)) / total_delta * kernel_cores
     return SecondLook(
-        host_cores=round(host_cores, 1),
-        lium_container_cores=round(lium_cores_among(stats_rows, lium_container_keys), 1),
-        dockerd_cores=round(excused_dockerd_cores, 1),
+        host_cores=round(host_cores, 2),
+        lium_container_cores=round(lium_cores_among(stats_rows, lium_container_keys), 2),
+        dockerd_cores=round(excused_dockerd_cores, 2),
         provider_cores=provider_cores_outside_lium(
             host_cores - excused_dockerd_cores, stats_rows, lium_container_keys
         ),
