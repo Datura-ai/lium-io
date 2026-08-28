@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import NoReturn
 
 import aiohttp
@@ -11,6 +12,7 @@ import tenacity
 import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
+    MinerJobRequestPayload,
     BackupContainerRequest,
     DeliveryStamps,
     CancelStorageOperationRequest,
@@ -31,6 +33,7 @@ from payload_models.payloads import (
     DuplicateExecutorsResponse,
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
+    ForcedValidationRequest,
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
@@ -44,6 +47,7 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import (
     Error,
+    RentedExecutorsResponse,
     ExecutorUptimeResponse,
     RentedMachineResponse,
     Response,
@@ -67,8 +71,10 @@ from websockets.asyncio.client import ClientConnection
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from clients.backend_client import BackendClient
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import inflight_creates
+from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
@@ -771,6 +777,7 @@ class ComputeClient:
         | AddSshPublicKeyRequest
         | RemoveSshPublicKeysRequest
         | ExecutorRentFinishedRequest
+        | ForcedValidationRequest
         | GetPodLogsRequestFromServer
         | AddDebugSshKeyRequest
         | BackupContainerRequest
@@ -794,6 +801,7 @@ class ComputeClient:
         | AddSshPublicKeyRequest
         | RemoveSshPublicKeysRequest
         | ExecutorRentFinishedRequest
+        | ForcedValidationRequest
         | GetPodLogsRequestFromServer
         | AddDebugSshKeyRequest
         | BackupContainerRequest
@@ -970,3 +978,66 @@ class ComputeClient:
             await self.backup_handler.handle_restore_container_req(job_request)
         elif isinstance(job_request, CancelStorageOperationRequest):
             await self.backup_handler.handle_cancel_storage_operation_req(job_request)
+        elif isinstance(job_request, ForcedValidationRequest):
+            await self.handle_forced_validation(job_request, logging_extra)
+
+    async def handle_forced_validation(
+        self, job_request: ForcedValidationRequest, logging_extra: dict
+    ) -> None:
+        """Validate one executor now, outside the scheduled cycle.
+
+        Staging only: the backend gates the request as well, this is the second gate so a
+        message that reaches a production validator does nothing.
+        """
+        if settings.DEPLOY_ENV == "PROD":
+            logger.warning(
+                _m(
+                    "Forced validation is disabled in production",
+                    extra=get_extra_info(logging_extra),
+                ),
+            )
+            return
+
+        executor_id: str = str(job_request.executor_id)
+        miner = await self.subtensor_client.get_miner(job_request.miner_hotkey)
+        payload = MinerJobRequestPayload(
+            job_batch_id=f"forced-{uuid.uuid4()}",
+            miner_hotkey=job_request.miner_hotkey,
+            miner_coldkey=miner.coldkey,
+            miner_address=job_request.miner_address,
+            miner_port=job_request.miner_port,
+        )
+        backend_client = BackendClient(
+            base_url=settings.COMPUTE_REST_API_URL or "", keypair=self.keypair
+        )
+        rented_data = await backend_client.get_all_rented_executors()
+        file_encrypt_service = FileEncryptService(ssh_service=self.miner_service.ssh_service)
+        encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
+
+        job = await self.miner_service.request_job_to_miner(
+            payload=payload,
+            encrypted_files=encrypted_files,
+            rented_data=rented_data or RentedExecutorsResponse(executors={}),
+            default_docker_image_digests={},
+            executor_id=executor_id,
+        )
+
+        # The miner filters by executor_id, but a failed job still answers with the whole-miner
+        # sentinel result. Publish the target executor only, so a forced run never writes specs
+        # for a machine nobody asked about.
+        results = [
+            result for result in job["results"] if result.executor_info.uuid == executor_id
+        ]
+        logger.info(
+            _m(
+                "Forced validation finished",
+                extra=get_extra_info({
+                    **logging_extra,
+                    "job_batch_id": payload.job_batch_id,
+                    "published": len(results),
+                }),
+            ),
+        )
+        await self.miner_service.publish_machine_specs(
+            results, payload.miner_hotkey, payload.miner_coldkey
+        )

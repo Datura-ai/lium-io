@@ -193,6 +193,7 @@ class ContainerRequestType(enum.Enum):
     RestoreContainerRequest = "RestoreContainerRequest"
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
+    ForcedValidationRequest = "ForcedValidationRequest"
 
 
 class WorkloadKind(enum.Enum):
@@ -368,6 +369,12 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
     # drops it on deserialization of the backend's request.
     cache_volumes: list[CacheVolume] | None = None
+
+
+class ForcedValidationRequest(BaseServerRequest):
+    """Validate one executor now, outside the scheduled cycle. Staging only."""
+
+    message_type: ContainerRequestType = ContainerRequestType.ForcedValidationRequest
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):

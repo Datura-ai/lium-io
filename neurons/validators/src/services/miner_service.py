@@ -222,8 +222,13 @@ class MinerService:
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
+        executor_id: str | None = None,
     ):
-        """Request job to miner - uses REST API if configured, otherwise WebSocket."""
+        """Request job to miner - uses REST API if configured, otherwise WebSocket.
+
+        With executor_id set the miner returns that one executor only, so the same path
+        validates a single machine (forced validation) instead of the whole miner.
+        """
         if settings.USE_REST_API:
             logger.info(
                 _m(
@@ -235,7 +240,7 @@ class MinerService:
                 ),
             )
             return await self._request_job_to_miner(
-                payload, encrypted_files, rented_data, default_docker_image_digests
+                payload, encrypted_files, rented_data, default_docker_image_digests, executor_id
             )
         else:
             logger.info(
@@ -289,6 +294,7 @@ class MinerService:
                         public_key=public_key,
                         validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
                         miner_hotkey=payload.miner_hotkey, # include miner's hotkey in the request
+                        executor_id=executor_id,
                         nonce=nonce_hex,
                     )
                 )
@@ -400,7 +406,8 @@ class MinerService:
                         await miner_client.send_model(SSHPubKeyRemoveRequest(
                             public_key=public_key,
                             validator_signature=self._sign_validator_pubkey(my_key, public_key),
-                            miner_hotkey=payload.miner_hotkey
+                            miner_hotkey=payload.miner_hotkey,
+                            executor_id=executor_id,
                         ))
                     except Exception as e:
                         logger.warning(
@@ -1860,6 +1867,7 @@ class MinerService:
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
+        executor_id: str | None = None,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: see the WebSocket path — the RoCE probe measures the cycle's remaining time
@@ -1890,6 +1898,7 @@ class MinerService:
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
                 miner_hotkey=payload.miner_hotkey,
+                executor_id=executor_id,
                 nonce=nonce_hex,
             )
             
@@ -1990,7 +1999,7 @@ class MinerService:
                         my_key=my_key,
                         public_key=public_key,
                         miner_hotkey=payload.miner_hotkey,
-                        executor_id=None,
+                        executor_id=executor_id,
                         log_extra=default_extra,
                     )
 
