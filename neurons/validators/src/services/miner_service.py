@@ -795,6 +795,8 @@ class MinerService:
                         "tee_type": result.tee_type,
                         "tdx_attestation_passed": result.tdx_attestation_passed,
                         "gpu_attestation_passed": result.gpu_attestation_passed,
+                        "sent_at": time.time(),
+                        "batch_total": len(results),
                     },
                 )
             except Exception as e:

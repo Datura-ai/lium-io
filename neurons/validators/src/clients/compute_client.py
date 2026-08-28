@@ -87,6 +87,15 @@ from clients.handlers.backup_handler import BackupHandler
 
 logger = logging.getLogger(__name__)
 
+# DAH-2792: the backend drains a scoring cycle (~550 specs, ~4 MB) one message at a time. With the
+# library defaults (16-32 queued messages, pong within 20 s) its transport stopped reading, our
+# keepalive ping waited unread behind the burst, and we closed the socket mid-cycle with 1011.
+# 1024 holds a whole cycle; ping_timeout=40 doubles the deadline in case it does not.
+# Mirror of ws_* in compute-app src/core/uvicorn_worker.py.
+WS_MAX_QUEUE = 1024
+WS_PING_INTERVAL = 20
+WS_PING_TIMEOUT = 40
+
 
 class AuthenticationError(Exception):
     def __init__(self, reason: str, errors: list[Error]):
@@ -130,7 +139,12 @@ class ComputeClient:
                 extra=get_extra_info(self.logging_extra)
             )
         )
-        return websockets.connect(self.compute_app_uri)
+        return websockets.connect(
+            self.compute_app_uri,
+            max_queue=WS_MAX_QUEUE,
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
+        )
 
     async def miner_driver_awaiter(self):
         """avoid memory leak by awaiting miner driver tasks"""
@@ -336,6 +350,8 @@ class ComputeClient:
                             attestation_digest=data.get("attestation_digest"),
                             tdx_attestation_passed=data.get("tdx_attestation_passed"),
                             gpu_attestation_passed=data.get("gpu_attestation_passed"),
+                            sent_at=data.get("sent_at"),
+                            batch_total=data.get("batch_total"),
                         )
 
                         async with self.lock:
@@ -445,6 +461,8 @@ class ComputeClient:
                     log_to_send = self.message_queue.pop(0)
 
                 if log_to_send:
+                    log_to_send.forwarded_at = time.time()
+                    log_to_send.queue_depth = len(self.message_queue)
                     try:
                         await self.send_model(log_to_send)
                     except Exception as exc:

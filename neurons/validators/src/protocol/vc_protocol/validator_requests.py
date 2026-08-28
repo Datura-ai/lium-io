@@ -29,6 +29,12 @@ class RequestType(enum.Enum):
 
 class BaseValidatorRequest(BaseRequest):
     message_type: RequestType
+    # DAH-2792: delivery stamps, epoch seconds. sent_at is set where the message is produced
+    # (the validator for specs), forwarded_at and queue_depth by the connector right before
+    # ws.send(); compute-app turns the gaps into delay histograms. None on unstamped messages.
+    sent_at: float | None = None
+    forwarded_at: float | None = None
+    queue_depth: int | None = None
 
 
 class AuthenticationPayload(pydantic.BaseModel):
@@ -94,6 +100,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     gpu_attestation_passed: bool | None = None
     # None = publisher did not report the field; [] = no catalogued reason was recorded.
     incentive_reasons: list[IncentiveReason] | None = None
+    # DAH-2792: specs published for this miner in this job_batch_id, so the backend can count
+    # expected against received and see a truncated cycle as a number, not as a dashboard dip.
+    batch_total: int | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):
