@@ -682,3 +682,20 @@ async def test_a_node_below_the_floor_carries_no_second_look(context_factory):
         result = await ProviderSideLoadCheck().run(ctx)
 
     assert result.event.what_we_saw["second_look"] is None
+
+
+def test_the_readings_always_reconstruct_the_verdict():
+    # Codex found a boundary where independently rounded readings and the verdict disagreed by
+    # a tenth. The verdict is derived from the readings now, so the two cannot drift apart.
+    from neurons.validators.src.services.task.checks.provider_side_load import (
+        floor_to_tenth,
+        parse_second_look,
+    )
+
+    for busy_jiffies in range(1, 400):
+        before = "0 0 32 0"
+        after = f"6400 {6400 - busy_jiffies} 32 0"
+        look = parse_second_look(before, "c1|pod_renter|0.50%", after, {"pod_renter"})
+        assert look is not None
+        reconstructed = look.host_cores - look.lium_container_cores - look.dockerd_cores
+        assert floor_to_tenth(max(0.0, reconstructed)) == look.provider_cores

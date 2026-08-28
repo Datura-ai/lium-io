@@ -101,6 +101,12 @@ class ContainerRow:
         return self.cpu_percent
 
 
+def floor_to_tenth(cores: float) -> float:
+    """Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
+    inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5."""
+    return math.floor(round(cores, 3) * 10) / 10
+
+
 def lium_cores_among(rows: list[ContainerRow], lium_container_keys: set[str]) -> float:
     """What Lium's own containers burn, in cores.
 
@@ -122,10 +128,7 @@ def provider_cores_outside_lium(
     host_cores: float, rows: list[ContainerRow], lium_container_keys: set[str]
 ) -> float:
     """The host's cores minus the containers Lium itself put there."""
-    # Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
-    # inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5.
-    provider_cores = max(0.0, host_cores - lium_cores_among(rows, lium_container_keys))
-    return math.floor(round(provider_cores, 3) * 10) / 10
+    return floor_to_tenth(max(0.0, host_cores - lium_cores_among(rows, lium_container_keys)))
 
 
 @dataclass(frozen=True)
@@ -416,12 +419,15 @@ def parse_second_look(
     # `dockerd` is a process name anyone can copy, so its excuse is capped like the name tier
     excused_dockerd_cores = min(max(0.0, dockerd_cores), CLAIMED_EXCUSE_CORES)
     host_cores = (total_delta - (last_idle - first_idle)) / total_delta * kernel_cores
+    reported_host_cores = round(host_cores, 2)
+    reported_lium_cores = round(lium_cores_among(stats_rows, lium_container_keys), 2)
+    reported_dockerd_cores = round(excused_dockerd_cores, 2)
     return SecondLook(
-        host_cores=round(host_cores, 2),
-        lium_container_cores=round(lium_cores_among(stats_rows, lium_container_keys), 2),
-        dockerd_cores=round(excused_dockerd_cores, 2),
-        provider_cores=provider_cores_outside_lium(
-            host_cores - excused_dockerd_cores, stats_rows, lium_container_keys
+        host_cores=reported_host_cores,
+        lium_container_cores=reported_lium_cores,
+        dockerd_cores=reported_dockerd_cores,
+        provider_cores=floor_to_tenth(
+            max(0.0, reported_host_cores - reported_lium_cores - reported_dockerd_cores)
         ),
     )
 
