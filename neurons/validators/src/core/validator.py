@@ -25,7 +25,12 @@ from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
 from services.miner_service import MinerService
-from services.redis_service import GPU_ESTIMATES_CHANNEL, PENDING_PODS_PREFIX, RedisService
+from services.redis_service import (
+    FORCED_VALIDATION_CYCLE_KEY,
+    GPU_ESTIMATES_CHANNEL,
+    PENDING_PODS_PREFIX,
+    RedisService,
+)
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import VerifyXValidationService
 
@@ -112,8 +117,6 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
-            backend_client=self.backend_client,
-            file_encrypt_service=self.file_encrypt_service,
         )
 
         # init miner_scores: always load from Redis if present so accumulated
@@ -230,6 +233,21 @@ class Validator:
                     ),
                 ),
             )
+
+            # DAH-2090: a staging development tool. The connector process sets this key when an
+            # operator asks for a cycle now, so the wait for the next block window is skipped.
+            if await self.redis_service.get(FORCED_VALIDATION_CYCLE_KEY):
+                await self.redis_service.delete(FORCED_VALIDATION_CYCLE_KEY)
+                self.last_job_run_blocks = 0
+                logger.info(
+                    _m(
+                        "[sync] Forced validation cycle requested, starting one now",
+                        extra=get_extra_info({
+                            **self.default_extra,
+                            "current_block": current_block,
+                        }),
+                    ),
+                )
 
             if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB

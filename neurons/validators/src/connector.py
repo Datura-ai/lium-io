@@ -16,9 +16,7 @@ async def run_forever():
     await initiate_services()
     keypair = settings.get_bittensor_wallet().get_hotkey()
     compute_app_client = ComputeClient(
-        keypair,
-        f"{settings.COMPUTE_APP_URI}/validator/{keypair.ss58_address}",
-        ioc["MinerService"],
+        keypair, f"{settings.COMPUTE_APP_URI}/validator/{keypair.ss58_address}", ioc["MinerService"]
     )
     async with compute_app_client:
         await compute_app_client.run_forever()

@@ -31,7 +31,7 @@ from payload_models.payloads import (
     DuplicateExecutorsResponse,
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
-    ForcedValidationRequest,
+    ForcedValidationCycleRequest,
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
@@ -98,9 +98,6 @@ class AuthenticationError(Exception):
     def __init__(self, reason: str, errors: list[Error]):
         self.reason = reason
         self.errors = errors
-
-
-LogContext = dict[str, str | int | None]
 
 
 class ComputeClient:
@@ -672,6 +669,14 @@ class ComputeClient:
             return
 
         try:
+            pydantic.TypeAdapter(ForcedValidationCycleRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self.handle_forced_validation_cycle()
+            return
+
+        try:
             req: GetEstimateRequest = pydantic.TypeAdapter(GetEstimateRequest).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
@@ -762,6 +767,23 @@ class ComputeClient:
             )
         )
 
+    async def handle_forced_validation_cycle(self) -> None:
+        """Start a validation cycle now instead of waiting for the next block window.
+
+        Staging only. The backend gates the request too; this is the second gate, so a message
+        that reaches a production validator does nothing.
+        """
+        if settings.DEPLOY_ENV == "PROD":
+            logger.warning(
+                _m(
+                    "Forced validation cycle is disabled in production",
+                    extra=get_extra_info(self.logging_extra),
+                ),
+            )
+            return
+
+        await self.miner_service.request_validation_cycle_now()
+
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)
         return miner.axon_info
@@ -775,7 +797,6 @@ class ComputeClient:
         | AddSshPublicKeyRequest
         | RemoveSshPublicKeysRequest
         | ExecutorRentFinishedRequest
-        | ForcedValidationRequest
         | GetPodLogsRequestFromServer
         | AddDebugSshKeyRequest
         | BackupContainerRequest
@@ -799,7 +820,6 @@ class ComputeClient:
         | AddSshPublicKeyRequest
         | RemoveSshPublicKeysRequest
         | ExecutorRentFinishedRequest
-        | ForcedValidationRequest
         | GetPodLogsRequestFromServer
         | AddDebugSshKeyRequest
         | BackupContainerRequest
@@ -976,28 +996,3 @@ class ComputeClient:
             await self.backup_handler.handle_restore_container_req(job_request)
         elif isinstance(job_request, CancelStorageOperationRequest):
             await self.backup_handler.handle_cancel_storage_operation_req(job_request)
-        elif isinstance(job_request, ForcedValidationRequest):
-            await self.handle_forced_validation(job_request, logging_extra)
-
-    async def handle_forced_validation(
-        self, job_request: ForcedValidationRequest, log_context: LogContext
-    ) -> None:
-        """Validate one executor now, outside the scheduled cycle. Staging only.
-
-        The backend gates the request too; this is the second gate, so a message that reaches
-        a production validator does nothing.
-        """
-        if settings.DEPLOY_ENV == "PROD":
-            logger.warning(
-                _m(
-                    "Forced validation is disabled in production",
-                    extra=get_extra_info(log_context),
-                ),
-            )
-            return
-
-        await self.miner_service.validate_one_executor_now(
-            executor_id=job_request.executor_id,
-            miner_hotkey=job_request.miner_hotkey,
-            log_context=log_context,
-        )

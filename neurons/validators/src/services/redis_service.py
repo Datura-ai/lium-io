@@ -32,6 +32,9 @@ PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
 GPU_ESTIMATES_CHANNEL = "gpu_estimates_channel"
 GPU_ESTIMATES_KEY = "gpu_estimates"
 INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
+# Set by the connector process, consumed by the validator process: the two do not share memory,
+# so this key is how a forced cycle request crosses between them.
+FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)

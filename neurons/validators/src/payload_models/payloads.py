@@ -1,5 +1,6 @@
 import enum
 from datetime import datetime
+from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
@@ -193,7 +194,16 @@ class ContainerRequestType(enum.Enum):
     RestoreContainerRequest = "RestoreContainerRequest"
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
-    ForcedValidationRequest = "ForcedValidationRequest"
+
+
+class ForcedValidationCycleRequest(BaseModel):
+    """Ask the validator to start its validation cycle now, not at the next block window.
+
+    A staging development tool: it removes the wait for the next cycle. It carries no executor
+    -- the cycle validates the whole fleet, exactly as the scheduled one does.
+    """
+
+    message_type: Literal["ForcedValidationCycleRequest"]
 
 
 class WorkloadKind(enum.Enum):
@@ -369,12 +379,6 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
     # drops it on deserialization of the backend's request.
     cache_volumes: list[CacheVolume] | None = None
-
-
-class ForcedValidationRequest(BaseServerRequest):
-    """Validate one executor now, outside the scheduled cycle. Staging only."""
-
-    message_type: ContainerRequestType = ContainerRequestType.ForcedValidationRequest
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
