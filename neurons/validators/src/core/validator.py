@@ -112,6 +112,8 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+            backend_client=self.backend_client,
+            file_encrypt_service=self.file_encrypt_service,
         )
 
         # init miner_scores: always load from Redis if present so accumulated

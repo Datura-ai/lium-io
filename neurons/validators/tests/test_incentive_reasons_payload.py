@@ -81,6 +81,8 @@ async def test_publisher_carries_reason_codes_as_data_not_just_log_text(
         task_service=MagicMock(),
         redis_service=redis_service,
         attestation_service=MagicMock(),
+        backend_client=MagicMock(),
+        file_encrypt_service=MagicMock(),
     )
 
     await service.publish_machine_specs([job], miner_hotkey="hk", miner_coldkey="ck")
@@ -107,6 +109,8 @@ async def test_publisher_reports_empty_list_when_no_catalogued_reason_exists(
         task_service=MagicMock(),
         redis_service=redis_service,
         attestation_service=MagicMock(),
+        backend_client=MagicMock(),
+        file_encrypt_service=MagicMock(),
     )
 
     await service.publish_machine_specs([job], miner_hotkey="hk", miner_coldkey="ck")
