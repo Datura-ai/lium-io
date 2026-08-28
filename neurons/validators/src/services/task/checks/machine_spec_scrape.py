@@ -13,9 +13,10 @@ from services.gpu_spec_table import normalize_gpu_model
 from .network_ema import compute_ema
 from .upload_files import UploadFailed, upload_validation_files
 
-# DAH-2794: how fast the stdin attempt must fail for the binary fallback to still fit the
-# 780 s per-executor budget. An interpreter that cannot run the source rejects it in ~2 s.
-FALLBACK_AFTER_MS = 60_000
+# DAH-2794: how fast the stdin attempt must fail for the binary fallback to still be worth it.
+# An interpreter that cannot run the source rejects it in ~2 s, so this ceiling keeps the fallback
+# path within the flag-off path plus 10 s — and that one already runs against the 780 s budget.
+FALLBACK_AFTER_MS = 10_000
 
 
 def _update_keys(data: Any, key_mapping: dict[str, str]) -> Any:
@@ -50,6 +51,26 @@ def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, 
     ]
 
 
+def _decrypt_payload(ctx: Context, stdout: str) -> str:
+    # find the scrape's ciphertext among the executor's stdout lines and decrypt it
+    #
+    # The payload is the scrape's own print, but the image decides what else lands on stdout: a
+    # .pth or sitecustomize prints before it, an atexit handler after it. Fernet authenticates, so
+    # a wrong line raises instead of decoding — trying them newest-first costs nothing and beats
+    # betting on a fixed position.
+    if not ctx.encrypt_key:
+        raise ValueError("Missing encrypt_key in context")
+
+    last_exc: Exception | None = None
+    for line in reversed([ln.strip() for ln in stdout.splitlines() if ln.strip()]):
+        try:
+            return ctx.services.ssh.decrypt_payload(ctx.encrypt_key, line)
+        except Exception as exc:
+            last_exc = exc
+
+    raise last_exc or ValueError("Scrape produced no output to decrypt")
+
+
 def _binary_command(remote_dir: str, script_filename: str) -> str:
     script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
     return f"chmod +x {script_path} && {script_path}"
@@ -81,7 +102,7 @@ class MachineSpecScrapeCheck:
         # `-I` implies -E -s -P, which drops PYTHONPATH, the user site-dir and the cwd entry
         # from sys.path, so a file left next to the SSH login shell cannot shadow psutil or
         # json. It does not disable site processing: a .pth or sitecustomize inside the image
-        # still runs, which is why the payload is read off the last line rather than the first.
+        # still runs and prints, which is what `_decrypt_payload` searches through.
         command = f"{shlex.quote(ctx.executor.python_path)} -I -"
         res = await ctx.runner.run(
             command,
@@ -101,12 +122,9 @@ class MachineSpecScrapeCheck:
         if res.duration_ms > FALLBACK_AFTER_MS or not ctx.config.machine_scrape_filename:
             return result
 
-        fallback_from = {
-            "reason": result.event.reason_code,
-            "exit_code": res.exit_code,
-            "duration_ms": res.duration_ms,
-            "stderr_tail": res.stderr[-200:],
-        }
+        # The stdin attempt's own event is discarded with the retry, so carry it whole: a run that
+        # exited 0 and produced an unreadable payload says nothing in exit_code or stderr.
+        fallback_from = {"reason": result.event.reason_code, **result.event.what_we_saw}
 
         try:
             remote_dir = await upload_validation_files(ctx)
@@ -188,13 +206,7 @@ class MachineSpecScrapeCheck:
             return CheckResult(passed=False, event=event)
 
         try:
-            # Last line, not first: the payload is the scrape's final print, and a .pth or
-            # sitecustomize in the executor image can put its own line in front of it.
-            line = [ln for ln in res.stdout.splitlines() if ln.strip()][-1].strip()
-            if not ctx.encrypt_key:
-                raise ValueError("Missing encrypt_key in context")
-
-            decrypted = ctx.services.ssh.decrypt_payload(ctx.encrypt_key, line)
+            decrypted = _decrypt_payload(ctx, res.stdout)
             raw = json.loads(decrypted)
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)

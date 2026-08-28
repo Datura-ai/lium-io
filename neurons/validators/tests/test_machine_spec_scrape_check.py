@@ -69,12 +69,14 @@ class DummySSHCommandRunner:
 
 # Mock SSHService for decryption
 class DummySSHService:
-    def __init__(self, *, decrypted_data: dict):
+    def __init__(self, *, decrypted_data: dict, valid_payload: str | None = None):
         """
         Args:
             decrypted_data: The decrypted machine specs to return
+            valid_payload: The only line that authenticates, as Fernet would — anything else raises
         """
         self.decrypted_data = decrypted_data
+        self.valid_payload = valid_payload
         self.decrypt_called_with: dict | None = None
 
     def decrypt_payload(self, encrypt_key: str, payload: str) -> str:
@@ -83,6 +85,8 @@ class DummySSHService:
             "encrypt_key": encrypt_key,
             "payload": payload,
         }
+        if self.valid_payload is not None and payload != self.valid_payload:
+            raise ValueError("Invalid token")
         return json.dumps(self.decrypted_data)
 
 
@@ -381,3 +385,105 @@ async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_failure_was_
     assert result.event.what_we_saw["delivery"] == "stdin"
     assert len(runner.calls) == 1
     assert ssh_client.sftp_client.put_called_with is None
+
+
+@pytest.mark.parametrize("over_stdin", [True, False])
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_finds_the_payload_among_other_stdout_lines(
+    over_stdin, context_factory
+):
+    # The image decides what else lands on stdout — a .pth prints before the scrape, an atexit
+    # handler after it. Neither the first nor the last line is a safe bet on either path.
+    # Arrange
+    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
+    ssh_service = DummySSHService(
+        decrypted_data=raw_specs, valid_payload="encrypted_payload_here"
+    )
+    runner = DummySSHCommandRunner(
+        result=make_command_result(
+            success=True,
+            stdout="sitecustomize: loaded\nencrypted_payload_here\nExiting worker thread",
+        )
+    )
+    ctx = context_factory(
+        services=build_services(ssh=ssh_service),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(scrape_over_stdin=over_stdin, remote_dir="/remote/path"),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert result.updates["state"].gpu_count == 1
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_falls_back_when_the_stdin_payload_will_not_decrypt(
+    context_factory,
+):
+    # The failure mode a probe cannot see: the modules import, the scrape runs, and the token it
+    # produces is not one this validator can read.
+    # Arrange
+    raw_specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
+    ssh_service = DummySSHService(
+        decrypted_data=raw_specs, valid_payload="encrypted_payload_here"
+    )
+    runner = DummySSHCommandRunner(
+        results=[
+            make_command_result(success=True, stdout="unreadable_token", duration_ms=2000),
+            make_command_result(success=True, stdout="encrypted_payload_here"),
+        ]
+    )
+    ssh_client = DummySSHClient()
+    ctx = context_factory(
+        services=build_services(ssh=ssh_service),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(scrape_over_stdin=True, upload_local_dir="/local/validator/files"),
+        runner=runner,
+        ssh=ssh_client,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert len(runner.calls) == 2
+    assert ssh_client.sftp_client.put_called_with is not None
+    fallback_from = result.event.what_we_saw["fallback_from"]
+    # exit 0 and an empty stderr say nothing here — the exception and the output are the evidence.
+    assert fallback_from["reason"] == Msg.SCRAPE_PARSE_FAILED.reason
+    assert fallback_from["stdout_head"] == "unreadable_token"
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_reports_the_stdin_failure_when_the_fallback_upload_fails(
+    context_factory,
+):
+    # Arrange
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=False, exit_code=1, stderr="boom", duration_ms=1600)
+    )
+    ssh_client = DummySSHClient(sftp_should_raise=True, sftp_error="Permission denied")
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(scrape_over_stdin=True, upload_local_dir="/local/validator/files"),
+        runner=runner,
+        ssh=ssh_client,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is False
+    assert result.event.reason_code == Msg.SCRAPE_FAILED.reason
+    assert "Permission denied" in result.event.what_we_saw["fallback_upload_error"]
+    assert result.event.what_we_saw["fallback_from"]["stderr_tail"] == "boom"
