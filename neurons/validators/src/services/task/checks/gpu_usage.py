@@ -1,15 +1,18 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from core.config import settings
 from protocol.vc_protocol.compute_requests import (
+    BROKEN_POD_STATUS,
     LIVE_FILLER_RUN_STATUSES,
     FillerRunActiveResponse,
     PodRentalActiveResponse,
 )
 from services.const import (
+    BROKEN_POD_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
@@ -421,7 +424,29 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     )
     if pod_rental is None:
         return True
-    return _the_answer_is_about_this_node(ctx, pod_rental.executor_id) and pod_rental.active
+    if not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
+        return False
+    return pod_rental.active or _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental)
+
+
+def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveResponse) -> bool:
+    """Whether a BROKEN pod's container is still the leftover our own reaper owes us.
+
+    The exemption is deliberately time-boxed. The pod ROW survives 24 hours, but the container it
+    left behind is gone within the stale-container grace, so an exemption that followed the row
+    would hand a provider a whole day in which the name of their own broken pod launders a foreign
+    workload.
+    """
+    if pod_rental.status != BROKEN_POD_STATUS or pod_rental.rental_closed_at is None:
+        return False
+    # The backend closes a rental with a naive UTC timestamp, but the field is a datetime parsed off
+    # the wire: an offset in the JSON would make it aware, and mixing the two raises inside a fatal
+    # check. Read a naive value as the UTC it is and compare in one frame.
+    closed_at: datetime = pod_rental.rental_closed_at
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    time_since_the_rental_closed: timedelta = datetime.now(timezone.utc) - closed_at
+    return time_since_the_rental_closed < timedelta(minutes=BROKEN_POD_CONTAINER_GRACE_MINUTES)
 
 
 def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:

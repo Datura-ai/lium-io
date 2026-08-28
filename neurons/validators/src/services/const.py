@@ -250,6 +250,11 @@ DPHN_CACHE_SIZE_GB = 40
 DPHN_CACHE_LISTING_FLOOR_GB = 100
 DPHN_CACHE_FREE_MARGIN_GB = 50
 FILLER_CONTAINER_GRACE_MINUTES = 15
+# DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
+# container lives until the sweep above collects it, so the bound follows that grace with one cycle
+# of margin. It must stay SHORT: the pod row itself survives 24 h, and an exemption that long would
+# let a provider reuse the name of their own broken pod for a foreign workload.
+BROKEN_POD_CONTAINER_GRACE_MINUTES = 2 * FILLER_CONTAINER_GRACE_MINUTES
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.
 FILLER_LIVENESS_GRACE_MINUTES = 10
