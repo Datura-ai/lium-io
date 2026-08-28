@@ -12,6 +12,7 @@ import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
+    DeliveryStamps,
     CancelStorageOperationRequest,
     RestoreContainerRequest,
     BaseServerRequest,
@@ -87,12 +88,8 @@ from clients.handlers.backup_handler import BackupHandler
 
 logger = logging.getLogger(__name__)
 
-# DAH-2792: the backend drains a scoring cycle (~550 specs, ~4 MB) one message at a time. With the
-# library defaults (16-32 queued messages, pong within 20 s) its transport stopped reading, our
-# keepalive ping waited unread behind the burst, and we closed the socket mid-cycle with 1011.
-# 1024 holds a whole cycle; ping_timeout=40 doubles the deadline in case it does not.
-# Mirror of ws_* in compute-app src/core/uvicorn_worker.py.
-WS_MAX_QUEUE = 1024
+# DAH-2792: the keepalive pong queues behind a scoring-cycle burst and missed the 20 s default;
+# mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
 
@@ -117,7 +114,7 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.message_queue = []
+        self.message_queue: list[DeliveryStamps] = []
         self.lock = asyncio.Lock()
 
         self.logging_extra = {
@@ -141,7 +138,6 @@ class ComputeClient:
         )
         return websockets.connect(
             self.compute_app_uri,
-            max_queue=WS_MAX_QUEUE,
             ping_interval=WS_PING_INTERVAL,
             ping_timeout=WS_PING_TIMEOUT,
         )

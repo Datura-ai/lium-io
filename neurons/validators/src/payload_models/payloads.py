@@ -483,7 +483,15 @@ class ContainerResponseType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
 
 
-class BaseValidatorResponse(BaseRequest):
+class DeliveryStamps(BaseModel):
+    # DAH-2792: epoch seconds; sent_at by the producer, forwarded_at/queue_depth by the connector
+    # before ws.send(). Mixed into every model the connector queues, since its send loop stamps them all.
+    sent_at: float | None = None
+    forwarded_at: float | None = None
+    queue_depth: int | None = None
+
+
+class BaseValidatorResponse(BaseRequest, DeliveryStamps):
     message_type: ContainerResponseType
     miner_hotkey: str
     executor_id: str

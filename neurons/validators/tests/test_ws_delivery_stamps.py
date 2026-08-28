@@ -1,15 +1,17 @@
 """DAH-2792: the validator -> connector -> backend path carries delivery stamps so the backend
-can measure how long a message waited at each hop, and the connector opens the websocket with
-limits that survive a whole scoring cycle pushed in one burst.
+can measure how long a message waited at each hop, and the connector opens the websocket with a
+pong timeout long enough for the keepalive to survive a scoring-cycle burst.
 """
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from payload_models.payloads import ContainerCreated, DeliveryStamps
 
-from clients.compute_client import WS_MAX_QUEUE, WS_PING_INTERVAL, WS_PING_TIMEOUT, ComputeClient
+from clients.compute_client import WS_PING_INTERVAL, WS_PING_TIMEOUT, ComputeClient
 from protocol.vc_protocol.validator_requests import ExecutorSpecRequest, RentedMachineRequest
 from services.miner_service import MinerService
 from services.redis_service import MACHINE_SPEC_CHANNEL
@@ -17,7 +19,7 @@ from services.redis_service import MACHINE_SPEC_CHANNEL
 pytest_plugins = ["fixtures.incentive_fixtures"]
 
 
-def _client(message_queue: list | None = None) -> ComputeClient:
+def _client(message_queue: list[DeliveryStamps] | None = None) -> ComputeClient:
     client = ComputeClient.__new__(ComputeClient)
     client.keypair = MagicMock(ss58_address="validator-hotkey")
     client.lock = asyncio.Lock()
@@ -29,7 +31,7 @@ def _client(message_queue: list | None = None) -> ComputeClient:
 
 
 async def _bridge_machine_spec(payload: dict[str, Any]) -> ExecutorSpecRequest:
-    async def listen():
+    async def listen() -> AsyncIterator[dict[str, bytes]]:
         yield {"channel": MACHINE_SPEC_CHANNEL.encode(), "data": json.dumps(payload).encode()}
         raise asyncio.CancelledError
 
@@ -41,10 +43,7 @@ async def _bridge_machine_spec(payload: dict[str, Any]) -> ExecutorSpecRequest:
     return client.message_queue[0]
 
 
-@pytest.mark.asyncio
-async def test_publisher_stamps_sent_at_and_batch_total(create_job_result, mock_settings) -> None:
-    # Arrange
-    jobs = [create_job_result(), create_job_result()]
+async def _published_payloads(jobs: list[Any]) -> list[dict[str, Any]]:
     redis_service = MagicMock()
     redis_service.publish = AsyncMock()
     service = MinerService(
@@ -53,12 +52,19 @@ async def test_publisher_stamps_sent_at_and_batch_total(create_job_result, mock_
         redis_service=redis_service,
         attestation_service=MagicMock(),
     )
+    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck")
+    return [call.args[1] for call in redis_service.publish.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_publisher_stamps_sent_at_and_batch_total(create_job_result, mock_settings) -> None:
+    # Arrange
+    jobs = [create_job_result(), create_job_result()]
 
     # Act
-    await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck")
+    payloads = await _published_payloads(jobs)
 
     # Assert
-    payloads = [call.args[1] for call in redis_service.publish.await_args_list]
     assert [payload["batch_total"] for payload in payloads] == [2, 2]
     assert all(isinstance(payload["sent_at"], float) for payload in payloads)
 
@@ -66,16 +72,7 @@ async def test_publisher_stamps_sent_at_and_batch_total(create_job_result, mock_
 @pytest.mark.asyncio
 async def test_bridge_carries_sent_at_and_batch_total(create_job_result, mock_settings) -> None:
     # Arrange
-    redis_service = MagicMock()
-    redis_service.publish = AsyncMock()
-    service = MinerService(
-        ssh_service=MagicMock(),
-        task_service=MagicMock(),
-        redis_service=redis_service,
-        attestation_service=MagicMock(),
-    )
-    await service.publish_machine_specs([create_job_result()], miner_hotkey="hk", miner_coldkey="ck")
-    _, payload = redis_service.publish.await_args.args
+    [payload] = await _published_payloads([create_job_result()])
 
     # Act
     spec = await _bridge_machine_spec(payload)
@@ -87,17 +84,8 @@ async def test_bridge_carries_sent_at_and_batch_total(create_job_result, mock_se
 
 @pytest.mark.asyncio
 async def test_bridge_tolerates_payload_without_stamps(create_job_result, mock_settings) -> None:
-    # Arrange
-    redis_service = MagicMock()
-    redis_service.publish = AsyncMock()
-    service = MinerService(
-        ssh_service=MagicMock(),
-        task_service=MagicMock(),
-        redis_service=redis_service,
-        attestation_service=MagicMock(),
-    )
-    await service.publish_machine_specs([create_job_result()], miner_hotkey="hk", miner_coldkey="ck")
-    _, payload = redis_service.publish.await_args.args
+    # Arrange: a validator from before DAH-2792 publishes no stamps
+    [payload] = await _published_payloads([create_job_result()])
     del payload["sent_at"]
     del payload["batch_total"]
 
@@ -109,26 +97,51 @@ async def test_bridge_tolerates_payload_without_stamps(create_job_result, mock_s
     assert spec.batch_total is None
 
 
+async def _drain_send_loop(client: ComputeClient, expected_sends: int) -> list[dict[str, Any]]:
+    # the loop never returns on its own; the mocked socket stops it after the expected sends
+    sent_messages: list[dict[str, Any]] = []
+
+    async def send(raw_message: str) -> None:
+        sent_messages.append(json.loads(raw_message))
+        if len(sent_messages) == expected_sends:
+            raise asyncio.CancelledError
+
+    client.ws = MagicMock(send=send)
+    with pytest.raises(asyncio.CancelledError):
+        await client.handle_send_messages()
+    return sent_messages
+
+
 @pytest.mark.asyncio
 async def test_send_loop_stamps_forwarded_at_and_messages_still_waiting_behind() -> None:
     # Arrange
     client = _client([RentedMachineRequest(), RentedMachineRequest()])
-    client.ws = MagicMock()
-    client.ws.send = AsyncMock()
-    task = asyncio.create_task(client.handle_send_messages())
 
     # Act
-    while client.ws.send.await_count < 2:
-        await asyncio.sleep(0)
-    task.cancel()
+    sent = await _drain_send_loop(client, expected_sends=2)
 
     # Assert
-    sent = [json.loads(call.args[0]) for call in client.ws.send.await_args_list]
     assert [message["queue_depth"] for message in sent] == [1, 0]
     assert all(isinstance(message["forwarded_at"], float) for message in sent)
 
 
-def test_connect_opens_the_socket_with_burst_sized_limits() -> None:
+@pytest.mark.asyncio
+async def test_send_loop_stamps_container_responses_too() -> None:
+    # Arrange: the queue mixes container responses (payload_models) with validator requests
+    container_created = ContainerCreated(
+        miner_hotkey="hk", executor_id="ex", pod_id="pod", container_name="c", volume_name="v", port_maps=[]
+    )
+    client = _client([container_created, RentedMachineRequest()])
+
+    # Act
+    sent = await _drain_send_loop(client, expected_sends=2)
+
+    # Assert
+    assert [message["message_type"] for message in sent] == ["ContainerCreated", "RentedMachineRequest"]
+    assert [message["queue_depth"] for message in sent] == [1, 0]
+
+
+def test_connect_sets_keepalive_ping_interval_and_timeout() -> None:
     # Arrange
     client = _client()
 
@@ -139,9 +152,6 @@ def test_connect_opens_the_socket_with_burst_sized_limits() -> None:
     # Assert
     connect.assert_called_once_with(
         "wss://backend.example/validator",
-        max_queue=WS_MAX_QUEUE,
         ping_interval=WS_PING_INTERVAL,
         ping_timeout=WS_PING_TIMEOUT,
     )
-    assert WS_MAX_QUEUE >= 1024
-    assert WS_PING_TIMEOUT > WS_PING_INTERVAL
