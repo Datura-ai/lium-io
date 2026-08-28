@@ -487,7 +487,7 @@ async def read_gpu_power_restore_records(
     return GpuPowerRestoreReadResult(records=records, read_failed=read_failed)
 
 
-def _uncapped_run_threshold_watts(record: GpuPowerRestoreRecord, state: GpuPowerState) -> float:
+def _uncapped_run_threshold_watts(record: GpuPowerRestoreRecord, default_watts: float | None) -> float:
     """The limit at which the job counts as having run uncapped.
 
     ``MIN_POWER_LIMIT_RATIO`` of the card default — the same line the backend guard kills the
@@ -498,37 +498,45 @@ def _uncapped_run_threshold_watts(record: GpuPowerRestoreRecord, state: GpuPower
     host guards sit one point above this line (0.91 of default, 4090 409/450, 5090 518/575).
     Falls back to the miner's own pre-cap limit when the GPU does not report a default.
     """
-    if state.default_watts is None:
+    if default_watts is None or default_watts <= 0:
         return record.watts
-    return MIN_POWER_LIMIT_RATIO * state.default_watts
+    return MIN_POWER_LIMIT_RATIO * default_watts
 
 
-def _detect_cap_revert(
-    record: GpuPowerRestoreRecord, state: GpuPowerState, observed_at: float
+def detect_cap_revert(
+    record: GpuPowerRestoreRecord,
+    current_watts: float,
+    default_watts: float | None,
+    observed_at: float,
 ) -> GpuPowerCapRevert | None:
-    """What we saw on one GPU when the host raised the limit back past the line at which the
-    job ran uncapped. None when nothing proves a revert.
+    """What we saw on one GPU whose live limit the host raised back past the line at which the
+    job runs uncapped. None when nothing proves a revert.
 
-    DAH-2786. Three conditions, each ruling out a different innocent case:
-    - ``capped_to_watts`` is stamped only after a verified set, so a cap that never landed
-      (the DAH-2715 population, whose container cannot cap at all) can never accuse. It is also
-      absent on records written before this field existed.
+    DAH-2786. Read WHILE the Lium job runs, never at teardown: a host that leaves our cap alone
+    during the job and only resets the limit afterwards has harmed nothing, and the two look
+    identical once the container is gone.
+
+    Three conditions, each ruling out a different innocent case:
+    - ``capped_to_watts`` is stamped only after a verified set with persistence mode on, so a
+      cap that never landed (the DAH-2715 population, whose container cannot cap at all) and a
+      cap that can revert on its own (DAH-2702) can never accuse. It is also absent on records
+      written before this field existed.
     - the limit is not where we left it, so a cap that held cannot accuse.
     - the limit is at or above the uncapped line, which is what makes the revert cost Lium the
       whole job rather than a few watts.
     """
     if record.capped_to_watts is None:
         return None
-    if state.current_watts <= record.capped_to_watts:
+    if current_watts <= record.capped_to_watts:
         return None
-    if state.current_watts < _uncapped_run_threshold_watts(record, state):
+    if current_watts < _uncapped_run_threshold_watts(record, default_watts):
         return None
     return GpuPowerCapRevert(
         observed_at=observed_at,
         pod_id=record.pod_id,
         gpu_uuid=record.gpu_uuid,
         capped_to_watts=record.capped_to_watts,
-        found_watts=state.current_watts,
+        found_watts=int(current_watts),
     )
 
 
@@ -592,7 +600,7 @@ def _reverts_of_jobs_not_already_recorded(
     return new_reverts
 
 
-async def _record_cap_reverts(
+async def record_cap_reverts(
     redis: RedisService,
     executor_id: str,
     reverted_gpus: list[GpuPowerCapRevert],
@@ -655,22 +663,12 @@ async def _restore_records(
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
     (a failed restore keeps it for the safety nets to retry). Returns the restored count."""
     restored = 0
-    # DAH-2786: the limit we read here is the only place we learn the host undid our cap.
-    # Grouped per executor - one host can carry several, and a whole-host restore sweeps them all.
-    reverted_gpus_by_executor: dict[str, list[GpuPowerCapRevert]] = {}
-    now = time.time()
     for record in records:
         state = state_by_uuid.get(record.gpu_uuid)
         watts_before = state.current_watts if state else None
-        cap_revert: GpuPowerCapRevert | None = (
-            _detect_cap_revert(record, state, now) if state is not None else None
-        )
-        if cap_revert is not None:
-            reverted_gpus_by_executor.setdefault(record.executor_id, []).append(cap_revert)
         if record.capped_to_watts is not None:
-            # Judged above, and about to be untrue: the restore below raises the limit itself,
-            # so a record that outlives a failed delete must not let OUR raise read as the
-            # host's on the next pass.
+            # DAH-2786: the restore below raises the limit itself, so a record that outlives a
+            # failed delete must not keep claiming a cap of ours is standing.
             await _set_applied_cap_on_restore_record(redis, record.gpu_uuid, None, None, log_extra)
         restore_outcome = await _set_and_log_power_limit(
             ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
@@ -688,8 +686,6 @@ async def _restore_records(
                 {"gpu_uuid": record.gpu_uuid},
                 log_extra,
             )
-    for executor_id, reverted_gpus in reverted_gpus_by_executor.items():
-        await _record_cap_reverts(redis, executor_id, reverted_gpus, log_extra)
     return restored
 
 

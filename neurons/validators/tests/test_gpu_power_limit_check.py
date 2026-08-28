@@ -143,7 +143,9 @@ async def test_power_limit_skipped_when_lium_default_job_active(context_factory,
     result = await GpuPowerLimitCheck().run(ctx)
     assert result.passed is True
     assert result.event.reason_code == "GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER"
-    read_records_mock.assert_not_awaited()  # never touch records under a live filler
+    # DAH-2786: the records ARE read here now — a live filler is the only moment we can catch
+    # the host raising our cap back. Reading them never changes this verdict.
+    read_records_mock.assert_awaited()
 
 
 @pytest.mark.asyncio
