@@ -60,6 +60,7 @@ from payload_models.payloads import (
 )
 from services.attestation_service import AttestationError, AttestationService
 from services.const import (
+    FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_SIZE_GB,
@@ -1952,7 +1953,12 @@ class DockerService:
         """
         if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
             return []
-        existing: set[str] = set(await self._find_cache_volumes_to_sweep(ssh_client, set(), default_extra))
+        requested_names: list[str] = [cache_volume.name for cache_volume in payload.cache_volumes]
+        existing: set[str] = set(
+            await self._find_cache_volumes_to_sweep(
+                ssh_client, set(), default_extra, self._cache_volume_families(requested_names)
+            )
+        )
         present: list[CacheVolume] = [volume for volume in payload.cache_volumes if volume.name in existing]
         if len(present) == len(payload.cache_volumes):
             return list(payload.cache_volumes)
@@ -1988,14 +1994,31 @@ class DockerService:
             return present
         return list(payload.cache_volumes)
 
+    @staticmethod
+    def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
+        """The cache prefixes these volume names belong to, e.g. `dphn_cache_` for a DPHN launch.
+
+        DAH-2805: a launch may only sweep its OWN family. A node that moves from DPHN to ENGY asks
+        for engy volumes, and sweeping every cache prefix there would delete the Dolphin cache the
+        node needs for its next fast start — the very thing these volumes exist for.
+        """
+        return tuple(
+            prefix
+            for prefix in FILLER_CACHE_VOLUME_PREFIXES
+            if any(name.startswith(prefix) for name in volume_names)
+        )
+
     async def _find_cache_volumes_to_sweep(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         keep_names: set[str],
         default_extra: dict,
+        name_prefixes: tuple[str, ...] = (DPHN_CACHE_VOLUME_PREFIX,),
     ) -> list[str]:
         # Cache volumes present on the host that this create no longer names, i.e. left by an older
         # model or runtime. Empty on any listing failure — sweeping is never worth failing a launch.
+        if not name_prefixes:
+            return []
         try:
             listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
         except asyncio.CancelledError:
@@ -2003,7 +2026,7 @@ class DockerService:
         except Exception as exc:
             logger.warning(
                 _m(
-                    "Failed to list DPHN cache volumes",
+                    "Failed to list filler cache volumes",
                     extra=get_extra_info({**default_extra, "error": str(exc)}),
                 ),
                 exc_info=True,
@@ -2014,7 +2037,7 @@ class DockerService:
         return sorted(
             name
             for name in (line.strip() for line in (listed.stdout or "").splitlines())
-            if name.startswith(DPHN_CACHE_VOLUME_PREFIX) and name not in keep_names
+            if name.startswith(name_prefixes) and name not in keep_names
         )
 
     async def sweep_stale_cache_volumes(
@@ -2051,7 +2074,9 @@ class DockerService:
             return
 
         keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
-        stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(ssh_client, keep_names, default_extra)
+        stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(
+            ssh_client, keep_names, default_extra, self._cache_volume_families(sorted(keep_names))
+        )
         if not stale_volumes:
             return
         logger.info(
