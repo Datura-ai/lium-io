@@ -755,15 +755,6 @@ class MinerService:
             "results": [job_result],
         }
 
-    async def request_validation_cycle_now(self) -> None:
-        """Ask the validator loop to start its cycle now, not at the next block window.
-
-        The loop runs in another process, so the request crosses over Redis. Staging only --
-        the caller gates on the environment.
-        """
-        await self.redis_service.request_forced_validation_cycle()
-        logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
-
     async def validate_one_miner_now(self, miner_hotkey: str) -> None:
         """Validate every executor of one miner now, and publish the result.
 
@@ -801,7 +792,7 @@ class MinerService:
 
     async def _gather_forced_validation_inputs(
         self, miner_hotkey: str, log_context: dict[str, str | int | None]
-    ) -> "ForcedValidationInputs | None":
+    ) -> ForcedValidationInputs | None:
         """Collect everything one validation run needs, or None when the run must not start.
 
         The four calls are independent, and three of them block the loop: the chain reads, and

@@ -32,7 +32,6 @@ from payload_models.payloads import (
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
     ForcedMinerValidationRequest,
-    ForcedValidationCycleRequest,
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
@@ -678,14 +677,6 @@ class ComputeClient:
             return
 
         try:
-            pydantic.TypeAdapter(ForcedValidationCycleRequest).validate_json(raw_msg)
-        except pydantic.ValidationError:
-            pass
-        else:
-            await self.handle_forced_validation_cycle()
-            return
-
-        try:
             request = pydantic.TypeAdapter(ForcedMinerValidationRequest).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
@@ -775,23 +766,6 @@ class ComputeClient:
                 ),
             )
         )
-
-    async def handle_forced_validation_cycle(self) -> None:
-        """Start a validation cycle now instead of waiting for the next block window.
-
-        Staging only. The backend gates the request too; this is the second gate, so a message
-        that reaches a production validator does nothing.
-        """
-        if settings.DEPLOY_ENV == "PROD":
-            logger.warning(
-                _m(
-                    "Forced validation cycle is disabled in production",
-                    extra=get_extra_info(self.logging_extra),
-                ),
-            )
-            return
-
-        await self.miner_service.request_validation_cycle_now()
 
     async def handle_forced_miner_validation(self, request: ForcedMinerValidationRequest) -> None:
         """Validate one miner now instead of waiting for the next block window.
