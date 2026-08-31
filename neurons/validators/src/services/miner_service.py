@@ -63,11 +63,7 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService, inflight_creates
-from services.redis_service import (
-    FORCED_VALIDATION_CYCLE_KEY,
-    MACHINE_SPEC_CHANNEL,
-    RedisService,
-)
+from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
 from incentive.config import BASE_GPU_MAP
@@ -738,12 +734,12 @@ class MinerService:
         }
 
     async def request_validation_cycle_now(self) -> None:
-        """Ask the validator loop to start its cycle now instead of at the next block window.
+        """Ask the validator loop to start its cycle now, not at the next block window.
 
         The loop runs in another process, so the request crosses over Redis. Staging only --
         the caller gates on the environment.
         """
-        await self.redis_service.set(FORCED_VALIDATION_CYCLE_KEY, "1")
+        await self.redis_service.request_forced_validation_cycle()
         logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
 
     async def publish_machine_specs(

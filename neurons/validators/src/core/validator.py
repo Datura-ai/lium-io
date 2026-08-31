@@ -26,7 +26,6 @@ from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
 from services.miner_service import MinerService
 from services.redis_service import (
-    FORCED_VALIDATION_CYCLE_KEY,
     GPU_ESTIMATES_CHANNEL,
     PENDING_PODS_PREFIX,
     RedisService,
@@ -157,27 +156,15 @@ class Validator:
             ),
         )
 
-    async def start_cycle_now_if_an_operator_asked(self, current_block: int) -> None:
-        """Clear the block-window wait when a forced cycle was requested. Staging only.
+    async def an_operator_asked_for_a_cycle_now(self) -> bool:
+        """Whether an operator asked for a cycle. Reads only -- the request stays pending.
 
-        DAH-2090. The connector process sets the key; it runs beside this one and shares no
-        memory with it, so Redis is how the request crosses over. The key is consumed here, so
-        one request starts exactly one cycle.
+        DAH-2090, staging only. The connector process writes the request; it runs beside this
+        one and shares no memory with it, so Redis carries it across. The request is cleared
+        only once a cycle actually starts, so a tick that gives up early tries again instead
+        of swallowing it.
         """
-        if not await self.redis_service.get(FORCED_VALIDATION_CYCLE_KEY):
-            return
-
-        await self.redis_service.delete(FORCED_VALIDATION_CYCLE_KEY)
-        self.last_job_run_blocks = 0
-        logger.info(
-            _m(
-                "[sync] Forced validation cycle requested, starting one now",
-                extra=get_extra_info({
-                    **self.default_extra,
-                    "current_block": current_block,
-                }),
-            ),
-        )
+        return await self.redis_service.is_forced_validation_cycle_requested()
 
     async def sync(self):
         try:
@@ -256,9 +243,15 @@ class Validator:
                 ),
             )
 
-            await self.start_cycle_now_if_an_operator_asked(current_block)
+            # Kept out of last_job_run_blocks on purpose: that field is the throttle's memory of
+            # the previous cycle, and sync() can still return early below. Zeroing it would leave
+            # the gate open on every following tick instead of running one cycle.
+            cycle_asked_for_now = await self.an_operator_asked_for_a_cycle_now()
 
-            if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
+            if (
+                cycle_asked_for_now
+                or current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB
+            ):
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
 
@@ -303,6 +296,10 @@ class Validator:
                 )
 
                 self.last_job_run_blocks = current_block
+                if cycle_asked_for_now:
+                    # Cleared here and not at the read: every return above this line means no
+                    # cycle started, and the operator's request must survive to the next tick.
+                    await self.redis_service.clear_forced_validation_cycle_request()
 
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
 

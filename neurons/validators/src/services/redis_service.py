@@ -32,8 +32,8 @@ PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
 GPU_ESTIMATES_CHANNEL = "gpu_estimates_channel"
 GPU_ESTIMATES_KEY = "gpu_estimates"
 INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
-# Set by the connector process, consumed by the validator process: the two do not share memory,
-# so this key is how a forced cycle request crosses between them.
+# Written by the connector process, read by the validator process: they share no memory, so
+# this key is how an operator's request for a cycle crosses between them.
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 
 # Distributed lock settings
@@ -141,6 +141,15 @@ class RedisService:
             await pubsub.aclose()
             raise
         return pubsub
+
+    async def request_forced_validation_cycle(self) -> None:
+        await self.set(FORCED_VALIDATION_CYCLE_KEY, "1")
+
+    async def is_forced_validation_cycle_requested(self) -> bool:
+        return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
+
+    async def clear_forced_validation_cycle_request(self) -> None:
+        await self.delete(FORCED_VALIDATION_CYCLE_KEY)
 
     async def set(self, key: str, value: str):
         """Set a key-value pair in Redis."""

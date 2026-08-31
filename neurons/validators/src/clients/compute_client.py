@@ -669,19 +669,19 @@ class ComputeClient:
             return
 
         try:
-            pydantic.TypeAdapter(ForcedValidationCycleRequest).validate_json(raw_msg)
-        except pydantic.ValidationError:
-            pass
-        else:
-            await self.handle_forced_validation_cycle()
-            return
-
-        try:
             req: GetEstimateRequest = pydantic.TypeAdapter(GetEstimateRequest).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
         else:
             await self._handle_get_estimate(req)
+            return
+
+        try:
+            pydantic.TypeAdapter(ForcedValidationCycleRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self.handle_forced_validation_cycle()
             return
 
         try:
