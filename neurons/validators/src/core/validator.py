@@ -164,7 +164,23 @@ class Validator:
         only once a cycle actually starts, so a tick that gives up early tries again instead
         of swallowing it.
         """
-        return await self.redis_service.is_forced_validation_cycle_requested()
+        # A production validator ignores the key entirely, so a stray one cannot start a cycle
+        # there even if something wrote it.
+        if settings.DEPLOY_ENV == "PROD":
+            return False
+
+        # This runs on every tick, before the cycle branch. Without the guard a Redis blip
+        # would end the whole tick as a generic "[sync] Unknown error".
+        try:
+            return await self.redis_service.is_forced_validation_cycle_requested()
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[sync] Could not read the forced validation cycle request",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+            return False
 
     async def sync(self):
         try:

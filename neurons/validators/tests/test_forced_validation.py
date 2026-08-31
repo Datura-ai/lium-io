@@ -77,8 +77,11 @@ async def test_a_container_message_is_not_read_as_a_forced_cycle(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_the_connector_request_reaches_the_validator_process(shared_redis) -> None:
+async def test_the_connector_request_reaches_the_validator_process(monkeypatch, shared_redis) -> None:
     """The two processes agree only through Redis, so mocks cannot prove this."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "STAGE")
     connector_miner_service = MinerService.__new__(MinerService)
     connector_miner_service.redis_service = _redis_service(shared_redis)
     validator_process = Validator.__new__(Validator)
@@ -100,3 +103,31 @@ async def test_the_connector_request_reaches_the_validator_process(shared_redis)
 def test_the_backend_bytes_still_parse_as_the_model_this_side_expects() -> None:
     """The two repos agree only on this string; nothing else checks that they still match."""
     assert ForcedValidationCycleRequest.model_validate_json(FORCED_CYCLE_MESSAGE_FROM_BACKEND)
+
+
+@pytest.mark.asyncio
+async def test_a_production_validator_ignores_a_stray_request(monkeypatch, shared_redis) -> None:
+    """The connector refuses to write on prod; this is the second gate, in the reading process."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "PROD")
+    validator_process = Validator.__new__(Validator)
+    validator_process.redis_service = _redis_service(shared_redis)
+    await validator_process.redis_service.request_forced_validation_cycle()
+
+    assert await validator_process.an_operator_asked_for_a_cycle_now() is False
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_redis_does_not_end_the_sync_tick(monkeypatch) -> None:
+    """sync() catches this, but it would lose the whole tick, cycle branch included."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "STAGE")
+    validator_process = Validator.__new__(Validator)
+    validator_process.default_extra = {}
+    validator_process.redis_service = MagicMock(
+        is_forced_validation_cycle_requested=AsyncMock(side_effect=ConnectionError("redis down"))
+    )
+
+    assert await validator_process.an_operator_asked_for_a_cycle_now() is False
