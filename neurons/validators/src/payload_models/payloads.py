@@ -1,5 +1,6 @@
 import enum
 from datetime import datetime
+from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
@@ -193,6 +194,16 @@ class ContainerRequestType(enum.Enum):
     RestoreContainerRequest = "RestoreContainerRequest"
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
+
+
+class ForcedValidationCycleRequest(BaseModel):
+    """Ask the validator to start its validation cycle now, not at the next block window.
+
+    A staging development tool: it removes the wait for the next cycle. It carries no executor
+    -- the cycle validates the whole fleet, exactly as the scheduled one does.
+    """
+
+    message_type: Literal["ForcedValidationCycleRequest"]
 
 
 class WorkloadKind(enum.Enum):
