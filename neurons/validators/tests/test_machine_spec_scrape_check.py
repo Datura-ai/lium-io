@@ -531,6 +531,32 @@ async def test_machine_spec_scrape_decrypts_nothing_but_the_token_on_a_spammed_s
 
 
 @pytest.mark.asyncio
+async def test_machine_spec_scrape_reads_a_token_longer_than_the_search_window(
+    context_factory,
+):
+    # A byte-wise cut of the tail lands inside a big payload and takes the `gAAAAA` prefix with
+    # it, after which no reader recognises the line. Whole lines are searched instead.
+    # Arrange
+    long_token = FERNET_TOKEN + "x" * (400 * 1024)
+    ssh_service = DummySSHService(decrypted_data=RAW_SPECS, valid_payload=long_token)
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=f"chatter\n{long_token}"))
+    ctx = context_factory(
+        services=build_services(ssh=ssh_service),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    # Act
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert ssh_service.decrypt_call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_scrape_reported_its_own_error(
     context_factory,
 ):

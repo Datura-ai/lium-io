@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import shlex
-from dataclasses import replace
+from collections.abc import Iterator
+from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
 from ..messages import MachineSpecMessages as Msg, render_message
@@ -11,14 +12,14 @@ from ..runner import SSHCommandResult
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
 from .network_ema import compute_ema
-from .upload_files import UploadFailed, upload_validation_files
+from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 # DAH-2794: how long a failed stdin attempt may have taken and still be worth retrying with the
 # binary. Above a full scrape (~15 s on a real box, so a payload that will not decrypt is only
 # knowable around then), below the point where the retry stops fitting: 60 s here + 300 s upload
 # + 300 s scrape = 660 s against the 780 s per-executor timeout. The upload gets one attempt for
 # exactly that reason.
-FALLBACK_MAX_STDIN_DURATION_MS = 60_000
+STDIN_FAILURE_RETRY_WINDOW_MS = 60_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
@@ -27,10 +28,22 @@ FALLBACK_UPLOAD_ATTEMPTS = 1
 FERNET_TOKEN_PREFIX = "gAAAAA"
 
 # How much stdout the miner puts in front of the scrape's own line is his choice, not a bounded
-# amount, so only the tail is searched and only so many candidates are decrypted — both run
-# synchronously on the event loop shared with every other executor in the cycle.
+# amount, so only the last lines are searched and only so many candidates are decrypted — both
+# run synchronously on the event loop shared with every other executor in the cycle.
 STDOUT_SEARCH_TAIL_BYTES = 256 * 1024
 MAX_PAYLOAD_DECRYPT_ATTEMPTS = 20
+
+
+def _lines_from_the_end(stdout: str) -> Iterator[str]:
+    # whole lines, newest first, until the window is spent — a token that is itself longer than
+    # the window would lose its prefix to a byte-wise cut and be dropped by every reader below
+    end = len(stdout)
+    scanned = 0
+    while end > 0 and scanned < STDOUT_SEARCH_TAIL_BYTES:
+        start = stdout.rfind("\n", 0, end)
+        yield stdout[start + 1 : end]
+        scanned += end - start
+        end = start
 
 
 def _update_keys(data: Any, key_mapping: dict[str, str]) -> Any:
@@ -76,7 +89,7 @@ def _decrypt_payload(ctx: Context, stdout: str) -> str:
 
     last_exc: Exception | None = None
     attempts = 0
-    for line in reversed(stdout[-STDOUT_SEARCH_TAIL_BYTES:].splitlines()):
+    for line in _lines_from_the_end(stdout):
         candidate = line.strip()
         if not candidate.startswith(FERNET_TOKEN_PREFIX):
             continue
@@ -94,14 +107,47 @@ def _decrypt_payload(ctx: Context, stdout: str) -> str:
 def _scrape_reported_its_own_failure(stdout: str) -> bool:
     # the scrape prints {"error": ...} as its last line and exits non-zero when it ran but found
     # nothing to report; a source the interpreter could not run prints nothing of ours at all
-    lines = [line for line in stdout[-STDOUT_SEARCH_TAIL_BYTES:].splitlines() if line.strip()]
-    if not lines:
+    last_line = next((line for line in _lines_from_the_end(stdout) if line.strip()), None)
+    if last_line is None:
         return False
     try:
-        report = json.loads(lines[-1])
+        report = json.loads(last_line)
     except ValueError:
         return False
     return isinstance(report, dict) and "error" in report
+
+
+@dataclass(frozen=True)
+class StdinAttempt:
+    """Why the stdin delivery failed, carried into the event of the binary retry.
+
+    The retry discards the stdin attempt's own event, and a run that exited 0 with an unreadable
+    payload says nothing in ``exit_code`` or ``stderr`` — so the reason travels with it.
+    """
+
+    reason: str
+    command_id: str | None = None
+    exit_code: int | None = None
+    duration_ms: int | None = None
+    stderr_tail: str | None = None
+    exception: str | None = None
+    stdout_head: str | None = None
+
+    @classmethod
+    def from_failed_result(cls, result: CheckResult) -> StdinAttempt:
+        what_we_saw = result.event.what_we_saw
+        carried = {field.name for field in fields(cls)} - {"reason"}
+        return cls(
+            reason=result.event.reason_code,
+            **{name: what_we_saw.get(name) for name in carried},
+        )
+
+    def as_event_field(self) -> dict[str, Any]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if getattr(self, field.name) is not None
+        }
 
 
 def _binary_command(remote_dir: str, script_filename: str) -> str:
@@ -149,10 +195,10 @@ class MachineSpecScrapeCheck:
 
         # The source did not run here: wrong interpreter, no psutil, or a cryptography too old
         # to produce a token this validator can read. The binary carries its own interpreter and
-        # every dependency, so retry with it — but past FALLBACK_MAX_STDIN_DURATION_MS the scrape
+        # every dependency, so retry with it — but past STDIN_FAILURE_RETRY_WINDOW_MS the scrape
         # hung rather than failed to start, and the binary runs the very same code.
         if (
-            scrape_run.duration_ms > FALLBACK_MAX_STDIN_DURATION_MS
+            scrape_run.duration_ms > STDIN_FAILURE_RETRY_WINDOW_MS
             or not ctx.config.machine_scrape_filename
         ):
             return result
@@ -162,12 +208,16 @@ class MachineSpecScrapeCheck:
         if scrape_run.exit_code != 0 and _scrape_reported_its_own_failure(scrape_run.stdout):
             return result
 
-        # The stdin attempt's own event is discarded with the retry, so carry it whole: a run that
-        # exited 0 and produced an unreadable payload says nothing in exit_code or stderr.
-        fallback_from = {"reason": result.event.reason_code, **result.event.what_we_saw}
+        return await self._retry_scrape_with_uploaded_binary(
+            ctx, timeout, fallback_from=StdinAttempt.from_failed_result(result)
+        )
 
+    async def _retry_scrape_with_uploaded_binary(
+        self, ctx: Context, timeout: int, *, fallback_from: StdinAttempt
+    ) -> CheckResult:
+        # upload the frozen scrape and run it, after the stdin delivery failed to start
         try:
-            remote_dir = await upload_validation_files(ctx, attempts=FALLBACK_UPLOAD_ATTEMPTS)
+            remote_dir = await upload_validation_files_to_fresh_remote_dir(ctx, attempts=FALLBACK_UPLOAD_ATTEMPTS)
         except UploadFailed as exc:
             event = render_message(
                 Msg.SCRAPE_FAILED,
@@ -175,7 +225,7 @@ class MachineSpecScrapeCheck:
                 check_id=self.check_id,
                 what={
                     "delivery": "stdin",
-                    "fallback_from": fallback_from,
+                    "fallback_from": fallback_from.as_event_field(),
                     "fallback_upload_error": str(exc),
                 },
             )
@@ -222,11 +272,11 @@ class MachineSpecScrapeCheck:
         scrape_run: SSHCommandResult,
         *,
         delivery: Literal["stdin", "upload"],
-        fallback_from: dict[str, Any] | None = None,
+        fallback_from: StdinAttempt | None = None,
     ) -> CheckResult:
         what: dict[str, Any] = {"delivery": delivery}
         if fallback_from:
-            what["fallback_from"] = fallback_from
+            what["fallback_from"] = fallback_from.as_event_field()
 
         if not scrape_run.success or not scrape_run.stdout.strip():
             event = render_message(

@@ -15,8 +15,8 @@ class UploadFailed(Exception):
     """The validation assets never reached the executor."""
 
 
-async def upload_validation_files(ctx: Context, *, attempts: int = MAX_RETRIES) -> str:
-    # copy the local validation assets into a fresh random directory on the executor
+async def upload_validation_files_to_fresh_remote_dir(ctx: Context, *, attempts: int = MAX_RETRIES) -> str:
+    # copy the local validation assets into a fresh random directory on the executor, and name it
     local_dir = ctx.state.upload_local_dir
     executor_root = ctx.config.executor_root
     if not local_dir or not executor_root:
@@ -80,7 +80,7 @@ class UploadFilesCheck:
             return CheckResult(passed=False, event=event)
 
         try:
-            remote_dir = await upload_validation_files(ctx)
+            remote_dir = await upload_validation_files_to_fresh_remote_dir(ctx)
         except UploadFailed as exc:
             event = render_message(
                 Msg.UPLOAD_FAILED,
