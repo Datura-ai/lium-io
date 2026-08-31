@@ -70,6 +70,9 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import inflight_creates
+from clients.backend_client import BackendClient
+from services.file_encrypt_service import FileEncryptService
+from services.forced_miner_validation import validate_one_miner_now
 from services.miner_service import MinerService
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
@@ -104,9 +107,16 @@ class ComputeClient:
     HEARTBEAT_PERIOD = 60
 
     def __init__(
-        self, keypair: bittensor.Keypair, compute_app_uri: str, miner_service: MinerService
+        self,
+        keypair: bittensor.Keypair,
+        compute_app_uri: str,
+        miner_service: MinerService,
+        backend_client: BackendClient,
+        file_encrypt_service: FileEncryptService,
     ):
         self.keypair = keypair
+        self.backend_client = backend_client
+        self.file_encrypt_service = file_encrypt_service
         self.ws: ClientConnection | None = None
         self.compute_app_uri = compute_app_uri
         self.compute_app_rest_api_uri = compute_app_uri.replace("wss", "https").replace("ws", "http")
@@ -681,7 +691,11 @@ class ComputeClient:
         except pydantic.ValidationError:
             pass
         else:
-            await self.handle_forced_miner_validation(request)
+            # Not awaited: the receive loop reads one frame at a time, and this run costs
+            # tens of seconds. Container create and delete would sit unread behind it.
+            await self.miner_drivers.put(
+                asyncio.create_task(self.handle_forced_miner_validation(request))
+            )
             return
 
         try:
@@ -782,7 +796,12 @@ class ComputeClient:
             )
             return
 
-        await self.miner_service.validate_one_miner_now(request.miner_hotkey)
+        await validate_one_miner_now(
+            self.miner_service,
+            self.backend_client,
+            self.file_encrypt_service,
+            request.miner_hotkey,
+        )
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)

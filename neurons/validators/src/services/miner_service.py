@@ -11,9 +11,7 @@ import aiohttp
 from asyncssh import SSHKey
 import asyncssh
 import bittensor
-from clients.backend_client import BackendClient
 from clients.miner_client import MinerClient
-from clients.subtensor_client import SubtensorClient
 from datura.requests.miner_requests import (
     AcceptJobRequest,
     AcceptSSHKeyRequest,
@@ -60,11 +58,7 @@ from payload_models.payloads import (
 )
 from tenacity import RetryError
 
-from pydantic import BaseModel
-
 from core.config import settings
-from services.default_docker_image_digest_service import fetch_default_image_digests
-from services.file_encrypt_service import FileEncryptService
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
@@ -190,15 +184,6 @@ REST_SSH_REMOVE_TIMEOUT = 10  # Timeout for SSH key removal requests
 MANUAL_RENTAL_FORCED_PASS_EVENT = "Executor force-passed as special manual rental (not validated)"
 
 
-class ForcedValidationInputs(BaseModel):
-    """Everything one validation run needs, gathered before the miner is contacted."""
-
-    payload: MinerJobRequestPayload
-    encrypted_files: MinerJobEnryptedFiles
-    rented_executors: RentedExecutorsResponse
-    default_docker_image_digests: dict[str, str]
-
-
 class MinerService:
     def __init__(
         self,
@@ -206,18 +191,11 @@ class MinerService:
         task_service: Annotated[TaskService, Depends(TaskService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
-        backend_client: Annotated[BackendClient, Depends(BackendClient)],
-        file_encrypt_service: Annotated[FileEncryptService, Depends(FileEncryptService)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
-        self.backend_client = backend_client
-        self.file_encrypt_service = file_encrypt_service
-        # ecrypt_miner_job_files wipes and rebuilds one fixed temp directory, so two forced
-        # runs at once would delete each other's binaries mid-run.
-        self.forced_validation_lock = asyncio.Lock()
 
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
@@ -754,131 +732,6 @@ class MinerService:
             "miner_coldkey": payload.miner_coldkey,
             "results": [job_result],
         }
-
-    async def validate_one_miner_now(self, miner_hotkey: str) -> None:
-        """Validate every executor of one miner now, and publish the result.
-
-        This is one iteration of the scheduled cycle, aimed at a single miner. The cycle waits
-        on all registered miners and most of them never answer, so it costs minutes; one miner
-        returns in seconds. Staging only -- the caller gates on the environment.
-        """
-        log_context: dict[str, str | int | None] = {"miner_hotkey": miner_hotkey}
-        async with self.forced_validation_lock:
-            job_inputs = await self._gather_forced_validation_inputs(miner_hotkey, log_context)
-            if job_inputs is None:
-                return
-            job = await self.request_job_to_miner(
-                payload=job_inputs.payload,
-                encrypted_files=job_inputs.encrypted_files,
-                rented_data=job_inputs.rented_executors,
-                default_docker_image_digests=job_inputs.default_docker_image_digests,
-            )
-
-        results: list[JobResult] = job["results"]
-        logger.info(
-            _m(
-                "Forced miner validation finished",
-                extra=get_extra_info({
-                    **log_context,
-                    "job_batch_id": job_inputs.payload.job_batch_id,
-                    "results": len(results),
-                    "log_text": results[0].log_text if results else "",
-                }),
-            ),
-        )
-        await self.publish_machine_specs(
-            results, job_inputs.payload.miner_hotkey, job_inputs.payload.miner_coldkey
-        )
-
-    async def _gather_forced_validation_inputs(
-        self, miner_hotkey: str, log_context: dict[str, str | int | None]
-    ) -> ForcedValidationInputs | None:
-        """Collect everything one validation run needs, or None when the run must not start.
-
-        The four calls are independent, and three of them block the loop: the chain reads, and
-        the PyInstaller build inside ecrypt_miner_job_files. The connector process also serves
-        container create and delete traffic, so the blocking ones go to threads.
-        """
-        subtensor_client = SubtensorClient.get_instance()
-        miners = await subtensor_client.get_miners()
-        matches = [miner for miner in miners if miner.hotkey == miner_hotkey]
-        if not matches:
-            logger.error(
-                _m(
-                    "Forced miner validation stopped: miner is not in the metagraph",
-                    extra=get_extra_info(log_context),
-                ),
-            )
-            return None
-        miner = matches[0]
-
-        (
-            job_batch_id,
-            rented_executors,
-            encrypted_files,
-            default_docker_image_digests,
-        ) = await asyncio.gather(
-            self._current_cycle_batch_id(subtensor_client),
-            self.backend_client.get_all_rented_executors(),
-            asyncio.to_thread(self.file_encrypt_service.ecrypt_miner_job_files),
-            self._fetch_default_docker_image_digests_or_empty(log_context),
-        )
-
-        # The scheduled cycle skips its whole iteration when this fetch fails
-        # (core/validator.py), because an empty rental map reads every rented machine as free:
-        # the run would then disturb a customer's box and score it by the wrong rule set.
-        if rented_executors is None:
-            logger.error(
-                _m(
-                    "Forced miner validation stopped: could not fetch rented executors",
-                    extra=get_extra_info(log_context),
-                ),
-            )
-            return None
-
-        return ForcedValidationInputs(
-            payload=MinerJobRequestPayload(
-                job_batch_id=job_batch_id,
-                miner_hotkey=miner_hotkey,
-                miner_coldkey=miner.coldkey,
-                miner_address=miner.axon_info.ip,
-                miner_port=miner.axon_info.port,
-            ),
-            encrypted_files=encrypted_files,
-            rented_executors=rented_executors,
-            default_docker_image_digests=default_docker_image_digests,
-        )
-
-    @staticmethod
-    async def _current_cycle_batch_id(subtensor_client: SubtensorClient) -> str:
-        """The batch id of the cycle running now, in the shape the scheduled cycle sends.
-
-        The backend parses this field as a "%Y-%m-%d %H:%M:%S" cycle timestamp, so a forced run
-        cannot invent its own id -- it would fail the spec ingestion.
-        """
-        current_block: int = await asyncio.to_thread(subtensor_client.get_current_block)
-        cycle_block: int = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
-        return await subtensor_client.get_time_from_block(cycle_block)
-
-    @staticmethod
-    async def _fetch_default_docker_image_digests_or_empty(
-        log_context: dict[str, str | int | None],
-    ) -> dict[str, str]:
-        """The digest snapshot the scheduled cycle validates against, empty when Docker Hub fails.
-
-        Fail-open like the cycle: an empty snapshot skips the digest check. Without the fetch a
-        forced run would score the miner by a weaker rule set than the cycle does.
-        """
-        try:
-            return await fetch_default_image_digests()
-        except Exception as exc:
-            logger.error(
-                _m(
-                    "Forced miner validation could not fetch image digests; digest checks skip",
-                    extra=get_extra_info({**log_context, "error": str(exc)}),
-                ),
-            )
-            return {}
 
     async def publish_machine_specs(
         self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str

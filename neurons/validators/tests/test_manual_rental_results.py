@@ -19,7 +19,7 @@ See .omc/plans/special-manual-rental.md sections T3, T4 and 5 for the full ratio
 exercised directly here rather than by driving the full websocket/REST flow.
 """
 
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -89,8 +89,6 @@ def make_miner_service() -> MinerService:
         task_service=Mock(),
         redis_service=Mock(),
         attestation_service=Mock(),
-        backend_client=MagicMock(),
-        file_encrypt_service=MagicMock(),
     )
 
 

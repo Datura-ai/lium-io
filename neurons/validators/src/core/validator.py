@@ -99,8 +99,6 @@ class Validator:
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
-            backend_client=self.backend_client,
-            file_encrypt_service=self.file_encrypt_service,
         )
         task_service = TaskService(
             ssh_service=ssh_service,
@@ -157,6 +155,32 @@ class Validator:
                 ),
             ),
         )
+
+    async def an_operator_asked_for_a_cycle_now(self) -> bool:
+        """Whether an operator asked for a cycle. Reads only -- the request stays pending.
+
+        DAH-2090, staging only. The connector process writes the request; it runs beside this
+        one and shares no memory with it, so Redis carries it across. The request is cleared
+        only once a cycle actually starts, so a tick that gives up early tries again instead
+        of swallowing it.
+        """
+        # A production validator ignores the key entirely, so a stray one cannot start a cycle
+        # there even if something wrote it.
+        if settings.DEPLOY_ENV == "PROD":
+            return False
+
+        # This runs on every tick, before the cycle branch. Without the guard a Redis blip
+        # would end the whole tick as a generic "[sync] Unknown error".
+        try:
+            return await self.redis_service.is_forced_validation_cycle_requested()
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[sync] Could not read the forced validation cycle request",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+            return False
 
     async def sync(self):
         try:
@@ -235,7 +259,15 @@ class Validator:
                 ),
             )
 
-            if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
+            # Kept out of last_job_run_blocks on purpose: that field is the throttle's memory of
+            # the previous cycle, and sync() can still return early below. Zeroing it would leave
+            # the gate open on every following tick instead of running one cycle.
+            cycle_asked_for_now = await self.an_operator_asked_for_a_cycle_now()
+
+            if (
+                cycle_asked_for_now
+                or current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB
+            ):
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
 
@@ -280,6 +312,10 @@ class Validator:
                 )
 
                 self.last_job_run_blocks = current_block
+                if cycle_asked_for_now:
+                    # Cleared here and not at the read: every return above this line means no
+                    # cycle started, and the operator's request must survive to the next tick.
+                    await self.redis_service.clear_forced_validation_cycle_request()
 
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
 

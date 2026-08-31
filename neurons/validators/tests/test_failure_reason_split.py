@@ -7,7 +7,7 @@ filler_run.failure_reason and logs. Packing the full text into msg is what leake
 into renter dashboards.
 """
 
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 from core.utils import _m
 from payload_models.payloads import (
@@ -24,8 +24,6 @@ def _miner_service() -> MinerService:
         task_service=Mock(),
         redis_service=Mock(),
         attestation_service=Mock(),
-        backend_client=MagicMock(),
-        file_encrypt_service=MagicMock(),
     )
 
 
