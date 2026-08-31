@@ -2,11 +2,10 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field, PrivateAttr
-
 from datura.requests.miner_requests import ExecutorSSHInfo
-
 from incentive.miner_incentive_log import IncentiveReason
+from protocol.vc_protocol.validator_requests import ValidationEvent
+from pydantic import BaseModel, Field, PrivateAttr
 
 if TYPE_CHECKING:
     from incentive.miner_incentive_log import MinerLogLine
@@ -35,6 +34,7 @@ class JobResult(BaseModel):
     job_batch_id: str
     log_status: str
     log_text: str
+    validation_event: ValidationEvent | None = None
     # One timestamp shared by every executor finalized in this validator cycle.
     # It is assigned after final weights are calculated and is the accounting/day key.
     scored_at: datetime | None = None
@@ -238,27 +238,6 @@ class JobResult(BaseModel):
     @property
     def is_successful(self):
         return (self.score > 0 or self.job_score > 0) and self.gpu_model and self.gpu_count > 0
-
-
-class ValidationEvent(BaseModel):
-    event: str
-    reason_code: str
-    severity: str
-    category: str = "runtime"
-    impact: str
-    remediation: str | None = None
-    what_we_saw: dict[str, Any] = Field(default_factory=dict)
-    warnings: list[str] = Field(default_factory=list)
-    help_uri: str | None = None
-    check_id: str | None = None
-    pipeline_id: str | None = None
-    trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    when: datetime
-    context: dict[str, Any] = Field(default_factory=dict)
-
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
-        extra = "allow"
 
 
 def build_msg(

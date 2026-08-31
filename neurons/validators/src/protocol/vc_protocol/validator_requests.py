@@ -1,13 +1,13 @@
 import enum
 import json
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 
 import bittensor
 import pydantic
 from datura.requests.base import BaseRequest
-
 from incentive.miner_incentive_log import IncentiveReason
 from payload_models.payloads import DeliveryStamps
 
@@ -58,6 +58,25 @@ class AuthenticateRequest(BaseValidatorRequest):
         return cls(payload=payload, signature=f"0x{keypair.sign(payload.blob_for_signing()).hex()}")
 
 
+class ValidationEvent(pydantic.BaseModel):
+    event: str
+    reason_code: str
+    severity: str
+    category: str = "runtime"
+    impact: str
+    remediation: str | None = None
+    what_we_saw: dict[str, Any] = pydantic.Field(default_factory=dict)
+    warnings: list[str] = pydantic.Field(default_factory=list)
+    help_uri: str | None = None
+    check_id: str | None = None
+    pipeline_id: str | None = None
+    trace_id: str = pydantic.Field(default_factory=lambda: str(uuid.uuid4()))
+    when: datetime
+    context: dict[str, Any] = pydantic.Field(default_factory=dict)
+
+    model_config = pydantic.ConfigDict(extra="allow")
+
+
 class ExecutorSpecRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ExecutorSpecRequest
     miner_hotkey: str
@@ -73,6 +92,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     synthetic_job_score: float | None
     log_text: str | None
     log_status: str | None
+    validation_event: ValidationEvent | None = None
     job_batch_id: str
     netuid: int | None = None
     scored_at: datetime | None = None

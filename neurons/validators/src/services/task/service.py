@@ -150,6 +150,7 @@ class TaskService:
                     verified_job_info=base_ctx.verified,  # From original context
                     log_text=log_text.to_full_string(),
                     success=success,
+                    validation_event=last_event,
                 )
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
