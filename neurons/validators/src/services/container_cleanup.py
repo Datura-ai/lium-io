@@ -21,7 +21,6 @@ from services.const import (
 
 logger = logging.getLogger(__name__)
 
-
 # Anonymous docker volumes are named with a 64-char hex hash.
 ANON_VOLUME_NAME_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -357,25 +356,24 @@ class ContainerCleanup:
     ) -> list[str]:
         """Run the find INSIDE a helper container with the volumes mounted by name.
 
-        The validator's SSH session lands inside the miner's executor container, so a host path like
-        `/var/lib/docker/volumes/<name>/_data` does not exist there — the same reason
-        `df_available_bytes` measures disk through a bind-mounted helper. Mounting by NAME also means
-        no mount-point lookup at all, and it cannot reach outside the volumes we asked for.
+        Same reason `df_available_bytes` measures disk through a helper: the validator's SSH session
+        lands inside the executor container, where the volumes' host paths do not exist. Mounting by
+        NAME also removes the mount-point lookup, and the helper cannot reach outside what we mount.
 
         `-name` comes before `-type`/`-mmin` so only a name match pays a stat(), and the removal is
-        `-exec rm`, not `-delete`: `-delete` turns on `-depth`, which silently disables the xet prune.
+        `-exec rm`, not `-delete`: `-delete` turns on `-depth`, which silently disables the prunes.
         Verified against busybox find (alpine 3.19): it removes the aged temporary, keeps a fresh one,
-        keeps a finished blob, and never descends into the xet chunk cache.
+        keeps a finished blob, and never descends into the xet or runtimes trees.
         """
         mount_flags: str = " ".join(
             f"-v {shlex.quote(name)}:/cache{index}" for index, name in enumerate(volume_names)
         )
         search_roots: str = " ".join(f"/cache{index}" for index in range(len(volume_names)))
-        # Named, and named with a Lium prefix: the provider-side load gate excuses our own
-        # housekeeping by name (LIUM_INFRA_CONTAINER_PREFIXES), and an anonymous container would be
-        # counted as the provider taking the machine from Lium. `--rm` keeps the name free for the
-        # next cycle, and a name still in use only fails this sweep, which is already best-effort.
+        # The `rm -f` first: `--rm` does not fire if dockerd is restarted mid-run, and a leftover
+        # container would hold the name for good — the sweep would then fail silently on that node
+        # forever. Worst case it interrupts a sweep another validator started, which simply runs again.
         result = await ssh_client.run(
+            f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1; "
             f"/usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} {mount_flags} {ALPINE_HELPER_IMAGE} "
             f"find {search_roots} -maxdepth {DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH} "
             "-type d \\( -name xet -o -name runtimes \\) -prune -o "

@@ -59,9 +59,10 @@ async def test_sweeps_both_filler_cache_volumes():
     assert "-v dphn_cache_hf_model:/cache0" in find_command
     assert "-v engy_cache_ckpt_v3:/cache1" in find_command
     assert "find /cache0 /cache1" in find_command
-    # Named with a Lium prefix, or the provider-side load gate counts our own housekeeping against
-    # the miner (LIUM_INFRA_CONTAINER_PREFIXES excuses by name).
+    # Named, or the provider-side load gate counts our housekeeping against the miner.
     assert f"--name {CACHE_SWEEP_CONTAINER_NAME}" in find_command
+    # A leftover from a dockerd restart would hold the name for good and kill the sweep silently.
+    assert f"docker rm -f {CACHE_SWEEP_CONTAINER_NAME}" in find_command
 
 
 @pytest.mark.asyncio
