@@ -51,7 +51,9 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
+from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
+from services.executor_image_policy import outdated_image_remediation
 
 if TYPE_CHECKING:
     from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, PowerCapIncapable
@@ -80,6 +82,7 @@ class ZeroIncentiveReason(StrEnum):
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
+    OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
 
 
 class IncentiveReason(BaseModel):
@@ -230,6 +233,23 @@ class MinerLogLine(BaseModel):
                 "of a Lium job, and executors on your own job do not earn subnet incentive."
             ),
             internal_message="Executor excluded from both pools - running miner's own default job",
+        )
+
+    @staticmethod
+    def no_payout_because_outdated_executor_image(result: JobResult) -> MinerLogLine:
+        report = result.executor_image_report or {}
+        expected_ref = report.get("expected_ref") or settings.EXECUTOR_IMAGE_REF
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE,
+            message=outdated_image_remediation(str(expected_ref)),
+            extra_fields={
+                "executor_image_status": report.get("status"),
+                "observed_digest": report.get("observed_digest"),
+                "expected_digest": report.get("expected_digest"),
+                "expected_ref": expected_ref,
+            },
+            internal_message="Executor excluded from both pools because a required image is outdated",
         )
 
     # ── Group B: idle but not qualified for the unrented pool ─────────────────

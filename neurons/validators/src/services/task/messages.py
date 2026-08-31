@@ -411,6 +411,30 @@ class BannedProviderMessages:
     )
 
 
+class ExecutorImageMessages:
+    CURRENT = MessageTemplate(
+        event="Executor image is current",
+        reason="EXECUTOR_IMAGE_CURRENT",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Executor image check skipped",
+        reason="EXECUTOR_IMAGE_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="No image penalty this cycle",
+    )
+    OUTDATED = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="error",
+        category="policy",
+        impact="Score set to 0 until the image is current",
+    )
+
+
 class SysboxRequiredMessages:
     SYSBOX_MISSING = MessageTemplate(
         event="Sysbox required for unrented executor",

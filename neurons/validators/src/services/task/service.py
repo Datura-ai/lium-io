@@ -10,6 +10,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationError, AttestationNonce, AttestationService
 from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
+from services.executor_image_policy import ExpectedImageSnapshot
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.redis_service import RedisService
@@ -66,6 +67,7 @@ class TaskService:
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
+        executor_image_snapshot: ExpectedImageSnapshot | None = None,
         attestation_nonce: AttestationNonce | None = None,
     ):
         """New pipeline-based validation task implementation."""
@@ -122,6 +124,7 @@ class TaskService:
                     encrypted_files=encrypted_files,
                     rented_data=rented_data,
                     default_docker_image_digests=default_docker_image_digests,
+                    executor_image_snapshot=executor_image_snapshot,
                     tdx_attestation_passed=attestation_passed,
                     gpu_attestation_passed=gpu_attestation_passed,
                 )

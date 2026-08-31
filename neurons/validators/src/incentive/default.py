@@ -13,7 +13,7 @@ from services.task_service import JobResult
 from core.config import get_total_burn_emission, settings
 from core.utils import _m, get_extra_info, get_logger
 from incentive.base import BaseIncentive
-from incentive.miner_incentive_log import MinerLogLine
+from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 
 logger = get_logger(__name__)
 
@@ -103,6 +103,20 @@ class DefaultIncentive(BaseIncentive):
             self.failed_executors += 1
         return result
 
+    @staticmethod
+    def _record_outdated_image_reason(result: JobResult) -> bool:
+        report = result.executor_image_report or {}
+        if report.get("status") != "OUTDATED":
+            return False
+        if not any(
+            reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
+            for reason in result.zero_incentive_reasons
+        ):
+            result.record_incentive_log(
+                MinerLogLine.no_payout_because_outdated_executor_image(result)
+            )
+        return True
+
     async def _post_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Process a job result.
 
@@ -140,6 +154,10 @@ class DefaultIncentive(BaseIncentive):
         Returns:
             JobResult with calculated mining score
         """
+        if self._record_outdated_image_reason(job_result):
+            job_result.mining_score = 0
+            return job_result
+
         # Early exit check - if job score is 0, return immediately
         if not job_result.score:
             job_result.mining_score = 0
