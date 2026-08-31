@@ -285,6 +285,11 @@ RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 # services/task/__init__ and the checks back in.
 PROBE_CONTAINER_NAME = "lium_roce_probe"
 
+# DAH-2805: the throwaway helper that sweeps abandoned download temporaries out of the filler cache
+# volumes. Named — and named with a Lium prefix — so the provider-side load gate excuses the seconds
+# of CPU it holds instead of counting our own housekeeping against the miner.
+CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
+
 # Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
 # them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
 # provider-side load gate (DAH-2734) must not bill their CPU to the provider, so it excuses
@@ -302,6 +307,7 @@ LIUM_INFRA_CONTAINER_PREFIXES = (
     # real CPU while it runs
     "s3fs-backup",
     PROBE_CONTAINER_NAME,
+    CACHE_SWEEP_CONTAINER_NAME,
 )
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 

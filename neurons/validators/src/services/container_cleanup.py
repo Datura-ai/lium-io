@@ -11,6 +11,7 @@ from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_VOLUME_PREFIX,
+    CACHE_SWEEP_CONTAINER_NAME,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
@@ -40,6 +41,9 @@ VOLUME_RM_MAX_PER_PASS = 200
 # sweep_abandoned_download_temporaries): with hf_xet the destination file is written in 64 MiB
 # bursts, which at the slowest per-file rate measured in prod (~50 KB/s) is ~22 min between writes.
 # 4 hours clears that by 10x while bounding the standing garbage to ~70 GB at the observed leak rate.
+# The residual case is accepted, not overlooked: a download whose process is alive but has written
+# nothing for four hours loses its file. It loses nothing real — huggingface_hub never resumes a
+# temporary anyway, so that attempt was already going to restart from byte zero.
 DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES = 240
 
 # Depth from the volume root: `hub/models--*/blobs` (Dolphin) and
@@ -367,8 +371,12 @@ class ContainerCleanup:
             f"-v {shlex.quote(name)}:/cache{index}" for index, name in enumerate(volume_names)
         )
         search_roots: str = " ".join(f"/cache{index}" for index in range(len(volume_names)))
+        # Named, and named with a Lium prefix: the provider-side load gate excuses our own
+        # housekeeping by name (LIUM_INFRA_CONTAINER_PREFIXES), and an anonymous container would be
+        # counted as the provider taking the machine from Lium. `--rm` keeps the name free for the
+        # next cycle, and a name still in use only fails this sweep, which is already best-effort.
         result = await ssh_client.run(
-            f"/usr/bin/docker run --rm {mount_flags} {ALPINE_HELPER_IMAGE} "
+            f"/usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} {mount_flags} {ALPINE_HELPER_IMAGE} "
             f"find {search_roots} -maxdepth {DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH} "
             "-type d \\( -name xet -o -name runtimes \\) -prune -o "
             f"-name '*.incomplete' -type f -mmin +{DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES} "

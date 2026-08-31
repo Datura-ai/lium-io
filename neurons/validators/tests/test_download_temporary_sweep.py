@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from services.const import CACHE_SWEEP_CONTAINER_NAME
+
 from services.container_cleanup import DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES, ContainerCleanup
 
 
@@ -57,6 +59,9 @@ async def test_sweeps_both_filler_cache_volumes():
     assert "-v dphn_cache_hf_model:/cache0" in find_command
     assert "-v engy_cache_ckpt_v3:/cache1" in find_command
     assert "find /cache0 /cache1" in find_command
+    # Named with a Lium prefix, or the provider-side load gate counts our own housekeeping against
+    # the miner (LIUM_INFRA_CONTAINER_PREFIXES excuses by name).
+    assert f"--name {CACHE_SWEEP_CONTAINER_NAME}" in find_command
 
 
 @pytest.mark.asyncio
