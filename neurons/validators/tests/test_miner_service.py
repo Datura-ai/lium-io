@@ -11,7 +11,7 @@ PortConnectivityCheck's renting_in_progress tolerate. This test therefore pins
 that a ContainerCreateRequest is delegated to create_container and that
 miner_service no longer makes an early wait_for_port_check_containers call.
 """
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -75,6 +75,8 @@ def miner_service(mocker):
         task_service=mocker.Mock(),
         redis_service=redis_service,
         attestation_service=mocker.Mock(),
+        backend_client=MagicMock(),
+        file_encrypt_service=MagicMock(),
     )
     return svc
 

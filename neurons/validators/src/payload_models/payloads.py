@@ -209,6 +209,17 @@ class ForcedValidationCycleRequest(BaseModel):
     message_type: Literal["ForcedValidationCycleRequest"]
 
 
+class ForcedMinerValidationRequest(BaseModel):
+    """Ask the validator to validate one miner now, not at the next block window.
+
+    A staging development tool. The whole cycle waits on every registered miner, and most of
+    them never answer, so a run aimed at one miner returns in seconds instead of minutes.
+    """
+
+    message_type: Literal["ForcedMinerValidationRequest"]
+    miner_hotkey: str
+
+
 class WorkloadKind(enum.Enum):
     CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
     FILLER = "FILLER"
