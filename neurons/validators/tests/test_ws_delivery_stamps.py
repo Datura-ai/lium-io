@@ -52,6 +52,8 @@ async def _published_payloads(jobs: list[Any]) -> list[dict[str, Any]]:
         task_service=MagicMock(),
         redis_service=redis_service,
         attestation_service=MagicMock(),
+        backend_client=MagicMock(),
+        file_encrypt_service=MagicMock(),
     )
     await service.publish_machine_specs(jobs, miner_hotkey="hk", miner_coldkey="ck")
     return [call.args[1] for call in redis_service.publish.await_args_list]

@@ -31,6 +31,7 @@ from payload_models.payloads import (
     DuplicateExecutorsResponse,
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
+    ForcedMinerValidationRequest,
     ForcedValidationCycleRequest,
     GetEstimateRequest,
     GetPodLogsRequestFromServer,
@@ -685,6 +686,14 @@ class ComputeClient:
             return
 
         try:
+            request = pydantic.TypeAdapter(ForcedMinerValidationRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self.handle_forced_miner_validation(request)
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = "Invalid message received from backend"
@@ -783,6 +792,23 @@ class ComputeClient:
             return
 
         await self.miner_service.request_validation_cycle_now()
+
+    async def handle_forced_miner_validation(self, request: ForcedMinerValidationRequest) -> None:
+        """Validate one miner now instead of waiting for the next block window.
+
+        Staging only. The backend gates the request too; this is the second gate, so a message
+        that reaches a production validator does nothing.
+        """
+        if settings.DEPLOY_ENV == "PROD":
+            logger.warning(
+                _m(
+                    "Forced miner validation is disabled in production",
+                    extra=get_extra_info(self.logging_extra),
+                ),
+            )
+            return
+
+        await self.miner_service.validate_one_miner_now(request.miner_hotkey)
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)

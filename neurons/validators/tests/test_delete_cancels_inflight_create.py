@@ -8,7 +8,7 @@ the next paying rental.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -39,6 +39,8 @@ def miner_service() -> MinerService:
         task_service=Mock(),
         redis_service=Mock(),
         attestation_service=Mock(),
+        backend_client=MagicMock(),
+        file_encrypt_service=MagicMock(),
     )
 
 

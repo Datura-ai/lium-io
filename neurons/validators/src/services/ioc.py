@@ -75,6 +75,8 @@ async def initiate_services():
         task_service=ioc["TaskService"],
         redis_service=ioc["RedisService"],
         attestation_service=ioc["AttestationService"],
+        backend_client=ioc["BackendClient"],
+        file_encrypt_service=ioc["FileEncryptService"],
     )
 
 
