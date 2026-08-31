@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-
 from neurons.validators.src.services.task.result_handler import ResultHandler
+from protocol.vc_protocol.validator_requests import ValidationEvent
 
 from tests.helpers import build_state
 
@@ -45,6 +46,30 @@ async def test_handle_result_nests_gpu_metrics_in_spec(context_factory):
 
     assert result.spec["gpu_metrics"] == metrics
     assert result.spec["gpu_metrics"]["fp32_tflops"] == 51.2
+
+
+@pytest.mark.asyncio
+async def test_handle_result_preserves_structured_validation_event(context_factory):
+    ctx = _context(context_factory, gpu_metrics=None)
+    validation_event = ValidationEvent(
+        event="GPU mismatch",
+        reason_code="GPU_MISMATCH",
+        severity="critical",
+        impact="Node cannot be listed",
+        when=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
+        context=ctx,
+        miner_info=_miner_info(),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="GPU mismatch",
+        success=False,
+        validation_event=validation_event,
+    )
+
+    assert result.validation_event == validation_event
 
 
 @pytest.mark.asyncio
