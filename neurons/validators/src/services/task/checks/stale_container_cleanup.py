@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import time
+
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+
+# DAH-2805: how often the download-temporary sweep may run per executor. The check itself runs every
+# pipeline cycle (~15 min), but a temporary cannot become eligible until it is
+# DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES old, so walking the cache every cycle buys nothing and costs a
+# helper container plus a tree walk on every node. Same throttle CustomBuildOrphanSweepCheck uses,
+# for the same reason.
+DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS = 60 * 60
 
 
 class StaleContainerCleanupCheck:
@@ -33,6 +43,16 @@ class StaleContainerCleanupCheck:
     check_id = "executor.cleanup.stale_containers"
     fatal = False
 
+    def __init__(self, sweep_interval_seconds: int = DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS) -> None:
+        self._sweep_interval_seconds = sweep_interval_seconds
+        # executor uuid -> when its cache was last swept. In memory on the check, which the pipeline
+        # factory builds once and reuses across cycles; a validator restart simply sweeps again.
+        self._last_sweep_at: dict[str, float] = {}
+
+    def _sweep_is_due(self, executor_uuid: str, now: float) -> bool:
+        last_sweep_at: float | None = self._last_sweep_at.get(executor_uuid)
+        return last_sweep_at is None or (now - last_sweep_at) >= self._sweep_interval_seconds
+
     async def run(self, ctx: Context) -> CheckResult:
         removed_count, removed_names = await ctx.services.container_cleanup.cleanup(
             ssh_client=ctx.ssh,
@@ -50,14 +70,16 @@ class StaleContainerCleanupCheck:
             executor_uuid=ctx.executor.uuid,
         )
 
-        # DAH-2805: a filler weight download that is killed mid-flight leaves a `*.incomplete` file
-        # nothing will ever read again, and one prod node reached 741 GB of them. It is swept from
-        # here rather than from inside the filler image because this loop reaches the node on every
-        # cycle whatever image is on it, and it cleans what is already on the fleet.
-        swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
-            ssh_client=ctx.ssh,
-            executor_uuid=ctx.executor.uuid,
-        )
+        # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
+        # on one prod node. Swept from here because this check reaches every node, whatever image it
+        # runs; throttled because the files it looks for cannot appear faster than the age window.
+        swept_download_temporaries: int | None = None
+        if self._sweep_is_due(ctx.executor.uuid, time.monotonic()):
+            swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
+                ssh_client=ctx.ssh,
+                executor_uuid=ctx.executor.uuid,
+            )
+            self._last_sweep_at[ctx.executor.uuid] = time.monotonic()
 
         event = render_message(
             Msg.CLEANED,

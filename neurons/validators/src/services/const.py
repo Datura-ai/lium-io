@@ -241,9 +241,8 @@ FILLER_CONTAINER_PREFIX = "filler_"
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.
 DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
-# DAH-2805: the ENGY filler keeps its ~35 GB checkpoint in its own cache volume. Only the
-# download-temporary sweep looks at it: reclaiming a whole ENGY volume is a separate decision
-# nobody has made, so the DPHN-only paths keep using DPHN_CACHE_VOLUME_PREFIX alone.
+# DAH-2805: only the download-temporary sweep looks at the ENGY cache — reclaiming a whole ENGY
+# volume is a separate decision nobody has made, so the DPHN-only paths keep using their own prefix.
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
 FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
 # DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after

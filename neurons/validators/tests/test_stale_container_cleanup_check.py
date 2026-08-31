@@ -157,3 +157,17 @@ async def test_also_sweeps_abandoned_download_temporaries():
     assert cleanup.sweep_calls == [{"ssh_client": "ssh-conn-sentinel", "executor_uuid": ctx.executor.uuid}]
     assert result.passed
     assert result.event.what_we_saw["swept_download_temporaries"] == 7
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_is_throttled_per_executor():
+    # DAH-2805: the check runs every pipeline cycle (~15 min) but a temporary cannot become eligible
+    # until it is hours old, so a per-executor cadence keeps the walk off every cycle.
+    cleanup = RecordingContainerCleanup(swept=1)
+    check = StaleContainerCleanupCheck()
+
+    await check.run(_make_ctx(cleanup))
+    second_result = await check.run(_make_ctx(cleanup))
+
+    assert len(cleanup.sweep_calls) == 1
+    assert second_result.event.what_we_saw["swept_download_temporaries"] is None

@@ -18,13 +18,11 @@ class FakeSshClient:
     def __init__(
         self,
         volumes: list[str],
-        mount_points: dict[str, str] | None = None,
-        found_paths: list[str] | None = None,
+        find_returns_paths: list[str] | None = None,
         volume_ls_fails: bool = False,
     ):
         self._volumes = volumes
-        self._mount_points = mount_points or {name: f"/var/lib/docker/volumes/{name}/_data" for name in volumes}
-        self._found_paths = found_paths or []
+        self._find_returns_paths = find_returns_paths or []
         self._volume_ls_fails = volume_ls_fails
         self.commands: list[str] = []
 
@@ -34,33 +32,31 @@ class FakeSshClient:
             if self._volume_ls_fails:
                 return SimpleNamespace(exit_status=1, stdout="", stderr="boom")
             return SimpleNamespace(exit_status=0, stdout="\n".join(self._volumes), stderr="")
-        if "volume inspect" in command:
-            inspected = [name for name in self._mount_points if name in command]
-            return SimpleNamespace(
-                exit_status=0, stdout="\n".join(self._mount_points[name] for name in inspected), stderr=""
-            )
-        if command.startswith("find "):
-            return SimpleNamespace(exit_status=0, stdout="\n".join(self._found_paths), stderr="")
+        if " find " in command:
+            return SimpleNamespace(exit_status=0, stdout="\n".join(self._find_returns_paths), stderr="")
         return SimpleNamespace(exit_status=0, stdout="", stderr="")
 
 
 def _find_command(ssh_client: FakeSshClient) -> str:
-    return next((command for command in ssh_client.commands if command.startswith("find ")), "")
+    return next((command for command in ssh_client.commands if " find " in command), "")
 
 
 @pytest.mark.asyncio
 async def test_sweeps_both_filler_cache_volumes():
     ssh_client = FakeSshClient(
         volumes=["dphn_cache_hf_model", "engy_cache_ckpt_v3"],
-        found_paths=["/var/lib/docker/volumes/dphn_cache_hf_model/_data/hub/blobs/abc.1234abcd.incomplete"],
+        find_returns_paths=["/cache0/hub/models--x/blobs/abc.1234abcd.incomplete"],
     )
 
     removed = await ContainerCleanup().sweep_abandoned_download_temporaries(ssh_client, "exec-1")
 
     assert removed == 1
     find_command = _find_command(ssh_client)
-    assert "/var/lib/docker/volumes/dphn_cache_hf_model/_data" in find_command
-    assert "/var/lib/docker/volumes/engy_cache_ckpt_v3/_data" in find_command
+    # Mounted by NAME into the helper container: the validator's SSH session lands inside the
+    # executor container, where the volume's host path does not exist.
+    assert "-v dphn_cache_hf_model:/cache0" in find_command
+    assert "-v engy_cache_ckpt_v3:/cache1" in find_command
+    assert "find /cache0 /cache1" in find_command
 
 
 @pytest.mark.asyncio
@@ -72,8 +68,10 @@ async def test_only_aged_incomplete_files_are_targeted():
     find_command = _find_command(ssh_client)
     assert "-name '*.incomplete'" in find_command
     assert f"-mmin +{DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES}" in find_command
-    # `-delete` turns on `-depth`, which would silently disable the xet prune next to it.
+    # `-delete` turns on `-depth`, which would silently disable the prune next to it.
     assert "-delete" not in find_command
+    # The worker runtimes and the xet chunk cache are 10^4-10^5 inodes that never hold one.
+    assert "-name xet -o -name runtimes" in find_command
 
 
 @pytest.mark.asyncio
@@ -97,7 +95,7 @@ async def test_a_node_without_filler_caches_runs_no_find():
 
 @pytest.mark.asyncio
 async def test_dry_run_removes_nothing():
-    ssh_client = FakeSshClient(volumes=["dphn_cache_hf_model"], found_paths=["/data/a.incomplete"])
+    ssh_client = FakeSshClient(volumes=["dphn_cache_hf_model"], find_returns_paths=["/data/a.incomplete"])
 
     removed = await ContainerCleanup(dry_run=True).sweep_abandoned_download_temporaries(ssh_client, "exec-1")
 

@@ -82,6 +82,10 @@ JOB_LENGTH = 300
 # wrt input data and only reads ctx, so a shared instance is safe.
 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
 
+# DAH-2805: same reason — the download-temporary sweep inside this check carries its own per-executor
+# cadence, and a fresh instance every cycle would sweep every cycle.
+_STALE_CONTAINER_CLEANUP_SINGLETON = StaleContainerCleanupCheck()
+
 
 class PipelineFactory:
     """Factory for building and configuring validation pipelines."""
@@ -283,7 +287,7 @@ class PipelineFactory:
                 # Cleaning it here frees those ports so PortConnectivityCheck can bind them this
                 # cycle; otherwise PortCountCheck (fatal) halts the pipeline before the cleanup
                 # that used to live in TenantEnforcementCheck ever runs -> executor stuck at 0.
-                StaleContainerCleanupCheck(),
+                _STALE_CONTAINER_CLEANUP_SINGLETON,
                 # DAH-2734: non-fatal gate on the load the PROVIDER puts on a listed machine.
                 # Specs arithmetic, plus one read-only SSH reading when the load is above the
                 # floor. AFTER the cleanup above: a pod Lium has just ended is our leftover to
