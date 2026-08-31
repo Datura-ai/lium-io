@@ -729,3 +729,34 @@ async def test_the_event_keeps_both_readings_side_by_side(context_factory):
     what = result.event.what_we_saw
     assert what["cpu_cores_before_confirmation"] == 8.9
     assert what["provider_cpu_cores"] == 0.4  # 2.0 host - 1.58 the renter's pod
+
+
+def test_a_real_shell_sample_parses():
+    """Recorded from CPU_RESAMPLE_COMMAND run unchanged inside a linux container, with a real
+    binary named `dockerd` burning a core and a stub `docker` printing two stats rows. Proves
+    the awk, the pgrep walk and the section markers survive a real shell, which no mock does."""
+    reading = parse_confirmed_cpu_reading(
+        "231533405 225982883 10 210",
+        "aaaaaaaaaaaa|pod_renter|150.00%\nbbbbbbbbbbbb|sn13_miner|300.00%",
+        "231533508 225982964 10 221",
+        {"pod_renter"},
+    )
+
+    assert reading is not None
+    assert reading.host_cores == 2.14  # 22 busy jiffies of 103, over 10 cores
+    assert reading.lium_container_cores == 1.5  # the renter's pod, the miner is not ours
+    assert reading.dockerd_cores == 1.07  # 11 jiffies over a 0.103 s window
+
+
+def test_a_shell_that_printed_an_extra_line_is_refused():
+    """The sample line must hold exactly four numbers. Anything else means the command did not
+    run as written, and guessing at a partial reading is how an honest node gets zeroed."""
+    assert (
+        parse_confirmed_cpu_reading(
+            "130 \n231533405 225982883 10 210",
+            "aaaaaaaaaaaa|pod_renter|150.00%",
+            "231533508 225982964 10 221",
+            {"pod_renter"},
+        )
+        is None
+    )
