@@ -35,6 +35,9 @@ INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
 # Written by the connector process, read by the validator process: they share no memory, so
 # this key is how an operator's request for a cycle crosses between them.
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
+# One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
+# ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
+FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -143,7 +146,13 @@ class RedisService:
         return pubsub
 
     async def request_forced_validation_cycle(self) -> None:
-        await self.set(FORCED_VALIDATION_CYCLE_KEY, "1")
+        # The TTL is the backstop, not the normal path: the request is cleared when a cycle
+        # starts. It bounds a request that outlives its purpose -- a validator that is down,
+        # or a stale replica still serving the key after the delete.
+        async with self.lock:
+            await self.redis.set(
+                FORCED_VALIDATION_CYCLE_KEY, "1", ex=FORCED_VALIDATION_CYCLE_TTL_SECONDS
+            )
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None

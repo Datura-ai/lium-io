@@ -11,7 +11,11 @@ from clients.compute_client import ComputeClient
 from core.validator import Validator
 from payload_models.payloads import ForcedValidationCycleRequest
 from services.miner_service import MinerService
-from services.redis_service import RedisService
+from services.redis_service import (
+    FORCED_VALIDATION_CYCLE_KEY,
+    FORCED_VALIDATION_CYCLE_TTL_SECONDS,
+    RedisService,
+)
 
 # The exact bytes the backend puts on the websocket, taken from
 # ForcedValidationCycleRequest().model_dump_json() in lium-io-backend.
@@ -131,3 +135,20 @@ async def test_an_unreachable_redis_does_not_end_the_sync_tick(monkeypatch) -> N
     )
 
     assert await validator_process.an_operator_asked_for_a_cycle_now() is False
+
+
+@pytest.mark.asyncio
+async def test_a_request_nobody_picks_up_expires(monkeypatch, shared_redis) -> None:
+    """The TTL bounds a request the validator never consumed -- it was down, or Redis lagged."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "STAGE")
+    connector_miner_service = MinerService.__new__(MinerService)
+    connector_miner_service.redis_service = _redis_service(shared_redis)
+    validator_process = Validator.__new__(Validator)
+    validator_process.redis_service = _redis_service(shared_redis)
+
+    await connector_miner_service.request_validation_cycle_now()
+    ttl = await validator_process.redis_service.redis.ttl(FORCED_VALIDATION_CYCLE_KEY)
+
+    assert 0 < ttl <= FORCED_VALIDATION_CYCLE_TTL_SECONDS
