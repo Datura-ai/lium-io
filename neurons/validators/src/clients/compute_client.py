@@ -346,6 +346,7 @@ class ComputeClient:
                             attestation_digest=data.get("attestation_digest"),
                             tdx_attestation_passed=data.get("tdx_attestation_passed"),
                             gpu_attestation_passed=data.get("gpu_attestation_passed"),
+                            executor_image=data.get("executor_image"),
                             sent_at=data.get("sent_at"),
                             batch_total=data.get("batch_total"),
                         )
