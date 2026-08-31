@@ -50,6 +50,15 @@ class StaleContainerCleanupCheck:
             executor_uuid=ctx.executor.uuid,
         )
 
+        # DAH-2805: a filler weight download that is killed mid-flight leaves a `*.incomplete` file
+        # nothing will ever read again, and one prod node reached 741 GB of them. It is swept from
+        # here rather than from inside the filler image because this loop reaches the node on every
+        # cycle whatever image is on it, and it cleans what is already on the fleet.
+        swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
+            ssh_client=ctx.ssh,
+            executor_uuid=ctx.executor.uuid,
+        )
+
         event = render_message(
             Msg.CLEANED,
             ctx=ctx,
@@ -58,6 +67,7 @@ class StaleContainerCleanupCheck:
                 "removed_count": removed_count,
                 "removed_containers": removed_names,
                 "reclaimed_cache_volumes": reclaimed_cache_volumes,
+                "swept_download_temporaries": swept_download_temporaries,
             },
         )
         return CheckResult(passed=True, event=event)

@@ -75,6 +75,12 @@ class DockerCommand:
         return f"/usr/bin/docker volume rm {names} 2>/dev/null || true"
 
     @staticmethod
+    def volume_mount_points(*volume_names: str) -> str:
+        """Build docker volume inspect command printing one host path per volume."""
+        names = " ".join(shlex.quote(name) for name in volume_names)
+        return f"/usr/bin/docker volume inspect {names} --format '{{{{.Mountpoint}}}}' 2>/dev/null || true"
+
+    @staticmethod
     def volume_ls_dangling() -> str:
         """Build docker volume ls command listing dangling volume names."""
         return "/usr/bin/docker volume ls -qf dangling=true"

@@ -24,11 +24,13 @@ from protocol.vc_protocol.compute_requests import (
 class RecordingContainerCleanup:
     """Records cleanup() calls and returns a configurable (count, names) result."""
 
-    def __init__(self, result=(0, []), reclaimed=0):
+    def __init__(self, result=(0, []), reclaimed=0, swept=0):
         self._result = result
         self._reclaimed = reclaimed
+        self._swept = swept
         self.calls = []
         self.reclaim_calls = []
+        self.sweep_calls = []
 
     async def cleanup(self, ssh_client, rented_data, executor_uuid):
         self.calls.append(
@@ -43,6 +45,10 @@ class RecordingContainerCleanup:
     async def reclaim_dphn_cache_when_disk_is_tight(self, ssh_client, executor_uuid):
         self.reclaim_calls.append({"ssh_client": ssh_client, "executor_uuid": executor_uuid})
         return self._reclaimed
+
+    async def sweep_abandoned_download_temporaries(self, ssh_client, executor_uuid):
+        self.sweep_calls.append({"ssh_client": ssh_client, "executor_uuid": executor_uuid})
+        return self._swept
 
 
 def _make_ctx(cleanup, rented_data=None):
@@ -137,3 +143,17 @@ async def test_also_reclaims_the_dphn_cache_when_disk_is_tight():
     assert cleanup.reclaim_calls == [{"ssh_client": "ssh-conn-sentinel", "executor_uuid": ctx.executor.uuid}]
     assert result.passed
     assert result.event.what_we_saw["reclaimed_cache_volumes"] == 2
+
+
+@pytest.mark.asyncio
+async def test_also_sweeps_abandoned_download_temporaries():
+    # DAH-2805: the sweep rides this same per-cycle visit, so a node is cleaned whatever image it
+    # currently runs — including one whose filler already filled the disk and stopped mining.
+    cleanup = RecordingContainerCleanup(swept=7)
+    ctx = _make_ctx(cleanup)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert cleanup.sweep_calls == [{"ssh_client": "ssh-conn-sentinel", "executor_uuid": ctx.executor.uuid}]
+    assert result.passed
+    assert result.event.what_we_saw["swept_download_temporaries"] == 7

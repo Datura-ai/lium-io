@@ -1,5 +1,6 @@
 import logging
 import re
+import shlex
 from typing import Optional
 
 import asyncssh
@@ -10,6 +11,7 @@ from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_VOLUME_PREFIX,
+    FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
     POD_CONTAINER_PREFIX,
@@ -30,6 +32,25 @@ DPHN_CACHE_RECLAIM_FREE_FLOOR_GB = DPHN_CACHE_LISTING_FLOOR_GB
 # Remove at most this many per pass; GC runs each cycle, so a backlog drains
 # over a few passes without a huge `docker volume rm` command.
 VOLUME_RM_MAX_PER_PASS = 200
+
+# DAH-2805: how long an abandoned huggingface_hub download temporary may sit in a filler cache volume
+# before the sweep removes it. huggingface_hub >= 1.18 writes every attempt to a UNIQUE
+# `<etag>.<8hex>.incomplete` and unlinks it in a `finally`, so a file only survives a download whose
+# process was KILLED — and the retry starts from byte zero under a new name, never reading the old
+# one. On a host too slow to finish a shard inside the worker's own readiness window that is one
+# 0.2-1.7 GB orphan per kill, forever: 742 files / 741 GB measured in one prod container, 2026-08-31.
+#
+# By AGE, because the writer is invisible from here: it lives inside a container, so no pid or
+# open-fd check can see it, and the volume is shared by every filler container on the node. A live
+# download touches its file at least once per burst — with hf_xet once per 64 MiB — which at the
+# slowest per-file rate measured in prod (~50 KB/s) is ~22 min of silence on a HEALTHY download.
+# 4 hours clears that by 10x while bounding the standing garbage to ~70 GB at the observed leak rate.
+DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES = 240
+
+# The temporaries live in `<volume>/hub/models--*/blobs` (Dolphin) and
+# `<volume>/models/<repo>/.cache/huggingface/download` (ENGY); 8 reaches both with slack. The bound
+# matters because these volumes also hold the multi-GB xet chunk cache and the worker runtimes.
+DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH = 8
 
 
 class ContainerCleanup:
@@ -269,14 +290,99 @@ class ContainerCleanup:
             return None
 
     async def _get_dphn_cache_volumes(self, ssh_client: asyncssh.SSHClientConnection) -> list[str]:
+        return await self._get_cache_volumes(ssh_client, (DPHN_CACHE_VOLUME_PREFIX,))
+
+    async def _get_cache_volumes(
+        self, ssh_client: asyncssh.SSHClientConnection, name_prefixes: tuple[str, ...]
+    ) -> list[str]:
         result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
         if getattr(result, "exit_status", 0) != 0:
             return []
         return sorted(
             name
             for name in (line.strip() for line in (result.stdout or "").splitlines())
-            if name.startswith(DPHN_CACHE_VOLUME_PREFIX)
+            if name.startswith(name_prefixes)
         )
+
+    async def sweep_abandoned_download_temporaries(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_uuid: str,
+    ) -> int:
+        """Delete `*.incomplete` files no writer has touched in DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES.
+
+        DAH-2805: a filler's weight download that is killed mid-flight leaves its temporary behind,
+        and nothing ever reads it again (see the constant for the mechanism). One prod node reached
+        741 GB of them and dropped out of the rental listing.
+
+        It runs HERE, not inside the filler image, for three reasons: this loop visits a node on
+        every cycle whatever image is on it, one prefix list covers DPHN and ENGY alike, and it
+        cleans the garbage already on the fleet without waiting for an image rollout.
+
+        Only files matching `*.incomplete`, only inside volumes whose name carries one of our own
+        cache prefixes, and only when they are older than the window — a renter's volume is never a
+        candidate. Returns how many files were removed.
+        """
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            cache_volumes: list[str] = await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES)
+            if not cache_volumes:
+                return 0
+            mount_points: list[str] = await self._get_volume_mount_points(ssh_client, cache_volumes)
+            if not mount_points:
+                return 0
+            if self.dry_run:
+                logger.info(
+                    _m(
+                        "[DRY RUN] Would sweep abandoned download temporaries",
+                        extra=extra | {"volumes": cache_volumes, "dry_run": True},
+                    )
+                )
+                return 0
+
+            removed_paths: list[str] = await self._remove_aged_download_temporaries(ssh_client, mount_points)
+            if not removed_paths:
+                return 0
+            logger.info(
+                _m(
+                    f"Swept {len(removed_paths)} abandoned download temporaries from the filler cache",
+                    extra=extra
+                    | {
+                        "volumes": cache_volumes,
+                        "max_age_minutes": DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES,
+                        "sample_paths": removed_paths[:5],
+                    },
+                )
+            )
+            return len(removed_paths)
+        except Exception as e:
+            logger.warning(_m("Download-temporary sweep failed", extra=extra | {"error": str(e)}))
+            return 0
+
+    async def _get_volume_mount_points(
+        self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]
+    ) -> list[str]:
+        # Asked of docker rather than built from the data root: a volume on a non-local driver, or a
+        # daemon with a moved root, would otherwise hand the sweep a path that does not exist.
+        result = await ssh_client.run(DockerCommand.volume_mount_points(*volume_names))
+        if getattr(result, "exit_status", 0) != 0:
+            return []
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip().startswith("/")]
+
+    async def _remove_aged_download_temporaries(
+        self, ssh_client: asyncssh.SSHClientConnection, mount_points: list[str]
+    ) -> list[str]:
+        # `-name` before `-type`/`-mmin` so only a name match pays a stat(), and `-exec rm`, not
+        # `-delete`: `-delete` turns on `-depth`, which would silently disable the xet prune.
+        quoted_roots: str = " ".join(shlex.quote(path) for path in mount_points)
+        find_command: str = (
+            f"find {quoted_roots} -maxdepth {DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH} "
+            "-type d -name xet -prune -o "
+            f"-name '*.incomplete' -type f -mmin +{DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES} "
+            "-print -exec rm -f {} + 2>/dev/null || true"
+        )
+        result = await ssh_client.run(find_command)
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
     async def get_dangling_anonymous_volumes(self, ssh_client) -> Optional[list[str]]:
         # anonymous (64-hex) volumes referenced by no container; None if listing failed
