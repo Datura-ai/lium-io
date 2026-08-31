@@ -157,6 +157,28 @@ class Validator:
             ),
         )
 
+    async def start_cycle_now_if_an_operator_asked(self, current_block: int) -> None:
+        """Clear the block-window wait when a forced cycle was requested. Staging only.
+
+        DAH-2090. The connector process sets the key; it runs beside this one and shares no
+        memory with it, so Redis is how the request crosses over. The key is consumed here, so
+        one request starts exactly one cycle.
+        """
+        if not await self.redis_service.get(FORCED_VALIDATION_CYCLE_KEY):
+            return
+
+        await self.redis_service.delete(FORCED_VALIDATION_CYCLE_KEY)
+        self.last_job_run_blocks = 0
+        logger.info(
+            _m(
+                "[sync] Forced validation cycle requested, starting one now",
+                extra=get_extra_info({
+                    **self.default_extra,
+                    "current_block": current_block,
+                }),
+            ),
+        )
+
     async def sync(self):
         try:
             logger.info(
@@ -234,20 +256,7 @@ class Validator:
                 ),
             )
 
-            # DAH-2090: a staging development tool. The connector process sets this key when an
-            # operator asks for a cycle now, so the wait for the next block window is skipped.
-            if await self.redis_service.get(FORCED_VALIDATION_CYCLE_KEY):
-                await self.redis_service.delete(FORCED_VALIDATION_CYCLE_KEY)
-                self.last_job_run_blocks = 0
-                logger.info(
-                    _m(
-                        "[sync] Forced validation cycle requested, starting one now",
-                        extra=get_extra_info({
-                            **self.default_extra,
-                            "current_block": current_block,
-                        }),
-                    ),
-                )
+            await self.start_cycle_now_if_an_operator_asked(current_block)
 
             if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB

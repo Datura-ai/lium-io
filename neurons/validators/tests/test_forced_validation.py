@@ -1,5 +1,6 @@
 """DAH-2090: the forced validation cycle, and the gate that keeps it off production."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -56,3 +57,45 @@ def test_the_message_only_matches_its_own_payload() -> None:
     )
     with pytest.raises(Exception):
         ForcedValidationCycleRequest.model_validate({"message_type": "ContainerCreateRequest"})
+
+
+# The exact bytes the backend puts on the websocket: reproduce with
+#   ForcedValidationCycleRequest().model_dump_json() in lium-io-backend.
+BACKEND_WIRE_MESSAGE = '{"message_type":"ForcedValidationCycleRequest"}'
+
+
+@pytest.mark.asyncio
+async def test_the_backend_message_reaches_the_service_through_real_dispatch(monkeypatch) -> None:
+    """handle_message tries many models in turn, so the branch order is worth pinning."""
+    client = _make_client(monkeypatch, "STAGE")
+    client.lock = asyncio.Lock()
+
+    await client.handle_message(BACKEND_WIRE_MESSAGE)
+
+    client.miner_service.request_validation_cycle_now.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_production_ignores_the_backend_message(monkeypatch) -> None:
+    client = _make_client(monkeypatch, "PROD")
+    client.lock = asyncio.Lock()
+
+    await client.handle_message(BACKEND_WIRE_MESSAGE)
+
+    client.miner_service.request_validation_cycle_now.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_another_message_is_not_captured_by_the_new_branch(monkeypatch) -> None:
+    client = _make_client(monkeypatch, "STAGE")
+    client.lock = asyncio.Lock()
+    client.miner_drivers = asyncio.Queue()
+    client.miner_driver = MagicMock(return_value=asyncio.sleep(0))
+    delete_request = (
+        '{"message_type":"ContainerDeleteRequest","miner_hotkey":"h",'
+        '"executor_id":"e","pod_id":"p","container_name":"c","volume_name":"v"}'
+    )
+
+    await client.handle_message(delete_request)
+
+    client.miner_service.request_validation_cycle_now.assert_not_awaited()
