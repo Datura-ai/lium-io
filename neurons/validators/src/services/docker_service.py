@@ -2081,7 +2081,7 @@ class DockerService:
             return
         logger.info(
             _m(
-                "Sweeping stale DPHN cache volumes",
+                "Sweeping stale filler cache volumes",
                 extra=get_extra_info({
                     **default_extra,
                     "stale_volumes": stale_volumes,
