@@ -4186,14 +4186,10 @@ class DockerService:
                         pod_id=payload.pod_id,
                     )
                 )
-                # command = f"/usr/bin/docker logout"
-                # await self.execute_and_stream_logs(
-                #     ssh_client=ssh_client,
-                #     command=command,
-                #     log_tag=log_tag,
-                #     log_text=f"Logging out of Docker registry",
-                #     log_extra=default_extra,
-                # )
+                # No logout counterpart below: the SDK login is a POST /auth to the executor's
+                # Docker daemon and the credential stays in this validator's client, so nothing is
+                # written to the executor's ~/.docker/config.json for a `docker logout` to clear.
+                #
                 # The default cache-template images are public Docker Hub refs, so a
                 # registry login buys nothing for them — the pull needs no auth and is
                 # itself almost always skipped (the image is pre-cached on the executor).
