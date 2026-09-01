@@ -13,7 +13,11 @@ import pytest
 
 from services.const import CACHE_SWEEP_CONTAINER_NAME
 
-from services.container_cleanup import DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES, ContainerCleanup
+from services.container_cleanup import (
+    DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES,
+    DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS,
+    ContainerCleanup,
+)
 
 
 class FakeSshClient:
@@ -63,6 +67,8 @@ async def test_sweeps_both_filler_cache_volumes():
     assert f"--name {CACHE_SWEEP_CONTAINER_NAME}" in find_command
     # A leftover from a dockerd restart would hold the name for good and kill the sweep silently.
     assert f"docker rm -f {CACHE_SWEEP_CONTAINER_NAME}" in find_command
+    # A wedged docker daemon must not eat the executor's cycle ahead of the fatal port checks.
+    assert f"timeout {DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS} " in find_command
 
 
 @pytest.mark.asyncio

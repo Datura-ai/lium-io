@@ -50,6 +50,10 @@ DOWNLOAD_TEMPORARY_MAX_AGE_MINUTES = 240
 # because these volumes also hold the multi-GB xet chunk cache and the worker runtimes.
 DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH = 8
 
+# The whole helper run is bounded: the walk itself takes hundreds of ms on a real cache, so anything
+# near a minute means a wedged docker daemon rather than work in progress.
+DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
+
 
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
@@ -372,8 +376,12 @@ class ContainerCleanup:
         # The `rm -f` first: `--rm` does not fire if dockerd is restarted mid-run, and a leftover
         # container would hold the name for good — the sweep would then fail silently on that node
         # forever. Worst case it interrupts a sweep another validator started, which simply runs again.
+        # `timeout` bounds a wedged dockerd the same way machine_scrape does for `docker stats`: this
+        # call sits in the per-executor pipeline ahead of the fatal port checks, so a hang here would
+        # cost the node its whole cycle. A killed sweep simply removes nothing and runs again later.
         result = await ssh_client.run(
             f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1; "
+            f"timeout {DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS} "
             f"/usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} {mount_flags} {ALPINE_HELPER_IMAGE} "
             f"find {search_roots} -maxdepth {DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH} "
             "-type d \\( -name xet -o -name runtimes \\) -prune -o "
