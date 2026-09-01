@@ -241,6 +241,10 @@ FILLER_CONTAINER_PREFIX = "filler_"
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.
 DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
+# DAH-2805: only the download-temporary sweep looks at the ENGY cache — reclaiming a whole ENGY
+# volume is a separate decision nobody has made, so the DPHN-only paths keep using their own prefix.
+ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
+FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
 # DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
 # downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
 # of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom
@@ -281,6 +285,11 @@ RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 # services/task/__init__ and the checks back in.
 PROBE_CONTAINER_NAME = "lium_roce_probe"
 
+# DAH-2805: the throwaway helper that sweeps abandoned download temporaries out of the filler cache
+# volumes. Named — and named with a Lium prefix — so the provider-side load gate excuses the seconds
+# of CPU it holds instead of counting our own housekeeping against the miner.
+CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
+
 # Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
 # them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
 # provider-side load gate (DAH-2734) must not bill their CPU to the provider, so it excuses
@@ -298,6 +307,7 @@ LIUM_INFRA_CONTAINER_PREFIXES = (
     # real CPU while it runs
     "s3fs-backup",
     PROBE_CONTAINER_NAME,
+    CACHE_SWEEP_CONTAINER_NAME,
 )
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
