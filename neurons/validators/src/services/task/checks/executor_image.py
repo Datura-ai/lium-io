@@ -59,6 +59,15 @@ class ExecutorImageCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
+        if ctx.tdx_attestation_passed:
+            event = render_message(
+                Msg.SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                extra={"skip_reason": "cvm", "tdx_attestation_passed": True},
+            )
+            return CheckResult(passed=True, event=event)
+
         snapshot = ctx.config.executor_image_snapshot
         if snapshot is None or snapshot.executor is None:
             event = render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)

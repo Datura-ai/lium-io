@@ -161,6 +161,25 @@ async def test_unobservable_executor_digest_is_outdated():
 
 
 @pytest.mark.asyncio
+async def test_cvm_outdated_executor_skips_image_check():
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(
+            specs=specs(executor_digest=STALE_DIGEST),
+            rented_data=SimpleNamespace(executors={}),
+        ),
+        tdx_attestation_passed=True,
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is True
+    assert result.updates == {}
+    assert result.event.reason_code == "EXECUTOR_IMAGE_SKIPPED"
+    assert result.event.context.get("skip_reason") == "cvm"
+
+
+@pytest.mark.asyncio
 async def test_missing_expected_state_skips_without_penalty():
     unknown_policy = ExpectedImageSnapshot(
         executor=None,
