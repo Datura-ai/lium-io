@@ -84,6 +84,9 @@ class ContextConfig:
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
+    # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
+    # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
+    machine_scrape_source: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -411,4 +411,5 @@ class FileEncryptService:
             all_keys=all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
+            machine_scrape_source=obfuscated_content,
         )
