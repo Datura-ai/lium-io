@@ -447,9 +447,11 @@ class _InflightCreateRegistry:
 inflight_creates = _InflightCreateRegistry()
 
 # How long a delete waits for the create it just cancelled. The create reads the flag at its next
-# checkpoint, and the only checkpoint gap that can orphan a container is the short one before
-# `docker run` — a pull-length wait would hold the customer's delete for nothing.
-CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS = 30.0
+# checkpoint, and the long gap is the one AFTER `docker run` — ssh bootstrap, keys, jupyter — where
+# the container already holds the host ports. DAH-2814: prod measured 35-180 s from the cancel to the
+# create stopping, so the first 30 s limit ran out on 4 of 7 races in a day and the delete tore the
+# pod down beside a create that was still working.
+CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS = 180.0
 
 
 def _is_missing_docker_container_error(exc: Exception) -> bool:
