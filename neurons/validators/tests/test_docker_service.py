@@ -16,6 +16,7 @@ import pytest_asyncio
 from tenacity import Future, RetryError
 
 import services.docker_service as docker_service_module
+from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
@@ -2049,64 +2050,95 @@ def _executor_info_for(payload: ContainerCreateRequest, *, tdx_quote: str | None
     )
 
 
-@pytest.mark.asyncio
-async def test_create_container_mounts_dstack_socket_on_cvm_node(docker_service, monkeypatch):
-    # The executor answered the SSH-key upload with a TDX quote → it runs in a dstack CVM guest →
-    # the customer's pod gets the guest agent socket so its TEE tooling can quote from inside.
+def _patch_quote_socket_path(docker_service, monkeypatch, *, broker_error: Exception | None = None):
     _patch_create_container_happy_path(docker_service, monkeypatch)
     run_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_spy)
-    payload = _cvm_socket_payload()
+    ensure_broker = AsyncMock(side_effect=broker_error)
+    monkeypatch.setattr("services.docker_service.ensure_quote_broker", ensure_broker)
+    return run_spy, ensure_broker
 
+
+async def _create(docker_service, payload, *, tdx_quote: str | None):
     await docker_service.create_container(
         payload=payload,
-        executor_info=_executor_info_for(payload, tdx_quote='{"quote": "0xdeadbeef"}'),
+        executor_info=_executor_info_for(payload, tdx_quote=tdx_quote),
         keypair=Mock(ss58_address="validator-hotkey"),
         private_key="encrypted",
     )
 
+
+@pytest.mark.asyncio
+async def test_create_container_brokers_the_quote_socket_on_cvm_node(docker_service, monkeypatch):
+    # The executor answered the SSH-key upload with a TDX quote → it runs in a dstack CVM guest →
+    # the validator brings up the quote-only broker and the pod gets ITS socket at the SDK path.
+    run_spy, ensure_broker = _patch_quote_socket_path(docker_service, monkeypatch)
+
+    await _create(docker_service, _cvm_socket_payload(), tdx_quote='{"quote": "0xdeadbeef"}')
+
+    ensure_broker.assert_awaited_once()
     run_spec = run_spy.await_args.kwargs["run_spec"]
     binds = [(m.source, m.target, m.read_only) for m in run_spec.volumes]
-    assert ("/var/run/dstack.sock", "/var/run/dstack.sock", False) in binds
+    assert (QUOTE_BROKER_SOCKET_PATH, DSTACK_GUEST_SOCKET_PATH, True) in binds
+    # the raw guest-agent socket never reaches a pod
+    assert DSTACK_GUEST_SOCKET_PATH not in {m.source for m in run_spec.volumes}
     # The existing CVM quirk stays: no --cpus inside a CVM.
     assert run_spec.cpu_count is None
 
 
 @pytest.mark.asyncio
-async def test_create_container_no_dstack_socket_on_bare_metal(docker_service, monkeypatch):
-    _patch_create_container_happy_path(docker_service, monkeypatch)
-    run_spy = AsyncMock()
-    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_spy)
-    payload = _cvm_socket_payload()
-
-    await docker_service.create_container(
-        payload=payload,
-        executor_info=_executor_info_for(payload, tdx_quote=None),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
+async def test_create_container_still_rents_when_the_broker_fails(docker_service, monkeypatch):
+    # A guest whose broker cannot start (registry hiccup, disk) still rents; the pod has no
+    # socket and its own log says why — a broker outage must not block every CVM rental.
+    run_spy, _ = _patch_quote_socket_path(
+        docker_service, monkeypatch, broker_error=RuntimeError("Docker SDK pull failed")
     )
 
+    await _create(docker_service, _cvm_socket_payload(), tdx_quote='{"quote": "0xdeadbeef"}')
+
     run_spec = run_spy.await_args.kwargs["run_spec"]
-    assert "/var/run/dstack.sock" not in {m.target for m in run_spec.volumes}
+    assert DSTACK_GUEST_SOCKET_PATH not in {m.target for m in run_spec.volumes}
+    warnings = [
+        call.args[0]
+        for call in docker_service.stream_log.await_args_list
+        if call.args[1] == "warning"
+    ]
+    assert any("TDX quote socket unavailable" in message for message in warnings)
+
+
+@pytest.mark.asyncio
+async def test_create_container_no_quote_socket_on_bare_metal(docker_service, monkeypatch):
+    run_spy, ensure_broker = _patch_quote_socket_path(docker_service, monkeypatch)
+
+    await _create(docker_service, _cvm_socket_payload(), tdx_quote=None)
+
+    ensure_broker.assert_not_awaited()
+    run_spec = run_spy.await_args.kwargs["run_spec"]
+    assert DSTACK_GUEST_SOCKET_PATH not in {m.target for m in run_spec.volumes}
     assert run_spec.cpu_count == 1
 
 
 @pytest.mark.asyncio
-async def test_create_container_no_dstack_socket_for_filler_on_cvm_node(docker_service, monkeypatch):
-    _patch_create_container_happy_path(docker_service, monkeypatch)
-    run_spy = AsyncMock()
-    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", run_spy)
-    payload = _cvm_socket_payload(WorkloadKind.FILLER)
+async def test_create_container_no_quote_socket_for_filler_on_cvm_node(docker_service, monkeypatch):
+    run_spy, ensure_broker = _patch_quote_socket_path(docker_service, monkeypatch)
 
-    await docker_service.create_container(
-        payload=payload,
-        executor_info=_executor_info_for(payload, tdx_quote='{"quote": "0xdeadbeef"}'),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
+    await _create(docker_service, _cvm_socket_payload(WorkloadKind.FILLER), tdx_quote='{"quote": "0xdeadbeef"}')
 
+    ensure_broker.assert_not_awaited()
     run_spec = run_spy.await_args.kwargs["run_spec"]
-    assert "/var/run/dstack.sock" not in {m.target for m in run_spec.volumes}
+    assert DSTACK_GUEST_SOCKET_PATH not in {m.target for m in run_spec.volumes}
+
+
+@pytest.mark.asyncio
+async def test_create_container_quote_socket_kill_switch(docker_service, monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_CVM_POD_QUOTE_SOCKET", False)
+    run_spy, ensure_broker = _patch_quote_socket_path(docker_service, monkeypatch)
+
+    await _create(docker_service, _cvm_socket_payload(), tdx_quote='{"quote": "0xdeadbeef"}')
+
+    ensure_broker.assert_not_awaited()
+    run_spec = run_spy.await_args.kwargs["run_spec"]
+    assert DSTACK_GUEST_SOCKET_PATH not in {m.target for m in run_spec.volumes}
 
 
 @pytest.mark.asyncio

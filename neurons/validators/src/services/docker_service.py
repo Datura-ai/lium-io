@@ -71,6 +71,7 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
+from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.gpu_power_limit import (
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
@@ -521,23 +522,14 @@ def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets
     return mounts
 
 
-# The dstack guest agent's Unix socket inside a dstack CVM guest — the path the dstack SDK dials by
-# default (`DstackClient()`), and the path renter tooling that says "Lium Confidential Computing"
-# expects to find in the pod. The executor's own compose (docker-compose.app.yml) already bind-mounts
-# it from the guest for the executor's TDX quotes; a rental container on the same guest gets the same
-# bind (source == target) so the renter can call GetQuote/Info from inside the pod.
-DSTACK_GUEST_SOCKET_PATH = "/var/run/dstack.sock"
-
-
-def _build_dstack_socket_mounts(payload: ContainerCreateRequest, *, in_cvm: bool) -> list[VolumeMount]:
-    # Only a customer rental on a dstack CVM guest gets the socket. `in_cvm` is the validator's
-    # existing CVM marker (the executor answered the SSH-key upload with a TDX quote it could only
-    # have obtained through this very socket) — outside a CVM the source path does not exist and
-    # dockerd would silently create an empty DIRECTORY there. A FILLER (DPHN/PEARL) has no
-    # attestation use and the socket is one shared per guest, so it never receives it.
-    if not in_cvm or payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
-        return []
-    return [VolumeMount(source=DSTACK_GUEST_SOCKET_PATH, target=DSTACK_GUEST_SOCKET_PATH)]
+def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> bool:
+    # customer rentals on a dstack CVM guest; a FILLER (DPHN/PEARL) has no attestation use and a
+    # bare-metal node has no guest agent to broker
+    return (
+        settings.ENABLE_CVM_POD_QUOTE_SOCKET
+        and in_cvm
+        and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+    )
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -1009,7 +1001,7 @@ class DockerService:
         gpu_devices,
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
-        in_cvm: bool = False,
+        quote_socket: bool = False,
     ) -> ContainerRunSpec:
         environment = {
             key: str(value)
@@ -1039,9 +1031,10 @@ class DockerService:
             occupied_targets.add("/mnt")
         # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
         volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
-        # Customer-rental-only, CVM-only: the dstack guest agent socket, so a TEE workload can fetch
-        # its own TDX quote from inside the pod. No-op on bare metal and for fillers.
-        volumes.extend(_build_dstack_socket_mounts(payload, in_cvm=in_cvm))
+        # DAH-2828: the quote-only broker socket at the dstack SDK's default path, so a TEE
+        # workload on a CVM node can take its own TDX quote from inside the pod.
+        if quote_socket:
+            volumes.append(quote_socket_pod_mount())
 
         device_mounts = [DeviceMount(path_on_host="/dev/net/tun", path_in_container="/dev/net/tun")]
         if encrypted_local_volume:
@@ -1069,6 +1062,33 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
         )
+
+    async def _ensure_pod_quote_socket(
+        self,
+        *,
+        docker_client,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        log_tag: str,
+    ) -> bool:
+        # best-effort: a guest whose broker cannot start still rents, the pod just gets no
+        # socket and says so in its own log — a Docker Hub hiccup must not block every CVM rental
+        try:
+            await ensure_quote_broker(docker_client, ssh_client, log_extra=default_extra)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "CVM quote broker unavailable; creating the pod without /var/run/dstack.sock",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+            )
+            await self.stream_log(
+                f"TDX quote socket unavailable in this pod (quote broker failed to start: {exc})",
+                "warning",
+                log_tag,
+            )
+            return False
+        return True
 
     @staticmethod
     async def _assert_cluster_overlay_port_free(
@@ -4698,6 +4718,16 @@ class DockerService:
                 # TODO: remove this when cvm is fixed
                 in_cvm = bool(executor_info.tdx_quote)
                 cpu_count = None if in_cvm else payload.cpu_count
+
+                quote_socket = False
+                if _wants_quote_socket(payload, in_cvm=in_cvm):
+                    current_step = "cvm_quote_broker"
+                    quote_socket = await self._ensure_pod_quote_socket(
+                        docker_client=docker_client,
+                        ssh_client=ssh_client,
+                        default_extra=default_extra,
+                        log_tag=log_tag,
+                    )
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -4710,9 +4740,7 @@ class DockerService:
                     gpu_devices=gpu_config,
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
-                    # A CVM rental gets the dstack guest-agent socket bind-mounted so the workload
-                    # can take TDX quotes from inside the pod (renter-reported gap on CC nodes).
-                    in_cvm=in_cvm,
+                    quote_socket=quote_socket,
                 )
 
                 logger.info(
