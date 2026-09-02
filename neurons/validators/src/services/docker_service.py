@@ -81,7 +81,7 @@ from services.gpu_power_limit import (
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
-from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
+from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_environment
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
@@ -183,23 +183,15 @@ def _published_ports(
     port. On a host whose ports the provider forwards as a range, and on a host that shares its
     public address with other executors, a fixed host port is forwarded to nobody.
     """
-    return (
-        *(
-            PortBinding(container_port=docker_port, host_port=internal_port)
-            for docker_port, internal_port, _ in port_maps
-        ),
-        *(
-            (
-                PortBinding(
-                    container_port=WIREGUARD_LISTEN_PORT,
-                    host_port=overlay_host_port,
-                    protocol="udp",
-                ),
-            )
-            if overlay_host_port is not None
-            else ()
-        ),
-    )
+    bindings: list[PortBinding] = [
+        PortBinding(container_port=docker_port, host_port=internal_port)
+        for docker_port, internal_port, _ in port_maps
+    ]
+    if overlay_host_port is not None:
+        bindings.append(
+            PortBinding(container_port=WIREGUARD_LISTEN_PORT, host_port=overlay_host_port, protocol="udp")
+        )
+    return tuple(bindings)
 
 
 def _s3fs_plugin_alias(volume_name: str) -> str:
@@ -1026,14 +1018,14 @@ class DockerService:
         # tensors still travel over InfiniBand. Absent on an ordinary rental.
         overlay_host_port: int | None = None
         if payload.cluster_membership is not None:
-            cluster_networking = cluster_pod_networking(
-                payload.cluster_membership.wireguard_conf,
-                payload.cluster_membership.ssh_private_key,
-                payload.cluster_membership.ssh_authorized_key,
-                payload.cluster_membership.overlay_udp_port,
+            environment.update(
+                cluster_pod_environment(
+                    payload.cluster_membership.wireguard_conf,
+                    payload.cluster_membership.ssh_private_key,
+                    payload.cluster_membership.ssh_authorized_key,
+                )
             )
-            environment.update(cluster_networking.environment)
-            overlay_host_port = cluster_networking.overlay_host_port
+            overlay_host_port = payload.cluster_membership.overlay_host_port
 
         volume_target = _LIUM_CIPHER_MOUNT if encrypted_local_volume else local_volume_path
         volumes = [VolumeMount(source=local_volume, target=volume_target)]
@@ -1108,14 +1100,16 @@ class DockerService:
     ) -> None:
         """A cluster node publishes its overlay port on the host, so nothing else may hold it.
 
-        Docker's own refusal is `Bind for 0.0.0.0:51820 failed: port is already allocated`, which
+        Docker's own refusal is `Bind for 0.0.0.0:<port> failed: port is already allocated`, which
         says nothing about the overlay and sends whoever reads it hunting through the rental's TCP
         mappings. Checking first turns that into an answer that names the port and the holder
         (DAH-2620). DAH-2842: the port checked is the one this node was allocated, which is the one
-        the create is about to bind.
+        the create is about to bind. Only the UDP side of it: that number now comes from the
+        executor's verified ports, so the rental's own TCP mappings can carry the same number, and an
+        unqualified filter would report the node's own container as the holder.
         """
         result = await ssh_client.run(
-            f"docker ps --filter publish={overlay_host_port} --format '{{{{.Names}}}}'"
+            f"docker ps --filter publish={overlay_host_port}/udp --format '{{{{.Names}}}}'"
         )
         holders = [name.strip() for name in result.stdout.splitlines() if name.strip()]
         if not holders:
@@ -4681,7 +4675,7 @@ class DockerService:
                 if payload.cluster_membership is not None:
                     current_step = "cluster_overlay_port"
                     await self._assert_cluster_overlay_port_free(
-                        ssh_client, payload.cluster_membership.overlay_udp_port, default_extra
+                        ssh_client, payload.cluster_membership.overlay_host_port, default_extra
                     )
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
