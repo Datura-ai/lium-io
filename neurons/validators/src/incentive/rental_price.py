@@ -61,6 +61,12 @@ NCU_PROFILING_UNRESTRICTED = "unrestricted"
 CAP_SYS_ADMIN_BIT = 21
 NVIDIACTL_ROOT_UID = 0
 
+# DAH-2835 — Docker Hub egress gate. An unrented executor that could not reach
+# registry-1.docker.io for this many consecutive validation cycles (~45 minutes) forfeits the
+# unrented incentive but stays active. One or two bad cycles are a network blip and withhold
+# nothing.
+MIN_REGISTRY_UNREACHABLE_CYCLES_TO_PENALIZE = 3
+
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
@@ -89,6 +95,12 @@ class PowerCapIncapable(BaseModel):
 
     container_cap_eff: str  # effective capability mask of the executor container, hex
     nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
+
+
+class RegistryUnreachable(BaseModel):
+    """Consecutive cycles the host failed to reach Docker Hub. Sole owner of that spec key."""
+
+    unreachable_cycles: int
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -473,6 +485,38 @@ class RentalPriceIncentive(DefaultIncentive):
                     "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _registry_unreachable(self, result: JobResult) -> RegistryUnreachable | None:
+        # None unless the probe PROVES a sustained outage: the key is absent on every node the
+        # probe skipped (no scrape, SSH error, Redis down, validator itself offline from Docker
+        # Hub), and a wrong JSON type is a missing reading, not a breach. bool is excluded
+        # explicitly - True passes isinstance(int) and would read as one bad cycle.
+        if result.spec is None:
+            return None
+        unreachable_cycles: Any = result.spec.get("registry_unreachable_cycles")
+        if not isinstance(unreachable_cycles, int) or isinstance(unreachable_cycles, bool):
+            return None
+        if unreachable_cycles < MIN_REGISTRY_UNREACHABLE_CYCLES_TO_PENALIZE:
+            return None
+        return RegistryUnreachable(unreachable_cycles=unreachable_cycles)
+
+    def _log_registry_egress_limit(self, result: JobResult, measured: RegistryUnreachable) -> None:
+        enforced: bool = settings.ENABLE_UNRENTED_REGISTRY_EGRESS_LIMIT
+        logger.info(
+            _m(
+                "Unrented executor cannot reach Docker Hub"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "unreachable_cycles": measured.unreachable_cycles,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.REGISTRY_UNREACHABLE,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -977,8 +1021,6 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2715 power cap gate: an idle machine whose container cannot apply a GPU power
         # cap is not fully usable for Lium's own jobs, so it forfeits the unrented incentive
         # (node stays active). While the flag is off we only log the would-be exclusion.
-        # Last in the chain, so a node already excluded by an ENFORCED gate above is not
-        # measured here - read the shadow numbers against the flags that were on that cycle.
         power_cap_incapable: PowerCapIncapable | None = (
             self._power_cap_incapable(job_result) if eligible_for_rental_share else None
         )
@@ -988,6 +1030,23 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_cannot_apply_gpu_power_cap(
                     job_result, power_cap_incapable
+                )
+                job_result.record_incentive_log(reason)
+
+        # DAH-2835 Docker Hub egress gate: an idle machine that has been cut off from
+        # registry-1.docker.io for several cycles cannot pull a rental's image, so it forfeits
+        # the unrented incentive (node stays active). While the flag is off we only log it.
+        # Last in the chain, so a node already excluded by an ENFORCED gate above is not
+        # measured here - read the shadow numbers against the flags that were on that cycle.
+        registry_unreachable: RegistryUnreachable | None = (
+            self._registry_unreachable(job_result) if eligible_for_rental_share else None
+        )
+        if registry_unreachable is not None:
+            self._log_registry_egress_limit(job_result, registry_unreachable)
+            if settings.ENABLE_UNRENTED_REGISTRY_EGRESS_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_registry_unreachable(
+                    job_result, registry_unreachable
                 )
                 job_result.record_incentive_log(reason)
 

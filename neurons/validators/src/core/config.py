@@ -317,6 +317,12 @@ class Settings(BaseSettings):
     # to logging the breach without withholding anything.
     ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
+    # DAH-2835 — Docker Hub egress gate. When True, an unrented executor that could not reach
+    # registry-1.docker.io for MIN_REGISTRY_UNREACHABLE_CYCLES_TO_PENALIZE consecutive
+    # validation cycles loses the unrented rental incentive while staying active. When False,
+    # the breach is only logged (shadow mode) so prod impact can be observed before enforcing.
+    ENABLE_UNRENTED_REGISTRY_EGRESS_LIMIT: bool = Field(env="ENABLE_UNRENTED_REGISTRY_EGRESS_LIMIT", default=False)
+
     # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
     # scoring the whole box as rented.

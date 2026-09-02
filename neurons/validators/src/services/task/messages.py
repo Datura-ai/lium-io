@@ -1260,8 +1260,9 @@ class FinalizeMessages:
 class RegistryEgressMessages:
     """DAH-2835 — Docker Hub egress probe.
 
-    Advisory only. The verdict rides executor.specs as `registry_reachable`; the backend hides
-    an unreachable host from the available listing. Score is never touched.
+    The count of consecutive failed cycles rides executor.specs as
+    `registry_unreachable_cycles`; the unrented incentive is withheld only after several of
+    them in a row, so a network blip costs the provider nothing. Score is never touched.
     """
 
     REACHABLE = MessageTemplate(
@@ -1276,7 +1277,7 @@ class RegistryEgressMessages:
         reason="REGISTRY_UNREACHABLE",
         severity="warning",
         category="runtime",
-        impact="Host is hidden from the listing — every rental of a non-cached image would fail at docker pull",
+        impact="Every rental of a non-cached image would fail at docker pull; after several cycles in a row the unrented incentive is withheld",
         remediation="Restore outbound HTTPS to registry-1.docker.io from the executor host.",
     )
     SKIPPED = MessageTemplate(
@@ -1284,7 +1285,7 @@ class RegistryEgressMessages:
         reason="REGISTRY_EGRESS_CHECK_SKIPPED",
         severity="info",
         category="runtime",
-        impact="None — the probe could not answer this cycle, the previous verdict stands",
+        impact="None — nothing was measured this cycle, so the incentive gate reads this executor as unmeasured",
     )
 
 

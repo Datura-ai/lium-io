@@ -119,11 +119,10 @@ class ContextState:
     # serves STALE content under an unchanged tag); None = not compared this cycle
     # (not cached / no backend digest / unreadable RepoDigest — strict fail-open).
     recommended_image_digest_match: bool | None = None
-    # DAH-2835: can this host still reach Docker Hub? True/False once probed; None = not
-    # probed this cycle (validator lost the registry too / SSH failed / unreadable output).
-    # ResultHandler publishes it into executor.specs only when not None, so a cycle that
-    # could not answer leaves the previous verdict standing.
-    registry_reachable: bool | None = None
+    # DAH-2835: cycles in a row this host could not reach Docker Hub; 0 = reachable this
+    # cycle. None = not measured (validator lost the registry too / SSH, curl or Redis
+    # failed), and ResultHandler then omits the key rather than inventing a count.
+    registry_unreachable_cycles: int | None = None
     executor_image_report: ExecutorImageReport | None = None
 
 
