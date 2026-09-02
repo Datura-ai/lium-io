@@ -106,7 +106,10 @@ class ContextState:
     gpu_splitting_min_count: int | None = None
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
-    verified_port_count: int = 0
+    # DAH-2647: None = PortConnectivityCheck reached no verdict this cycle — no port could
+    # be selected, or the SSH session died mid-check. Only that check sets None; a zero
+    # would read as "this executor has no working ports" and PortCountCheck scores it 0.
+    verified_port_count: int | None = 0
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None

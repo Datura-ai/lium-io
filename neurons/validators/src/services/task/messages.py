@@ -847,6 +847,13 @@ class PortCountMessages:
         impact="Score set to 0",
         remediation="Increase port range or check port mappings configuration.",
     )
+    PORT_COUNT_NOT_MEASURED = MessageTemplate(
+        event="Port availability not measured",
+        reason="PORT_COUNT_NOT_MEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
 
 
 VERIFYX_DEBUG_DOC_URL = (
@@ -1029,6 +1036,13 @@ class RentalVerificationMessages:
         reason="RENTAL_CHECK_DISABLED",
         severity="info",
         category="policy",
+        impact="Proceed without backend rental verification",
+    )
+    SKIPPED_PORTS_NOT_MEASURED = MessageTemplate(
+        event="Rental verification skipped, ports not measured",
+        reason="RENTAL_CHECK_SKIPPED_PORTS_NOT_MEASURED",
+        severity="info",
+        category="runtime",
         impact="Proceed without backend rental verification",
     )
     VERIFIED = MessageTemplate(
