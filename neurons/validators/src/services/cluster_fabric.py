@@ -17,8 +17,12 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 
-# WireGuard listens here inside every pod, published 1:1 to the host so a peer reaches it at the
-# host's public address on this same port. UDP is not a choice: WireGuard has no TCP mode.
+# WireGuard listens here inside every pod. UDP is not a choice: WireGuard has no TCP mode.
+#
+# DAH-2842: this is the container side only. The host side is the port the backend allocated for this
+# node from the executor's verified ports, because a provider forwards only those, and several
+# executors can sit behind one public address with a range each. Publishing this port on the host as
+# well, as the fleet did before, gave every such node an endpoint nothing forwards.
 WIREGUARD_LISTEN_PORT = 51820
 
 
@@ -27,19 +31,25 @@ class ClusterPodNetworking:
     """What a cluster node needs on top of an ordinary pod."""
 
     environment: dict[str, str]
-    published_udp_ports: tuple[int, ...]
+    # The host port that carries this node's overlay traffic to WIREGUARD_LISTEN_PORT in the pod.
+    overlay_host_port: int
 
 
 def cluster_pod_networking(
     wireguard_conf: str,
     ssh_private_key: str,
     ssh_authorized_key: str,
+    overlay_udp_port: int,
 ) -> ClusterPodNetworking:
-    """The config in env for the template's entrypoint, and the UDP port to publish.
+    """The config in env for the template's entrypoint, and the host port to publish for it.
 
     Base64 because the config and the private key are multi-line and travel as environment
     variables. DAH-2664: the SSH pair is the group's shared login, so `mpirun` and pdsh can start
     ranks on the peers; an older backend sends neither and the entrypoint then installs nothing.
+
+    DAH-2842: `overlay_udp_port` is the host port this node's peers dial, allocated by the backend
+    from the executor's own verified ports. An older backend sends nothing and the payload default
+    keeps the fleet's previous behaviour.
     """
     environment: dict[str, str] = {
         "LIUM_WIREGUARD_CONF_B64": base64.b64encode(wireguard_conf.encode()).decode()
@@ -49,5 +59,5 @@ def cluster_pod_networking(
         environment["LIUM_CLUSTER_SSH_PUBKEY"] = ssh_authorized_key
     return ClusterPodNetworking(
         environment=environment,
-        published_udp_ports=(WIREGUARD_LISTEN_PORT,),
+        overlay_host_port=overlay_udp_port,
     )

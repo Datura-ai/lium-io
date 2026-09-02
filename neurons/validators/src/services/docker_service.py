@@ -172,12 +172,16 @@ LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
 
 def _published_ports(
     port_maps: list[tuple[int, int, int]],
-    cluster_udp_ports: tuple[int, ...],
+    overlay_host_port: int | None,
 ) -> tuple[PortBinding, ...]:
-    """The rental's own TCP ports, plus the UDP ports a cluster node needs on top.
+    """The rental's own TCP ports, plus the UDP port a cluster node needs on top.
 
     WireGuard's handshake is UDP and the fleet publishes only TCP by default, so a cluster node that
     got no UDP port here would raise its interface and never complete a handshake (DAH-2620).
+
+    DAH-2842: the host side is the port the backend allocated for this node, not the container's own
+    port. On a host whose ports the provider forwards as a range, and on a host that shares its
+    public address with other executors, a fixed host port is forwarded to nobody.
     """
     return (
         *(
@@ -185,8 +189,15 @@ def _published_ports(
             for docker_port, internal_port, _ in port_maps
         ),
         *(
-            PortBinding(container_port=udp_port, host_port=udp_port, protocol="udp")
-            for udp_port in cluster_udp_ports
+            (
+                PortBinding(
+                    container_port=WIREGUARD_LISTEN_PORT,
+                    host_port=overlay_host_port,
+                    protocol="udp",
+                ),
+            )
+            if overlay_host_port is not None
+            else ()
         ),
     )
 
@@ -1013,15 +1024,16 @@ class DockerService:
         # DAH-2620: a node of a multi-node group rental gets its WireGuard overlay config injected and
         # the WireGuard UDP port published, so NCCL's socket bootstrap can reach the other nodes; the
         # tensors still travel over InfiniBand. Absent on an ordinary rental.
-        cluster_udp_ports: tuple[int, ...] = ()
+        overlay_host_port: int | None = None
         if payload.cluster_membership is not None:
             cluster_networking = cluster_pod_networking(
                 payload.cluster_membership.wireguard_conf,
                 payload.cluster_membership.ssh_private_key,
                 payload.cluster_membership.ssh_authorized_key,
+                payload.cluster_membership.overlay_udp_port,
             )
             environment.update(cluster_networking.environment)
-            cluster_udp_ports = cluster_networking.published_udp_ports
+            overlay_host_port = cluster_networking.overlay_host_port
 
         volume_target = _LIUM_CIPHER_MOUNT if encrypted_local_volume else local_volume_path
         volumes = [VolumeMount(source=local_volume, target=volume_target)]
@@ -1047,7 +1059,7 @@ class DockerService:
             name=container_name,
             command=build_container_command_argv(custom_options.startup_commands),
             environment=environment,
-            ports=_published_ports(port_maps, cluster_udp_ports),
+            ports=_published_ports(port_maps, overlay_host_port),
             volumes=tuple(volumes),
             restart_policy="unless-stopped",
             runtime="sysbox-runc" if payload.is_sysbox else None,
@@ -1092,24 +1104,25 @@ class DockerService:
 
     @staticmethod
     async def _assert_cluster_overlay_port_free(
-        ssh_client: asyncssh.SSHClientConnection, default_extra: dict
+        ssh_client: asyncssh.SSHClientConnection, overlay_host_port: int, default_extra: dict
     ) -> None:
-        """A cluster node publishes the WireGuard port 1:1, so nothing else may hold it.
+        """A cluster node publishes its overlay port on the host, so nothing else may hold it.
 
         Docker's own refusal is `Bind for 0.0.0.0:51820 failed: port is already allocated`, which
         says nothing about the overlay and sends whoever reads it hunting through the rental's TCP
         mappings. Checking first turns that into an answer that names the port and the holder
-        (DAH-2620).
+        (DAH-2620). DAH-2842: the port checked is the one this node was allocated, which is the one
+        the create is about to bind.
         """
         result = await ssh_client.run(
-            f"docker ps --filter publish={WIREGUARD_LISTEN_PORT} --format '{{{{.Names}}}}'"
+            f"docker ps --filter publish={overlay_host_port} --format '{{{{.Names}}}}'"
         )
         holders = [name.strip() for name in result.stdout.splitlines() if name.strip()]
         if not holders:
             return
 
         message = (
-            f"UDP {WIREGUARD_LISTEN_PORT} is taken by {', '.join(holders)}, so the cluster overlay "
+            f"UDP {overlay_host_port} is taken by {', '.join(holders)}, so the cluster overlay "
             "cannot bind. A node can carry one cluster pod at a time."
         )
         logger.error(_m("Cluster overlay port busy", extra=get_extra_info({**default_extra, "holders": holders})))
@@ -4667,7 +4680,9 @@ class DockerService:
 
                 if payload.cluster_membership is not None:
                     current_step = "cluster_overlay_port"
-                    await self._assert_cluster_overlay_port_free(ssh_client, default_extra)
+                    await self._assert_cluster_overlay_port_free(
+                        ssh_client, payload.cluster_membership.overlay_udp_port, default_extra
+                    )
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
                 # gpu_power_limits). Fail-closed: apply undoes any partial work on failure, and the
