@@ -1257,6 +1257,37 @@ class FinalizeMessages:
     )
 
 
+class RegistryEgressMessages:
+    """DAH-2835 — Docker Hub egress probe.
+
+    Advisory only. The verdict rides executor.specs as `registry_reachable`; the backend hides
+    an unreachable host from the available listing. Score is never touched.
+    """
+
+    REACHABLE = MessageTemplate(
+        event="Executor can reach Docker Hub",
+        reason="REGISTRY_REACHABLE",
+        severity="info",
+        category="runtime",
+        impact="None — image pulls can start on this host",
+    )
+    UNREACHABLE = MessageTemplate(
+        event="Executor cannot reach Docker Hub",
+        reason="REGISTRY_UNREACHABLE",
+        severity="warning",
+        category="runtime",
+        impact="Host is hidden from the listing — every rental of a non-cached image would fail at docker pull",
+        remediation="Restore outbound HTTPS to registry-1.docker.io from the executor host.",
+    )
+    SKIPPED = MessageTemplate(
+        event="Docker Hub egress probe skipped",
+        reason="REGISTRY_EGRESS_CHECK_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="None — the probe could not answer this cycle, the previous verdict stands",
+    )
+
+
 class CachedTemplateMessages:
     """DAH-2265 — cached-template verification.
 

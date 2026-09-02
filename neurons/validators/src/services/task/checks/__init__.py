@@ -1,6 +1,7 @@
 from .banned_gpu import BannedGpuCheck
 from .banned_provider import BannedProviderCheck
 from .cached_template_verification import CachedTemplateVerificationCheck
+from .registry_egress import RegistryEgressCheck
 from .capability import CapabilityCheck
 from .collateral import CollateralCheck
 from .cpu_truth import CpuTruthCheck
@@ -35,6 +36,7 @@ __all__ = [
     "BannedGpuCheck",
     "BannedProviderCheck",
     "CachedTemplateVerificationCheck",
+    "RegistryEgressCheck",
     "CapabilityCheck",
     "CollateralCheck",
     "CpuTruthCheck",

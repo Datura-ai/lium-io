@@ -177,6 +177,13 @@ class ResultHandler:
         if context.state.recommended_image_digest_match is not None:
             specs["recommended_image_digest_match"] = context.state.recommended_image_digest_match
 
+        # DAH-2835: whether this host can reach Docker Hub. False means every rental of an
+        # image it has not cached would fail at docker_pull, so the backend hides it from the
+        # available listing. Only published when probed (None -> key omitted, previous verdict
+        # stands). Rides executor.specs like recommended_image_cached; no scoring impact.
+        if context.state.registry_reachable is not None:
+            specs["registry_reachable"] = context.state.registry_reachable
+
         executor_image_report = (
             context.state.executor_image_report.as_dict()
             if context.state.executor_image_report

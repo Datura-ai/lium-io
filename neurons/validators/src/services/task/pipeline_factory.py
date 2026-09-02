@@ -50,6 +50,7 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     ProviderSideLoadCheck,
+    RegistryEgressCheck,
     RentalVerificationCheck,
     ScoreCheck,
     SpecChangeCheck,
@@ -322,6 +323,11 @@ class PipelineFactory:
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
                 # idle valid-executor population. No scoring impact; fails open on any error.
                 CachedTemplateVerificationCheck(),
+                # DAH-2835: advisory, non-fatal — the only check that touches the registry.
+                # Sits next to the cached-template check because both answer "can this host
+                # start a rental's image pull"; this one asks about the images it has NOT
+                # cached. Publishes registry_reachable to specs; the backend does the hiding.
+                RegistryEgressCheck(),
                 RentalVerificationCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
