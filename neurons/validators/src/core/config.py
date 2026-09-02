@@ -317,7 +317,6 @@ class Settings(BaseSettings):
     # to logging the breach without withholding anything.
     ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
-
     # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
     # scoring the whole box as rented.
@@ -367,6 +366,10 @@ class Settings(BaseSettings):
     TDX_REATTEST_INTERVAL_SECONDS: int = Field(env="TDX_REATTEST_INTERVAL_SECONDS", default=3600)
     # Issued nonce validity window; a quote echoing an older nonce is stale.
     ATTESTATION_NONCE_TTL_SECONDS: int = Field(env="ATTESTATION_NONCE_TTL_SECONDS", default=600)
+
+    # DAH-2828: customer pods on CVM nodes get /var/run/dstack.sock through the quote-only broker
+    # (services/cvm_quote_broker.py). Kill switch only; off = pods get no quote path.
+    ENABLE_CVM_POD_QUOTE_SOCKET: bool = Field(env="ENABLE_CVM_POD_QUOTE_SOCKET", default=True)
 
     # G1 — NVIDIA GPU confidential-compute attestation (validator-side verification).
     # Off = observe-only: nvidia_payload, when present, is verified and logged but

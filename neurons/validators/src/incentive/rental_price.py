@@ -91,7 +91,6 @@ class PowerCapIncapable(BaseModel):
     nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
 
 
-
 # ── Snapshot models ──────────────────────────────────────────────────────────
 
 class GpuBucketRentalState(BaseModel):
@@ -478,8 +477,6 @@ class RentalPriceIncentive(DefaultIncentive):
                 },
             )
         )
-
-
 
     def _reason_excluded_from_both_pools(self, job_result: JobResult) -> MinerLogLine | None:
         """First reason (if any) the executor is excluded from BOTH incentive pools.
@@ -980,6 +977,8 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2715 power cap gate: an idle machine whose container cannot apply a GPU power
         # cap is not fully usable for Lium's own jobs, so it forfeits the unrented incentive
         # (node stays active). While the flag is off we only log the would-be exclusion.
+        # Last in the chain, so a node already excluded by an ENFORCED gate above is not
+        # measured here - read the shadow numbers against the flags that were on that cycle.
         power_cap_incapable: PowerCapIncapable | None = (
             self._power_cap_incapable(job_result) if eligible_for_rental_share else None
         )
@@ -991,7 +990,6 @@ class RentalPriceIncentive(DefaultIncentive):
                     job_result, power_cap_incapable
                 )
                 job_result.record_incentive_log(reason)
-
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:

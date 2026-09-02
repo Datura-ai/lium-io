@@ -27,7 +27,6 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
        attestation (offer any of the three to earn),
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
-     host cut off from registry-1.docker.io for several cycles (restore egress to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -57,11 +56,7 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from services.executor_image_policy import outdated_image_remediation
 
 if TYPE_CHECKING:
-    from incentive.rental_price import (
-        InsufficientDisk,
-        MissingFlagshipCapability,
-        PowerCapIncapable,
-    )
+    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, PowerCapIncapable
     from services.task_service import JobResult
 
 
@@ -411,7 +406,6 @@ class MinerLogLine(BaseModel):
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
             },
         )
-
 
     # ── Calculation reports: the per-cycle lines every scored node gets ───────
 
