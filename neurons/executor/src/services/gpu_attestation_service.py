@@ -91,6 +91,9 @@ class GPUAttestationService:
                 url=None,
                 evidence="",
             )
+            # ppcie_mode is the NVIDIA SDK's "standalone mode", not "node runs Protected PCIe":
+            # cc_admin.init_nvml refuses standalone on a PPCIE driver, so True breaks PPCIE nodes.
+            # False matches NVIDIA's PPCIE verifier and works for per-card CC too — do not flip.
             return attester.get_evidence(options={"ppcie_mode": False})
         finally:
             try:
