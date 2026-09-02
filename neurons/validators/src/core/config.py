@@ -367,10 +367,6 @@ class Settings(BaseSettings):
     # Issued nonce validity window; a quote echoing an older nonce is stale.
     ATTESTATION_NONCE_TTL_SECONDS: int = Field(env="ATTESTATION_NONCE_TTL_SECONDS", default=600)
 
-    # DAH-2828: customer pods on CVM nodes get /var/run/dstack.sock through the quote-only broker
-    # (services/cvm_quote_broker.py). Kill switch only; off = pods get no quote path.
-    ENABLE_CVM_POD_QUOTE_SOCKET: bool = Field(env="ENABLE_CVM_POD_QUOTE_SOCKET", default=True)
-
     # G1 — NVIDIA GPU confidential-compute attestation (validator-side verification).
     # Off = observe-only: nvidia_payload, when present, is verified and logged but
     # never affects the outcome. On = a CVM executor (verified TDX quote) must supply
