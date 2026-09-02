@@ -842,7 +842,7 @@ class PortCountMessages:
     INSUFFICIENT_PORTS = MessageTemplate(
         event="Insufficient available ports",
         reason="INSUFFICIENT_PORTS",
-        severity="warning",
+        severity="error",
         category="runtime",
         impact="Score set to 0",
         remediation="Increase port range or check port mappings configuration.",
@@ -1260,9 +1260,8 @@ class FinalizeMessages:
 class RegistryEgressMessages:
     """DAH-2835 — Docker Hub egress probe.
 
-    The count of consecutive failed cycles rides executor.specs as
-    `registry_unreachable_cycles`; the unrented incentive is withheld only after several of
-    them in a row, so a network blip costs the provider nothing. Score is never touched.
+    A failed probe zeroes the score. The backend (DAH-2748) turns a streak of failed cycles
+    into "hidden from browse and refused for new rentals", so one blip costs no rental.
     """
 
     REACHABLE = MessageTemplate(
@@ -1275,9 +1274,9 @@ class RegistryEgressMessages:
     UNREACHABLE = MessageTemplate(
         event="Executor cannot reach Docker Hub",
         reason="REGISTRY_UNREACHABLE",
-        severity="warning",
+        severity="error",
         category="runtime",
-        impact="Every rental of a non-cached image would fail at docker pull; after several cycles in a row the unrented incentive is withheld",
+        impact="Score set to 0 — every rental of an image this host has not cached would fail at docker pull",
         remediation="Restore outbound HTTPS to registry-1.docker.io from the executor host.",
     )
     SKIPPED = MessageTemplate(
@@ -1285,7 +1284,7 @@ class RegistryEgressMessages:
         reason="REGISTRY_EGRESS_CHECK_SKIPPED",
         severity="info",
         category="runtime",
-        impact="None — nothing was measured this cycle, so the incentive gate reads this executor as unmeasured",
+        impact="None — the probe could not answer this cycle, so it accuses nobody",
     )
 
 

@@ -11,7 +11,6 @@ from incentive.rental_price import (
     InsufficientDisk,
     MissingFlagshipCapability,
     PowerCapIncapable,
-    RegistryUnreachable,
     RentalPriceIncentive,
 )
 from services.task_service import JobResult
@@ -37,7 +36,6 @@ def test_reason_enum_pins_the_stable_code_contract():
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
-        "registry_unreachable",
     }
 
 
@@ -145,13 +143,6 @@ def _job(**overrides) -> JobResult:
             ),
             "cannot_apply_gpu_power_cap",
             "CAP_SYS_ADMIN",
-        ),
-        (
-            lambda job: MinerLogLine.no_payout_because_registry_unreachable(
-                job, RegistryUnreachable(unreachable_cycles=3)
-            ),
-            "registry_unreachable",
-            "registry-1.docker.io",
         ),
     ],
 )

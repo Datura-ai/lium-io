@@ -61,7 +61,6 @@ if TYPE_CHECKING:
         InsufficientDisk,
         MissingFlagshipCapability,
         PowerCapIncapable,
-        RegistryUnreachable,
     )
     from services.task_service import JobResult
 
@@ -89,7 +88,6 @@ class ZeroIncentiveReason(StrEnum):
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
-    REGISTRY_UNREACHABLE = "registry_unreachable"
 
 
 class IncentiveReason(BaseModel):
@@ -414,24 +412,6 @@ class MinerLogLine(BaseModel):
             },
         )
 
-    @staticmethod
-    def no_payout_because_registry_unreachable(
-        result: JobResult, measured: RegistryUnreachable
-    ) -> MinerLogLine:
-        return MinerLogLine._no_payout(
-            result,
-            reason=ZeroIncentiveReason.REGISTRY_UNREACHABLE,
-            message=(
-                "No unrented incentive: this executor cannot reach registry-1.docker.io "
-                f"(Docker Hub), and has not for {measured.unreachable_cycles} consecutive "
-                "validation cycles. Every rental of an image the host has not already cached "
-                "would fail at the image pull. Restore outbound HTTPS to registry-1.docker.io "
-                "from the executor host (check the firewall, the DNS and the upstream route: "
-                "'curl -sS https://registry-1.docker.io/v2/' must answer 401 or 200), or rent "
-                "this executor out to earn."
-            ),
-            extra_fields={"registry_unreachable_cycles": measured.unreachable_cycles},
-        )
 
     # ── Calculation reports: the per-cycle lines every scored node gets ───────
 

@@ -177,13 +177,6 @@ class ResultHandler:
         if context.state.recommended_image_digest_match is not None:
             specs["recommended_image_digest_match"] = context.state.recommended_image_digest_match
 
-        # DAH-2835: cycles in a row this host could not reach Docker Hub (0 = reachable). The
-        # unrented-incentive gate in incentive/rental_price.py reads it and withholds the idle
-        # incentive at 3 consecutive cycles, behind a shadow flag; no scoring impact. Only
-        # published when measured (None -> key omitted, which means "not measured").
-        if context.state.registry_unreachable_cycles is not None:
-            specs["registry_unreachable_cycles"] = context.state.registry_unreachable_cycles
-
         executor_image_report = (
             context.state.executor_image_report.as_dict()
             if context.state.executor_image_report

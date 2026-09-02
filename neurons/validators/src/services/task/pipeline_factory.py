@@ -323,13 +323,11 @@ class PipelineFactory:
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
                 # idle valid-executor population. No scoring impact; fails open on any error.
                 CachedTemplateVerificationCheck(),
-                # DAH-2835: non-fatal — the only check that touches the registry. Sits next to
-                # the cached-template check because both answer "can this host start a rental's
-                # image pull"; this one asks about the images it has NOT cached. Publishes
-                # registry_unreachable_cycles to specs; the unrented-incentive gate reads it.
-                # After the rented short-circuit, so a partially rented split node is never
-                # probed and its free portion stays unmeasured — read the shadow numbers as
-                # the fully idle population only.
+                # DAH-2835: fatal — the only check that touches the registry. Sits next to the
+                # cached-template check because both answer "can this host start a rental's
+                # image pull"; this one asks about the images it has NOT cached. The tolerance
+                # for a blip is DAH-2748's failed-cycle streak on the backend, not a second one
+                # here. After the rented short-circuit, so a renter's box is never probed.
                 RegistryEgressCheck(),
                 RentalVerificationCheck(),
                 ScoreCheck(),
