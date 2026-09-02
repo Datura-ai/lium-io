@@ -1066,7 +1066,7 @@ class DockerService:
     async def _ensure_pod_quote_socket(
         self,
         *,
-        docker_client,
+        docker_client: RentalDockerSdkClient,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         log_tag: str,
@@ -4728,6 +4728,8 @@ class DockerService:
                         default_extra=default_extra,
                         log_tag=log_tag,
                     )
+                    # the broker cold start (image pull, socket wait) must not read as port-check wait
+                    prev_timestamp = now_ms()
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
