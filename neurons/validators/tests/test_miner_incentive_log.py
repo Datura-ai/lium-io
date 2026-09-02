@@ -35,6 +35,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "insufficient_disk_for_vram",
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
+        "outdated_executor_image",
     }
 
 

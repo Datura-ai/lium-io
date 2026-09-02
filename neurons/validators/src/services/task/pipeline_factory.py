@@ -19,6 +19,7 @@ from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
 from services.container_cleanup import ContainerCleanup
 from services.executor_connectivity_service import ExecutorConnectivityService
+from services.executor_image_policy import ExpectedImageSnapshot
 from services.inspector_validation_service import InspectorValidationService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
@@ -35,6 +36,7 @@ from .checks import (
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DuplicateExecutorCheck,
+    ExecutorImageCheck,
     FinalizeCheck,
     GpuCountCheck,
     GpuFingerprintCheck,
@@ -138,6 +140,7 @@ class PipelineFactory:
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
+        executor_image_snapshot: ExpectedImageSnapshot | None = None,
         tdx_attestation_passed: bool = False,
         gpu_attestation_passed: bool | None = None,
     ) -> Context:
@@ -225,6 +228,7 @@ class PipelineFactory:
                 machine_scrape_timeout=JOB_LENGTH,
                 obfuscation_keys=encrypted_files.all_keys,
                 default_docker_image_digests=default_docker_image_digests,
+                executor_image_snapshot=executor_image_snapshot,
                 validator_keypair=keypair,
                 max_gpu_count=MAX_GPU_COUNT,
                 gpu_model_rates=GPU_MODEL_RATES,
@@ -306,6 +310,7 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
@@ -366,6 +371,7 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).
                 TenantEnforcementCheck(recover_stale_pods=False),

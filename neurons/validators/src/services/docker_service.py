@@ -6370,62 +6370,6 @@ class DockerService:
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
-    async def get_docker_hub_digests(self, repositories) -> dict[str, str]:
-        """Retrieve all tags and their corresponding digests from Docker Hub."""
-        all_digests = {}  # Initialize a dictionary to store all tag-digest pairs
-
-        async with aiohttp.ClientSession() as session:
-            for repo in repositories:
-                try:
-                    # Split repository and tag if specified
-                    if ":" in repo:
-                        repository, specified_tag = repo.split(":", 1)
-                    else:
-                        repository, specified_tag = repo, None
-
-                    # Get authorization token
-                    async with session.get(
-                        f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repository}:pull"
-                    ) as token_response:
-                        token_response.raise_for_status()
-                        token = await token_response.json()
-                        token = token.get("token")
-
-                    # Find all tags if no specific tag is specified
-                    if specified_tag is None:
-                        async with session.get(
-                            f"https://index.docker.io/v2/{repository}/tags/list",
-                            headers={"Authorization": f"Bearer {token}"},
-                        ) as tags_response:
-                            tags_response.raise_for_status()
-                            tags_data = await tags_response.json()
-                            all_tags = tags_data.get("tags", [])
-                    else:
-                        all_tags = [specified_tag]
-
-                    # Dictionary to store tag-digest pairs for the current repository
-                    tag_digests = {}
-                    for tag in all_tags:
-                        # Get image digest
-                        async with session.head(
-                            f"https://index.docker.io/v2/{repository}/manifests/{tag}",
-                            headers={
-                                "Authorization": f"Bearer {token}",
-                                "Accept": "application/vnd.docker.distribution.manifest.v2+json",
-                            },
-                        ) as manifest_response:
-                            manifest_response.raise_for_status()
-                            digest = manifest_response.headers.get("Docker-Content-Digest")
-                            tag_digests[f"{repository}:{tag}"] = digest
-
-                    # Update the all_digests dictionary with the current repository's tag-digest pairs
-                    all_digests.update(tag_digests)
-
-                except aiohttp.ClientError as e:
-                    print(f"Error retrieving data for {repo}: {e}")
-
-        return all_digests
-
     def _get_preferred_ports(self, initial_port_count: int | None) -> list[int]:
         """Calculate preferred ports based on initial_port_count.
 

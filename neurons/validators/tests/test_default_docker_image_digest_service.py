@@ -7,6 +7,7 @@ import pytest
 from neurons.validators.src.services.default_docker_image_digest_service import (
     _shared_config_image_refs,
     fetch_default_image_digests,
+    fetch_executor_image_digest,
     fetch_registry_digest,
 )
 
@@ -118,3 +119,16 @@ async def test_fetch_default_image_digests_reads_refs_from_shared_config():
         digests = await fetch_default_image_digests()
 
     assert digests == {"daturaai/pytorch:shared": "sha256:shared"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_executor_image_digest_uses_executor_image_ref():
+    with patch(
+        f"{_MODULE}.fetch_registry_digest",
+        new=AsyncMock(return_value=f"sha256:{'a' * 64}"),
+    ) as fetch_registry:
+        digest = await fetch_executor_image_digest()
+
+    assert digest == f"sha256:{'a' * 64}"
+    fetch_registry.assert_awaited_once()
+    assert fetch_registry.await_args.args[1] == "daturaai/compute-subnet-executor:latest"

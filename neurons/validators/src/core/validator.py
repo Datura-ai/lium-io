@@ -12,8 +12,12 @@ from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
 from services.collateral_contract_service import CollateralContractService
-from services.default_docker_image_digest_service import fetch_default_image_digests
+from services.default_docker_image_digest_service import (
+    fetch_default_image_digests,
+    fetch_executor_image_digest,
+)
 from services.docker_service import DockerService
+from services.executor_image_policy import build_expected_image_snapshot
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
@@ -286,6 +290,19 @@ class Validator:
                         ),
                     )
 
+                try:
+                    executor_digest = await fetch_executor_image_digest()
+                except Exception as exc:
+                    executor_digest = None
+                    logger.error(
+                        _m(
+                            "[sync] executor image digest fetch failed; image check skips this cycle",
+                            extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                        ),
+                    )
+
+                executor_image_snapshot = build_expected_image_snapshot(executor_digest)
+
                 # Fetch all rented executors from backend API
                 rented_executors = await self.backend_client.get_all_rented_executors()
                 if rented_executors is None:
@@ -335,6 +352,7 @@ class Validator:
                             encrypted_files=encrypted_files,
                             rented_data=rented_executors,
                             default_docker_image_digests=default_image_digests,
+                            executor_image_snapshot=executor_image_snapshot,
                         )
                     )
                     for miner in miners

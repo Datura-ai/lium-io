@@ -93,6 +93,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     attestation_digest: str | None = None
     tdx_attestation_passed: bool | None = None
     gpu_attestation_passed: bool | None = None
+    executor_image: dict[str, Any] | None = None
     # None = publisher did not report the field; [] = no catalogued reason was recorded.
     incentive_reasons: list[IncentiveReason] | None = None
     # DAH-2792: specs the validator scored for this miner in this job_batch_id, counting the ones

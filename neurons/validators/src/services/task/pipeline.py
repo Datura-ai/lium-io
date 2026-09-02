@@ -16,6 +16,7 @@ from services.collateral_contract_service import CollateralContractService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
+from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
@@ -71,6 +72,7 @@ class ContextConfig:
     # DAH-2380: per-cycle snapshot of default cache-template image_ref -> bare digest,
     # fetched from Docker Hub at job-cycle start. Empty => digest check skips (fail-open).
     default_docker_image_digests: dict[str, str]
+    executor_image_snapshot: ExpectedImageSnapshot | None = None
     validator_keypair: Optional[Any] = None
     max_gpu_count: Optional[int] = None
     gpu_model_rates: Optional[dict[str, Any]] = None
@@ -117,6 +119,7 @@ class ContextState:
     # serves STALE content under an unchanged tag); None = not compared this cycle
     # (not cached / no backend digest / unreadable RepoDigest — strict fail-open).
     recommended_image_digest_match: bool | None = None
+    executor_image_report: ExecutorImageReport | None = None
 
 
 class CheckResult(BaseModel):

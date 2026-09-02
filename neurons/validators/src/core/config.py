@@ -274,6 +274,10 @@ class Settings(BaseSettings):
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
+    EXECUTOR_IMAGE_REF: str = Field(
+        env="EXECUTOR_IMAGE_REF",
+        default="daturaai/compute-subnet-executor:latest",
+    )
 
     # DAH-2272: when on, raise the asyncssh logger to DEBUG (debug level 2) so the
     # SSH handshake (banner / key exchange / auth) is logged per connection, and

@@ -6,6 +6,7 @@ from .collateral import CollateralCheck
 from .cpu_truth import CpuTruthCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
 from .duplicate_executor import DuplicateExecutorCheck
+from .executor_image import ExecutorImageCheck
 from .finalize import FinalizeCheck
 from .gpu_count import GpuCountCheck
 from .gpu_fingerprint import GpuFingerprintCheck
@@ -39,6 +40,7 @@ __all__ = [
     "CpuTruthCheck",
     "CustomBuildOrphanSweepCheck",
     "DuplicateExecutorCheck",
+    "ExecutorImageCheck",
     "FinalizeCheck",
     "GpuCountCheck",
     "GpuFingerprintCheck",

@@ -7,6 +7,7 @@ based on collateral status, rental state, and contract versions.
 from typing import Tuple
 
 from core.config import settings, shared_client
+from services.executor_image_policy import ImageVerdict
 from services.task.pipeline import Context
 
 
@@ -37,6 +38,12 @@ def calculate_scores(
     warning_messages = []
     job_score = 1.0
     actual_score = 1.0
+
+    image_report = getattr(ctx.state, "executor_image_report", None)
+    if image_report and image_report.status is ImageVerdict.OUTDATED:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Required executor image is outdated")
 
     # Machine price check
     base_price = shared_client.config.machine_prices.get(gpu_model, 0)
