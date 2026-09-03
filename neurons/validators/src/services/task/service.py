@@ -1,6 +1,8 @@
+import asyncio
 import logging
 from typing import Annotated
 
+import asyncssh
 import bittensor
 from clients.backend_client import BackendClient
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -24,8 +26,19 @@ from .models import JobResult
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
+from .ssh_unreachable_grace import SshUnreachableGrace
 
 logger = logging.getLogger(__name__)
+
+def _is_ssh_transport_failure(error: BaseException) -> bool:
+    """True when we never got a usable SSH session, so nothing about the node was measured.
+
+    asyncssh raises its own errors for a refused or reset connection and for a rejected
+    handshake; the socket layer raises OSError; a hung handshake raises TimeoutError. A
+    failure inside the pipeline is a real verdict and never lands here.
+    """
+    return isinstance(error, (asyncssh.Error, OSError, asyncio.TimeoutError))
+
 
 class TaskService:
     def __init__(
@@ -42,6 +55,7 @@ class TaskService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.ssh_unreachable_grace = SshUnreachableGrace(redis_service)
         self.attestation_service = attestation_service
         self.wallet = settings.get_bittensor_wallet()
 
@@ -157,9 +171,48 @@ class TaskService:
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed
+                # DAH-2748: the node answered, so the SSH grace starts again from zero.
+                await self.ssh_unreachable_grace.record_successful_cycle(
+                    executor_info.uuid, result.score
+                )
                 return result
 
         except Exception as e:
+            # DAH-2748: a node we could not open SSH to was not measured, so the first such
+            # cycle in a row keeps its last score. Every other failure is a real verdict.
+            score_for_this_cycle: float = 0.0
+            if _is_ssh_transport_failure(e):
+                verdict = await self.ssh_unreachable_grace.score_for_unreachable_cycle(
+                    executor_info.uuid
+                )
+                score_for_this_cycle = verdict.score
+                event = self.ssh_unreachable_grace.build_event(
+                    executor_uuid=executor_info.uuid,
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    error=str(e),
+                    streak=verdict.streak,
+                    forgiven=verdict.forgiven,
+                )
+                log_text = _m(event.event, extra=event.model_dump())
+                logger.error(log_text, exc_info=True)
+                return JobResult(
+                    spec=None,
+                    executor_info=executor_info,
+                    score=score_for_this_cycle,
+                    job_score=0,
+                    collateral_deposited=False,
+                    job_batch_id=miner_info.job_batch_id,
+                    log_status="error",
+                    log_text=log_text.to_full_string(),
+                    gpu_model=None,
+                    gpu_count=0,
+                    sysbox_runtime=False,
+                    attestation_digest=attestation_digest,
+                    tee_type=tee_type,
+                    gpu_attestation_passed=gpu_attestation_passed,
+                )
+
             log_text = _m(
                 "Pipeline validation error",
                 extra=get_extra_info({

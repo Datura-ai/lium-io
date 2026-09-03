@@ -353,3 +353,7 @@ TDX_WHITELIST = {
         },
     }
 }
+
+# DAH-2748: the SSH-unreachable streak is only meaningful between two cycles (15 min apart).
+# An hour outlives a missed cycle and forgets a node nobody validates any more.
+SSH_UNREACHABLE_STREAK_TTL_SECONDS = 3600
