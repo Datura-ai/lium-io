@@ -44,5 +44,5 @@ async def test_the_probe_asks_about_the_overlay_port() -> None:
     # Act
     await DockerService._assert_cluster_overlay_port_free(ssh, {})
 
-    # Assert — UDP only: the rental's own TCP mappings can hold the same number.
+    # Assert — UDP only: a co-tenant's TCP mapping can hold the same number.
     assert f"publish={WIREGUARD_LISTEN_PORT}/udp" in ssh.run.call_args.args[0]

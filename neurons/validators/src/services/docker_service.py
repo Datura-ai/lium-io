@@ -1101,8 +1101,8 @@ class DockerService:
         mappings. Checking first turns that into an answer that names the port and the holder
         (DAH-2620).
         """
-        # UDP only: the rental's own TCP mappings can hold the same number, and a protocol-agnostic
-        # filter would then name this pod's own container as the holder and refuse the create.
+        # UDP only: a co-tenant's TCP mapping can hold the same number, and a protocol-agnostic
+        # filter would name that container as the holder and refuse a create nothing is blocking.
         result = await ssh_client.run(
             f"docker ps --filter publish={WIREGUARD_LISTEN_PORT}/udp --format '{{{{.Names}}}}'"
         )
