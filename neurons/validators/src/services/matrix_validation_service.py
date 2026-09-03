@@ -35,6 +35,14 @@ MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 90
 # serialises) and stays clear of that ceiling on the widest honest hosts.
 MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS = 8
 
+# VRAM (MB) the work-proof leaves untouched when sizing the matmul. The probe process needs
+# its CUDA context, and a B200 in NVIDIA confidential-computing mode already holds ~1.8 GB at
+# idle (1766 MB used vs ~730 MB out of CC mode); with 2 GB d_A fit and d_B OOMed (DAH-2850).
+# A fixed constant on purpose: host-reported memory_used_mb is executor-controlled and must not
+# be allowed to shrink the challenge. Capped at a quarter of the card so small consumer cards
+# (3-8 GB in the registry) keep a real challenge instead of a sliver or a negative dim_k.
+MATMUL_VRAM_HEADROOM_MB = 4096
+
 
 class DMCompVerifyWrapper:
     def __init__(self, lib_name: str):
@@ -226,7 +234,7 @@ class ValidationService:
         return 0
 
     def get_max_matrix_dimensions(self, gpu_memory, dim_n):
-        gpu_memory = gpu_memory - 2 * 1024
+        gpu_memory = gpu_memory - min(MATMUL_VRAM_HEADROOM_MB, gpu_memory // 4)
         max_memory = gpu_memory * (1024.0 ** 2)
 
         element_size = 8  # 8 bytes for double precision
