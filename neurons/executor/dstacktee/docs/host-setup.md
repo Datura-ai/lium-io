@@ -11,7 +11,7 @@ Provider guide for taking a TDX host from bare metal to an attested Lium CVM exe
 ## 1. Hardware and firmware
 
 - **CPU**: Intel Xeon with TDX **and** SGX — Sapphire Rapids (XCC/MCC SKUs only), Emerald Rapids, or Granite Rapids. SGX is not optional: the sealing-key provider runs in an SGX enclave.
-- **GPU**: NVIDIA Confidential-Computing capable — Hopper (H100/H200) or Blackwell (B200/B300). Hopper: CC mode for a single GPU per CVM, Protected PCIe (GPUs **and** NVSwitches, `CVM_GPUS=all` — a listed set leaves the NVSwitches on the host) for a whole 8× HGX board. Blackwell: CC mode only. Commands and checks: [Enable GPU Confidential Computing mode](https://docs.lium.io/providers/nodes/cvm#4-enable-gpu-confidential-computing-mode).
+- **GPU**: NVIDIA Confidential-Computing capable — Hopper (H100/H200) or Blackwell (B200/B300). Hopper: CC mode for a single GPU per CVM, Protected PCIe (GPUs **and** NVSwitches, `CVM_GPUS=all` — a listed set leaves the NVSwitches on the host) for a whole 8× HGX board. Blackwell: CC mode only. Commands and checks: [Enable GPU Confidential Computing mode](https://docs.lium.io/providers/nodes/cvm#4-enable-gpu-confidential-computing-mode). Bring-up scripts written against the older single-GPU guidance, such as `cvm-host-phase2.sh`, set Protected PCIe back to off — keep Protected PCIe nodes out of them and re-query the mode after any run.
 - **BIOS**: latest vendor BIOS; enable TDX, SGX, VT-x/VT-d. After boot, `/dev/sgx_enclave` and `/dev/sgx_provision` must exist.
 
 ## 2. Kernel and boot parameters
