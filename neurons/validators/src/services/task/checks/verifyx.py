@@ -12,13 +12,6 @@ MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
 
 
 class VerifyXCheck:
-    """Run the optional VerifyX hardware probe and update specs with its findings.
-
-    This preserves the legacy feature flag behaviour: when VerifyX is enabled we block on
-    its success, otherwise the check becomes a no-op. Documenting it here lets us debate
-    the value of the external probe independently from the rest of the pipeline.
-    """
-
     check_id = "gpu.validate.verifyx"
     fatal = True
 

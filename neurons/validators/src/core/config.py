@@ -1,6 +1,5 @@
 import pathlib
 from datetime import datetime
-from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
@@ -10,12 +9,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 if TYPE_CHECKING:
     from bittensor import Wallet
 
+from enum import Enum
+
 from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 
 
 class FeatureFlag(str, Enum):
-    """Feature flag names for type-safe access."""
     VERIFYX_NETWORK_VALIDATION = "verifyx_network_validation"
 
 
@@ -331,15 +331,14 @@ class Settings(BaseSettings):
             "info": "3rd version: Fixed 'ExecutorNotOwned' error",
         },
     }
-    FEATURE_FLAGS: dict[str, bool] = {
-        FeatureFlag.VERIFYX_NETWORK_VALIDATION: False,  # If it's True - then bad internet connection will raise error on synthetic job
-    }
-
     # GPU types that will be excluded in collateral checks
     COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [
         "NVIDIA B200"
     ]
-    
+    FEATURE_FLAGS: dict[str, bool] = {
+        FeatureFlag.VERIFYX_NETWORK_VALIDATION: False,
+    }
+
     # TDX Attestation settings
     ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
     TDX_VERIFIER_URL: str | None = Field(env="TDX_VERIFIER_URL", default=None)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 
-from core.config import settings, FeatureFlag
+from core.config import FeatureFlag, settings
 from core.utils import _m, get_extra_info
 from core.checksums import sha256_from_executor, sha256_from_path
 
@@ -366,18 +366,31 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
         errors.append(f"Integrity check failed for {download_result['pkg']}")
         success = False
 
-    download_speed = network_execution["download"]["speed_mbps"]
-    upload_speed = network_execution.get("speedtest", {}).get("upload_mbps")
+    speedtest = network_execution["speedtest"]
+    upload_speed = speedtest.get("upload_mbps")
+    download_speed = speedtest["download_mbps"]
+    package_download_speed = download_result["speed_mbps"]
+
+    if upload_speed is None or upload_speed <= 0:
+        errors.append("Network performance data unavailable")
+        success = False
 
     if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
         errors.append(
-            f"Network download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+            f"Cloudflare download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+        )
+        success = False
+
+    if package_download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
+        errors.append(
+            f"Package download speed inadequate: {package_download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
         )
         success = False
 
     stats = {
         "download_speed": download_speed,
         "upload_speed": upload_speed,
+        "package_download_speed": package_download_speed,
         "success": success,
         "execution_time_ms": network_execution["execution_time_ms"],
     }

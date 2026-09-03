@@ -22,7 +22,6 @@ RUN apt-get update \
      openssh-client \
      openssh-server \
      pkg-config \
-     speedtest-cli \
      ssh \
      awscli \
      tar \

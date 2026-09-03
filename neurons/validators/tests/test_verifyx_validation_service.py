@@ -19,11 +19,108 @@ from neurons.validators.src.services.verifyx_validation_service import (
     MIN_CIPHER_LEN,
     VerifyXFailureClass,
     VerifyXValidationService,
+    _perform_verification_checks,
+    _verify_network_test,
 )
 
 
 def _executor_info() -> SimpleNamespace:
     return SimpleNamespace(python_path="/usr/bin/python3", root_dir="/root/app", uuid="exec-1")
+
+
+def _network_payload(
+    *,
+    cloudflare_download_speed: float = 100.0,
+    package_download_speed: float = 100.0,
+    upload_speed: float | None = 20.0,
+) -> tuple[dict, dict]:
+    challenge_data = {
+        "network_challenge": {
+            "download": {"pkg": "network.bin", "size": 1024, "hash": "expected"}
+        }
+    }
+    response_data = {
+        "network_execution": {
+            "success": True,
+            "download": {
+                "pkg": "network.bin",
+                "size": 1024,
+                "hash": "expected",
+                "speed_mbps": package_download_speed,
+            },
+            "speedtest": {
+                "download_mbps": cloudflare_download_speed,
+                "upload_mbps": upload_speed,
+            },
+            "execution_time_ms": 250,
+        }
+    }
+    return challenge_data, response_data
+
+
+def test_network_stats_use_cloudflare_download_speed():
+    challenge_data, response_data = _network_payload(
+        cloudflare_download_speed=125.0,
+        package_download_speed=80.0,
+    )
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert errors == []
+    assert stats == {
+        "download_speed": 125.0,
+        "upload_speed": 20.0,
+        "package_download_speed": 80.0,
+        "success": True,
+        "execution_time_ms": 250,
+    }
+
+
+def test_network_fails_when_package_download_is_too_slow():
+    challenge_data, response_data = _network_payload(package_download_speed=49.0)
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert any("Package download speed inadequate" in error for error in errors)
+
+
+def test_network_fails_when_cloudflare_download_is_too_slow():
+    challenge_data, response_data = _network_payload(cloudflare_download_speed=49.0)
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert any("Cloudflare download speed inadequate" in error for error in errors)
+
+
+def test_network_fails_without_positive_upload_speed():
+    challenge_data, response_data = _network_payload(upload_speed=None)
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert "Network performance data unavailable" in errors
+
+
+def test_network_failure_does_not_reject_when_flag_is_off():
+    payload = {"challenge_data": {}, "response_data": {}}
+
+    with patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_network_test",
+        return_value=({"success": False}, ["network failed"]),
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_memory_test",
+        return_value=({"success": True}, []),
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_storage_test",
+        return_value=({"success": True}, []),
+    ):
+        result = _perform_verification_checks(payload)
+
+    assert result["success"] is True
+    assert result["network"]["success"] is False
+    assert result["errors"] == ["network failed"]
 
 
 @pytest.mark.asyncio

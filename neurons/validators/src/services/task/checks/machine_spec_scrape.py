@@ -11,7 +11,6 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
-from .network_ema import compute_ema
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 # DAH-2794: how long a failed stdin attempt may have taken and still be worth retrying with the
@@ -316,21 +315,6 @@ class MachineSpecScrapeCheck:
             gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
             gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
             supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
-
-            prev_ema = (
-                ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
-                if ctx.state.rented_data else None
-            )
-            network = specs.get("network") or {}
-            network["ema_download_speed"] = compute_ema(
-                prev_ema.ema_download_speed if prev_ema else None,
-                network.get("download_speed"),
-            )
-            network["ema_upload_speed"] = compute_ema(
-                prev_ema.ema_upload_speed if prev_ema else None,
-                network.get("upload_speed"),
-            )
-            specs = {**specs, "network": network}
 
             extra_info = {
                 "sysbox_runtime": sysbox_runtime,
