@@ -343,6 +343,12 @@ class Settings(BaseSettings):
     # TDX Attestation settings
     ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
     TDX_VERIFIER_URL: str | None = Field(env="TDX_VERIFIER_URL", default=None)
+    # A verifier image embeds exactly one QEMU version's ACPI oracle, so it can
+    # verify exactly one host-QEMU version. TDX_VERIFIER_URL pins the default
+    # (QEMU 9.2.1) oracle; this optional second verifier carries the QEMU 10.x
+    # oracle. Quotes whose vm_config qemu_version major >= 10 route here when it is
+    # configured; unset (default) keeps the single-verifier behavior unchanged.
+    TDX_VERIFIER_QEMU10_URL: str | None = Field(env="TDX_VERIFIER_QEMU10_URL", default=None)
     ENABLE_ATTESTATION_WHITELIST: bool = Field(env="ENABLE_ATTESTATION_WHITELIST", default=False)
 
     # G4 — TCB/advisory enforcement (CVM attestation gap remediation).
