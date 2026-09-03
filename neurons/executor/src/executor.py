@@ -12,6 +12,7 @@ from core.logger import get_logger
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
+from vast_api.wiring import attach_vast_api
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +39,9 @@ async def lifespan(app: FastAPI):
     # Start pulling this host's cache template image as soon as the executor
     # boots, and keep it fresh in the background, without blocking startup.
     prefetch_task = asyncio.create_task(run_cache_template_prefetch())
+    # Watch the nested dockerd for Vast contract start/end edges and report
+    # them to the backend (no-op until the machine is enrolled and configured).
+    events_task = asyncio.create_task(app.state.vast_events_poller.run_forever())
     try:
         yield
     finally:
@@ -48,6 +52,13 @@ async def lifespan(app: FastAPI):
             pass
         except Exception as e:
             logger.warning(f"cache template pre-pull task ended with error: {e}")
+        events_task.cancel()
+        try:
+            await events_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"vast contract events task ended with error: {e}")
 
 
 app = FastAPI(
@@ -61,6 +72,7 @@ app = FastAPI(
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_middleware(MinerMiddleware)
 app.include_router(apis_router)
+attach_vast_api(app)
 
 reload = True if settings.ENV == "dev" else False
 

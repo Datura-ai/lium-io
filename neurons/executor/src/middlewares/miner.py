@@ -14,6 +14,24 @@ from core.logger import _m, get_logger
 logger = get_logger(__name__)
 
 AUTHENTICATED_REQUEST_TIMEOUT_SECONDS = 30
+# /vast/setup returns 202 immediately, but status/delete probe the nested dockerd
+# through blocking execs that can be slow; everything else keeps the tight cap
+VAST_REQUEST_TIMEOUT_SECONDS = 180
+
+
+def request_timeout_seconds(path: str) -> int:
+    # per-path timeout for authenticated requests
+    if path.startswith("/vast"):
+        return VAST_REQUEST_TIMEOUT_SECONDS
+    return AUTHENTICATED_REQUEST_TIMEOUT_SECONDS
+
+
+def trusted_hotkeys(path: str) -> list[str]:
+    # the Vast admin key opens /vast/* only — never the rest of the executor API
+    hotkeys = [settings.MINER_HOTKEY_SS58_ADDRESS, settings.DEFAULT_MINER_HOTKEY]
+    if path.startswith("/vast"):
+        hotkeys.append(settings.VAST_ADMIN_HOTKEY)
+    return hotkeys
 
 
 class MinerMiddleware(BaseHTTPMiddleware):
@@ -48,11 +66,8 @@ class MinerMiddleware(BaseHTTPMiddleware):
 
             logger.info(_m("miner ip", extra=default_extra))
 
-            # Try verifying with both the configured miner hotkey and the default portal hotkey
-            hotkeys_to_verify = [
-                settings.MINER_HOTKEY_SS58_ADDRESS,
-                settings.DEFAULT_MINER_HOTKEY,
-            ]
+            # Try verifying with every hotkey trusted for this path
+            hotkeys_to_verify = trusted_hotkeys(request.url.path)
 
             verified = False
             for hotkey in hotkeys_to_verify:
@@ -92,7 +107,7 @@ class MinerMiddleware(BaseHTTPMiddleware):
             try:
                 response = await asyncio.wait_for(
                     call_next(request),
-                    timeout=AUTHENTICATED_REQUEST_TIMEOUT_SECONDS,
+                    timeout=request_timeout_seconds(request.url.path),
                 )
             except TimeoutError:
                 logger.error(
