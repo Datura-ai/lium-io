@@ -802,6 +802,9 @@ class MinerService:
                         "incentive_formula_inputs": result.incentive_formula_inputs,
                         "log_status": result.log_status,
                         "log_text": result.full_log_text,
+                        "validation_event": (
+                            result.validation_event.model_dump(mode="json") if result.validation_event else None
+                        ),
                         # [] means this cycle reported no catalogued zero-incentive reason.
                         "incentive_reasons": [
                             reason.model_dump(mode="json") for reason in result.zero_incentive_reasons

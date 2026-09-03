@@ -8,12 +8,13 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from core.utils import _m, get_extra_info
-from payload_models.payloads import MinerJobRequestPayload
-from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from datura.requests.miner_requests import ExecutorSSHInfo
+from payload_models.payloads import MinerJobRequestPayload
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
 from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
+
+from core.utils import _m, get_extra_info
 
 from .models import JobResult
 from .pipeline import Context
@@ -63,6 +64,7 @@ class ResultHandler:
         verified_job_info: dict,
         log_text: str,
         success: bool,
+        validation_event: ValidationEvent | None = None,
     ) -> JobResult:
         """Handle task result by persisting verification data and building JobResult.
 
@@ -73,6 +75,7 @@ class ResultHandler:
             verified_job_info: Previous verification job info from Redis
             log_text: Log message for this result
             success: Whether validation succeeded
+            validation_event: Structured final validation outcome
 
         Returns:
             JobResult containing all validation outcomes
@@ -204,6 +207,7 @@ class ResultHandler:
             job_batch_id=miner_info.job_batch_id,
             log_status=log_status,
             log_text=str(log_text),
+            validation_event=validation_event,
             gpu_model=gpu_model,
             gpu_count=gpu_count,
             sysbox_runtime=context.state.sysbox_runtime,
