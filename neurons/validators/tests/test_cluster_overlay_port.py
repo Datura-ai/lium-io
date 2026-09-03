@@ -1,17 +1,11 @@
-"""DAH-2620 — a busy WireGuard port must say so, instead of surfacing docker's bind error.
-
-DAH-2842: the port checked is the one the backend allocated for this node, because that is the one
-the create binds on the host.
-"""
+"""DAH-2620 — a busy WireGuard port must say so, instead of surfacing docker's bind error."""
 
 from unittest.mock import AsyncMock
 
 import pytest
 
+from services.cluster_fabric import WIREGUARD_LISTEN_PORT
 from services.docker_service import DockerService
-
-# A port out of the executor's own verified range, which is what the backend allocates.
-_BACKEND_ALLOCATED_HOST_PORT = 10113
 
 
 def _ssh(stdout: str) -> AsyncMock:
@@ -26,7 +20,7 @@ async def test_a_free_port_passes_silently() -> None:
     ssh = _ssh("")
 
     # Act / Assert — no raise
-    await DockerService._assert_cluster_overlay_port_free(ssh, _BACKEND_ALLOCATED_HOST_PORT, {})
+    await DockerService._assert_cluster_overlay_port_free(ssh, {})
 
 
 @pytest.mark.asyncio
@@ -36,19 +30,19 @@ async def test_a_busy_port_names_the_holder() -> None:
 
     # Act / Assert
     with pytest.raises(RuntimeError) as failure:
-        await DockerService._assert_cluster_overlay_port_free(ssh, _BACKEND_ALLOCATED_HOST_PORT, {})
+        await DockerService._assert_cluster_overlay_port_free(ssh, {})
 
-    assert str(_BACKEND_ALLOCATED_HOST_PORT) in str(failure.value)
+    assert str(WIREGUARD_LISTEN_PORT) in str(failure.value)
     assert "pod_abc123" in str(failure.value)
 
 
 @pytest.mark.asyncio
-async def test_the_probe_asks_about_the_port_this_node_was_allocated() -> None:
+async def test_the_probe_asks_about_the_overlay_port() -> None:
     # Arrange
     ssh = _ssh("")
 
     # Act
-    await DockerService._assert_cluster_overlay_port_free(ssh, _BACKEND_ALLOCATED_HOST_PORT, {})
+    await DockerService._assert_cluster_overlay_port_free(ssh, {})
 
     # Assert — UDP only: the rental's own TCP mappings can hold the same number.
-    assert f"publish={_BACKEND_ALLOCATED_HOST_PORT}/udp" in ssh.run.call_args.args[0]
+    assert f"publish={WIREGUARD_LISTEN_PORT}/udp" in ssh.run.call_args.args[0]

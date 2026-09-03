@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from payload_models.payloads import ClusterMembership, ContainerCreateRequest, CustomOptions
-from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_environment
+from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.docker_service import DockerService
 from services.rental_docker_sdk import GpuDockerConfig
 
@@ -25,16 +25,22 @@ PersistentKeepalive = 25
 
 _SSH_PRIVATE_KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nZmFrZS1rZXk=\n-----END OPENSSH PRIVATE KEY-----\n"
 _SSH_AUTHORIZED_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIfake lium-cluster"
-# DAH-2842: a port out of this executor's verified range, which is what the backend now allocates.
-_BACKEND_ALLOCATED_HOST_PORT = 10113
 
 
 def test_the_config_reaches_the_pod_intact_through_the_environment() -> None:
-    environment = cluster_pod_environment(_RENDERED_CONF, _SSH_PRIVATE_KEY, _SSH_AUTHORIZED_KEY)
+    networking = cluster_pod_networking(_RENDERED_CONF, _SSH_PRIVATE_KEY, _SSH_AUTHORIZED_KEY)
 
     # Base64 because the config is multi-line and travels as an env var; the entrypoint decodes it.
-    decoded = base64.b64decode(environment["LIUM_WIREGUARD_CONF_B64"]).decode()
+    decoded = base64.b64decode(networking.environment["LIUM_WIREGUARD_CONF_B64"]).decode()
     assert decoded == _RENDERED_CONF
+
+
+def test_the_wireguard_port_is_published_over_udp() -> None:
+    networking = cluster_pod_networking(_RENDERED_CONF, _SSH_PRIVATE_KEY, _SSH_AUTHORIZED_KEY)
+
+    # WireGuard has no TCP mode, and the fleet publishes only TCP by default — without this the
+    # handshake never happens and the overlay never forms.
+    assert networking.published_udp_ports == (WIREGUARD_LISTEN_PORT,)
 
 
 # --- the run spec: an ordinary rental must not notice any of this ---
@@ -88,50 +94,29 @@ def test_an_ordinary_rental_gets_no_overlay_config_and_no_udp_port(docker_servic
 def test_a_cluster_node_gets_its_config_and_the_udp_port_alongside_the_usual_ones(
     docker_service,
 ) -> None:
-    payload = _payload(
-        ClusterMembership(
-            node_index=0, wireguard_conf=_RENDERED_CONF, overlay_host_port=_BACKEND_ALLOCATED_HOST_PORT
-        )
-    )
+    payload = _payload(ClusterMembership(node_index=0, wireguard_conf=_RENDERED_CONF))
 
     run_spec = _run_spec(docker_service, payload)
 
     decoded = base64.b64decode(run_spec.environment["LIUM_WIREGUARD_CONF_B64"]).decode()
     assert decoded == _RENDERED_CONF
     udp_ports = [port for port in run_spec.ports if port.protocol == "udp"]
-    # WireGuard has no TCP mode and the fleet publishes only TCP by default, so without this binding
-    # the handshake never happens. DAH-2842: the host side is the allocated port, the container side
-    # is where WireGuard listens.
-    assert [(port.container_port, port.host_port) for port in udp_ports] == [
-        (WIREGUARD_LISTEN_PORT, _BACKEND_ALLOCATED_HOST_PORT)
-    ]
-    # The rental's own published ports are still there — the overlay is added, not substituted.
-    assert any(port.protocol == "tcp" and port.container_port == 2000 for port in run_spec.ports)
-
-
-def test_an_older_backend_still_gets_the_port_the_fleet_published_before(docker_service) -> None:
-    # DAH-2842: no overlay port on the wire means a backend that predates this, and the node must
-    # come up exactly as it did then rather than with no overlay at all.
-    payload = _payload(ClusterMembership(node_index=0, wireguard_conf=_RENDERED_CONF))
-
-    run_spec = _run_spec(docker_service, payload)
-
-    udp_ports = [port for port in run_spec.ports if port.protocol == "udp"]
     assert [(port.container_port, port.host_port) for port in udp_ports] == [
         (WIREGUARD_LISTEN_PORT, WIREGUARD_LISTEN_PORT)
     ]
-
+    # The rental's own published ports are still there — the overlay is added, not substituted.
+    assert any(port.protocol == "tcp" and port.container_port == 2000 for port in run_spec.ports)
 
 # --- DAH-2664: the group's shared SSH login ---
 
 
 def test_the_shared_ssh_login_reaches_the_pod_intact() -> None:
-    environment = cluster_pod_environment(_RENDERED_CONF, _SSH_PRIVATE_KEY, _SSH_AUTHORIZED_KEY)
+    networking = cluster_pod_networking(_RENDERED_CONF, _SSH_PRIVATE_KEY, _SSH_AUTHORIZED_KEY)
 
     # The private key is multi-line, so it travels base64'd like the config; the public line is not.
-    decoded = base64.b64decode(environment["LIUM_CLUSTER_SSH_KEY_B64"]).decode()
+    decoded = base64.b64decode(networking.environment["LIUM_CLUSTER_SSH_KEY_B64"]).decode()
     assert decoded == _SSH_PRIVATE_KEY
-    assert environment["LIUM_CLUSTER_SSH_PUBKEY"] == _SSH_AUTHORIZED_KEY
+    assert networking.environment["LIUM_CLUSTER_SSH_PUBKEY"] == _SSH_AUTHORIZED_KEY
 
 
 def test_a_backend_that_sends_no_ssh_login_injects_nothing(docker_service) -> None:

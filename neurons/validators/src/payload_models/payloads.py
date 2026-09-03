@@ -290,11 +290,6 @@ class ClusterMembership(BaseModel):
     # which is how mpirun, pdsh and every nccl-tests recipe launch. Empty from an older backend.
     ssh_private_key: str = Field(default="", repr=False)
     ssh_authorized_key: str = ""
-    # DAH-2842: published to the pod's WireGuard port. The backend takes it from the executor's
-    # verified ports, because a provider forwards only those; on a NAT-mapped executor it is the
-    # internal side of that mapping, and the peers dial the external one. 51820 from an older
-    # backend, which is the port the fleet published before.
-    overlay_host_port: int = 51820
 
 
 class ContainerCreateRequest(ContainerBaseRequest):

@@ -15,22 +15,27 @@ open the port WireGuard needs.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 
-# WireGuard listens here inside every pod. UDP is not a choice: WireGuard has no TCP mode.
-#
-# DAH-2842: the container side only. On the host the node publishes the port the backend allocated
-# for it from the executor's verified ports, because a provider forwards only the verified range,
-# and several executors can sit behind one public address with a range each — publishing this port
-# on the host too, as the fleet did before, gave such a node an endpoint nothing forwards.
+# WireGuard listens here inside every pod, published 1:1 to the host so a peer reaches it at the
+# host's public address on this same port. UDP is not a choice: WireGuard has no TCP mode.
 WIREGUARD_LISTEN_PORT = 51820
 
 
-def cluster_pod_environment(
+@dataclass(frozen=True, slots=True)
+class ClusterPodNetworking:
+    """What a cluster node needs on top of an ordinary pod."""
+
+    environment: dict[str, str]
+    published_udp_ports: tuple[int, ...]
+
+
+def cluster_pod_networking(
     wireguard_conf: str,
     ssh_private_key: str,
     ssh_authorized_key: str,
-) -> dict[str, str]:
-    """The config in env for the template's entrypoint.
+) -> ClusterPodNetworking:
+    """The config in env for the template's entrypoint, and the UDP port to publish.
 
     Base64 because the config and the private key are multi-line and travel as environment
     variables. DAH-2664: the SSH pair is the group's shared login, so `mpirun` and pdsh can start
@@ -42,4 +47,7 @@ def cluster_pod_environment(
     if ssh_private_key and ssh_authorized_key:
         environment["LIUM_CLUSTER_SSH_KEY_B64"] = base64.b64encode(ssh_private_key.encode()).decode()
         environment["LIUM_CLUSTER_SSH_PUBKEY"] = ssh_authorized_key
-    return environment
+    return ClusterPodNetworking(
+        environment=environment,
+        published_udp_ports=(WIREGUARD_LISTEN_PORT,),
+    )
