@@ -1,0 +1,21 @@
+name: Temp staging
+
+# `/temp-stg [<N>h|destroy]` on a PR: a temporary copy of staging (validator + central miner
+# from this branch, portal and stats from lium-platform), 4 hours by default. The work happens
+# in Datura-ai/lium-infra; see its TEMP_STG.md.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  request:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/temp-stg')
+    uses: Datura-ai/lium-infra/.github/workflows/temp-stg-request.yml@main
+    secrets:
+      github-token: ${{ secrets.TEMP_STG_GITHUB_TOKEN }}
