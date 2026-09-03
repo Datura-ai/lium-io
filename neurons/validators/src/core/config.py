@@ -178,10 +178,13 @@ class Settings(BaseSettings):
     # miner's score is left exactly as it was, so referral emission moves value from
     # burn to referrers and never dilutes mining. See `_apply_referral_pool`.
     #
-    # REFERRAL_EMISSION_SHARE is env-tunable and defaults to INERT (0.0): nothing is
-    # redirected until ops sets a non-zero share at launch (coordinated with the backend
-    # referral rail).
-    REFERRAL_EMISSION_SHARE: float = Field(env="REFERRAL_EMISSION_SHARE", default=0.0)
+    # DAH-2251 launch: the share is 1% of the cycle total, shipped as the DEFAULT rather
+    # than left inert for ops to set per host. Every validator has to apply the same pool
+    # or Yuma consensus reads the difference as deviation, so a per-operator env cannot
+    # launch this — the same reason NEW_BURNERS and the burn share ship with the code
+    # rather than as host config. Still env-tunable: an operator can override, and setting
+    # it back to 0.0 disables the pool without a release.
+    REFERRAL_EMISSION_SHARE: float = Field(env="REFERRAL_EMISSION_SHARE", default=0.01)
 
     # DAH-2251 — fail-closed feed of epoch-stable referral EMA weights, served by the
     # backend at `<COMPUTE_REST_API_URL>/v1/referral-weights`. Left unset it is DERIVED
