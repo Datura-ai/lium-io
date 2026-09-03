@@ -1,6 +1,8 @@
+import ast
 import json
 from dataclasses import dataclass
 from datetime import datetime, UTC
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,6 +24,26 @@ from tests.helpers import (
 
 RAW_SPECS = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
 UNREADABLE_TOKEN = "gAAAAABnot-ours"
+
+
+def test_machine_scrape_has_no_speedtest_helpers():
+    scrape_path = (
+        Path(__file__).parent.parent / "src" / "miner_jobs" / "machine_scrape.py"
+    )
+    tree = ast.parse(scrape_path.read_text())
+    function_names = {
+        node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    }
+
+    assert function_names.isdisjoint(
+        {
+            "get_network_speed",
+            "speedcheck_output",
+            "netmeasure_output",
+            "cloudflare_speed",
+            "benchmark_network_speed",
+        }
+    )
 
 
 # Mock SSH command result matching the real SSHCommandResult
@@ -253,9 +275,7 @@ async def test_machine_spec_scrape_check(
         assert updated_state.specs.get("cpu") == mock_specs["cpu"]
         assert updated_state.specs.get("gpu_processes") == mock_specs["gpu_processes"]
         assert updated_state.specs.get("sysbox_runtime") == mock_specs["sysbox_runtime"]
-        # EMA network fields are always added; both None since mock_specs has no network data
-        assert updated_state.specs.get("network", {}).get("ema_download_speed") is None
-        assert updated_state.specs.get("network", {}).get("ema_upload_speed") is None
+        assert "network" not in updated_state.specs
         assert updated_state.gpu_count == 2
         assert updated_state.gpu_model == "NVIDIA RTX 3090"
         assert updated_state.gpu_model_count == "NVIDIA RTX 3090:2"
@@ -372,7 +392,7 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
 async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_failure_was_slow(
     duration_ms, context_factory
 ):
-    # A scrape that dies deep in the run — past the network benchmark — is not an incompatible
+    # A scrape that dies deep in the run is not an incompatible
     # interpreter, and an upload plus a second full scrape would blow the per-executor budget.
     # Arrange
     runner = DummySSHCommandRunner(

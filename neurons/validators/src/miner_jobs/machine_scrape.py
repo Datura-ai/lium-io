@@ -643,117 +643,6 @@ def run_cmd(cmd):
     return proc.stdout
 
 
-def get_network_speed():
-    """Get upload and download speed of the machine."""
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd("speedtest-cli --json")
-        speedtest_data = json.loads(speedtest_cmd)
-        data["upload_speed"] = speedtest_data["upload"] / 1_000_000  # Convert to Mbps
-        data["download_speed"] = speedtest_data["download"] / 1_000_000  # Convert to Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-def speedcheck_output():
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd("/root/app/.venv/bin/speedcheck run --type ookla")
-        json_start = speedtest_cmd.find('{')
-        json_str = speedtest_cmd[json_start:]
-        speedtest_data = json.loads(json_str)
-        data["download_speed"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
-        data["upload_speed"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-def netmeasure_output():
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd(f"/root/app/.venv/bin/netmeasure speedtest_dotnet")
-        download_match = re.search(r'Download Rate: ([\d.]+) bit/s', speedtest_cmd)
-        upload_match = re.search(r'Upload Rate: ([\d.]+) bit/s', speedtest_cmd)
-
-        if download_match and upload_match:
-            download_speed = float(download_match.group(1))
-            upload_speed = float(upload_match.group(1))
-            
-            # Convert to Mbps
-            data["download_speed"] = download_speed / 1_000_000 # Convert to Mbps 
-            data["upload_speed"] = upload_speed / 1_000_000 # Convert to Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-def cloudflare_speed():
-    """Measure network speed using Cloudflare's speed endpoint via curl."""
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        # Download: 50 MB
-        out = run_cmd(
-            "curl -o /dev/null -s -w '%{speed_download}' "
-            "--max-time 15 "
-            "'https://speed.cloudflare.com/__down?bytes=50000000'"
-        )
-        data["download_speed"] = round(float(out) * 8 / 1_000_000, 2)  # bytes/s → Mbps
-
-        # Upload: 25 MB via stdin pipe (no temp file)
-        out = run_cmd(
-            "dd if=/dev/zero bs=1M count=25 2>/dev/null | "
-            "curl -o /dev/null -s -w '%{speed_upload}' "
-            "--max-time 15 -X POST --data-binary @- "
-            "'https://speed.cloudflare.com/__up'"
-        )
-        data["upload_speed"] = round(float(out) * 8 / 1_000_000, 2)  # bytes/s → Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-
-def benchmark_network_speed():
-    """Run network speed methods in fallback order, stopping once both metrics are satisfied.
-
-    Methods are tried in order: speedtest_cli → cloudflare → netmeasure → speedcheck.
-    Each method is only called if at least one metric (download or upload) is still missing.
-    All executed per-method raw results are stored under 'measurements' for logging.
-    """
-    order = [
-        ("speedtest_cli", get_network_speed),
-        ("cloudflare", cloudflare_speed),
-        ("netmeasure", netmeasure_output),
-        ("speedcheck", speedcheck_output),
-    ]
-
-    measurements = {}
-    download: float | None = None
-    upload: float | None = None
-    download_source: str | None = None
-    upload_source: str | None = None
-
-    for name, method in order:
-        if download is not None and upload is not None:
-            break
-
-        result = method()
-        measurements[name] = result
-
-        if download is None and result.get("download_speed"):
-            download = result["download_speed"]
-            download_source = name
-
-        if upload is None and result.get("upload_speed"):
-            upload = result["upload_speed"]
-            upload_source = name
-
-    return {
-        "download_speed": download,
-        "upload_speed": upload,
-        "download_source": download_source,
-        "upload_source": upload_source,
-        "measurements": measurements,
-    }
-
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 # /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
 # let a scrape round hang on it.
@@ -1529,7 +1418,7 @@ def get_machine_specs():
         data["kernel_scrape_error"] = repr(exc)
 
     
-    data["data_network"] = benchmark_network_speed()
+    data["data_network"] = {}
 
     data["data_md5_checksums"] = {
         "md5_checksums_nvidia_smi": f"{get_md5_checksum_from_file_content(nvidia_smi_content)}:{get_sha256_checksum_from_file_content(nvidia_smi_content)}",
