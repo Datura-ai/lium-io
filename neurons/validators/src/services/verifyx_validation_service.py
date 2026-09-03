@@ -229,6 +229,10 @@ class VerifyXValidationService:
             try:
                 payload = verifyx_validator.verify_response(challenge_response)
                 verification_result = _perform_verification_checks(payload)
+                _log_verifyx_network_speeds(
+                    verification_result.get("network") or {},
+                    default_extra,
+                )
                 return VerifyXResponse(data=verification_result)
             except Exception as e:
                 return self._failure_response(
@@ -473,6 +477,41 @@ def _verify_xet_test(challenge_data: dict, response_data: dict) -> Tuple[dict, L
         "hash": xet_execution.get("hash", ""),
         "error": xet_execution.get("error"),
     }, errors
+
+
+def _format_mbps(value: object) -> str:
+    if isinstance(value, (int, float)):
+        return f"{float(value):.2f}"
+    return "none"
+
+
+def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
+    package_download_mbps = network.get("package_download_speed")
+    cloudflare_download_mbps = network.get("download_speed")
+    cloudflare_upload_mbps = network.get("upload_speed")
+    exec_id = default_extra.get("executor_uuid") or "none"
+    message = (
+        "VerifyX network speeds "
+        f"package_download_mbps={_format_mbps(package_download_mbps)} "
+        f"cloudflare_download_mbps={_format_mbps(cloudflare_download_mbps)} "
+        f"cloudflare_upload_mbps={_format_mbps(cloudflare_upload_mbps)} "
+        f"success={network.get('success')} "
+        f"exec={exec_id}"
+    )
+    logger.info(
+        _m(
+            message,
+            extra=get_extra_info(
+                {
+                    **default_extra,
+                    "package_download_mbps": package_download_mbps,
+                    "cloudflare_download_mbps": cloudflare_download_mbps,
+                    "cloudflare_upload_mbps": cloudflare_upload_mbps,
+                    "network_success": network.get("success"),
+                }
+            ),
+        )
+    )
 
 
 def _perform_verification_checks(payload: dict) -> Dict[str, Any]:

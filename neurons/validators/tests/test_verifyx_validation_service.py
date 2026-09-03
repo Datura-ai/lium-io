@@ -19,6 +19,8 @@ from neurons.validators.src.services.verifyx_validation_service import (
     MIN_CIPHER_LEN,
     VerifyXFailureClass,
     VerifyXValidationService,
+    _format_mbps,
+    _log_verifyx_network_speeds,
     _perform_verification_checks,
     _verify_network_test,
 )
@@ -121,6 +123,32 @@ def test_network_failure_does_not_reject_when_flag_is_off():
     assert result["success"] is True
     assert result["network"]["success"] is False
     assert result["errors"] == ["network failed"]
+
+
+def test_format_mbps_and_network_speed_log_line(caplog):
+    assert _format_mbps(125.456) == "125.46"
+    assert _format_mbps(None) == "none"
+
+    with caplog.at_level(logging.INFO):
+        _log_verifyx_network_speeds(
+            {
+                "package_download_speed": 80.0,
+                "download_speed": 125.5,
+                "upload_speed": 20.25,
+                "success": True,
+            },
+            {"executor_uuid": "exec-abc"},
+        )
+
+    assert any(
+        "VerifyX network speeds "
+        "package_download_mbps=80.00 "
+        "cloudflare_download_mbps=125.50 "
+        "cloudflare_upload_mbps=20.25 "
+        "success=True "
+        "exec=exec-abc" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 @pytest.mark.asyncio
