@@ -35,13 +35,14 @@ MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 90
 # serialises) and stays clear of that ceiling on the widest honest hosts.
 MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS = 8
 
-# VRAM (MB) the work-proof leaves untouched when sizing the matmul. The probe process needs
-# its CUDA context, and a B200 in NVIDIA confidential-computing mode already holds ~1.8 GB at
-# idle (1766 MB used vs ~730 MB out of CC mode); with 2 GB d_A fit and d_B OOMed (DAH-2850).
-# A fixed constant on purpose: host-reported memory_used_mb is executor-controlled and must not
-# be allowed to shrink the challenge. Capped at a quarter of the card so small consumer cards
-# (3-8 GB in the registry) keep a real challenge instead of a sliver or a negative dim_k.
-MATMUL_VRAM_HEADROOM_MB = 4096
+# VRAM (MB) the work-proof leaves untouched: a quarter of the card, clamped between the two.
+# The reserve must clear what an idle card may legally hold (GPU_HELD_VRAM_MB_LIMIT, 2048 MB —
+# a B200 in confidential-computing mode sits just under it at 1766 MB) plus the probe's own CUDA
+# context, ~600 MB on Blackwell; under the old flat 2 GB, d_A fit and d_B OOMed (DAH-2850).
+# Constants, not host-reported memory_used_mb — an executor could use that to shrink its own
+# challenge. The floor keeps 3-6 GB consumer cards on the 2 GB they have always run with.
+MATMUL_VRAM_RESERVE_MAX_MB = 4096
+MATMUL_VRAM_RESERVE_MIN_MB = 2048
 
 
 class DMCompVerifyWrapper:
@@ -234,8 +235,10 @@ class ValidationService:
         return 0
 
     def get_max_matrix_dimensions(self, gpu_memory, dim_n):
-        gpu_memory = gpu_memory - min(MATMUL_VRAM_HEADROOM_MB, gpu_memory // 4)
-        max_memory = gpu_memory * (1024.0 ** 2)
+        reserved_mb = min(
+            MATMUL_VRAM_RESERVE_MAX_MB, max(MATMUL_VRAM_RESERVE_MIN_MB, gpu_memory // 4)
+        )
+        max_memory = (gpu_memory - reserved_mb) * (1024.0 ** 2)
 
         element_size = 8  # 8 bytes for double precision
 
