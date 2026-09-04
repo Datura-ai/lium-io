@@ -63,6 +63,7 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService, inflight_creates
+from services.executor_image_policy import ExpectedImageSnapshot
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
@@ -222,6 +223,7 @@ class MinerService:
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
+        executor_image_snapshot: ExpectedImageSnapshot | None = None,
     ):
         """Request job to miner - uses REST API if configured, otherwise WebSocket."""
         if settings.USE_REST_API:
@@ -235,7 +237,11 @@ class MinerService:
                 ),
             )
             return await self._request_job_to_miner(
-                payload, encrypted_files, rented_data, default_docker_image_digests
+                payload,
+                encrypted_files,
+                rented_data,
+                default_docker_image_digests,
+                executor_image_snapshot,
             )
         else:
             logger.info(
@@ -363,6 +369,7 @@ class MinerService:
                                     encrypted_files=encrypted_files,
                                     rented_data=rented_data,
                                     default_docker_image_digests=default_docker_image_digests,
+                                    executor_image_snapshot=executor_image_snapshot,
                                     attestation_nonce=attestation_nonce,
                                 ),
                                 timeout=settings.JOB_TIME_OUT - 120
@@ -733,6 +740,15 @@ class MinerService:
             "results": [job_result],
         }
 
+    async def request_validation_cycle_now(self) -> None:
+        """Ask the validator loop to start its cycle now, not at the next block window.
+
+        The loop runs in another process, so the request crosses over Redis. Staging only --
+        the caller gates on the environment.
+        """
+        await self.redis_service.request_forced_validation_cycle()
+        logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
+
     async def publish_machine_specs(
         self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str
     ):
@@ -758,6 +774,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
             ),
         )
+        batch_total = len(results)
         for result in results:
             try:
                 await self.redis_service.publish(
@@ -795,6 +812,9 @@ class MinerService:
                         "tee_type": result.tee_type,
                         "tdx_attestation_passed": result.tdx_attestation_passed,
                         "gpu_attestation_passed": result.gpu_attestation_passed,
+                        "executor_image": result.executor_image_report,
+                        "sent_at": time.time(),
+                        "batch_total": batch_total,
                     },
                 )
             except Exception as e:
@@ -1857,6 +1877,7 @@ class MinerService:
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
+        executor_image_snapshot: ExpectedImageSnapshot | None = None,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: see the WebSocket path — the RoCE probe measures the cycle's remaining time
@@ -1947,6 +1968,7 @@ class MinerService:
                                 encrypted_files=encrypted_files,
                                 rented_data=rented_data,
                                 default_docker_image_digests=default_docker_image_digests,
+                                executor_image_snapshot=executor_image_snapshot,
                                 attestation_nonce=attestation_nonce,
                             ),
                             timeout=settings.JOB_TIME_OUT - 120

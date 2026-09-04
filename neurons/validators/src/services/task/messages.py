@@ -98,6 +98,13 @@ class UploadFilesMessages:
         category="prep",
         impact="Proceed to validation",
     )
+    UPLOAD_SKIPPED = MessageTemplate(
+        event="Validation files not uploaded",
+        reason="UPLOAD_SKIPPED",
+        severity="info",
+        category="prep",
+        impact="Proceed to validation",
+    )
     UPLOAD_FAILED = MessageTemplate(
         event="Failed to upload validation files",
         reason="UPLOAD_FAILED",
@@ -401,6 +408,30 @@ class BannedProviderMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+
+
+class ExecutorImageMessages:
+    CURRENT = MessageTemplate(
+        event="Executor image is current",
+        reason="EXECUTOR_IMAGE_CURRENT",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Executor image check skipped",
+        reason="EXECUTOR_IMAGE_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="No image penalty this cycle",
+    )
+    OUTDATED = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="error",
+        category="policy",
+        impact="Score set to 0 until the image is current",
     )
 
 
@@ -1169,6 +1200,49 @@ class CpuTruthMessages:
         reason="CPU_TRUTH_DISABLED",
         severity="info",
         category="env",
+        impact="Proceed",
+    )
+
+
+class ProviderSideLoadMessages:
+    """DAH-2734 — the CPU/disk twin of the foreign-GPU gate: a provider who runs another
+    subnet's miner on a listed machine sells capacity he already uses himself. Shadow
+    (PROVIDER_SIDE_LOAD_CHECK_ENABLED without enforcement) renders LOAD_ABOVE_LIMIT as a
+    warning and keeps passed=True; only PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED zeroes the
+    score, and only for the CPU half — a disk figure above the limit is reported, never
+    scored, because it is read once and carries every docker category nobody enumerated."""
+
+    LOAD_OK = MessageTemplate(
+        event="Provider-side load within limits",
+        reason="PROVIDER_SIDE_LOAD_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    LOAD_ABOVE_LIMIT = MessageTemplate(
+        event="Provider-side workload consumes the machine's CPU or disk",
+        reason="PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
+        severity="error",
+        category="policy",
+        impact="Score set to 0",
+        remediation=(
+            "A workload outside Lium containers holds this machine's CPU or disk "
+            "(another subnet's miner, or host-side jobs). Stop it, then re-run your node. "
+            "Capacity you sell on Lium must be free for the renter."
+        ),
+    )
+    NOT_MEASURABLE = MessageTemplate(
+        event="Provider-side load not measurable this cycle",
+        reason="PROVIDER_SIDE_LOAD_UNKNOWN",
+        severity="info",
+        category="policy",
+        impact="Proceed without penalty",
+    )
+    SKIPPED = MessageTemplate(
+        event="Provider-side load check disabled",
+        reason="PROVIDER_SIDE_LOAD_DISABLED",
+        severity="info",
+        category="policy",
         impact="Proceed",
     )
 

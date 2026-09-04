@@ -6,6 +6,7 @@ from .collateral import CollateralCheck
 from .cpu_truth import CpuTruthCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
 from .duplicate_executor import DuplicateExecutorCheck
+from .executor_image import ExecutorImageCheck
 from .finalize import FinalizeCheck
 from .gpu_count import GpuCountCheck
 from .gpu_fingerprint import GpuFingerprintCheck
@@ -17,6 +18,7 @@ from .inspector import InspectorRentedCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
+from .provider_side_load import ProviderSideLoadCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_machine import TenantEnforcementCheck
@@ -38,6 +40,7 @@ __all__ = [
     "CpuTruthCheck",
     "CustomBuildOrphanSweepCheck",
     "DuplicateExecutorCheck",
+    "ExecutorImageCheck",
     "FinalizeCheck",
     "GpuCountCheck",
     "GpuFingerprintCheck",
@@ -50,6 +53,7 @@ __all__ = [
     "NvmlDigestCheck",
     "PortConnectivityCheck",
     "PortCountCheck",
+    "ProviderSideLoadCheck",
     "RentalVerificationCheck",
     "TdxHostCheck",
     "TenantEnforcementCheck",

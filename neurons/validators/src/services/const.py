@@ -241,6 +241,10 @@ FILLER_CONTAINER_PREFIX = "filler_"
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.
 DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
+# DAH-2805: only the download-temporary sweep looks at the ENGY cache — reclaiming a whole ENGY
+# volume is a separate decision nobody has made, so the DPHN-only paths keep using their own prefix.
+ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
+FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
 # DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
 # downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
 # of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom
@@ -250,6 +254,11 @@ DPHN_CACHE_SIZE_GB = 40
 DPHN_CACHE_LISTING_FLOOR_GB = 100
 DPHN_CACHE_FREE_MARGIN_GB = 50
 FILLER_CONTAINER_GRACE_MINUTES = 15
+# DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
+# container lives until the sweep above collects it, so the bound follows that grace with one cycle
+# of margin. It must stay SHORT: the pod row itself survives 24 h, and an exemption that long would
+# let a provider reuse the name of their own broken pod for a foreign workload.
+BROKEN_POD_CONTAINER_GRACE_MINUTES = 2 * FILLER_CONTAINER_GRACE_MINUTES
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.
 FILLER_LIVENESS_GRACE_MINUTES = 10
@@ -270,6 +279,36 @@ DEFAULT_JOB_OWNER_LIUM = "lium"
 #   container_*    — validator DinD/port-check probes (hotkey-scoped)
 #   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
 RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
+
+# DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
+# without importing the probe service: that module reaches services.task.models, which pulls
+# services/task/__init__ and the checks back in.
+PROBE_CONTAINER_NAME = "lium_roce_probe"
+
+# DAH-2805: the throwaway helper that sweeps abandoned download temporaries out of the filler cache
+# volumes. Named — and named with a Lium prefix — so the provider-side load gate excuses the seconds
+# of CPU it holds instead of counting our own housekeeping against the miner.
+CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
+
+# Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
+# them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
+# provider-side load gate (DAH-2734) must not bill their CPU to the provider, so it excuses
+# them BY NAME. A name is forgeable, which is why this tier only ever excuses load and never
+# grants the rental status `pod_*` and `filler_*` get from the backend.
+# Add a new Lium infra container here and the gate inherits it.
+# `executor-` is the compose project the executor stack runs under: the runner, watchtower,
+# autoheal and postgres beside the executor itself. They are Lium's, they idle, and the gate
+# caps this whole tier, so the name buys a forger nothing.
+LIUM_INFRA_CONTAINER_PREFIXES = (
+    "container_",
+    "health_check_",
+    "executor-",
+    # the s3 backup helper (miner_jobs/backup_storage.py) copies a renter's volume, which costs
+    # real CPU while it runs
+    "s3fs-backup",
+    PROBE_CONTAINER_NAME,
+    CACHE_SWEEP_CONTAINER_NAME,
+)
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
 TDX_WHITELIST = {

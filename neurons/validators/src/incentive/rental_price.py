@@ -731,6 +731,7 @@ class RentalPriceIncentive(DefaultIncentive):
         reassignment happens later in `_reassign_split_candidates`, once every
         bucket's fill is known.
         """
+        self._record_outdated_image_reason(result)
         if not result.is_successful:
             return
 
@@ -1009,6 +1010,11 @@ class RentalPriceIncentive(DefaultIncentive):
         Returns:
             Calculated score (0 for unrented eligible GPUs, normal score otherwise)
         """
+        if self._record_outdated_image_reason(job_result):
+            job_result.mining_score = 0
+            job_result.eligible_for_rental_share = False
+            return job_result
+
         # Hard exclusions: reasons a validated executor earns 0 from BOTH pools.
         # One evaluator so the internal log, the customer-facing incentive log, and the
         # scoring decision all read from the same source and cannot drift (DAH-2327).

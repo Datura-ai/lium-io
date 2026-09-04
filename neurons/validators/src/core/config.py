@@ -197,6 +197,9 @@ class Settings(BaseSettings):
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
     ENABLE_INSPECTOR: bool = True
+    # DAH-2794: feed the obfuscated scrape to the executor's own interpreter over stdin
+    # instead of freezing it into a ~13 MB onefile and uploading that every cycle.
+    ENABLE_SCRAPE_SOURCE_DELIVERY: bool = Field(env="ENABLE_SCRAPE_SOURCE_DELIVERY", default=False)
     INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK: bool = Field(
         env="INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK",
         default=True,
@@ -254,6 +257,15 @@ class Settings(BaseSettings):
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
     # defaults off like every other money-withholding gate above: a replay over the live fleet
     # flags 5 nodes, and that population deserves a shadow week before the first payout is cut.
+    # DAH-2734 — the CPU/disk twin of the gate below: a provider who mines another subnet
+    # (SN13/Data Universe) on a listed machine takes CPU and disk from the renter the same way
+    # a foreign GPU workload takes the card. CHECK observes and logs; ENFORCEMENT zeroes the
+    # score. Enforcement defaults off: a provider's own nginx also burns CPU, so the floors
+    # need a shadow week over the live fleet before the first payout is cut.
+    PROVIDER_SIDE_LOAD_CHECK_ENABLED: bool = Field(env="PROVIDER_SIDE_LOAD_CHECK_ENABLED", default=True)
+    PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
+        env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
+    )
     FOREIGN_GPU_WORKLOAD_CHECK_ENABLED: bool = Field(env="FOREIGN_GPU_WORKLOAD_CHECK_ENABLED", default=True)
     FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
@@ -262,6 +274,10 @@ class Settings(BaseSettings):
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
     DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
+    EXECUTOR_IMAGE_REF: str = Field(
+        env="EXECUTOR_IMAGE_REF",
+        default="daturaai/compute-subnet-executor:latest",
+    )
 
     # DAH-2272: when on, raise the asyncssh logger to DEBUG (debug level 2) so the
     # SSH handshake (banner / key exchange / auth) is logged per connection, and
@@ -362,6 +378,10 @@ class Settings(BaseSettings):
     TDX_REATTEST_INTERVAL_SECONDS: int = Field(env="TDX_REATTEST_INTERVAL_SECONDS", default=3600)
     # Issued nonce validity window; a quote echoing an older nonce is stale.
     ATTESTATION_NONCE_TTL_SECONDS: int = Field(env="ATTESTATION_NONCE_TTL_SECONDS", default=600)
+
+    # DAH-2828: customer pods on CVM nodes get /var/run/dstack.sock through the quote-only broker
+    # (services/cvm_quote_broker.py). Kill switch only; off = pods get no quote path.
+    ENABLE_CVM_POD_QUOTE_SOCKET: bool = Field(env="ENABLE_CVM_POD_QUOTE_SOCKET", default=True)
 
     # G1 — NVIDIA GPU confidential-compute attestation (validator-side verification).
     # Off = observe-only: nvidia_payload, when present, is verified and logged but

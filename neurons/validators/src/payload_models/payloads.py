@@ -1,5 +1,6 @@
 import enum
 from datetime import datetime
+from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
@@ -156,6 +157,9 @@ class MinerJobEnryptedFiles(BaseModel):
     all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
+    # DAH-2794: the same obfuscated source the binary was frozen from, so a pipeline that can
+    # deliver it over stdin needs no upload and one that cannot still has the binary.
+    machine_scrape_source: str
     # score_file_name: str
 
 
@@ -193,6 +197,16 @@ class ContainerRequestType(enum.Enum):
     RestoreContainerRequest = "RestoreContainerRequest"
     CancelStorageOperationRequest = "CancelStorageOperationRequest"
     InstallJupyterServer = "InstallJupyterServer"
+
+
+class ForcedValidationCycleRequest(BaseModel):
+    """Ask the validator to start its validation cycle now, not at the next block window.
+
+    A staging development tool: it removes the wait for the next cycle. It carries no executor
+    -- the cycle validates the whole fleet, exactly as the scheduled one does.
+    """
+
+    message_type: Literal["ForcedValidationCycleRequest"]
 
 
 class WorkloadKind(enum.Enum):
@@ -483,7 +497,15 @@ class ContainerResponseType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
 
 
-class BaseValidatorResponse(BaseRequest):
+class DeliveryStamps(BaseModel):
+    # DAH-2792: epoch seconds; sent_at by the producer, forwarded_at/queue_depth by the connector
+    # before ws.send(). Mixed into every model the connector queues, since its send loop stamps them all.
+    sent_at: float | None = None
+    forwarded_at: float | None = None
+    queue_depth: int | None = None
+
+
+class BaseValidatorResponse(BaseRequest, DeliveryStamps):
     message_type: ContainerResponseType
     miner_hotkey: str
     executor_id: str

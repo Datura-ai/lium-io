@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -52,6 +53,53 @@ def dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
         ):
             return [key.value for key in node.value.keys]
     raise AssertionError(f"{dict_name} dict literal not found")
+
+
+# Every Fernet token is base64url of a 0x80 version byte, so all of them start with "gAAAAA" —
+# and MachineSpecScrapeCheck only tries to decrypt the stdout lines shaped like that.
+FERNET_TOKEN = "gAAAAABscrape-payload"
+
+
+@dataclass(frozen=True)
+class SFTPPutCall:
+    local_path: str
+    remote_path: str
+    recurse: bool
+
+
+class DummySFTPClient:
+    """Mock SFTP client that simulates file upload."""
+
+    def __init__(self, *, should_raise: bool = False, error_message: str = ""):
+        self.should_raise = should_raise
+        self.error_message = error_message
+        self.put_called_with: SFTPPutCall | None = None
+        self.put_call_count = 0
+
+    async def put(self, local_path: str, remote_path: str, recurse: bool = False) -> None:
+        self.put_call_count += 1
+        self.put_called_with = SFTPPutCall(local_path, remote_path, recurse)
+        if self.should_raise:
+            raise RuntimeError(self.error_message)
+
+
+class DummySSHClient:
+    """Mock SSH client that provides SFTP access."""
+
+    def __init__(self, *, sftp_should_raise: bool = False, sftp_error: str = ""):
+        self.sftp_client = DummySFTPClient(
+            should_raise=sftp_should_raise,
+            error_message=sftp_error,
+        )
+
+    def start_sftp_client(self):
+        return self
+
+    async def __aenter__(self):
+        return self.sftp_client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
 
 
 class DummyScoreCalc:

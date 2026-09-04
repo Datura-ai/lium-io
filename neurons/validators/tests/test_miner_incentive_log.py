@@ -36,6 +36,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
         "filler_container_entered",
+        "outdated_executor_image",
     }
 
 

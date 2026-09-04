@@ -1,15 +1,18 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from core.config import settings
 from protocol.vc_protocol.compute_requests import (
+    BROKEN_POD_STATUS,
     LIVE_FILLER_RUN_STATUSES,
     FillerRunActiveResponse,
     PodRentalActiveResponse,
 )
 from services.const import (
+    BROKEN_POD_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
@@ -98,7 +101,7 @@ class GpuUsageCheck:
             return None
 
         enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
-        workload_containers: set[str] = _lium_workload_containers(ctx)
+        workload_containers: set[str] = lium_workload_containers(ctx)
         foreign_processes: list[ForeignGpuProcess] = [
             ForeignGpuProcess(
                 pid=process.get("pid"),
@@ -310,11 +313,14 @@ class GpuUsageCheck:
             return None
 
 
-def _lium_workload_containers(ctx: Context) -> set[str]:
+def lium_workload_containers(ctx: Context) -> set[str]:
     """This node's fillers and pods, as the BACKEND knows them — not as the node names them.
 
     A container-name prefix would hand a pass to anything the provider renames `filler_*`,
     and the ticket's whole requirement is a verdict `docker rename` cannot defeat.
+
+    Public because both gates that judge a foreign workload share it: this one for the card,
+    the provider-side load one for CPU. They must never disagree about whose container it is.
     """
     rented_data = ctx.state.rented_data
     containers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
@@ -340,10 +346,15 @@ def _parse_gpu_memory_used_mb(gpu_query_csv: str) -> dict[str, float]:
     return memory_by_uuid
 
 
+def carries_a_rental_prefix(container_name: str) -> bool:
+    """Named like a rental of ours. Says nothing about who really started it: `docker rename`
+    forges the name, which is why every caller confirms it against the backend."""
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+
+
 def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
     """The container is named like one of ours, but the backend did not report it this cycle."""
-    container_name: str = process.container_name or ""
-    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+    return carries_a_rental_prefix(process.container_name or "")
 
 
 async def _drop_containers_the_backend_still_owns(
@@ -373,7 +384,7 @@ async def _drop_containers_the_backend_still_owns(
         return foreign_processes
 
     ownership_verdicts: list[bool] = await asyncio.gather(
-        *(_the_backend_still_owns(ctx, name) for name in lium_named_containers)
+        *(the_backend_still_owns(ctx, name) for name in lium_named_containers)
     )
     still_ours: set[str] = {
         name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
@@ -381,8 +392,10 @@ async def _drop_containers_the_backend_still_owns(
     return [process for process in foreign_processes if process.container_name not in still_ours]
 
 
-async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
+async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     """True when the backend confirms the id inside the container name as a live run of ours.
+
+    Public because the provider-side load gate asks the same question about the same race.
 
     Mirrors the filler re-check in rental_verification. Fail-open on an unreachable backend
     (a None response): an inability to measure never withholds money here.
@@ -411,7 +424,29 @@ async def _the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     )
     if pod_rental is None:
         return True
-    return _the_answer_is_about_this_node(ctx, pod_rental.executor_id) and pod_rental.active
+    if not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
+        return False
+    return pod_rental.active or _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental)
+
+
+def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveResponse) -> bool:
+    """Whether a BROKEN pod's container is still the leftover our own reaper owes us.
+
+    The exemption is deliberately time-boxed. The pod ROW survives 24 hours, but the container it
+    left behind is gone within the stale-container grace, so an exemption that followed the row
+    would hand a provider a whole day in which the name of their own broken pod launders a foreign
+    workload.
+    """
+    if pod_rental.status != BROKEN_POD_STATUS or pod_rental.rental_closed_at is None:
+        return False
+    # The backend closes a rental with a naive UTC timestamp, but the field is a datetime parsed off
+    # the wire: an offset in the JSON would make it aware, and mixing the two raises inside a fatal
+    # check. Read a naive value as the UTC it is and compare in one frame.
+    closed_at: datetime = pod_rental.rental_closed_at
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    time_since_the_rental_closed: timedelta = datetime.now(timezone.utc) - closed_at
+    return time_since_the_rental_closed < timedelta(minutes=BROKEN_POD_CONTAINER_GRACE_MINUTES)
 
 
 def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:

@@ -10,10 +10,13 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from core.utils import configure_logs_of_other_modules, _m, get_extra_info, get_logger
 from core.validator import Validator
 from clients.subtensor_client import SubtensorClient
-from services.default_docker_image_digest_service import fetch_default_image_digests
+from services.default_docker_image_digest_service import (
+    fetch_default_image_digests,
+    fetch_executor_image_digest,
+)
+from services.executor_image_policy import build_expected_image_snapshot
 from services.ioc import ioc
 from services.miner_service import MinerService
-from services.docker_service import DockerService
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.file_encrypt_service import FileEncryptService
 from payload_models.payloads import (
@@ -138,6 +141,9 @@ async def _request_job_to_miner(miner_hotkey: str):
 
         encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
 
+        executor_digest = await fetch_executor_image_digest()
+        executor_image_snapshot = build_expected_image_snapshot(executor_digest)
+
         result = await miner_service.request_job_to_miner(
             MinerJobRequestPayload(
                 job_batch_id='job_batch_id',
@@ -149,6 +155,7 @@ async def _request_job_to_miner(miner_hotkey: str):
             encrypted_files=encrypted_files,
             rented_data=RentedExecutorsResponse(executors={}),
             default_docker_image_digests=await fetch_default_image_digests(),
+            executor_image_snapshot=executor_image_snapshot,
         )
         print('job_result:', result)
     finally:

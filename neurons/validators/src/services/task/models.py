@@ -66,6 +66,7 @@ class JobResult(BaseModel):
     tdx_attestation_passed: bool = False
     # G1 — NVIDIA CC GPU attestation outcome (None = not performed)
     gpu_attestation_passed: bool | None = None
+    executor_image_report: dict[str, Any] | None = None
 
     inspector_outcome: str = "SKIPPED"
 

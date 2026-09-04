@@ -19,6 +19,7 @@ from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
 from services.container_cleanup import ContainerCleanup
 from services.executor_connectivity_service import ExecutorConnectivityService
+from services.executor_image_policy import ExpectedImageSnapshot
 from services.inspector_validation_service import InspectorValidationService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
@@ -35,6 +36,7 @@ from .checks import (
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DuplicateExecutorCheck,
+    ExecutorImageCheck,
     FinalizeCheck,
     GpuCountCheck,
     GpuFingerprintCheck,
@@ -47,6 +49,7 @@ from .checks import (
     NvmlDigestCheck,
     PortConnectivityCheck,
     PortCountCheck,
+    ProviderSideLoadCheck,
     RentalVerificationCheck,
     ScoreCheck,
     SpecChangeCheck,
@@ -80,6 +83,10 @@ JOB_LENGTH = 300
 # call would lose the "last swept at" timestamps. The check itself is stateless
 # wrt input data and only reads ctx, so a shared instance is safe.
 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
+
+# DAH-2805: same reason — the download-temporary sweep inside this check carries its own per-executor
+# cadence, and a fresh instance every cycle would sweep every cycle.
+_STALE_CONTAINER_CLEANUP_SINGLETON = StaleContainerCleanupCheck()
 
 
 class PipelineFactory:
@@ -133,6 +140,7 @@ class PipelineFactory:
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
+        executor_image_snapshot: ExpectedImageSnapshot | None = None,
         tdx_attestation_passed: bool = False,
         gpu_attestation_passed: bool | None = None,
     ) -> Context:
@@ -209,9 +217,18 @@ class PipelineFactory:
                 compute_rest_app_url=settings.COMPUTE_REST_API_URL,
                 gpu_monitor_script_relative="src/gpus_utility.py",
                 machine_scrape_filename=encrypted_files.machine_scrape_file_name,
+                # DAH-2794: an executor that can run the source needs no upload at all. The
+                # binary stays built because the miner picks the executor image, and one that
+                # predates a dependency the scrape imports has to keep the self-contained path.
+                machine_scrape_source=(
+                    encrypted_files.machine_scrape_source
+                    if settings.ENABLE_SCRAPE_SOURCE_DELIVERY
+                    else None
+                ),
                 machine_scrape_timeout=JOB_LENGTH,
                 obfuscation_keys=encrypted_files.all_keys,
                 default_docker_image_digests=default_docker_image_digests,
+                executor_image_snapshot=executor_image_snapshot,
                 validator_keypair=keypair,
                 max_gpu_count=MAX_GPU_COUNT,
                 gpu_model_rates=GPU_MODEL_RATES,
@@ -274,7 +291,12 @@ class PipelineFactory:
                 # Cleaning it here frees those ports so PortConnectivityCheck can bind them this
                 # cycle; otherwise PortCountCheck (fatal) halts the pipeline before the cleanup
                 # that used to live in TenantEnforcementCheck ever runs -> executor stuck at 0.
-                StaleContainerCleanupCheck(),
+                _STALE_CONTAINER_CLEANUP_SINGLETON,
+                # DAH-2734: non-fatal gate on the load the PROVIDER puts on a listed machine.
+                # Specs arithmetic, plus one read-only SSH reading when the load is above the
+                # floor. AFTER the cleanup above: a pod Lium has just ended is our leftover to
+                # remove, not a workload to bill the provider for.
+                ProviderSideLoadCheck(),
                 # DAH-2211 Phase 3.4(ii): orphan sweep for `lium-build-*`
                 # image/scratch artifacts left behind by validator crashes or
                 # aborted releases. Internally throttled to once-per-6h per
@@ -288,6 +310,7 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
@@ -329,6 +352,8 @@ class PipelineFactory:
                 GpuVramPrecheck(),
                 # DAH-2671 item 2a: read-only SSH corroboration, safe in dry run (mutates nothing).
                 CpuTruthCheck(),
+                # DAH-2734: specs arithmetic plus a read-only SSH reading — safe in dry run.
+                ProviderSideLoadCheck(),
                 # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.
                 GpuPowerLimitCheck(restore_stale_caps=False),
@@ -346,6 +371,7 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
+                ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).
                 TenantEnforcementCheck(recover_stale_pods=False),

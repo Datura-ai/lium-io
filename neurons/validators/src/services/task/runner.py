@@ -36,6 +36,7 @@ class SSHCommandRunner:
         timeout: int = 60,
         check: bool = False,
         retryable: bool = True,
+        stdin_text: str | None = None,
     ) -> SSHCommandResult:
         """Run a command and capture stdout/stderr safely."""
         attempt = 0
@@ -47,7 +48,7 @@ class SSHCommandRunner:
             start = datetime.now(UTC)
             t0 = time.perf_counter()
             try:
-                result = await asyncio.wait_for(self.ssh.run(cmd), timeout=timeout)
+                result = await asyncio.wait_for(self.ssh.run(cmd, input=stdin_text), timeout=timeout)
                 dt = int((time.perf_counter() - t0) * 1000)
                 stdout = str(result.stdout) or ""
                 stderr = str(result.stderr) or ""

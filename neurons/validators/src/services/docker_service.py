@@ -60,6 +60,7 @@ from payload_models.payloads import (
 )
 from services.attestation_service import AttestationError, AttestationService
 from services.const import (
+    FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_SIZE_GB,
@@ -70,6 +71,7 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
+from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.gpu_power_limit import (
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
@@ -518,6 +520,16 @@ def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets
         occupied_targets.add(cache_volume.target)
         mounts.append(VolumeMount(source=cache_volume.name, target=cache_volume.target))
     return mounts
+
+
+def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> bool:
+    # customer rentals on a dstack CVM guest; a FILLER (DPHN/PEARL) has no attestation use and a
+    # bare-metal node has no guest agent to broker
+    return (
+        settings.ENABLE_CVM_POD_QUOTE_SOCKET
+        and in_cvm
+        and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+    )
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -989,6 +1001,7 @@ class DockerService:
         gpu_devices,
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
+        quote_socket: bool = False,
     ) -> ContainerRunSpec:
         environment = {
             key: str(value)
@@ -1018,6 +1031,10 @@ class DockerService:
             occupied_targets.add("/mnt")
         # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
         volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
+        # DAH-2828: the quote-only broker socket at the dstack SDK's default path, so a TEE
+        # workload on a CVM node can take its own TDX quote from inside the pod.
+        if quote_socket:
+            volumes.append(quote_socket_pod_mount())
 
         device_mounts = [DeviceMount(path_on_host="/dev/net/tun", path_in_container="/dev/net/tun")]
         if encrypted_local_volume:
@@ -1046,6 +1063,33 @@ class DockerService:
             entrypoint=custom_options.entrypoint,
         )
 
+    async def _ensure_pod_quote_socket(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        log_tag: str,
+    ) -> bool:
+        # best-effort: a guest whose broker cannot start still rents, the pod just gets no
+        # socket and says so in its own log — a Docker Hub hiccup must not block every CVM rental
+        try:
+            await ensure_quote_broker(docker_client, ssh_client, log_extra=default_extra)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "CVM quote broker unavailable; creating the pod without /var/run/dstack.sock",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+            )
+            await self.stream_log(
+                f"TDX quote socket unavailable in this pod (quote broker failed to start: {exc})",
+                "warning",
+                log_tag,
+            )
+            return False
+        return True
+
     @staticmethod
     async def _assert_cluster_overlay_port_free(
         ssh_client: asyncssh.SSHClientConnection, default_extra: dict
@@ -1057,8 +1101,10 @@ class DockerService:
         mappings. Checking first turns that into an answer that names the port and the holder
         (DAH-2620).
         """
+        # UDP only: a co-tenant's TCP mapping can hold the same number, and a protocol-agnostic
+        # filter would name that container as the holder and refuse a create nothing is blocking.
         result = await ssh_client.run(
-            f"docker ps --filter publish={WIREGUARD_LISTEN_PORT} --format '{{{{.Names}}}}'"
+            f"docker ps --filter publish={WIREGUARD_LISTEN_PORT}/udp --format '{{{{.Names}}}}'"
         )
         holders = [name.strip() for name in result.stdout.splitlines() if name.strip()]
         if not holders:
@@ -1952,7 +1998,12 @@ class DockerService:
         """
         if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
             return []
-        existing: set[str] = set(await self._find_cache_volumes_to_sweep(ssh_client, set(), default_extra))
+        requested_names: list[str] = [cache_volume.name for cache_volume in payload.cache_volumes]
+        existing: set[str] = set(
+            await self._find_cache_volumes_to_sweep(
+                ssh_client, set(), default_extra, self._cache_volume_families(requested_names)
+            )
+        )
         present: list[CacheVolume] = [volume for volume in payload.cache_volumes if volume.name in existing]
         if len(present) == len(payload.cache_volumes):
             return list(payload.cache_volumes)
@@ -1988,14 +2039,31 @@ class DockerService:
             return present
         return list(payload.cache_volumes)
 
+    @staticmethod
+    def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
+        """The cache prefixes these volume names belong to, e.g. `dphn_cache_` for a DPHN launch.
+
+        DAH-2805: a launch may only sweep its OWN family. A node that moves from DPHN to ENGY asks
+        for engy volumes, and sweeping every cache prefix there would delete the Dolphin cache the
+        node needs for its next fast start — the very thing these volumes exist for.
+        """
+        return tuple(
+            prefix
+            for prefix in FILLER_CACHE_VOLUME_PREFIXES
+            if any(name.startswith(prefix) for name in volume_names)
+        )
+
     async def _find_cache_volumes_to_sweep(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         keep_names: set[str],
         default_extra: dict,
+        name_prefixes: tuple[str, ...] = (DPHN_CACHE_VOLUME_PREFIX,),
     ) -> list[str]:
         # Cache volumes present on the host that this create no longer names, i.e. left by an older
         # model or runtime. Empty on any listing failure — sweeping is never worth failing a launch.
+        if not name_prefixes:
+            return []
         try:
             listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
         except asyncio.CancelledError:
@@ -2003,7 +2071,7 @@ class DockerService:
         except Exception as exc:
             logger.warning(
                 _m(
-                    "Failed to list DPHN cache volumes",
+                    "Failed to list filler cache volumes",
                     extra=get_extra_info({**default_extra, "error": str(exc)}),
                 ),
                 exc_info=True,
@@ -2014,7 +2082,7 @@ class DockerService:
         return sorted(
             name
             for name in (line.strip() for line in (listed.stdout or "").splitlines())
-            if name.startswith(DPHN_CACHE_VOLUME_PREFIX) and name not in keep_names
+            if name.startswith(name_prefixes) and name not in keep_names
         )
 
     async def sweep_stale_cache_volumes(
@@ -2051,12 +2119,14 @@ class DockerService:
             return
 
         keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
-        stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(ssh_client, keep_names, default_extra)
+        stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(
+            ssh_client, keep_names, default_extra, self._cache_volume_families(sorted(keep_names))
+        )
         if not stale_volumes:
             return
         logger.info(
             _m(
-                "Sweeping stale DPHN cache volumes",
+                "Sweeping stale filler cache volumes",
                 extra=get_extra_info({
                     **default_extra,
                     "stale_volumes": stale_volumes,
@@ -4186,14 +4256,10 @@ class DockerService:
                         pod_id=payload.pod_id,
                     )
                 )
-                # command = f"/usr/bin/docker logout"
-                # await self.execute_and_stream_logs(
-                #     ssh_client=ssh_client,
-                #     command=command,
-                #     log_tag=log_tag,
-                #     log_text=f"Logging out of Docker registry",
-                #     log_extra=default_extra,
-                # )
+                # No logout counterpart below: the SDK login is a POST /auth to the executor's
+                # Docker daemon and the credential stays in this validator's client, so nothing is
+                # written to the executor's ~/.docker/config.json for a `docker logout` to clear.
+                #
                 # The default cache-template images are public Docker Hub refs, so a
                 # registry login buys nothing for them — the pull needs no auth and is
                 # itself almost always skipped (the image is pre-cached on the executor).
@@ -4652,7 +4718,20 @@ class DockerService:
                 # CPU and memory restriction flags
                 # --cpus flag isn't working inside cvm. skip to use it when tdx_quote is present
                 # TODO: remove this when cvm is fixed
-                cpu_count = None if executor_info.tdx_quote else payload.cpu_count
+                in_cvm = bool(executor_info.tdx_quote)
+                cpu_count = None if in_cvm else payload.cpu_count
+
+                quote_socket = False
+                if _wants_quote_socket(payload, in_cvm=in_cvm):
+                    current_step = "cvm_quote_broker"
+                    quote_socket = await self._ensure_pod_quote_socket(
+                        docker_client=docker_client,
+                        ssh_client=ssh_client,
+                        default_extra=default_extra,
+                        log_tag=log_tag,
+                    )
+                    # the broker cold start (image pull, socket wait) must not read as port-check wait
+                    prev_timestamp = now_ms()
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -4665,6 +4744,7 @@ class DockerService:
                     gpu_devices=gpu_config,
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
+                    quote_socket=quote_socket,
                 )
 
                 logger.info(
@@ -6348,62 +6428,6 @@ class DockerService:
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
-
-    async def get_docker_hub_digests(self, repositories) -> dict[str, str]:
-        """Retrieve all tags and their corresponding digests from Docker Hub."""
-        all_digests = {}  # Initialize a dictionary to store all tag-digest pairs
-
-        async with aiohttp.ClientSession() as session:
-            for repo in repositories:
-                try:
-                    # Split repository and tag if specified
-                    if ":" in repo:
-                        repository, specified_tag = repo.split(":", 1)
-                    else:
-                        repository, specified_tag = repo, None
-
-                    # Get authorization token
-                    async with session.get(
-                        f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repository}:pull"
-                    ) as token_response:
-                        token_response.raise_for_status()
-                        token = await token_response.json()
-                        token = token.get("token")
-
-                    # Find all tags if no specific tag is specified
-                    if specified_tag is None:
-                        async with session.get(
-                            f"https://index.docker.io/v2/{repository}/tags/list",
-                            headers={"Authorization": f"Bearer {token}"},
-                        ) as tags_response:
-                            tags_response.raise_for_status()
-                            tags_data = await tags_response.json()
-                            all_tags = tags_data.get("tags", [])
-                    else:
-                        all_tags = [specified_tag]
-
-                    # Dictionary to store tag-digest pairs for the current repository
-                    tag_digests = {}
-                    for tag in all_tags:
-                        # Get image digest
-                        async with session.head(
-                            f"https://index.docker.io/v2/{repository}/manifests/{tag}",
-                            headers={
-                                "Authorization": f"Bearer {token}",
-                                "Accept": "application/vnd.docker.distribution.manifest.v2+json",
-                            },
-                        ) as manifest_response:
-                            manifest_response.raise_for_status()
-                            digest = manifest_response.headers.get("Docker-Content-Digest")
-                            tag_digests[f"{repository}:{tag}"] = digest
-
-                    # Update the all_digests dictionary with the current repository's tag-digest pairs
-                    all_digests.update(tag_digests)
-
-                except aiohttp.ClientError as e:
-                    print(f"Error retrieving data for {repo}: {e}")
-
-        return all_digests
 
     def _get_preferred_ports(self, initial_port_count: int | None) -> list[int]:
         """Calculate preferred ports based on initial_port_count.

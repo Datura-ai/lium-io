@@ -18,6 +18,8 @@ import logging
 
 import aiohttp
 
+from core.config import settings
+
 logger = logging.getLogger(__name__)
 
 _MANIFEST_ACCEPT = (
@@ -115,3 +117,10 @@ async def fetch_default_image_digests() -> dict[str, str]:
             len(digests),
         )
     return digests
+
+
+async def fetch_executor_image_digest() -> str | None:
+    ref = settings.EXECUTOR_IMAGE_REF
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        return await fetch_registry_digest(session, ref)

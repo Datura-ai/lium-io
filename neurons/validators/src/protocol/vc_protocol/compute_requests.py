@@ -191,6 +191,9 @@ class RentedExecutorsResponse(BaseModel):
 
 class PodRentalActiveResponse(BaseModel):
     active: bool
+    # DAH-2757: the pod's own state. `active` answers "is the rental live", which is a different
+    # question from "is this container ours" — see BROKEN_POD_STATUS below.
+    status: str | None = None
     # DAH-2757: the executor the pod belongs to. The answer is about the POD, not about where it
     # runs, so without this a provider can name a squatter container after a live pod of their
     # second node. Absent means a backend that predates the field — then the fleet snapshot is the
@@ -221,6 +224,11 @@ class FillerRunActiveResponse(BaseModel):
 # container that outlives its run is an orphan, not a workload we started. Mirrors FillerRunStatus
 # in the backend (models/filler_run.py) — a new transitional state there belongs here too.
 LIVE_FILLER_RUN_STATUSES = frozenset({"STARTING", "RUNNING", "STOPPING"})
+
+# DAH-2757: a pod the backend marked BROKEN has a closed rental, so it reports active=False, but its
+# container stays on the host until the stale-container reaper collects it. That leftover is ours to
+# tolerate, not a foreign workload to score against the provider.
+BROKEN_POD_STATUS = "BROKEN"
 
 
 class ExecutorUptimeResponse(BaseModel):

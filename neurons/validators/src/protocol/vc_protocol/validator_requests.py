@@ -9,6 +9,7 @@ import pydantic
 from datura.requests.base import BaseRequest
 
 from incentive.miner_incentive_log import IncentiveReason
+from payload_models.payloads import DeliveryStamps
 
 
 class RequestType(enum.Enum):
@@ -27,7 +28,7 @@ class RequestType(enum.Enum):
     EstimateResponse = "EstimateResponse"
 
 
-class BaseValidatorRequest(BaseRequest):
+class BaseValidatorRequest(BaseRequest, DeliveryStamps):
     message_type: RequestType
 
 
@@ -92,8 +93,12 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     attestation_digest: str | None = None
     tdx_attestation_passed: bool | None = None
     gpu_attestation_passed: bool | None = None
+    executor_image: dict[str, Any] | None = None
     # None = publisher did not report the field; [] = no catalogued reason was recorded.
     incentive_reasons: list[IncentiveReason] | None = None
+    # DAH-2792: specs the validator scored for this miner in this job_batch_id, counting the ones
+    # whose redis publish failed; the backend reads expected minus received as lost on the websocket.
+    batch_total: int | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

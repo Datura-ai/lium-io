@@ -205,6 +205,14 @@ class ResultHandler:
         if context.state.recommended_image_digest_match is not None:
             specs["recommended_image_digest_match"] = context.state.recommended_image_digest_match
 
+        executor_image_report = (
+            context.state.executor_image_report.as_dict()
+            if context.state.executor_image_report
+            else None
+        )
+        if executor_image_report is not None:
+            specs["executor_image"] = executor_image_report
+
         # NVIDIA driver version string reported by NVML (e.g. "580.95.05"). Used by the
         # minimum-driver requirement gate.
         nvidia_driver_version = str(specs.get("gpu", {}).get("driver") or "")
@@ -241,6 +249,7 @@ class ResultHandler:
             default_job_owner=default_job_owner,
             tdx_attestation_passed=context.tdx_attestation_passed,
             gpu_attestation_passed=context.gpu_attestation_passed,
+            executor_image_report=executor_image_report,
             inspector_outcome=inspector_outcome,
         )
 

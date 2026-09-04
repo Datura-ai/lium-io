@@ -16,6 +16,7 @@ from services.collateral_contract_service import CollateralContractService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
+from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
@@ -71,6 +72,7 @@ class ContextConfig:
     # DAH-2380: per-cycle snapshot of default cache-template image_ref -> bare digest,
     # fetched from Docker Hub at job-cycle start. Empty => digest check skips (fail-open).
     default_docker_image_digests: dict[str, str]
+    executor_image_snapshot: ExpectedImageSnapshot | None = None
     validator_keypair: Optional[Any] = None
     max_gpu_count: Optional[int] = None
     gpu_model_rates: Optional[dict[str, Any]] = None
@@ -84,6 +86,9 @@ class ContextConfig:
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
+    # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
+    # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
+    machine_scrape_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,7 @@ class ContextState:
     # serves STALE content under an unchanged tag); None = not compared this cycle
     # (not cached / no backend digest / unreadable RepoDigest — strict fail-open).
     recommended_image_digest_match: bool | None = None
+    executor_image_report: ExecutorImageReport | None = None
 
 
 class CheckResult(BaseModel):
@@ -164,6 +170,9 @@ class Context(BaseModel):
     # False only once CpuTruthCheck sees a mismatch under enforcement; the score gate lives in
     # calculate_scores because the check is non-fatal and ScoreCheck runs after it.
     cpu_truth_passed: bool = True
+    # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
+    # enforcement; the score gate lives in calculate_scores for the same reason as above.
+    provider_side_load_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None

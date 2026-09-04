@@ -35,7 +35,7 @@ from neurons.validators.src.services.task.checks import (
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
 
 from datura.requests.miner_requests import ExecutorSSHInfo
-from helpers import build_context_config, build_services, build_state
+from helpers import FERNET_TOKEN, build_context_config, build_services, build_state
 
 
 class MockContainerCleanup:
@@ -115,11 +115,11 @@ class DummyLogger:
 class DummySSHCommandRunner:
     """Mock SSH command runner for successful operations."""
 
-    def __init__(self, machine_specs_encrypted: str = "encrypted_payload"):
+    def __init__(self, machine_specs_encrypted: str = FERNET_TOKEN):
         self.machine_specs_encrypted = machine_specs_encrypted
         self.commands_called = []
 
-    async def run(self, command: str, timeout: int = 300, retryable: bool = False):
+    async def run(self, command: str, timeout: int = 300, retryable: bool = False, stdin_text=None):
         self.commands_called.append(command)
 
         from neurons.validators.src.services.task.runner import SSHCommandResult
@@ -338,11 +338,8 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     # Setup real executor (not Mock - to avoid Pydantic serialization issues)
     executor = make_executor("executor-123")
 
-    # Create encrypted payload
-    encrypted_payload = "encrypted_machine_specs_here"
-
     # Setup mocks
-    runner = DummySSHCommandRunner(machine_specs_encrypted=encrypted_payload)
+    runner = DummySSHCommandRunner(machine_specs_encrypted=FERNET_TOKEN)
     ssh_client = DummySSHClient()
     ssh_service = DummySSHService()
     redis_service = DummyRedisService()
