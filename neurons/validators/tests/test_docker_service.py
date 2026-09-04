@@ -5185,6 +5185,239 @@ def test_should_encrypt_local_volume_requires_local_sysbox_customer_volume(monke
     )
 
 
+@pytest.mark.parametrize(
+    "encrypted, expected_policy",
+    [(True, None), (False, "unless-stopped")],
+)
+def test_run_spec_restart_policy_only_for_plain_volumes(
+    docker_service, encrypted, expected_policy
+):
+    # Arrange
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+    )
+
+    # Act
+    run_spec = docker_service._build_rental_container_run_spec(
+        payload=payload,
+        container_name="pod_test",
+        custom_options=CustomOptions(),
+        port_maps=[],
+        local_volume="volume_test",
+        local_volume_path="/root",
+        encrypted_local_volume=encrypted,
+        external_volume_name=None,
+        gpu_devices=build_gpu_docker_config(["GPU-test"]),
+        effective_storage_limit_gb=None,
+        cpu_count=None,
+    )
+
+    # Assert
+    assert run_spec.restart_policy == expected_policy
+
+
+def _encrypted_container_ssh_run(command, **kwargs):
+    # the container being replaced answers `docker inspect` with the gocryptfs ciphertext mount, and
+    # any image asked about carries no volume-encryption label
+    if "docker image inspect" in command:
+        return _make_ssh_command_result()
+    if "docker inspect" in command:
+        return _make_ssh_command_result(stdout=f"{_LIUM_CIPHER_MOUNT}\n")
+    return _make_ssh_command_result()
+
+
+@pytest.mark.asyncio
+async def test_encryption_downgrade_refused_when_old_container_is_encrypted(docker_service):
+    # Arrange: the pod being replaced holds a gocryptfs volume, the payload says plain
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        return_value=_make_ssh_command_result(stdout=f"{_LIUM_CIPHER_MOUNT}\n/mnt\n")
+    )
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        is_sysbox=False,
+        enable_volume_encryption=True,
+    )
+
+    # Act / Assert
+    with pytest.raises(RentalDockerOperationError):
+        await docker_service._assert_no_encryption_downgrade(
+            ssh_client=ssh_client,
+            payload=payload,
+            local_volume="volume_test",
+            container_name="pod_test",
+            log_extra={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_container_refuses_encryption_downgrade_before_removing_the_pod(
+    docker_service,
+    monkeypatch,
+):
+    """The old container is the only witness to the volume being encrypted, so the refusal has to
+    land while it still exists -- a recreate that removed it first would leave the operator with a
+    deleted pod and no evidence."""
+    # Arrange: recreate of an encrypted pod, payload arrives with a stale is_sysbox=False
+    ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
+    ssh_client.run = AsyncMock(side_effect=_encrypted_container_ssh_run)
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        local_volume="volume_test",
+        is_sysbox=False,
+        enable_volume_encryption=True,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    # Act
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    # Assert
+    assert result.failure_step == "volume_encryption_precheck"
+    docker_service.clean_existing_containers.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_container_refuses_an_unlabelled_image_on_an_encrypted_volume(
+    docker_service,
+    monkeypatch,
+):
+    """The other way a recreate ends up plain: the payload does ask for encryption, but the image it
+    switches to carries no label, and the fallback would mount the ciphertext at the renter's path
+    -- by which point the container that proved the volume encrypted is already gone."""
+    # Arrange: recreate of an encrypted pod onto an image without the volume-encryption label
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
+    ssh_client.run = AsyncMock(side_effect=_encrypted_container_ssh_run)
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:unlabelled",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        local_volume="volume_test",
+        is_sysbox=True,
+        enable_volume_encryption=True,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    # Act
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    # Assert
+    assert result.failure_step == "encrypted_volume_image_inspect"
+
+
+@pytest.mark.asyncio
+async def test_encryption_downgrade_allows_a_recreate_whose_container_is_gone(docker_service):
+    # Arrange: the payload asks for encryption on a machine that cannot do it -- the ordinary shape
+    # of most of the fleet -- and no container is left to contradict it
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(exit_status=1))
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        is_sysbox=False,
+        enable_volume_encryption=True,
+    )
+
+    # Act / Assert: no exception
+    assert await docker_service._assert_no_encryption_downgrade(
+        ssh_client=ssh_client,
+        payload=payload,
+        local_volume="volume_test",
+        container_name="pod_test",
+        log_extra={},
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_encryption_downgrade_skips_the_inspect_on_a_first_create(docker_service):
+    # Arrange: a rental whose volume this validator is about to create has no history to lose
+    ssh_client = AsyncMock()
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        is_sysbox=True,
+        enable_volume_encryption=True,
+    )
+
+    # Act
+    downgrade_risk = await docker_service._assert_no_encryption_downgrade(
+        ssh_client=ssh_client,
+        payload=payload,
+        local_volume=None,
+        container_name="pod_test",
+        log_extra={},
+    )
+
+    # Assert
+    assert downgrade_risk is False
+    ssh_client.run.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_image_has_encrypted_volume_label(docker_service):
     ssh_client = AsyncMock()
