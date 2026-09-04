@@ -70,6 +70,12 @@ class JobResult(BaseModel):
 
     inspector_outcome: str = "SKIPPED"
 
+    # DAH-2748: every reachability check this cycle failed, with what we saw when we tried.
+    # The backend hides such a node from the market until a cycle reports none. None means this
+    # cycle never got to check — a failure before the connect leaves the stored errors alone
+    # rather than re-listing a node nobody tested.
+    availability_errors: list[dict[str, Any]] | None = None
+
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
@@ -241,6 +247,10 @@ class JobResult(BaseModel):
         return (self.score > 0 or self.job_score > 0) and self.gpu_model and self.gpu_count > 0
 
 
+# DAH-2748: the category of an error that means "someone could not reach something".
+AVAILABILITY_CATEGORY = "availability"
+
+
 class ValidationEvent(BaseModel):
     event: str
     reason_code: str
@@ -260,6 +270,11 @@ class ValidationEvent(BaseModel):
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
         extra = "allow"
+
+    @property
+    def is_availability_error(self) -> bool:
+        """DAH-2748: this error means someone could not reach something, so the node is hidden."""
+        return self.category == AVAILABILITY_CATEGORY
 
 
 def build_msg(

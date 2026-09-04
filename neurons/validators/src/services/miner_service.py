@@ -815,6 +815,7 @@ class MinerService:
                         "executor_image": result.executor_image_report,
                         "sent_at": time.time(),
                         "batch_total": batch_total,
+                        "availability_errors": result.availability_errors,
                     },
                 )
             except Exception as e:

@@ -349,6 +349,7 @@ class ComputeClient:
                             executor_image=data.get("executor_image"),
                             sent_at=data.get("sent_at"),
                             batch_total=data.get("batch_total"),
+                            availability_errors=data.get("availability_errors"),
                         )
 
                         async with self.lock:
