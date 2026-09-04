@@ -60,6 +60,34 @@ container_running() {
     docker ps --format "table {{.Names}}" | grep -q "$1" 2>/dev/null
 }
 
+# Resolve the QEMU binary the launcher will actually use: dstack.py reads
+# [qemu] path from the client.conf chain (later files override earlier ones)
+# and only falls back to PATH when no config sets it.
+resolve_qemu_path() {
+    local resolved=""
+    local conf
+    for conf in /etc/dstack/client.conf "$HOME/.config/dstack/client.conf" "$THIS_DIR/.dstack/client.conf"; do
+        [ -f "$conf" ] || continue
+        local configured
+        configured=$(awk '/^[[:space:]]*\[/ { section = $0 }
+            section ~ /\[qemu\]/ && /^[[:space:]]*path[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); print }' "$conf" | tail -n1)
+        [ -n "$configured" ] && resolved="$configured"
+    done
+    if [ -n "$resolved" ]; then
+        echo "$resolved"
+    else
+        command -v qemu-system-x86_64 2>/dev/null
+    fi
+}
+
+# List host processes still holding a VM directory: the dstack.py launcher and
+# the QEMU it runs as a child (both carry the VM directory on their command line).
+cvm_pids() {
+    local vm_dir="$1"
+    pgrep -f "dstack\.py run ${vm_dir}(/|[[:space:]]|\$)" 2>/dev/null || true
+    pgrep -f "qemu-system-x86_64.*${vm_dir}/" 2>/dev/null || true
+}
+
 # Function to download and extract OS image
 download_os_image() {
     local temp_file="/tmp/dstack-os-image-$$.tar.gz"
@@ -142,10 +170,29 @@ check_requirements() {
 
     # Check QEMU
     log_info "Checking QEMU installation..."
-    if command_exists qemu-system-x86_64; then
-        log_success "QEMU is installed: $(qemu-system-x86_64 --version | head -n1)"
+    local qemu_bin
+    qemu_bin=$(resolve_qemu_path || true)
+    if [ -n "$qemu_bin" ] && "$qemu_bin" --version >/dev/null 2>&1; then
+        local qemu_version
+        qemu_version=$("$qemu_bin" --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n1)
+        case "$qemu_version" in
+        9.2.1)
+            log_success "QEMU is the dstack 9.2.1 build: $qemu_bin"
+            ;;
+        1[0-9].*)
+            log_error "QEMU $qemu_version at $qemu_bin is a distro build: the verifier's RTMR0 oracle is built from dstack QEMU 9.2.1, so attestation can never pass"
+            log_info "See docs/host-setup.md section 3 — build kvinwang/qemu-tdx branch dstack-qemu-9.2.1 and point [qemu] path in client.conf at it"
+            all_good=false
+            ;;
+        "")
+            log_warning "Could not parse the QEMU version of $qemu_bin; attestation requires the dstack 9.2.1 build (docs/host-setup.md section 3)"
+            ;;
+        *)
+            log_warning "QEMU $qemu_version at $qemu_bin is not the dstack 9.2.1 build attestation expects (docs/host-setup.md section 3)"
+            ;;
+        esac
     else
-        log_error "QEMU (qemu-system-x86_64) is not installed"
+        log_error "QEMU (qemu-system-x86_64) is not installed or not executable${qemu_bin:+ at $qemu_bin}"
         all_good=false
     fi
 
@@ -166,12 +213,49 @@ check_requirements() {
         log_warning "Intel TDX support not detected in CPU info"
     fi
 
+    # Check the TDX module TCB. The 882 floor (2.0.08, minor SVN 5) is Intel's minimum for
+    # the 2.0 series on Granite Rapids; the 1.5 series on Sapphire/Emerald Rapids numbers its
+    # builds differently, so it only gets reported. Too old = "No matching TCB level found".
+    log_info "Checking Intel TDX module build..."
+    local tdx_line tdx_major tdx_build
+    tdx_line=$(dmesg 2>/dev/null | grep -i 'virt/tdx' | grep -i 'build_num' | tail -n1)
+    tdx_major=$(printf '%s' "$tdx_line" | sed -n 's/.*major_version[^0-9]*\([0-9][0-9]*\).*/\1/p')
+    tdx_build=$(printf '%s' "$tdx_line" | sed -n 's/.*build_num[^0-9]*\([0-9][0-9]*\).*/\1/p')
+    if [ -z "$tdx_build" ]; then
+        log_warning "No TDX module build number in dmesg (kernel 7.0 prints none, and dmesg may need root); the proof is then the quote's tee_tcb_svn — see docs/host-setup.md section 1"
+    elif [ "$tdx_major" != "2" ]; then
+        log_info "TDX module ${tdx_major:-?}.x build $tdx_build (pre-Granite Rapids series); Intel's minimum is per platform — the quote's tee_tcb_svn is the proof, see docs/host-setup.md section 1"
+    elif [ "$tdx_build" -ge 882 ]; then
+        log_success "TDX module build $tdx_build meets Intel's minimum (882 = 2.0.08)"
+    else
+        log_error "TDX module build $tdx_build is below Intel's minimum 882 (2.0.08, minor SVN 5): DCAP verification fails with 'No matching TCB level found'"
+        log_info "See docs/host-setup.md section 1 — update the module via /boot/efi/EFI/TDX/ or a vendor BIOS"
+        all_good=false
+    fi
+
     # Check SGX devices
     log_info "Checking SGX devices..."
     if [ -e /dev/sgx_enclave ] && [ -e /dev/sgx_provision ]; then
         log_success "SGX devices are available"
     else
         log_warning "SGX devices (/dev/sgx_enclave, /dev/sgx_provision) not found"
+    fi
+
+    # Check NUMA topology. The possible set is always a superset of the online one,
+    # so any difference means the firmware over-declares nodes.
+    log_info "Checking NUMA node topology..."
+    if [ -r /sys/devices/system/node/possible ] && [ -r /sys/devices/system/node/online ]; then
+        local numa_possible numa_online
+        numa_possible=$(cat /sys/devices/system/node/possible)
+        numa_online=$(cat /sys/devices/system/node/online)
+        if [ "$numa_possible" = "$numa_online" ]; then
+            log_success "NUMA nodes possible=$numa_possible online=$numa_online"
+        else
+            log_warning "NUMA nodes possible=$numa_possible but online=$numa_online: Gramine 1.5 (the pinned key-provider image) fails load_enclave with EINVAL on such firmware"
+            log_info "See docs/host-setup.md section 4 — rebuild the key provider on gramine:1.9"
+        fi
+    else
+        log_warning "Cannot read /sys/devices/system/node/{possible,online}; skipping the NUMA check"
     fi
 
     # Check key-provider
@@ -188,6 +272,26 @@ check_requirements() {
     else
         log_error "Key-provider configuration not found at $KEY_PROVIDER_DIR"
         all_good=false
+    fi
+
+    # Check the PCCS the key provider takes DCAP collateral from
+    log_info "Checking PCCS reachability..."
+    local qcnl_conf="$KEY_PROVIDER_DIR/sgx_default_qcnl.conf"
+    if [ -f "$qcnl_conf" ]; then
+        local pccs_url
+        pccs_url=$(sed -n 's/.*"pccs_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$qcnl_conf" | head -n1)
+        if [ -z "$pccs_url" ]; then
+            log_warning "No pccs_url in $qcnl_conf"
+        elif ! command_exists curl; then
+            log_warning "curl is not installed; cannot check whether $pccs_url answers"
+        elif curl -k -s -o /dev/null --max-time 5 "$pccs_url"; then
+            log_success "PCCS answers: $pccs_url"
+        else
+            log_warning "PCCS $pccs_url does not answer; the key provider will fail DCAP collateral fetch"
+        fi
+        log_info "A reachable PCCS is not enough: the platform must be registered with Intel (multi-package platforms need it) — enable 'SGX Auto MP Registration' in BIOS or run PCKIDRetrievalTool against your PCCS, see docs/host-setup.md section 4"
+    else
+        log_warning "QCNL configuration not found at $qcnl_conf"
     fi
 
     # Check dstack-os-image
@@ -568,18 +672,39 @@ stop_cvm() {
 
     if [ ! -d "$VMS_DIR/$cvm_name" ]; then
         log_error "CVM '$cvm_name' not found at $VMS_DIR/$cvm_name"
+        # the directory was removed under a running VM: the processes are the only trace left
+        local orphan_pids
+        orphan_pids=$(cvm_pids "$VMS_DIR/$cvm_name" | sort -u | xargs)
+        if [ -n "$orphan_pids" ]; then
+            log_error "but a VM from that directory is still running (pids: $orphan_pids) and keeps holding its GPUs and ports; kill those pids"
+        fi
         return 1
     fi
 
     shift
-    python3 "$SCRIPTS_DIR/dstack.py" stop "$VMS_DIR/$cvm_name" "$@"
+    local stop_rc=0
+    python3 "$SCRIPTS_DIR/dstack.py" stop "$VMS_DIR/$cvm_name" "$@" || stop_rc=$?
 
-    if [ $? -eq 0 ]; then
-        log_success "CVM '$cvm_name' stopped"
-    else
+    if [ $stop_rc -ne 0 ]; then
         log_error "Failed to stop CVM '$cvm_name'"
         return 1
     fi
+
+    # dstack.py stop exits 0 when runtime.json is missing — after 'rm -rf run/vms/<name>'
+    # under a running VM it stops nothing, so only the process list proves the VM is gone.
+    local leftover_pids attempt
+    for attempt in 1 2 3 4 5; do
+        leftover_pids=$(cvm_pids "$VMS_DIR/$cvm_name" | sort -u | xargs)
+        [ -z "$leftover_pids" ] && break
+        sleep 1
+    done
+    if [ -n "$leftover_pids" ]; then
+        log_error "CVM '$cvm_name' is still running (pids: $leftover_pids) and keeps holding its GPUs and ports"
+        log_info "Retry with '$0 stop $cvm_name --force', or kill those pids once you know what they are"
+        return 1
+    fi
+
+    log_success "CVM '$cvm_name' stopped"
 }
 
 # List available GPUs
