@@ -8,17 +8,17 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import HostPolicyResult
 from services.task import service as task_service_module
-from services.task.service import TaskService, _is_ssh_transport_failure
 from services.task.availability import (
     AVAILABILITY_CATEGORY,
     AvailabilityErrorCode,
     ReachSource,
     ReachTarget,
+    availability_errors,
     build_availability_event,
     build_ssh_unreachable_event,
-    availability_error_codes,
 )
 from services.task.models import JobResult, build_msg
+from services.task.service import TaskService, _is_ssh_transport_failure
 
 
 def test_ssh_unreachable_is_an_availability_error() -> None:
@@ -35,7 +35,7 @@ def test_ssh_unreachable_is_an_availability_error() -> None:
     assert event.what_we_saw["reach_target"] == "executor_ssh"
     assert event.what_we_saw["ssh_port"] == 2200
     assert event.remediation
-    assert availability_error_codes([event]) == ["EXECUTOR_SSH_UNREACHABLE"]
+    assert [e.reason_code for e in availability_errors([event])] == ["EXECUTOR_SSH_UNREACHABLE"]
 
 
 def test_an_ordinary_check_failure_is_not_an_availability_error() -> None:
@@ -49,12 +49,12 @@ def test_an_ordinary_check_failure_is_not_an_availability_error() -> None:
 
     # Act / Assert
     assert event.is_availability_error is False
-    assert availability_error_codes([event]) == []
+    assert availability_errors([event]) == []
 
 
 def test_no_events_mean_no_availability_error() -> None:
-    assert availability_error_codes(None) == []
-    assert availability_error_codes([]) == []
+    assert availability_errors(None) == []
+    assert availability_errors([]) == []
 
 
 def test_an_availability_error_anywhere_in_the_cycle_counts() -> None:
@@ -70,7 +70,7 @@ def test_an_availability_error_anywhere_in_the_cycle_counts() -> None:
     )
 
     # Act / Assert
-    assert availability_error_codes([unreachable, later_verdict]) == ["EXECUTOR_SSH_UNREACHABLE"]
+    assert [e.reason_code for e in availability_errors([unreachable, later_verdict])] == ["EXECUTOR_SSH_UNREACHABLE"]
 
 
 def test_the_class_names_who_could_not_reach_what() -> None:
@@ -166,7 +166,7 @@ async def test_a_cycle_that_cannot_open_ssh_scores_zero_and_reports_the_code(mon
     result = await _run_cycle(_task_service_that_reaches_the_ssh_connect(), miner, executor)
 
     assert result.score == 0
-    assert result.availability_error_codes == ["EXECUTOR_SSH_UNREACHABLE"]
+    assert [e["reason_code"] for e in result.availability_errors] == ["EXECUTOR_SSH_UNREACHABLE"]
     assert "EXECUTOR_SSH_UNREACHABLE" in result.log_text
 
 
@@ -187,7 +187,7 @@ async def test_a_network_error_before_the_ssh_connect_is_not_blamed_on_the_node(
     assert result.score == 0
     # None, not []: this cycle never reached the connect, so it must not clear what the
     # cycle before it found.
-    assert result.availability_error_codes is None
+    assert result.availability_errors is None
     assert "EXECUTOR_SSH_UNREACHABLE" not in result.log_text
 
 
@@ -209,17 +209,19 @@ def test_every_failed_reachability_check_is_reported() -> None:
     registry.reason_code = "CONTAINER_CANNOT_REACH_DOCKER_HUB"
 
     # Act
-    codes = availability_error_codes([ssh, registry, ssh])
+    problems = availability_errors([ssh, registry, ssh])
 
-    # Assert - both, in the order the checks ran, and no repeat
-    assert codes == ["EXECUTOR_SSH_UNREACHABLE", "CONTAINER_CANNOT_REACH_DOCKER_HUB"]
+    # Assert - both, in the order the checks ran, no repeat, each with its own details
+    assert [p.reason_code for p in problems] == ["EXECUTOR_SSH_UNREACHABLE", "CONTAINER_CANNOT_REACH_DOCKER_HUB"]
+    assert problems[0].reach_target == "executor_ssh"
+    assert problems[0].what_we_saw["ssh_port"] == 2200
+    assert problems[1].what_we_saw["registry"] == "docker.io"
 
 
 @pytest.mark.asyncio
 async def test_a_failure_after_the_shell_opened_reports_the_node_as_reachable() -> None:
     """DAH-2748: the connect proved the node is there, so a later crash must not keep it hidden."""
     import asyncssh
-
     from datura.requests.miner_requests import ExecutorSSHInfo
     from payload_models.payloads import MinerJobRequestPayload
     from services.task.service import TaskService
@@ -261,4 +263,4 @@ async def test_a_failure_after_the_shell_opened_reports_the_node_as_reachable() 
             rented_data=MagicMock(), default_docker_image_digests={},
         )
 
-    assert result.availability_error_codes == []
+    assert result.availability_errors == []

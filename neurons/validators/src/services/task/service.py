@@ -21,7 +21,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
-from .availability import availability_error_codes, build_ssh_unreachable_event
+from .availability import availability_errors, build_ssh_unreachable_event
 from .models import JobResult
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
@@ -178,7 +178,9 @@ class TaskService:
                 result.gpu_attestation_passed = gpu_attestation_passed
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
-                result.availability_error_codes = availability_error_codes(events)
+                result.availability_errors = [
+                    error.model_dump(mode="json") for error in availability_errors(events)
+                ]
                 return result
 
         except Exception as e:
@@ -192,7 +194,7 @@ class TaskService:
                     error=str(e),
                 )
                 log_text = _m(event.event, extra=event.model_dump())
-                availability_codes = [event.reason_code]
+                availability_problems = [error.model_dump(mode="json") for error in availability_errors([event])]
             else:
                 log_text = _m(
                     "Pipeline validation error",
@@ -210,7 +212,7 @@ class TaskService:
                 # A cycle that opened the shell proves the node is reachable, so it reports an
                 # empty list and re-lists a node an earlier cycle hid. A cycle that never got
                 # there says nothing, and must not clear what the cycle before it found.
-                availability_codes = [] if has_reached_the_node else None
+                availability_problems = [] if has_reached_the_node else None
             logger.error(log_text, exc_info=True)
             return JobResult(
                 spec=None,
@@ -227,7 +229,7 @@ class TaskService:
                 attestation_digest=attestation_digest,
                 tee_type=tee_type,
                 gpu_attestation_passed=gpu_attestation_passed,
-                availability_error_codes=availability_codes,
+                availability_errors=availability_problems,
             )
 
 

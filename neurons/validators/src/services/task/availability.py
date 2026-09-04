@@ -11,7 +11,9 @@ whose last cycle carried an availability error, and the provider portal shows th
 """
 
 from enum import StrEnum
+from typing import Any
 
+from pydantic import BaseModel, Field
 from services.task.models import AVAILABILITY_CATEGORY, ValidationEvent, build_msg
 
 
@@ -60,14 +62,41 @@ def build_availability_event(
     )
 
 
-def availability_error_codes(events: list[ValidationEvent] | None) -> list[str]:
+class AvailabilityError(BaseModel):
+    """One reachability check that failed, in the shape the provider portal renders.
+
+    A cycle can fail more than one — the image registry and the model hub, say — and each needs
+    its own line: what could not be reached, and what we saw when we tried.
+    """
+
+    reason_code: str
+    reach_source: str
+    reach_target: str
+    message: str
+    remediation: str | None = None
+    what_we_saw: dict[str, Any] = Field(default_factory=dict)
+
+
+def availability_errors(events: list[ValidationEvent] | None) -> list[AvailabilityError]:
     """Every availability error this cycle raised, in the order the checks ran.
 
-    A cycle can fail more than one reachability check — the image registry and the model hub,
-    say — and the provider needs to see all of them, so the whole event list is read and every
-    code is kept. Duplicates are dropped: one code per check.
+    The whole event list is read, not only the last one: a check that fails early still hides
+    the node. One entry per reason code — a check that fires twice is still one problem.
     """
-    return list(dict.fromkeys(event.reason_code for event in events or [] if event.is_availability_error))
+    errors: dict[str, AvailabilityError] = {}
+    for event in events or []:
+        if not event.is_availability_error or event.reason_code in errors:
+            continue
+        seen = dict(event.what_we_saw)
+        errors[event.reason_code] = AvailabilityError(
+            reason_code=event.reason_code,
+            reach_source=str(seen.pop("reach_source", "")),
+            reach_target=str(seen.pop("reach_target", "")),
+            message=event.event,
+            remediation=event.remediation,
+            what_we_saw=seen,
+        )
+    return list(errors.values())
 
 
 def build_ssh_unreachable_event(
