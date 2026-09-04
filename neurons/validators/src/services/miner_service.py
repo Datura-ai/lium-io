@@ -815,6 +815,8 @@ class MinerService:
                         "executor_image": result.executor_image_report,
                         "sent_at": time.time(),
                         "batch_total": batch_total,
+                        # DAH-2748: set when this cycle could not reach something.
+                        "availability_error_code": result.availability_error_code,
                     },
                 )
             except Exception as e:

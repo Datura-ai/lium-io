@@ -22,11 +22,11 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
+from .availability import availability_error_code, build_ssh_unreachable_event
 from .models import JobResult
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
-from .ssh_unreachable_grace import SshUnreachableGrace
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,6 @@ class TaskService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-        self.ssh_unreachable_grace = SshUnreachableGrace(redis_service)
         self.attestation_service = attestation_service
         self.wallet = settings.get_bittensor_wallet()
 
@@ -171,35 +170,27 @@ class TaskService:
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed
-                # DAH-2748: the node answered, so the SSH grace starts again from zero.
-                await self.ssh_unreachable_grace.record_successful_cycle(
-                    executor_info.uuid, result.score
-                )
+                # DAH-2748: any check that could not reach something hides the node. The category
+                # carries that, so a new reachability check needs no change here.
+                result.availability_error_code = availability_error_code(last_event)
                 return result
 
         except Exception as e:
-            # DAH-2748: a node we could not open SSH to was not measured, so the first such
-            # cycle in a row keeps its last score. Every other failure is a real verdict.
-            score_for_this_cycle: float = 0.0
+            # DAH-2748: SSH we could not open is an availability error, not a verdict on the
+            # machine. One is enough to hide the node until a cycle succeeds.
             if _is_ssh_transport_failure(e):
-                verdict = await self.ssh_unreachable_grace.score_for_unreachable_cycle(
-                    executor_info.uuid
-                )
-                score_for_this_cycle = verdict.score
-                event = self.ssh_unreachable_grace.build_event(
+                event = build_ssh_unreachable_event(
                     executor_uuid=executor_info.uuid,
                     host=executor_info.address,
                     port=executor_info.ssh_port,
                     error=str(e),
-                    streak=verdict.streak,
-                    forgiven=verdict.forgiven,
                 )
                 log_text = _m(event.event, extra=event.model_dump())
                 logger.error(log_text, exc_info=True)
                 return JobResult(
                     spec=None,
                     executor_info=executor_info,
-                    score=score_for_this_cycle,
+                    score=0,
                     job_score=0,
                     collateral_deposited=False,
                     job_batch_id=miner_info.job_batch_id,
@@ -211,6 +202,7 @@ class TaskService:
                     attestation_digest=attestation_digest,
                     tee_type=tee_type,
                     gpu_attestation_passed=gpu_attestation_passed,
+                    availability_error_code=event.reason_code,
                 )
 
             log_text = _m(
