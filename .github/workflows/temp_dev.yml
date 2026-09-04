@@ -1,0 +1,22 @@
+name: Temp staging
+
+# `/temp-dev [<N>h|destroy]` on a PR: a temporary copy of staging (validator + central miner from
+# this branch, the miner portal from lium-platform), 4 hours by default. The work happens in
+# Datura-ai/lium-infra; see its TEMP_DEV.md.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  request:
+    # the marker keeps this feature's own comments (they quote `/temp-dev`) from starting a run
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/temp-dev') && !contains(github.event.comment.body, '<!-- temp-dev-bot -->')
+    uses: Datura-ai/lium-infra/.github/workflows/temp-dev-request.yml@main
+    secrets:
+      github-token: ${{ secrets.TEMP_DEV_GITHUB_TOKEN }}
