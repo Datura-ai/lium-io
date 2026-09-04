@@ -26,6 +26,13 @@ from tests.helpers import build_context_config, build_services, build_state
         ("Intel(R) Xeon(R) 6766E", True),
         # TDX-capable: case-insensitive match
         ("INTEL(R) XEON(R) PLATINUM 8592+", True),
+        # TDX-capable: inside a CVM lscpu reports the raw "family/model" CPUID instead of a name
+        ("06/cf", True),  # Emerald Rapids, TEEmo H200 CVMs
+        ("06/ad", True),  # Granite Rapids, B200 CVM at 146.88.195.16
+        ("06/8f", True),  # Sapphire Rapids
+        ("06/AE", True),  # Granite Rapids D, uppercase hex
+        # Not TDX-capable: raw CPUID of a family 6 model without TDX (Alder Lake client)
+        ("06/97", False),
         # Not TDX-capable: 3rd Gen Xeon Scalable (Ice Lake)
         ("Intel(R) Xeon(R) Platinum 8380", False),
         ("Intel(R) Xeon(R) Gold 6330", False),
