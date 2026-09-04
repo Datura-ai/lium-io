@@ -147,6 +147,13 @@ ORIGINAL_KEYS = {
     'data_container_cap_eff': "container_cap_eff",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
+    'data_filler_entries': "filler_entries",
+    'data_filler_entry_scrape_error': "filler_entry_scrape_error",
+    'entry_container': "container",
+    'entry_kind': "kind",
+    'entry_pid': "pid",
+    'entry_seconds_after_start': "seconds_after_start",
+    'entry_command': "command",
 }
 
 
@@ -325,6 +332,13 @@ class FileEncryptService:
             'data_container_cap_eff': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
+            'data_filler_entries': "",
+            'data_filler_entry_scrape_error': "",
+            'entry_container': "",
+            'entry_kind': "",
+            'entry_pid': "",
+            'entry_seconds_after_start': "",
+            'entry_command': "",
         }
 
         # Generate dictionary key mapping on validator side

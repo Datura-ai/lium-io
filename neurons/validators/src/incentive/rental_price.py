@@ -11,6 +11,7 @@ rental subsidy. See `incentive/config.py:MAX_UNRENTED_GPUS_BY_TYPE`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -60,6 +61,9 @@ NCU_PROFILING_UNRESTRICTED = "unrestricted"
 # capability mask and the owner of /dev/nvidiactl, which sysbox maps away from root.
 CAP_SYS_ADMIN_BIT = 21
 NVIDIACTL_ROOT_UID = 0
+# DAH-2787: the two ways into a filler container the scrape can report, docker daemon event and
+# live process parentage. Anything else is a reading we do not understand, so it is not judged.
+FILLER_ENTRY_KINDS = ("docker_exec", "open_session")
 
 
 # ── Spec measurements ────────────────────────────────────────────────────────
@@ -89,6 +93,61 @@ class PowerCapIncapable(BaseModel):
 
     container_cap_eff: str  # effective capability mask of the executor container, hex
     nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
+
+
+class FillerContainerEntry(BaseModel):
+    """One visit inside a filler container that came from the host (DAH-2787).
+
+    Two shapes, one meaning. `docker_exec` comes from the docker daemon's own event log and
+    carries finished visits too, which is how a guard script that execs for milliseconds is
+    caught. `open_session` comes from process parentage - a process in the container's PID
+    namespace whose parent is outside it - and is the only way to see an `nsenter`, which never
+    reaches the daemon. Carried verbatim so the provider is shown the visit that cost them the
+    incentive. Sole owner of these scrape keys."""
+
+    container_name: str
+    kind: str  # "docker_exec" or "open_session"
+    pid: int | None  # the live process, when the visit is still open
+    seconds_after_start: float  # between the container's start and the visit
+    command: str
+
+    @staticmethod
+    def from_scrape(reported_entry: Any) -> FillerContainerEntry | None:
+        # The scrape is written on the miner's machine: a missing or wrongly typed reading is an
+        # inability to measure, not a breach, so every unknown shape fails open. bool is excluded
+        # explicitly - it passes isinstance(int) and would otherwise read as pid 1.
+        if not isinstance(reported_entry, dict):
+            return None
+        container_name: Any = reported_entry.get("container")
+        kind: Any = reported_entry.get("kind")
+        pid: Any = reported_entry.get("pid")
+        seconds_after_start: Any = reported_entry.get("seconds_after_start")
+        command: Any = reported_entry.get("command")
+        if not isinstance(container_name, str) or not container_name:
+            return None
+        if kind not in FILLER_ENTRY_KINDS:
+            return None
+        if kind == "open_session":
+            # a live session is proven by its process, so it must name a real one
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                return None
+        elif pid is not None:
+            return None  # a finished exec has no process left to name
+        if not isinstance(seconds_after_start, int | float) or isinstance(seconds_after_start, bool):
+            return None
+        try:
+            visit_seconds_after_start: float = float(seconds_after_start)
+        except OverflowError:
+            return None  # an integer too large for a float is not a reading
+        if not math.isfinite(visit_seconds_after_start):
+            return None  # inf compares greater than every grace, nan than none
+        return FillerContainerEntry(
+            container_name=container_name,
+            kind=kind,
+            pid=pid,
+            seconds_after_start=visit_seconds_after_start,
+            command=command if isinstance(command, str) else "",
+        )
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -473,6 +532,48 @@ class RentalPriceIncentive(DefaultIncentive):
                     "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _filler_container_entry(self, result: JobResult) -> FillerContainerEntry | None:
+        # The latest visit inside a filler container, or None when the scrape does not PROVE one.
+        # A visit during the container's first minutes is ours: the validator execs into a fresh
+        # filler itself (public keys, sshd bootstrap), and it never enters one again afterwards.
+        if result.spec is None:
+            # no scrape at all: a synthetic or estimated job result, nothing to measure
+            return None
+        reported_entries: Any = result.spec.get("filler_entries")
+        if not isinstance(reported_entries, list):
+            return None
+        grace_seconds: float = settings.FILLER_ENTRY_GRACE_SECONDS
+        entries: list[FillerContainerEntry] = []
+        for reported_entry in reported_entries:
+            entry: FillerContainerEntry | None = FillerContainerEntry.from_scrape(reported_entry)
+            if entry is not None and entry.seconds_after_start >= grace_seconds:
+                entries.append(entry)
+        if not entries:
+            return None
+        return max(entries, key=lambda visit: visit.seconds_after_start)
+
+    def _log_filler_container_entry(self, result: JobResult, entry: FillerContainerEntry) -> None:
+        enforced: bool = settings.ENABLE_UNRENTED_FILLER_ENTRY_LIMIT
+        logger.info(
+            _m(
+                "Somebody entered the filler container of an unrented executor"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "filler_container": entry.container_name,
+                    "entry_kind": entry.kind,
+                    "entry_pid": entry.pid,
+                    "entry_seconds_after_start": entry.seconds_after_start,
+                    "entry_command": entry.command,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.FILLER_CONTAINER_ENTERED,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -977,8 +1078,8 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2715 power cap gate: an idle machine whose container cannot apply a GPU power
         # cap is not fully usable for Lium's own jobs, so it forfeits the unrented incentive
         # (node stays active). While the flag is off we only log the would-be exclusion.
-        # Last in the chain, so a node already excluded by an ENFORCED gate above is not
-        # measured here - read the shadow numbers against the flags that were on that cycle.
+        # A node already excluded by an ENFORCED gate above is not measured here - read the
+        # shadow numbers against the flags that were on that cycle.
         power_cap_incapable: PowerCapIncapable | None = (
             self._power_cap_incapable(job_result) if eligible_for_rental_share else None
         )
@@ -988,6 +1089,22 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_cannot_apply_gpu_power_cap(
                     job_result, power_cap_incapable
+                )
+                job_result.record_incentive_log(reason)
+
+        # DAH-2787 filler entry gate: an idle machine is paid to run Lium's own job untouched,
+        # so a session opened inside that job's container from the host forfeits the unrented
+        # incentive (node stays active). Ships in shadow mode - while the flag is off we only
+        # log the would-be exclusion.
+        filler_entry: FillerContainerEntry | None = (
+            self._filler_container_entry(job_result) if eligible_for_rental_share else None
+        )
+        if filler_entry is not None:
+            self._log_filler_container_entry(job_result, filler_entry)
+            if settings.ENABLE_UNRENTED_FILLER_ENTRY_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_filler_container_entered(
+                    job_result, filler_entry
                 )
                 job_result.record_incentive_log(reason)
 

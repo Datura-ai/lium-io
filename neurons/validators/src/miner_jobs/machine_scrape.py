@@ -772,10 +772,9 @@ class UnixSocketHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.socket_path)
 
 
-def docker_api_get(path):
+def docker_api_read(path):
     # read one docker daemon endpoint over its unix socket; the scrape runs inside the privileged
-    # executor container, where the host socket is bind-mounted. The CLI reports these sizes as
-    # human strings ("45.08GB"); the API returns exact integers.
+    # executor container, where the host socket is bind-mounted.
     conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, DOCKER_API_TIMEOUT_SECONDS)
     try:
         conn.request("GET", path)
@@ -783,9 +782,14 @@ def docker_api_get(path):
         body = response.read()
         if response.status != 200:
             raise RuntimeError(f"docker api {path} returned HTTP {response.status}")
-        return json.loads(body)
+        return body
     finally:
         conn.close()
+
+
+def docker_api_get(path):
+    # The CLI reports these sizes as human strings ("45.08GB"); the API returns exact integers.
+    return json.loads(docker_api_read(path))
 
 
 def get_vloopback_volume_bytes(docker_root_dir):
@@ -1103,6 +1107,13 @@ NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 PROC_SELF_STATUS_PATH = "/proc/self/status"
 NVIDIACTL_PATH = "/dev/nvidiactl"
+PROC_DIR = "/proc"
+FILLER_CONTAINER_NAME_PREFIX = "filler_"
+ENTRY_COMMAND_MAX_CHARS = 200
+MAX_REPORTED_ENTRIES = 100
+MAX_REPORTED_ENTRIES_PER_CONTAINER = 5
+EXEC_EVENT_WINDOW_SECONDS = 3600
+EXEC_CREATE_STATUS_PREFIX = "exec_create: "
 INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
 # Enough of the GID table to carry both the link-local entries and the IPv4-mapped one. Its index
 # is driver-specific - mlx5 puts it at 2-3, Intel irdma at 1 - so consumers must match on the
@@ -1182,6 +1193,291 @@ def probe_gpu_power_cap_ability() -> GpuPowerCapProbe:
         scrape_errors.append(f"Cannot stat {NVIDIACTL_PATH}: {e}")
 
     return GpuPowerCapProbe(cap_eff, nvidiactl_owner_uid, "; ".join(scrape_errors))
+
+
+class FillerEntryProbe:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, entries: list[dict], scrape_error: str) -> None:
+        self.entries = entries
+        self.scrape_error = scrape_error
+
+
+def docker_api_get_events(path: str) -> list[dict]:
+    # The events endpoint answers with one JSON object per line, so it parses line by line. A
+    # `since`/`until` pair that both lie in the past makes the daemon send its buffered events
+    # and close, instead of streaming new ones forever.
+    return [json.loads(line) for line in docker_api_read(path).splitlines() if line.strip()]
+
+
+def read_pid_namespace(pid: int) -> str:
+    # The kernel prints one identifier per namespace ("pid:[4026532817]"), so two processes are in
+    # the same PID namespace when this string matches.
+    return os.readlink(f"{PROC_DIR}/{pid}/ns/pid")
+
+
+def read_process_parent_and_start_ticks(pid: int) -> tuple[int, int]:
+    # /proc/<pid>/stat holds the command name in brackets, and it may contain spaces and brackets
+    # of its own, so the fields are counted from the LAST bracket: parent pid is the 2nd of them
+    # and the start time the 20th. The start time counts clock ticks since the host booted.
+    with open(f"{PROC_DIR}/{pid}/stat") as stat_file:
+        stat_line = stat_file.read()
+    fields = stat_line[stat_line.rindex(")") + 1:].split()
+    return int(fields[1]), int(fields[19])
+
+
+def read_process_command(pid: int) -> str:
+    try:
+        with open(f"{PROC_DIR}/{pid}/cmdline", "rb") as cmdline_file:
+            command = cmdline_file.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    return command.replace("\0", " ").strip()[:ENTRY_COMMAND_MAX_CHARS]
+
+
+def read_host_uptime_seconds() -> float:
+    with open(f"{PROC_DIR}/uptime") as uptime_file:
+        return float(uptime_file.read().split()[0])
+
+
+def read_processes_by_pid_namespace() -> dict[str, dict[int, tuple[int, int]]]:
+    # Every process on the host, grouped by the PID namespace it runs in:
+    # {namespace: {pid: (parent_pid, start_ticks)}}. One pass for the whole node - a split node
+    # runs one filler per GPU bundle, and reading /proc per container would repeat two reads per
+    # host process for each of them.
+    processes_by_namespace = {}
+    for process_dir in os.listdir(PROC_DIR):
+        if not process_dir.isdigit():
+            continue
+        pid = int(process_dir)
+        try:
+            namespace = read_pid_namespace(pid)
+            processes = processes_by_namespace.setdefault(namespace, {})
+            processes[pid] = read_process_parent_and_start_ticks(pid)
+        except Exception:
+            continue  # /proc is a moving target: the process exited during the scan
+    return processes_by_namespace
+
+
+def find_open_sessions(
+    parent_and_start_ticks_by_pid: dict[int, tuple[int, int]],
+    init_pid: int,
+    container_name: str,
+    container_start_ticks: int,
+    clock_ticks_per_second: int,
+) -> list[dict]:
+    """Sessions still open in the container that were started from outside it.
+
+    `parent_and_start_ticks_by_pid` holds every process in the container's own PID namespace. Everything a container
+    starts itself has a parent in that same namespace, or is an orphan the container's own init
+    adopted. `docker exec` and `nsenter` are the two ways in from the host, and both leave the
+    same mark: the new process joins the namespace while its parent stays outside it. Only the
+    session itself is reported - what it then runs has a parent inside. This is the only way to
+    see an `nsenter`, which never reaches the docker daemon.
+    """
+    sessions = []
+    for member_pid, (parent_pid, start_ticks) in parent_and_start_ticks_by_pid.items():
+        if member_pid == init_pid or parent_pid in parent_and_start_ticks_by_pid:
+            continue
+        sessions.append({
+            "entry_container": container_name,
+            "entry_kind": "open_session",
+            "entry_pid": member_pid,
+            "entry_seconds_after_start": round(
+                (start_ticks - container_start_ticks) / clock_ticks_per_second, 1
+            ),
+            "entry_command": read_process_command(member_pid),
+        })
+    return sessions
+
+
+def find_docker_exec_events(container_start_times: dict[str, float]) -> list[dict]:
+    """Every `docker exec` the daemon recorded for these containers, finished ones included.
+
+    A guard script execs for milliseconds, so the live scan above almost never meets one. The
+    daemon keeps its last events in memory and hands them out with the command line, which turns
+    those short visits into a fact we can read once per cycle. `container_start_times` maps a
+    filler container name to when it started, in seconds since the host booted.
+    """
+    boot_time_unix = psutil.boot_time()
+    now_unix = boot_time_unix + read_host_uptime_seconds()
+    events = docker_api_get_events(
+        f"/events?since={int(now_unix - EXEC_EVENT_WINDOW_SECONDS)}&until={int(now_unix)}"
+    )
+
+    exec_visits = []
+    for event in events:
+        # Docker 29 dropped the legacy `status` field and sends the same string as `Action`;
+        # older daemons send both. Read one, fall back to the other (measured on a staging host
+        # running 29.1.4, where reading `status` alone saw nothing).
+        action = str(event.get("Action") or event.get("status") or "")
+        if not action.startswith(EXEC_CREATE_STATUS_PREFIX):
+            continue
+        container_name = ((event.get("Actor") or {}).get("Attributes") or {}).get("name") or ""
+        if container_name not in container_start_times:
+            continue
+        event_unix = event.get("time")
+        if not isinstance(event_unix, (int, float)) or isinstance(event_unix, bool):
+            continue
+        container_start_unix = boot_time_unix + container_start_times[container_name]
+        exec_visits.append({
+            "entry_container": container_name,
+            "entry_kind": "docker_exec",
+            "entry_pid": None,  # the session is over; the daemon keeps the command, not the pid
+            "entry_seconds_after_start": round(event_unix - container_start_unix, 1),
+            "entry_command": action[len(EXEC_CREATE_STATUS_PREFIX):][:ENTRY_COMMAND_MAX_CHARS],
+        })
+    return exec_visits
+
+
+def seconds_after_container_start(entry: dict) -> float:
+    # A plain function, not a lambda: obfuscator.py renames a lambda's argument only where it is
+    # read, which leaves the packaged scrape referring to a name nothing binds.
+    return entry["entry_seconds_after_start"]
+
+
+def probe_filler_container_entries() -> FillerEntryProbe:
+    # DAH-2787: an idle node earns the unrented incentive while it runs Lium's own job, and nobody
+    # may work inside that job's container. Report the visits raw, each with the seconds between
+    # the container's start and the visit - the validator holds the grace that keeps our own setup
+    # execs, which all happen while the container is being created, out of the verdict.
+    # Never raises: get_machine_specs has no guard around it, and a scrape that dies here would
+    # cost the miner every executor's score.
+    try:
+        return find_filler_container_entries()
+    except Exception as e:
+        return FillerEntryProbe([], f"Filler entry probe failed: {e}")
+
+
+class RunningFillerContainers:
+    # Plain class rather than a dataclass/NamedTuple, for the same reason as FillerEntryProbe.
+    def __init__(
+        self,
+        init_pid_by_container: dict[str, int],
+        start_ticks_by_container: dict[str, int],
+        healthcheck_command_by_container: dict[str, str],
+        scrape_error: str,
+    ) -> None:
+        self.init_pid_by_container = init_pid_by_container
+        self.start_ticks_by_container = start_ticks_by_container
+        self.healthcheck_command_by_container = healthcheck_command_by_container
+        self.scrape_error = scrape_error
+
+
+def read_healthcheck_command(details: dict) -> str:
+    # An image HEALTHCHECK is run by the daemon as an exec, so it lands in the event log and in
+    # the process list exactly like a person's `docker exec` (verified against a live daemon).
+    # The command is the only thing that tells the two apart, so it is cut to the same length a
+    # reported command is - a longer healthcheck would otherwise never match its own visit.
+    test = (((details or {}).get("Config") or {}).get("Healthcheck") or {}).get("Test") or []
+    if not isinstance(test, list) or len(test) < 2:
+        return ""
+    if test[0] == "CMD-SHELL":
+        return f"/bin/sh -c {test[1]}"[:ENTRY_COMMAND_MAX_CHARS]
+    if test[0] == "CMD":
+        return " ".join(str(argument) for argument in test[1:])[:ENTRY_COMMAND_MAX_CHARS]
+    return ""
+
+
+def read_running_filler_containers() -> RunningFillerContainers:
+    # Every running filler container on the host, with the pid of its init process and when that
+    # process started, in clock ticks since the host booted.
+    scrape_errors = []
+    init_pid_by_container = {}
+    start_ticks_by_container = {}
+    healthcheck_command_by_container = {}
+    for container in docker_api_get("/containers/json") or []:
+        container_name = ""
+        for name in container.get("Names") or []:
+            if name.lstrip("/").startswith(FILLER_CONTAINER_NAME_PREFIX):
+                container_name = name.lstrip("/")
+                break
+        if not container_name:
+            continue
+        try:
+            details = docker_api_get(f"/containers/{container.get('Id')}/json")
+            init_pid = int(((details or {}).get("State") or {}).get("Pid") or 0)
+            if init_pid <= 0:  # 0 means the container is not running
+                continue
+            init_pid_by_container[container_name] = init_pid
+            start_ticks_by_container[container_name] = read_process_parent_and_start_ticks(init_pid)[1]
+            healthcheck_command_by_container[container_name] = read_healthcheck_command(details)
+        except Exception as e:
+            scrape_errors.append(f"Cannot read {container_name}: {e}")
+    return RunningFillerContainers(
+        init_pid_by_container,
+        start_ticks_by_container,
+        healthcheck_command_by_container,
+        "; ".join(scrape_errors),
+    )
+
+
+def is_healthcheck_visit(entry: dict, healthcheck_command_by_container: dict[str, str]) -> bool:
+    # A container with no healthcheck excuses nothing: without this guard a visit whose command
+    # could not be read would match the empty default and vanish from the report.
+    healthcheck_command = healthcheck_command_by_container.get(entry["entry_container"], "")
+    return bool(healthcheck_command) and entry["entry_command"] == healthcheck_command
+
+
+def find_filler_container_entries() -> FillerEntryProbe:
+    fillers = read_running_filler_containers()
+    scrape_errors = [fillers.scrape_error] if fillers.scrape_error else []
+    if not fillers.init_pid_by_container:
+        # Nothing of ours runs on this host, so /proc stays unread - the walk below costs two
+        # reads per host process.
+        return FillerEntryProbe([], "; ".join(scrape_errors))
+
+    clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
+    processes_by_namespace = read_processes_by_pid_namespace()
+    scrape_pid_namespace = read_pid_namespace(os.getpid())
+    entries = []
+    for container_name, init_pid in fillers.init_pid_by_container.items():
+        try:
+            container_namespace = read_pid_namespace(init_pid)
+            if container_namespace == scrape_pid_namespace:
+                # A container sharing the host PID namespace (--pid=host) has no membership to
+                # judge: every host process would read as a member. Its exec events still count.
+                continue
+            entries.extend(find_open_sessions(
+                processes_by_namespace.get(container_namespace) or {},
+                init_pid,
+                container_name,
+                fillers.start_ticks_by_container[container_name],
+                clock_ticks_per_second,
+            ))
+        except Exception as e:
+            scrape_errors.append(f"Cannot read {container_name}: {e}")
+
+    try:
+        entries.extend(find_docker_exec_events({
+            name: ticks / clock_ticks_per_second
+            for name, ticks in fillers.start_ticks_by_container.items()
+        }))
+    except Exception as e:
+        scrape_errors.append(f"Cannot read docker events: {e}")
+
+    entries = [
+        entry
+        for entry in entries
+        if not is_healthcheck_visit(entry, fillers.healthcheck_command_by_container)
+    ]
+
+    # A guard script that execs every few minutes fills a whole window with the same visit, so the
+    # newest few carry the same proof in a payload the backend can hold. The cap is PER CONTAINER:
+    # a host-wide one lets visits into a busy container push another container's only visit out of
+    # the report, which is a bypass on a host that carries more than one executor.
+    entries.sort(key=seconds_after_container_start, reverse=True)
+    kept = []
+    kept_per_container = {}
+    for entry in entries:
+        container_name = entry["entry_container"]
+        if kept_per_container.get(container_name, 0) >= MAX_REPORTED_ENTRIES_PER_CONTAINER:
+            continue
+        kept_per_container[container_name] = kept_per_container.get(container_name, 0) + 1
+        kept.append(entry)
+        if len(kept) >= MAX_REPORTED_ENTRIES:
+            break  # a host that shows this many Lium-named containers has a bigger problem
+    return FillerEntryProbe(kept, "; ".join(scrape_errors))
 
 
 def get_host_boot_id() -> str:
@@ -1453,6 +1749,11 @@ def get_machine_specs():
     data["data_nvidiactl_owner_uid"] = power_cap_probe.nvidiactl_owner_uid
     if power_cap_probe.scrape_error:
         data["data_power_cap_probe_error"] = power_cap_probe.scrape_error
+
+    filler_entry_probe = probe_filler_container_entries()
+    data["data_filler_entries"] = filler_entry_probe.entries
+    if filler_entry_probe.scrape_error:
+        data["data_filler_entry_scrape_error"] = filler_entry_probe.scrape_error
 
     infiniband = get_infiniband_ports()
     data["data_infiniband_ports"] = [port.as_payload() for port in infiniband.ports]
