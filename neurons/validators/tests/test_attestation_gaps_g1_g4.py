@@ -11,6 +11,8 @@ Covers, per the remediation-plan test matrix (§6):
   (TDX-pass + GPU-fail is never "passed").
 - Minimal-G5: the CVM ratchet fail-closed on an omitted quote and the score gate.
 - G2: monotonic compose version floor in the whitelist check.
+- DAH-2861: the PROD compose whitelist contents — the latest runner is accepted,
+  the July staging-hotkey build is gone.
 """
 
 import base64
@@ -596,3 +598,47 @@ async def test_g2_compose_version_floor(service, monkeypatch):
 
     # Act / Assert — unknown OS image always rejected
     assert await service._check_whitelist("new-hash", "bad-os-image", executor) is False
+
+
+# ---------------------------------------------------------------------------
+# DAH-2861 — the PROD compose whitelist itself
+# ---------------------------------------------------------------------------
+
+# executor-v1.123 runner sha256:8c07d3a9… (2026-08-19), the prod build.
+LATEST_RUNNER_COMPOSE_HASH = "8224d58801af6333561f116e2d566b179b399f1d1d700f0e8a5ab9326ae901d9"
+# executor-v1.108 runner sha256:f85b948b… (2026-07-07), which bakes the staging validator hotkey.
+JULY_STAGING_RUNNER_COMPOSE_HASH = "ab4d14336f0762c0d8ec7631a69148246661de84ceead7a215f8a33b74fd43e6"
+
+
+async def test_prod_whitelist_accepts_latest_runner_compose(service, monkeypatch):
+    # Arrange
+    from services import const
+
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "PROD")
+    os_image = next(iter(const.TDX_WHITELIST["OS_IMAGE_HASH"]))
+    executor = _make_executor()
+
+    # Act / Assert — default floor
+    monkeypatch.setattr(settings, "TDX_MINIMUM_COMPOSE_VERSION", 0)
+    assert await service._check_whitelist(LATEST_RUNNER_COMPOSE_HASH, os_image, executor) is True
+
+    # Act / Assert — floor raised to this release: still at/above it
+    monkeypatch.setattr(settings, "TDX_MINIMUM_COMPOSE_VERSION", 4)
+    assert await service._check_whitelist(LATEST_RUNNER_COMPOSE_HASH, os_image, executor) is True
+
+
+async def test_prod_whitelist_rejects_july_staging_runner_compose(service, monkeypatch):
+    # Arrange — the July runner is gone from the dict, so rejection cannot depend on the floor
+    from services import const
+
+    monkeypatch.setattr(settings, "DEPLOY_ENV", "PROD")
+    monkeypatch.setattr(settings, "TDX_MINIMUM_COMPOSE_VERSION", 0)
+    os_image = next(iter(const.TDX_WHITELIST["OS_IMAGE_HASH"]))
+    executor = _make_executor()
+
+    # Act / Assert
+    assert JULY_STAGING_RUNNER_COMPOSE_HASH not in const.TDX_WHITELIST["COMPOSE_HASH"]["PROD"]
+    assert (
+        await service._check_whitelist(JULY_STAGING_RUNNER_COMPOSE_HASH, os_image, executor)
+        is False
+    )

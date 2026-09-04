@@ -330,15 +330,15 @@ TDX_WHITELIST = {
     # (`hash in TDX_WHITELIST["COMPOSE_HASH"][env]`) keep working on the dict keys.
     "COMPOSE_HASH": {
         "PROD": {
-            # DAH-2338 — executor-v1.108 measured compose: executor-runner pinned to
-            # daturaai/compute-subnet-executor-runner:latest @
-            # sha256:f85b948b6cb280423b17e34ea28c0f98139243ecea32cd42106f90d19dc619f1
-            # (executor @ sha256:94b5e734…, pushed 2026-07-07), init/pre-launch as
-            # of 077f42c1 (G1 GPU attestation guest env whitelist). Replaces v2
-            # 0995e41b… (executor-v1.107 runner b58211e7…) — CVMs on the old digest
-            # must redeploy with EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:f85b948b… .
-            # Assumes default `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo).
-            "ab4d14336f0762c0d8ec7631a69148246661de84ceead7a215f8a33b74fd43e6": 3,
+            # DAH-2861 — measured compose of the latest runner, daturaai/compute-subnet-executor-runner
+            # @ sha256:8c07d3a91f8900bd3f0e19025fb7a2c32f82577385550187b28c7769060d18b7 (pushed
+            # 2026-08-19, executor @ sha256:8dbf5395…, a prod build with no config_override.py).
+            # Seen in the event log of the 146.88.195.16 CVM on 2026-09-03. Assumes default
+            # `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo).
+            "8224d58801af6333561f116e2d566b179b399f1d1d700f0e8a5ab9326ae901d9": 4,
+            # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
+            # that runner bakes the STAGING validator hotkey via config_override.py and answers every
+            # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.
         },
         "STAGE": {
             "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11": 1,
