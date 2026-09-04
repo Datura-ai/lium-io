@@ -122,13 +122,16 @@ def _exec_event(
     command: str = "pgrep -x peakminer",
     seconds_ago: float = 60.0,
     status: str | None = None,
+    field: str = "Action",
 ) -> dict[str, Any]:
-    return {
+    # Docker 29 sends the string as `Action` and leaves `status` null; older daemons send both.
+    event = {
         "Type": "container",
-        "status": status if status is not None else f"exec_create: {command}",
         "time": int(NOW_UNIX - seconds_ago),
         "Actor": {"ID": FILLER_CONTAINER_ID, "Attributes": {"name": container_name}},
     }
+    event[field] = status if status is not None else f"exec_create: {command}"
+    return event
 
 
 def _events_api(events: list[dict[str, Any]] | None = None):
@@ -237,6 +240,17 @@ def test_a_finished_docker_exec_is_reported(proc_dir: Path) -> None:
     assert entries[0]["entry_container"] == FILLER_CONTAINER_NAME
     assert entries[0]["entry_command"] == "pgrep -x peakminer"
     assert entries[0]["entry_seconds_after_start"] == pytest.approx(CONTAINER_AGE - 60, abs=1)
+
+
+@pytest.mark.parametrize("field", ["Action", "status"])
+def test_both_daemon_event_shapes_are_read(proc_dir: Path, field: str) -> None:
+    # Measured on a staging host running docker 29.1.4: it sends `Action` and leaves `status`
+    # null, so a probe that reads `status` alone sees no visit at all.
+    scrape = _build_probe(proc_dir, events=[_exec_event(field=field)])
+
+    entries = _entries(scrape)
+
+    assert [entry["entry_command"] for entry in entries] == ["pgrep -x peakminer"]
 
 
 def test_exec_events_of_other_containers_are_ignored(proc_dir: Path) -> None:

@@ -1245,8 +1245,11 @@ def find_docker_exec_events(container_start_times: dict[str, float]) -> list[dic
 
     exec_visits = []
     for event in events:
-        status = str(event.get("status") or "")
-        if not status.startswith(EXEC_CREATE_STATUS_PREFIX):
+        # Docker 29 dropped the legacy `status` field and sends the same string as `Action`;
+        # older daemons send both. Read one, fall back to the other (measured on a staging host
+        # running 29.1.4, where reading `status` alone saw nothing).
+        action = str(event.get("Action") or event.get("status") or "")
+        if not action.startswith(EXEC_CREATE_STATUS_PREFIX):
             continue
         container_name = ((event.get("Actor") or {}).get("Attributes") or {}).get("name") or ""
         if container_name not in container_start_times:
@@ -1260,7 +1263,7 @@ def find_docker_exec_events(container_start_times: dict[str, float]) -> list[dic
             "entry_kind": "docker_exec",
             "entry_pid": None,  # the session is over; the daemon keeps the command, not the pid
             "entry_seconds_after_start": round(event_unix - container_start_unix, 1),
-            "entry_command": status[len(EXEC_CREATE_STATUS_PREFIX):][:ENTRY_COMMAND_MAX_CHARS],
+            "entry_command": action[len(EXEC_CREATE_STATUS_PREFIX):][:ENTRY_COMMAND_MAX_CHARS],
         })
     return exec_visits
 
