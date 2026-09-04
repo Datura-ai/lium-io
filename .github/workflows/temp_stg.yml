@@ -15,7 +15,8 @@ permissions:
 
 jobs:
   request:
-    if: github.event.issue.pull_request && contains(github.event.comment.body, '/temp-stg')
+    # the marker keeps this feature's own comments (they quote `/temp-stg`) from starting a run
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/temp-stg') && !contains(github.event.comment.body, '<!-- temp-stg-bot -->')
     uses: Datura-ai/lium-infra/.github/workflows/temp-stg-request.yml@main
     secrets:
       github-token: ${{ secrets.TEMP_STG_GITHUB_TOKEN }}
