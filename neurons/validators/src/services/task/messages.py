@@ -1260,8 +1260,8 @@ class FinalizeMessages:
 class RegistryEgressMessages:
     """DAH-2835 — Docker Hub egress probe.
 
-    A failed probe zeroes the score. The backend (DAH-2748) turns a streak of failed cycles
-    into "hidden from browse and refused for new rentals", so one blip costs no rental.
+    Only the two harmless outcomes live here. A failed probe is an availability error and is
+    built by `services/task/availability.py`, so the backend hides the node on one of them.
     """
 
     REACHABLE = MessageTemplate(
@@ -1270,14 +1270,6 @@ class RegistryEgressMessages:
         severity="info",
         category="runtime",
         impact="None — image pulls can start on this host",
-    )
-    UNREACHABLE = MessageTemplate(
-        event="Executor cannot reach Docker Hub",
-        reason="REGISTRY_UNREACHABLE",
-        severity="error",
-        category="runtime",
-        impact="Score set to 0 — every rental of an image this host has not cached would fail at docker pull",
-        remediation="Restore outbound HTTPS to registry-1.docker.io from the executor host.",
     )
     SKIPPED = MessageTemplate(
         event="Docker Hub egress probe skipped",

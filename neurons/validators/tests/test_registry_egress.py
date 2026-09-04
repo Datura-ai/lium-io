@@ -2,11 +2,12 @@
 
 No check touches the registry, so a host whose egress to Docker Hub died stays verified,
 scored and rentable, and fails every rental of an image it has not cached at `docker_pull`.
-This check asks the one question nothing else asks, and fails the host when the answer is no.
+This check asks the one question nothing else asks.
 
-The tolerance for a network blip is NOT here: DAH-2748 on the backend hides a node from browse
-and refuses new rentals only after a streak of failed cycles, and one good cycle resets it. What
-IS here is fail-open — anything that leaves the probe unable to answer must accuse nobody.
+A failed probe is an AVAILABILITY error (DAH-2748), the shared class for "we could not reach
+something": one is enough to zero the score and take the node off the market. So the tests below
+guard two things — that a real failure carries that category, and that everything which leaves
+the probe unable to answer accuses nobody.
 """
 
 from unittest.mock import AsyncMock, Mock
@@ -14,6 +15,10 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from neurons.validators.src.services.task.checks.registry_egress import RegistryEgressCheck
+from neurons.validators.src.services.task.availability import (
+    AVAILABILITY_CATEGORY,
+    AvailabilityErrorCode,
+)
 from neurons.validators.src.services.task.messages import RegistryEgressMessages as Msg
 
 from tests.helpers import build_context_config, build_state
@@ -41,9 +46,7 @@ def _ctx(context_factory, ssh: AsyncMock, digests: dict[str, str] | None = None)
 
 
 def test_check_is_fatal():
-    # A host that cannot pull cannot serve a rental, so it scores 0 like every other fatal
-    # check. The blip tolerance is the backend's failed-cycle streak (DAH-2748), not a second
-    # counter here.
+    # A host that cannot pull cannot serve a rental, so it scores 0 like every other fatal check.
     assert RegistryEgressCheck.fatal is True
 
 
@@ -73,8 +76,15 @@ async def test_no_answer_fails_the_host(context_factory, status):
     result = await RegistryEgressCheck().run(ctx)
 
     assert result.passed is False
-    assert result.event.reason_code == Msg.UNREACHABLE.reason
+    # The category is what carries the node off the market: services/task/service.py reads it
+    # off the last event and the backend hides any node whose cycle reported one.
+    assert result.event.category == AVAILABILITY_CATEGORY
+    assert result.event.reason_code == AvailabilityErrorCode.DOCKER_HUB_UNREACHABLE
     assert result.event.what_we_saw["http_status"] == status
+    # Who could not reach what — the field a future container-to-Hugging-Face check fills in too.
+    assert result.event.what_we_saw["reacher"] == "container"
+    assert result.event.what_we_saw["reached"] == "docker_hub"
+    assert result.event.remediation
 
 
 @pytest.mark.asyncio
@@ -89,6 +99,7 @@ async def test_validator_lost_docker_hub_accuses_nobody(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.SKIPPED.reason
+    assert result.event.category != AVAILABILITY_CATEGORY
     ssh.run.assert_not_awaited()
 
 

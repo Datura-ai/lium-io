@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..availability import build_docker_hub_unreachable_event
 from ..messages import RegistryEgressMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -30,11 +31,11 @@ class RegistryEgressCheck:
     every check, keeps its score, stays listed — and fails every rental of an image it has not
     already cached, at `failure_step=docker_pull`.
 
-    A failed probe zeroes the score, like every other fatal check. What stops a network blip
-    from costing the provider a rental is DAH-2748 on the backend side: a node is hidden from
-    browse and refused for new rentals only after `VALIDATION_FAILURE_STREAK_TO_BLOCK_RENTALS`
-    failed cycles in a row, and one good cycle resets that streak. Billing of a renter already
-    on the node is never touched — a rented executor short-circuits before this check.
+    A failed probe is an availability error (DAH-2748): the shared class for "we could not reach
+    something". One is enough — the score goes to zero, the backend takes the node off the market
+    and refuses new rentals at once, and the provider portal shows the reason. The next successful
+    cycle clears it. Billing of a renter already on the node is never touched: `active` is not
+    involved, and a rented executor short-circuits before this check anyway.
 
     Fails open on every uncertainty: an SSH error, unreadable curl output, or a validator that
     lost Docker Hub itself all pass the check rather than punish a host for our own outage.
@@ -59,14 +60,23 @@ class RegistryEgressCheck:
         if not http_status.isdigit():
             return self._skipped(ctx, "curl printed no status code", output=http_status[:200])
 
-        reachable: bool = http_status in REACHABLE_STATUS_CODES
-        event = render_message(
-            Msg.REACHABLE if reachable else Msg.UNREACHABLE,
-            ctx=ctx,
-            check_id=self.check_id,
-            what={"http_status": http_status, "url": REGISTRY_PING_URL},
+        if http_status in REACHABLE_STATUS_CODES:
+            event = render_message(
+                Msg.REACHABLE,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"http_status": http_status, "url": REGISTRY_PING_URL},
+            )
+            return CheckResult(passed=True, event=event)
+
+        return CheckResult(
+            passed=False,
+            event=build_docker_hub_unreachable_event(
+                executor_uuid=ctx.executor.uuid,
+                http_status=http_status,
+                url=REGISTRY_PING_URL,
+            ),
         )
-        return CheckResult(passed=reachable, event=event)
 
     def _skipped(self, ctx: Context, reason: str, **what: str) -> CheckResult:
         event = render_message(
