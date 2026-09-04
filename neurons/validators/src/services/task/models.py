@@ -70,6 +70,10 @@ class JobResult(BaseModel):
 
     inspector_outcome: str = "SKIPPED"
 
+    # DAH-2748: set when this cycle ended in an availability error (we could not reach
+    # something). The backend hides such a node from the market until a cycle succeeds.
+    availability_error_code: str | None = None
+
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
@@ -260,6 +264,11 @@ class ValidationEvent(BaseModel):
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
         extra = "allow"
+
+    @property
+    def is_availability_error(self) -> bool:
+        """DAH-2748: this error means someone could not reach something, so the node is hidden."""
+        return self.category == "availability"
 
 
 def build_msg(

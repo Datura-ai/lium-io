@@ -1,6 +1,8 @@
+import asyncio
 import logging
 from typing import Annotated
 
+import asyncssh
 import bittensor
 from clients.backend_client import BackendClient
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -20,12 +22,23 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
+from .availability import build_ssh_unreachable_event, first_availability_error_code
 from .models import JobResult
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
 
 logger = logging.getLogger(__name__)
+
+def _is_ssh_transport_failure(error: BaseException) -> bool:
+    """True when we never got a usable SSH session, so nothing about the node was measured.
+
+    asyncssh raises its own errors for a refused or reset connection and for a rejected
+    handshake; the socket layer raises OSError; a hung handshake raises TimeoutError. A
+    failure inside the pipeline is a real verdict and never lands here.
+    """
+    return isinstance(error, (asyncssh.Error, OSError, asyncio.TimeoutError))
+
 
 class TaskService:
     def __init__(
@@ -157,9 +170,41 @@ class TaskService:
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed
+                # DAH-2748: any check that could not reach something hides the node. The whole
+                # event list is read, so a new reachability check needs no change here.
+                result.availability_error_code = first_availability_error_code(events)
                 return result
 
         except Exception as e:
+            # DAH-2748: SSH we could not open is an availability error, not a verdict on the
+            # machine. One is enough to hide the node until a cycle succeeds.
+            if _is_ssh_transport_failure(e):
+                event = build_ssh_unreachable_event(
+                    executor_uuid=executor_info.uuid,
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    error=str(e),
+                )
+                log_text = _m(event.event, extra=event.model_dump())
+                logger.error(log_text, exc_info=True)
+                return JobResult(
+                    spec=None,
+                    executor_info=executor_info,
+                    score=0,
+                    job_score=0,
+                    collateral_deposited=False,
+                    job_batch_id=miner_info.job_batch_id,
+                    log_status="error",
+                    log_text=log_text.to_full_string(),
+                    gpu_model=None,
+                    gpu_count=0,
+                    sysbox_runtime=False,
+                    attestation_digest=attestation_digest,
+                    tee_type=tee_type,
+                    gpu_attestation_passed=gpu_attestation_passed,
+                    availability_error_code=event.reason_code,
+                )
+
             log_text = _m(
                 "Pipeline validation error",
                 extra=get_extra_info({
