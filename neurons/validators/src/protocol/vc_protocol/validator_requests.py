@@ -99,9 +99,10 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # DAH-2792: specs the validator scored for this miner in this job_batch_id, counting the ones
     # whose redis publish failed; the backend reads expected minus received as lost on the websocket.
     batch_total: int | None = None
-    # DAH-2748: reason code when this cycle ended in an availability error. The backend keeps
-    # the node off the market while it is set, and clears it on the next successful cycle.
-    availability_error_code: str | None = None
+    # DAH-2748: every reachability check this cycle failed. The backend keeps the node off the
+    # market while the list is not empty and clears it on an empty one. None means the cycle
+    # never got to check, and the stored codes stay as they are.
+    availability_error_codes: list[str] | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

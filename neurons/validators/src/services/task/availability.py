@@ -12,19 +12,17 @@ whose last cycle carried an availability error, and the provider portal shows th
 
 from enum import StrEnum
 
-from services.task.models import ValidationEvent, build_msg
-
-AVAILABILITY_CATEGORY = "availability"
+from services.task.models import AVAILABILITY_CATEGORY, ValidationEvent, build_msg
 
 
-class Reacher(StrEnum):
+class ReachSource(StrEnum):
     """Who tried to reach something."""
 
     VALIDATOR = "validator"
     CONTAINER = "container"
 
 
-class Reached(StrEnum):
+class ReachTarget(StrEnum):
     """What could not be reached. Add a member for every new reachability check."""
 
     EXECUTOR_SSH = "executor_ssh"
@@ -39,35 +37,37 @@ class AvailabilityErrorCode(StrEnum):
 def build_availability_event(
     *,
     code: AvailabilityErrorCode,
-    reacher: Reacher,
-    reached: Reached,
-    event: str,
+    reach_source: ReachSource,
+    reach_target: ReachTarget,
+    event_text: str,
     impact: str,
     remediation: str,
-    what: dict,
+    what_we_saw: dict[str, str | int | None],
 ) -> ValidationEvent:
-    """One availability error. `reacher` and `reached` say who could not reach what."""
+    """One availability error, naming who could not reach what."""
     return build_msg(
-        event=event,
+        event=event_text,
         reason=str(code),
         severity="error",
         category=AVAILABILITY_CATEGORY,
         impact=impact,
         remediation=remediation,
-        what={"reacher": str(reacher), "reached": str(reached), **what},
+        what={
+            "reach_source": str(reach_source),
+            "reach_target": str(reach_target),
+            **what_we_saw,
+        },
     )
 
 
-def first_availability_error_code(events: list[ValidationEvent] | None) -> str | None:
-    """The code of the first availability error in this cycle, if it had one.
+def availability_error_codes(events: list[ValidationEvent] | None) -> list[str]:
+    """Every availability error this cycle raised, in the order the checks ran.
 
-    The whole list is read, not only the last event: a reachability check that fails early
-    still hides the node, whatever the pipeline reports afterwards.
+    A cycle can fail more than one reachability check — the image registry and the model hub,
+    say — and the provider needs to see all of them, so the whole event list is read and every
+    code is kept. Duplicates are dropped: one code per check.
     """
-    for event in events or []:
-        if event.is_availability_error:
-            return event.reason_code
-    return None
+    return list(dict.fromkeys(event.reason_code for event in events or [] if event.is_availability_error))
 
 
 def build_ssh_unreachable_event(
@@ -75,15 +75,15 @@ def build_ssh_unreachable_event(
 ) -> ValidationEvent:
     return build_availability_event(
         code=AvailabilityErrorCode.EXECUTOR_SSH_UNREACHABLE,
-        reacher=Reacher.VALIDATOR,
-        reached=Reached.EXECUTOR_SSH,
-        event="Validator cannot open SSH to this node",
+        reach_source=ReachSource.VALIDATOR,
+        reach_target=ReachTarget.EXECUTOR_SSH,
+        event_text="Validator cannot open SSH to this node",
         impact="The node is hidden from the market and cannot take new rentals until a check succeeds.",
         remediation=(
             "Check that sshd on the node accepts the validator on its management port, "
             "and that no firewall or rate limit rejects the connection."
         ),
-        what={
+        what_we_saw={
             "executor_uuid": executor_uuid,
             "ssh_host": host,
             "ssh_port": port,

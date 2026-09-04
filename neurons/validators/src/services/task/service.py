@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from typing import Annotated
 
@@ -22,7 +21,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
-from .availability import build_ssh_unreachable_event, first_availability_error_code
+from .availability import availability_error_codes, build_ssh_unreachable_event
 from .models import JobResult
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
@@ -31,13 +30,12 @@ from .result_handler import ResultHandler
 logger = logging.getLogger(__name__)
 
 def _is_ssh_transport_failure(error: BaseException) -> bool:
-    """True when we never got a usable SSH session, so nothing about the node was measured.
+    """The pair the rented-machine check uses; OSError also covers a hung handshake since 3.11.
 
-    asyncssh raises its own errors for a refused or reset connection and for a rejected
-    handshake; the socket layer raises OSError; a hung handshake raises TimeoutError. A
-    failure inside the pipeline is a real verdict and never lands here.
+    Only the KIND of error. The caller must also confirm WHERE it came from: the attestation
+    verifier's HTTP call raises the same types and says nothing about the node's own SSH.
     """
-    return isinstance(error, (asyncssh.Error, OSError, asyncio.TimeoutError))
+    return isinstance(error, (asyncssh.Error, OSError))
 
 
 class TaskService:
@@ -88,6 +86,11 @@ class TaskService:
         tee_type = None
         attestation_passed = False
         gpu_attestation_passed = None
+        # DAH-2748: true only while the SSH connection is being opened, so a network error from
+        # the attestation verifier or from a pipeline check is never blamed on the node's sshd.
+        is_opening_ssh_connection = False
+        # Once the shell is open the node is proven reachable, whatever fails afterwards.
+        has_reached_the_node = False
 
         try:
             # Decrypt private key
@@ -119,6 +122,7 @@ class TaskService:
                 logger.error(log_text)
                 raise
 
+            is_opening_ssh_connection = True
             async with InteractiveShellService(
                 host=executor_info.address,
                 username=executor_info.ssh_username,
@@ -126,6 +130,8 @@ class TaskService:
                 port=executor_info.ssh_port,
                 known_hosts=known_hosts_policy,
             ) as shell:
+                is_opening_ssh_connection = False
+                has_reached_the_node = True
                 # Build validation context
                 base_ctx = await self.pipeline_factory.build_context(
                     shell=shell,
@@ -172,13 +178,13 @@ class TaskService:
                 result.gpu_attestation_passed = gpu_attestation_passed
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
-                result.availability_error_code = first_availability_error_code(events)
+                result.availability_error_codes = availability_error_codes(events)
                 return result
 
         except Exception as e:
             # DAH-2748: SSH we could not open is an availability error, not a verdict on the
             # machine. One is enough to hide the node until a cycle succeeds.
-            if _is_ssh_transport_failure(e):
+            if is_opening_ssh_connection and _is_ssh_transport_failure(e):
                 event = build_ssh_unreachable_event(
                     executor_uuid=executor_info.uuid,
                     host=executor_info.address,
@@ -186,38 +192,25 @@ class TaskService:
                     error=str(e),
                 )
                 log_text = _m(event.event, extra=event.model_dump())
-                logger.error(log_text, exc_info=True)
-                return JobResult(
-                    spec=None,
-                    executor_info=executor_info,
-                    score=0,
-                    job_score=0,
-                    collateral_deposited=False,
-                    job_batch_id=miner_info.job_batch_id,
-                    log_status="error",
-                    log_text=log_text.to_full_string(),
-                    gpu_model=None,
-                    gpu_count=0,
-                    sysbox_runtime=False,
-                    attestation_digest=attestation_digest,
-                    tee_type=tee_type,
-                    gpu_attestation_passed=gpu_attestation_passed,
-                    availability_error_code=event.reason_code,
+                availability_codes = [event.reason_code]
+            else:
+                log_text = _m(
+                    "Pipeline validation error",
+                    extra=get_extra_info({
+                        "job_batch_id": miner_info.job_batch_id,
+                        "miner_hotkey": miner_info.miner_hotkey,
+                        "executor_uuid": executor_info.uuid,
+                        "executor_ip_address": executor_info.address,
+                        "executor_port": executor_info.port,
+                        "ssh_user": executor_info.ssh_username,
+                        "ssh_port": executor_info.ssh_port,
+                        "error": str(e),
+                    })
                 )
-
-            log_text = _m(
-                "Pipeline validation error",
-                extra=get_extra_info({
-                    "job_batch_id": miner_info.job_batch_id,
-                    "miner_hotkey": miner_info.miner_hotkey,
-                    "executor_uuid": executor_info.uuid,
-                    "executor_ip_address": executor_info.address,
-                    "executor_port": executor_info.port,
-                    "ssh_user": executor_info.ssh_username,
-                    "ssh_port": executor_info.ssh_port,
-                    "error": str(e),
-                })
-            )
+                # A cycle that opened the shell proves the node is reachable, so it reports an
+                # empty list and re-lists a node an earlier cycle hid. A cycle that never got
+                # there says nothing, and must not clear what the cycle before it found.
+                availability_codes = [] if has_reached_the_node else None
             logger.error(log_text, exc_info=True)
             return JobResult(
                 spec=None,
@@ -234,6 +227,7 @@ class TaskService:
                 attestation_digest=attestation_digest,
                 tee_type=tee_type,
                 gpu_attestation_passed=gpu_attestation_passed,
+                availability_error_codes=availability_codes,
             )
 
 
