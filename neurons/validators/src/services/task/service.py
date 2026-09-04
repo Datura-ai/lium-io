@@ -22,7 +22,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
-from .availability import availability_error_code, build_ssh_unreachable_event
+from .availability import build_ssh_unreachable_event, first_availability_error_code
 from .models import JobResult
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
@@ -170,9 +170,9 @@ class TaskService:
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed
-                # DAH-2748: any check that could not reach something hides the node. The category
-                # carries that, so a new reachability check needs no change here.
-                result.availability_error_code = availability_error_code(last_event)
+                # DAH-2748: any check that could not reach something hides the node. The whole
+                # event list is read, so a new reachability check needs no change here.
+                result.availability_error_code = first_availability_error_code(events)
                 return result
 
         except Exception as e:

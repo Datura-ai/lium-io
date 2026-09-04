@@ -265,6 +265,11 @@ class ValidationEvent(BaseModel):
         json_encoders = {datetime: lambda v: v.isoformat()}
         extra = "allow"
 
+    @property
+    def is_availability_error(self) -> bool:
+        """DAH-2748: this error means someone could not reach something, so the node is hidden."""
+        return self.category == "availability"
+
 
 def build_msg(
     *,

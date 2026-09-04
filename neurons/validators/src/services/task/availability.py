@@ -1,13 +1,13 @@
-"""DAH-2748: validation errors that mean "we could not reach something".
+"""DAH-2748: validation errors that mean "someone could not reach something".
 
-An availability error says the platform could not talk to a machine, not that the machine
-failed a check. One is enough to take the node off the market: a node nobody can reach cannot
-serve a customer, and offering it produces a failed rental.
+An availability error says the platform could not talk to a machine or a service, not that the
+machine failed a check. One is enough to take the node off the market: a node nobody can reach
+cannot serve a customer, and offering it produces a failed rental.
 
-The class is shared on purpose. Every future reachability check joins it by emitting an event
-with this category — the validator reaching the node, the container reaching Docker Hub, the
-container reaching Hugging Face. Nothing else has to change: the backend hides any node whose
-last cycle carried an availability error, and the provider portal shows the reason.
+The class is shared on purpose. A new reachability check joins it by naming who could not reach
+what and emitting the event — the validator reaching the node today, the container reaching
+Docker Hub or Hugging Face tomorrow. Nothing downstream changes: the backend hides any node
+whose last cycle carried an availability error, and the provider portal shows the reason.
 """
 
 from enum import StrEnum
@@ -17,8 +17,21 @@ from services.task.models import ValidationEvent, build_msg
 AVAILABILITY_CATEGORY = "availability"
 
 
+class Reacher(StrEnum):
+    """Who tried to reach something."""
+
+    VALIDATOR = "validator"
+    CONTAINER = "container"
+
+
+class Reached(StrEnum):
+    """What could not be reached. Add a member for every new reachability check."""
+
+    EXECUTOR_SSH = "executor_ssh"
+
+
 class AvailabilityErrorCode(StrEnum):
-    """Who could not reach what. Add a member for every new reachability check."""
+    """The code the backend stores and the portal shows. One per check."""
 
     EXECUTOR_SSH_UNREACHABLE = "EXECUTOR_SSH_UNREACHABLE"
 
@@ -26,11 +39,14 @@ class AvailabilityErrorCode(StrEnum):
 def build_availability_event(
     *,
     code: AvailabilityErrorCode,
+    reacher: Reacher,
+    reached: Reached,
     event: str,
     impact: str,
     remediation: str,
     what: dict,
 ) -> ValidationEvent:
+    """One availability error. `reacher` and `reached` say who could not reach what."""
     return build_msg(
         event=event,
         reason=str(code),
@@ -38,15 +54,20 @@ def build_availability_event(
         category=AVAILABILITY_CATEGORY,
         impact=impact,
         remediation=remediation,
-        what=what,
+        what={"reacher": str(reacher), "reached": str(reached), **what},
     )
 
 
-def availability_error_code(event: ValidationEvent | None) -> str | None:
-    """The reason code when this event is an availability error, otherwise None."""
-    if event is None or event.category != AVAILABILITY_CATEGORY:
-        return None
-    return event.reason_code
+def first_availability_error_code(events: list[ValidationEvent] | None) -> str | None:
+    """The code of the first availability error in this cycle, if it had one.
+
+    The whole list is read, not only the last event: a reachability check that fails early
+    still hides the node, whatever the pipeline reports afterwards.
+    """
+    for event in events or []:
+        if event.is_availability_error:
+            return event.reason_code
+    return None
 
 
 def build_ssh_unreachable_event(
@@ -54,6 +75,8 @@ def build_ssh_unreachable_event(
 ) -> ValidationEvent:
     return build_availability_event(
         code=AvailabilityErrorCode.EXECUTOR_SSH_UNREACHABLE,
+        reacher=Reacher.VALIDATOR,
+        reached=Reached.EXECUTOR_SSH,
         event="Validator cannot open SSH to this node",
         impact="The node is hidden from the market and cannot take new rentals until a check succeeds.",
         remediation=(

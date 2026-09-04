@@ -6,9 +6,11 @@ import pytest
 from services.task.availability import (
     AVAILABILITY_CATEGORY,
     AvailabilityErrorCode,
-    availability_error_code,
+    Reached,
+    Reacher,
     build_availability_event,
     build_ssh_unreachable_event,
+    first_availability_error_code,
 )
 from services.task.models import build_msg
 
@@ -21,10 +23,13 @@ def test_ssh_unreachable_is_an_availability_error() -> None:
 
     # Assert
     assert event.category == AVAILABILITY_CATEGORY
+    assert event.is_availability_error is True
     assert event.reason_code == AvailabilityErrorCode.EXECUTOR_SSH_UNREACHABLE
-    assert availability_error_code(event) == "EXECUTOR_SSH_UNREACHABLE"
+    assert event.what_we_saw["reacher"] == "validator"
+    assert event.what_we_saw["reached"] == "executor_ssh"
     assert event.what_we_saw["ssh_port"] == 2200
     assert event.remediation
+    assert first_availability_error_code([event]) == "EXECUTOR_SSH_UNREACHABLE"
 
 
 def test_an_ordinary_check_failure_is_not_an_availability_error() -> None:
@@ -37,26 +42,49 @@ def test_an_ordinary_check_failure_is_not_an_availability_error() -> None:
     )
 
     # Act / Assert
-    assert availability_error_code(event) is None
+    assert event.is_availability_error is False
+    assert first_availability_error_code([event]) is None
 
 
-def test_no_event_means_no_availability_error() -> None:
-    assert availability_error_code(None) is None
+def test_no_events_mean_no_availability_error() -> None:
+    assert first_availability_error_code(None) is None
+    assert first_availability_error_code([]) is None
 
 
-def test_a_future_check_joins_the_class_by_category_alone() -> None:
-    # Arrange: a container that cannot reach an image registry, written without touching
-    # the backend or the portal.
-    event = build_availability_event(
-        code=AvailabilityErrorCode.EXECUTOR_SSH_UNREACHABLE,
-        event="Container cannot reach the image registry",
-        impact="The node is hidden from the market.",
-        remediation="Check outbound network on the node.",
-        what={"target": "registry"},
+def test_an_availability_error_anywhere_in_the_cycle_counts() -> None:
+    # Arrange: the reachability check fails early and an ordinary verdict follows it.
+    unreachable = build_ssh_unreachable_event(
+        executor_uuid="node-1", host="1.2.3.4", port=2200, error="refused"
+    )
+    later_verdict = build_msg(
+        event="GPU count does not match",
+        reason="GPU_COUNT_MISMATCH",
+        severity="error",
+        impact="Score is zero for this cycle.",
     )
 
     # Act / Assert
-    assert availability_error_code(event) == "EXECUTOR_SSH_UNREACHABLE"
+    assert first_availability_error_code([unreachable, later_verdict]) == "EXECUTOR_SSH_UNREACHABLE"
+
+
+def test_the_class_names_who_could_not_reach_what() -> None:
+    # Arrange: a container that cannot reach an image registry. A new check adds its members
+    # to the two enums and the code; nothing downstream changes.
+    event = build_availability_event(
+        code=AvailabilityErrorCode.EXECUTOR_SSH_UNREACHABLE,
+        reacher=Reacher.CONTAINER,
+        reached=Reached.EXECUTOR_SSH,
+        event="Container cannot reach the image registry",
+        impact="The node is hidden from the market.",
+        remediation="Check outbound network on the node.",
+        what={"registry": "docker.io"},
+    )
+
+    # Act / Assert
+    assert event.is_availability_error is True
+    assert event.what_we_saw["reacher"] == "container"
+    assert event.what_we_saw["reached"] == "executor_ssh"
+    assert event.what_we_saw["registry"] == "docker.io"
 
 
 @pytest.mark.asyncio
