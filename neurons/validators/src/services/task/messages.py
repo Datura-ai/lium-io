@@ -842,7 +842,7 @@ class PortCountMessages:
     INSUFFICIENT_PORTS = MessageTemplate(
         event="Insufficient available ports",
         reason="INSUFFICIENT_PORTS",
-        severity="warning",
+        severity="error",
         category="runtime",
         impact="Score set to 0",
         remediation="Increase port range or check port mappings configuration.",
@@ -1254,6 +1254,29 @@ class FinalizeMessages:
         severity="info",
         category="runtime",
         impact="Proceed",
+    )
+
+
+class RegistryEgressMessages:
+    """DAH-2835 — Docker Hub egress probe.
+
+    Only the two harmless outcomes live here. A failed probe is an availability error and is
+    built by `services/task/availability.py`, so the backend hides the node on one of them.
+    """
+
+    REACHABLE = MessageTemplate(
+        event="Executor can reach Docker Hub",
+        reason="REGISTRY_REACHABLE",
+        severity="info",
+        category="runtime",
+        impact="None — image pulls can start on this host",
+    )
+    SKIPPED = MessageTemplate(
+        event="Docker Hub egress probe skipped",
+        reason="REGISTRY_EGRESS_CHECK_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="None — the probe could not answer this cycle, so it accuses nobody",
     )
 
 

@@ -20,6 +20,7 @@ from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
 from .provider_side_load import ProviderSideLoadCheck
 from .port_count import PortCountCheck
+from .registry_egress import RegistryEgressCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_machine import TenantEnforcementCheck
 from .score import ScoreCheck
@@ -54,6 +55,7 @@ __all__ = [
     "PortConnectivityCheck",
     "PortCountCheck",
     "ProviderSideLoadCheck",
+    "RegistryEgressCheck",
     "RentalVerificationCheck",
     "TdxHostCheck",
     "TenantEnforcementCheck",

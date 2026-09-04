@@ -50,6 +50,7 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     ProviderSideLoadCheck,
+    RegistryEgressCheck,
     RentalVerificationCheck,
     ScoreCheck,
     SpecChangeCheck,
@@ -322,6 +323,12 @@ class PipelineFactory:
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
                 # idle valid-executor population. No scoring impact; fails open on any error.
                 CachedTemplateVerificationCheck(),
+                # DAH-2835: fatal — the only check that touches the registry. Sits next to the
+                # cached-template check because both answer "can this host start a rental's
+                # image pull"; this one asks about the images it has NOT cached. The tolerance
+                # for a blip is DAH-2748's failed-cycle streak on the backend, not a second one
+                # here. After the rented short-circuit, so a renter's box is never probed.
+                RegistryEgressCheck(),
                 RentalVerificationCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),

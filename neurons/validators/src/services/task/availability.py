@@ -12,7 +12,7 @@ whose last cycle carried an availability error, and the provider portal shows th
 
 from enum import StrEnum
 
-from services.task.models import ValidationEvent, build_msg
+from .models import ValidationEvent, build_msg
 
 AVAILABILITY_CATEGORY = "availability"
 
@@ -28,12 +28,14 @@ class Reached(StrEnum):
     """What could not be reached. Add a member for every new reachability check."""
 
     EXECUTOR_SSH = "executor_ssh"
+    DOCKER_HUB = "docker_hub"
 
 
 class AvailabilityErrorCode(StrEnum):
     """The code the backend stores and the portal shows. One per check."""
 
     EXECUTOR_SSH_UNREACHABLE = "EXECUTOR_SSH_UNREACHABLE"
+    DOCKER_HUB_UNREACHABLE = "DOCKER_HUB_UNREACHABLE"
 
 
 def build_availability_event(
@@ -89,4 +91,22 @@ def build_ssh_unreachable_event(
             "ssh_port": port,
             "error": error,
         },
+    )
+
+
+def build_docker_hub_unreachable_event(
+    *, executor_uuid: str, http_status: str, url: str
+) -> ValidationEvent:
+    """DAH-2835: the executor container could not reach the registry every rental pulls from."""
+    return build_availability_event(
+        code=AvailabilityErrorCode.DOCKER_HUB_UNREACHABLE,
+        reacher=Reacher.CONTAINER,
+        reached=Reached.DOCKER_HUB,
+        event="This node cannot reach Docker Hub",
+        impact="The node is hidden from the market and cannot take new rentals until a check succeeds.",
+        remediation=(
+            "Restore outbound HTTPS from the node to registry-1.docker.io. Every rental of an "
+            "image the node has not already cached fails at the image pull without it."
+        ),
+        what={"executor_uuid": executor_uuid, "http_status": http_status, "url": url},
     )
