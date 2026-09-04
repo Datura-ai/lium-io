@@ -1052,8 +1052,10 @@ class DockerService:
             # DAH-2780: an encrypted pod must never be restarted by docker. The gocryptfs mount
             # lives inside the container and dies with it, and nothing remounts it on a docker-side
             # restore -- so the container comes back with the plaintext path as an ordinary
-            # directory and the renter's writes land unencrypted on the miner's disk. Recovery goes
-            # through the validator, which mounts before it starts.
+            # directory and the renter's writes land unencrypted on the miner's disk. The cost is
+            # real: DAH-2306 recovery only fires on the State.Error docker writes after a restart it
+            # attempted itself, so an encrypted pod that exits now stays down until it is recreated
+            # -- a host reboot included.
             restart_policy=None if encrypted_local_volume else "unless-stopped",
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
@@ -4486,7 +4488,7 @@ class DockerService:
 
                 # Must run before the cleanup below removes the container it inspects.
                 current_step = "volume_encryption_precheck"
-                await self._assert_no_encryption_downgrade(
+                existing_volume_encrypted = await self._assert_no_encryption_downgrade(
                     ssh_client=ssh_client,
                     payload=payload,
                     local_volume=local_volume,
@@ -4607,6 +4609,17 @@ class DockerService:
                         ssh_client,
                         payload.docker_image,
                     ):
+                        if existing_volume_encrypted:
+                            # DAH-2780: falling back to plain here would mount the ciphertext of a
+                            # volume the renter already has data in straight at their path. An edit
+                            # that swaps in an unlabelled image is the one way to reach it, and by
+                            # now the container that proved the volume encrypted is gone -- so the
+                            # answer taken before the cleanup is the only one left.
+                            raise RentalDockerOperationError(
+                                f"{container_name} runs an encrypted volume but "
+                                f"{payload.docker_image} carries no {_ENCRYPTED_VOLUME_IMAGE_LABEL} "
+                                "label; refusing rather than mounting it as plain"
+                            )
                         use_encrypted_volume = False
                         volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
                         await self.stream_log(
@@ -5725,21 +5738,26 @@ class DockerService:
         local_volume: str | None,
         container_name: str,
         log_extra: dict[str, Any],
-    ) -> None:
-        # a recreate that would mount an already-encrypted rental volume as plaintext
+    ) -> bool:
+        # whether the pod being replaced already holds an encrypted volume; raises when this
+        # request would mount that volume as plaintext
         #
         # DAH-2780: the payload decides encryption from `is_sysbox`, which the backend reads off
         # executor specs -- and specs freeze whenever a validation cycle scores zero. A pod created
         # while the machine was known to be sysbox can therefore be recreated with is_sysbox=False,
         # and the ciphertext tree would be mounted straight at the renter's path: they would see
         # gocryptfs internals and write plaintext next to them. The container being replaced is the
-        # only place that knows the truth, so ask it before it is removed. A first create has no
-        # such container, the inspect answers UNKNOWN, and nothing here fires.
+        # only place that knows the truth, so ask it before it is removed, and carry the answer to
+        # the image-label check further down, which is the other way this deploy can end up plain.
         #
         # A rental whose volume this validator is about to create has no history to lose, so it
         # skips the inspect rather than paying for it on every deploy.
         if not local_volume:
-            return
+            return False
+
+        state = await self._local_volume_encryption_state(ssh_client, container_name)
+        if state is not _VolumeEncryptionState.ENCRYPTED:
+            return False
 
         if _should_encrypt_local_volume(
             local_volume,
@@ -5747,11 +5765,7 @@ class DockerService:
             payload.is_sysbox,
             payload.enable_volume_encryption,
         ):
-            return
-
-        state = await self._local_volume_encryption_state(ssh_client, container_name)
-        if state is not _VolumeEncryptionState.ENCRYPTED:
-            return
+            return True
 
         logger.error(
             _m(
@@ -5761,12 +5775,17 @@ class DockerService:
                     "container_name": container_name,
                     "is_sysbox": payload.is_sysbox,
                     "enable_volume_encryption": payload.enable_volume_encryption,
+                    "volume_encryption_enabled_setting": settings.ENABLE_VOLUME_ENCRYPTION,
                 }),
             )
         )
+        # name both causes -- a payload that lost `is_sysbox` to frozen specs, and the global kill
+        # switch being off. They need opposite answers, and this line is all the operator gets.
         raise RentalDockerOperationError(
             f"{container_name} runs an encrypted volume but this request would mount it as plain "
-            f"(is_sysbox={payload.is_sysbox}, enable_volume_encryption={payload.enable_volume_encryption}); "
+            f"(workload_kind={payload.workload_kind.value}, is_sysbox={payload.is_sysbox}, "
+            f"enable_volume_encryption={payload.enable_volume_encryption}, "
+            f"ENABLE_VOLUME_ENCRYPTION={settings.ENABLE_VOLUME_ENCRYPTION}); "
             "refusing rather than exposing the renter's data"
         )
 
