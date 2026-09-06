@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
+from core.config import settings
+from core.utils import _m, get_extra_info
+
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .network_ema import compute_ema
+
+logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
 
@@ -73,13 +79,48 @@ class VerifyXCheck:
             machine_spec=specs,
         )
 
-        # Extract errors with clear priority: data.errors > result.error
-        errors = self._extract_errors(result)
-
         prev_ema = (
             ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
             if ctx.state.rented_data else None
         )
+
+        cold_sample_retry: dict[str, Any] | None = None
+        if _is_cold_sample_below_gate(ctx, result, prev_ema):
+            # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
+            # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
+            # single-stream 260–500 MB CDN object, cold (the scrape's own speedtest read 0.7–1.7 Gbps
+            # on two of the traced hosts, 104 Mbps on the third whose link the executor's on-boot
+            # template pre-pull was sharing) — and passed the next cycle at 205–760 Mbps. One more
+            # sample inside the same task costs at most one VerifyX run; the failure costs the
+            # provider a whole cycle. Known hosts (any prior EMA) are not retried, and the gate is
+            # unchanged: one of the two samples must clear it.
+            retry = await verifyx_service.validate_verifyx_and_process_job(
+                shell=ctx.services.shell,
+                executor_info=ctx.executor,
+                default_extra=ctx.default_extra,
+                machine_spec=specs,
+            )
+            first_speed = _download_speed(result)
+            retry_speed = _download_speed(retry)
+            use_retry = retry.data is not None and bool(retry.data.get("success")) and (
+                retry_speed or 0.0
+            ) > (first_speed or 0.0)
+            cold_sample_retry = {
+                "first_download_speed_mbps": first_speed,
+                "retry_download_speed_mbps": retry_speed,
+                "used": "retry" if use_retry else "first",
+            }
+            logger.info(
+                _m(
+                    "VerifyX cold first sample below the gate, re-measured once",
+                    extra=get_extra_info({**ctx.default_extra, **cold_sample_retry}),
+                )
+            )
+            if use_retry:
+                result = retry
+
+        # Extract errors with clear priority: data.errors > result.error
+        errors = self._extract_errors(result)
 
         if result.data and result.data.get("success"):
             base_specs = ctx.state.specs
@@ -135,6 +176,8 @@ class VerifyXCheck:
             )
             if errors:
                 event.what_we_saw["errors"] = errors
+            if cold_sample_retry:
+                event.what_we_saw["cold_sample_retry"] = cold_sample_retry
 
             updated_state = replace(ctx.state, specs=updated_specs)
 
@@ -149,6 +192,8 @@ class VerifyXCheck:
                         "min_download_speed_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
                     },
                 )
+                if cold_sample_retry:
+                    slow_event.what_we_saw["cold_sample_retry"] = cold_sample_retry
                 return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
 
             return CheckResult(
@@ -184,6 +229,31 @@ _FAILURE_TEMPLATE_BY_CLASS = {
     "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
     "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
 }
+
+
+def _download_speed(result) -> float | None:
+    if not result.data:
+        return None
+    return (result.data.get("network") or {}).get("download_speed")
+
+
+def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
+    """The one case DAH-2959 re-measures: a never-measured executor whose probe otherwise passed
+    but whose single download sample would fail the EMA gate on its own.
+
+    `rented_data` present is required — without the backend's answer every executor looks
+    never-measured, and a backend blip must not double VerifyX for the whole fleet.
+    """
+    if not settings.VERIFYX_COLD_SAMPLE_RETRY_ENABLED:
+        return False
+    if ctx.state.rented_data is None:
+        return False
+    if prev_ema is not None and prev_ema.ema_verifyx_download_speed is not None:
+        return False
+    if not result.data or not result.data.get("success"):
+        return False
+    speed = _download_speed(result)
+    return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:
