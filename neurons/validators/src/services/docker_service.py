@@ -383,6 +383,102 @@ class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
 
 
+# DAH-2740: the name a pod's current container is parked under while an edit builds its replacement.
+EDIT_PARKED_SUFFIX = "__prev"
+
+
+class _EditSwap:
+    """DAH-2740: keep the customer's container until its replacement runs, so a failed edit can be undone.
+
+    The edit path used to force-remove the pod's own container in the stale sweep and only then
+    create the new one, so anything that failed after the sweep — an unkillable container, a
+    gocryptfs EPERM — left the customer with neither the old pod nor a new one (8 of 88 edits in
+    one week). Now the container is renamed aside (instant, kills nothing) and stopped to free its
+    ports and GPUs; the replacement is created under the original name; on success the parked one
+    is removed, on any failure the half-built replacement is removed and the parked one is renamed
+    back and started. If the container cannot even be stopped, the edit fails before anything was
+    destroyed. Entered together with the SSH connection so the undo still has a live session.
+    """
+
+    def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict):
+        self.ssh_client = ssh_client
+        self.container_name = container_name
+        self.parked_name: str | None = None
+        self.default_extra = default_extra
+
+    async def __aenter__(self) -> "_EditSwap":
+        return self
+
+    async def park(self) -> str | None:
+        """Rename the running container aside and stop it. None when there is nothing to park."""
+        listed = await self.ssh_client.run(
+            f'/usr/bin/docker ps -a --format "{{{{.Names}}}}" --filter name=^{shlex.quote(self.container_name)}$'
+        )
+        if self.container_name not in (listed.stdout or "").split():
+            return None
+        parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
+        # a leftover from an earlier edit that never finished must not block the rename
+        await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
+        renamed = await self.ssh_client.run(
+            f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
+        )
+        if renamed.exit_status != 0:
+            raise Exception(f"[park_current_container] docker rename failed: {(renamed.stderr or '').strip()}")
+        self.parked_name = parked
+        stopped = await self.ssh_client.run(f"/usr/bin/docker stop -t 10 {shlex.quote(parked)}")
+        if stopped.exit_status != 0:
+            # The container cannot be stopped: give it its name back and fail the edit with the
+            # pod exactly as it was. This is the wedge that used to surface as RetryError[...]
+            # after a destructive `docker rm -fv`. If even the rename back fails, parked_name
+            # stays set so __aexit__ tries the full restore once more.
+            renamed_back = await self.ssh_client.run(
+                f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
+            )
+            if renamed_back.exit_status == 0:
+                self.parked_name = None
+            raise Exception(
+                "[park_current_container] the running container could not be stopped, the pod was left "
+                f"as it was: {(stopped.stderr or '').strip()}"
+            )
+        logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
+        return parked
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if self.parked_name is None:
+            return False
+        if exc is None or isinstance(exc, _CreateCancelledByDelete):
+            # Replacement is up (or the pod was deleted meanwhile): the old container is now the
+            # stale one. Best effort — a wedged remove is left to the stale-container sweep.
+            removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_name)}")
+            if removed.exit_status != 0:
+                logger.warning(
+                    _m(
+                        "Parked container could not be removed after edit; left for the stale sweep",
+                        extra=get_extra_info({**self.default_extra, "parked": self.parked_name, "error": (removed.stderr or "").strip()}),
+                    )
+                )
+            return False
+        await self.restore()
+        return False
+
+    async def restore(self) -> None:
+        """Undo the edit: drop the half-built replacement, give the parked container its name back, start it."""
+        q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
+        await self.ssh_client.run(f"/usr/bin/docker rm -fv {q_name} 2>/dev/null || true")
+        renamed = await self.ssh_client.run(f"/usr/bin/docker rename {q_parked} {q_name}")
+        started = await self.ssh_client.run(f"/usr/bin/docker start {q_name}") if renamed.exit_status == 0 else renamed
+        extra = get_extra_info({**self.default_extra, "parked": self.parked_name, "restored": started.exit_status == 0})
+        if started.exit_status == 0:
+            logger.warning(_m("Edit failed; the pod's previous container was restored", extra=extra))
+        else:
+            logger.error(
+                _m(
+                    "Edit failed and the previous container could not be restored",
+                    extra={**extra, "error": (started.stderr or "").strip()},
+                )
+            )
+
+
 @dataclass
 class _InflightCreate:
     # A retried rent can put a second create on the same pod while the first still runs, so the
@@ -4239,6 +4335,8 @@ class DockerService:
                     executor_info=executor_info,
                     private_key=private_key,
                 ) as docker_client,
+                # DAH-2740: undoes a failed edit while this SSH session is still open
+                _EditSwap(ssh_client, self.get_container_name(payload), default_extra) as edit_swap,
             ):
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
@@ -4479,6 +4577,15 @@ class DockerService:
                 if local_volume:
                     protected_volume_names.add(local_volume)
 
+                protected_container_names = list(payload.active_container_names or [])
+                if local_volume:
+                    # DAH-2740: an edit keeps its current container, parked, until the replacement runs;
+                    # the sweep below must not treat the parked name as stale.
+                    current_step = "park_current_container"
+                    parked_name = await edit_swap.park()
+                    if parked_name:
+                        protected_container_names.append(parked_name)
+
                 current_step = "container_cleanup"
                 # DAH-1524: the GC below (force-removing stale pod_/filler_
                 # containers + their volumes that aren't in active_*) stays on the
@@ -4494,7 +4601,7 @@ class DockerService:
                     default_extra=default_extra,
                     pod_name=container_name,
                     clear_volume=False if local_volume else True,
-                    active_container_names=payload.active_container_names,
+                    active_container_names=protected_container_names,
                     active_volume_names=payload.active_volume_names,
                 )
 
@@ -5116,7 +5223,8 @@ class DockerService:
                 "Failed create_container",
                 extra=get_extra_info({
                     **default_extra,
-                    "error": str(e),
+                    # DAH-2740: a tenacity RetryError says nothing; the last attempt's text is the cause
+                    "error": "; ".join(_exception_texts(e)),
                     "failure_step": current_step,
                 }),
             )
