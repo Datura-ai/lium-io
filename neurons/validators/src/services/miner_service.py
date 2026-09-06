@@ -184,6 +184,10 @@ REST_SSH_REMOVE_TIMEOUT = 10  # Timeout for SSH key removal requests
 # node that actually passed validation -- nothing about this node was verified.
 MANUAL_RENTAL_FORCED_PASS_EVENT = "Executor force-passed as special manual rental (not validated)"
 
+# DAH-2958: who is verifying an executor right now (values of MinerService.in_flight).
+CYCLE_LANE = "cycle"
+EXPRESS_LANE = "express"
+
 
 class MinerService:
     def __init__(
@@ -197,6 +201,41 @@ class MinerService:
         self.task_service = task_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
+        # DAH-2958: executor uuid -> CYCLE_LANE | EXPRESS_LANE while its pipeline is running. The
+        # wave and the express lane run in this one process, so a plain dict is the whole
+        # coordination: each lane skips what the other holds. Stays empty with the flag off.
+        self.in_flight: dict[str, str] = {}
+
+    def _claim_for_cycle(
+        self, executors: list[ExecutorSSHInfo], default_extra: dict
+    ) -> list[ExecutorSSHInfo]:
+        """The wave takes every executor the miner returned, minus those the express lane is
+        verifying at this moment, so a new node's hardware tests never run twice concurrently
+        (DAH-2958). Only a never-validated executor can be held by the express lane, so the
+        scoring of every already-validated executor is untouched. Flag off: list returned as is.
+        """
+        if not settings.EXPRESS_LANE_ENABLED:
+            return executors
+        claimed: list[ExecutorSSHInfo] = []
+        for executor in executors:
+            if self.in_flight.get(executor.uuid) == EXPRESS_LANE:
+                logger.info(
+                    _m(
+                        "Executor left to the express lane this cycle",
+                        extra=get_extra_info({**default_extra, "executor_uuid": executor.uuid}),
+                    ),
+                )
+                continue
+            self.in_flight[executor.uuid] = CYCLE_LANE
+            claimed.append(executor)
+        return claimed
+
+    def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
+        if not settings.EXPRESS_LANE_ENABLED:
+            return
+        for executor in executors:
+            if self.in_flight.get(executor.uuid) == CYCLE_LANE:
+                del self.in_flight[executor.uuid]
 
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
@@ -224,8 +263,14 @@ class MinerService:
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
+        executor_id: str | None = None,
     ):
-        """Request job to miner - uses REST API if configured, otherwise WebSocket."""
+        """Request job to miner - uses REST API if configured, otherwise WebSocket.
+
+        executor_id (DAH-2958): None asks the miner for every executor it has for this validator
+        (the cycle); a uuid asks for that one executor only (the express lane) — the miner already
+        filters register_pubkey on it, exactly as it does for the rental key-submit.
+        """
         if settings.USE_REST_API:
             logger.info(
                 _m(
@@ -242,6 +287,7 @@ class MinerService:
                 rented_data,
                 default_docker_image_digests,
                 executor_image_snapshot,
+                executor_id=executor_id,
             )
         else:
             logger.info(
@@ -295,6 +341,7 @@ class MinerService:
                         public_key=public_key,
                         validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
                         miner_hotkey=payload.miner_hotkey, # include miner's hotkey in the request
+                        executor_id=executor_id,
                         nonce=nonce_hex,
                     )
                 )
@@ -357,29 +404,37 @@ class MinerService:
                             payload,
                             "Miner returned zero executors in AcceptSSHKeyRequest",
                         )
-                    tasks = [
-                        asyncio.create_task(
-                            asyncio.wait_for(
-                                self.task_service.create_task(
-                                    miner_info=payload,
-                                    executor_info=executor_info,
-                                    keypair=my_key,
-                                    private_key=private_key.decode("utf-8"),
-                                    public_key=public_key.decode("utf-8"),
-                                    encrypted_files=encrypted_files,
-                                    rented_data=rented_data,
-                                    default_docker_image_digests=default_docker_image_digests,
-                                    executor_image_snapshot=executor_image_snapshot,
-                                    attestation_nonce=attestation_nonce,
-                                ),
-                                timeout=settings.JOB_TIME_OUT - 120
+                    executors = (
+                        self._claim_for_cycle(msg.executors, default_extra)
+                        if executor_id is None
+                        else msg.executors
+                    )
+                    try:
+                        tasks = [
+                            asyncio.create_task(
+                                asyncio.wait_for(
+                                    self.task_service.create_task(
+                                        miner_info=payload,
+                                        executor_info=executor_info,
+                                        keypair=my_key,
+                                        private_key=private_key.decode("utf-8"),
+                                        public_key=public_key.decode("utf-8"),
+                                        encrypted_files=encrypted_files,
+                                        rented_data=rented_data,
+                                        default_docker_image_digests=default_docker_image_digests,
+                                        executor_image_snapshot=executor_image_snapshot,
+                                        attestation_nonce=attestation_nonce,
+                                    ),
+                                    timeout=settings.JOB_TIME_OUT - 120
+                                )
                             )
-                        )
-                        for executor_info in msg.executors
-                    ]
+                            for executor_info in executors
+                        ]
 
-                    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-                    results = self._filter_task_results(msg.executors, raw_results, default_extra)
+                        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    finally:
+                        self._release_cycle_claims(executors)
+                    results = self._filter_task_results(executors, raw_results, default_extra)
                     results.extend(
                         self._build_manual_rental_results(payload, rented_data, existing=results)
                     )
@@ -407,7 +462,8 @@ class MinerService:
                         await miner_client.send_model(SSHPubKeyRemoveRequest(
                             public_key=public_key,
                             validator_signature=self._sign_validator_pubkey(my_key, public_key),
-                            miner_hotkey=payload.miner_hotkey
+                            miner_hotkey=payload.miner_hotkey,
+                            executor_id=executor_id,
                         ))
                     except Exception as e:
                         logger.warning(
@@ -1878,6 +1934,7 @@ class MinerService:
         rented_data: RentedExecutorsResponse,
         default_docker_image_digests: dict[str, str],
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
+        executor_id: str | None = None,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: see the WebSocket path — the RoCE probe measures the cycle's remaining time
@@ -1908,6 +1965,7 @@ class MinerService:
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
                 miner_hotkey=payload.miner_hotkey,
+                executor_id=executor_id,
                 nonce=nonce_hex,
             )
             
@@ -1956,29 +2014,37 @@ class MinerService:
                         payload,
                         "Miner returned zero executors in AcceptSSHKeyRequest",
                     )
-                tasks = [
-                    asyncio.create_task(
-                        asyncio.wait_for(
-                            self.task_service.create_task(
-                                miner_info=payload,
-                                executor_info=executor_info,
-                                keypair=my_key,
-                                private_key=private_key.decode("utf-8"),
-                                public_key=public_key.decode("utf-8"),
-                                encrypted_files=encrypted_files,
-                                rented_data=rented_data,
-                                default_docker_image_digests=default_docker_image_digests,
-                                executor_image_snapshot=executor_image_snapshot,
-                                attestation_nonce=attestation_nonce,
-                            ),
-                            timeout=settings.JOB_TIME_OUT - 120
+                executors = (
+                    self._claim_for_cycle(msg.executors, default_extra)
+                    if executor_id is None
+                    else msg.executors
+                )
+                try:
+                    tasks = [
+                        asyncio.create_task(
+                            asyncio.wait_for(
+                                self.task_service.create_task(
+                                    miner_info=payload,
+                                    executor_info=executor_info,
+                                    keypair=my_key,
+                                    private_key=private_key.decode("utf-8"),
+                                    public_key=public_key.decode("utf-8"),
+                                    encrypted_files=encrypted_files,
+                                    rented_data=rented_data,
+                                    default_docker_image_digests=default_docker_image_digests,
+                                    executor_image_snapshot=executor_image_snapshot,
+                                    attestation_nonce=attestation_nonce,
+                                ),
+                                timeout=settings.JOB_TIME_OUT - 120
+                            )
                         )
-                    )
-                    for executor_info in msg.executors
-                ]
+                        for executor_info in executors
+                    ]
 
-                raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-                results = self._filter_task_results(msg.executors, raw_results, default_extra)
+                    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    self._release_cycle_claims(executors)
+                results = self._filter_task_results(executors, raw_results, default_extra)
                 results.extend(
                     self._build_manual_rental_results(payload, rented_data, existing=results)
                 )
@@ -2009,7 +2075,7 @@ class MinerService:
                         my_key=my_key,
                         public_key=public_key,
                         miner_hotkey=payload.miner_hotkey,
-                        executor_id=None,
+                        executor_id=executor_id,
                         log_extra=default_extra,
                     )
 
