@@ -39,6 +39,7 @@ from .checks import (
     ExecutorImageCheck,
     FinalizeCheck,
     GpuCountCheck,
+    GpuFaultProbeCheck,
     GpuFingerprintCheck,
     GpuModelValidCheck,
     GpuPowerLimitCheck,
@@ -317,6 +318,9 @@ class PipelineFactory:
                 VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),
+                # DAH-3035: the kernel-fault probe right after the matmul it complements — same idle,
+                # capability-verified population, same filler skip. Flag-gated, shadow-first, off by default.
+                GpuFaultProbeCheck(),
                 # DAH-2265 Plan 2: advisory, non-fatal — observes whether the executor has
                 # the recommended default image pre-pulled (DOCKER_PULL no-op). Runs here,
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
@@ -381,6 +385,7 @@ class PipelineFactory:
                 # VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),
+                GpuFaultProbeCheck(),
                 RentalVerificationCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),

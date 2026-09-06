@@ -9,6 +9,7 @@ from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
 from .finalize import FinalizeCheck
 from .gpu_count import GpuCountCheck
+from .gpu_fault_probe import GpuFaultProbeCheck
 from .gpu_fingerprint import GpuFingerprintCheck
 from .gpu_model_valid import GpuModelValidCheck
 from .gpu_power_limit import GpuPowerLimitCheck
@@ -43,6 +44,7 @@ __all__ = [
     "ExecutorImageCheck",
     "FinalizeCheck",
     "GpuCountCheck",
+    "GpuFaultProbeCheck",
     "GpuFingerprintCheck",
     "GpuModelValidCheck",
     "GpuPowerLimitCheck",

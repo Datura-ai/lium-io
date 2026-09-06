@@ -270,6 +270,13 @@ class Settings(BaseSettings):
     FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
     )
+    # DAH-3035 — a ~6 s kernel-fault probe after the matmul: indexed/scattered access, atomics, a pointer
+    # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML ECC/row-remap deltas.
+    # A card that faults under indexed access (Blender "Illegal address in CUDA queue", 6 Sep) passes the
+    # sequential matmul. CHECK runs it and logs the verdict; ENFORCEMENT lets a fault zero the score. Both
+    # default off: the probe is new GPU work on every idle node per cycle, so it starts as an opt-in shadow.
+    GPU_FAULT_PROBE_CHECK_ENABLED: bool = Field(env="GPU_FAULT_PROBE_CHECK_ENABLED", default=False)
+    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")

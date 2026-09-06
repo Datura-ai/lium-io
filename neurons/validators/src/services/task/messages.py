@@ -1013,6 +1013,53 @@ class CapabilityMessages:
     )
 
 
+class GpuFaultProbeMessages:
+    """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (GPU_FAULT_PROBE_CHECK_ENABLED
+    without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only
+    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+
+    DISABLED = MessageTemplate(
+        event="GPU kernel-fault probe disabled",
+        reason="GPU_FAULT_PROBE_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    FILLER_SKIPPED = MessageTemplate(
+        event="GPU kernel-fault probe skipped for active filler",
+        reason="GPU_FAULT_PROBE_SKIPPED_ACTIVE_FILLER",
+        severity="info",
+        category="policy",
+        impact="Active filler runtime preserved; the probe would compete for VRAM.",
+    )
+    PROBE_OK = MessageTemplate(
+        event="GPU kernel-fault probe passed",
+        reason="GPU_FAULT_PROBE_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    PROBE_FAILED = MessageTemplate(
+        event="GPU kernel-fault probe failed",
+        reason="GPU_FAULT_PROBE_FAILED",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "A GPU returned a CUDA error, wrong data or hung under indexed memory access, or NVML reported "
+            "new uncorrected ECC errors / remapped rows. Check `nvidia-smi -q -d ECC,ROW_REMAPPER` and the host "
+            "`dmesg` for NVRM Xid lines; reseat or replace the card, or reset it (`nvidia-smi -r`) and wait one cycle."
+        ),
+    )
+    UNKNOWN = MessageTemplate(
+        event="GPU kernel-fault probe could not run",
+        reason="GPU_FAULT_PROBE_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed without penalty",
+    )
+
+
 class ScoreMessages:
     SCORE_COMPUTED = MessageTemplate(
         event="Scores computed",
