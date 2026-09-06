@@ -90,6 +90,25 @@ async def test_expired_snapshot_is_fully_replaced(monkeypatch):
     assert bulk.await_count == 2
 
 
+async def test_wave_sees_node_added_after_a_recent_rental_refresh(monkeypatch):
+    # DAH-2957, prod 4 Sep: a rental refreshed the snapshot at T, the provider added a
+    # node at T+38s, the validator wave came at T+101s and was served the T snapshot.
+    clock = Mock(monotonic=lambda: 1000.0)
+    monkeypatch.setattr("clients.miner_portal_api.time", clock)
+    bulk = AsyncMock(return_value=SNAPSHOT)
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
+    await MinerPortalAPI.fetch_executors("hotkey-a", "aaaa-1")  # rental key-submit at T
+
+    added = {"id": "aaaa-new", "validator_hotkey": "v1"}
+    bulk.return_value = {**SNAPSHOT, "hotkey-a": SNAPSHOT["hotkey-a"] + [added]}
+    clock.monotonic = lambda: 1101.0  # wave start, T+101s
+
+    executors_a = await MinerPortalAPI.fetch_executors("hotkey-a", None)
+
+    assert added in executors_a
+    assert bulk.await_count == 2
+
+
 async def test_stale_snapshot_served_when_refresh_fails(monkeypatch):
     bulk = AsyncMock(return_value=SNAPSHOT)
     monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
