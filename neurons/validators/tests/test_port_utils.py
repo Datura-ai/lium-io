@@ -1,6 +1,5 @@
 import json
 
-import pytest
 
 from services.port_utils import DEFAULT_PORT_RANGE, get_all_ports
 

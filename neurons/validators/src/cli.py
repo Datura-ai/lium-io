@@ -8,7 +8,6 @@ import click
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import configure_logs_of_other_modules, _m, get_extra_info, get_logger
-from core.validator import Validator
 from clients.subtensor_client import SubtensorClient
 from services.default_docker_image_digest_service import (
     fetch_default_image_digests,

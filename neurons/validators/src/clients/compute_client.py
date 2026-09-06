@@ -9,7 +9,6 @@ import bittensor
 import pydantic
 import tenacity
 import websockets
-from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
     DeliveryStamps,
@@ -239,7 +238,7 @@ class ComputeClient:
                         )
                         await asyncio.sleep(reconnect_delay)
                         reconnect_delay = min(reconnect_delay * 2, max_delay)
-            except Exception as exc:
+            except Exception:
                 logger.error(
                     _m(
                         "Error connecting to compute app, retrying...",
@@ -288,7 +287,7 @@ class ComputeClient:
                     try:
                         channel = message['channel'].decode('utf-8')
                         data = json.loads(message['data'])
-                    except Exception as exc:
+                    except Exception:
                         continue
 
                     logger.info(

@@ -14,7 +14,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import bittensor
 from pydantic import BaseModel, Field
 
 from core.config import get_total_burn_emission, settings, shared_client

@@ -7,7 +7,6 @@ import bittensor
 from core.config import settings
 from core.validator import Validator
 from incentive.config import IncentiveConfig
-from incentive.factory import IncentiveFactory
 from services.task_service import JobResult
 
 

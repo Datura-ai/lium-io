@@ -13,7 +13,6 @@ from typing import Optional
 import asyncio
 import aiohttp
 
-from bittensor import AsyncSubtensor
 from core.config import settings
 from core.utils import get_logger, _m
 from clients.subtensor_client import SubtensorClient
