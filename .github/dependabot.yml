@@ -1,0 +1,14 @@
+# neurons/executor/dstacktee/key-provider carries a Cargo.lock with no Cargo.toml: the
+# manifest lives in the upstream repository the Dockerfile clones, the lock only pins its
+# dependencies. The dependency graph still indexes the lock, so every Dependabot security
+# job for it fails with "Cargo.toml not found" (4 of 4 runs). Skip that path; there is no
+# other Cargo project, so version updates stay off.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+    exclude-paths:
+      - neurons/executor/dstacktee/key-provider/**
