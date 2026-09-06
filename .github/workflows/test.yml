@@ -126,7 +126,6 @@ jobs:
     name: ruff format (${{ matrix.package }})
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -134,6 +133,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/ruff-action@v3
+        continue-on-error: true
         with:
           version: "0.5.1"
           args: format --check
