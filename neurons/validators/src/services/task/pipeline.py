@@ -198,6 +198,32 @@ class LoggerSink:
         getattr(self.logger, level)(_m(event.event, extra=event.model_dump(mode="json")))
 
 
+# DAH-3012: steps shorter than this are left out of the final event's summary — they are the
+# ~25 sub-second bookkeeping checks; the 6–8 that carry the run's time are what a provider (and a
+# Loki query) needs to see, in ~300 bytes.
+STEP_SUMMARY_MIN_MS = 1000
+
+
+def summarize_steps(
+    steps: list[tuple[str, int]], elapsed_time_ms: int, failed_check_id: str | None = None
+) -> dict[str, Any]:
+    """What the run spent its time on, for the last event's `what_we_saw` (DAH-3012).
+
+    The last event is the one the backend stores as the executor's `log_text` and the portal shows
+    as `last_validation`, so this is how per-step durations reach the provider without a new
+    field anywhere downstream.
+    """
+    summary: dict[str, Any] = {
+        "steps": {
+            check_id: round(ms / 1000, 1) for check_id, ms in steps if ms >= STEP_SUMMARY_MIN_MS
+        },
+        "steps_total_s": round(elapsed_time_ms / 1000, 1),
+    }
+    if failed_check_id:
+        summary["steps_failed"] = failed_check_id
+    return summary
+
+
 class Pipeline:
     def __init__(self, checks: List[Check], sink: EventSink):
         self.checks = checks
@@ -207,8 +233,10 @@ class Pipeline:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()
+        steps: list[tuple[str, int]] = []
+        last_index = len(self.checks) - 1
 
-        for chk in self.checks:
+        for index, chk in enumerate(self.checks):
             check_start_time = time.perf_counter()
             res = await chk.run(current_ctx)
             check_end_time = time.perf_counter()
@@ -218,6 +246,15 @@ class Pipeline:
 
             res.event.context["execution_time_ms"] = execution_time_ms
             res.event.context["elapsed_time_ms"] = elapsed_time_ms
+            steps.append((chk.check_id, execution_time_ms))
+
+            failed = not res.passed and getattr(chk, "fatal", False)
+            if failed or res.halt or index == last_index:
+                res.event.what_we_saw.update(
+                    summarize_steps(
+                        steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                    )
+                )
 
             await self.sink.emit(res.event)
             events.append(res.event)
@@ -225,7 +262,7 @@ class Pipeline:
             if res.updates:
                 current_ctx = current_ctx.model_copy(update=res.updates)
 
-            if not res.passed and getattr(chk, "fatal", False):
+            if failed:
                 return False, events, current_ctx
 
             if res.halt:
