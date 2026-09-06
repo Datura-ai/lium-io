@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Annotated
 
@@ -43,7 +44,10 @@ class TaskService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
+        self.backend_client = backend_client
         self.wallet = settings.get_bittensor_wallet()
+        # DAH-3019: the start reports run in the background; the set keeps them referenced until done.
+        self._start_reports: set[asyncio.Task] = set()
 
         # Initialize pipeline factory with all required services
         self.pipeline_factory = PipelineFactory(
@@ -56,6 +60,28 @@ class TaskService:
             backend_client=backend_client,
             pod_recovery=pod_recovery,
         )
+
+    def report_verification_started(
+        self,
+        pipeline_id: str,
+        miner_info: MinerJobRequestPayload,
+        executor_info: ExecutorSSHInfo,
+    ) -> None:
+        """Tell the backend the pipeline for this executor is starting (DAH-3019), off the hot path.
+
+        Scheduled, not awaited: the report must not add its round trip (or a slow backend's 10-s
+        timeout) to every executor's pipeline. The client method swallows every error.
+        """
+        task = asyncio.create_task(
+            self.backend_client.report_verification_started(
+                executor_info.uuid,
+                job_batch_id=miner_info.job_batch_id,
+                pipeline_id=pipeline_id,
+                miner_hotkey=miner_info.miner_hotkey,
+            )
+        )
+        self._start_reports.add(task)
+        task.add_done_callback(self._start_reports.discard)
 
     async def create_task(
         self,
@@ -128,6 +154,8 @@ class TaskService:
                     tdx_attestation_passed=attestation_passed,
                     gpu_attestation_passed=gpu_attestation_passed,
                 )
+
+                self.report_verification_started(base_ctx.pipeline_id, miner_info, executor_info)
 
                 # Build and run validation pipeline
                 # Use dry run pipeline if DRY_RUN mode is enabled to avoid state changes
