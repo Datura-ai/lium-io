@@ -51,3 +51,5 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "test/**" = ["D", "F403", "F405"]
+# vendored NVML bindings: `from ctypes import *` is how the upstream pynvml module is written
+"neurons/validators/src/miner_jobs/machine_scrape.py" = ["F403", "F405"]
