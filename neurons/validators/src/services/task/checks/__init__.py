@@ -4,6 +4,7 @@ from .cached_template_verification import CachedTemplateVerificationCheck
 from .capability import CapabilityCheck
 from .collateral import CollateralCheck
 from .cpu_truth import CpuTruthCheck
+from .disk_health import DiskHealthCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
@@ -38,6 +39,7 @@ __all__ = [
     "CapabilityCheck",
     "CollateralCheck",
     "CpuTruthCheck",
+    "DiskHealthCheck",
     "CustomBuildOrphanSweepCheck",
     "DuplicateExecutorCheck",
     "ExecutorImageCheck",

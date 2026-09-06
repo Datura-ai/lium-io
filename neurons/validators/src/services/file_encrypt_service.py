@@ -147,6 +147,20 @@ ORIGINAL_KEYS = {
     'data_container_cap_eff': "container_cap_eff",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
+    # DAH-2928: disk health. Prefixed so no existing key is a substring (ecrypt_miner_job_files
+    # renames by sequential str.replace); the longer of two keys sharing a prefix comes first.
+    'data_disk_health_scrape_error': "disk_health_scrape_error",
+    'data_disk_health': "disk_health",
+    'dh_docker_root_dir': "docker_root_dir",
+    'dh_read_only_mounts': "read_only_mounts",
+    'dh_write_probe_error': "write_probe_error",
+    'dh_write_probe': "write_probe",
+    'dh_kernel_io_error_lines': "kernel_io_error_lines",
+    'dh_kernel_io_errors': "kernel_io_errors",
+    'dh_kernel_log_error': "kernel_log_error",
+    'dh_block_io_errors': "block_io_errors",
+    'dh_nvme_states': "nvme_states",
+    'dh_smart': "smart",
 }
 
 
@@ -325,6 +339,19 @@ class FileEncryptService:
             'data_container_cap_eff': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
+            # DAH-2928 - longer keys before the key they extend (prefix rule above)
+            'data_disk_health_scrape_error': "",
+            'data_disk_health': "",
+            'dh_docker_root_dir': "",
+            'dh_read_only_mounts': "",
+            'dh_write_probe_error': "",
+            'dh_write_probe': "",
+            'dh_kernel_io_error_lines': "",
+            'dh_kernel_io_errors': "",
+            'dh_kernel_log_error': "",
+            'dh_block_io_errors': "",
+            'dh_nvme_states': "",
+            'dh_smart': "",
         }
 
         # Generate dictionary key mapping on validator side

@@ -254,6 +254,42 @@ class GpuVramMessages:
     )
 
 
+class DiskHealthMessages:
+    NOT_WRITABLE = MessageTemplate(
+        event="Executor disk refuses writes",
+        reason="DISK_NOT_WRITABLE",
+        severity="error",
+        category="env",
+        impact="Job skipped; score set to 0",
+        remediation="The filesystem holding the docker root is mounted read-only or returned EROFS/EIO "
+        "to a write probe. Check dmesg for I/O errors, run a filesystem check, replace the disk if "
+        "SMART reports a failure, then remount read-write and restart the executor.",
+    )
+    ERRORS_REPORTED = MessageTemplate(
+        event="Executor disk reports errors",
+        reason="DISK_ERRORS_REPORTED",
+        severity="warning",
+        category="env",
+        impact="Proceed; readings forwarded to the backend in specs.disk_health",
+        remediation="The kernel log, a sysfs error counter, an NVMe controller state or SMART reports "
+        "disk errors on this host. Check dmesg and smartctl before the disk fails outright.",
+    )
+    UNKNOWN = MessageTemplate(
+        event="Executor disk health not reported",
+        reason="DISK_HEALTH_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Executor disk health ok",
+        reason="DISK_HEALTH_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",
