@@ -1,0 +1,43 @@
+# Code owners — GitHub requests a review from the people on the LAST matching line when a PR touches the path.
+# Two owners per path so one absence does not block; one approval satisfies the branch rule.
+# Proposal from 180-day commit/line evidence per path and 90-day merged-PR review data (DAH-3022);
+# lines marked "TODO owner: confirm" are the ones where the evidence is thin or disagrees with the reviewer map.
+# How reviews work here: .github/REVIEWING.md
+
+# 166 / 98 validator commits; 72 / 40 approvals of 148 merged validator PRs
+*                                           @arhangel66 @taiberium
+
+# 166 / 98 commits (180 d), 12 / 17 in the last 30 d; 72 / 40 approvals
+# TODO owner: confirm — the 5 Sep map said validator → jam6099 / pixel29913; the commit and review evidence says arhangel66 / taiberium
+/neurons/validators/                        @arhangel66 @taiberium
+
+# 27 / 6 commits (pixel29913 5 of 6 in the last 30 d); 14 / 4 approvals
+# TODO owner: confirm — the 5 Sep map said executor → jam6099 (5 commits, 0 approvals)
+/neurons/executor/                          @arhangel66 @pixel29913
+
+# 9 commits (last Jul 2026); approvers fortunelucky777 3, taiberium 1
+# TODO owner: confirm — nobody touched this path in the last 30 d
+/neurons/miners/                            @arhangel66 @taiberium
+
+# 1 commit in 180 d (fortunelucky777); approvers pixel29913 / arhangel66
+# TODO owner: confirm — bus factor 1
+/datura/                                    @arhangel66 @pixel29913
+
+# 0 commits in 180 d; a loop PR is the only activity
+# TODO owner: confirm — untouched — owner decides who owns it
+/watchtower/                                @arhangel66
+
+# 0 commits in 180 d (install scripts)
+# TODO owner: confirm — untouched — owner decides
+/scripts/                                   @arhangel66
+
+# 1 commit in 180 d
+# TODO owner: confirm — untouched 90 d
+/docs/                                      @arhangel66
+
+# contributing docs, 0 commits in 180 d
+# TODO owner: confirm — untouched
+/contrib/                                   @arhangel66
+
+# jam6099 3 of 5 workflow commits; CI/infra per the 5 Sep map
+/.github/                                   @jam6099 @pixel29913
