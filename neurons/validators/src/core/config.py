@@ -111,6 +111,12 @@ class Settings(BaseSettings):
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
     REDIS_USERNAME: str | None = Field(env="REDIS_USERNAME", default=None)
     REDIS_PASSWORD: str | None = Field(env="REDIS_PASSWORD", default=None)
+    # DAH-3006: RedisService wraps every command in one process-wide asyncio.Lock. In a ~500-executor
+    # wave the lock's FIFO queue drains at ~0.4 s per command (each hold spans several starved
+    # event-loop iterations), so a 1-ms SISMEMBER waits p50 73 s (Loki, 6 Sep 12:03 wave) — ~45 %
+    # of the median idle pipeline. Off: commands go straight to the bounded BlockingConnectionPool
+    # (DAH-2475), which is what serialises them when it must. On = today's behaviour.
+    REDIS_COMMAND_LOCK_ENABLED: bool = Field(env="REDIS_COMMAND_LOCK_ENABLED", default=True)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
