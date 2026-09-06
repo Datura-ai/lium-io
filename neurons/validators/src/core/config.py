@@ -205,6 +205,21 @@ class Settings(BaseSettings):
         default=True,
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
+    # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
+    # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
+    # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
+    # SCORED cycle expensive to fake, and the next scored cycle runs them anyway. Only a caller that
+    # passes `first_pass=True` to TaskService.create_task gets the fast path, and only with this
+    # flag on; the wave never does, so every scored verification is unchanged. Measured (Loki,
+    # 2–6 Sep, idle runs): matmul p50 26 s (74 s on the fresh dogfood node), VerifyX p50 78 s.
+    FIRST_PASS_FAST_PATH_ENABLED: bool = Field(env="FIRST_PASS_FAST_PATH_ENABLED", default=False)
+    # The matmul is sized from min(card VRAM, this) instead of the whole card: same challenge,
+    # seal and UUID check, 5–17x less data to generate and copy.
+    FIRST_PASS_MATMUL_VRAM_MB: int = Field(env="FIRST_PASS_MATMUL_VRAM_MB", default=8192)
+    # VerifyX challenge config for the first pass (defaults 128 GB / 5 GB in VerifyXSettings). The
+    # measurements are still taken and published; only the amount of RAM/disk written shrinks.
+    FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
+    FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both

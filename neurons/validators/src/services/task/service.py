@@ -69,8 +69,13 @@ class TaskService:
         default_docker_image_digests: dict[str, str],
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         attestation_nonce: AttestationNonce | None = None,
+        first_pass: bool = False,
     ):
-        """New pipeline-based validation task implementation."""
+        """New pipeline-based validation task implementation.
+
+        `first_pass` (DAH-3011): the caller knows this is the executor's first, unscored verification
+        (the express lane, DAH-2958). The wave never sets it.
+        """
         attestation_digest = None
         tee_type = None
         attestation_passed = False
@@ -127,6 +132,7 @@ class TaskService:
                     executor_image_snapshot=executor_image_snapshot,
                     tdx_attestation_passed=attestation_passed,
                     gpu_attestation_passed=gpu_attestation_passed,
+                    first_pass=first_pass,
                 )
 
                 # Build and run validation pipeline

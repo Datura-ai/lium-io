@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from core.config import settings
+
 from ..messages import CapabilityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -39,6 +41,11 @@ class CapabilityCheck:
 
         validation_service = ctx.services.validation
 
+        # DAH-3011: a first, unscored verification sizes the matmul from a VRAM budget instead of
+        # the whole card (same challenge/seal/UUID check). The keyword is only passed on that path
+        # so the scored call is byte-for-byte today's.
+        sizing = {"vram_budget_mb": settings.FIRST_PASS_MATMUL_VRAM_MB} if ctx.config.first_pass else {}
+
         result = None
         failure_reason = None
         try:
@@ -47,16 +54,20 @@ class CapabilityCheck:
                 executor_info=ctx.executor,
                 default_extra=ctx.default_extra,
                 machine_spec=specs,
+                **sizing,
             )
         except Exception as exc:
             failure_reason = str(exc)
 
         if result and result.success:
+            what: dict = {"metrics": result.metrics}
+            if sizing:
+                what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]
             event = render_message(
                 Msg.VERIFY_OK,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"metrics": result.metrics},
+                what=what,
             )
             # Carry FP32 TFLOPS metrics into pipeline state so ResultHandler can nest them
             # in the published specs. Only on success and only when present (fail-safe:

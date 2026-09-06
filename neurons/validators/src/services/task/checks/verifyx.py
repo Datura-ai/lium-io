@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
+from core.config import settings
+
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .network_ema import compute_ema
@@ -66,11 +68,18 @@ class VerifyXCheck:
                 updates={"state": replace(ctx.state, specs=updated_specs)},
             )
 
+        # DAH-3011: a first, unscored verification writes less RAM/disk (the measurements are still
+        # taken and published). The keyword is only passed on that path so the scored call is
+        # byte-for-byte today's.
+        sizing = (
+            {"challenge_config_overrides": _first_pass_challenge_config()} if ctx.config.first_pass else {}
+        )
         result = await verifyx_service.validate_verifyx_and_process_job(
             shell=ctx.services.shell,
             executor_info=ctx.executor,
             default_extra=ctx.default_extra,
             machine_spec=specs,
+            **sizing,
         )
 
         # Extract errors with clear priority: data.errors > result.error
@@ -135,10 +144,31 @@ class VerifyXCheck:
             )
             if errors:
                 event.what_we_saw["errors"] = errors
+            if sizing:
+                event.what_we_saw["first_pass_challenge_config"] = sizing["challenge_config_overrides"]
 
             updated_state = replace(ctx.state, specs=updated_specs)
 
             ema_download = updated_specs["network"]["ema_verifyx_download_speed"]
+            never_measured = prev_ema is None or prev_ema.ema_verifyx_download_speed is None
+            if ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS and ctx.config.first_pass and never_measured:
+                # DAH-3011: the first pass is never scored, and a fresh node's single cold sample fails
+                # this gate 14 % of the time (DAH-2959). Publish the raw sample, leave the EMA unseeded
+                # so the first SCORED cycle bootstraps from a warm sample and enforces the gate, and say
+                # so on the event. A known host, or any scored cycle, never takes this branch.
+                deferred_network = {
+                    key: value
+                    for key, value in updated_specs["network"].items()
+                    if key not in ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
+                }
+                updated_state = replace(
+                    ctx.state, specs={**updated_specs, "network": deferred_network}
+                )
+                event.what_we_saw["bandwidth_gate"] = "deferred_to_first_scored_cycle"
+                event.what_we_saw["first_sample_download_speed_mbps"] = download_speed
+                event.what_we_saw["min_download_speed_mbps"] = MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+                return CheckResult(passed=True, event=event, updates={"state": updated_state})
+
             if ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
                 slow_event = render_message(
                     Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
@@ -184,6 +214,13 @@ _FAILURE_TEMPLATE_BY_CLASS = {
     "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
     "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
 }
+
+
+def _first_pass_challenge_config() -> dict[str, int]:
+    return {
+        "memory_max_test_gb": settings.FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB,
+        "storage_throughput_test_gb": settings.FIRST_PASS_VERIFYX_STORAGE_TEST_GB,
+    }
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:
