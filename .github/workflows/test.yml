@@ -1,22 +1,21 @@
 name: Tests
 
 on:
+  # no `paths:` filter any more: a required status check that never reports blocks the
+  # merge button, and the miners tree was outside the old filter (lium-io#1280 ran no test
+  # job at all). 4.7 min on a docs-only PR is cheaper than a required check that never comes.
   pull_request:
     branches: [main, dev]
-    paths:
-      - 'neurons/validators/**'
-      - 'neurons/executor/**'
-      - 'datura/**'
-      - '.github/workflows/test.yml'
   push:
     branches: [main]
-    paths:
-      - 'neurons/validators/**'
-      - 'neurons/executor/**'
-      - 'datura/**'
 
 permissions:
   contents: read
+
+# a second push to the same PR cancels the first run
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validators:
@@ -85,3 +84,64 @@ jobs:
 
       - name: Run tests
         run: mkdir -p tmp && pdm run pytest tests/ -v --tb=short
+
+  miners:
+    # neurons/miners/tests never ran in CI; the miner talks to the portal API and the
+    # validators, so a broken client ships to every provider on the next tag
+    name: Miners Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: neurons/miners
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pdm
+        uses: pdm-project/setup-pdm@v4
+        with:
+          cache: true
+          cache-dependency-path: neurons/miners/pdm.lock
+
+      - name: Install dependencies
+        run: pdm install
+
+      - name: Run tests
+        run: pdm run pytest tests/ -v --tb=short
+
+  lint:
+    # ruff format is the repo's pre-commit hook (.pre-commit-config.yaml, same version pin)
+    # and CI never ran it. `format --check` only, like lium-platform: `ruff check` has open
+    # findings and is the team's call to gate on.
+    name: ruff format (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [validators, executor, miners]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          version: "0.5.1"
+          args: format --check
+          src: neurons/${{ matrix.package }}
+
+  tests-ok:
+    # the one context to require in the ruleset; lium-io requires no status check today
+    name: tests-ok
+    needs: [validators, executor, miners, lint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
