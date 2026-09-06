@@ -119,11 +119,14 @@ jobs:
 
   lint:
     # ruff format is the repo's pre-commit hook (.pre-commit-config.yaml, same version pin)
-    # and CI never ran it. `format --check` only, like lium-platform: `ruff check` has open
-    # findings and is the team's call to gate on.
+    # and CI never ran it. REPORT-ONLY: on 6 Sep 2026 main had 207/301 validators, 30/51
+    # executor and 20/43 miners files unformatted, so gating would block every PR until one
+    # `ruff format` commit per package lands; drop continue-on-error and add `lint` to
+    # tests-ok after that. `ruff check` is left out: it has open findings too.
     name: ruff format (${{ matrix.package }})
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -137,9 +140,10 @@ jobs:
           src: neurons/${{ matrix.package }}
 
   tests-ok:
-    # the one context to require in the ruleset; lium-io requires no status check today
+    # the one context to require in the ruleset; lium-io requires no status check today.
+    # `lint` joins once the packages are formatted (see above).
     name: tests-ok
-    needs: [validators, executor, miners, lint]
+    needs: [validators, executor, miners]
     if: always()
     runs-on: ubuntu-latest
     steps:
