@@ -10,6 +10,7 @@ import secrets
 import shlex
 import time
 from collections.abc import Iterator
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
@@ -4006,6 +4007,30 @@ class DockerService:
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
 
+    @staticmethod
+    async def _connect_ssh_and_docker(
+        connections: AsyncExitStack,
+        ssh_connect,
+        docker_connect,
+    ) -> tuple[asyncssh.SSHClientConnection, RentalDockerSdkClient]:
+        """DAH-3004: enter both connection contexts at once on the caller's exit stack.
+
+        ``gather`` waits for both outcomes, so whichever succeeded is already registered on
+        ``connections`` when the first failure is re-raised — the stack closes it on the way out
+        and nothing is leaked, which a bare ``gather`` (one coroutine still connecting while the
+        exception propagates) would not guarantee.
+        """
+        outcomes = await asyncio.gather(
+            connections.enter_async_context(ssh_connect),
+            connections.enter_async_context(docker_connect),
+            return_exceptions=True,
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        ssh_client, docker_client = outcomes
+        return ssh_client, docker_client
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -4224,22 +4249,29 @@ class DockerService:
             # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
             # split for this connect (host/network vs. remote sshd) without
             # changing how the connection is established.
-            async with (
-                connect_with_phase_timing(
-                    log_extra=default_extra,
-                    host=executor_info.address,
-                    port=executor_info.ssh_port,
-                    username=executor_info.ssh_username,
-                    client_keys=[pkey],
-                    known_hosts=known_hosts_policy,
-                    keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
-                    keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
-                ) as ssh_client,
-                self.rental_docker_client_factory.connect(
-                    executor_info=executor_info,
-                    private_key=private_key,
-                ) as docker_client,
-            ):
+            #
+            # DAH-3004: the asyncssh session and the Docker-SDK-over-SSH client are two
+            # independent SSH handshakes to the same host; opened one after the other they
+            # cost p50 2.1 s / p90 4.3 s per rent (container_profiler_events, 7 d). Open them
+            # together: same connections, same order of use, roughly half the wait.
+            async with AsyncExitStack() as connections:
+                ssh_client, docker_client = await self._connect_ssh_and_docker(
+                    connections,
+                    connect_with_phase_timing(
+                        log_extra=default_extra,
+                        host=executor_info.address,
+                        port=executor_info.ssh_port,
+                        username=executor_info.ssh_username,
+                        client_keys=[pkey],
+                        known_hosts=known_hosts_policy,
+                        keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
+                        keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
+                    ),
+                    self.rental_docker_client_factory.connect(
+                        executor_info=executor_info,
+                        private_key=private_key,
+                    ),
+                )
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
                 prev_timestamp = now_ms()
