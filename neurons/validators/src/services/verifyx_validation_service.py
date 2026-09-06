@@ -152,7 +152,10 @@ class VerifyXValidationService:
         executor_info,
         default_extra: dict,
         machine_spec: dict,
+        challenge_config_overrides: dict | None = None,
     ):
+        # challenge_config_overrides (DAH-3011): keys of the challenge `config` block to replace for
+        # this run — a first, unscored verification writes less RAM/disk. None = today's config.
         try:
             # Verify checksum before proceeding with validation
             local_checksum = sha256_from_path(self.lib_name)
@@ -171,18 +174,21 @@ class VerifyXValidationService:
             seed = random.getrandbits(64)
             verifyx_validator = VerifyXValidator(self.lib_name, seed)
 
+            challenge_config = {
+                "memory_allocation_percentage": settings.verifyx.MEMORY_ALLOCATION_PERCENTAGE,
+                "memory_min_test_gb": settings.verifyx.MEMORY_MIN_TEST_GB,
+                "memory_max_test_gb": settings.verifyx.MEMORY_MAX_TEST_GB,
+                "storage_min_available_gb": settings.verifyx.STORAGE_MIN_AVAILABLE_GB,
+                "storage_throughput_test_gb": settings.verifyx.STORAGE_THROUGHPUT_TEST_GB,
+                "network_timeout_seconds": settings.verifyx.NETWORK_TIMEOUT_SECONDS,
+                "enable_xet_challenge": settings.verifyx.ENABLE_XET_CHALLENGE,
+            }
+            if challenge_config_overrides:
+                challenge_config.update(challenge_config_overrides)
             challenge_input = {
                 "seed": seed,
                 "machine_info": gpu_info,
-                "config": {
-                    "memory_allocation_percentage": settings.verifyx.MEMORY_ALLOCATION_PERCENTAGE,
-                    "memory_min_test_gb": settings.verifyx.MEMORY_MIN_TEST_GB,
-                    "memory_max_test_gb": settings.verifyx.MEMORY_MAX_TEST_GB,
-                    "storage_min_available_gb": settings.verifyx.STORAGE_MIN_AVAILABLE_GB,
-                    "storage_throughput_test_gb": settings.verifyx.STORAGE_THROUGHPUT_TEST_GB,
-                    "network_timeout_seconds": settings.verifyx.NETWORK_TIMEOUT_SECONDS,
-                    "enable_xet_challenge": settings.verifyx.ENABLE_XET_CHALLENGE,
-                },
+                "config": challenge_config,
             }
 
             cipher_text = verifyx_validator.generate_challenge(challenge_input)
