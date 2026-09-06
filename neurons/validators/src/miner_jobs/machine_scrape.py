@@ -711,6 +711,75 @@ def cloudflare_speed():
     return data
 
 
+# CDN throughput probe (DAH-2922). The speed-test figures above are what the listing shows today, and
+# on the fleet they sit in a few-hundred-Mbps band that does not separate a node pulling weights at
+# 45 MB/s from one pulling at 4 GB/s (a 60x spread measured on the same checkpoint). A few parallel
+# streams against a CDN edge - the way hf_xet/aria2 pull - is the closest cheap proxy, so it is
+# reported next to the existing numbers, never in their place: nothing here feeds incentive.
+CDN_PROBE_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=50000000"
+CDN_PROBE_UPLOAD_URL = "https://speed.cloudflare.com/__up"
+CDN_PROBE_DOWNLOAD_STREAMS = 4
+CDN_PROBE_UPLOAD_STREAMS = 2
+CDN_PROBE_UPLOAD_MB_PER_STREAM = 25
+CDN_PROBE_MAX_SECONDS = 15
+CURL_SAMPLE_FORMAT = "%{size_download} %{size_upload} %{time_total}\\n"
+
+
+def aggregate_curl_throughput_mbps(output, use_upload_size):
+    """Bytes moved by every stream over the slowest stream's wall time, in Mbps.
+
+    The streams start within milliseconds of each other, so max(time_total) is the wall time of
+    the batch and the ratio slightly under-reports - the safe side for a figure a renter reads as
+    "at least this".
+    """
+    total_bytes = 0.0
+    wall_seconds = 0.0
+    samples = 0
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        total_bytes += float(parts[1] if use_upload_size else parts[0])
+        wall_seconds = max(wall_seconds, float(parts[2]))
+        samples += 1
+    if samples == 0 or wall_seconds <= 0 or total_bytes <= 0:
+        raise RuntimeError(f"no usable curl samples in {output!r}"[:300])
+    return round(total_bytes * 8 / wall_seconds / 1_000_000, 2)
+
+
+def cdn_bandwidth_probe():
+    """Parallel-stream ingress and egress against a CDN edge, in Mbps; failures are reported, not raised."""
+    data = {
+        "ncdn_down": None,
+        "ncdn_up": None,
+        "ncdn_streams": CDN_PROBE_DOWNLOAD_STREAMS,
+    }
+    errors = []
+    curl_base = f"curl -o /dev/null -sS -w '{CURL_SAMPLE_FORMAT}' --max-time {CDN_PROBE_MAX_SECONDS}"
+    try:
+        download_cmd = ""
+        for _stream in range(CDN_PROBE_DOWNLOAD_STREAMS):
+            download_cmd += f"{curl_base} '{CDN_PROBE_DOWNLOAD_URL}' & "
+        download_cmd += "wait"
+        data["ncdn_down"] = aggregate_curl_throughput_mbps(run_cmd(download_cmd), False)
+    except Exception as exc:
+        errors.append(f"download: {exc!r}"[:200])
+    try:
+        upload_cmd = ""
+        for _stream in range(CDN_PROBE_UPLOAD_STREAMS):
+            upload_cmd += (
+                f"dd if=/dev/zero bs=1M count={CDN_PROBE_UPLOAD_MB_PER_STREAM} 2>/dev/null | "
+                f"{curl_base} -X POST --data-binary @- '{CDN_PROBE_UPLOAD_URL}' & "
+            )
+        upload_cmd += "wait"
+        data["ncdn_up"] = aggregate_curl_throughput_mbps(run_cmd(upload_cmd), True)
+    except Exception as exc:
+        errors.append(f"upload: {exc!r}"[:200])
+    if errors:
+        data["ncdn_error"] = "; ".join(errors)
+    return data
+
+
 def benchmark_network_speed():
     """Run network speed methods in fallback order, stopping once both metrics are satisfied.
 
@@ -746,12 +815,17 @@ def benchmark_network_speed():
             upload = result["upload_speed"]
             upload_source = name
 
+    # Always measured, next to the speed-test figures: a different question (CDN throughput, several
+    # streams) with its own keys, so the existing download/upload fields keep their meaning.
+    cdn = cdn_bandwidth_probe()
+
     return {
         "download_speed": download,
         "upload_speed": upload,
         "download_source": download_source,
         "upload_source": upload_source,
         "measurements": measurements,
+        **cdn,
     }
 
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
@@ -1327,6 +1401,164 @@ def get_infiniband_ports() -> InfinibandObservation:
     return InfinibandObservation(ports, "")
 
 
+# GPU-to-GPU interconnect (DAH-2922). Two "8x H200" listings can differ in whether the cards share
+# NVLink and allow peer-to-peer at all; tensor-parallel and FSDP jobs run several times slower on
+# PCIe and NCCL does not start where P2P is off. nvidia-smi is the source because it is what a
+# renter runs first on the pod, so what the listing says and what the renter sees cannot disagree.
+NVIDIA_SMI_TOPO_MATRIX_CMD = "nvidia-smi topo -m"
+NVIDIA_SMI_TOPO_P2P_READ_CMD = "nvidia-smi topo -p2p r"
+NVIDIA_SMI_NVLINK_STATUS_CMD = "nvidia-smi nvlink -s"
+# nvidia-smi's own classes, worst first: SYS crosses the inter-socket link, PIX is one PCIe switch.
+PCIE_LINK_CLASSES_WORST_FIRST = ["SYS", "NODE", "PHB", "PXB", "PIX"]
+TOPO_GPU_LABEL_PATTERN = r"^GPU\d+$"
+TOPO_NVLINK_CELL_PATTERN = r"^NV(\d+)$"
+NVLINK_ACTIVE_LINK_PATTERN = r"Link \d+: [\d.]+ GB/s"
+NVLINK_GPU_HEADER_PATTERN = r"^GPU \d+:"
+
+
+def parse_topology_matrix(output):
+    """The GPU-by-GPU cells of an `nvidia-smi topo -m` or `nvidia-smi topo -p2p r` table.
+
+    Returns (labels, rows): labels in table order ("GPU0", ...), rows[i][j] the cell for
+    (labels[i], labels[j]). NIC columns/rows and the affinity columns are dropped so the matrix is
+    square; the legend is ignored. ([], []) when the output has no GPU header row.
+    """
+    header = None
+    gpu_columns = []
+    labels = []
+    rows = []
+    for line in output.splitlines():
+        cells = [cell.strip() for cell in re.split(r"\t+|\s{2,}", line.rstrip())]
+        if header is None:
+            if len(cells) > 1 and cells[0] == "" and re.match(TOPO_GPU_LABEL_PATTERN, cells[1]):
+                header = cells
+                gpu_columns = [index for index, cell in enumerate(cells) if re.match(TOPO_GPU_LABEL_PATTERN, cell)]
+            continue
+        if not cells or not re.match(TOPO_GPU_LABEL_PATTERN, cells[0]):
+            continue
+        if len(cells) <= max(gpu_columns):
+            continue
+        labels.append(cells[0])
+        rows.append([cells[index] for index in gpu_columns])
+    return labels, rows
+
+
+def count_active_nvlinks_per_gpu(output):
+    """Active NVLink count per GPU block of `nvidia-smi nvlink -s`; [] when no GPU block is listed."""
+    counts = []
+    for line in output.splitlines():
+        if re.match(NVLINK_GPU_HEADER_PATTERN, line.strip()):
+            counts.append(0)
+        elif counts and re.search(NVLINK_ACTIVE_LINK_PATTERN, line):
+            counts[-1] += 1
+    return counts
+
+
+class GpuInterconnectObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, payload, scrape_error):
+        self.payload = payload
+        self.scrape_error = scrape_error
+
+
+def summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output):
+    """Facts a renter needs from the three nvidia-smi tables, in one flat payload.
+
+    nvlink is True only when EVERY GPU pair is joined by NVLink (what an HGX board looks like); a
+    4-GPU box with two NVLink bridges is not "NVLink" for a TP=4 job. p2p is True only when every
+    pair reads OK. Both are None when the table is missing or the host has a single GPU.
+    """
+    labels, rows = parse_topology_matrix(topo_output)
+    gpu_count = len(labels)
+    gpu_pairs = gpu_count * (gpu_count - 1) // 2
+    nvlink_pairs = 0
+    nvlink_link_counts = []
+    pcie_classes_seen = set()
+    for i in range(gpu_count):
+        for j in range(i + 1, gpu_count):
+            cell = rows[i][j]
+            nv_match = re.match(TOPO_NVLINK_CELL_PATTERN, cell)
+            if nv_match:
+                nvlink_pairs += 1
+                nvlink_link_counts.append(int(nv_match.group(1)))
+            elif cell in PCIE_LINK_CLASSES_WORST_FIRST:
+                pcie_classes_seen.add(cell)
+
+    pcie_class = None
+    for candidate in PCIE_LINK_CLASSES_WORST_FIRST:
+        if candidate in pcie_classes_seen:
+            pcie_class = candidate
+            break
+
+    p2p = None
+    p2p_pairs = None
+    p2p_ok_pairs = None
+    if p2p_output is not None:
+        p2p_labels, p2p_rows = parse_topology_matrix(p2p_output)
+        p2p_count = len(p2p_labels)
+        p2p_pairs = p2p_count * (p2p_count - 1) // 2
+        p2p_ok_pairs = 0
+        for i in range(p2p_count):
+            for j in range(i + 1, p2p_count):
+                if p2p_rows[i][j] == "OK":
+                    p2p_ok_pairs += 1
+        if p2p_pairs > 0:
+            p2p = p2p_ok_pairs == p2p_pairs
+
+    nvlink_active_links = None
+    if nvlink_output is not None:
+        active_counts = count_active_nvlinks_per_gpu(nvlink_output)
+        if active_counts:
+            nvlink_active_links = min(active_counts)
+
+    return {
+        "ic_devices": gpu_count,
+        "ic_gpu_pairs": gpu_pairs,
+        "ic_nvlink": (nvlink_pairs == gpu_pairs) if gpu_pairs > 0 else None,
+        "ic_nvlink_pairs": nvlink_pairs,
+        "ic_nvlink_links": min(nvlink_link_counts) if nvlink_link_counts else None,
+        "ic_nvlink_active_links": nvlink_active_links,
+        "ic_pcie_class": pcie_class,
+        "ic_p2p": p2p,
+        "ic_p2p_pairs": p2p_pairs,
+        "ic_p2p_ok_pairs": p2p_ok_pairs,
+        "ic_matrix": rows,
+    }
+
+
+def get_gpu_interconnect():
+    """Run the three nvidia-smi topology tables and summarize them; never fails the scrape.
+
+    `topo -m` is required - without it there is nothing to report and the reason travels in
+    scrape_error. `topo -p2p r` and `nvlink -s` are optional: older drivers and PCIe-only cards exit
+    non-zero on them, which is itself the answer, so their fields are None and the error is kept.
+    """
+    errors = []
+    try:
+        topo_output = run_cmd(NVIDIA_SMI_TOPO_MATRIX_CMD)
+    except Exception as exc:
+        return GpuInterconnectObservation(None, f"{NVIDIA_SMI_TOPO_MATRIX_CMD}: {exc!r}"[:400])
+
+    p2p_output = None
+    try:
+        p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
+    except Exception as exc:
+        errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
+
+    nvlink_output = None
+    try:
+        nvlink_output = run_cmd(NVIDIA_SMI_NVLINK_STATUS_CMD)
+    except Exception as exc:
+        errors.append(f"{NVIDIA_SMI_NVLINK_STATUS_CMD}: {exc!r}"[:200])
+
+    try:
+        payload = summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output)
+    except Exception as exc:
+        return GpuInterconnectObservation(None, f"parse: {exc!r}"[:400])
+    return GpuInterconnectObservation(payload, "; ".join(errors))
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -1458,6 +1690,11 @@ def get_machine_specs():
     data["data_infiniband_ports"] = [port.as_payload() for port in infiniband.ports]
     if infiniband.scrape_error:
         data["data_infiniband_scrape_error"] = infiniband.scrape_error
+
+    interconnect = get_gpu_interconnect()
+    data["data_interconnect"] = interconnect.payload
+    if interconnect.scrape_error:
+        data["data_interconnect_scrape_error"] = interconnect.scrape_error
 
     try:
         lscpu_output = run_cmd("lscpu")
