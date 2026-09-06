@@ -412,6 +412,23 @@ class Settings(BaseSettings):
     # Use REST API instead of WebSocket for miner communication
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
 
+    # DAH-2958 — express lane for never-validated executors. A new node is published only by
+    # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and
+    # then for the slowest miner in the fleet (2–9 min): node add → AVAILABLE p50 21.4 min over
+    # 175 onboardings, floor 8.2 min. With the flag on, core/express_lane.py polls the portal's
+    # executor snapshot every TICK seconds, runs the SAME pipeline the cycle runs on executors
+    # this validator has never published, and publishes the result spec-only (no scored_at, so
+    # no incentive ledger row); the next cycle scores and overwrites it as today. Off by default:
+    # flag off = today's behaviour, nothing else in this block is read.
+    EXPRESS_LANE_ENABLED: bool = Field(env="EXPRESS_LANE_ENABLED", default=False)
+    EXPRESS_LANE_TICK_SECONDS: int = Field(env="EXPRESS_LANE_TICK_SECONDS", default=30)
+    # Hard bound on the extra load a registration flood can add: at most this many express
+    # verifications in flight at once (so also per tick), and per miner.
+    EXPRESS_LANE_MAX_IN_FLIGHT: int = Field(env="EXPRESS_LANE_MAX_IN_FLIGHT", default=4)
+    EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
+        env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
+    )
+
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
     # is authoritative for the size cap but the validator double-checks it as

@@ -38,6 +38,7 @@ from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import VerifyXValidationService
 
 from core.config import settings
+from core.express_lane import CycleInputs, ExpressLane
 from core.utils import _m, get_extra_info, get_logger
 from services.ssh_service import SSHService
 
@@ -46,6 +47,8 @@ logger = get_logger(__name__)
 SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
+# Executor uuid request_job_to_miner reports a miner-level failure under (no real executor).
+FAILED_MINER_EXECUTOR_UUID = "11111111-1111-1111-1111-111111111111"
 
 
 class Validator:
@@ -54,6 +57,9 @@ class Validator:
         self.should_exit = False
         self.last_job_run_blocks = 0
         self.default_extra = {}
+        # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
+        # express lane so its verifications are the cycle's pipeline. None before the first cycle.
+        self.cycle_inputs: CycleInputs | None = None
 
         self.miner_scores = {}
         # Hotkeys with at least one live executor in the last completed cycle. Rebuilt
@@ -121,6 +127,13 @@ class Validator:
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
         )
+        self.express_lane = ExpressLane(
+            miner_service=self.miner_service,
+            redis_service=self.redis_service,
+            backend_client=self.backend_client,
+            subtensor_client=self.subtensor_client,
+            cycle_inputs=self.express_lane_cycle_inputs,
+        )
 
         # init miner_scores: always load from Redis if present so accumulated
         # scores survive an unclean restart (SIGKILL / OOM / liveness preempt).
@@ -159,6 +172,14 @@ class Validator:
                 ),
             ),
         )
+
+    def express_lane_cycle_inputs(self) -> CycleInputs | None:
+        """DAH-2958: the express lane runs only once a full cycle has completed since start —
+        that cycle seeds the validated-executor set with the whole fleet, so the lane never
+        mistakes a long-known executor for a new one after a deploy or restart."""
+        if self.completed_cycles_since_start < 1:
+            return None
+        return self.cycle_inputs
 
     async def an_operator_asked_for_a_cycle_now(self) -> bool:
         """Whether an operator asked for a cycle. Reads only -- the request stays pending.
@@ -335,6 +356,13 @@ class Validator:
                     await self.redis_service.clear_forced_validation_cycle_request()
 
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
+                # The line above replaced the job-files directory; the express lane must use
+                # the new one from here on.
+                self.cycle_inputs = CycleInputs(
+                    encrypted_files=encrypted_files,
+                    default_image_digests=default_image_digests,
+                    executor_image_snapshot=executor_image_snapshot,
+                )
 
                 task_info = {}
 
@@ -577,10 +605,30 @@ class Validator:
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
 
                     # Publish machine specs
+                    published_executor_ids: list[str] = []
                     for miner_hotkey, results in incentive.job_results.items():
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
                             await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
+                            published_executor_ids.extend(
+                                result.executor_info.uuid
+                                for result in results
+                                if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
+                            )
+
+                    if settings.EXPRESS_LANE_ENABLED:
+                        # DAH-2958: everything published by a cycle is "validated" for the
+                        # express lane; only what the portal lists beyond this set is new.
+                        # Never lets a Redis blip end the cycle: the next cycle seeds again.
+                        try:
+                            await self.redis_service.mark_executors_validated(published_executor_ids)
+                        except Exception as exc:
+                            logger.error(
+                                _m(
+                                    "[sync] Failed to record validated executors for the express lane",
+                                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                                ),
+                            )
 
                     self.completed_cycles_since_start += 1
 
@@ -676,6 +724,13 @@ class Validator:
         try:
             await self.initiate_services()
             self.should_exit = False
+
+            if settings.EXPRESS_LANE_ENABLED and not settings.DRY_RUN:
+                # DAH-2958: ticks beside the cycle on this loop; coordination through
+                # MinerService.in_flight. Flag off: the task is never created.
+                self.express_lane_task = asyncio.create_task(
+                    self.express_lane.run(lambda: self.should_exit)
+                )
 
             while not self.should_exit:
                 await self.sync()
