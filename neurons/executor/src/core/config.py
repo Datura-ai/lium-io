@@ -9,7 +9,7 @@ VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
 try:
     from core.config_override import _VALIDATOR_HOTKEY_SS58 
     VALIDATOR_HOTKEY_SS58 = _VALIDATOR_HOTKEY_SS58
-except Exception as e:
+except Exception:
     pass
 
 class Settings(BaseSettings):

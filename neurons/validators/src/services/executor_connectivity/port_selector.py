@@ -1,9 +1,6 @@
-import json
-import random
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import PREFERRED_POD_PORTS
 from services.executor_connectivity.models import PortPair
 from services.port_utils import get_all_ports
 

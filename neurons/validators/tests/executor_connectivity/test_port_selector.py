@@ -1,8 +1,6 @@
-import pytest
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.executor_connectivity.models import PortPair
 from services.executor_connectivity.port_selector import PortSelector
 
 

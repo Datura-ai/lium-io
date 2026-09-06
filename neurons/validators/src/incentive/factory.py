@@ -5,7 +5,6 @@ from incentive.base import BaseIncentive
 from incentive.config import IncentiveConfig
 from incentive.default import DefaultIncentive
 from incentive.rental_price import RentalPriceIncentive
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.redis_service import RedisService
 from services.task.models import JobResult
 

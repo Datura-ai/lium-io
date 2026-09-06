@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from uuid import uuid4, UUID
-from datetime import datetime
 
 import asyncssh
 from docker.errors import APIError

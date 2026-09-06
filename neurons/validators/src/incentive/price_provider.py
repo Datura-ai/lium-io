@@ -13,7 +13,7 @@ from typing import Optional
 import asyncio
 import aiohttp
 
-from bittensor import AsyncSubtensor
+from bittensor import AsyncSubtensor  # noqa: F401  # unused here; tests/test_price_provider.py patches it
 from core.config import settings
 from core.utils import get_logger, _m
 from clients.subtensor_client import SubtensorClient
