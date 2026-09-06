@@ -1138,7 +1138,6 @@ async def test_rental_price_failed_executors_rented_do_not_score(
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
     # --- Assert ---
-    from tests.helpers import extract_incentive_section
 
     for hotkey, results in all_job_results.items():
         for result in results:
@@ -1207,7 +1206,6 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
         assert_executor_has_log,
         assert_incentive_log_present,
         assert_log_contains_keys,
-        extract_incentive_section,
     )
 
     for hotkey, results in all_job_results.items():
@@ -1731,22 +1729,7 @@ async def test_rental_price_multi_variant_mixed_rental_status(
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
     # Assert
-    # Verify miner A has mining score (rented → uses default algorithm)
-    total_gpu_counts = _total_gpu_counts(all_job_results)
-    expected_a_mining = expected_executor_score(
-        gpu_model="H200",
-        gpu_count=5,
-        total_gpu_count=total_gpu_counts["H200"],
-        portion=GPU_PORTION["H200"],
-        is_rented=True,
-        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
-        sysbox_runtime=True,
-        collateral_deposited=True,
-        uptime_minutes=120,
-    )
-
     # Verify miners B and C have rental values
-    unrented_counts = {"H200 NVL": 3, "H200": 2}
     total_unrented_counts = {"H200": 2, "H200 NVL": 3}  # For expected_miner_rental_value
 
     expected_b_rental = expected_miner_rental_value(
@@ -1881,13 +1864,6 @@ async def test_rental_price_multiple_base_models_with_variants(
     assert h200_dilution_factor == pytest.approx(0.8, abs=0.01), "H200 should have dilution factor 0.8"
     assert h200_nvl_dilution_factor == pytest.approx(0.8, abs=0.01), "H200 NVL should have same dilution factor as H200"
 
-    # Verify total rental cost: H100 undiluted + H200 variants diluted
-    expected_total_rental_cost = (
-        4 * H100_HOURLY_RATE +  # H100: no dilution
-        3 * expected_h200_effective_rate +  # H200: diluted
-        2 * expected_h200_nvl_effective_rate  # H200 NVL: diluted
-    )
-
     # All three miners receive positive rental share weights
     assert validator.miner_scores["miner_a"] > 0, "Miner A should get rental share"
     assert validator.miner_scores["miner_b"] > 0, "Miner B should get rental share"
@@ -1939,19 +1915,6 @@ async def test_rental_price_single_miner_multiple_variants(
             assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
 
     # Calculate expected values
-    total_gpu_counts = _total_gpu_counts(all_job_results)
-    expected_mining = expected_executor_score(
-        gpu_model="H100",
-        gpu_count=4,
-        total_gpu_count=total_gpu_counts["H100"],
-        portion=GPU_PORTION["H100"],
-        is_rented=True,
-        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
-        sysbox_runtime=True,
-        collateral_deposited=True,
-        uptime_minutes=120,
-    )
-
     total_unrented_counts = {"H200": 3, "H200 NVL": 2}
     expected_rental = expected_miner_rental_value(
         miner_results=all_job_results["miner_a"],

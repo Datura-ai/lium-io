@@ -365,7 +365,7 @@ def _LoadNvmlLibrary(nvmlLib_content: bytes):
                         try:
                             # Check for nvml.dll in System32 first for DCH drivers
                             nvmlLib = CDLL(os.path.join(os.getenv("WINDIR", "C:/Windows"), "System32/nvml.dll"))
-                        except OSError as ose:
+                        except OSError:
                             # If nvml.dll is not found in System32, it should be in ProgramFiles
                             # load nvml.dll from %ProgramFiles%/NVIDIA Corporation/NVSMI/nvml.dll
                             nvmlLib = CDLL(os.path.join(os.getenv("ProgramFiles", "C:/Program Files"), "NVIDIA Corporation/NVSMI/nvml.dll"))
@@ -379,7 +379,7 @@ def _LoadNvmlLibrary(nvmlLib_content: bytes):
                             nvmlLib = CDLL(temp_file_path)
                         finally:
                             os.remove(temp_file_path)
-                except OSError as ose:
+                except OSError:
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
                 if (nvmlLib == None):
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
@@ -1071,7 +1071,6 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
         return False, f"An unexpected error occurred: {e}"
 
 
-
 def check_storage_limit_ability() -> tuple[bool, str]:
     """
     Checks if the system supports limiting the storage size of a container.
@@ -1359,13 +1358,6 @@ def get_machine_specs():
 
         for i in range(device_count):
             handle = nvmlDeviceGetHandleByIndex(i)
-            # graphic_clock = nvmlDeviceGetDefaultApplicationsClock(handle, NVML_CLOCK_GRAPHICS)
-            # memory_clock = nvmlDeviceGetDefaultApplicationsClock(handle, NVML_CLOCK_MEM)
-            # memory_clocks = nvmlDeviceGetSupportedMemoryClocks(handle)
-            # print(graphic_clock)
-            # print(memory_clock)
-            # print(memory_clocks)
-
             cuda_compute_capability = nvmlDeviceGetCudaComputeCapability(handle)
             major = cuda_compute_capability[0]
             minor = cuda_compute_capability[1]

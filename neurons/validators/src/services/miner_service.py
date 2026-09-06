@@ -13,7 +13,6 @@ import asyncssh
 import bittensor
 from clients.miner_client import MinerClient
 from datura.requests.miner_requests import (
-    AcceptJobRequest,
     AcceptSSHKeyRequest,
     DeclineJobRequest,
     ExecutorSSHInfo,
@@ -30,7 +29,6 @@ from datura.requests.validator_requests import (
     ssh_pubkey_signing_blob,
 )
 from fastapi import Depends
-from clients.validator_portal_api import ValidatorPortalAPI
 from payload_models.payloads import (
     BackupContainerRequest,
     CancelStorageOperationRequest,
@@ -52,7 +50,6 @@ from payload_models.payloads import (
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
     InstallJupyterServerRequest,
-    JupyterServerInstalled,
     JupyterInstallationFailed,
     WorkloadKind,
 )
@@ -995,7 +992,7 @@ class MinerService:
 
                     try:
                         executor = msg.executors[0]
-                    except Exception as e:
+                    except Exception:
                         executor = None
 
                     if executor is None or executor.uuid != payload.executor_id:
@@ -1443,7 +1440,7 @@ class MinerService:
 
                     try:
                         executor = msg.executors[0]
-                    except Exception as e:
+                    except Exception:
                         executor = None
 
                     if executor is None or executor.uuid != payload.executor_id:
@@ -2146,7 +2143,7 @@ class MinerService:
 
                 try:
                     executor = msg.executors[0]
-                except Exception as e:
+                except Exception:
                     executor = None
 
                 if executor is None or executor.uuid != payload.executor_id:
@@ -2516,7 +2513,7 @@ class MinerService:
 
                 try:
                     executor = msg.executors[0]
-                except Exception as e:
+                except Exception:
                     executor = None
 
                 if executor is None or executor.uuid != payload.executor_id:

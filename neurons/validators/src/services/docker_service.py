@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-import aiohttp
 import asyncssh
 import bittensor
 import redis.exceptions
@@ -1310,7 +1309,7 @@ class DockerService:
         pod_mapping_raw: list[PayloadPortMapping] | None = None,
         workload_kind: WorkloadKind | None = None,
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
-        executor_uuid = UUID(executor_id)
+        UUID(executor_id)  # validates the id format, raises ValueError otherwise
 
         try:
             # Use distributed lock to prevent race conditions when allocating ports
@@ -5307,11 +5306,10 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
+        asyncssh.import_private_key(private_key)  # validates the key, raises on a bad payload
 
-        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            known_hosts_policy = await self._prepare_known_hosts_policy(
+            await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
@@ -6323,9 +6321,8 @@ class DockerService:
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
 
-        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            known_hosts_policy = await self._prepare_known_hosts_policy(
+            await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,

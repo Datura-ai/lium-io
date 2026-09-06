@@ -4,7 +4,6 @@ import os
 import socket
 import struct
 import threading
-from pathlib import Path
 from unittest.mock import Mock
 
 import pytest

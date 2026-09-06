@@ -6,7 +6,6 @@ complete validation flow.
 """
 
 import pytest
-from unittest.mock import Mock
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
@@ -34,7 +33,6 @@ from neurons.validators.src.services.task.checks import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
 
-from datura.requests.miner_requests import ExecutorSSHInfo
 from helpers import FERNET_TOKEN, build_context_config, build_services, build_state
 
 
@@ -42,11 +40,6 @@ class MockContainerCleanup:
     """Mock container cleanup service for tests."""
     async def cleanup(self, ssh_client, rented_data, executor_uuid):
         return 0, []
-from protocol.vc_protocol.compute_requests import (
-    RentedExecutor,
-    RentedExecutorsResponse,
-    RentedPod,
-)
 
 
 def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
@@ -60,40 +53,6 @@ def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
         python_path="/usr/bin/python3",
         root_dir="/root/app",
     )
-
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
-
-class DummyKeypair:
-    """Keypair that can be serialized (unlike Mock)."""
-
-    def __init__(self):
-        self.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-
-    def sign(self, data: bytes) -> bytes:
-        return b"\x00" * 64
-
-
-def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
-    """Create a real ExecutorSSHInfo for tests."""
-    return ExecutorSSHInfo(
-        uuid=uuid,
-        address="192.168.1.100",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        python_path="/usr/bin/python3",
-        root_dir="/root/app",
-    )
-
-
-class DummyKeypair:
-    """Keypair that can be serialized (unlike Mock)."""
-
-    def __init__(self):
-        self.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
-
-    def sign(self, data: bytes) -> bytes:
-        return b"\x00" * 64
 
 
 class DummyLogger:

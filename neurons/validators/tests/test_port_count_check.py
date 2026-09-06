@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from datura.requests.miner_requests import ExecutorSSHInfo
 
 from neurons.validators.src.services.task.checks.port_count import PortCountCheck
 from neurons.validators.src.services.task.messages import PortCountMessages as Msg

@@ -3,7 +3,6 @@ from core.db import get_db
 from services.ssh_service import MinerSSHService
 from services.validator_service import ValidatorService, ValidatorDao
 from services.executor_service import ExecutorService, ExecutorDao
-from services.cli_service import CliService
 
 
 ioc = {}

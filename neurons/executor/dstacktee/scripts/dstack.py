@@ -786,7 +786,7 @@ def shutdown_instance(vm_dir: str, timeout: int = 30, force: bool = False) -> No
             "\r\n"
         )
         sock.sendall(request.encode())
-        response = sock.recv(4096)
+        sock.recv(4096)
         sock.close()
         logger.info("shutdown request sent successfully")
     except Exception as e:

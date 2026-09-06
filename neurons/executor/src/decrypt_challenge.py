@@ -1,7 +1,7 @@
 import os
 import json
 import argparse
-from ctypes import CDLL, c_longlong, POINTER, c_int, c_void_p, c_char_p
+from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
 
 # Opt-in to the TFLOPS benchmark for THIS process only. The shared library reads
 # TFLOPS_ENABLE at solve time and runs the throughput benchmark after the challenge

@@ -19,7 +19,6 @@ from watchtower import (
     find_container_by_name,
     pull_and_restart_containers,
     check_and_update,
-    EXECUTOR_RUNNER_CONTAINER_NAME,
 )
 from models import WatchtowerDigestResponse
 
