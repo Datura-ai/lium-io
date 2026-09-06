@@ -196,6 +196,12 @@ class Settings(BaseSettings):
 
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
+    # DAH-2959: a never-measured executor whose first VerifyX download sample is below the 100 Mbps
+    # EMA gate gets one more sample inside the same task, and the better one seeds the EMA. 11 of
+    # 80 fresh nodes (2–5 Sep) lost 1–3 cycles to a cold first sample (32–88 Mbps on one
+    # single-stream CDN object) and passed the next cycle at 205–760 Mbps. The gate, the threshold
+    # and known hosts (any prior EMA) are unchanged.
+    VERIFYX_COLD_SAMPLE_RETRY_ENABLED: bool = Field(env="VERIFYX_COLD_SAMPLE_RETRY_ENABLED", default=False)
     ENABLE_INSPECTOR: bool = True
     # DAH-2794: feed the obfuscated scrape to the executor's own interpreter over stdin
     # instead of freezing it into a ~13 MB onefile and uploading that every cycle.
