@@ -848,6 +848,47 @@ async def test_tenant_enforcement_allows_mapped_filler_with_customer_rental(cont
     assert score_calculator.called_with["rented"] is True
 
 
+@pytest.mark.asyncio
+async def test_tenant_enforcement_allows_every_filler_bundle_beside_customer_pod(context_factory):
+    # DAH-2472: a partially rented GPU-split node keeps one filler per free VRAM bundle. Every
+    # bundle's GPU process must count as in-tenant, not only the first filler's.
+    executor_uuid = "executor-123"
+    pod_container = "tenant-123"
+    fillers = ["filler_bundle_a", "filler_bundle_b"]
+    rented_data = build_rented_data(
+        executor_uuid,
+        {"containers": [{"name": pod_container, "pod_id": "pod-1"}], "owner_flag": False},
+    )
+    rented_data.all_filler_containers_by_executor[executor_uuid] = fillers
+    score_calculator = DummyScoreCalculator(actual_score=1.0, job_score=1.0)
+    services = build_services(
+        score_calculator=score_calculator,
+        container_cleanup=MockContainerCleanup(),
+    )
+    state = build_state(
+        gpu_processes=[
+            {"container_name": pod_container, "pid": 1001},
+            {"container_name": fillers[0], "pid": 1002},
+            {"container_name": fillers[1], "pid": 1003},
+        ],
+        gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
+        rented_data=rented_data,
+    )
+    ctx = context_factory(
+        services=services,
+        state=state,
+        ssh=DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."]),
+        collateral_deposited=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True, result.event
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert result.updates["rented"] is True
+
+
 def build_recovery_context(
     context_factory,
     ssh: DummySSHClient,
