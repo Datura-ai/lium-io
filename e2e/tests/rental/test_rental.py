@@ -45,7 +45,7 @@ def _create_request(pod_id: str, renter_pub: str):
         cpu_count=1,
         memory_gb=1,
         volume_limit_gb=1,
-        storage_limit_gb=2,
+        storage_limit_gb=None,  # what the platform sends for a host whose docker root is not xfs+pquota (no --storage-opt)
         is_sysbox=False,
         timestamp=int(time.time()),
         available_ports=ports,
