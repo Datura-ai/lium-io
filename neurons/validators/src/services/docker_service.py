@@ -10,7 +10,7 @@ import secrets
 import shlex
 import time
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import AsyncExitStack
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
@@ -4447,8 +4447,8 @@ class DockerService:
     @staticmethod
     async def _connect_ssh_and_docker(
         connections: AsyncExitStack,
-        ssh_connect,
-        docker_connect,
+        ssh_connect: AbstractAsyncContextManager[asyncssh.SSHClientConnection],
+        docker_connect: AbstractAsyncContextManager[RentalDockerSdkClient],
     ) -> tuple[asyncssh.SSHClientConnection, RentalDockerSdkClient]:
         """DAH-3004: enter both connection contexts at once on the caller's exit stack.
 
