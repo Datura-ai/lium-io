@@ -210,6 +210,27 @@ async def test_the_express_lane_asks_the_miner_for_one_executor(rest_miner_servi
 
 
 @pytest.mark.asyncio
+async def test_the_express_lane_verifies_only_the_executor_it_asked_for(rest_miner_service, monkeypatch):
+    """A miner that ignores the executor filter must not get its other executors verified on the
+    express path — they may be held by the wave, and their results are discarded anyway."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
+    new_node, extra = str(uuid4()), str(uuid4())
+    rest_miner_service.in_flight[new_node] = EXPRESS_LANE
+    rest_miner_service.in_flight[extra] = CYCLE_LANE
+    rest_miner_service.miner_returns(new_node, extra)
+
+    job = await _request(rest_miner_service, executor_id=new_node)
+
+    verified = [c.kwargs["executor_info"].uuid for c in rest_miner_service.task_service.create_task.call_args_list]
+    assert verified == [new_node]
+    assert [r.executor_info.uuid for r in job["results"]] == [new_node]
+    # the wave's claim on the extra executor is untouched
+    assert rest_miner_service.in_flight == {new_node: EXPRESS_LANE, extra: CYCLE_LANE}
+
+
+@pytest.mark.asyncio
 async def test_the_wave_skips_an_executor_the_express_lane_holds_and_releases_its_own(
     rest_miner_service, monkeypatch, caplog
 ):
