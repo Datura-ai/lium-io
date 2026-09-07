@@ -1,6 +1,11 @@
 # Validator
 
-**[Validator Documentation](https://docs.lium.io/bittensor-subnet/validator)**
+**[Validator Documentation](https://docs.lium.io/validators)**
+
+Subnet 51 has one validator, operated by the Lium team (hotkey `5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p`).
+This directory is its source. If you want to verify what the validator does, use the community
+[sn51-auditor](https://github.com/Datura-ai/sn51-auditor) instead of running a second validator.
+The steps below are for the Lium team's own deployments and for testnet.
 
 ## System Requirements
 
@@ -33,13 +38,13 @@ btcli w regen_hotkey
 #### Step 1: Clone Git repo
 
 ```
-git clone https://github.com/Datura-ai/compute-subnet.git
+git clone https://github.com/Datura-ai/lium-io.git
 ```
 
 #### Step 2: Install Required Tools
 
 ```
-cd compute-subnet && chmod +x scripts/install_validator_on_ubuntu.sh && ./scripts/install_validator_on_ubuntu.sh
+cd lium-io && chmod +x scripts/install_validator_on_ubuntu.sh && ./scripts/install_validator_on_ubuntu.sh
 ```
 
 Verify docker installation
