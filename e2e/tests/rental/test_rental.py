@@ -100,6 +100,10 @@ def test_rental_creates_a_container_the_renter_can_ssh_into_then_deletes_it(serv
             rc, out = lib.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "ls /dev/nvidia0 2>&1; true"))
             assert "No such file" in out, f"a GPU-less host handed out a GPU device: {out}"
     finally:
+        # the platform answers ContainerCreated with ExecutorRentFinishedRequest once it has recorded the pod; the
+        # connector's only action on it is clearing the executor's pending-rental flag (clients/compute_client.py) —
+        # without that step a delete is refused with RentingInProgress for up to 30 min, exactly as in production
+        lib.run(services["MinerService"].redis_service.remove_pending_pod(lib.MINER_HOTKEY, lib.EXECUTOR_UUID, pod_id))
         t1 = time.monotonic()
         deleted = lib.run(services["MinerService"].handle_container(_delete_request(pod_id, created.container_name, created.volume_name)))
         lib.write_artifact("rental-deleted.json", {"delete_s": round(time.monotonic() - t1, 1), "response": deleted.model_dump(mode="json") if hasattr(deleted, "model_dump") else str(deleted)})
