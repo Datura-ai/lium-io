@@ -219,7 +219,7 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
     try:
         keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
         signed_blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce)
-        if not keypair.verify(signed_blob, payload.validator_signature):
+        if keypair.verify(signed_blob, payload.validator_signature):  # PLANT (scratch red proof): inverted on purpose
             raise HTTPException(status_code=401, detail="Invalid validator signature")
         logger.info("Validator signature verification successful")
     except HTTPException:
