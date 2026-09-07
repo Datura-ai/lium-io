@@ -165,12 +165,30 @@ jobs:
           args: format --check
           src: neurons/${{ matrix.package }}
 
+  ruff-check:
+    # DAH-2972: gate the rule families that are at zero after the dead-code sweep (DAH-2971) so
+    # it cannot regress: F (pyflakes: unused imports/variables, redefinitions, undefined names)
+    # and ASYNC210/ASYNC251 (blocking HTTP call / time.sleep inside a coroutine). F541 stays
+    # ignored and the other families stay out until each is at zero; add a family here in the
+    # commit that fixes it. Config: the root pyproject.toml ([tool.ruff]).
+    name: ruff check (pyflakes, blocking calls in coroutines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # same pin as lium-platform's CI
+      - run: pip install ruff==0.15.5
+      - run: ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower
+
   tests-ok:
     # the one context to require in the ruleset; lium-io requires no status check today.
     # A package whose job was skipped as unchanged passes. `lint` joins once the packages
     # are formatted (see above).
     name: tests-ok
-    needs: [route, validators, executor, miners]
+    needs: [route, validators, executor, miners, ruff-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
