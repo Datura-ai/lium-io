@@ -66,3 +66,5 @@ For more details, visit the [Validator Setup Guide](neurons/validators/README.md
 If you need assistance or have any questions, feel free to reach out:
 
 - **Discord Support**: [Dedicated Channel within the Bittensor Discord](https://discord.com/channels/799672011265015819/1291754566957928469)
+
+<!-- DAH-3145 router proof: a docs-only change selects no package (scratch PR, closed after the run) -->
