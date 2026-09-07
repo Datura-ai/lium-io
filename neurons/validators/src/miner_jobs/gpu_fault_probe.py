@@ -22,6 +22,7 @@ import argparse
 import ctypes
 import json
 import multiprocessing
+import multiprocessing.connection
 import os
 import subprocess
 import sys
@@ -715,9 +716,16 @@ def nvml_faults(before: dict, after: dict) -> list[str]:
                     f"gpu {a['index']}: remapped rows corrected {rows_before[0]} -> {rows[0]}, "
                     f"uncorrected {rows_before[1]} -> {rows[1]}"
                 )
-            if rows[2] or rows[3]:
+            # isPending stays set until the GPU is reset, so a card already pending a remap before the run
+            # must not fault on every cycle: only a flag that came up during the run counts
+            if (
+                rows_before
+                and len(rows_before) >= 4
+                and ((rows[2] and not rows_before[2]) or (rows[3] and not rows_before[3]))
+            ):
                 faults.append(
-                    f"gpu {a['index']}: remapped rows pending={rows[2]} failure={rows[3]}"
+                    f"gpu {a['index']}: remapped rows pending={rows_before[2]} -> {rows[2]}, "
+                    f"failure={rows_before[3]} -> {rows[3]}"
                 )
         if a.get("recovery_action"):
             faults.append(f"gpu {a['index']}: NVML recovery action {a['recovery_action']} required")
@@ -734,6 +742,67 @@ def xid_lines() -> dict:
         return {"available": False, "error": (out.stderr or "").strip()[:200]}
     lines = [line.strip() for line in out.stdout.splitlines() if "NVRM: Xid" in line]
     return {"available": True, "count": len(lines), "last": lines[-5:]}
+
+
+def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]:
+    """One report per worker, every pipe polled together until the deadline.
+
+    Every worker gets the whole budget: a card that hangs does not eat the time of the ones after it, and a
+    report a worker has already sent (a fault on GPU 3 while GPU 0 hangs) is read, not discarded. A worker
+    still in setup at the deadline did not get to measure anything: the host, the driver or the container's
+    limits kept it from starting, which is an error; once its kernels run, a hang or a crash is the card's.
+    """
+    pending = {
+        index: {"process": process, "conn": conn, "phase": "setup"}
+        for index, process, conn in workers
+    }
+    reports: dict[int, dict] = {}
+
+    def no_verdict(index: int, describe) -> None:
+        worker = pending.pop(index)
+        reports[index] = {
+            "index": index,
+            "status": "fault" if worker["phase"] == "kernels" else "error",
+            "error": describe(worker["phase"]),
+        }
+
+    def died(index: int) -> None:
+        code = _exit_code(pending[index]["process"])
+        no_verdict(index, lambda phase: f"worker died in {phase} with exit code {code}")
+
+    def sweep(timeout: float) -> None:
+        by_conn = {worker["conn"]: index for index, worker in pending.items()}
+        for conn in multiprocessing.connection.wait(list(by_conn), timeout=timeout):
+            index = by_conn[conn]
+            try:
+                message = conn.recv()
+            except EOFError:  # the pipe closed without a report: the worker is gone
+                died(index)
+                continue
+            if "phase" in message:
+                pending[index]["phase"] = message["phase"]
+            else:
+                reports[index] = message
+                del pending[index]
+        for index, worker in list(pending.items()):
+            if not worker["process"].is_alive() and not worker["conn"].poll(0):
+                died(index)
+
+    while pending and time.perf_counter() < deadline:
+        sweep(0.2)
+    if pending:
+        sweep(0)  # a message that landed as the deadline passed
+    for index in list(pending):
+        pending[index]["process"].kill()
+        no_verdict(index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s")
+    for _, process, _ in workers:
+        process.join(5)
+    return [reports[index] for index, _, _ in workers]
+
+
+def _exit_code(process):
+    process.join(1)
+    return process.exitcode
 
 
 def main(argv: list[str]) -> int:
@@ -776,45 +845,11 @@ def main(argv: list[str]) -> int:
         child_conn.close()
         workers.append((index, process, parent_conn))
 
-    # one deadline for the concurrent workers, with grace that grows with their number: eight interpreters
-    # forking, JIT-compiling and allocating at once on a loaded host take longer than one
+    # one wall-clock budget for the concurrent workers, with grace that grows with their number: eight
+    # interpreters forking, JIT-compiling and allocating at once on a loaded host take longer than one
     grace = WORKER_GRACE_SECONDS + WORKER_GRACE_PER_GPU_SECONDS * (len(workers) - 1)
-    deadline = time.perf_counter() + args.seconds + grace
-    for index, process, conn in workers:
-        report = None
-        phase = "setup"
-        while time.perf_counter() < deadline:
-            if conn.poll(0.2):
-                try:
-                    message = conn.recv()
-                except EOFError:
-                    break
-                if "phase" in message:
-                    phase = message["phase"]
-                    continue
-                report = message
-                break
-            if not process.is_alive():
-                break
-        process.join(timeout=max(0.0, deadline - time.perf_counter()))
-        # a worker still in setup did not get to measure anything: the host, the driver or the container's
-        # limits kept it from starting, which is an error; once its kernels run, a hang or a crash is the card's
-        if process.is_alive():
-            process.kill()
-            process.join(5)
-            report = {
-                "index": index,
-                "status": "fault" if phase == "kernels" else "error",
-                "error": f"hung in {phase}: no result after {int(args.seconds + grace)}s",
-            }
-        elif report is None:
-            code = process.exitcode
-            report = {
-                "index": index,
-                "status": "fault" if phase == "kernels" else "error",
-                "error": f"worker died in {phase} with exit code {code}",
-            }
-        result["devices"].append(report)
+    budget = args.seconds + grace
+    result["devices"] = drain_workers(workers, time.perf_counter() + budget, budget)
 
     result["nvml_after"] = nvml_snapshot()
     result["xid"] = xid_lines()

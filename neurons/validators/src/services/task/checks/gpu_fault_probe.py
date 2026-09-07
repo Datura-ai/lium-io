@@ -18,9 +18,10 @@ PROBE_SOURCE_PATH = Path(__file__).resolve().parents[3] / "miner_jobs" / "gpu_fa
 PROBE_SOURCE = PROBE_SOURCE_PATH.read_text()
 PROBE_JSON_MARKER = "GPU_FAULT_PROBE_JSON:"
 # Measured on a healthy 1x RTX 4090 (driver 580): 5.3 s in-script, 6.6 s over SSH, 7 rounds on a 2 GB
-# working set. A hung card is caught INSIDE the probe: every worker has its own deadline (--seconds + 30 s
-# + 5 s per extra GPU) and is reported as a fault in the verdict. This cap sits above the largest of those
-# (8 GPUs: 4 + 65 s) and only catches an interpreter that never printed or an SSH channel that stalled;
+# working set. A hung card is caught INSIDE the probe: the workers share one wall-clock budget (--seconds
+# + 30 s + 5 s per extra GPU) and are drained together, so every card gets the whole budget and a verdict —
+# a hang in setup is an error (scored UNKNOWN), a hang in the kernels is a fault. This cap sits above the
+# largest budget (8 GPUs: 4 + 65 s) and only catches an interpreter that never printed or an SSH channel that stalled;
 # the runner sets error_type "timeout" for any asyncio.TimeoutError around ssh.run, so that path cannot
 # tell a transport stall from a hung host and is scored UNKNOWN, like the other no-report outcomes.
 PROBE_TIMEOUT_SECONDS = 120

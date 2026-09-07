@@ -197,8 +197,9 @@ async def test_nvml_delta_is_a_fault_even_when_every_kernel_passed(context_facto
 @pytest.mark.asyncio
 async def test_ssh_timeout_is_unknown_not_a_fault(context_factory):
     # the runner sets "timeout" for any asyncio.TimeoutError around ssh.run, a stalled channel included; a card
-    # that hangs is caught by the probe's own per-worker deadline and comes back as a verdict, so no verdict
-    # means the probe could not be measured, like the sibling no-report path
+    # that hangs is caught inside the probe (one budget, every worker drained until it) and comes back as a
+    # verdict — error in setup, fault in the kernels — so no verdict means the probe could not be measured,
+    # like the sibling no-report path
     ctx = make_ctx(context_factory, FakeRunner("", exit_code=-1, error_type="timeout"))
 
     with probe_gate(enforce=True):
@@ -400,7 +401,90 @@ def test_a_row_remapped_during_the_run_is_a_fault_even_without_a_pending_or_fail
     assert nvml_faults(before, uncorrected) == [
         "gpu 0: remapped rows corrected 3 -> 3, uncorrected 0 -> 1"
     ]
-    assert nvml_faults(before, pending) == ["gpu 0: remapped rows pending=1 failure=0"]
+    assert nvml_faults(before, pending) == ["gpu 0: remapped rows pending=0 -> 1, failure=0 -> 0"]
+
+
+def test_a_remap_already_pending_before_the_run_is_not_a_fault_on_every_cycle():
+    # isPending stays set until the GPU is reset: a card that was pending a remap before the probe must fault
+    # once (the 0 -> 1 transition), not on every cycle after it
+    nvml_faults = _probe_namespace("nvml_faults")["nvml_faults"]
+    already_pending = {
+        "gpus": [
+            {"index": 0, "ecc_uncorrected": 0, "remapped_rows": [3, 0, 1, 0], "recovery_action": 0}
+        ]
+    }
+    still_pending = {
+        "gpus": [
+            {"index": 0, "ecc_uncorrected": 0, "remapped_rows": [3, 0, 1, 0], "recovery_action": 0}
+        ]
+    }
+    now_failed = {
+        "gpus": [
+            {"index": 0, "ecc_uncorrected": 0, "remapped_rows": [3, 0, 1, 1], "recovery_action": 0}
+        ]
+    }
+
+    assert nvml_faults(already_pending, still_pending) == []
+    assert nvml_faults(already_pending, now_failed) == [
+        "gpu 0: remapped rows pending=1 -> 1, failure=0 -> 1"
+    ]
+
+
+def _fake_worker(index, behaviour, conn):
+    # stands in for the probe's _worker: same pipe protocol ({"phase": ...} then one report), scripted
+    import time as _time
+
+    conn.send({"phase": "setup"})
+    if behaviour == "hang-in-setup":
+        _time.sleep(60)
+    conn.send({"phase": "kernels"})
+    if behaviour == "hang-in-kernels":
+        _time.sleep(60)
+    if behaviour == "die":
+        import os as _os
+
+        _os._exit(3)
+    status = "fault" if behaviour == "fault" else "ok"
+    conn.send({"index": index, "status": status, "error": "Xid 79" if status == "fault" else None})
+    conn.close()
+
+
+def test_a_hung_worker_does_not_swallow_the_verdicts_of_the_others():
+    # taiberium on #1297: one shared deadline drained worker by worker meant a hang on GPU 0 left zero
+    # iterations for GPU 1..n — their reports (a real fault included) were discarded as "died in setup".
+    # Every pipe is polled together until the deadline, so each worker gets the whole budget and every
+    # report already sent is read.
+    import multiprocessing
+    import time
+
+    namespace = _probe_namespace("drain_workers", "_exit_code")
+    namespace["multiprocessing"] = multiprocessing
+    namespace["time"] = time
+    drain_workers = namespace["drain_workers"]
+    mp = multiprocessing.get_context("fork")
+    workers = []
+    for index, behaviour in enumerate(["hang-in-kernels", "fault", "ok", "die", "hang-in-setup"]):
+        parent_conn, child_conn = mp.Pipe(duplex=False)
+        process = mp.Process(target=_fake_worker, args=(index, behaviour, child_conn))
+        process.start()
+        child_conn.close()
+        workers.append((index, process, parent_conn))
+
+    started = time.perf_counter()
+    reports = drain_workers(workers, started + 3.0, 3.0)
+    elapsed = time.perf_counter() - started
+
+    assert [r["index"] for r in reports] == [0, 1, 2, 3, 4]
+    assert reports[0]["status"] == "fault" and "hung in kernels" in reports[0]["error"]
+    assert reports[1] == {"index": 1, "status": "fault", "error": "Xid 79"}
+    assert reports[2]["status"] == "ok"
+    assert (
+        reports[3]["status"] == "fault"
+        and "died in kernels with exit code 3" in reports[3]["error"]
+    )
+    assert reports[4]["status"] == "error" and "hung in setup" in reports[4]["error"]
+    assert 3.0 <= elapsed < 10.0  # the two hangs cost one budget, not one budget each
+    assert not any(process.is_alive() for _, process, _ in workers)
 
 
 def test_setup_calls_in_the_probe_are_errors_not_faults():
