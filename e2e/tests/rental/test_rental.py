@@ -66,7 +66,7 @@ def test_rental_creates_a_container_the_renter_can_ssh_into_then_deletes_it(serv
     from payload_models.payloads import ContainerCreated, ContainerDeleted, FailedContainerRequest
 
     renter_priv, renter_pub = lib.ssh_keypair()
-    pod_id = f"e2e-{uuid.uuid4()}"
+    pod_id = str(uuid.uuid4())
     t0 = time.monotonic()
     created = lib.run(services["MinerService"].handle_container(_create_request(pod_id, renter_pub)))
     create_s = round(time.monotonic() - t0, 1)
@@ -107,7 +107,7 @@ def test_rental_on_an_executor_the_miner_does_not_own_is_refused(services):
     from payload_models.payloads import FailedContainerRequest
 
     _, renter_pub = lib.ssh_keypair()
-    req = _create_request(f"e2e-{uuid.uuid4()}", renter_pub)
+    req = _create_request(str(uuid.uuid4()), renter_pub)
     req.executor_id = str(uuid.uuid4())
     t0 = time.monotonic()
     resp = lib.run(services["MinerService"].handle_container(req))
