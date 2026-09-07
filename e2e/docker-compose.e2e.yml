@@ -1,0 +1,184 @@
+# The subnet loop on one machine: a real executor on its own docker daemon, a real miner that owns it, and the
+# validator's own services driving them (e2e/README.md). Every image is built from this checkout.
+name: lium-io-e2e
+
+networks:
+  e2e:
+    ipam:
+      config:
+        - subnet: ${E2E_NET_SUBNET}
+
+volumes:
+  dind-data:
+  miner-db-data:
+  val-db-data:
+
+services:
+  # The executor host's docker daemon. Rental containers the validator starts land here, and their published
+  # ports appear on this container's address — which is also the executor's address, because the executor
+  # shares this network namespace (network_mode below), exactly as an executor shares its host's.
+  dind:
+    build: ./dind
+    image: lium-e2e/dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+      E2E_GPU: ${E2E_GPU}
+    volumes:
+      - dind-data:/var/lib/docker
+      - ./dind/daemon.json:/etc/docker/daemon.json:ro
+    ports:
+      # the Makefile builds the rental image onto this daemon (seed) and lists its containers (logs)
+      - "127.0.0.1:23750:2375"
+    networks:
+      e2e:
+        ipv4_address: ${E2E_EXECUTOR_IP}
+    healthcheck:
+      test: ["CMD-SHELL", "docker -H tcp://127.0.0.1:2375 info >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  executor:
+    build:
+      context: ../neurons/executor
+      additional_contexts:
+        datura: ../datura
+    image: lium-e2e/executor
+    network_mode: service:dind
+    depends_on:
+      dind:
+        condition: service_healthy
+    env_file: executor/e2e.env
+    environment:
+      MINER_HOTKEY_SS58_ADDRESS: ${E2E_MINER_HOTKEY}
+      INTERNAL_PORT: ${E2E_EXECUTOR_PORT}
+      SSH_PORT: ${E2E_EXECUTOR_SSH_PORT}
+      SSH_PUBLIC_PORT: ${E2E_EXECUTOR_SSH_PORT}
+      DOCKER_HOST: tcp://127.0.0.1:2375
+    volumes:
+      # the validator hotkey the executor trusts — production bakes it into the image (core/config.py); the :dev
+      # images override it the same way, through core/config_override.py
+      - ./executor/config_override.py:/root/app/src/core/config_override.py:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:${E2E_EXECUTOR_PORT}/version || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 15s
+
+  miner-db:
+    image: postgres:15.19-alpine
+    environment:
+      POSTGRES_DB: miner
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - miner-db-data:/var/lib/postgresql/data
+    networks: [e2e]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  miner:
+    build:
+      context: ../neurons/miners
+      additional_contexts:
+        datura: ../datura
+    image: lium-e2e/miner
+    depends_on:
+      miner-db:
+        condition: service_healthy
+    env_file: miner/e2e.env
+    environment:
+      BITTENSOR_HOTKEY_MNEMONIC: ${E2E_MINER_MNEMONIC}
+      DEFAULT_VALIDATOR_HOTKEY: ${E2E_VALIDATOR_HOTKEY}
+      EXTERNAL_IP_ADDRESS: ${E2E_MINER_IP}
+      INTERNAL_PORT: ${E2E_MINER_PORT}
+      EXTERNAL_PORT: ${E2E_MINER_PORT}
+    volumes:
+      - ./miner/healthcheck.py:/healthcheck.py:ro
+    networks:
+      e2e:
+        ipv4_address: ${E2E_MINER_IP}
+    healthcheck:
+      # a 4xx from the signed route means uvicorn is up and the migrations ran (run.sh order); the image has no curl
+      test: ["CMD-SHELL", "python3 /healthcheck.py"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  redis:
+    image: redis:7.4.7-alpine
+    networks:
+      e2e:
+        ipv4_address: ${E2E_REDIS_IP}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  val-db:
+    image: postgres:15.19-alpine
+    environment:
+      POSTGRES_DB: validator
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - val-db-data:/var/lib/postgresql/data
+    networks: [e2e]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # The validator image plus pytest. The suites import the validator's own services (MinerService, TaskService,
+  # DockerService) and run them against the miner and the executor above — the same code path the validator
+  # process takes every cycle, minus the chain (the subtensor client is never constructed).
+  tester:
+    build:
+      context: ..
+      dockerfile: e2e/tester/Dockerfile
+      additional_contexts:
+        datura: ../datura
+    image: lium-e2e/tester
+    profiles: [tools]
+    depends_on:
+      redis:
+        condition: service_healthy
+      val-db:
+        condition: service_healthy
+      miner:
+        condition: service_healthy
+      executor:
+        condition: service_healthy
+    env_file: tester/e2e.env
+    environment:
+      BITTENSOR_HOTKEY_MNEMONIC: ${E2E_VALIDATOR_MNEMONIC}
+      E2E_VALIDATOR_HOTKEY: ${E2E_VALIDATOR_HOTKEY}
+      E2E_MINER_HOTKEY: ${E2E_MINER_HOTKEY}
+      E2E_MINER_MNEMONIC: ${E2E_MINER_MNEMONIC}
+      E2E_STRANGER_MNEMONIC: ${E2E_STRANGER_MNEMONIC}
+      E2E_EXECUTOR_IP: ${E2E_EXECUTOR_IP}
+      E2E_EXECUTOR_PORT: ${E2E_EXECUTOR_PORT}
+      E2E_EXECUTOR_SSH_PORT: ${E2E_EXECUTOR_SSH_PORT}
+      E2E_EXECUTOR_UUID: ${E2E_EXECUTOR_UUID}
+      E2E_DEAD_EXECUTOR_UUID: ${E2E_DEAD_EXECUTOR_UUID}
+      E2E_DEAD_EXECUTOR_IP: ${E2E_DEAD_EXECUTOR_IP}
+      E2E_MINER_IP: ${E2E_MINER_IP}
+      E2E_MINER_PORT: ${E2E_MINER_PORT}
+      E2E_POD_IMAGE: ${E2E_POD_IMAGE}
+      E2E_GPU: ${E2E_GPU}
+      REDIS_HOST: redis
+    volumes:
+      - ./tests:/e2e/tests:ro
+      - ./tester:/e2e/tester:ro
+      - ./artifacts:/e2e/artifacts
+    networks: [e2e]
+    working_dir: /e2e

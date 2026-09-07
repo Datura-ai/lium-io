@@ -1,0 +1,23 @@
+# E2E_GPU=1 override (Makefile adds this file): the executor uses the HOST's dockerd and GPUs instead of the stack's
+# GPU-less dind, exactly as a provider's executor does — host network, /var/run/docker.sock, `--gpus all`. Rental
+# containers then run on the host daemon with real devices, and the scrape sees real GPUs. Meant for a GPU box or a
+# Lium DinD pod (nested docker with the NVIDIA runtime); the other services stay on the compose network and reach the
+# executor through the network gateway (E2E_EXECUTOR_IP=172.30.0.1, set by the Makefile when E2E_GPU is on).
+services:
+  dind:
+    profiles: [cpu-only]   # not started
+  executor:
+    network_mode: host
+    depends_on: !reset []
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./executor/config_override.py:/root/app/src/core/config_override.py:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
