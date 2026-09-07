@@ -19,7 +19,7 @@ curl -fsSL https://lium.io/mine.sh | bash -s -- -k <your_miner_hotkey_ss58>
 The script installs the [`lium`](https://github.com/Datura-ai/lium) CLI and runs `lium mine`, which:
 
 1. clones this repository into `./compute-subnet` (or pulls the branch if the directory already exists),
-2. runs `scripts/install_executor_on_ubuntu.sh` (Docker, NVIDIA Container Toolkit and GPU checks),
+2. runs `scripts/install_executor_on_ubuntu.sh` (Docker Engine and the compose plugin), then checks prerequisites — `nvidia-smi`, `nvidia-container-cli`, `docker info`,
 3. renders `neurons/executor/.env` from `.env.template` with the hotkey and the ports — you are prompted for the service port (`8080`), the node SSH port (`2200`), an optional public SSH port and an optional renting port range; pass `--auto` to accept the defaults without prompts,
 4. starts the executor with `docker compose up -d` and waits for the container to report `healthy`,
 5. runs the validator's own check against the node (`daturaai/lium-validator:latest`).
