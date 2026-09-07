@@ -20,10 +20,12 @@ permissions:
   # the router lists the PR's files
   pull-requests: read
 
-# a merge-group run is never cancelled: each group has its own ref, and cancelling one would drop its
-# PRs from the queue.
+# one run per PR head — a second push cancels the first. A push to main or a merge-group run is never
+# cancelled and never queued behind another: each commit gets its own group (a shared `github.ref` group
+# would keep one pending run per ref, so a third quick merge would cancel the second's pending run even
+# with cancel-in-progress off; cancelling a merge-group run would drop its PRs from the queue).
 concurrency:
-  group: tests-${{ github.event.pull_request.number || github.ref }}
+  group: tests-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
