@@ -2,7 +2,9 @@
 # GPU-less dind, exactly as a provider's executor does — host network, /var/run/docker.sock, `--gpus all`. Rental
 # containers then run on the host daemon with real devices, and the scrape sees real GPUs. Meant for a GPU box or a
 # Lium DinD pod (nested docker with the NVIDIA runtime); the other services stay on the compose network and reach the
-# executor through the network gateway (E2E_EXECUTOR_IP=172.30.0.1, set by the Makefile when E2E_GPU is on).
+# executor through the network gateway (E2E_EXECUTOR_IP=172.30.0.1) on sshd port E2E_EXECUTOR_SSH_PORT (E2E_GPU_SSH_PORT,
+# 2222 — the host's own sshd holds :22 on a Lium pod), both set by the Makefile when E2E_GPU is on.
+# Not yet run on a GPU host: e2e-all-repos/REPORT.md in the loop; the CPU path is what CI proves.
 services:
   dind:
     profiles: [cpu-only]   # not started
@@ -11,6 +13,8 @@ services:
     depends_on: !reset []
     environment:
       DOCKER_HOST: unix:///var/run/docker.sock
+      SSH_PORT: ${E2E_EXECUTOR_SSH_PORT}
+      SSH_PUBLIC_PORT: ${E2E_EXECUTOR_SSH_PORT}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./executor/trust_anchor.py:/root/app/src/core/config_override.py:ro

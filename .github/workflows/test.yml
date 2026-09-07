@@ -29,6 +29,7 @@ jobs:
       validators: ${{ steps.pkgs.outputs.validators }}
       executor: ${{ steps.pkgs.outputs.executor }}
       miners: ${{ steps.pkgs.outputs.miners }}
+      e2e: ${{ steps.pkgs.outputs.e2e }}
     steps:
       - uses: actions/checkout@v4
       - id: pkgs
@@ -167,10 +168,11 @@ jobs:
 
   tests-ok:
     # the one context to require in the ruleset; lium-io requires no status check today.
-    # A package whose job was skipped as unchanged passes. `lint` joins once the packages
-    # are formatted (see above).
+    # A package whose job was skipped as unchanged passes, and so does a skipped e2e-gate
+    # (a PR that touches no neuron); a failed or cancelled one fails this. `lint` joins
+    # once the packages are formatted (see above).
     name: tests-ok
-    needs: [route, validators, executor, miners]
+    needs: [route, validators, executor, miners, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -180,18 +182,22 @@ jobs:
   # The subnet loop end to end on one runner (e2e/README.md): the PR's executor on its own dockerd, the PR's miner that
   # owns it, and the PR's validator services signing in, installing keys, scraping, walking the check pipeline,
   # publishing the verdict, then renting a container and tearing it down — plus every refusal a spoofer must hit.
-  # `e2e-gate` is the stable name to require on main. gate.sh puts a hard timeout on every step, runs every suite
-  # even after a failure, and always leaves e2e/artifacts (timings, summary.md, junit per suite, compose logs, the
-  # suites' JSON dumps) — uploaded on every run and summarised in one sticky PR comment. Reproduce: make -C e2e e2e-full.
+  # Routed like the package jobs: runs when any neuron, datura/, .github/ or e2e/ changed, skipped otherwise, and
+  # reported through tests-ok either way. gate.sh puts a hard timeout on every step, runs every suite even after a
+  # failure, and always leaves e2e/artifacts (timings, summary.md, junit per suite, compose logs, the suites' JSON
+  # dumps) — uploaded on every run and summarised in one sticky PR comment. Reproduce: make -C e2e e2e-full.
   e2e:
     name: e2e-gate
+    needs: route
+    if: needs.route.outputs.e2e == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
       pull-requests: write   # the sticky result comment (skipped on fork PRs, where the token is read-only)
     concurrency:
-      group: e2e-${{ github.event.pull_request.number || github.ref }}
+      # per PR, or per commit on main — a shared ref group would cancel the previous main commit's run
+      group: e2e-${{ github.event.pull_request.number || github.sha }}
       cancel-in-progress: true
     defaults:
       run:
@@ -232,7 +238,8 @@ jobs:
               '',
               `<sub>Compose stack: the PR's executor + miner + validator services on one runner, no chain, no GPU (e2e/README.md). Reproduce: \`make -C e2e e2e-full\`; on a GPU box: \`E2E_GPU=1 make -C e2e e2e-full\`.</sub>`,
             ].join('\n');
-            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number, per_page: 100 });
+            // every page: on a PR with more than 100 comments a single page would miss the marker and post a second comment
+            const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: context.issue.number, per_page: 100 });
             const mine = comments.find(c => c.body?.startsWith(marker));
             if (mine) await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
             else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
