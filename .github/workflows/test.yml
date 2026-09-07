@@ -9,17 +9,15 @@ on:
   push:
     branches: [main]
   # merge queue: a queued group (main + the PRs ahead + this one) is merged only when the checks required
-  # on main report on the merge_group ref; without this trigger an enqueued PR waits forever. `paths:`
-  # does not apply to merge_group, so every group runs the whole workflow (job names unchanged, so the
-  # check names match the ones a ruleset requires).
+  # on main report on the merge_group ref; without this trigger an enqueued PR waits forever.
   merge_group:
     branches: [main]
 
 permissions:
   contents: read
 
-# one run per PR head — a second push cancels the first. A merge-group run is never cancelled: each group
-# has its own ref, and cancelling one would drop its PRs from the queue.
+# a merge-group run is never cancelled: each group has its own ref, and cancelling one would drop its
+# PRs from the queue.
 concurrency:
   group: tests-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
