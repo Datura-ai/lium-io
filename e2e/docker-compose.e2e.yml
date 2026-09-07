@@ -59,7 +59,7 @@ services:
     volumes:
       # the validator hotkey the executor trusts — production bakes it into the image (core/config.py); the :dev
       # images override it the same way, through core/config_override.py
-      - ./executor/config_override.py:/root/app/src/core/config_override.py:ro
+      - ./executor/trust_anchor.py:/root/app/src/core/config_override.py:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:${E2E_EXECUTOR_PORT}/version || exit 1"]
       interval: 5s

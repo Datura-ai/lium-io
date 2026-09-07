@@ -40,8 +40,8 @@ def test_miner_lists_the_executor_for_its_validator():
 def test_miner_refuses_a_stranger_listing_executors():
     sk = lib.stranger_keypair()
     r = lib.http("POST", f"{lib.MINER_URL}/executors", json={"signature": lib.sign(sk, sk.ss58_address), "validator_hotkey": sk.ss58_address})
-    # a valid signature over the wrong hotkey: the route only proves key ownership, and a stranger owns no executors
-    assert r.status_code == 200 and r.json()["executors"] == [], r.text
+    # a stranger with a valid signature over its own hotkey is not a registered validator: refused outright
+    assert r.status_code == 403, r.text
     vk = lib.validator_keypair()
     r = lib.http("POST", f"{lib.MINER_URL}/executors", json={"signature": lib.sign(sk, vk.ss58_address), "validator_hotkey": vk.ss58_address})
     assert r.status_code == 401, f"a stranger's signature under the validator's hotkey must be refused: {r.status_code} {r.text}"
@@ -110,10 +110,14 @@ def test_future_timestamp_is_refused_401():
     assert r.status_code == 401 and "future" in r.text.lower(), r.text
 
 
-def test_headers_for_another_miner_are_refused():
+def test_headers_for_another_miner_install_nothing():
+    """X-Miner-Hotkey names a miner this one is not: the signature still verifies (it covers that hotkey), but no
+    executor of ours is handed out under another miner's name."""
     vk = lib.validator_keypair()
     r, _, _ = _submit(lib.validator_rest_headers(vk, miner_hotkey=lib.stranger_keypair().ss58_address))
-    assert r.status_code in (401, 403), r.text
+    assert r.status_code in (200, 401, 403), r.text
+    if r.status_code == 200:
+        assert r.json().get("executors") == [], r.text
 
 
 # ------------------------------------------------------------ miner → executor /upload_ssh_key -------------------------

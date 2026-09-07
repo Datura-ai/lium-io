@@ -13,7 +13,7 @@ services:
       DOCKER_HOST: unix:///var/run/docker.sock
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./executor/config_override.py:/root/app/src/core/config_override.py:ro
+      - ./executor/trust_anchor.py:/root/app/src/core/config_override.py:ro
     deploy:
       resources:
         reservations:
