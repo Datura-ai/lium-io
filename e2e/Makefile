@@ -23,7 +23,7 @@ else
   export E2E_EXECUTOR_IP := 172.30.0.1
 endif
 
-.PHONY: e2e e2e-full build up wait seed test test-protocol test-cycle test-rental logs down
+.PHONY: e2e e2e-full build up seed test logs down
 
 e2e:
 	$(MAKE) build
