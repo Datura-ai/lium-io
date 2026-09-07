@@ -5,14 +5,17 @@ nothing, exactly as before. Flag on: a portal executor registered after the firs
 start that this validator never published is verified alone, as a first pass, with the cycle's
 own pipeline inputs and published spec-only; an executor registered before that cycle is the
 cycle's; the wave and the lane never run on one executor at the same time; the next cycle keeps
-the job files a running express verification reads; the in-flight caps bound a registration flood;
-an executor the miner does not return is retried a bounded number of times and then left to the
-cycle.
+the job files a running express verification reads, and a cycle that starts during a tick moves
+the launch to its files; a verification without its job files is never published as the node's
+verdict; the in-flight caps bound a registration flood; an executor the miner does not return is
+retried a bounded number of times and then left to the cycle.
 """
 
 import asyncio
 import json
 import logging
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock
@@ -93,7 +96,17 @@ def _portal_executor(
     )
 
 
-def _cycle_inputs(tmp_directory: str = "/tmp/x") -> CycleInputs:
+@pytest.fixture(autouse=True)
+def job_files_root(tmp_path, monkeypatch):
+    """Every cycle-* directory a test makes lands under pytest's tmp_path (the lane launches only
+    on a directory that exists, so the inputs name real ones)."""
+    monkeypatch.setattr(file_encrypt_service, "JOB_FILES_ROOT", tmp_path)
+    return tmp_path
+
+
+def _cycle_inputs(tmp_directory: str | None = None) -> CycleInputs:
+    if tmp_directory is None:
+        tmp_directory = tempfile.mkdtemp(prefix="cycle-", dir=file_encrypt_service.JOB_FILES_ROOT)
     return CycleInputs(
         encrypted_files=MinerJobEnryptedFiles(
             encrypt_key="k",
@@ -448,7 +461,6 @@ async def test_the_next_cycle_keeps_the_job_files_a_running_express_verification
 ):
     """Each cycle writes its job files to a fresh directory; the earlier ones are removed unless
     the lane still reads them. Without `keep`, the next cycle's prep is today's rmtree."""
-    monkeypatch.setattr(file_encrypt_service, "JOB_FILES_ROOT", tmp_path)
     first = FileEncryptService.fresh_job_files_directory()
     (first / "scrape").write_bytes(b"frozen")
     new_node = str(uuid4())
@@ -476,6 +488,111 @@ async def test_the_next_cycle_keeps_the_job_files_a_running_express_verification
     # negative control — the same prep without `keep` removes the directory mid-run
     fourth = FileEncryptService.fresh_job_files_directory()
     assert not third.exists() and fourth.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_that_starts_during_the_tick_moves_the_launch_to_its_job_files(monkeypatch, wallet):
+    """tick() awaits the portal, Redis, the metagraph and the backend before it launches. A cycle
+    whose prep runs in that window removes the directory the tick read first (nothing held it yet)
+    and publishes new inputs; the launch must hold and use the directory that exists then."""
+    first = FileEncryptService.fresh_job_files_directory()
+    new_node = str(uuid4())
+    snapshot = {"miner-a": [_portal_executor(new_node)]}
+    harness = _Harness(monkeypatch, snapshot, [_Neuron("miner-a")])
+    harness.inputs = _cycle_inputs(tmp_directory=str(first))
+    prepared = []
+
+    async def portal_snapshot_while_a_cycle_starts():
+        # Validator.sync(): ecrypt_miner_job_files(keep_directories=directories_in_use()), then
+        # the new CycleInputs — one synchronous step from the lane's point of view
+        second = FileEncryptService.fresh_job_files_directory(keep=harness.lane.directories_in_use())
+        harness.inputs = _cycle_inputs(tmp_directory=str(second))
+        prepared.append(second)
+        return snapshot
+
+    harness.portal_api.get_all_executors = AsyncMock(side_effect=portal_snapshot_while_a_cycle_starts)
+    harness.release.clear()  # inspect the launch before the verification completes
+
+    assert await harness.lane.tick() == 1
+
+    (second,) = prepared
+    assert not first.exists() and second.exists()
+    assert harness.lane.directories_in_use() == {str(second)}
+    await asyncio.sleep(0)  # the verification task runs up to the miner request
+    request = harness.miner_service.request_job_to_miner.call_args.kwargs
+    assert request["encrypted_files"].tmp_directory == str(second)
+
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert await harness.redis_service.get_validated_executors() == {new_node}
+
+
+@pytest.mark.asyncio
+async def test_a_missing_job_files_directory_skips_the_tick_instead_of_verifying_without_it(
+    monkeypatch, wallet, caplog
+):
+    """A verification without its job files fails as if the node had (UploadFilesCheck, the
+    scrape's binary fallback). When the current directory is gone, nothing is launched and no
+    attempt is counted; the node is tried again once a cycle has written new files."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    shutil.rmtree(harness.inputs.encrypted_files.tmp_directory)
+
+    with caplog.at_level(logging.WARNING):
+        assert await harness.tick_and_settle() == 0
+
+    harness.miner_service.request_job_to_miner.assert_not_awaited()
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    assert harness.lane._pending[new_node].attempts == 0
+    assert harness.miner_service.in_flight == {}
+    assert "[express] Job files directory is missing, skipping this tick" in caplog.text
+
+    # a cycle writes new files: the same node is verified on the next tick
+    harness.inputs = _cycle_inputs()
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_result_produced_after_the_job_files_vanished_is_not_the_nodes_verdict(
+    monkeypatch, wallet, caplog
+):
+    """The hold keeps the directory across cycles; if it is removed anyway while the verification
+    runs, the pipeline's failure is the validator's. Nothing is published, the executor is not
+    marked validated, the attempt is not counted, and the lane retries after the backoff."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    directory = harness.inputs.encrypted_files.tmp_directory
+
+    def failed_job(payload, executor_id, **_):
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [_job_result(executor_id, score=0.0)]}
+
+    async def request_job_to_miner(payload, executor_id, **_):
+        shutil.rmtree(directory)  # the upload finds no files; the pipeline scores the node 0
+        return failed_job(payload, executor_id)
+
+    harness.miner_service.request_job_to_miner = AsyncMock(side_effect=request_job_to_miner)
+
+    with caplog.at_level(logging.INFO):
+        assert await harness.tick_and_settle() == 1
+
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    assert await harness.redis_service.get_validated_executors() == set()
+    assert harness.lane.directories_in_use() == set()
+    assert harness.miner_service.in_flight == {}
+    pending = harness.lane._pending[new_node]
+    assert pending.attempts == 0 and pending.not_before > 0
+    assert "[express] Job files were removed during the verification, result discarded" in caplog.text
+    assert not [r for r in caplog.records if r.getMessage() == EXPRESS_PUBLISHED_EVENT]
+
+    # negative control — the same 0 score with the files in place is the node's verdict
+    harness.inputs = _cycle_inputs()
+    harness.miner_service.request_job_to_miner = AsyncMock(side_effect=failed_job)
+    pending.not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert await harness.redis_service.get_validated_executors() == {new_node}
 
 
 @pytest.mark.asyncio

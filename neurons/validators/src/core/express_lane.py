@@ -16,6 +16,7 @@ today. Off by default (settings.EXPRESS_LANE_ENABLED).
 
 import asyncio
 import logging
+import os
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -133,6 +134,7 @@ class ExpressLane:
         inputs = self.cycle_inputs()
         if inputs is None:
             return 0
+        fleet_known_since = inputs.fleet_known_since
 
         snapshot = await self.portal_api.get_all_executors()
         if snapshot is None:
@@ -156,7 +158,7 @@ class ExpressLane:
                     # time to go by): long-known to this validator even if never published since
                     # the flag went on — its miner failed or was offline. The cycle owns it.
                     or executor.created_at is None
-                    or executor.created_at < inputs.fleet_known_since
+                    or executor.created_at < fleet_known_since
                 ):
                     continue
                 present.add(executor.id)
@@ -203,6 +205,26 @@ class ExpressLane:
             )
             return 0
 
+        # Read the inputs again, after the last await: a cycle that started during the awaits
+        # above replaced them and removed the earlier job-files directory (nothing held it yet).
+        # The validator's prep is synchronous and there is no await between here and the holds
+        # below, so the directory these inputs name is the current one and each hold keeps it
+        # until its verification ends.
+        inputs = self.cycle_inputs()
+        if inputs is None:
+            return 0
+        directory = inputs.encrypted_files.tmp_directory
+        if not os.path.isdir(directory):
+            # Something outside the validator removed the current cycle's files. A verification
+            # without them fails as if the node had; skip the tick instead.
+            logger.warning(
+                _m(
+                    "[express] Job files directory is missing, skipping this tick",
+                    extra=get_extra_info({"directory": directory}),
+                )
+            )
+            return 0
+
         launched = 0
         for pending in chosen:
             if pending.executor.id in in_flight:
@@ -214,7 +236,7 @@ class ExpressLane:
                 self._defer(pending, "miner is not among the serving opted-in miners")
                 continue
             in_flight[pending.executor.id] = EXPRESS_LANE
-            self._directories_in_use[inputs.encrypted_files.tmp_directory] += 1
+            self._directories_in_use[directory] += 1
             task = asyncio.create_task(self._verify(pending, miner, inputs, rented_data))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -223,13 +245,16 @@ class ExpressLane:
 
     async def _verify(self, pending: _Pending, miner, inputs: CycleInputs, rented_data) -> None:
         executor_id = pending.executor.id
-        pending.attempts += 1
+        directory = inputs.encrypted_files.tmp_directory
+        # Counted against the node once the outcome is the node's (below); a verification the
+        # validator itself spoiled is retried without spending one of MAX_ATTEMPTS.
+        attempt = pending.attempts + 1
         started_wall = datetime.now(UTC)
         started = time.monotonic()
         extra = {
             "executor_uuid": executor_id,
             "miner_hotkey": miner.hotkey,
-            "attempt": pending.attempts,
+            "attempt": attempt,
         }
         try:
             payload = MinerJobRequestPayload(
@@ -253,6 +278,19 @@ class ExpressLane:
                 ),
                 timeout=settings.JOB_TIME_OUT,
             )
+            if not os.path.isdir(directory):
+                # The hold keeps this directory across cycles, so it went away by another hand.
+                # The pipeline reports a missing upload (UploadFilesCheck, the scrape's binary
+                # fallback) as the node's failure; the node did nothing. Discard, retry later.
+                logger.warning(
+                    _m(
+                        "[express] Job files were removed during the verification, result discarded",
+                        extra=get_extra_info({**extra, "directory": directory}),
+                    )
+                )
+                pending.not_before = time.monotonic() + RETRY_SECONDS
+                return
+            pending.attempts = attempt
             # Only this executor's own result: a miner-level failure comes back under the
             # failed-miner sentinel uuid and a manual rental elsewhere on the miner is not ours.
             results = [
@@ -301,6 +339,7 @@ class ExpressLane:
                 )
             )
         except Exception as exc:
+            pending.attempts = attempt
             logger.error(
                 _m(
                     "[express] Verification failed before a result could be published",
@@ -312,7 +351,6 @@ class ExpressLane:
         finally:
             if self.miner_service.in_flight.get(executor_id) == EXPRESS_LANE:
                 del self.miner_service.in_flight[executor_id]
-            directory = inputs.encrypted_files.tmp_directory
             self._directories_in_use[directory] -= 1
             if self._directories_in_use[directory] <= 0:
                 del self._directories_in_use[directory]
