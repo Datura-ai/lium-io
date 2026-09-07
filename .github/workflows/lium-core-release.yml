@@ -1,5 +1,8 @@
-name: Build and Publish to PyPI
+name: lium-core release (PyPI)
 
+# Moved from Datura-ai/lium-core/.github/workflows/release.yml (DAH-3135). Same job, same OIDC
+# trusted publishing: PyPI project `lium-core` must list this repository, this workflow file name
+# and the `release` environment as its trusted publisher before the next release is run here.
 on:
   workflow_dispatch:
     inputs:
@@ -12,6 +15,9 @@ jobs:
   build:
     name: Build Python distribution
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/lium-core
     steps:
     - uses: actions/checkout@v4
 
@@ -32,7 +38,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: dist
-        path: dist/
+        path: packages/lium-core/dist/
 
   approve-and-publish:
     needs: build
