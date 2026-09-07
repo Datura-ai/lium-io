@@ -8,9 +8,10 @@ through it, a scatter back (plain stores and atomics), a dependent pointer chase
 async H2D/D2H round-trip. Every result is verified on the device (mismatch counters) and a sample of
 the chase on the host. A fault is any non-zero CUDA return code once the context exists
 (CUDA_ERROR_ILLEGAL_ADDRESS is what Blender prints as "Illegal address in CUDA queue"), a data
-mismatch, a worker that crashes or hangs, or an uncorrected-ECC / remapped-row / recovery-action
-change in NVML across the run. A probe that cannot start (no libcuda, cuInit, PTX JIT) is an error,
-not a fault: the validator does not penalise what it could not measure.
+mismatch, a worker that crashes or hangs once its kernels run, or an uncorrected-ECC / remapped-row /
+recovery-action change in NVML across the run. A probe that cannot start (no libcuda, cuInit, PTX JIT,
+context creation, an allocation the card or the container's limits refuse, a worker that never gets past
+setup) is an error, not a fault: the validator does not penalise what it could not measure.
 
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
 """
@@ -38,6 +39,9 @@ VRAM_RESERVE_MB = (
     1024  # left free on the card: the runtime's own context and whatever else idles there
 )
 WORKER_GRACE_SECONDS = 30  # on top of --seconds: JIT, allocations, copies, host verification
+WORKER_GRACE_PER_GPU_SECONDS = (
+    5  # more of it per extra worker: they fork, JIT and allocate at the same time
+)
 
 # fmix32-style mixer whose every step is a bijection on [0, 2**k): (x + seed) mod 2**k, odd multiplier
 # mod 2**k, xorshift within k bits. Mirrored in PTX by k_perm; the host replays it to check the chase.
@@ -402,7 +406,7 @@ def _read_counter(cuda: Cuda, d_ctr: int, h_ctr, stream) -> int:
     return ctypes.c_uint32.from_address(h_ctr.value).value
 
 
-def probe_device(index: int, seconds: float, vram_mb: int) -> dict:
+def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dict:
     report: dict = {"index": index}
     cuda = Cuda()
     lib = cuda.lib
@@ -470,13 +474,21 @@ def probe_device(index: int, seconds: float, vram_mb: int) -> dict:
     lib.cuDeviceGetName(name, 256, device)
     report["name"] = name.value.decode(errors="replace")
 
+    # setup: everything up to the first kernel launch is "could the probe start", not "is the card faulty" —
+    # a context the driver refuses, a busy or full card, a memlock cap on pinned memory all raise ProbeError
     context = ctypes.c_void_p()
-    cuda.call("cuCtxCreate_v2", ctypes.byref(context), 0, device)
+    cuda.call("cuCtxCreate_v2", ctypes.byref(context), 0, device, fault=False)
     free, total = ctypes.c_size_t(), ctypes.c_size_t()
-    cuda.call("cuMemGetInfo_v2", ctypes.byref(free), ctypes.byref(total))
+    cuda.call("cuMemGetInfo_v2", ctypes.byref(free), ctypes.byref(total), fault=False)
     report["vram_free_mb"] = free.value // MB
 
     budget = min(vram_mb * MB, max(free.value - VRAM_RESERVE_MB * MB, 0))
+    smallest = BUFFERS * 4 * (1 << MIN_LOG2_N)
+    if budget < smallest:
+        raise ProbeError(
+            f"not enough free VRAM: {free.value // MB} MB free, {VRAM_RESERVE_MB} MB reserved, "
+            f"the smallest working set is {smallest // MB} MB"
+        )
     log2_n = MIN_LOG2_N
     while log2_n < MAX_LOG2_N and BUFFERS * 4 * (1 << (log2_n + 1)) <= budget:
         log2_n += 1
@@ -505,27 +517,29 @@ def probe_device(index: int, seconds: float, vram_mb: int) -> dict:
     report["jit_ms"] = int((time.perf_counter() - t_jit) * 1000)
 
     stream = ctypes.c_void_p()
-    cuda.call("cuStreamCreate", ctypes.byref(stream), 1)  # CU_STREAM_NON_BLOCKING
+    cuda.call("cuStreamCreate", ctypes.byref(stream), 1, fault=False)  # CU_STREAM_NON_BLOCKING
     device_buffers = []
     for _ in range(BUFFERS):
         ptr = ctypes.c_uint64()
-        cuda.call("cuMemAlloc_v2", ctypes.byref(ptr), n * 4)
+        cuda.call("cuMemAlloc_v2", ctypes.byref(ptr), n * 4, fault=False)
         device_buffers.append(DevPtr(ptr.value))
     d_in, d_idx, d_out, d_aux = device_buffers
     d_ctr = ctypes.c_uint64()
-    cuda.call("cuMemAlloc_v2", ctypes.byref(d_ctr), 16)
+    cuda.call("cuMemAlloc_v2", ctypes.byref(d_ctr), 16, fault=False)
     d_ctr = DevPtr(d_ctr.value)
     h_ctr = ctypes.c_void_p()
-    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_ctr), 16)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_ctr), 16, fault=False)
     copy_bytes = min(32 * MB, n * 4)
     h_src, h_dst = ctypes.c_void_p(), ctypes.c_void_p()
-    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_src), copy_bytes)
-    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_dst), copy_bytes)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_src), copy_bytes, fault=False)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_dst), copy_bytes, fault=False)
     pattern = os.urandom(copy_bytes)
     ctypes.memmove(h_src, pattern, copy_bytes)
     h_sample = ctypes.c_void_p()
-    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_sample), CHASE_SAMPLES * 4)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_sample), CHASE_SAMPLES * 4, fault=False)
     report["copy_mb"] = copy_bytes // MB
+    if on_phase is not None:
+        on_phase("kernels")  # from here on a hang or a crash is the card's
 
     def launch(kernel: str, *args) -> None:
         _launch(cuda, funcs[kernel], stream, n, *args)
@@ -590,8 +604,13 @@ def probe_device(index: int, seconds: float, vram_mb: int) -> dict:
 
 def _worker(index: int, seconds: float, vram_mb: int, conn) -> None:
     started = time.perf_counter()
+
+    def on_phase(phase: str) -> None:
+        # the parent classifies a worker that never answers by the phase it reached: setup -> error, kernels -> fault
+        conn.send({"phase": phase})
+
     try:
-        report = probe_device(index, seconds, vram_mb)
+        report = probe_device(index, seconds, vram_mb, on_phase)
         report["status"] = "ok"
     except CudaFault as exc:
         report = {"index": index, "status": "fault", "error": str(exc)}
@@ -628,6 +647,11 @@ def _device_count(mp) -> int:
         else {"error": "device enumeration hung"}
     )
     process.join(5)
+    if process.is_alive():
+        # multiprocessing joins live children at interpreter exit without a timeout: a hung enumeration
+        # would keep this process alive past the check's deadline and turn "could not count" into a fault
+        process.kill()
+        process.join(5)
     if "error" in reply:
         raise ProbeError(reply["error"])
     return reply["count"]
@@ -678,9 +702,23 @@ def nvml_faults(before: dict, after: dict) -> list[str]:
                 faults.append(
                     f"gpu {a['index']}: uncorrected ECC errors {b['ecc_uncorrected']} -> {a['ecc_uncorrected']}"
                 )
-        rows = a.get("remapped_rows")
-        if rows and len(rows) >= 4 and (rows[2] or rows[3]):
-            faults.append(f"gpu {a['index']}: remapped rows pending={rows[2]} failure={rows[3]}")
+        rows, rows_before = a.get("remapped_rows"), b.get("remapped_rows")
+        if rows and len(rows) >= 4:
+            # (corrected, uncorrected, isPending, failureOccurred): a row remapped during the run is a fault
+            # whether or not the remap is still pending or has failed
+            if (
+                rows_before
+                and len(rows_before) >= 2
+                and (rows[0] > rows_before[0] or rows[1] > rows_before[1])
+            ):
+                faults.append(
+                    f"gpu {a['index']}: remapped rows corrected {rows_before[0]} -> {rows[0]}, "
+                    f"uncorrected {rows_before[1]} -> {rows[1]}"
+                )
+            if rows[2] or rows[3]:
+                faults.append(
+                    f"gpu {a['index']}: remapped rows pending={rows[2]} failure={rows[3]}"
+                )
         if a.get("recovery_action"):
             faults.append(f"gpu {a['index']}: NVML recovery action {a['recovery_action']} required")
     return faults
@@ -738,33 +776,43 @@ def main(argv: list[str]) -> int:
         child_conn.close()
         workers.append((index, process, parent_conn))
 
-    deadline = time.perf_counter() + args.seconds + WORKER_GRACE_SECONDS
+    # one deadline for the concurrent workers, with grace that grows with their number: eight interpreters
+    # forking, JIT-compiling and allocating at once on a loaded host take longer than one
+    grace = WORKER_GRACE_SECONDS + WORKER_GRACE_PER_GPU_SECONDS * (len(workers) - 1)
+    deadline = time.perf_counter() + args.seconds + grace
     for index, process, conn in workers:
         report = None
+        phase = "setup"
         while time.perf_counter() < deadline:
             if conn.poll(0.2):
                 try:
-                    report = conn.recv()
+                    message = conn.recv()
                 except EOFError:
-                    pass
+                    break
+                if "phase" in message:
+                    phase = message["phase"]
+                    continue
+                report = message
                 break
             if not process.is_alive():
                 break
         process.join(timeout=max(0.0, deadline - time.perf_counter()))
+        # a worker still in setup did not get to measure anything: the host, the driver or the container's
+        # limits kept it from starting, which is an error; once its kernels run, a hang or a crash is the card's
         if process.is_alive():
             process.kill()
             process.join(5)
             report = {
                 "index": index,
-                "status": "fault",
-                "error": f"hung: no result after {int(args.seconds + WORKER_GRACE_SECONDS)}s",
+                "status": "fault" if phase == "kernels" else "error",
+                "error": f"hung in {phase}: no result after {int(args.seconds + grace)}s",
             }
         elif report is None:
             code = process.exitcode
             report = {
                 "index": index,
-                "status": "fault",
-                "error": f"worker died with exit code {code}",
+                "status": "fault" if phase == "kernels" else "error",
+                "error": f"worker died in {phase} with exit code {code}",
             }
         result["devices"].append(report)
 

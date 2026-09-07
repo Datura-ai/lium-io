@@ -195,15 +195,58 @@ async def test_nvml_delta_is_a_fault_even_when_every_kernel_passed(context_facto
 
 
 @pytest.mark.asyncio
-async def test_ssh_timeout_is_a_fault(context_factory):
+async def test_ssh_timeout_is_unknown_not_a_fault(context_factory):
+    # the runner sets "timeout" for any asyncio.TimeoutError around ssh.run, a stalled channel included; a card
+    # that hangs is caught by the probe's own per-worker deadline and comes back as a verdict, so no verdict
+    # means the probe could not be measured, like the sibling no-report path
     ctx = make_ctx(context_factory, FakeRunner("", exit_code=-1, error_type="timeout"))
 
     with probe_gate(enforce=True):
         result = await GpuFaultProbeCheck().run(ctx)
 
-    assert result.passed is False
-    assert result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UNKNOWN.reason
     assert f"{PROBE_TIMEOUT_SECONDS}s" in result.event.what_we_saw["error"]
+
+
+def test_the_ssh_cap_sits_above_the_probes_own_largest_deadline():
+    # otherwise the SSH timeout fires first and a hung 8th GPU is never reported as a fault by the probe
+    namespace = _probe_namespace("WORKER_GRACE_SECONDS", "WORKER_GRACE_PER_GPU_SECONDS")
+    largest = (
+        PROBE_SECONDS
+        + namespace["WORKER_GRACE_SECONDS"]
+        + namespace["WORKER_GRACE_PER_GPU_SECONDS"] * 7
+    )
+    assert PROBE_TIMEOUT_SECONDS > largest + 10
+
+
+@pytest.mark.asyncio
+async def test_executor_controlled_report_fields_are_capped_in_the_event(context_factory):
+    # faults, nvml_after and xid come from the executor: a hostile or noisy report must not blow up the event
+    stdout = probe_stdout(
+        "fault",
+        faults=[f"gpu 0: {'x' * 5000}"] * 100,
+        nvml_after={
+            "available": True,
+            "gpus": [{"index": i, "uuid": "u" * 5000, "junk": "y" * 5000} for i in range(64)],
+        },
+        xid={"available": True, "count": 3, "last": ["z" * 5000] * 50},
+    )
+    ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
+
+    with probe_gate(enforce=True):
+        result = await GpuFaultProbeCheck().run(ctx)
+
+    seen = result.event.what_we_saw
+    assert len(seen["probe"]["faults"]) == module.MAX_FAULT_LINES
+    assert all(len(fault) <= module.MAX_FAULT_CHARS for fault in seen["probe"]["faults"])
+    assert len(seen["probe"]["nvml_after"]["gpus"]) == module.MAX_NVML_GPUS
+    assert "junk" not in seen["probe"]["nvml_after"]["gpus"][0]
+    assert len(seen["probe"]["nvml_after"]["gpus"][0]["uuid"]) == module.MAX_FAULT_CHARS
+    assert len(seen["xid"]["last"]) == module.MAX_XID_LINES
+    assert all(len(line) <= module.MAX_XID_CHARS for line in seen["xid"]["last"])
+    assert len(seen["error"]) <= module.MAX_FAULT_LINES * module.MAX_FAULT_CHARS
+    assert len(json.dumps(seen)) < 30_000
 
 
 @pytest.mark.asyncio
@@ -299,18 +342,96 @@ def test_probe_source_is_standard_library_only_and_prints_the_marker():
     assert module.PROBE_SOURCE_PATH.name == "gpu_fault_probe.py"
 
 
-def test_permutation_is_a_bijection_for_every_seed():
-    # the host replays this permutation to check the pointer chase; a collision would blame the GPU
+def _probe_namespace(*names: str) -> dict:
+    # the probe is stdin-shipped source, not an importable module: lift the named functions and constants
     namespace: dict = {}
     kept = [
         node
         for node in ast.parse(PROBE_SOURCE).body
-        if (isinstance(node, ast.FunctionDef) and node.name == "perm")
-        or (isinstance(node, ast.Assign) and node.targets[0].id in {"PERM_MUL", "PERM_SHIFT"})
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (isinstance(node, ast.Assign) and node.targets[0].id in names)
     ]
     exec(compile(ast.Module(body=kept, type_ignores=[]), "probe", "exec"), namespace)
-    perm = namespace["perm"]
+    return namespace
+
+
+def test_permutation_is_a_bijection_for_every_seed():
+    # the host replays this permutation to check the pointer chase; a collision would blame the GPU
+    perm = _probe_namespace("perm", "PERM_MUL", "PERM_SHIFT")["perm"]
     for log2_n in (4, 12, 20):
         n = 1 << log2_n
         for seed in (0, 12345, 0x9E37 * 6 + 12345):
             assert len({perm(i, seed & (n - 1), n - 1) for i in range(n)}) == n
+
+
+def test_a_row_remapped_during_the_run_is_a_fault_even_without_a_pending_or_failed_remap():
+    # NVML remapped_rows = (corrected, uncorrected, isPending, failureOccurred): the counts moving is the event
+    nvml_faults = _probe_namespace("nvml_faults")["nvml_faults"]
+    before = {
+        "gpus": [
+            {"index": 0, "ecc_uncorrected": 0, "remapped_rows": [3, 0, 0, 0], "recovery_action": 0}
+        ]
+    }
+    quiet = {
+        "gpus": [
+            {"index": 0, "ecc_uncorrected": 0, "remapped_rows": [3, 0, 0, 0], "recovery_action": 0}
+        ]
+    }
+    corrected = {
+        "gpus": [
+            {"index": 0, "ecc_uncorrected": 0, "remapped_rows": [4, 0, 0, 0], "recovery_action": 0}
+        ]
+    }
+    uncorrected = {
+        "gpus": [
+            {"index": 0, "ecc_uncorrected": 0, "remapped_rows": [3, 1, 0, 0], "recovery_action": 0}
+        ]
+    }
+    pending = {
+        "gpus": [
+            {"index": 0, "ecc_uncorrected": 0, "remapped_rows": [3, 0, 1, 0], "recovery_action": 0}
+        ]
+    }
+
+    assert nvml_faults(before, quiet) == []
+    assert nvml_faults(before, corrected) == [
+        "gpu 0: remapped rows corrected 3 -> 4, uncorrected 0 -> 0"
+    ]
+    assert nvml_faults(before, uncorrected) == [
+        "gpu 0: remapped rows corrected 3 -> 3, uncorrected 0 -> 1"
+    ]
+    assert nvml_faults(before, pending) == ["gpu 0: remapped rows pending=1 failure=0"]
+
+
+def test_setup_calls_in_the_probe_are_errors_not_faults():
+    # an out-of-memory card, a busy card or a memlock cap must not be written up as broken hardware: every CUDA
+    # call before the first kernel launch is fault=False, and a budget below the smallest working set is a ProbeError
+    tree = ast.parse(PROBE_SOURCE)
+    probe_device = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "probe_device"
+    )
+    setup_calls = {
+        "cuCtxCreate_v2",
+        "cuMemGetInfo_v2",
+        "cuStreamCreate",
+        "cuMemAlloc_v2",
+        "cuMemAllocHost_v2",
+    }
+    seen = set()
+    for node in ast.walk(probe_device):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "call"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value in setup_calls
+        ):
+            seen.add(node.args[0].value)
+            fault = [kw for kw in node.keywords if kw.arg == "fault"]
+            assert fault and fault[0].value.value is False, (
+                f"{node.args[0].value} would raise CudaFault"
+            )
+    assert seen == setup_calls
+    assert "not enough free VRAM" in PROBE_SOURCE
+    assert 'on_phase("kernels")' in PROBE_SOURCE
