@@ -1,6 +1,11 @@
 # Miner
 
-**[Miner Documentation](https://docs.lium.io/bittensor-subnet/miner/overview)**
+**[Provider Documentation](https://docs.lium.io/providers)** — docs.lium.io calls a miner a *provider*, the
+central miner the *self-hosted provider* ([setup guide](https://docs.lium.io/providers/self-hosted-provider)),
+and an executor a *node*. Most providers do not run this service themselves: opting into the
+[Lium.io Central Provider Server](https://docs.lium.io/providers/provider-configuration) from the
+[Provider Portal](https://provider.lium.io) lets Lium run it for you, and nodes are then set up with
+`lium mine` ([Node Quickstart](https://docs.lium.io/providers/nodes/quickstart)).
 
 ## Overview
 
@@ -19,7 +24,7 @@ To run the central miner, you only need a CPU server with the following specific
 
 Executors are GPU-equipped machines that perform the computational tasks. The central miner manages these executors, which can be easily added or removed from the network.
 
-To see the compatible GPUs to mine with and their relative rewards, see this dict [here](https://github.com/Datura-ai/compute-subnet/blob/main/neurons/validators/src/services/const.py#L3).
+To see the compatible GPUs to mine with and their relative rewards, see this dict [here](https://github.com/Datura-ai/lium-io/blob/main/neurons/validators/src/services/const.py).
 
 ## Installation
 
@@ -28,13 +33,13 @@ To see the compatible GPUs to mine with and their relative rewards, see this dic
 #### Step 1: Clone the Git Repository
 
 ```
-git clone https://github.com/Datura-ai/compute-subnet.git
+git clone https://github.com/Datura-ai/lium-io.git
 ```
 
 #### Step 2: Install Required Tools
 
 ```
-cd compute-subnet && chmod +x scripts/install_miner_on_ubuntu.sh && ./scripts/install_miner_on_ubuntu.sh
+cd lium-io && chmod +x scripts/install_miner_on_ubuntu.sh && ./scripts/install_miner_on_ubuntu.sh
 ```
 
 Verify if bittensor and docker installed: 
