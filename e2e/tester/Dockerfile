@@ -17,7 +17,7 @@ COPY --from=datura . /datura
 
 RUN pdm lock --check
 RUN pdm install --prod
-RUN .venv/bin/pip install --no-cache-dir pytest==8.4.2 pytest-timeout==2.4.0 pytest-asyncio==1.2.0
+RUN pdm run python -m ensurepip --upgrade >/dev/null && pdm run python -m pip install --no-cache-dir -q pytest==8.4.2 pytest-timeout==2.4.0 requests
 
 COPY neurons/validators/ .
 

@@ -176,3 +176,63 @@ jobs:
     steps:
       - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
+
+  # The subnet loop end to end on one runner (e2e/README.md): the PR's executor on its own dockerd, the PR's miner that
+  # owns it, and the PR's validator services signing in, installing keys, scraping, walking the check pipeline,
+  # publishing the verdict, then renting a container and tearing it down — plus every refusal a spoofer must hit.
+  # `e2e-gate` is the stable name to require on main. gate.sh puts a hard timeout on every step, runs every suite
+  # even after a failure, and always leaves e2e/artifacts (timings, summary.md, junit per suite, compose logs, the
+  # suites' JSON dumps) — uploaded on every run and summarised in one sticky PR comment. Reproduce: make -C e2e e2e-full.
+  e2e:
+    name: e2e-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: write   # the sticky result comment (skipped on fork PRs, where the token is read-only)
+    concurrency:
+      group: e2e-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@v4
+      - name: build, up, every suite, logs, down — each step under a hard timeout (gate.sh)
+        id: gate
+        timeout-minutes: 55
+        run: ./gate.sh
+      - uses: actions/upload-artifact@v4
+        id: artifacts
+        if: always()
+        with:
+          name: e2e-gate-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
+          path: e2e/artifacts
+          retention-days: 14
+      - name: result on the PR
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+          ARTIFACT_URL: ${{ steps.artifacts.outputs.artifact-url }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- e2e-gate -->';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const summary = fs.existsSync('e2e/artifacts/summary.md')
+              ? fs.readFileSync('e2e/artifacts/summary.md', 'utf8')
+              : `**e2e gate: FAIL** — no summary written: the gate did not reach its first step (outcome ${process.env.OUTCOME}); see the run log.`;
+            const body = [
+              marker,
+              `### e2e gate · ${context.payload.pull_request.head.sha.slice(0, 8)} · [run](${runUrl})${process.env.ARTIFACT_URL ? ` · [artifacts](${process.env.ARTIFACT_URL})` : ''}`,
+              '',
+              summary.trim(),
+              '',
+              `<sub>Compose stack: the PR's executor + miner + validator services on one runner, no chain, no GPU (e2e/README.md). Reproduce: \`make -C e2e e2e-full\`; on a GPU box: \`E2E_GPU=1 make -C e2e e2e-full\`.</sub>`,
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number, per_page: 100 });
+            const mine = comments.find(c => c.body?.startsWith(marker));
+            if (mine) await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
