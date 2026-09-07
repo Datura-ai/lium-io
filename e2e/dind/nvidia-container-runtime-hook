@@ -1,5 +1,5 @@
 #!/bin/sh
 # Stand-in for NVIDIA's prestart hook on a machine without GPUs: dockerd only checks that the binary exists when
 # `--gpus` is used, then calls it before the container's init. Doing nothing = the container starts without GPUs.
-# On E2E_GPU=1 hosts entrypoint.sh replaces this file with the real hook.
+# With E2E_GPU=1 dind is not started at all (docker-compose.gpu.yml), so this file is never used there.
 exit 0

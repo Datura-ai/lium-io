@@ -9,7 +9,7 @@
 #     suites' JSON dumps (cycle-result.json, rental-*.json), pass or fail; CI uploads the directory and posts summary.md on the PR;
 #   - the stack is torn down (volumes too) on every exit path; KEEP_UP=1 keeps it for debugging.
 # Exit 0 only when build, up and every suite passed. CI's e2e-gate job runs this (`make e2e-full`); a GPU box or
-# a Lium DinD pod runs the same script with E2E_GPU=1 — same script, same result.
+# a Lium DinD pod is meant to run the same script with E2E_GPU=1 (README: the GPU path has not been run yet).
 # (Same gate as lium-platform/e2e/gate.sh; keep the two in step.)
 #
 # Env: SUITES (default: every tests/<name>; each needs a test-<name> Makefile target), T_BUILD T_UP T_SUITE

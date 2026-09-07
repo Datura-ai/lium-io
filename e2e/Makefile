@@ -10,6 +10,14 @@ SHELL := /bin/bash
 include stack.env
 export
 
+# E2E_GPU=1 hands the host's GPUs to the executor (docker-compose.gpu.yml): the scrape then sees real GPUs and the
+# cycle suite expects a verified executor. It comes from the caller's environment — `?=` keeps that value; stack.env
+# must not set it (a make variable from the include would override the environment). Unset in CI.
+E2E_GPU ?=
+# on a GPU host the executor shares the host's network; its sshd cannot take :22 where the host's (a Lium pod's) already
+# listens, so it gets this port instead — override when it clashes too
+E2E_GPU_SSH_PORT ?= 2222
+
 ARTIFACTS := $(CURDIR)/artifacts
 WAIT_TIMEOUT ?= 300
 ifeq ($(E2E_GPU),)
@@ -21,6 +29,7 @@ else
   COMPOSE := docker compose --env-file stack.env -f docker-compose.e2e.yml -f docker-compose.gpu.yml
   EXECUTOR_DOCKER := docker
   export E2E_EXECUTOR_IP := 172.30.0.1
+  export E2E_EXECUTOR_SSH_PORT := $(E2E_GPU_SSH_PORT)
 endif
 
 .PHONY: e2e e2e-full build up seed test logs down

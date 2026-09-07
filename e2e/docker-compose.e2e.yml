@@ -177,7 +177,7 @@ services:
       E2E_MINER_IP: ${E2E_MINER_IP}
       E2E_MINER_PORT: ${E2E_MINER_PORT}
       E2E_POD_IMAGE: ${E2E_POD_IMAGE}
-      E2E_GPU: ${E2E_GPU}
+      E2E_GPU: ${E2E_GPU:-}
       REDIS_HOST: redis
     volumes:
       - ./tests:/e2e/tests:ro

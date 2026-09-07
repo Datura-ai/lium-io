@@ -7,9 +7,11 @@ obfuscated scrape, walk the check pipeline, publish the verdict, rent a containe
 missing is the chain: the subtensor client is never constructed, the miner never syncs, and the hotkeys are three
 throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else is the code that runs in production.
 
-CI runs it on every PR that touches a neuron, `datura/` or `e2e/` (`.github/workflows/test.yml`, job **`e2e-gate`**).
-The lium-platform repo has the same gate for the platform side (its stub validator/executor stand in for this
-repo); together they cover the loop from the renter's `lium up` to the container on the provider's host.
+CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
+**`e2e-gate`**, routed by `.github/actions/changed-packages`); a PR that touches none of those skips it, and
+`tests-ok` reports green either way. The lium-platform repo has the same gate for the platform side (its stub
+validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
+container on the provider's host.
 
 ## The stack (`docker-compose.e2e.yml`)
 
@@ -36,6 +38,11 @@ make build up     # keep the stack for test-writing; `make test-protocol` etc.; 
 E2E_GPU=1 make e2e-full   # on a GPU host: the executor uses this machine's dockerd + GPUs (docker-compose.gpu.yml)
 ```
 
+`E2E_GPU` comes from the environment (`E2E_GPU=1 make …`, not a line in `stack.env`: a value there would override the
+caller's). On a GPU host the executor shares the host network and its sshd listens on `E2E_GPU_SSH_PORT` (2222; the
+host's own sshd holds :22 on a Lium pod). **The GPU path has not been run yet** — CI and the loop's runs are the
+CPU path; what it is meant to prove is marked below.
+
 `make up` is idempotent (`--wait` on every healthcheck, seed is `ON CONFLICT DO NOTHING`). Cold build ≈ 4 min on
 16 vCPU, warm ≈ 10 s; the whole gate ≈ 10 min cold.
 
@@ -53,17 +60,18 @@ one sticky PR comment. A new suite = `tests/<name>/` + nothing else (`test-%` in
 executor `/version`; the miner lists both seeded executors for the validator's signed `POST /executors` and refuses a
 stranger's signature under the validator's hotkey (401); the four REST headers (`AuthenticationPayload`) are
 accepted, the miner installs the key on the executor and the key opens it over SSH, `ssh-pubkey-remove` closes it
-again; a stranger's signature → 401, an unregistered validator → 403, a stale or future timestamp → 401, headers for
-another miner refused; on the executor, the miner+validator double signature is accepted (`/upload_ssh_key` →
-SSH coordinates → SSH works → `/remove_ssh_key`), a spoofed validator signature → 401, a spoofed miner signature →
-401/403, a substituted public key (#744) → 400.
+again; a stranger's signature → 401, an unregistered validator → 403, a stale or future timestamp → 401, headers
+naming another miner still yield only this miner's executors (the miner does not compare the hotkey; the test
+accepts 200/401/403 and checks the list); on the executor, the miner+validator double signature is accepted
+(`/upload_ssh_key` → SSH coordinates → SSH works → `/remove_ssh_key`), a spoofed validator signature → 401, a spoofed
+miner signature → 401/403, a substituted public key (#744) → 400/401.
 
 **`tests/cycle`** — `MinerService.request_job_to_miner` (the REST path `lium mine` providers are on):
 the pyarmor+PyInstaller scrape build, key install through the miner, SSH, scrape upload + run, the check pipeline,
 a `JobResult` for OUR executor (not the synthetic `1111…` failure), with the deterministic verdict for the host — on
 a GPU-less runner the scrape runs and fails on the executor (its stderr comes back in the event) and the pipeline
 halts with **`SCRAPE_FAILED`**, score 0, "GPU unverified" (a provider whose driver is gone gets exactly this today;
-known verdicts below); with `E2E_GPU=1` `gpu_count ≥ 1` and a model. Then
+known verdicts below); with `E2E_GPU=1` the suite expects `gpu_count ≥ 1` and a model (not yet observed — see above). Then
 `publish_machine_specs` → the `MACHINE_SPEC_CHANNEL` message the connector relays to the platform, with the fields
 the platform reads (`executor_uuid`, `score`, `log_text`, `incentive_reasons`, …). Failure paths: the seeded
 offline executor is dropped by the miner within its timeout and never scored while the live one is; an unreachable
@@ -74,7 +82,7 @@ CI box nor a Lium pod can run sysbox; bare metal is the only place the flag-on A
 **`tests/rental`** — `MinerService.handle_container`: `ContainerCreateRequest` for the executor → a container from
 `pod/Dockerfile` (ubuntu + openssh-server; `seed` builds it onto the executor's dockerd) with the renter's key,
 `ContainerCreated` with the port map; the renter's key opens the pod on the executor's address (what `lium exec`
-does); no `/dev/nvidia0` inside on a GPU-less host, `nvidia-smi -L` lists GPUs with `E2E_GPU=1`;
+does); no `/dev/nvidia0` inside on a GPU-less host (with `E2E_GPU=1` the suite expects `nvidia-smi -L` to list GPUs — not yet observed);
 `ContainerDeleteRequest` → `ContainerDeleted` and the port is closed. A create for an executor the miner does not own
 → `FailedContainerRequest`, fast.
 
@@ -89,5 +97,5 @@ does); no `/dev/nvidia0` inside on a GPU-less host, `nvidia-smi -L` lists GPUs w
 
 Weights on chain, the AVAILABLE verdict of an unrented executor behind `REQUIRE_SYSBOX_FOR_UNRENTED` (needs sysbox on
 bare metal), TDX/CVM attestation, the real GPU checks (matmul, VerifyX, nvml digest, fingerprint — `E2E_GPU=1` on a
-GPU host runs them), the portal → central-miner sync (the executor row is seeded), Watchtower. Those stay on the
-team's staging (testnet-37, the staging A4000).
+GPU host is meant to run them; no such run yet), the portal → central-miner sync (the executor row is seeded),
+Watchtower. Those stay on the team's staging (testnet-37, the staging A4000).
