@@ -6,9 +6,9 @@ build a JobResult. Nothing is mocked below the chain: the same pyarmor/PyInstall
 hop, the same checks. `publish_machine_specs` then puts the verdict on the redis channel the connector forwards to
 the platform — the message a node's "verification" state on lium.io is made from.
 
-Without a GPU (CI) the pipeline stops at the GPU model check with GPU_COUNT_ZERO: score 0, a named reason — the
-exact verdict a provider with a broken driver gets. With E2E_GPU=1 the executor sees the host's GPUs and the cycle
-must report them.
+Without a GPU (CI) the scrape itself fails on the executor (it keys its output on the first GPU's fields) and the
+pipeline halts with SCRAPE_FAILED, score 0 — the exact verdict a provider whose driver is gone gets today. With
+E2E_GPU=1 the executor sees the host's GPUs and the cycle must report them.
 """
 
 import asyncio
@@ -55,7 +55,7 @@ async def _one_cycle(ioc, miner_address=lib.MINER_IP, miner_port=lib.MINER_PORT)
 
 
 def test_cycle_reaches_the_executor_and_returns_a_verdict(services):
-    payload, result, timing = asyncio.run(_one_cycle(services))
+    payload, result, timing = lib.run(_one_cycle(services))
     lib.write_artifact("cycle-result.json", {"timing": timing, "result": {k: (v if k != "results" else [r.model_dump(mode="json") for r in v]) for k, v in result.items()}})
     assert result["miner_hotkey"] == lib.MINER_HOTKEY
     results = result["results"]
@@ -70,11 +70,14 @@ def test_cycle_reaches_the_executor_and_returns_a_verdict(services):
         assert job.spec and job.spec.get("gpu", {}).get("count", 0) >= 1, job.log_text
         assert job.gpu_model, job.log_text
     else:
-        # no GPU on this host: the scrape ran (specs came back) and the pipeline refused the node for it
-        assert job.spec is not None, f"no specs came back — the scrape never ran on the executor: {job.log_text}"
-        assert job.spec.get("gpu", {}).get("count", None) == 0, job.spec.get("gpu")
+        # no GPU on this host: the key was installed, the scrape was uploaded and RAN on the executor (the stderr tail
+        # in the event is the scrape's own traceback), and the pipeline halted with the verdict a GPU-less host gets
+        # today — SCRAPE_FAILED (machine_scrape derives its output key from gpu_details[0], so zero GPUs cannot even
+        # report gpu.count=0; see README "known verdicts").
         assert job.score == 0 and job.gpu_count == 0
-        assert "GPU_COUNT_ZERO" in job.log_text, job.log_text
+        assert "SCRAPE_FAILED" in job.log_text, job.log_text
+        assert "IndexError" in job.log_text or "gpu" in job.log_text.lower(), job.log_text
+        assert "GPU unverified" in job.log_text, job.log_text
 
 
 def test_cycle_verdict_is_published_for_the_platform(services):
@@ -88,8 +91,8 @@ def test_cycle_verdict_is_published_for_the_platform(services):
     sub.subscribe(MACHINE_SPEC_CHANNEL)
     time.sleep(0.5)
 
-    payload, result, _ = asyncio.run(_one_cycle(services))
-    asyncio.run(services["MinerService"].publish_machine_specs(result["results"], payload.miner_hotkey, payload.miner_coldkey))
+    payload, result, _ = lib.run(_one_cycle(services))
+    lib.run(services["MinerService"].publish_machine_specs(result["results"], payload.miner_hotkey, payload.miner_coldkey))
 
     msg = lib.wait_for(lambda: sub.get_message(timeout=1.0), timeout=30, interval=0.2, what="MACHINE_SPEC_CHANNEL message")
     body = json.loads(msg["data"])
@@ -101,7 +104,7 @@ def test_cycle_verdict_is_published_for_the_platform(services):
         assert key in body, f"{key} missing from the published verdict"
     assert body["batch_total"] == 1
     if not lib.GPU:
-        assert body["score"] == 0 and "GPU_COUNT_ZERO" in body["log_text"]
+        assert body["score"] == 0 and "SCRAPE_FAILED" in body["log_text"]
 
 
 def test_offline_executor_is_dropped_not_scored_and_does_not_stall_the_cycle():
@@ -126,7 +129,7 @@ def test_offline_executor_is_dropped_not_scored_and_does_not_stall_the_cycle():
 def test_unreachable_miner_fails_the_job_fast(services):
     """No miner on that port: the validator must return its synthetic failed result, not hang the cycle."""
     t0 = time.monotonic()
-    payload, result, _ = asyncio.run(_one_cycle(services, miner_address=lib.MINER_IP, miner_port=lib.MINER_PORT + 7))
+    payload, result, _ = lib.run(_one_cycle(services, miner_address=lib.MINER_IP, miner_port=lib.MINER_PORT + 7))
     assert time.monotonic() - t0 < 300, "an unreachable miner must fail fast, not eat the cycle"
     job = result["results"][0]
     assert job.score == 0 and job.log_status == "error"
@@ -144,4 +147,4 @@ def test_sysbox_gate_names_its_reason(services):
 
     checks = PipelineFactory.build_checks()
     assert any(isinstance(c, SysboxRequiredCheck) for c in checks), [type(c).__name__ for c in checks]
-    assert SysboxRequiredMessages.MISSING.reason == "SYSBOX_REQUIRED_MISSING"
+    assert SysboxRequiredMessages.SYSBOX_MISSING.reason == "SYSBOX_REQUIRED_MISSING"

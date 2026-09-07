@@ -68,7 +68,7 @@ def test_rental_creates_a_container_the_renter_can_ssh_into_then_deletes_it(serv
     renter_priv, renter_pub = lib.ssh_keypair()
     pod_id = f"e2e-{uuid.uuid4()}"
     t0 = time.monotonic()
-    created = asyncio.run(services["MinerService"].handle_container(_create_request(pod_id, renter_pub)))
+    created = lib.run(services["MinerService"].handle_container(_create_request(pod_id, renter_pub)))
     create_s = round(time.monotonic() - t0, 1)
     dump = created.model_dump(mode="json") if hasattr(created, "model_dump") else str(created)
     lib.write_artifact("rental-created.json", {"create_s": create_s, "response": dump})
@@ -84,23 +84,23 @@ def test_rental_creates_a_container_the_renter_can_ssh_into_then_deletes_it(serv
     try:
         # the renter's key opens the pod on the executor's address — what `lium exec`/`ssh` do after `lium up`
         rc, out = lib.wait_for(
-            lambda: asyncio.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "hostname && cat /etc/os-release | head -1")),
+            lambda: lib.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "hostname && cat /etc/os-release | head -1")),
             timeout=120, interval=3, what="ssh into the rented container",
         )
         assert rc == 0 and out.strip(), (rc, out)
         if lib.GPU:
-            rc, out = asyncio.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "nvidia-smi -L"))
+            rc, out = lib.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "nvidia-smi -L"))
             assert rc == 0 and "GPU 0" in out, (rc, out)
         else:
-            rc, out = asyncio.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "ls /dev/nvidia0 2>&1; true"))
+            rc, out = lib.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "ls /dev/nvidia0 2>&1; true"))
             assert "No such file" in out, f"a GPU-less host handed out a GPU device: {out}"
     finally:
         t1 = time.monotonic()
-        deleted = asyncio.run(services["MinerService"].handle_container(_delete_request(pod_id, created.container_name, created.volume_name)))
+        deleted = lib.run(services["MinerService"].handle_container(_delete_request(pod_id, created.container_name, created.volume_name)))
         lib.write_artifact("rental-deleted.json", {"delete_s": round(time.monotonic() - t1, 1), "response": deleted.model_dump(mode="json") if hasattr(deleted, "model_dump") else str(deleted)})
     assert isinstance(deleted, ContainerDeleted), deleted
     with pytest.raises(Exception):
-        asyncio.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "true", timeout=15))
+        lib.run(lib.ssh_run(lib.EXECUTOR_IP, external_ssh, "root", renter_priv, "true", timeout=15))
 
 
 def test_rental_on_an_executor_the_miner_does_not_own_is_refused(services):
@@ -110,7 +110,7 @@ def test_rental_on_an_executor_the_miner_does_not_own_is_refused(services):
     req = _create_request(f"e2e-{uuid.uuid4()}", renter_pub)
     req.executor_id = str(uuid.uuid4())
     t0 = time.monotonic()
-    resp = asyncio.run(services["MinerService"].handle_container(req))
+    resp = lib.run(services["MinerService"].handle_container(req))
     assert time.monotonic() - t0 < 120, "a refused rental must fail fast"
     assert isinstance(resp, FailedContainerRequest), resp
     lib.write_artifact("rental-refused.json", resp.model_dump(mode="json"))
