@@ -6,10 +6,12 @@ description: >-
   stalls a merge queue. On a PR the diff is the PR's file list. On a merge-queue entry
   (merge_group) it is base_sha..head_sha, exactly the files the queued PR adds on top of main and
   the entries ahead of it. Any other event (push to main, workflow_dispatch) has no diff and
-  selects every package. datura/ is the protocol package every neuron installs from a path, so a
-  change there selects all three; a change under .github/ selects all three too — a router bug
-  must not hide behind its own filter. Files that never reach a package (*.md, .gitignore, docs)
-  select nothing.
+  selects every package. Only three prefixes select anything: neurons/<pkg>/ selects that
+  package; datura/ (the protocol package every neuron installs from a path) and .github/ (a
+  router bug must not hide behind its own filter) select all three. Every other path — the root
+  pyproject.toml and pdm.lock (dev tooling only), scripts/, contrib/, watchtower/, tests/ (an
+  empty package), *.md, .gitignore, docs/ — selects nothing; the isDoc filter only keeps those
+  files out of the "why" count.
 
 outputs:
   validators:
