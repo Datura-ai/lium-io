@@ -73,14 +73,14 @@ def test_validator_headers_are_accepted_and_the_executor_installs_the_key():
     assert ex["uuid"] == lib.EXECUTOR_UUID and ex["address"] == lib.EXECUTOR_IP
     assert ex["ssh_port"] == lib.EXECUTOR_SSH_PORT and ex["ssh_username"] and ex["python_path"] and ex["root_dir"]
     # the key the validator minted now opens the executor — the SSH hop every check runs over
-    rc, out = asyncio.run(lib.ssh_run(ex["address"], ex["ssh_port"], ex["ssh_username"], priv, "id -un && test -d " + ex["root_dir"]))
+    rc, out = lib.run(lib.ssh_run(ex["address"], ex["ssh_port"], ex["ssh_username"], priv, "id -un && test -d " + ex["root_dir"]))
     assert rc == 0 and out.strip() == ex["ssh_username"], (rc, out)
     # remove it the way the validator does at the end of the cycle
     r = lib.http("POST", f"{lib.MINER_URL}/api/validator/ssh-pubkey-remove", headers=lib.validator_rest_headers(vk),
                  json={"message_type": "SSHPubKeyRemoveRequest", "public_key": pub, "validator_signature": lib.sign(vk, pub), "miner_hotkey": lib.MINER_HOTKEY}, timeout=60)
     assert r.status_code == 200, r.text
     with pytest.raises(Exception):
-        asyncio.run(lib.ssh_run(ex["address"], ex["ssh_port"], ex["ssh_username"], priv, "true", timeout=15))
+        lib.run(lib.ssh_run(ex["address"], ex["ssh_port"], ex["ssh_username"], priv, "true", timeout=15))
 
 
 def test_stranger_signature_is_refused_401():
@@ -132,7 +132,7 @@ def test_executor_accepts_the_double_signature():
     assert r.status_code == 200, r.text
     info = r.json()
     assert info["ssh_port"] == lib.EXECUTOR_SSH_PORT and info["ssh_username"]
-    rc, _ = asyncio.run(lib.ssh_run(lib.EXECUTOR_IP, info["ssh_port"], info["ssh_username"], priv, "true"))
+    rc, _ = lib.run(lib.ssh_run(lib.EXECUTOR_IP, info["ssh_port"], info["ssh_username"], priv, "true"))
     assert rc == 0
     r = lib.http("POST", f"{lib.EXECUTOR_URL}/remove_ssh_key", json=lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub))
     assert r.status_code == 200, r.text

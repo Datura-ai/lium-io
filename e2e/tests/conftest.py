@@ -8,7 +8,15 @@ fails the way it does then). Nothing else is patched: miner, executor, SSH, dock
 are the real code.
 """
 
+import asyncio
+
 import pytest
+
+# One event loop for the whole tester process: services.ioc builds the validator's clients (redis, aiohttp) on the
+# loop that is current at import, and asyncio.run() would hand every test a fresh loop those clients are not bound
+# to ("attached to a different loop"). Suites call lib.run(coro), which uses this loop.
+LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(LOOP)
 
 
 def _stub_out_the_chain() -> None:

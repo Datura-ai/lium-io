@@ -25,6 +25,13 @@ GPU = ENV.get("E2E_GPU", "") not in ("", "0", "false")
 ARTIFACTS = "/e2e/artifacts"
 
 
+def run(coro):
+    """Run a coroutine on the tester's single event loop (tests/conftest.py)."""
+    import asyncio
+
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
 def keypair(mnemonic: str) -> Keypair:
     return Keypair.create_from_mnemonic(mnemonic)
 
