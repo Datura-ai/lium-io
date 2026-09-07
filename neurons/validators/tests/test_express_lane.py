@@ -1,10 +1,13 @@
 """DAH-2958: the express lane verifies never-validated executors ahead of the 15-min cycle.
 
 Flag off: request_job_to_miner asks the miner for every executor (executor_id=None) and claims
-nothing, exactly as before. Flag on: a portal executor this validator never published is verified
-alone with the cycle's own pipeline inputs and published spec-only; the wave and the lane never
-run on one executor at the same time; the in-flight caps bound a registration flood; an executor
-the miner does not return is retried a bounded number of times and then left to the cycle.
+nothing, exactly as before. Flag on: a portal executor registered after the first cycle since
+start that this validator never published is verified alone, as a first pass, with the cycle's
+own pipeline inputs and published spec-only; an executor registered before that cycle is the
+cycle's; the wave and the lane never run on one executor at the same time; the next cycle keeps
+the job files a running express verification reads; the in-flight caps bound a registration flood;
+an executor the miner does not return is retried a bounded number of times and then left to the
+cycle.
 """
 
 import asyncio
@@ -19,16 +22,20 @@ import bittensor
 import pytest
 from fakeredis.aioredis import FakeRedis
 
+import services.file_encrypt_service as file_encrypt_service
 from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, portal_miner_auth_blob
 from core.express_lane import EXPRESS_PUBLISHED_EVENT, MAX_ATTEMPTS, CycleInputs, ExpressLane
 from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from services.file_encrypt_service import FileEncryptService
 from services.miner_service import CYCLE_LANE, EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_LANE_VALIDATED_SET, RedisService
 from services.task.models import JobResult
 
 VALIDATOR_HOTKEY = "validator-hotkey"
+# The first cycle since start began an hour ago; the test executors register after it.
+FLEET_KNOWN_SINCE = datetime.now(UTC) - timedelta(hours=1)
 
 
 @dataclass
@@ -70,25 +77,34 @@ def _job_result(executor_id: str, score: float = 1.0) -> JobResult:
     )
 
 
-def _portal_executor(executor_id: str, registered_seconds_ago: float = 40.0, validator: str = VALIDATOR_HOTKEY):
+def _portal_executor(
+    executor_id: str,
+    registered_seconds_ago: float | None = 40.0,
+    validator: str = VALIDATOR_HOTKEY,
+):
     return PortalExecutor(
         id=executor_id,
         validator_hotkey=validator,
-        created_at=datetime.now(UTC) - timedelta(seconds=registered_seconds_ago),
+        created_at=(
+            datetime.now(UTC) - timedelta(seconds=registered_seconds_ago)
+            if registered_seconds_ago is not None
+            else None
+        ),
     )
 
 
-def _cycle_inputs() -> CycleInputs:
+def _cycle_inputs(tmp_directory: str = "/tmp/x") -> CycleInputs:
     return CycleInputs(
         encrypted_files=MinerJobEnryptedFiles(
             encrypt_key="k",
             all_keys={},
-            tmp_directory="/tmp/x",
+            tmp_directory=tmp_directory,
             machine_scrape_file_name="scrape",
             machine_scrape_source="",
         ),
         default_image_digests={},
         executor_image_snapshot=None,
+        fleet_known_since=FLEET_KNOWN_SINCE,
     )
 
 
@@ -231,6 +247,27 @@ async def test_the_express_lane_verifies_only_the_executor_it_asked_for(rest_min
 
 
 @pytest.mark.asyncio
+async def test_first_pass_reaches_the_task_only_when_the_caller_asks_for_it(rest_miner_service, monkeypatch):
+    """DAH-3011: `first_pass` travels request_job_to_miner → create_task; the wave's request (no
+    argument) runs today's scored pipeline."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
+    new_node, known = str(uuid4()), str(uuid4())
+    create_task = rest_miner_service.task_service.create_task
+
+    rest_miner_service.in_flight[new_node] = EXPRESS_LANE
+    rest_miner_service.miner_returns(new_node)
+    await _request(rest_miner_service, executor_id=new_node, first_pass=True)
+    assert create_task.await_args.kwargs["first_pass"] is True
+
+    rest_miner_service.in_flight.clear()
+    rest_miner_service.miner_returns(known)
+    await _request(rest_miner_service)
+    assert create_task.await_args.kwargs["first_pass"] is False
+
+
+@pytest.mark.asyncio
 async def test_the_wave_skips_an_executor_the_express_lane_holds_and_releases_its_own(
     rest_miner_service, monkeypatch, caplog
 ):
@@ -330,6 +367,7 @@ async def test_a_never_validated_executor_is_verified_alone_and_published_spec_o
 
     request = harness.miner_service.request_job_to_miner.await_args.kwargs
     assert request["executor_id"] == new_node
+    assert request["first_pass"] is True  # never scored: the DAH-3011 fast path may apply
     assert (request["payload"].miner_hotkey, request["payload"].miner_address, request["payload"].miner_port) == (
         "miner-a", "192.0.2.10", 8091
     )
@@ -372,6 +410,86 @@ async def test_validated_foreign_and_wave_held_executors_are_not_touched(monkeyp
     assert await harness.tick_and_settle() == 0
     harness.miner_service.request_job_to_miner.assert_not_awaited()
     harness.miner_service.publish_machine_specs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_executor_registered_before_the_first_cycle_is_the_cycles_even_when_never_published(
+    monkeypatch, wallet
+):
+    """The validated set holds what cycles published since the flag went on. An executor of a miner
+    that failed or was offline in those cycles is not in it, yet it is long-known: its registration
+    predates the first cycle since start, so the lane leaves it to the cycle. One with no
+    registration time is left to the cycle too. A registration after that cycle is a candidate."""
+    seed_seconds_ago = (datetime.now(UTC) - FLEET_KNOWN_SINCE).total_seconds()
+    long_known, undated, new_node = str(uuid4()), str(uuid4()), str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {
+            "miner-a": [
+                _portal_executor(long_known, registered_seconds_ago=seed_seconds_ago + 60),
+                _portal_executor(undated, registered_seconds_ago=None),
+                _portal_executor(new_node, registered_seconds_ago=seed_seconds_ago - 60),
+            ]
+        },
+        [_Neuron("miner-a")],
+    )
+
+    assert await harness.tick_and_settle() == 1
+
+    requested = [c.kwargs["executor_id"] for c in harness.miner_service.request_job_to_miner.await_args_list]
+    assert requested == [new_node]
+    assert await harness.redis_service.get_validated_executors() == {new_node}
+    assert set(harness.lane._pending) == set()  # the two skipped ones were never tracked
+
+
+@pytest.mark.asyncio
+async def test_the_next_cycle_keeps_the_job_files_a_running_express_verification_reads(
+    monkeypatch, wallet, tmp_path
+):
+    """Each cycle writes its job files to a fresh directory; the earlier ones are removed unless
+    the lane still reads them. Without `keep`, the next cycle's prep is today's rmtree."""
+    monkeypatch.setattr(file_encrypt_service, "JOB_FILES_ROOT", tmp_path)
+    first = FileEncryptService.fresh_job_files_directory()
+    (first / "scrape").write_bytes(b"frozen")
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.inputs = _cycle_inputs(tmp_directory=str(first))
+    harness.release.clear()  # the verification is mid-run
+
+    assert await harness.lane.tick() == 1
+    assert harness.lane.directories_in_use() == {str(first)}
+
+    # the next cycle prepares its files while the verification is still running
+    second = FileEncryptService.fresh_job_files_directory(keep=harness.lane.directories_in_use())
+    assert (first / "scrape").read_bytes() == b"frozen"
+    assert second.exists() and second != first and second.parent == tmp_path
+
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert harness.lane.directories_in_use() == set()
+
+    # the cycle after that has nothing to keep and removes both
+    third = FileEncryptService.fresh_job_files_directory(keep=harness.lane.directories_in_use())
+    assert not first.exists() and not second.exists() and third.exists()
+
+    # negative control — the same prep without `keep` removes the directory mid-run
+    fourth = FileEncryptService.fresh_job_files_directory()
+    assert not third.exists() and fourth.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_verification_that_raises_releases_its_job_files_directory(monkeypatch, wallet):
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.miner_service.request_job_to_miner = AsyncMock(side_effect=RuntimeError("ssh dropped"))
+
+    assert await harness.tick_and_settle() == 1
+
+    assert harness.lane.directories_in_use() == set()
+    assert harness.miner_service.in_flight == {}
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    assert harness.lane._pending[new_node].attempts == 1  # deferred, retried next tick
 
 
 @pytest.mark.asyncio

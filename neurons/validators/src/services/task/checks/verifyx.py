@@ -106,6 +106,7 @@ class VerifyXCheck:
                 executor_info=ctx.executor,
                 default_extra=ctx.default_extra,
                 machine_spec=specs,
+                **sizing,
             )
             first_speed = _download_speed(result)
             retry_speed = _download_speed(retry)
@@ -264,6 +265,8 @@ def _first_pass_challenge_config() -> dict[str, int]:
         "memory_max_test_gb": settings.FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB,
         "storage_throughput_test_gb": settings.FIRST_PASS_VERIFYX_STORAGE_TEST_GB,
     }
+
+
 def _download_speed(result) -> float | None:
     if not result.data:
         return None

@@ -6,11 +6,12 @@ A new node is published only by the fleet-wide scored cycle, so it waits for the
 was p50 21.4 / p90 63.5 min over 175 onboardings, floor 8.2 min (RECOVERY report, 6 Sep 2026).
 
 This lane runs beside Validator.sync() in the same process. Every tick it reads the portal's bulk
-executor snapshot, picks the executors assigned to this validator that it has never published,
-and runs the SAME pipeline the cycle runs — same job files, digests and image snapshot, same
-checks — on each one, alone, then publishes the result spec-only (scored_at stays None, so the
-backend creates the executor row but writes no incentive ledger row). The next scored cycle
-overwrites it as today. Off by default (settings.EXPRESS_LANE_ENABLED).
+executor snapshot, picks the executors assigned to this validator that registered after the first
+cycle since start began and that no cycle has published yet, and runs the SAME pipeline the cycle
+runs — same job files, digests and image snapshot, same checks, as a first pass (DAH-3011) — on
+each one, alone, then publishes the result spec-only (scored_at stays None, so the backend creates
+the executor row but writes no incentive ledger row). The next scored cycle overwrites it as
+today. Off by default (settings.EXPRESS_LANE_ENABLED).
 """
 
 import asyncio
@@ -49,6 +50,11 @@ class CycleInputs:
     encrypted_files: MinerJobEnryptedFiles
     default_image_digests: dict[str, str]
     executor_image_snapshot: ExpectedImageSnapshot | None
+    # When the first cycle since this process started began. That cycle asked every serving miner
+    # for its executors, so an executor registered before it is long-known even when its miner
+    # failed or was offline that cycle and it never reached the validated set; only executors
+    # registered after this instant can be new to this validator.
+    fleet_known_since: datetime
 
 
 @dataclass
@@ -75,8 +81,9 @@ class ExpressLane:
         self.redis_service = redis_service
         self.backend_client = backend_client
         self.subtensor_client = subtensor_client
-        # None until the first cycle since start has completed: that cycle seeds the validated
-        # set with the whole fleet and produces the job files, so nothing runs before it.
+        # None until the first cycle since start has completed: that cycle publishes every
+        # executor of every miner that answered and produces the job files, so nothing runs
+        # before it.
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
         self._pending: dict[str, _Pending] = {}
@@ -85,6 +92,13 @@ class ExpressLane:
         # Given up on this process's watch (MAX_ATTEMPTS without the miner returning them); the
         # normal cycle owns them from here. In memory on purpose: a restart may try again.
         self._left_to_cycle: set[str] = set()
+        # Job-files directory -> running verifications reading it. The validator keeps these
+        # directories when it prepares the next cycle's files (FileEncryptService).
+        self._directories_in_use: Counter[str] = Counter()
+
+    def directories_in_use(self) -> set[str]:
+        """Job-files directories a running express verification still reads."""
+        return {path for path, count in self._directories_in_use.items() if count > 0}
 
     async def run(self, should_exit: Callable[[], bool]) -> None:
         logger.info(
@@ -138,6 +152,11 @@ class ExpressLane:
                     executor.validator_hotkey != my_hotkey
                     or executor.id in validated
                     or executor.id in self._left_to_cycle
+                    # Registered before the first cycle since start (or with no registration
+                    # time to go by): long-known to this validator even if never published since
+                    # the flag went on — its miner failed or was offline. The cycle owns it.
+                    or executor.created_at is None
+                    or executor.created_at < inputs.fleet_known_since
                 ):
                     continue
                 present.add(executor.id)
@@ -195,6 +214,7 @@ class ExpressLane:
                 self._defer(pending, "miner is not among the serving opted-in miners")
                 continue
             in_flight[pending.executor.id] = EXPRESS_LANE
+            self._directories_in_use[inputs.encrypted_files.tmp_directory] += 1
             task = asyncio.create_task(self._verify(pending, miner, inputs, rented_data))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -227,6 +247,9 @@ class ExpressLane:
                     default_docker_image_digests=inputs.default_image_digests,
                     executor_image_snapshot=inputs.executor_image_snapshot,
                     executor_id=executor_id,
+                    # Never scored, so the pipeline may right-size its probes (DAH-3011) — it
+                    # does only with FIRST_PASS_FAST_PATH_ENABLED on.
+                    first_pass=True,
                 ),
                 timeout=settings.JOB_TIME_OUT,
             )
@@ -289,6 +312,10 @@ class ExpressLane:
         finally:
             if self.miner_service.in_flight.get(executor_id) == EXPRESS_LANE:
                 del self.miner_service.in_flight[executor_id]
+            directory = inputs.encrypted_files.tmp_directory
+            self._directories_in_use[directory] -= 1
+            if self._directories_in_use[directory] <= 0:
+                del self._directories_in_use[directory]
 
     def _defer(self, pending: _Pending, reason: str) -> None:
         """Try again after RETRY_SECONDS, or after MAX_ATTEMPTS leave the executor to the cycle.

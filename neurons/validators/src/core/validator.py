@@ -60,6 +60,8 @@ class Validator:
         # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
         # express lane so its verifications are the cycle's pipeline. None before the first cycle.
         self.cycle_inputs: CycleInputs | None = None
+        # When the first cycle since start began (CycleInputs.fleet_known_since).
+        self.first_cycle_started_at: datetime | None = None
 
         self.miner_scores = {}
         # Hotkeys with at least one live executor in the last completed cycle. Rebuilt
@@ -174,9 +176,10 @@ class Validator:
         )
 
     def express_lane_cycle_inputs(self) -> CycleInputs | None:
-        """DAH-2958: the express lane runs only once a full cycle has completed since start —
-        that cycle seeds the validated-executor set with the whole fleet, so the lane never
-        mistakes a long-known executor for a new one after a deploy or restart."""
+        """DAH-2958: the express lane runs only once a full cycle has completed since start.
+        That cycle marks validated every executor of every miner that answered it; an executor
+        registered before it began whose miner failed or was offline is not in that set, so the
+        lane also skips everything registered before `fleet_known_since` (the inputs carry it)."""
         if self.completed_cycles_since_start < 1:
             return None
         return self.cycle_inputs
@@ -355,13 +358,20 @@ class Validator:
                     # cycle started, and the operator's request must survive to the next tick.
                     await self.redis_service.clear_forced_validation_cycle_request()
 
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
-                # The line above replaced the job-files directory; the express lane must use
-                # the new one from here on.
+                if self.first_cycle_started_at is None:
+                    self.first_cycle_started_at = datetime.now(UTC)
+                # A fresh job-files directory for this cycle; the ones an express verification
+                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
+                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
+                    keep_directories=(
+                        self.express_lane.directories_in_use() if settings.EXPRESS_LANE_ENABLED else ()
+                    )
+                )
                 self.cycle_inputs = CycleInputs(
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
                     executor_image_snapshot=executor_image_snapshot,
+                    fleet_known_since=self.first_cycle_started_at,
                 )
 
                 task_info = {}

@@ -211,8 +211,9 @@ class MinerService:
     ) -> list[ExecutorSSHInfo]:
         """The wave takes every executor the miner returned, minus those the express lane is
         verifying at this moment, so a new node's hardware tests never run twice concurrently
-        (DAH-2958). Only a never-validated executor can be held by the express lane, so the
-        scoring of every already-validated executor is untouched. Flag off: list returned as is.
+        (DAH-2958). The lane holds only executors registered after the first cycle since start
+        that no cycle has published yet, so a long-known executor's scoring is untouched.
+        Flag off: list returned as is.
         """
         if not settings.EXPRESS_LANE_ENABLED:
             return executors
@@ -287,12 +288,16 @@ class MinerService:
         default_docker_image_digests: dict[str, str],
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
+        first_pass: bool = False,
     ):
         """Request job to miner - uses REST API if configured, otherwise WebSocket.
 
         executor_id (DAH-2958): None asks the miner for every executor it has for this validator
         (the cycle); a uuid asks for that one executor only (the express lane) — the miner already
         filters register_pubkey on it, exactly as it does for the rental key-submit.
+        first_pass (DAH-3011): this is the executor's first, unscored verification; handed to
+        TaskService.create_task, where FIRST_PASS_FAST_PATH_ENABLED decides whether the probes
+        shrink. The cycle never sets it.
         """
         if settings.USE_REST_API:
             logger.info(
@@ -311,6 +316,7 @@ class MinerService:
                 default_docker_image_digests,
                 executor_image_snapshot,
                 executor_id=executor_id,
+                first_pass=first_pass,
             )
         else:
             logger.info(
@@ -447,6 +453,7 @@ class MinerService:
                                         default_docker_image_digests=default_docker_image_digests,
                                         executor_image_snapshot=executor_image_snapshot,
                                         attestation_nonce=attestation_nonce,
+                                        first_pass=first_pass,
                                     ),
                                     timeout=settings.JOB_TIME_OUT - 120
                                 )
@@ -1958,6 +1965,7 @@ class MinerService:
         default_docker_image_digests: dict[str, str],
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
+        first_pass: bool = False,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: see the WebSocket path — the RoCE probe measures the cycle's remaining time
@@ -2057,6 +2065,7 @@ class MinerService:
                                     default_docker_image_digests=default_docker_image_digests,
                                     executor_image_snapshot=executor_image_snapshot,
                                     attestation_nonce=attestation_nonce,
+                                    first_pass=first_pass,
                                 ),
                                 timeout=settings.JOB_TIME_OUT - 120
                             )

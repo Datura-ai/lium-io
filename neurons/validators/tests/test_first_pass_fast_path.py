@@ -276,6 +276,36 @@ async def test_first_pass_failed_network_probe_is_deferred_too(fast_path_on, con
     assert result.event.what_we_saw["first_sample_download_speed_mbps"] is None
 
 
+class _ConfigAwareSequence:
+    """Queued responses, and the keyword arguments of every call."""
+
+    def __init__(self, *responses: MockVerifyXResponse):
+        self._responses = list(responses)
+        self.kwargs_per_call: list[dict] = []
+
+    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec, **kw):
+        self.kwargs_per_call.append(kw)
+        return self._responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_config(
+    fast_path_on, monkeypatch, context_factory
+):
+    """DAH-2959 + DAH-3011 compose: with both flags on, the cold-sample retry is a first-pass
+    probe too — the 128 GB / 5 GB write must not come back on the second sample."""
+    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
+    service = _ConfigAwareSequence(_probe(59.9), _probe(500.0))
+
+    result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
+
+    first_pass_overrides = {"challenge_config_overrides": {"memory_max_test_gb": 16, "storage_throughput_test_gb": 1}}
+    assert service.kwargs_per_call == [first_pass_overrides, first_pass_overrides]
+    assert result.passed is True
+    assert result.event.what_we_saw["cold_sample_retry"]["used"] == "retry"
+    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
+
+
 @pytest.mark.asyncio
 async def test_first_pass_on_a_host_with_an_ema_keeps_the_gate(fast_path_on, context_factory):
     known = RentedExecutorsResponse(
