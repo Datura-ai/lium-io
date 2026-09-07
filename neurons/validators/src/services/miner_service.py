@@ -230,6 +230,29 @@ class MinerService:
             claimed.append(executor)
         return claimed
 
+    def _only_requested(
+        self, executors: list[ExecutorSSHInfo], executor_id: str, default_extra: dict
+    ) -> list[ExecutorSSHInfo]:
+        """The express lane asked the miner for one executor; run the pipeline on that one only.
+        A miner that answers with more (an old miner ignoring the filter, or a misbehaving one)
+        would otherwise get every extra executor verified here, concurrently with the wave that
+        holds its claim, and the extra results are discarded by the caller anyway (DAH-2958)."""
+        requested = [executor for executor in executors if executor.uuid == executor_id]
+        if len(requested) != len(executors):
+            logger.warning(
+                _m(
+                    "Miner returned executors the express lane did not ask for; ignoring them",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "executor_uuid": executor_id,
+                            "ignored": [e.uuid for e in executors if e.uuid != executor_id],
+                        }
+                    ),
+                )
+            )
+        return requested
+
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
         if not settings.EXPRESS_LANE_ENABLED:
             return
@@ -407,7 +430,7 @@ class MinerService:
                     executors = (
                         self._claim_for_cycle(msg.executors, default_extra)
                         if executor_id is None
-                        else msg.executors
+                        else self._only_requested(msg.executors, executor_id, default_extra)
                     )
                     try:
                         tasks = [
@@ -2017,7 +2040,7 @@ class MinerService:
                 executors = (
                     self._claim_for_cycle(msg.executors, default_extra)
                     if executor_id is None
-                    else msg.executors
+                    else self._only_requested(msg.executors, executor_id, default_extra)
                 )
                 try:
                     tasks = [
