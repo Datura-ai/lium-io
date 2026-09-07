@@ -28,8 +28,11 @@ def services():
 
 
 def _create_request(pod_id: str, renter_pub: str):
-    from payload_models.payloads import ContainerCreateRequest
+    from payload_models.payloads import ContainerCreateRequest, PayloadPortMapping
 
+    # the platform sends the ports the validator verified on this executor in earlier cycles (PortConnectivityCheck →
+    # backend); the stack's executor advertises RENTING_PORT_RANGE=40000-40019, published on its address by dind
+    ports = [PayloadPortMapping(internal_port=p, external_port=p) for p in range(40000, 40010)]
     return ContainerCreateRequest(
         miner_hotkey=lib.MINER_HOTKEY,
         miner_address=lib.MINER_IP,
@@ -45,6 +48,8 @@ def _create_request(pod_id: str, renter_pub: str):
         storage_limit_gb=2,
         is_sysbox=False,
         timestamp=int(time.time()),
+        available_ports=ports,
+        pod_mapping=[],
     )
 
 
