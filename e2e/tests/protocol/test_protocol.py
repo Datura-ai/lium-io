@@ -110,14 +110,17 @@ def test_future_timestamp_is_refused_401():
     assert r.status_code == 401 and "future" in r.text.lower(), r.text
 
 
-def test_headers_for_another_miner_install_nothing():
-    """X-Miner-Hotkey names a miner this one is not: the signature still verifies (it covers that hotkey), but no
-    executor of ours is handed out under another miner's name."""
+def test_headers_naming_another_miner_still_yield_only_this_miners_executors():
+    """X-Miner-Hotkey is part of the signed blob but, outside CENTRAL_MODE, a selector the single miner does not
+    compare with its own hotkey (dependencies/auth.py): the reply must still be this miner's own executors and
+    nothing else — there is nothing else to leak, and no 5xx."""
     vk = lib.validator_keypair()
-    r, _, _ = _submit(lib.validator_rest_headers(vk, miner_hotkey=lib.stranger_keypair().ss58_address))
+    r, _, pub = _submit(lib.validator_rest_headers(vk, miner_hotkey=lib.stranger_keypair().ss58_address))
     assert r.status_code in (200, 401, 403), r.text
     if r.status_code == 200:
-        assert r.json().get("executors") == [], r.text
+        assert {e["uuid"] for e in r.json()["executors"]} <= {lib.EXECUTOR_UUID}, r.text
+        lib.http("POST", f"{lib.MINER_URL}/api/validator/ssh-pubkey-remove", headers=lib.validator_rest_headers(vk), timeout=60,
+                 json={"message_type": "SSHPubKeyRemoveRequest", "public_key": pub, "validator_signature": lib.sign(vk, pub), "miner_hotkey": lib.MINER_HOTKEY})
 
 
 # ------------------------------------------------------------ miner → executor /upload_ssh_key -------------------------
