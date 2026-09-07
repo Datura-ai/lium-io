@@ -23,9 +23,12 @@ services:
     privileged: true
     environment:
       DOCKER_TLS_CERTDIR: ""
-      E2E_GPU: ${E2E_GPU}
+    # a third listener on a host-bound directory: the executor bind-mounts that socket file as its
+    # /var/run/docker.sock, the path a provider's executor gets from its host (run.sh sets the group on it)
+    command: ["--host=unix:///var/run/docker.sock", "--host=unix:///dind-sock/docker.sock", "--host=tcp://0.0.0.0:2375"]
     volumes:
       - dind-data:/var/lib/docker
+      - ./.dind-sock:/dind-sock
     ports:
       # the Makefile builds the rental image onto this daemon (seed) and lists its containers (logs)
       - "127.0.0.1:23750:2375"
@@ -55,11 +58,12 @@ services:
       INTERNAL_PORT: ${E2E_EXECUTOR_PORT}
       SSH_PORT: ${E2E_EXECUTOR_SSH_PORT}
       SSH_PUBLIC_PORT: ${E2E_EXECUTOR_SSH_PORT}
-      DOCKER_HOST: tcp://127.0.0.1:2375
     volumes:
       # the validator hotkey the executor trusts — production bakes it into the image (core/config.py); the :dev
       # images override it the same way, through core/config_override.py
       - ./executor/trust_anchor.py:/root/app/src/core/config_override.py:ro
+      # the host's docker socket, as on a provider's machine (exists once dind is healthy — see depends_on)
+      - ./.dind-sock/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:${E2E_EXECUTOR_PORT}/version || exit 1"]
       interval: 5s
