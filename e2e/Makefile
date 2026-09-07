@@ -13,12 +13,12 @@ export
 ARTIFACTS := $(CURDIR)/artifacts
 WAIT_TIMEOUT ?= 300
 ifeq ($(E2E_GPU),)
-  COMPOSE := docker compose -f docker-compose.e2e.yml
+  COMPOSE := docker compose --env-file stack.env -f docker-compose.e2e.yml
   # the executor host's dockerd (rental containers land there); the pod image is built onto it in `seed`
   EXECUTOR_DOCKER := docker -H tcp://127.0.0.1:23750
 else
   # GPU host: the executor runs on THIS machine's dockerd (docker-compose.gpu.yml) and is reached at the network gateway
-  COMPOSE := docker compose -f docker-compose.e2e.yml -f docker-compose.gpu.yml
+  COMPOSE := docker compose --env-file stack.env -f docker-compose.e2e.yml -f docker-compose.gpu.yml
   EXECUTOR_DOCKER := docker
   export E2E_EXECUTOR_IP := 172.30.0.1
 endif
