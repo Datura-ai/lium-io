@@ -14,6 +14,8 @@ Welcome to **Lium.io powered by Bittensor Subnet 51**! This project enables a de
   - [For Renters](#for-renters)
   - [For Miners](#for-miners)
   - [For Validators](#for-validators)
+- [Repository Layout](#repository-layout)
+- [Running the Tests](#running-the-tests)
 - [Contact and Support](#contact-and-support)
 
 ## Introduction
@@ -41,7 +43,7 @@ If you are looking to rent computational resources, you can easily do so through
 
 To start renting machines, visit [lium.io](https://lium.io) and access the resources you need.
 
-**Command-Line Alternative**: For renters who prefer working from the terminal, you can also use [lium-cli](https://github.com/Datura-ai/lium-cli) - a command-line interface that allows you to manage GPU pods, SSH into machines, transfer files, and execute commands directly from your terminal. Install it with `pip install lium-cli`.
+**Command-Line Alternative**: For renters who prefer working from the terminal, you can also use the [Lium CLI](https://github.com/Datura-ai/lium) - a command-line interface that allows you to manage GPU pods, SSH into machines, transfer files, and execute commands directly from your terminal. Install it with `pip install lium.io`.
 
 ### For Miners
 
@@ -60,6 +62,33 @@ Validators play a crucial role in maintaining the integrity of the Compute Subne
 
 For more details, visit the [Validator Setup Guide](neurons/validators/README.md).
 
+## Repository Layout
+
+Three deployable services, one shared package, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files:
+
+- `neurons/validators/` — the validator: scores miners, verifies executors over SSH, creates and manages rental containers on them (`src/services/docker_service.py`), sets weights. `src/miner_jobs/` holds the scripts the validator uploads to an executor and runs there (`machine_scrape.py` hardware scrape, `backup_storage.py` / `restore_storage.py`, `workspace_mount.py`); `machine_scrape.py` is obfuscated per job by `src/services/file_encrypt_service.py` before upload, so its key order is load-bearing (see the comment at the top of that file).
+- `neurons/miners/` — the miner: registers executors with the network and answers validator requests; its database schema is Alembic migrations under `migrations/`.
+- `neurons/executor/` — the agent installed on a GPU machine: exposes the machine to its miner's validators, runs the containers. `dstacktee/` runs it inside an Intel TDX confidential VM with attestation (its own README).
+- `datura/` — the protocol shared by the three: request/response models (`datura/requests`), consumers, errors.
+- `watchtower/` — pulls validator-signed image updates and restarts containers (its own README).
+- `scripts/` — the `install_*_on_ubuntu.sh` installers referenced by the setup guides; `docs/` — operator notes; `contrib/` — contribution and style guides.
+
+## Running the Tests
+
+Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm project; the validator suite is the large one (~1,950 tests, about two minutes, SQLite — no Postgres needed):
+
+```bash
+cd neurons/validators && pdm install
+BITTENSOR_WALLET_NAME=test_wallet BITTENSOR_WALLET_HOTKEY_NAME=test_hotkey \
+SQLALCHEMY_DATABASE_URI=sqlite:///test.db ASYNC_SQLALCHEMY_DATABASE_URI=sqlite+aiosqlite:///test.db \
+ENABLE_TDX_ATTESTATION=True TDX_VERIFIER_URL=http://localhost:8000/verify \
+pdm run pytest tests/ -q
+
+cd neurons/executor && pdm install && mkdir -p tmp && pdm run pytest tests/ -q
+cd neurons/miners && pdm install && pdm run pytest tests/ -q
+```
+
+These are the exact commands `.github/workflows/test.yml` runs on every pull request. Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
 
 ## Contact and Support
 
