@@ -26,7 +26,6 @@ services:
       E2E_GPU: ${E2E_GPU}
     volumes:
       - dind-data:/var/lib/docker
-      - ./dind/daemon.json:/etc/docker/daemon.json:ro
     ports:
       # the Makefile builds the rental image onto this daemon (seed) and lists its containers (logs)
       - "127.0.0.1:23750:2375"
