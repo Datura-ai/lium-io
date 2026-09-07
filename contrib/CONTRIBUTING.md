@@ -16,10 +16,10 @@ The following is a set of guidelines for contributing to `lium-io`, the Subnet 5
 
 
 ## How Can I Contribute?
-Open an issue on [Datura-ai/lium-io](https://github.com/Datura-ai/lium-io/issues) describing the bug or the change you want, or pick one that is open. Fork the repository, branch from `main`, and open a pull request against `main` — the [README](../README.md) lists the layout and the exact test command for each neuron. Every pull request needs one approving review before it merges; the **Tests** workflow (validator and executor suites) runs on pull requests that touch `neurons/validators`, `neurons/executor` or `datura` — keep it green.
+Open an issue on [Datura-ai/lium-io](https://github.com/Datura-ai/lium-io/issues) describing the bug or the change you want, or pick one that is open. Fork the repository, branch from `main`, and open a pull request against `main` — the [README](../README.md) lists the layout and the exact test command for each neuron. Every pull request needs one approving review before it merges; the **Tests** workflow (validator, executor and miner suites) runs on every pull request against `main` or `dev` — keep it green.
 
 ## Communication Channels
-GitHub issues and pull requests on this repository. Providers running a node reach the team in the Lium Discord (linked from [docs.lium.io](https://docs.lium.io/providers/)); questions about the code belong in an issue so the answer stays findable.
+GitHub issues and pull requests on this repository. Providers running a node reach the team in the Lium Discord (linked from [docs.lium.io](https://docs.lium.io/providers)); questions about the code belong in an issue so the answer stays findable.
 
 > Please follow the Bittensor Subnet [style guide](./STYLE.md) regardless of your contribution type. 
 

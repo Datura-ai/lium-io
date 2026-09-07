@@ -64,7 +64,7 @@ For more details, visit the [Validator Setup Guide](neurons/validators/README.md
 
 ## Repository Layout
 
-Three deployable services, one shared package, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files:
+Three deployable services, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files, and one shared pdm package (`datura/`, a `pyproject.toml` only):
 
 - `neurons/validators/` — the validator: scores miners, verifies executors over SSH, creates and manages rental containers on them (`src/services/docker_service.py`), sets weights. `src/miner_jobs/` holds the scripts the validator uploads to an executor and runs there (`machine_scrape.py` hardware scrape, `backup_storage.py` / `restore_storage.py`, `workspace_mount.py`); `machine_scrape.py` is obfuscated per job by `src/services/file_encrypt_service.py` before upload, so its key order is load-bearing (see the comment at the top of that file).
 - `neurons/miners/` — the miner: registers executors with the network and answers validator requests; its database schema is Alembic migrations under `migrations/`.
@@ -82,13 +82,13 @@ cd neurons/validators && pdm install
 BITTENSOR_WALLET_NAME=test_wallet BITTENSOR_WALLET_HOTKEY_NAME=test_hotkey \
 SQLALCHEMY_DATABASE_URI=sqlite:///test.db ASYNC_SQLALCHEMY_DATABASE_URI=sqlite+aiosqlite:///test.db \
 ENABLE_TDX_ATTESTATION=True TDX_VERIFIER_URL=http://localhost:8000/verify \
-pdm run pytest tests/ -q
+pdm run pytest tests/ -v --tb=short --strict-markers
 
-cd neurons/executor && pdm install && mkdir -p tmp && pdm run pytest tests/ -q
-cd neurons/miners && pdm install && pdm run pytest tests/ -q
+cd neurons/executor && pdm install && mkdir -p tmp && pdm run pytest tests/ -v --tb=short
+cd neurons/miners && pdm install && pdm run pytest tests/ -v --tb=short
 ```
 
-These are the exact commands `.github/workflows/test.yml` runs on every pull request. Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
+These are the commands `.github/workflows/test.yml` runs on every pull request against `main` or `dev`. Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
 
 ## Contact and Support
 
