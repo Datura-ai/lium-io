@@ -4,6 +4,15 @@
 
 ## Quick setup with `lium mine` (recommended)
 
+Before the first command, the machine needs:
+
+- **Ubuntu 22.04 on x86_64**, kernel 5.19 or newer (6.x recommended; `hostnamectl` shows both), and root or passwordless `sudo`;
+- **the NVIDIA driver loaded** — `nvidia-smi` lists the GPUs;
+- **Docker Engine installed and running** — `docker ps` works. The Sysbox installer below refuses to run without it (`lium mine` runs the Docker install script too, but only after this step, and it is a no-op on a machine that already has Docker);
+- **a public IP** with the service port (`8080`) and the node SSH port (`2200`) reachable, and the SS58 hotkey of a provider registered on subnet 51.
+
+RAM, disk (including the 1.5× VRAM rule for the idle incentive) and the recommended XFS storage setup are in the [Node Quickstart requirements](https://docs.lium.io/providers/nodes/quickstart#requirements).
+
 Install [Sysbox](https://docs.lium.io/providers/nodes/sysbox) first — validators reject a node without the `sysbox-runc` runtime. The installer below also sets up the NVIDIA Container Toolkit:
 
 ```shell
