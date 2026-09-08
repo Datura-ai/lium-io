@@ -27,6 +27,7 @@ import pynvml
 from core.config import settings
 from core.logger import get_logger
 from services.cache_prefetch_state import STATE_PATH, CachePrefetchState, Outcome
+from services.pre_pull_service import PrePuller
 from services.pull_lock import cache_pull_lock
 
 logger = get_logger(__name__)
@@ -104,9 +105,16 @@ async def _local_digests(
 
 
 async def _cleanup_old_tags(
-    client: "docker.DockerClient", repository: str, keep_tag: str
+    client: "docker.DockerClient",
+    repository: str,
+    keep_tag: str,
+    keep_tags: frozenset[str] = frozenset(),
 ) -> str | None:
-    """Remove other locally cached tags of the same repository; return the last error."""
+    """Remove other locally cached tags of the same repository; return the last error.
+
+    ``keep_tags`` (DAH-2977): tags of pre-pull templates, which may share the repository
+    (daturaai/pytorch) and must survive a default-image refresh.
+    """
     try:
         images = await asyncio.to_thread(client.images.list, repository)
     except Exception as e:
@@ -116,7 +124,7 @@ async def _cleanup_old_tags(
     for image in images:
         for tag in list(image.tags):
             repo, _, tg = tag.rpartition(":")
-            if repo == repository and tg and tg != keep_tag:
+            if repo == repository and tg and tg != keep_tag and tg not in keep_tags:
                 try:
                     await asyncio.to_thread(client.images.remove, tag)
                     logger.info(f"Removed unused image: {tag}")
@@ -127,7 +135,10 @@ async def _cleanup_old_tags(
 
 
 async def _ensure_template(
-    client: "docker.DockerClient", data: dict, state: CachePrefetchState | None = None
+    client: "docker.DockerClient",
+    data: dict,
+    state: CachePrefetchState | None = None,
+    keep_tags: frozenset[str] = frozenset(),
 ) -> None:
     # A throwaway recorder keeps the body free of `if state:` guards when this is
     # called on its own (tests); the loop always passes the real one.
@@ -230,7 +241,7 @@ async def _ensure_template(
         state.note_pull_ok(image_ref)
         state.record_image_outcome(image_ref, Outcome.PULL_OK)
 
-    cleanup_error = await _cleanup_old_tags(client, docker_image, docker_image_tag)
+    cleanup_error = await _cleanup_old_tags(client, docker_image, docker_image_tag, keep_tags)
     state.note_cleanup_error(image_ref, cleanup_error)
 
 
@@ -269,6 +280,10 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
 
     logger.info(f"Cache template pre-pull starting (refresh every {refresh_interval}s)")
 
+    # DAH-2977: off by default. When on, the backend is asked for the top-N official
+    # templates too (`pre_pull: true` entries) and PrePuller warms one per sweep while idle.
+    pre_puller = PrePuller(client) if settings.PRE_PULL_TEMPLATES_ENABLED else None
+
     gpu_model = "unknown"
     driver_version = "unknown"
     # Bound every backend request so a hung server cannot wedge the prefetch loop;
@@ -296,6 +311,8 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                     )
 
                 params = {"gpu_model": gpu_model, "driver_version": driver_version}
+                if pre_puller:
+                    params["include_pre_pull"] = "true"
                 templates, status, backend_error = await _fetch_templates(session, url, params)
                 state.note_backend(
                     status=status, template_count=len(templates), error=backend_error
@@ -306,8 +323,24 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                     await asyncio.sleep(error_interval)
                     continue
 
+                # Pre-pull entries are opportunistic and idle-only, so they never go
+                # through the mandatory default-image path below; their tags are only
+                # shielded from its old-tag cleanup (same repository).
+                pre_pull = [data for data in templates if data.get("pre_pull")]
+                keep_tags = frozenset(
+                    data["docker_image_tag"] for data in pre_pull if data.get("docker_image_tag")
+                )
                 for data in templates:
-                    await _ensure_template(client, data, state)
+                    if not data.get("pre_pull"):
+                        await _ensure_template(client, data, state, keep_tags)
+                if pre_puller:
+                    try:
+                        await pre_puller.sweep(pre_pull)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        # Opportunistic: never let it change the default image's outcome.
+                        logger.warning(f"pre-pull sweep failed: {e}")
 
                 state.record_loop_outcome(Outcome.SWEEP_OK)
                 # Publish before sleeping, so the document is never a full refresh
