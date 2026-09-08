@@ -89,6 +89,14 @@ RUN mv /root/app/libdmcompverify.so /usr/lib/ \
   && mv /root/app/libverifyx.so /usr/lib/ \
   && mv /root/app/libinspector.so /usr/lib/
 
+# DAH-3137: install the gpu_sig hardware-signature prober (built `-cudart static` in
+# celium-gpu-verifier and published here, so it starts in this slim image with only the
+# driver's libcuda.so.1). Installed only when present; an absent binary => the validator
+# check skips (binary_absent).
+RUN if [ -s /root/app/gpu_sig ]; then \
+      mkdir -p /root/app/bin && mv /root/app/gpu_sig /root/app/bin/gpu_sig && chmod 0755 /root/app/bin/gpu_sig; \
+    fi
+
 # Remove existing SSH host keys
 RUN rm -f /etc/ssh/ssh_host_*
 

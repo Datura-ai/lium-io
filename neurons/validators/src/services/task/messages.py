@@ -1504,3 +1504,36 @@ class LocalVerifyMessages:
         category="transport",
         impact="The matmul and VerifyX verdicts below come from the executor's local run, judged by the validator",
     )
+
+
+class GpuSignatureMessages:
+    """DAH-3137 — on-host GPU hardware-signature challenge (observe-only)."""
+
+    SKIPPED = MessageTemplate(
+        event="GPU signature challenge skipped",
+        reason="GPU_SIGNATURE_SKIPPED",
+        severity="info",
+        category="gpu",
+        impact="None — check disabled, binary/verifier absent, or no claimed GPUs",
+    )
+    OK = MessageTemplate(
+        event="GPU signature challenge passed",
+        reason="GPU_SIGNATURE_OK",
+        severity="info",
+        category="gpu",
+        impact="None — every claimed card returned a fresh, sealed, in-envelope signature",
+    )
+    FAILED = MessageTemplate(
+        event="GPU signature challenge failed (observe-only)",
+        reason="GPU_SIGNATURE_FAILED",
+        severity="warning",
+        category="gpu",
+        impact=(
+            "Advisory — a claimed card failed the sealed nonce-bound signature "
+            "(possible count/type spoof); score is NOT affected until enforcement is wired"
+        ),
+        remediation=(
+            "Provider: ensure every advertised GPU is physically present and healthy. "
+            "Ops: review per-card reasons before enabling GPU_SIGNATURE_ENFORCEMENT_ENABLED."
+        ),
+    )
