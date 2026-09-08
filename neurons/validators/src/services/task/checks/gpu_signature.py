@@ -5,10 +5,12 @@ import secrets
 import shlex
 import time
 
-from core.config import settings
 from services.gpu_signature import evaluate_card, parse_result_line, summarize
 
-from ..messages import GpuSignatureMessages as Msg, render_message
+from core.config import settings
+
+from ..messages import GpuSignatureMessages as Msg
+from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
 

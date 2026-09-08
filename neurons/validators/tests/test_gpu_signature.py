@@ -7,8 +7,6 @@ verify / envelope / aggregate logic, including the count-spoof signals.
 import hashlib
 import hmac
 
-import pytest
-
 from services import gpu_signature as gs
 
 MASTER = b"lium-gpu-sig-dev-key-do-not-use-in-prod"
