@@ -344,7 +344,6 @@ class FileEncryptService:
         3. Runs the obfuscator script to generate an obfuscated version of the machine scrape script.
         4. Replaces dictionary keys in the obfuscated script with randomly generated names.
         5. Compiles the obfuscated script into a binary using Nuitka or another method.
-        6. Generates a score script file and obfuscates it for secure execution.
 
         Returns: MinerJobEnryptedFiles
         """
@@ -393,18 +392,6 @@ class FileEncryptService:
             #     machine_scrape_file_name = self.make_binary_file(
             #         str(tmp_directory), machine_scrape_file.name
             #     )
-
-        # # generate score_script file
-        # score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
-        # with open(score_script_file_path) as file:
-        #     content = file.read()
-        # modified_content = content
-
-        # with tempfile.NamedTemporaryFile(delete=True, suffix=".py") as score_file:
-        #     score_file.write(modified_content.encode("utf-8"))
-        #     score_file.flush()
-        #     os.fsync(score_file.fileno())
-        #     score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
