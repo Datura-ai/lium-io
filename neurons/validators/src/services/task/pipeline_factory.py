@@ -42,6 +42,7 @@ from .checks import (
     GpuFingerprintCheck,
     GpuModelValidCheck,
     GpuPowerLimitCheck,
+    GpuSignatureCheck,
     GpuUsageCheck,
     GpuVramPrecheck,
     InspectorRentedCheck,
@@ -317,6 +318,12 @@ class PipelineFactory:
                 VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),
+                # DAH-3137: nonce-bound, sealed per-GPU hardware-signature challenge from the
+                # pre-placed executor-image binary (matmul TFLOPS + VRAM bandwidth + kernel UUID).
+                # Additive and observe-only (ENABLE_GPU_SIGNATURE_CHECK, default off); runs right
+                # after the capability matmul on the same idle, non-filler population, changes no
+                # score. A building block toward liumd (DAH-2834).
+                GpuSignatureCheck(),
                 # DAH-2265 Plan 2: advisory, non-fatal — observes whether the executor has
                 # the recommended default image pre-pulled (DOCKER_PULL no-op). Runs here,
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
@@ -381,6 +388,9 @@ class PipelineFactory:
                 # VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),
+                # DAH-3137: observe-only, flag-gated (default off); safe in dry run (the GPU work
+                # is real but changes no executor/host state the dry run must avoid).
+                GpuSignatureCheck(),
                 RentalVerificationCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),

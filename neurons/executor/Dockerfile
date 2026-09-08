@@ -1,3 +1,26 @@
+# ---- optional gpu_sig builder (DAH-3137) --------------------------------------
+# Compiles the on-host GPU hardware-signature prober (neurons/executor/gpu_sig).
+# The builder base defaults to the SAME slim image as the final stage, so a
+# DEFAULT build pulls no CUDA and produces an EMPTY binary — the runtime install
+# below then no-ops and the validator check skips (binary_absent). Nothing about
+# the current image changes unless you opt in:
+#   docker build \
+#     --build-arg GPUSIG_BUILDER=nvidia/cuda:12.6.2-devel-ubuntu22.04 \
+#     --build-arg INSTALL_GPU_SIGNATURE=true \
+#     --build-arg LIUM_SIG_KEY=<hex-seal-key-matching-the-validator> ...
+ARG GPUSIG_BUILDER=python:3.11-slim
+FROM ${GPUSIG_BUILDER} AS gpusig
+ARG INSTALL_GPU_SIGNATURE=false
+ARG LIUM_SIG_KEY=lium-gpu-sig-dev-key-do-not-use-in-prod
+COPY gpu_sig /gpu_sig
+RUN set -e; \
+    if [ "$INSTALL_GPU_SIGNATURE" = "true" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends make build-essential && \
+      cd /gpu_sig && make gpu_sig LIUM_SIG_KEY="$LIUM_SIG_KEY" && cp gpu_sig /gpu_sig.bin; \
+    else \
+      : > /gpu_sig.bin; \
+    fi
+
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -85,6 +108,14 @@ COPY . .
 RUN mv /root/app/libdmcompverify.so /usr/lib/ \
   && mv /root/app/libverifyx.so /usr/lib/ \
   && mv /root/app/libinspector.so /usr/lib/
+
+# DAH-3137: install the gpu_sig prober only when it was actually built (opt-in
+# above). An empty artifact => not installed => the validator check skips.
+COPY --from=gpusig /gpu_sig.bin /tmp/gpu_sig.bin
+RUN if [ -s /tmp/gpu_sig.bin ]; then \
+      mkdir -p /root/app/bin && cp /tmp/gpu_sig.bin /root/app/bin/gpu_sig && chmod 0755 /root/app/bin/gpu_sig; \
+    fi; \
+    rm -f /tmp/gpu_sig.bin
 
 # Remove existing SSH host keys
 RUN rm -f /etc/ssh/ssh_host_*
