@@ -32,6 +32,9 @@ PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
 GPU_ESTIMATES_CHANNEL = "gpu_estimates_channel"
 GPU_ESTIMATES_KEY = "gpu_estimates"
 INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
+# DAH-1932: every executor UUID the stale-container cleanup has run for. A UUID not in this set
+# gets one cycle without container removal (see StaleContainerCleanupCheck).
+CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 # Written by the connector process, read by the validator process: they share no memory, so
 # this key is how an operator's request for a cycle crosses between them.
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
@@ -204,10 +207,10 @@ class RedisService:
         async with self.lock:
             await self.redis.delete(key)
 
-    async def sadd(self, key: str, elem: str):
-        """Add an element to a set in Redis."""
+    async def sadd(self, key: str, elem: str) -> int:
+        """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""
         async with self.lock:
-            await self.redis.sadd(key, elem)
+            return await self.redis.sadd(key, elem)
 
     async def srem(self, key: str, elem: str):
         """Remove an element from a set in Redis."""
