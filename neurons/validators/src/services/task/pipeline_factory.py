@@ -43,6 +43,7 @@ from .checks import (
     GpuFingerprintCheck,
     GpuModelValidCheck,
     GpuPowerLimitCheck,
+    GpuSignatureCheck,
     GpuUsageCheck,
     GpuVramPrecheck,
     InspectorRentedCheck,
@@ -325,6 +326,13 @@ class PipelineFactory:
                 # DAH-3035: the kernel-fault probe right after the matmul it complements — same idle,
                 # capability-verified population, same filler skip. Flag-gated, shadow-first, off by default.
                 GpuFaultProbeCheck(),
+                # DAH-3137: nonce-bound, sealed per-GPU hardware-signature challenge from the
+                # pre-placed executor-image binary (matmul TFLOPS + VRAM bandwidth + kernel UUID),
+                # authenticated by libgpusig.so. Additive and observe-only
+                # (ENABLE_GPU_SIGNATURE_CHECK, default off); runs after the capability matmul and its
+                # DAH-3035 fault probe, on the same idle, non-filler population, changes no score.
+                # Toward liumd (DAH-2834).
+                GpuSignatureCheck(),
                 # DAH-2265 Plan 2: advisory, non-fatal — observes whether the executor has
                 # the recommended default image pre-pulled (DOCKER_PULL no-op). Runs here,
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
@@ -390,6 +398,9 @@ class PipelineFactory:
                 TdxHostCheck(),
                 CapabilityCheck(),
                 GpuFaultProbeCheck(),
+                # DAH-3137: observe-only, flag-gated (default off); safe in dry run (the GPU work
+                # is real but changes no executor/host state the dry run must avoid).
+                GpuSignatureCheck(),
                 RentalVerificationCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
