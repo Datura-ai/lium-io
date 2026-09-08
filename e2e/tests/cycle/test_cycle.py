@@ -11,7 +11,6 @@ pipeline halts with SCRAPE_FAILED, score 0 — the exact verdict a provider whos
 E2E_GPU=1 the executor sees the host's GPUs and the cycle must report them.
 """
 
-import asyncio
 import json
 import time
 import uuid

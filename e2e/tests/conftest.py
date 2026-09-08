@@ -10,8 +10,6 @@ are the real code.
 
 import asyncio
 
-import pytest
-
 # One event loop for the whole tester process: services.ioc builds the validator's clients (redis, aiohttp) on the
 # loop that is current at import, and asyncio.run() would hand every test a fresh loop those clients are not bound
 # to ("attached to a different loop"). Suites call lib.run(coro), which uses this loop.
@@ -30,8 +28,3 @@ def _stub_out_the_chain() -> None:
 
 
 _stub_out_the_chain()
-
-
-@pytest.fixture(scope="session")
-def no_chain():
-    return True

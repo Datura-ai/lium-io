@@ -8,8 +8,6 @@ stack's dockerd carries a no-op NVIDIA prestart hook (e2e/dind), so the same com
 whole path is exercised; with E2E_GPU=1 the pod gets the host's GPUs and `nvidia-smi -L` inside it must list them.
 """
 
-import asyncio
-import json
 import time
 import uuid
 

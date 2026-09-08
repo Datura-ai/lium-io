@@ -48,8 +48,10 @@ where those two ports are not reachable from outside (a Lium pod, a firewalled d
 production host. **The GPU path has not been run yet** — CI and the loop's runs are the CPU path; what it is meant to
 prove is marked below.
 
-`make up` is idempotent (`--wait` on every healthcheck, seed is `ON CONFLICT DO NOTHING`). Cold build ≈ 4 min on
-16 vCPU, warm ≈ 10 s; the whole gate ≈ 10 min cold.
+`make up` is idempotent (`--wait` on every healthcheck, seed is `ON CONFLICT DO NOTHING`). Measured: cold build 136 s
+on 16 vCPU (sandbox EC2) and 155 s on the 4-vCPU GitHub runner, warm build ≈ 1 s; the whole gate ≈ 3 min warm (170 s
+on EC2) and ≈ 6 min cold (5m49s in CI). The `e2e-gate` job's sticky comment on the PR carries the per-stage times of
+the latest run.
 
 ## The merge gate (`make e2e-full` = `gate.sh`, CI job `e2e-gate`)
 

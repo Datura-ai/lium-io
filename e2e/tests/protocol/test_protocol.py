@@ -6,7 +6,6 @@ top (/upload_ssh_key), the executor installs it and answers with its SSH coordin
 removed. Each step here is the real HTTP call the code makes, plus the refusals a spoofer must hit.
 """
 
-import asyncio
 import socket
 import time
 
