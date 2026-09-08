@@ -52,8 +52,10 @@ runs:
             // the checkout is shallow at head_sha; two commits are all a diff needs
             const mg = context.payload.merge_group;
             await exec.exec('git', ['fetch', '--no-tags', '--depth=1', 'origin', mg.base_sha]);
-            const { stdout } = await exec.getExecOutput('git', ['diff', '--name-only', '--no-renames', mg.base_sha, mg.head_sha]);
-            files = stdout.split('\n').filter(f => f && !isDoc(f));
+            // -z: NUL-separated, unquoted paths — with core.quotePath a name holding a byte >= 0x80, `"` or `\`
+            // comes back quoted and would miss every prefix, silently skipping that package
+            const { stdout } = await exec.getExecOutput('git', ['diff', '--name-only', '-z', '--no-renames', mg.base_sha, mg.head_sha]);
+            files = stdout.split('\0').filter(f => f && !isDoc(f));
             why = `merge group ${mg.base_sha.slice(0, 7)}..${mg.head_sha.slice(0, 7)}: ${files.length} files`;
           }
 
