@@ -17,7 +17,8 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
         "NVIDIA GeForce RTX 4090 D": 0.11,
         "NVIDIA RTX 4000 Ada Generation": 0.16,
         "NVIDIA RTX 6000 Ada Generation": 0.69,
-        "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.86,
+        # same card for a renter; anchored at parity (DAH-3230, owner 2026-09-08)
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition": 1.0,
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 1.0,
         "NVIDIA L4": 0.11,
         "NVIDIA L40S": 0.35,

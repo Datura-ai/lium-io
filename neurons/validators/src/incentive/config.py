@@ -14,11 +14,25 @@ from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
 @dataclass(frozen=True)
 class DefaultPrice:
-    """Sentinel: resolve to MACHINE_PRICES[gpu_model] * multiplier."""
+    """Sentinel: resolve to rental_prices_per_hour[gpu_model] * multiplier."""
     multiplier: float = 1.0
 
 
 DEFAULT_PRICE = DefaultPrice()
+
+
+# Hourly anchor per GPU model for the unrented incentive. The table is lium-core's, installed from
+# PyPI at the version pinned in pdm.lock, which anchors the RTX PRO 6000 Server Edition at 0.86 and
+# the Workstation Edition at 1.0. The two are the same card for a renter (DAH-3230: the source table
+# in packages/lium-core and the backend's MACHINE_PRICES move the Server Edition to 1.0), so the
+# validator pins the two editions to parity here; the override can go once the validator's lock
+# carries a lium-core release with the parity table.
+RENTAL_PRICES_PER_HOUR: dict[str, float] = {
+    **DEFAULT_SHARED_CONFIG.machine_prices,
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+    ],
+}
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -120,7 +134,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
 }
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
-# Use DEFAULT_PRICE sentinel to fall back to MACHINE_PRICES.
+# Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
 # Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
 # Resolution order: specific GPU name > "*"; specific count > "*".
 D = DEFAULT_PRICE
@@ -270,13 +284,13 @@ class IncentiveConfig(BaseModel):
     )
 
     rental_prices_per_hour: dict[str, float] = Field(
-        default=DEFAULT_SHARED_CONFIG.machine_prices,
+        default=RENTAL_PRICES_PER_HOUR,
         description="Rental prices per GPU type in USD/hour"
     )
 
     gpu_count_custom_prices: dict[str, dict[str, float | DefaultPrice]] = Field(
         default=GPU_COUNT_CUSTOM_PRICES,
-        description="Per-(gpu_model, gpu_count) hourly prices. Use DEFAULT_PRICE for MACHINE_PRICES fallback."
+        description="Per-(gpu_model, gpu_count) hourly prices. Use DEFAULT_PRICE for rental_prices_per_hour fallback."
     )
 
     @field_validator("algorithm")
