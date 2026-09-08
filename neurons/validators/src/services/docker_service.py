@@ -9,7 +9,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
@@ -61,6 +61,7 @@ from payload_models.payloads import (
 )
 from services.attestation_service import AttestationError, AttestationService
 from services.const import (
+    EDIT_PARKED_SUFFIX,
     FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
     DPHN_CACHE_LISTING_FLOOR_GB,
@@ -486,10 +487,6 @@ class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
 
 
-# DAH-2740: the name a pod's current container is parked under while an edit builds its replacement.
-EDIT_PARKED_SUFFIX = "__prev"
-
-
 class _EditSwap:
     """DAH-2740: keep the customer's container until its replacement runs, so a failed edit can be undone.
 
@@ -508,20 +505,44 @@ class _EditSwap:
         self.container_name = container_name
         self.parked_name: str | None = None
         self.default_extra = default_extra
+        # How restore() brings the parked container back up. Set by the create path once it knows
+        # the pod's volume path: a bare `docker start` drops the gocryptfs plaintext mount and the
+        # sshd, so the restore goes through the same steps as start_existing_container
+        # (start, remount with allow_init=False, sshd bootstrap). None falls back to `docker start`.
+        self.bring_up: Callable[[str], Awaitable[None]] | None = None
 
     async def __aenter__(self) -> "_EditSwap":
         return self
 
     async def park(self) -> str | None:
         """Rename the running container aside and stop it. None when there is nothing to park."""
-        listed = await self.ssh_client.run(
-            f'/usr/bin/docker ps -a --format "{{{{.Names}}}}" --filter name=^{shlex.quote(self.container_name)}$'
-        )
-        if self.container_name not in (listed.stdout or "").split():
-            return None
         parked = f"{self.container_name}{EDIT_PARKED_SUFFIX}"
-        # a leftover from an earlier edit that never finished must not block the rename
-        await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
+        listed = await self.ssh_client.run(
+            f'/usr/bin/docker ps -a --format "{{{{.Names}}}}" '
+            f"--filter name=^{shlex.quote(self.container_name)}$ --filter name=^{shlex.quote(parked)}$"
+        )
+        names = set((listed.stdout or "").split())
+        if self.container_name not in names:
+            if parked in names:
+                # An earlier edit crashed between park and restore: the parked container is the
+                # customer's only copy. Give it its name back and carry on; never remove it.
+                renamed = await self.ssh_client.run(
+                    f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
+                )
+                if renamed.exit_status != 0:
+                    raise Exception(
+                        f"[park_current_container] a parked container from an earlier edit could not be "
+                        f"renamed back: {(renamed.stderr or '').strip()}"
+                    )
+                logger.warning(
+                    _m("Recovered a parked container from an earlier edit", extra=get_extra_info({**self.default_extra, "parked": parked}))
+                )
+            else:
+                return None
+        elif parked in names:
+            # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
+            # the leftover parked one is stale and must not block the rename.
+            await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
         renamed = await self.ssh_client.run(
             f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
         )
@@ -565,20 +586,31 @@ class _EditSwap:
         return False
 
     async def restore(self) -> None:
-        """Undo the edit: drop the half-built replacement, give the parked container its name back, start it."""
+        """Undo the edit: drop the half-built replacement, give the parked container its name back and
+        bring it up — start, gocryptfs remount (``allow_init=False``) and sshd, the way
+        ``start_existing_container`` does. Park stopped it, so the FUSE mount is gone; a bare
+        ``docker start`` would hand the customer ciphertext in the workspace."""
         q_name, q_parked = shlex.quote(self.container_name), shlex.quote(self.parked_name)
         await self.ssh_client.run(f"/usr/bin/docker rm -fv {q_name} 2>/dev/null || true")
         renamed = await self.ssh_client.run(f"/usr/bin/docker rename {q_parked} {q_name}")
-        started = await self.ssh_client.run(f"/usr/bin/docker start {q_name}") if renamed.exit_status == 0 else renamed
-        extra = get_extra_info({**self.default_extra, "parked": self.parked_name, "restored": started.exit_status == 0})
-        if started.exit_status == 0:
+        error: str | None = None
+        if renamed.exit_status != 0:
+            error = f"docker rename: {(renamed.stderr or '').strip()}"
+        elif self.bring_up is not None:
+            try:
+                await self.bring_up(self.container_name)
+            except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
+                error = f"{type(exc).__name__}: {exc}"
+        else:
+            started = await self.ssh_client.run(f"/usr/bin/docker start {q_name}")
+            if started.exit_status != 0:
+                error = f"docker start: {(started.stderr or '').strip()}"
+        extra = get_extra_info({**self.default_extra, "parked": self.parked_name, "restored": error is None})
+        if error is None:
             logger.warning(_m("Edit failed; the pod's previous container was restored", extra=extra))
         else:
             logger.error(
-                _m(
-                    "Edit failed and the previous container could not be restored",
-                    extra={**extra, "error": (started.stderr or "").strip()},
-                )
+                _m("Edit failed and the previous container could not be restored", extra={**extra, "error": error})
             )
 
 
@@ -1953,6 +1985,9 @@ class DockerService:
                 await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
+            # DAH-2740: a sibling create on the same host sweeps while an edit's parked container is
+            # the customer's only copy; the parked twin of every active pod name is protected too
+            active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
             active_volume_set = set(active_volume_names) if active_volume_names else set()
             pod_containers = [
                 name for name in all_names
@@ -4875,7 +4910,17 @@ class DockerService:
                 protected_container_names = list(payload.active_container_names or [])
                 if local_volume:
                     # DAH-2740: an edit keeps its current container, parked, until the replacement runs;
-                    # the sweep below must not treat the parked name as stale.
+                    # the sweep below must not treat the parked name as stale. A failed edit brings
+                    # the parked container back the way start_container does (remount, sshd), at the
+                    # pod's volume path.
+                    edit_swap.bring_up = lambda name: self._bring_up_existing_container(
+                        docker_client=docker_client,
+                        ssh_client=ssh_client,
+                        container_name=name,
+                        local_volume_path=local_volume_path,
+                        pod_id=payload.pod_id,
+                        default_extra=default_extra,
+                    )
                     current_step = "park_current_container"
                     parked_name = await edit_swap.park()
                     if parked_name:
@@ -5970,6 +6015,8 @@ class DockerService:
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
+            # the start goes through the docker SDK; the SSH session is opened only once it
+            # succeeded, for the remount (no shell fallback for a failed start)
             await run_logged_rental_docker_sdk_operation(
                 operation="start_container",
                 log_extra=default_extra,
@@ -5983,49 +6030,98 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
-                encrypted_volume_name = await self._encrypted_local_volume_name(
-                    docker_client,
-                    container_name,
+                await self._restore_mount_and_sshd_after_start(
+                    docker_client=docker_client,
+                    ssh_client=ssh_client,
+                    container_name=container_name,
+                    local_volume_path=local_volume_path,
+                    pod_id=pod_id,
+                    default_extra=default_extra,
                 )
-                if encrypted_volume_name:
-                    if not local_volume_path:
-                        raise RuntimeError(
-                            f"{container_name} holds an encrypted volume but no plaintext path "
-                            "was supplied; refusing to remount it at a guessed path"
-                        )
-                    await self.setup_encrypted_local_volume(
-                        ssh_client=ssh_client,
-                        container_name=container_name,
-                        plaintext_path=local_volume_path,
-                        volume_name=encrypted_volume_name,
-                        pod_id=pod_id,
-                        log_tag=f"start_container_{pod_id}",
-                        log_extra=default_extra,
-                        allow_init=False,
-                    )
-            ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
-                docker_client=docker_client,
+
+    async def _bring_up_existing_container(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        local_volume_path: str | None,
+        pod_id: str,
+        default_extra: dict[str, Any],
+    ) -> None:
+        """`docker start` plus :meth:`_restore_mount_and_sshd_after_start`, on clients the caller already
+        holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway."""
+        await run_logged_rental_docker_sdk_operation(
+            operation="start_container",
+            log_extra=default_extra,
+            call=lambda: docker_client.start(container_name=container_name),
+            container_name=container_name,
+        )
+        await self._restore_mount_and_sshd_after_start(
+            docker_client=docker_client,
+            ssh_client=ssh_client,
+            container_name=container_name,
+            local_volume_path=local_volume_path,
+            pod_id=pod_id,
+            default_extra=default_extra,
+        )
+
+    async def _restore_mount_and_sshd_after_start(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        local_volume_path: str | None,
+        pod_id: str,
+        default_extra: dict[str, Any],
+    ) -> None:
+        """What a bare ``docker start`` drops: the gocryptfs plaintext mount (remounted with
+        ``allow_init=False`` — an existing volume is never re-initialised) and the sshd. Shared by
+        ``start_existing_container`` and the undo of a failed edit."""
+        encrypted_volume_name = await self._encrypted_local_volume_name(
+            docker_client,
+            container_name,
+        )
+        if encrypted_volume_name:
+            if not local_volume_path:
+                raise RuntimeError(
+                    f"{container_name} holds an encrypted volume but no plaintext path "
+                    "was supplied; refusing to remount it at a guessed path"
+                )
+            await self.setup_encrypted_local_volume(
+                ssh_client=ssh_client,
                 container_name=container_name,
+                plaintext_path=local_volume_path,
+                volume_name=encrypted_volume_name,
+                pod_id=pod_id,
                 log_tag=f"start_container_{pod_id}",
                 log_extra=default_extra,
+                allow_init=False,
             )
-            if not ssh_bootstrap_ok:
-                logger.warning(
-                    _m(
-                        "Docker container started but SSH bootstrap did not complete cleanly",
-                        extra=get_extra_info(
-                            {**default_extra, "container_name": container_name}
-                        ),
-                    )
-                )
-            logger.info(
+        ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+            docker_client=docker_client,
+            container_name=container_name,
+            log_tag=f"start_container_{pod_id}",
+            log_extra=default_extra,
+        )
+        if not ssh_bootstrap_ok:
+            logger.warning(
                 _m(
-                    "Started Docker Container",
+                    "Docker container started but SSH bootstrap did not complete cleanly",
                     extra=get_extra_info(
                         {**default_extra, "container_name": container_name}
                     ),
-                ),
+                )
             )
+        logger.info(
+            _m(
+                "Started Docker Container",
+                extra=get_extra_info(
+                    {**default_extra, "container_name": container_name}
+                ),
+            ),
+        )
 
     async def recover_pod_after_stale_vloopback_mount(
         self,

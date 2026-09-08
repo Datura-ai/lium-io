@@ -12,6 +12,7 @@ from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_VOLUME_PREFIX,
     CACHE_SWEEP_CONTAINER_NAME,
+    EDIT_PARKED_SUFFIX,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
@@ -483,6 +484,9 @@ class ContainerCleanup:
         executor = rented_data.executors.get(executor_uuid)
         if executor:
             rented_containers.update(pod.container_name for pod in executor.pods)
+            # DAH-2740: an edit parks the pod's current container under <name>__prev while the
+            # replacement is created; it is the customer's only copy until then, whatever its age
+            rented_containers.update(f"{pod.container_name}{EDIT_PARKED_SUFFIX}" for pod in executor.pods)
 
         # Every filler container on the node is protected — a GPU-split node runs one per VRAM
         # bundle (DAH-2465), and reaping a sibling kills a live worker mid-cycle.
