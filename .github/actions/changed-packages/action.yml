@@ -1,0 +1,71 @@
+name: Changed packages
+description: >-
+  Which packages the current event touches. One output per package, "true" or "false", so every
+  test job can be skipped when its package is untouched while the aggregate check (tests-ok) still
+  reports on every PR — a required status check that never reports blocks the merge button and
+  stalls a merge queue. On a PR the diff is the PR's file list. On a merge-queue entry
+  (merge_group) it is base_sha..head_sha, exactly the files the queued PR adds on top of main and
+  the entries ahead of it. Any other event (push to main, workflow_dispatch) has no diff and
+  selects every package. Documentation never selects a package: *.md and .gitignore files
+  wherever they sit, and the root docs/ tree, are dropped from the file list before routing
+  (isDoc), so a PR that only edits neurons/validators/README.md runs no tests and tests-ok still
+  reports green — the tests exercise code, and none of those files is code. (A docs/ directory
+  inside a package, e.g. neurons/executor/dstacktee/docs/, is not dropped: it is part of that
+  package.) Of the rest, only three prefixes select
+  anything: neurons/<pkg>/ selects that package; datura/ (the protocol package every neuron
+  installs from a path) and .github/ (a router bug must not hide behind its own filter) select
+  all three. Every other path — the root pyproject.toml and pdm.lock (dev tooling only),
+  scripts/, contrib/, watchtower/, tests/ (an empty package) — selects nothing.
+
+outputs:
+  validators:
+    value: ${{ steps.route.outputs.validators }}
+  executor:
+    value: ${{ steps.route.outputs.executor }}
+  miners:
+    value: ${{ steps.route.outputs.miners }}
+
+runs:
+  using: composite
+  steps:
+    - id: route
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const PACKAGES = { validators: 'neurons/validators/', executor: 'neurons/executor/', miners: 'neurons/miners/' };
+          // a change to any of these selects every package
+          const SHARED = ['datura/', '.github/'];
+          const isDoc = f => /\.md$|(^|\/)\.gitignore$|^docs\//.test(f);
+          const touches = (files, prefix) =>
+            files.some(f => f.startsWith(prefix)) || files.some(f => SHARED.some(s => f.startsWith(s)));
+
+          let files = null, why = 'no diff for this event';
+          const prNumber = context.payload.pull_request?.number;
+          if (prNumber) {
+            const listed = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, per_page: 100,
+            });
+            // a rename out of a package is still a change to that package
+            files = listed.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)).filter(f => !isDoc(f));
+            why = `PR #${prNumber}: ${files.length} files`;
+          } else if (context.eventName === 'merge_group') {
+            // the checkout is shallow at head_sha; two commits are all a diff needs
+            const mg = context.payload.merge_group;
+            await exec.exec('git', ['fetch', '--no-tags', '--depth=1', 'origin', mg.base_sha]);
+            // -z: NUL-separated, unquoted paths — with core.quotePath a name holding a byte >= 0x80, `"` or `\`
+            // comes back quoted and would miss every prefix, silently skipping that package
+            const { stdout } = await exec.getExecOutput('git', ['diff', '--name-only', '-z', '--no-renames', mg.base_sha, mg.head_sha]);
+            files = stdout.split('\0').filter(f => f && !isDoc(f));
+            why = `merge group ${mg.base_sha.slice(0, 7)}..${mg.head_sha.slice(0, 7)}: ${files.length} files`;
+          }
+
+          const rows = [];
+          for (const [pkg, prefix] of Object.entries(PACKAGES)) {
+            const changed = files ? touches(files, prefix) : true;
+            core.setOutput(pkg, changed);
+            rows.push([pkg, changed ? 'changed' : 'unchanged', why]);
+          }
+          core.summary
+            .addHeading('Route', 3)
+            .addTable([[{data: 'package', header: true}, {data: 'result', header: true}, {data: 'why', header: true}], ...rows])
+            .write();

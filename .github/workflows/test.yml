@@ -1,16 +1,20 @@
 name: Tests
 
 on:
-  # no `paths:` filter any more: a required status check that never reports blocks the
-  # merge button, and the miners tree was outside the old filter (lium-io#1280 ran no test
-  # job at all). 4.7 min on a docs-only PR is cheaper than a required check that never comes.
+  # no `paths:` filter on the workflow: a required status check that never reports blocks the
+  # merge button and stalls a merge queue. The filtering happens inside — the `route` job reads
+  # the PR's (or merge-group entry's) file list and each package job runs only when its package,
+  # datura/ or .github/ changed. tests-ok reports on every PR either way. No `branches:` filter
+  # either: a PR stacked on another PR's branch (the loop's and the team's dependent PRs) used
+  # to get no run at all until its base merged and GitHub retargeted it to main.
   pull_request:
-    branches: [main, dev]
   push:
     branches: [main]
 
 permissions:
   contents: read
+  # the router lists the PR's files
+  pull-requests: read
 
 # a second push to the same PR cancels the first run
 concurrency:
@@ -18,8 +22,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      validators: ${{ steps.pkgs.outputs.validators }}
+      executor: ${{ steps.pkgs.outputs.executor }}
+      miners: ${{ steps.pkgs.outputs.miners }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pkgs
+        uses: ./.github/actions/changed-packages
+
   validators:
     name: Validators Tests
+    needs: route
+    if: needs.route.outputs.validators == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -57,6 +75,8 @@ jobs:
 
   executor:
     name: Executor Tests
+    needs: route
+    if: needs.route.outputs.executor == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -89,6 +109,8 @@ jobs:
     # neurons/miners/tests never ran in CI; the miner talks to the portal API and the
     # validators, so a broken client ships to every provider on the next tag
     name: Miners Tests
+    needs: route
+    if: needs.route.outputs.miners == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -124,6 +146,7 @@ jobs:
     # `ruff format` commit per package lands; drop continue-on-error and add `lint` to
     # tests-ok after that. `ruff check` is left out: it has open findings too.
     name: ruff format (${{ matrix.package }})
+    needs: route
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -131,8 +154,11 @@ jobs:
       matrix:
         package: [validators, executor, miners]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/ruff-action@v3
+      # `matrix` is not available in a job-level `if`, so the skip sits on the steps
+      - if: needs.route.outputs[matrix.package] == 'true'
+        uses: actions/checkout@v4
+      - if: needs.route.outputs[matrix.package] == 'true'
+        uses: astral-sh/ruff-action@v3
         continue-on-error: true
         with:
           version: "0.5.1"
@@ -141,9 +167,10 @@ jobs:
 
   tests-ok:
     # the one context to require in the ruleset; lium-io requires no status check today.
-    # `lint` joins once the packages are formatted (see above).
+    # A package whose job was skipped as unchanged passes. `lint` joins once the packages
+    # are formatted (see above).
     name: tests-ok
-    needs: [validators, executor, miners]
+    needs: [route, validators, executor, miners]
     if: always()
     runs-on: ubuntu-latest
     steps:
