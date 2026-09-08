@@ -18,7 +18,7 @@ container on the provider's host.
 | service | image | role |
 |---|---|---|
 | `dind` | `docker:27-dind` + a no-op `nvidia-container-runtime-hook` (`dind/`) | the executor host's dockerd. Rental containers land here and publish their ports on this address — which is also the executor's, because the executor shares this network namespace like an executor shares its host's. The hook lets `docker run --gpus …` start a GPU-less container on a runner with no GPU |
-| `executor` | built from `neurons/executor` | the real executor: FastAPI on :8001 (`/version`, `/upload_ssh_key`, …), sshd on :22, `/var/run/docker.sock` = dind's socket (bind-mounted, as a provider's host socket is). Trusts the e2e validator through `executor/trust_anchor.py` (mounted as `core/config_override.py`) (the mechanism the `:dev` images use) and the e2e miner through `MINER_HOTKEY_SS58_ADDRESS` |
+| `executor` | built from `neurons/executor` | the real executor: FastAPI on :8001 (`/version`, `/upload_ssh_key`, …), sshd on :2222 — the port it advertises (`E2E_EXECUTOR_SSH_PORT`; the compose `command:` writes it into `sshd_config.d`, since the stack has no docker port map to bridge :22), `/var/run/docker.sock` = dind's socket (bind-mounted, as a provider's host socket is). Trusts the e2e validator through `executor/trust_anchor.py` (mounted as `core/config_override.py`) (the mechanism the `:dev` images use) and the e2e miner through `MINER_HOTKEY_SS58_ADDRESS` |
 | `miner` + `miner-db` | built from `neurons/miners`, Postgres 15 | the real miner: wallet from the stack mnemonic (`run.sh`), `alembic upgrade head`, uvicorn. `DEBUG_SKIP_SYNC_FLOW` keeps it off the chain; `DEFAULT_VALIDATOR_HOTKEY` is the e2e validator (the real registration check, not the debug bypass). `miner/seed.sql` gives it two executors: the stack's and one nobody answers on |
 | `redis`, `val-db` | Redis 7, Postgres 15 | the validator's stores (`MACHINE_SPEC_CHANNEL` is where verdicts go) |
 | `tester` | `tester/Dockerfile` = `neurons/validators/Dockerfile` + pytest | the validator. Each suite is one `docker compose run tester pytest tests/<suite>`; the suites import `services.ioc` and call `MinerService` / `TaskService` / `DockerService` directly |
@@ -39,9 +39,11 @@ E2E_GPU=1 make e2e-full   # on a GPU host: the executor uses this machine's dock
 ```
 
 `E2E_GPU` comes from the environment (`E2E_GPU=1 make …`, not a line in `stack.env`: a value there would override the
-caller's). On a GPU host the executor shares the host network and its sshd listens on `E2E_GPU_SSH_PORT` (2222; the
-host's own sshd holds :22 on a Lium pod). **The GPU path has not been run yet** — CI and the loop's runs are the
-CPU path; what it is meant to prove is marked below.
+caller's). On a GPU host the executor shares the host network, so its sshd cannot take :22 (a Lium pod's own sshd
+holds it); it listens on `E2E_EXECUTOR_SSH_PORT` (2222) the same way the CPU path does — the compose `command:`
+configures sshd's `Port` from `SSH_PORT`, and `tests/protocol` checks the SSH banner on the advertised port every run.
+**The GPU path has not been run yet** — CI and the loop's runs are the CPU path; what it is meant to prove is marked
+below.
 
 `make up` is idempotent (`--wait` on every healthcheck, seed is `ON CONFLICT DO NOTHING`). Cold build ≈ 4 min on
 16 vCPU, warm ≈ 10 s; the whole gate ≈ 10 min cold.

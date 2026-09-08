@@ -7,6 +7,7 @@ removed. Each step here is the real HTTP call the code makes, plus the refusals 
 """
 
 import asyncio
+import socket
 import time
 
 import pytest
@@ -124,6 +125,22 @@ def test_headers_naming_another_miner_still_yield_only_this_miners_executors():
 
 
 # ------------------------------------------------------------ miner → executor /upload_ssh_key -------------------------
+
+
+def test_executor_sshd_listens_on_the_port_it_advertises():
+    """SSH_PORT is what the executor reports; nothing in the image makes sshd listen there (stock config: :22, bridged in
+    production by a docker port map this stack does not have). The compose `command:` sets sshd's Port from SSH_PORT —
+    this reads the SSH banner on the advertised port. Fails with ECONNREFUSED when sshd is still on :22 (the port is 2222
+    on purpose, so the CPU path proves the mechanism the GPU host relies on)."""
+    priv, pub = lib.ssh_keypair()
+    r = lib.http("POST", f"{lib.EXECUTOR_URL}/upload_ssh_key", json=lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub))
+    assert r.status_code == 200, r.text
+    port = r.json()["ssh_port"]
+    assert port == lib.EXECUTOR_SSH_PORT != 22, "the stack must advertise a non-default port or the check proves nothing"
+    with socket.create_connection((lib.EXECUTOR_IP, port), timeout=10) as s:
+        banner = s.recv(64)
+    assert banner.startswith(b"SSH-2.0-"), banner
+    lib.http("POST", f"{lib.EXECUTOR_URL}/remove_ssh_key", json=lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub))
 
 
 def test_executor_accepts_the_double_signature():

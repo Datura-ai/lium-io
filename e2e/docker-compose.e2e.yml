@@ -58,6 +58,11 @@ services:
       INTERNAL_PORT: ${E2E_EXECUTOR_PORT}
       SSH_PORT: ${E2E_EXECUTOR_SSH_PORT}
       SSH_PUBLIC_PORT: ${E2E_EXECUTOR_SSH_PORT}
+    # SSH_PORT is only what the executor ADVERTISES (miner_service.py); run.sh starts sshd on the stock config (:22) and in
+    # production a docker port map (`${SSH_PORT}:22`) bridges the two. This stack has no port map (network_mode
+    # service:dind here, host in docker-compose.gpu.yml), so sshd must itself listen on SSH_PORT: a drop-in under
+    # sshd_config.d (Debian's sshd_config includes *.conf there) sets Port before run.sh runs. tests/protocol checks the banner.
+    command: ["bash", "-c", "mkdir -p /etc/ssh/sshd_config.d && printf 'Port %s\\n' \"$$SSH_PORT\" > /etc/ssh/sshd_config.d/e2e-port.conf && exec bash run.sh"]
     volumes:
       # the validator hotkey the executor trusts — production bakes it into the image (core/config.py); the :dev
       # images override it the same way, through core/config_override.py
