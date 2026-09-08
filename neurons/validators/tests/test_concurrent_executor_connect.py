@@ -24,7 +24,12 @@ class _Recorder:
         self.docker_started = asyncio.Event()
 
 
-def _ssh_context(rec: _Recorder, *, fail: bool = False):
+# The side that survives connects a moment after the other side has failed: the failure is then already
+# known when the survivor registers, which is exactly the case a bare gather leaks and the helper closes.
+LATE_SURVIVOR_SECONDS = 0.01
+
+
+def _ssh_context(rec: _Recorder, *, fail: bool = False, late: bool = False):
     @asynccontextmanager
     async def ctx():
         rec.events.append("ssh:enter")
@@ -33,6 +38,8 @@ def _ssh_context(rec: _Recorder, *, fail: bool = False):
         await asyncio.wait_for(rec.docker_started.wait(), timeout=1)
         if fail:
             raise ConnectionError("sshd refused")
+        if late:
+            await asyncio.sleep(LATE_SURVIVOR_SECONDS)
         try:
             yield "ssh-client"
         finally:
@@ -41,7 +48,7 @@ def _ssh_context(rec: _Recorder, *, fail: bool = False):
     return ctx()
 
 
-def _docker_context(rec: _Recorder, *, fail: bool = False):
+def _docker_context(rec: _Recorder, *, fail: bool = False, late: bool = False):
     @asynccontextmanager
     async def ctx():
         rec.events.append("docker:enter")
@@ -49,6 +56,8 @@ def _docker_context(rec: _Recorder, *, fail: bool = False):
         await asyncio.wait_for(rec.ssh_started.wait(), timeout=1)
         if fail:
             raise ConnectionError("docker over ssh refused")
+        if late:
+            await asyncio.sleep(LATE_SURVIVOR_SECONDS)
         try:
             yield "docker-client"
         finally:
@@ -77,8 +86,11 @@ async def test_a_failed_docker_connect_closes_the_ssh_session_and_raises():
 
     with pytest.raises(ConnectionError, match="docker over ssh refused"):
         async with AsyncExitStack() as stack:
-            await DockerService._connect_ssh_and_docker(stack, _ssh_context(rec), _docker_context(rec, fail=True))
+            await DockerService._connect_ssh_and_docker(
+                stack, _ssh_context(rec, late=True), _docker_context(rec, fail=True)
+            )
 
+    # the ssh side connected after docker had already failed and is still closed, not leaked
     assert "ssh:exit" in rec.events
     assert "docker:exit" not in rec.events
 
@@ -89,8 +101,11 @@ async def test_a_failed_ssh_connect_closes_the_docker_client_and_raises():
 
     with pytest.raises(ConnectionError, match="sshd refused"):
         async with AsyncExitStack() as stack:
-            await DockerService._connect_ssh_and_docker(stack, _ssh_context(rec, fail=True), _docker_context(rec))
+            await DockerService._connect_ssh_and_docker(
+                stack, _ssh_context(rec, fail=True), _docker_context(rec, late=True)
+            )
 
+    # the docker side connected after ssh had already failed and is still closed, not leaked
     assert "docker:exit" in rec.events
 
 
