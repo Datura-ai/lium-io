@@ -2,8 +2,9 @@
 
 A renter's file on a pod changed on disk after it was written, with no error reaching the container;
 the executor's specs said nothing about its disks. The scrape now reports four independent readings
-(read-only docker-root mount, a write probe, kernel disk errors, sysfs/SMART state) and the check fails
-the executor only on the one that is unambiguous: the docker root refuses writes.
+(read-only docker-root mount, a write probe, kernel disk errors, sysfs/SMART state); the check is
+non-fatal and warns on the one that is unambiguous, the docker root refusing writes, without
+changing the score until the reading is proven on live executors.
 
 machine_scrape.py is a script, not a module — importing it runs the whole scrape — so the helpers are
 extracted by ast and executed in their own namespace (same pattern as test_scrape_infiniband.py).
@@ -108,6 +109,48 @@ def test_a_read_only_root_counts_when_the_docker_root_lives_on_it(scrape: dict[s
 def test_a_read_only_mount_elsewhere_does_not_count(scrape: dict[str, Any]) -> None:
     # Arrange — an immutable /usr, as image-based hosts have, is not the disk containers write to
     mounts = "/dev/sda2 / ext4 rw,relatime 0 0\n/dev/sda3 /usr ext4 ro,relatime 0 0\n"
+
+    # Act / Assert
+    assert scrape["mounts_holding"](mounts, "/var/lib/docker") == []
+
+
+@pytest.mark.parametrize(
+    "mounts",
+    [
+        "/dev/sda2 / ext4 ro,relatime,errors=remount-ro 0 0\n"
+        "/dev/nvme0n1 /var/lib/docker ext4 rw,relatime 0 0\n",
+        "/dev/nvme0n1 /var/lib/docker ext4 rw,relatime 0 0\n"
+        "/dev/sda2 / ext4 ro,relatime,errors=remount-ro 0 0\n",
+    ],
+    ids=["root-first", "docker-first"],
+)
+def test_a_read_only_root_above_a_writable_docker_root_does_not_count(
+    scrape: dict[str, Any], mounts: str
+) -> None:
+    # Arrange — root remounted ro after an error, the docker root on its own writable disk:
+    # containers still start, so this is no read-only docker root, whatever the line order
+    # Act / Assert
+    assert scrape["mounts_holding"](mounts, "/var/lib/docker") == []
+
+
+def test_only_the_covering_mount_is_reported_when_it_and_a_parent_are_read_only(
+    scrape: dict[str, Any],
+) -> None:
+    # Arrange — both / and the docker disk are ro: the disk a write lands on is the one named
+    mounts = "/dev/sda2 / ext4 ro,relatime 0 0\n/dev/nvme0n1 /var/lib/docker ext4 ro,relatime 0 0\n"
+
+    # Act / Assert
+    assert scrape["mounts_holding"](mounts, "/var/lib/docker") == ["/var/lib/docker"]
+
+
+def test_a_mount_over_the_same_point_takes_the_later_line(scrape: dict[str, Any]) -> None:
+    # Arrange — /var/lib/docker mounted ro, then a rw filesystem mounted over it: writes land on
+    # the later one
+    mounts = (
+        "/dev/sda2 / ext4 rw,relatime 0 0\n"
+        "/dev/sdb1 /var/lib/docker ext4 ro,relatime 0 0\n"
+        "/dev/nvme0n1 /var/lib/docker ext4 rw,relatime 0 0\n"
+    )
 
     # Act / Assert
     assert scrape["mounts_holding"](mounts, "/var/lib/docker") == []
@@ -401,27 +444,47 @@ async def test_a_healthy_disk_passes(context_factory):
     assert result.event.reason_code == Msg.OK.reason
 
 
+def test_the_check_is_non_fatal_until_the_reading_is_proven_on_live_executors():
+    # a fatal check here zeros rented and idle executors fleet-wide on one false reading
+    assert DiskHealthCheck.fatal is False
+
+
 @pytest.mark.asyncio
-async def test_a_read_only_docker_root_fails_the_executor(context_factory):
+async def test_a_read_only_docker_root_is_a_warning_and_does_not_fail_the_executor(context_factory):
     health = _health(read_only_mounts=["/var/lib/docker"], write_probe="failed", write_probe_error="EROFS")
     ctx = context_factory(state=build_state(specs={"disk_health": health}))
 
     result = await DiskHealthCheck().run(ctx)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.event.reason_code == Msg.NOT_WRITABLE.reason
+    assert result.event.severity == "warning"
     assert result.event.what_we_saw["read_only_mounts"] == ["/var/lib/docker"]
 
 
 @pytest.mark.asyncio
-async def test_a_write_probe_refused_with_eio_fails_even_with_a_read_write_mount(context_factory):
+async def test_a_read_only_covering_mount_alone_is_the_same_warning(context_factory):
+    # the mount table read ro, then a remount to rw landed before the probe wrote: still reported
+    health = _health(read_only_mounts=["/var/lib/docker"], write_probe="ok")
+    ctx = context_factory(state=build_state(specs={"disk_health": health}))
+
+    result = await DiskHealthCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.NOT_WRITABLE.reason
+    assert result.event.what_we_saw["write_probe"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_a_write_probe_refused_with_eio_is_a_warning_on_a_read_write_mount(context_factory):
     health = _health(write_probe="failed", write_probe_error="OSError: [Errno 5] Input/output error")
     ctx = context_factory(state=build_state(specs={"disk_health": health}))
 
     result = await DiskHealthCheck().run(ctx)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.event.reason_code == Msg.NOT_WRITABLE.reason
+    assert result.event.severity == "warning"
 
 
 @pytest.mark.asyncio

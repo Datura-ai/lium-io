@@ -1547,17 +1547,26 @@ class DiskHealthObservation:
 
 
 def mounts_holding(mounts_text: str, path: str) -> list[str]:
-    """The mount points of `mounts_text` (/proc/<pid>/mounts format) that are mounted read-only and
-    contain `path` - i.e. the filesystem a write to `path` would land on, plus anything above it."""
-    read_only = []
+    """The mount point a write to `path` lands on, when that filesystem is mounted read-only.
+
+    `mounts_text` is /proc/<pid>/mounts. Only the covering mount counts - the longest mount point
+    that is `path` or a parent of it, the last line winning when a point is mounted over - because
+    a mount above it says nothing about writes below: `ro /` with `rw /var/lib/docker` is a docker
+    root that takes writes, and returns []. One element or none; a list so the payload shape
+    holds."""
+    covering: tuple[str, list[str]] | None = None
     for line in mounts_text.splitlines():
         fields = line.split()
         if len(fields) < 4:
             continue
         mount_point, options = fields[1], fields[3].split(",")
-        if (path == mount_point or path.startswith(mount_point.rstrip("/") + "/")) and "ro" in options:
-            read_only.append(mount_point)
-    return read_only
+        if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
+            continue
+        if covering is None or len(mount_point) >= len(covering[0]):
+            covering = (mount_point, options)
+    if covering is None or "ro" not in covering[1]:
+        return []
+    return [covering[0]]
 
 
 def probe_write(directory: str) -> tuple[str, str]:
@@ -1631,8 +1640,9 @@ def get_disk_health() -> DiskHealthObservation:
     A renter's file on a pod changed on disk after it was written, with no error reaching the
     container. The scrape reported capacity and usage and nothing about health, so the node kept
     being listed. Four independent readings are taken and reported side by side; deciding what to
-    do with an error count is the backend's job, but a docker root that refuses writes is a node
-    that cannot start a container, and DiskHealthCheck fails it on that alone.
+    do with an error count is the backend's job. A docker root that refuses writes is a node that
+    cannot start a container; DiskHealthCheck reports it as a warning (no score change) until the
+    reading is proven on live executors.
     """
     try:
         docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"

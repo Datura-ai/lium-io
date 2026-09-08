@@ -269,9 +269,9 @@ class DiskHealthMessages:
     NOT_WRITABLE = MessageTemplate(
         event="Executor disk refuses writes",
         reason="DISK_NOT_WRITABLE",
-        severity="error",
+        severity="warning",
         category="env",
-        impact="Job skipped; score set to 0",
+        impact="Proceed; score not changed (observation only until proven on live executors)",
         remediation="The filesystem holding the docker root is mounted read-only or returned EROFS/EIO "
         "to a write probe. Check dmesg for I/O errors, run a filesystem check, replace the disk if "
         "SMART reports a failure, then remount read-write and restart the executor.",
