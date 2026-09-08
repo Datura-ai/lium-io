@@ -278,9 +278,10 @@ class PipelineFactory:
                 # here — before the rented short-circuit (TenantEnforcementCheck)
                 # — to gate rented and idle executors alike.
                 GpuVramPrecheck(),
-                # DAH-2928: pure-data gate on specs.disk_health from the scrape. A docker root that
-                # refuses writes cannot start a container; placed before the rented short-circuit so
-                # a rented host that has just lost its disk is scored zero too.
+                # DAH-2928: pure-data, non-fatal report on specs.disk_health from the scrape. A
+                # docker root that refuses writes cannot start a container; placed before the rented
+                # short-circuit so a rented host that has just lost its disk is reported too. The
+                # score is not changed until the reading is proven on live executors.
                 DiskHealthCheck(),
                 # DAH-2671 item 2a: non-fatal, observe-only CPU-count corroboration. Placed right
                 # after the GPU spec-check group (and before the rented short-circuit) so it reads
