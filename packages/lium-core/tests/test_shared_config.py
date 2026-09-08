@@ -1,0 +1,370 @@
+import logging
+from unittest.mock import MagicMock, patch
+
+import pydantic
+import pytest
+import requests
+
+from lium_core.shared_config.client import SharedConfigClient
+from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
+from lium_core.shared_config.model import SharedConfig
+from lium_core.shared_config.utils import dict_diff
+
+API_URL = "http://fake-api/config"
+
+SAMPLE_CONFIG_DATA = DEFAULT_SHARED_CONFIG.model_dump()
+
+ALTERED_CONFIG_DATA = {
+    **SAMPLE_CONFIG_DATA,
+    "rental_fees_rate": 0.75,
+    "collateral_days": 14,
+}
+
+
+def _make_response(json_data: dict, status_code: int = 200) -> MagicMock:
+    resp = MagicMock(spec=requests.Response)
+    resp.status_code = status_code
+    resp.json.return_value = json_data
+    resp.raise_for_status.return_value = None
+    if status_code >= 400:
+        resp.raise_for_status.side_effect = requests.HTTPError(response=resp)
+    return resp
+
+
+def _build_client(mock_get: MagicMock) -> SharedConfigClient:
+    """Create client with patched threading so no background loop runs."""
+    with patch("lium_core.shared_config.client.threading"):
+        client = SharedConfigClient(api_url=API_URL, refresh_interval=60)
+    return client
+
+
+# ==================== Model tests ====================
+
+
+def test_shared_config_is_frozen() -> None:
+    with pytest.raises(pydantic.ValidationError):
+        DEFAULT_SHARED_CONFIG.rental_fees_rate = 0.5
+
+
+def test_default_shared_config_has_all_fields() -> None:
+    assert len(DEFAULT_SHARED_CONFIG.machine_prices) > 0
+    assert len(DEFAULT_SHARED_CONFIG.required_deposit_amount) > 0
+    assert len(DEFAULT_SHARED_CONFIG.gpu_architectures) > 0
+    assert len(DEFAULT_SHARED_CONFIG.driver_cuda_map) > 0
+    assert DEFAULT_SHARED_CONFIG.machine_max_price_rate == 3.0
+    assert DEFAULT_SHARED_CONFIG.machine_min_price_rate == 0.5
+    assert DEFAULT_SHARED_CONFIG.soft_limit_price_rate == 1.1
+    assert DEFAULT_SHARED_CONFIG.rental_fees_rate == 0.9
+    assert DEFAULT_SHARED_CONFIG.collateral_days == 7
+    assert DEFAULT_SHARED_CONFIG.collateral_contract_address == "0x7DCCb5659c70Ce2104A9bb79E9E257473ECbe628"
+    assert DEFAULT_SHARED_CONFIG.bittensor_netuid == 51
+    assert DEFAULT_SHARED_CONFIG.volume_gb_hour_price_usd == 0.00005
+    assert DEFAULT_SHARED_CONFIG.max_initial_port_count == 200
+    assert DEFAULT_SHARED_CONFIG.total_burn_emission == 0.91
+    assert DEFAULT_SHARED_CONFIG.require_storage_limit_supported is False
+    assert DEFAULT_SHARED_CONFIG.multinode_clusters_enabled is False
+
+
+def test_multinode_clusters_flag_defaults_to_off() -> None:
+    # fail-closed: a payload from an older backend, or one that never loads, must not advertise a
+    # capability the server would refuse (DAH-2620)
+    assert DEFAULT_SHARED_CONFIG.multinode_clusters_enabled is False
+
+
+def test_machine_prices_p90_defaults_to_empty() -> None:
+    # backward-compatible: constructing without the new field yields an empty dict
+    assert DEFAULT_SHARED_CONFIG.machine_prices_p90 == {}
+
+
+def test_machine_prices_p90_accepts_values_and_serializes() -> None:
+    config = DEFAULT_SHARED_CONFIG.model_copy(update={"machine_prices_p90": {"NVIDIA H100 PCIe": 1.6}})
+    assert config.machine_prices_p90 == {"NVIDIA H100 PCIe": 1.6}
+    assert config.model_dump()["machine_prices_p90"] == {"NVIDIA H100 PCIe": 1.6}
+
+
+def test_nvml_ml_digests_defaults_to_empty() -> None:
+    # backward-compatible: constructing without the new field yields an empty dict
+    assert DEFAULT_SHARED_CONFIG.nvml_ml_digests == {}
+
+
+def test_nvml_ml_digests_accepts_values_and_serializes() -> None:
+    digest = "4de0188efc8bb6c7485e599fcc718978:6d8a58eb15a1c2e6067ec977e9de57b42a3d632b4073818ab648370fecfc82b1"
+    config = DEFAULT_SHARED_CONFIG.model_copy(update={"nvml_ml_digests": {"595.84": digest}})
+    assert config.nvml_ml_digests == {"595.84": digest}
+    assert config.model_dump()["nvml_ml_digests"] == {"595.84": digest}
+
+
+def test_nvml_ml_digests_defaults_when_absent() -> None:
+    # backward-compatible: a payload from an older backend without the field
+    # falls back to an empty dict instead of failing validation
+    config = SharedConfig.model_validate(
+        {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "nvml_ml_digests"}
+    )
+    assert config.nvml_ml_digests == {}
+
+
+def test_nvml_invalid_drivers_defaults_to_empty() -> None:
+    assert DEFAULT_SHARED_CONFIG.nvml_invalid_drivers == []
+
+
+def test_nvml_invalid_drivers_accepts_values_and_serializes() -> None:
+    config = DEFAULT_SHARED_CONFIG.model_copy(update={"nvml_invalid_drivers": ["591.86"]})
+    assert config.nvml_invalid_drivers == ["591.86"]
+    assert config.model_dump()["nvml_invalid_drivers"] == ["591.86"]
+
+
+def test_nvml_invalid_drivers_defaults_when_absent() -> None:
+    config = SharedConfig.model_validate(
+        {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "nvml_invalid_drivers"}
+    )
+    assert config.nvml_invalid_drivers == []
+
+
+def test_soft_limit_price_rate_defaults_when_absent() -> None:
+    # backward-compatible: a config built without the new field falls back to 1.1
+    config = SharedConfig.model_validate(
+        {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "soft_limit_price_rate"}
+    )
+    assert config.soft_limit_price_rate == 1.1
+
+
+def test_shared_config_serializes_to_json() -> None:
+    data = DEFAULT_SHARED_CONFIG.model_dump()
+    assert isinstance(data, dict)
+    assert "machine_prices" in data
+    assert "gpu_architectures" in data
+    assert "require_storage_limit_supported" in data
+    assert "multinode_clusters_enabled" in data
+    assert "default_docker_images" in data
+    assert isinstance(data["gpu_architectures"]["NVIDIA B200"]["arch"], str)
+
+
+def test_default_docker_images_default() -> None:
+    # packaged fallback: the two current default cache-template images, as full
+    # backend DOCKER_IMAGES entries (untyped dicts)
+    images = DEFAULT_SHARED_CONFIG.default_docker_images
+    assert [f"{img['image']}:{img['tag']}" for img in images] == [
+        "daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind",
+        "daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind",
+    ]
+    # full metadata rides along so future consumers can read it
+    assert all({"image", "tag", "cuda", "size"} <= img.keys() for img in images)
+
+
+def test_default_docker_images_defaults_when_absent() -> None:
+    # backward-compatible: a payload from an older backend without the field
+    # falls back to the packaged default instead of failing validation
+    config = SharedConfig.model_validate(
+        {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "default_docker_images"}
+    )
+    assert config.default_docker_images == DEFAULT_SHARED_CONFIG.default_docker_images
+
+
+def test_default_docker_images_round_trips_through_json() -> None:
+    # unknown metadata keys must survive the trip untouched (untyped dicts by design)
+    images = ({"image": "daturaai/pytorch", "tag": "cuda12.8-dind", "new_key": 1},)
+    config = DEFAULT_SHARED_CONFIG.model_copy(update={"default_docker_images": images})
+    restored = SharedConfig.model_validate_json(config.model_dump_json())
+    assert restored.default_docker_images == images
+
+
+# ==================== Utils tests (dict_diff) ====================
+
+
+@pytest.mark.parametrize(
+    "old, new, expected",
+    [
+        pytest.param({}, {}, [], id="both_empty"),
+        pytest.param({"a": 1}, {"a": 1}, [], id="no_changes"),
+        pytest.param(
+            {"a": 1},
+            {"a": 2},
+            ["[a]: 1 -> 2"],
+            id="top_level_change",
+        ),
+        pytest.param(
+            {"a": {"b": 1}},
+            {"a": {"b": 2}},
+            ["[a.b]: 1 -> 2"],
+            id="nested_change",
+        ),
+        pytest.param(
+            {"a": {"b": {"c": 1}}},
+            {"a": {"b": {"c": 99}}},
+            ["[a.b.c]: 1 -> 99"],
+            id="deep_nested_change",
+        ),
+        pytest.param(
+            {},
+            {"a": 1},
+            ["[a]: None -> 1"],
+            id="key_added",
+        ),
+        pytest.param(
+            {"a": 1},
+            {},
+            ["[a]: 1 -> None"],
+            id="key_removed",
+        ),
+        pytest.param(
+            {"a": 1, "b": 2, "c": 3},
+            {"a": 10, "b": 20, "c": 30},
+            ["[a]: 1 -> 10", "[b]: 2 -> 20", "[c]: 3 -> 30"],
+            id="multiple_changes_sorted",
+        ),
+        pytest.param(
+            {"a": {"nested": 1}},
+            {"a": "flat"},
+            ["[a]: {'nested': 1} -> flat"],
+            id="dict_becomes_scalar",
+        ),
+    ],
+)
+def test_dict_diff(old: dict, new: dict, expected: list[str]) -> None:
+    assert dict_diff(old, new) == expected
+
+
+# ==================== Client tests: _fetch ====================
+
+
+def test_fetch_success() -> None:
+    with patch("lium_core.shared_config.client.requests.get", return_value=_make_response(SAMPLE_CONFIG_DATA)):
+        client = _build_client(MagicMock())
+
+    assert isinstance(client.config, SharedConfig)
+    assert client.config == DEFAULT_SHARED_CONFIG
+
+
+def test_fetch_http_error() -> None:
+    with patch("lium_core.shared_config.client.requests.get", return_value=_make_response({}, status_code=500)):
+        client = _build_client(MagicMock())
+
+    assert client.config == DEFAULT_SHARED_CONFIG
+
+
+def test_fetch_network_error() -> None:
+    with patch("lium_core.shared_config.client.requests.get", side_effect=requests.ConnectionError("no network")):
+        client = _build_client(MagicMock())
+
+    assert client.config == DEFAULT_SHARED_CONFIG
+
+
+# ==================== Client tests: __init__ ====================
+
+
+def test_init_with_successful_fetch() -> None:
+    with patch("lium_core.shared_config.client.requests.get", return_value=_make_response(ALTERED_CONFIG_DATA)):
+        client = _build_client(MagicMock())
+
+    assert client.config.rental_fees_rate == 0.75
+    assert client.config.collateral_days == 14
+
+
+def test_init_fallback_to_default() -> None:
+    with patch("lium_core.shared_config.client.requests.get", side_effect=Exception("boom")):
+        client = _build_client(MagicMock())
+
+    assert client.config is DEFAULT_SHARED_CONFIG
+
+
+# ==================== Client tests: _refresh_loop ====================
+
+
+def test_refresh_updates_config_on_change() -> None:
+    mock_get = MagicMock(return_value=_make_response(SAMPLE_CONFIG_DATA))
+    with patch("lium_core.shared_config.client.requests.get", mock_get):
+        client = _build_client(mock_get)
+
+    assert client.config == DEFAULT_SHARED_CONFIG
+
+    mock_get.return_value = _make_response(ALTERED_CONFIG_DATA)
+
+    def _stop_after_one_iteration(_interval: int) -> None:
+        client._running = False
+
+    with (
+        patch("lium_core.shared_config.client.requests.get", mock_get),
+        patch("lium_core.shared_config.client.time.sleep", side_effect=_stop_after_one_iteration),
+    ):
+        client._running = True
+        client._refresh_loop()
+
+    assert client.config.rental_fees_rate == 0.75
+    assert client.config.collateral_days == 14
+
+
+def test_refresh_skips_on_same_config(caplog: pytest.LogCaptureFixture) -> None:
+    mock_get = MagicMock(return_value=_make_response(SAMPLE_CONFIG_DATA))
+    with patch("lium_core.shared_config.client.requests.get", mock_get):
+        client = _build_client(mock_get)
+
+    def _stop_after_one_iteration(_interval: int) -> None:
+        client._running = False
+
+    with (
+        patch("lium_core.shared_config.client.requests.get", mock_get),
+        patch("lium_core.shared_config.client.time.sleep", side_effect=_stop_after_one_iteration),
+        caplog.at_level(logging.DEBUG, logger="lium_core.shared_config.client"),
+    ):
+        client._running = True
+        client._refresh_loop()
+
+    assert "unchanged" in caplog.text
+
+
+def test_refresh_skips_on_fetch_failure() -> None:
+    mock_get = MagicMock(return_value=_make_response(SAMPLE_CONFIG_DATA))
+    with patch("lium_core.shared_config.client.requests.get", mock_get):
+        client = _build_client(mock_get)
+
+    original_config = client.config
+    mock_get.side_effect = requests.ConnectionError("down")
+
+    def _stop_after_one_iteration(_interval: int) -> None:
+        client._running = False
+
+    with (
+        patch("lium_core.shared_config.client.requests.get", mock_get),
+        patch("lium_core.shared_config.client.time.sleep", side_effect=_stop_after_one_iteration),
+    ):
+        client._running = True
+        client._refresh_loop()
+
+    assert client.config is original_config
+
+
+def test_refresh_sleep_is_jittered() -> None:
+    # sleep is refresh_interval scaled by the random jitter factor
+    mock_get = MagicMock(return_value=_make_response(SAMPLE_CONFIG_DATA))
+    with patch("lium_core.shared_config.client.requests.get", mock_get):
+        client = _build_client(mock_get)
+
+    slept: list[float] = []
+
+    def _record_and_stop(interval: float) -> None:
+        slept.append(interval)
+        client._running = False
+
+    with (
+        patch("lium_core.shared_config.client.requests.get", mock_get),
+        patch("lium_core.shared_config.client.time.sleep", side_effect=_record_and_stop),
+        patch("lium_core.shared_config.client.random.uniform", return_value=1.15) as mock_uniform,
+    ):
+        client._running = True
+        client._refresh_loop()
+
+    mock_uniform.assert_called_once_with(0.8, 1.2)
+    assert slept == [client._refresh_interval * 1.15]
+
+
+# ==================== Client tests: .config property ====================
+
+
+def test_config_property_returns_shared_config() -> None:
+    mock_get = MagicMock(return_value=_make_response(SAMPLE_CONFIG_DATA))
+    with patch("lium_core.shared_config.client.requests.get", mock_get):
+        client = _build_client(mock_get)
+
+    assert client.config.bittensor_netuid == DEFAULT_SHARED_CONFIG.bittensor_netuid
+    assert client.config.rental_fees_rate == DEFAULT_SHARED_CONFIG.rental_fees_rate
+    assert client.config.machine_prices == DEFAULT_SHARED_CONFIG.machine_prices

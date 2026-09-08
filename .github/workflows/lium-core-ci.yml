@@ -1,0 +1,40 @@
+name: lium-core
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'packages/lium-core/**'
+      - '.github/workflows/lium-core-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/lium-core/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: lium-core (pytest, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: packages/lium-core
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the package and pytest
+        run: pip install . pytest build
+
+      - name: Tests
+        run: pytest -q tests
+
+      # the wheel the release workflow ships must still build from the new path
+      - name: Build sdist and wheel
+        run: python -m build --sdist --wheel --outdir dist/
