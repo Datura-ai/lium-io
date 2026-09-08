@@ -711,75 +711,6 @@ def cloudflare_speed():
     return data
 
 
-# CDN throughput probe (DAH-2922). The speed-test figures above are what the listing shows today, and
-# on the fleet they sit in a few-hundred-Mbps band that does not separate a node pulling weights at
-# 45 MB/s from one pulling at 4 GB/s (a 60x spread measured on the same checkpoint). A few parallel
-# streams against a CDN edge - the way hf_xet/aria2 pull - is the closest cheap proxy, so it is
-# reported next to the existing numbers, never in their place: nothing here feeds incentive.
-CDN_PROBE_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=50000000"
-CDN_PROBE_UPLOAD_URL = "https://speed.cloudflare.com/__up"
-CDN_PROBE_DOWNLOAD_STREAMS = 4
-CDN_PROBE_UPLOAD_STREAMS = 2
-CDN_PROBE_UPLOAD_MB_PER_STREAM = 25
-CDN_PROBE_MAX_SECONDS = 15
-CURL_SAMPLE_FORMAT = "%{size_download} %{size_upload} %{time_total}\\n"
-
-
-def aggregate_curl_throughput_mbps(output, use_upload_size):
-    """Bytes moved by every stream over the slowest stream's wall time, in Mbps.
-
-    The streams start within milliseconds of each other, so max(time_total) is the wall time of
-    the batch and the ratio slightly under-reports - the safe side for a figure a renter reads as
-    "at least this".
-    """
-    total_bytes = 0.0
-    wall_seconds = 0.0
-    samples = 0
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) != 3:
-            continue
-        total_bytes += float(parts[1] if use_upload_size else parts[0])
-        wall_seconds = max(wall_seconds, float(parts[2]))
-        samples += 1
-    if samples == 0 or wall_seconds <= 0 or total_bytes <= 0:
-        raise RuntimeError(f"no usable curl samples in {output!r}"[:300])
-    return round(total_bytes * 8 / wall_seconds / 1_000_000, 2)
-
-
-def cdn_bandwidth_probe():
-    """Parallel-stream ingress and egress against a CDN edge, in Mbps; failures are reported, not raised."""
-    data = {
-        "ncdn_down": None,
-        "ncdn_up": None,
-        "ncdn_streams": CDN_PROBE_DOWNLOAD_STREAMS,
-    }
-    errors = []
-    curl_base = f"curl -o /dev/null -sS -w '{CURL_SAMPLE_FORMAT}' --max-time {CDN_PROBE_MAX_SECONDS}"
-    try:
-        download_cmd = ""
-        for _stream in range(CDN_PROBE_DOWNLOAD_STREAMS):
-            download_cmd += f"{curl_base} '{CDN_PROBE_DOWNLOAD_URL}' & "
-        download_cmd += "wait"
-        data["ncdn_down"] = aggregate_curl_throughput_mbps(run_cmd(download_cmd), False)
-    except Exception as exc:
-        errors.append(f"download: {exc!r}"[:200])
-    try:
-        upload_cmd = ""
-        for _stream in range(CDN_PROBE_UPLOAD_STREAMS):
-            upload_cmd += (
-                f"dd if=/dev/zero bs=1M count={CDN_PROBE_UPLOAD_MB_PER_STREAM} 2>/dev/null | "
-                f"{curl_base} -X POST --data-binary @- '{CDN_PROBE_UPLOAD_URL}' & "
-            )
-        upload_cmd += "wait"
-        data["ncdn_up"] = aggregate_curl_throughput_mbps(run_cmd(upload_cmd), True)
-    except Exception as exc:
-        errors.append(f"upload: {exc!r}"[:200])
-    if errors:
-        data["ncdn_error"] = "; ".join(errors)
-    return data
-
-
 def benchmark_network_speed():
     """Run network speed methods in fallback order, stopping once both metrics are satisfied.
 
@@ -815,17 +746,12 @@ def benchmark_network_speed():
             upload = result["upload_speed"]
             upload_source = name
 
-    # Always measured, next to the speed-test figures: a different question (CDN throughput, several
-    # streams) with its own keys, so the existing download/upload fields keep their meaning.
-    cdn = cdn_bandwidth_probe()
-
     return {
         "download_speed": download,
         "upload_speed": upload,
         "download_source": download_source,
         "upload_source": upload_source,
         "measurements": measurements,
-        **cdn,
     }
 
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"

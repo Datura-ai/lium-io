@@ -153,7 +153,7 @@ ORIGINAL_KEYS = {
     'data_container_cap_eff': "container_cap_eff",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
-    # DAH-2922: GPU interconnect summary (nvidia-smi topo) and the CDN throughput probe. The scrape
+    # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
     # keys are prefixed so no existing key is a substring of them (ecrypt_miner_job_files renames by
     # sequential str.replace); the backend names are what MachineSpecs declares.
     'data_interconnect_scrape_error': "interconnect_scrape_error",
@@ -169,10 +169,6 @@ ORIGINAL_KEYS = {
     'ic_p2p_pairs': "p2p_pairs",
     'ic_p2p': "p2p",
     'ic_matrix': "matrix",
-    'ncdn_down': "cdn_download_speed",
-    'ncdn_up': "cdn_upload_speed",
-    'ncdn_streams': "cdn_streams",
-    'ncdn_error': "cdn_probe_error",
 }
 
 
@@ -366,10 +362,6 @@ class FileEncryptService:
             'ic_p2p_pairs': "",
             'ic_p2p': "",
             'ic_matrix': "",
-            'ncdn_down': "",
-            'ncdn_up': "",
-            'ncdn_streams': "",
-            'ncdn_error': "",
         }
 
         # Generate dictionary key mapping on validator side

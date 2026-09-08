@@ -1,4 +1,4 @@
-"""DAH-2922 — get_gpu_interconnect() and cdn_bandwidth_probe() helpers in machine_scrape.py.
+"""DAH-2922 — the get_gpu_interconnect() helpers in machine_scrape.py.
 
 Table shapes follow `nvidia-smi topo -m`, `nvidia-smi topo -p2p r` and `nvidia-smi nvlink -s` as
 printed by driver 5xx on an HGX H200 host and on the PCIe-only 8x H200 host that motivated the
@@ -34,7 +34,6 @@ INTERCONNECT_HELPERS = {
     "get_gpu_interconnect",
 }
 
-CDN_HELPERS = {"aggregate_curl_throughput_mbps"}
 
 TOPO_LEGEND = """
 Legend:
@@ -114,7 +113,7 @@ PCIE_CARD_NVLINK_STATUS = (
 
 @pytest.fixture
 def scrape() -> dict[str, Any]:
-    return build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", INTERCONNECT_HELPERS | CDN_HELPERS, {"re": re})
+    return build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", INTERCONNECT_HELPERS, {"re": re})
 
 
 # -- parse_topology_matrix -------------------------------------------------------------------------
@@ -328,50 +327,7 @@ def test_probe_keeps_the_topo_answer_when_only_optional_tables_fail(scrape: dict
     assert "nvidia-smi nvlink -s" in observation.scrape_error
 
 
-# -- aggregate_curl_throughput_mbps ------------------------------------------------------------------
-
-
-def test_parallel_streams_are_summed_over_the_slowest_stream(scrape: dict[str, Any]) -> None:
-    # Arrange — four 50 MB streams, the slowest took 2 s: 200 MB / 2 s = 800 Mbps
-    output = "50000000 0 1.900\n50000000 0 2.000\n50000000 0 1.950\n50000000 0 1.800\n"
-
-    # Act
-    mbps = scrape["aggregate_curl_throughput_mbps"](output, False)
-
-    # Assert
-    assert mbps == 800.0
-
-
-def test_a_timed_out_stream_still_yields_the_bytes_it_moved(scrape: dict[str, Any]) -> None:
-    # Arrange — a 100 Mbps link cannot finish 4x50 MB in 15 s; curl still prints -w on exit 28
-    output = "\n".join(["46875000 0 15.001"] * 4) + "\n"
-
-    # Act
-    mbps = scrape["aggregate_curl_throughput_mbps"](output, False)
-
-    # Assert
-    assert mbps == pytest.approx(100.0, rel=0.01)
-
-
-def test_upload_uses_the_upload_size_column(scrape: dict[str, Any]) -> None:
-    # Arrange — two 25 MB uploads in 1 s: 400 Mbps
-    output = "0 26214400 1.0\n0 26214400 0.9\n"
-
-    # Act
-    mbps = scrape["aggregate_curl_throughput_mbps"](output, True)
-
-    # Assert
-    assert mbps == pytest.approx(419.43, rel=0.001)
-
-
-def test_no_samples_raise_instead_of_reporting_zero(scrape: dict[str, Any]) -> None:
-    # Arrange — curl absent or every stream failed before printing
-    with pytest.raises(RuntimeError):
-        # Act
-        scrape["aggregate_curl_throughput_mbps"]("sh: curl: not found\n", False)
-
-
-# -- validator-side event summary --------------------------------------------------------------------
+# -- the scrape.ok event -----------------------------------------------------------------------------
 
 
 def test_scrape_ok_event_carries_the_verdict_without_the_matrix() -> None:
@@ -422,14 +378,10 @@ NEW_KEYS = [
     "ic_p2p_pairs",
     "ic_p2p_ok_pairs",
     "ic_matrix",
-    "ncdn_down",
-    "ncdn_up",
-    "ncdn_streams",
-    "ncdn_error",
 ]
 
 
-def test_interconnect_and_cdn_keys_are_wired_through_both_obfuscation_tables() -> None:
+def test_interconnect_keys_are_wired_through_both_obfuscation_tables() -> None:
     """A key missing from either table ships un-renamed/un-mapped."""
     # Arrange
     service_module = ast.parse((SRC / "services" / "file_encrypt_service.py").read_text())
@@ -507,7 +459,7 @@ def test_the_obfuscated_scrape_still_summarizes_the_topology() -> None:
 
     # Assert — keys are random names by now, so the values carry the check: 11 fields, the NVLink
     # verdict True, 18 links, 28 pairs, the matrix, and no key left in clear text
-    assert len(payload) == len(NEW_KEYS) - 6  # the 11 ic_* fields
+    assert len(payload) == len(NEW_KEYS) - 2  # the 11 ic_* fields (NEW_KEYS also lists the two data_* keys)
     values = list(payload.values())
     assert values.count(True) == 2  # nvlink and p2p
     assert 18 in values and 28 in values
