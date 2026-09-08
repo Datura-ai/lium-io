@@ -171,8 +171,11 @@ class ValidatorPortalAPI:
 
         DAH-2958: the express lane discovers never-validated executors here, between cycles.
         This is the bulk snapshot the central miner already polls (DAH-2469); the endpoint is
-        guarded by signature_auth_miner, which verifies the signature over AuthenticationPayload
-        and nothing else, so the validator signs the same blob with its own hotkey.
+        guarded by signature_auth_miner, which verifies the signature over AuthenticationPayload,
+        so the validator signs the same blob with its own hotkey. The guard's subnet-registration
+        check (portal auth/signature_auth.py, commented out today with a note to restore it) is
+        SubtensorClient.get_miner, a lookup over every neuron of the subnet, which a registered
+        validator hotkey passes too.
         """
         api_base = (
             settings.MINER_PORTAL_REST_API_URL.rstrip("/")
@@ -199,7 +202,11 @@ class ValidatorPortalAPI:
                             _m(
                                 "Failed to fetch executor snapshot from portal",
                                 extra=get_extra_info(
-                                    {"status": response.status, "body": await response.text(), "url": url}
+                                    {
+                                        "status": response.status,
+                                        "body": await response.text(),
+                                        "url": url,
+                                    }
                                 ),
                             )
                         )

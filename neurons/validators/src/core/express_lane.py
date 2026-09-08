@@ -23,10 +23,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import bittensor
 from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
+from services.task_service import JobResult
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -134,13 +137,27 @@ class ExpressLane:
         inputs = self.cycle_inputs()
         if inputs is None:
             return 0
-        fleet_known_since = inputs.fleet_known_since
 
         snapshot = await self.portal_api.get_all_executors()
         if snapshot is None:
             return 0
 
         validated = await self.redis_service.get_validated_executors()
+        chosen = self._select(snapshot, validated, inputs.fleet_known_since)
+        if not chosen:
+            return 0
+        return await self._launch(chosen)
+
+    def _select(
+        self,
+        snapshot: dict[str, list[PortalExecutor]],
+        validated: set[str],
+        fleet_known_since: datetime,
+    ) -> list[_Pending]:
+        """Track this validator's never-validated executors; return the ones to launch now.
+
+        Oldest registration first, under the two in-flight caps.
+        """
         in_flight = self.miner_service.in_flight
         my_hotkey = self._hotkey()
         now = time.monotonic()
@@ -175,9 +192,6 @@ class ExpressLane:
         for executor_id in [e for e in self._pending if e not in present and e not in in_flight]:
             del self._pending[executor_id]
 
-        if not candidates:
-            return 0
-
         # Oldest registration first; then the two caps that bound a registration flood.
         candidates.sort(key=lambda p: p.executor.created_at or p.first_seen_at)
         express_in_flight = [e for e, lane in in_flight.items() if lane == EXPRESS_LANE]
@@ -194,14 +208,22 @@ class ExpressLane:
             chosen.append(pending)
             per_miner[pending.miner_hotkey] += 1
             room -= 1
-        if not chosen:
-            return 0
+        return chosen
 
+    async def _launch(self, chosen: list[_Pending]) -> int:
+        """Start one verification per chosen executor on the cycle's current job files.
+
+        Returns how many were started.
+        """
+        in_flight = self.miner_service.in_flight
         miners = {miner.hotkey: miner for miner in await self.subtensor_client.get_miners()}
         rented_data = await self.backend_client.get_all_rented_executors()
         if rented_data is None:
             logger.error(
-                _m("[express] Failed to fetch rented executors, skipping this tick", extra=get_extra_info({}))
+                _m(
+                    "[express] Failed to fetch rented executors, skipping this tick",
+                    extra=get_extra_info({}),
+                )
             )
             return 0
 
@@ -243,7 +265,13 @@ class ExpressLane:
             launched += 1
         return launched
 
-    async def _verify(self, pending: _Pending, miner, inputs: CycleInputs, rented_data) -> None:
+    async def _verify(
+        self,
+        pending: _Pending,
+        miner: bittensor.NeuronInfo,
+        inputs: CycleInputs,
+        rented_data: RentedExecutorsResponse,
+    ) -> None:
         executor_id = pending.executor.id
         directory = inputs.encrypted_files.tmp_directory
         # Counted against the node once the outcome is the node's (below); a verification the
@@ -251,7 +279,7 @@ class ExpressLane:
         attempt = pending.attempts + 1
         started_wall = datetime.now(UTC)
         started = time.monotonic()
-        extra = {
+        extra: dict[str, object] = {
             "executor_uuid": executor_id,
             "miner_hotkey": miner.hotkey,
             "attempt": attempt,
@@ -301,55 +329,7 @@ class ExpressLane:
             if not results:
                 self._defer(pending, "miner did not return the executor")
                 return
-
-            # Published as the pipeline produced it — no incentive, scored_at None — so the
-            # backend creates/updates the executor row (AVAILABLE when the score is positive)
-            # but writes no incentive_per_validator_cycle row: is_provider_emission_cycle_eligible
-            # needs scored_at. The next scored cycle overwrites the row as today.
-            await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey)
-            try:
-                await self.redis_service.mark_executors_validated([executor_id])
-            except Exception as exc:
-                # The result is published; a Redis blip must not run the node again. The cycle
-                # owns it from here (its next seed records it), like a node that used up its
-                # attempts.
-                self._left_to_cycle.add(executor_id)
-                logger.error(
-                    _m(
-                        "[express] Published, but could not record the executor as validated; left to the cycle",
-                        extra=get_extra_info({**extra, "error": str(exc)}),
-                    ),
-                )
-            self._pending.pop(executor_id, None)
-
-            published_at = datetime.now(UTC)
-            result = results[0]
-            registered_at = pending.executor.created_at
-            logger.info(
-                _m(
-                    EXPRESS_PUBLISHED_EVENT,
-                    extra=get_extra_info(
-                        {
-                            **extra,
-                            "outcome": "passed" if (result.score > 0 or result.job_score > 0) else "failed",
-                            "score": result.score,
-                            "log_status": result.log_status,
-                            "registered_at": registered_at.isoformat() if registered_at else None,
-                            "first_seen_at": pending.first_seen_at.isoformat(),
-                            "published_at": published_at.isoformat(),
-                            "registration_to_publish_s": round(
-                                (published_at - registered_at).total_seconds(), 1
-                            )
-                            if registered_at
-                            else None,
-                            "first_seen_to_publish_s": round(
-                                (published_at - pending.first_seen_at).total_seconds(), 1
-                            ),
-                            "verification_s": round(time.monotonic() - started, 1),
-                        }
-                    ),
-                )
-            )
+            await self._publish(pending, miner, results, extra, started)
         except Exception as exc:
             pending.attempts = attempt
             logger.error(
@@ -367,6 +347,69 @@ class ExpressLane:
             if self._directories_in_use[directory] <= 0:
                 del self._directories_in_use[directory]
 
+    async def _publish(
+        self,
+        pending: _Pending,
+        miner: bittensor.NeuronInfo,
+        results: list[JobResult],
+        extra: dict[str, object],
+        started: float,
+    ) -> None:
+        """Publish the executor's own result spec-only, record it as validated, log the metric.
+
+        Published as the pipeline produced it — no incentive, scored_at None — so the backend
+        creates/updates the executor row (AVAILABLE when the score is positive) but writes no
+        incentive_per_validator_cycle row: is_provider_emission_cycle_eligible needs scored_at.
+        The next scored cycle overwrites the row as today.
+        """
+        executor_id = pending.executor.id
+        await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey)
+        try:
+            await self.redis_service.mark_executors_validated([executor_id])
+        except Exception as exc:
+            # The result is published; a Redis blip must not run the node again. The cycle
+            # owns it from here (its next seed records it), like a node that used up its
+            # attempts.
+            self._left_to_cycle.add(executor_id)
+            logger.error(
+                _m(
+                    "[express] Published, but could not record the executor as validated; left to the cycle",
+                    extra=get_extra_info({**extra, "error": str(exc)}),
+                ),
+            )
+        self._pending.pop(executor_id, None)
+
+        published_at = datetime.now(UTC)
+        result = results[0]
+        registered_at = pending.executor.created_at
+        logger.info(
+            _m(
+                EXPRESS_PUBLISHED_EVENT,
+                extra=get_extra_info(
+                    {
+                        **extra,
+                        "outcome": "passed"
+                        if (result.score > 0 or result.job_score > 0)
+                        else "failed",
+                        "score": result.score,
+                        "log_status": result.log_status,
+                        "registered_at": registered_at.isoformat() if registered_at else None,
+                        "first_seen_at": pending.first_seen_at.isoformat(),
+                        "published_at": published_at.isoformat(),
+                        "registration_to_publish_s": round(
+                            (published_at - registered_at).total_seconds(), 1
+                        )
+                        if registered_at
+                        else None,
+                        "first_seen_to_publish_s": round(
+                            (published_at - pending.first_seen_at).total_seconds(), 1
+                        ),
+                        "verification_s": round(time.monotonic() - started, 1),
+                    }
+                ),
+            )
+        )
+
     def _defer(self, pending: _Pending, reason: str) -> None:
         """Try again after RETRY_SECONDS, or after MAX_ATTEMPTS leave the executor to the cycle.
 
@@ -381,7 +424,11 @@ class ExpressLane:
         if pending.attempts >= MAX_ATTEMPTS:
             self._left_to_cycle.add(pending.executor.id)
             self._pending.pop(pending.executor.id, None)
-            logger.warning(_m("[express] Executor left to the normal cycle", extra=get_extra_info(extra)))
+            logger.warning(
+                _m("[express] Executor left to the normal cycle", extra=get_extra_info(extra))
+            )
             return
         pending.not_before = time.monotonic() + RETRY_SECONDS
-        logger.info(_m("[express] Executor not verified yet, will retry", extra=get_extra_info(extra)))
+        logger.info(
+            _m("[express] Executor not verified yet, will retry", extra=get_extra_info(extra))
+        )

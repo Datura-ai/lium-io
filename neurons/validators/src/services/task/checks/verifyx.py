@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -15,6 +15,18 @@ from .network_ema import compute_ema
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+
+
+@dataclass(frozen=True)
+class ColdSampleRetry:
+    """DAH-2959: a never-measured node's two download samples and the one the check kept.
+
+    Attached to the event with `asdict`, so it serializes like the rest of `what_we_saw`.
+    """
+
+    first_download_speed_mbps: float | None
+    retry_download_speed_mbps: float | None
+    used: Literal["first", "retry"]
 
 
 class VerifyXCheck:
@@ -76,7 +88,9 @@ class VerifyXCheck:
         # taken and published). The keyword is only passed on that path so the scored call is
         # byte-for-byte today's.
         sizing = (
-            {"challenge_config_overrides": _first_pass_challenge_config()} if ctx.config.first_pass else {}
+            {"challenge_config_overrides": _first_pass_challenge_config()}
+            if ctx.config.first_pass
+            else {}
         )
         result = await verifyx_service.validate_verifyx_and_process_job(
             shell=ctx.services.shell,
@@ -88,10 +102,11 @@ class VerifyXCheck:
 
         prev_ema = (
             ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
-            if ctx.state.rented_data else None
+            if ctx.state.rented_data
+            else None
         )
 
-        cold_sample_retry: dict[str, Any] | None = None
+        cold_sample_retry: ColdSampleRetry | None = None
         if _is_cold_sample_below_gate(ctx, result, prev_ema):
             # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
             # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
@@ -110,18 +125,20 @@ class VerifyXCheck:
             )
             first_speed = _download_speed(result)
             retry_speed = _download_speed(retry)
-            use_retry = retry.data is not None and bool(retry.data.get("success")) and (
-                retry_speed or 0.0
-            ) > (first_speed or 0.0)
-            cold_sample_retry = {
-                "first_download_speed_mbps": first_speed,
-                "retry_download_speed_mbps": retry_speed,
-                "used": "retry" if use_retry else "first",
-            }
+            use_retry = (
+                retry.data is not None
+                and bool(retry.data.get("success"))
+                and (retry_speed or 0.0) > (first_speed or 0.0)
+            )
+            cold_sample_retry = ColdSampleRetry(
+                first_download_speed_mbps=first_speed,
+                retry_download_speed_mbps=retry_speed,
+                used="retry" if use_retry else "first",
+            )
             logger.info(
                 _m(
                     "VerifyX cold first sample below the gate, re-measured once",
-                    extra=get_extra_info({**ctx.default_extra, **cold_sample_retry}),
+                    extra=get_extra_info({**ctx.default_extra, **asdict(cold_sample_retry)}),
                 )
             )
             if use_retry:
@@ -185,15 +202,21 @@ class VerifyXCheck:
             if errors:
                 event.what_we_saw["errors"] = errors
             if sizing:
-                event.what_we_saw["first_pass_challenge_config"] = sizing["challenge_config_overrides"]
-            if cold_sample_retry:
-                event.what_we_saw["cold_sample_retry"] = cold_sample_retry
+                event.what_we_saw["first_pass_challenge_config"] = sizing[
+                    "challenge_config_overrides"
+                ]
+            if cold_sample_retry is not None:
+                event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
 
             updated_state = replace(ctx.state, specs=updated_specs)
 
             ema_download = updated_specs["network"]["ema_verifyx_download_speed"]
             never_measured = prev_ema is None or prev_ema.ema_verifyx_download_speed is None
-            if ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS and ctx.config.first_pass and never_measured:
+            if (
+                ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+                and ctx.config.first_pass
+                and never_measured
+            ):
                 # DAH-3011: the first pass is never scored, and a fresh node's single cold sample fails
                 # this gate 14 % of the time (DAH-2959). Publish the raw sample, leave the EMA unseeded
                 # so the first SCORED cycle bootstraps from a warm sample and enforces the gate, and say
@@ -221,8 +244,8 @@ class VerifyXCheck:
                         "min_download_speed_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
                     },
                 )
-                if cold_sample_retry:
-                    slow_event.what_we_saw["cold_sample_retry"] = cold_sample_retry
+                if cold_sample_retry is not None:
+                    slow_event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
                 return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
 
             return CheckResult(
