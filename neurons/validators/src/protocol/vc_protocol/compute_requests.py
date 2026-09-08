@@ -212,10 +212,11 @@ class PodHostRebootRecoveredResponse(BaseModel):
 
 
 class VerificationStartedResponse(BaseModel):
-    """Ack for DAH-3019 `verification-started`: the backend stored the run start so the
-    provider portal can show which step is running and how long is left."""
+    """Ack for DAH-3019 `verification-started` (one request per miner): how many of the batch's
+    executors the backend stored the run start for, so the provider portal can show which step
+    is running and how long is left. Fewer than sent means nodes this validator does not own."""
 
-    recorded: bool
+    recorded: int
 
 
 class FillerRunActiveResponse(BaseModel):

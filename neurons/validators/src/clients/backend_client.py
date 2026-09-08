@@ -5,8 +5,9 @@ import json
 import logging
 import re
 import time
+from datetime import datetime
 from typing import Any, ClassVar, TypeVar
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 import aiohttp
 import bittensor
@@ -28,9 +29,13 @@ from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
 
-# The canonical 8-4-4-4-12 form only: the executor uuid is miner-controlled and goes into a request
-# path, so anything else (braces, urn: prefix, a `../` path) is refused before it is interpolated.
+# The canonical 8-4-4-4-12 form only. Executor uuids are the miner's own strings; the backend parses
+# the batch as a list of UUIDs and rejects the whole request on one bad value, so a value that is not
+# a UUID is dropped here and the rest of the miner's batch still goes out.
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# Most uuids one verification-started request carries; the backend refuses a longer list with 422.
+# Sized well above the largest miner seen (148 executors, prod 8 Sep 2026).
+VERIFICATION_STARTED_BATCH_MAX = 512
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -360,48 +365,62 @@ class BackendClient:
         )
 
     async def report_verification_started(
-        self, executor_uuid: str, *, job_batch_id: str, pipeline_id: str, miner_hotkey: str
+        self, *, job_batch_id: str, miner_hotkey: str, executor_uuids: list[str], started_at: datetime
     ) -> None:
-        """Tell the backend this executor's validation pipeline has just started (DAH-3019).
+        """Tell the backend a miner's executors have just started their validation pipelines (DAH-3019).
 
-        One call per executor per run. The provider portal turns it, together with the per-step
-        durations of earlier runs, into "verifying · step 3/6 · ~70 s left"; without it the portal
-        only learns of a run when the whole cycle publishes, minutes after the node's own checks.
-        Fire-and-forget: never raises, a failure costs the provider a progress bar, not a verdict.
-        The route ships with lium-platform#120; until a backend has it the 404 is logged as a warning
-        (one line per executor per cycle at error level would read as an outage that is not one).
-        The uuid is the miner's own string: only the canonical 8-4-4-4-12 form is sent, quoted, so
-        a crafted value cannot point this signed POST at another backend route.
+        One signed POST per miner per cycle, `{job_batch_id, miner_hotkey, started_at, executor_uuids}`.
+        Per miner, not per executor: a miner's executors are launched in one `gather` and start within
+        a fraction of a second, and the whole cycle fires at once — per executor that was 483 requests
+        in 17 s (222 in one second) on prod, per miner it is 104 with a peak second of 39. The provider
+        portal turns the start, with the per-step durations of earlier runs, into "verifying · step
+        3/6 · ~70 s left".
+        Fire-and-forget: never raises, no retry, a 10-s timeout — a missed report costs the provider a
+        progress bar, not a verdict. Until the backend has the route (lium-platform#120) the 404 is a
+        warning, not an error. Uuids that are not UUIDs are dropped; more than 512 are split.
         """
-        if not UUID_RE.match(executor_uuid or ""):
+        uuids = [u for u in executor_uuids if UUID_RE.match(u or "")]
+        if len(uuids) < len(executor_uuids):
             logger.warning(
                 _m(
-                    "Verification start not reported: executor uuid is not a UUID",
-                    extra={"executor_uuid": str(executor_uuid)[:80], "miner_hotkey": miner_hotkey},
+                    "Verification start not reported for executors whose uuid is not a UUID",
+                    extra={
+                        "miner_hotkey": miner_hotkey,
+                        "skipped": [str(u)[:80] for u in executor_uuids if not UUID_RE.match(u or "")],
+                    },
                 )
             )
+        if not uuids:
             return
-        path = f"/validator/{self.keypair.ss58_address}/executors/{quote(executor_uuid, safe='')}"
-        try:
-            await self.post(
-                f"{path}/verification-started",
-                VerificationStartedResponse,
-                json_data={
-                    "job_batch_id": job_batch_id,
-                    "pipeline_id": pipeline_id,
-                    "miner_hotkey": miner_hotkey,
-                },
-                add_signature=True,
-                timeout=10,
-                non_200_log_level=logging.WARNING,
-            )
-        except Exception as exc:
-            logger.warning(
-                _m(
-                    "Failed to report verification start",
-                    extra={"executor_uuid": executor_uuid, "job_batch_id": job_batch_id, "error": str(exc)},
+        path = f"/validator/{self.keypair.ss58_address}/verification-started"
+        for start in range(0, len(uuids), VERIFICATION_STARTED_BATCH_MAX):
+            chunk = uuids[start : start + VERIFICATION_STARTED_BATCH_MAX]
+            try:
+                await self.post(
+                    path,
+                    VerificationStartedResponse,
+                    json_data={
+                        "job_batch_id": job_batch_id,
+                        "miner_hotkey": miner_hotkey,
+                        "started_at": started_at.isoformat(),
+                        "executor_uuids": chunk,
+                    },
+                    add_signature=True,
+                    timeout=10,
+                    non_200_log_level=logging.WARNING,
                 )
-            )
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Failed to report verification start",
+                        extra={
+                            "miner_hotkey": miner_hotkey,
+                            "job_batch_id": job_batch_id,
+                            "executors": len(chunk),
+                            "error": str(exc),
+                        },
+                    )
+                )
 
     async def report_unknown_driver(self, driver_version: str) -> None:
         """Ask the backend to verify an unknown NVIDIA driver (DAH-2451).

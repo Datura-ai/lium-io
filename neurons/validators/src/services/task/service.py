@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Annotated
 
 import bittensor
@@ -63,21 +64,22 @@ class TaskService:
 
     def report_verification_started(
         self,
-        pipeline_id: str,
         miner_info: MinerJobRequestPayload,
-        executor_info: ExecutorSSHInfo,
+        executors: list[ExecutorSSHInfo],
     ) -> None:
-        """Tell the backend the pipeline for this executor is starting (DAH-3019), off the hot path.
+        """Tell the backend this miner's executors are starting their pipelines (DAH-3019), off the hot path.
 
-        Scheduled, not awaited: the report must not add its round trip (or a slow backend's 10-s
-        timeout) to every executor's pipeline. The client method swallows every error.
+        Called once per miner by MinerService, right where it launches one `create_task` per executor,
+        so the whole batch shares one start time and one request. Scheduled, not awaited: the report
+        must not add its round trip (or a slow backend's 10-s timeout) to the miner's pipelines. The
+        client method swallows every error.
         """
         task = asyncio.create_task(
             self.backend_client.report_verification_started(
-                executor_info.uuid,
                 job_batch_id=miner_info.job_batch_id,
-                pipeline_id=pipeline_id,
                 miner_hotkey=miner_info.miner_hotkey,
+                executor_uuids=[executor.uuid for executor in executors],
+                started_at=datetime.now(UTC),
             )
         )
         self._start_reports.add(task)
@@ -160,8 +162,6 @@ class TaskService:
                     gpu_attestation_passed=gpu_attestation_passed,
                     first_pass=first_pass,
                 )
-
-                self.report_verification_started(base_ctx.pipeline_id, miner_info, executor_info)
 
                 # Build and run validation pipeline
                 # Use dry run pipeline if DRY_RUN mode is enabled to avoid state changes
