@@ -72,6 +72,21 @@ REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 logger = logging.getLogger(__name__)
 
 
+class _PassThroughLock:
+    """`RedisService.lock` with REDIS_COMMAND_LOCK_ENABLED off (DAH-3006): every `async with
+    self.lock:` site stays as it is, but nothing waits — each call is one atomic Redis command
+    and the pool bounds the concurrency."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def locked(self) -> bool:
+        return False
+
+
 class RedisService:
     def __init__(self):
         self.redis = aioredis.Redis(
@@ -99,7 +114,7 @@ class RedisService:
                 retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
             )
         )
-        self.lock = asyncio.Lock()
+        self.lock = asyncio.Lock() if settings.REDIS_COMMAND_LOCK_ENABLED else _PassThroughLock()
 
     @asynccontextmanager
     async def acquire_executor_lock(
