@@ -3,9 +3,10 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, ClassVar, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 import bittensor
@@ -26,6 +27,10 @@ from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
+
+# The canonical 8-4-4-4-12 form only: the executor uuid is miner-controlled and goes into a request
+# path, so anything else (braces, urn: prefix, a `../` path) is refused before it is interpolated.
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -113,6 +118,7 @@ class BackendClient:
         add_signature: bool = True,
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
+        non_200_log_level: int = logging.ERROR,
     ) -> T | None:
         return await self._request(
             "POST",
@@ -122,6 +128,7 @@ class BackendClient:
             add_signature=add_signature,
             timeout=timeout,
             extra_headers=extra_headers,
+            non_200_log_level=non_200_log_level,
         )
 
     async def _request(
@@ -134,8 +141,11 @@ class BackendClient:
         add_signature: bool = True,
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
+        non_200_log_level: int = logging.ERROR,
     ) -> T | None:
-        # single signed round-trip, retrying connection-level errors per backoff schedule
+        # single signed round-trip, retrying connection-level errors per backoff schedule.
+        # `non_200_log_level`: an optional call whose route may not exist on the backend yet logs
+        # a non-200 as a warning instead of an error (report_verification_started).
         url = f"{self.base_url}/{path.lstrip('/')}"
         context = {"url": url, "method": method}
 
@@ -163,11 +173,12 @@ class BackendClient:
                             )
                         )
                         if resp.status != 200:
-                            logger.error(
+                            logger.log(
+                                non_200_log_level,
                                 _m(
                                     f"HTTP {method} failed",
                                     extra=get_extra_info({**context, "status": resp.status}),
-                                )
+                                ),
                             )
                             return None
 
@@ -357,11 +368,23 @@ class BackendClient:
         durations of earlier runs, into "verifying · step 3/6 · ~70 s left"; without it the portal
         only learns of a run when the whole cycle publishes, minutes after the node's own checks.
         Fire-and-forget: never raises, a failure costs the provider a progress bar, not a verdict.
-        Older backends 404 and that is logged at the client's error level like any non-200.
+        The route ships with lium-platform#120; until a backend has it the 404 is logged as a warning
+        (one line per executor per cycle at error level would read as an outage that is not one).
+        The uuid is the miner's own string: only the canonical 8-4-4-4-12 form is sent, quoted, so
+        a crafted value cannot point this signed POST at another backend route.
         """
+        if not UUID_RE.match(executor_uuid or ""):
+            logger.warning(
+                _m(
+                    "Verification start not reported: executor uuid is not a UUID",
+                    extra={"executor_uuid": str(executor_uuid)[:80], "miner_hotkey": miner_hotkey},
+                )
+            )
+            return
+        path = f"/validator/{self.keypair.ss58_address}/executors/{quote(executor_uuid, safe='')}"
         try:
             await self.post(
-                f"/validator/{self.keypair.ss58_address}/executors/{executor_uuid}/verification-started",
+                f"{path}/verification-started",
                 VerificationStartedResponse,
                 json_data={
                     "job_batch_id": job_batch_id,
@@ -370,6 +393,7 @@ class BackendClient:
                 },
                 add_signature=True,
                 timeout=10,
+                non_200_log_level=logging.WARNING,
             )
         except Exception as exc:
             logger.warning(

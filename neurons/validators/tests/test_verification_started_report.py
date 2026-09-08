@@ -2,6 +2,7 @@
 the hot path and without ever failing the run."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,18 +19,23 @@ def client():
     return BackendClient(base_url="https://api.example.com", keypair=keypair)
 
 
+EXECUTOR_UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+
+
 @pytest.mark.asyncio
 async def test_report_verification_started_posts_the_run_to_the_validator_route(client):
     client.post = AsyncMock(return_value=SimpleNamespace(recorded=True))
 
     await client.report_verification_started(
-        "exec-uuid-1", job_batch_id="2026-09-06 21:00:00", pipeline_id="pipe-1", miner_hotkey="5Miner"
+        EXECUTOR_UUID, job_batch_id="2026-09-06 21:00:00", pipeline_id="pipe-1", miner_hotkey="5Miner"
     )
 
     client.post.assert_awaited_once()
     path = client.post.await_args.args[0]
     kwargs = client.post.await_args.kwargs
-    assert path == "/validator/5FakeValidatorHotkey/executors/exec-uuid-1/verification-started"
+    assert path == f"/validator/5FakeValidatorHotkey/executors/{EXECUTOR_UUID}/verification-started"
+    # the route ships with lium-platform#120; a 404 from an older backend is not an outage
+    assert kwargs["non_200_log_level"] == logging.WARNING
     assert kwargs["json_data"] == {
         "job_batch_id": "2026-09-06 21:00:00",
         "pipeline_id": "pipe-1",
@@ -45,8 +51,53 @@ async def test_report_verification_started_never_raises(client):
 
     # A failed report costs the provider a progress bar, never a verdict.
     await client.report_verification_started(
-        "exec-uuid-1", job_batch_id="2026-09-06 21:00:00", pipeline_id="pipe-1", miner_hotkey="5Miner"
+        EXECUTOR_UUID, job_batch_id="2026-09-06 21:00:00", pipeline_id="pipe-1", miner_hotkey="5Miner"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "crafted",
+    [
+        "../../admin/executors/x",
+        "3f2504e0-4f89-11d3-9a0c-0305e82c3301/../../../pods",
+        "{3f2504e0-4f89-11d3-9a0c-0305e82c3301}",
+        "urn:uuid:3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+        "3f2504e04f8911d39a0c0305e82c3301",
+        "",
+        "not a uuid at all?x=1",
+    ],
+)
+async def test_a_miner_controlled_uuid_that_is_not_a_uuid_is_never_put_in_the_path(client, crafted):
+    client.post = AsyncMock()
+
+    await client.report_verification_started(
+        crafted, job_batch_id="2026-09-06 21:00:00", pipeline_id="pipe-1", miner_hotkey="5Miner"
+    )
+
+    client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_404_from_a_backend_without_the_route_is_a_warning_not_an_error(client, caplog):
+    response = MagicMock()
+    response.status = 404
+    async_cm = AsyncMock()
+    async_cm.__aenter__ = AsyncMock(return_value=response)
+    async_cm.__aexit__ = AsyncMock(return_value=None)
+    session = MagicMock()
+    session.request = MagicMock(return_value=async_cm)
+
+    with (
+        patch.object(BackendClient, "get_session", AsyncMock(return_value=session)),
+        caplog.at_level(logging.WARNING),
+    ):
+        await client.report_verification_started(
+            EXECUTOR_UUID, job_batch_id="2026-09-06 21:00:00", pipeline_id="pipe-1", miner_hotkey="5Miner"
+        )
+
+    failed = [r for r in caplog.records if "HTTP POST failed" in r.getMessage()]
+    assert len(failed) == 1 and failed[0].levelno == logging.WARNING
 
 
 @pytest.mark.asyncio
