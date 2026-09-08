@@ -64,6 +64,7 @@ def _state(
     count: int = 1,
     default_job_owner: str | None = None,
     rented_data_known: bool = True,
+    min_limit: float | None = None,
 ) -> ContextState:
     details = [
         {
@@ -73,6 +74,7 @@ def _state(
             "power_default_limit": default_limit,
             "power_max_limit": max_limit,
         }
+        | ({"power_min_limit": min_limit} if min_limit is not None else {})
         for index in range(count)
     ]
     rented_data = None
@@ -97,6 +99,21 @@ async def test_power_limit_passes_when_current_is_close_to_default(context_facto
     assert result.passed is True
     assert result.event.reason_code == "GPU_POWER_LIMIT_OK"
     read_records_mock.assert_not_awaited()  # healthy nodes cost zero Redis traffic
+
+
+@pytest.mark.asyncio
+async def test_power_limit_evidence_carries_the_host_floor(context_factory, read_records_mock) -> None:
+    """B-113: the scrape's power_min_limit (the lowest cap the host accepts) travels into the
+    check's measurements so a power-cap guard can tell a BIOS clamp from a refused cap; a scrape
+    without the field yields None, never a failure."""
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350, min_limit=100))
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.event.what_we_saw["rejected_gpus"][0]["power_min_limit"] == 100
+
+    ctx = context_factory(state=_state(current_limit=320, default_limit=350))
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is True
+    assert result.event.what_we_saw["measurements"][0]["power_min_limit"] is None
 
 
 @pytest.mark.asyncio

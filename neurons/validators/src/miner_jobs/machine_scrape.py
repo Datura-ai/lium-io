@@ -1389,6 +1389,13 @@ def get_machine_specs():
                     "gpu.power_default_limit": safeNvmlValue(
                         lambda: nvmlDeviceGetPowerManagementDefaultLimit(handle) / 1000
                     ),
+                    # The lowest cap the host accepts (`nvidia-smi -q -d POWER` "Min Power Limit"). A
+                    # BIOS/driver clamp near the default (measured 409/450 W on 4090s, 518/575 W on
+                    # 5090s) makes `-pl <watts>` settle here instead of at the requested cap, so a
+                    # power-cap guard that only knows the stock default reads a false refusal.
+                    "gpu.power_min_limit": safeNvmlValue(
+                        lambda: nvmlDeviceGetPowerManagementLimitConstraints(handle)[0] / 1000
+                    ),
                     "gpu.power_max_limit": safeNvmlValue(
                         lambda: nvmlDeviceGetPowerManagementLimitConstraints(handle)[1] / 1000
                     ),
