@@ -1,0 +1,26 @@
+name: Lint
+
+# DAH-2972: gate only the rule families that are already clean, so the dead-code sweep (DAH-2971)
+# cannot regress. Not gated yet (counts on main after the sweep, `ruff check --isolated`):
+# F541 10 · E 23 · W 231 · I 291 · UP 152 · B 74 · SIM 74 · C4 46 · ASYNC110/221/240 8 —
+# each is one `ruff check --select <family> --fix` commit away; add it here once it is at zero.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    name: ruff (pyflakes, blocking calls in coroutines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # same pin as lium-platform's CI; config is the root pyproject.toml ([tool.ruff])
+      - run: pip install ruff==0.15.5
+      - run: ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower
