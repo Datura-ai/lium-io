@@ -6,6 +6,7 @@ the same files through the validator's models."""
 import pytest
 
 from lium_protocol import BACKEND_MESSAGES, VALIDATOR_MESSAGES, ValidatorMessageType
+from lium_protocol.backend_to_validator import SOCKET_REPLIES
 from lium_protocol.http import HTTP_MODELS
 from lium_protocol.recorded import json_keys, recorded
 
@@ -22,8 +23,9 @@ def test_recordings_cover_every_wire_type(direction: str) -> None:
     assert covered == set(REGISTRIES[direction].models()), "a wire type without a recording"
 
 
-def test_recordings_cover_every_http_body() -> None:
+def test_recordings_cover_every_http_body_and_socket_reply() -> None:
     assert {entry["expect"] for entry in recorded("http")} == set(HTTP_MODELS)
+    assert {entry["expect"] for entry in recorded("socket_replies")} == set(SOCKET_REPLIES)
 
 
 @pytest.mark.parametrize("entry", recorded("validator_to_backend"), ids=_ids("validator_to_backend"))
@@ -49,13 +51,19 @@ def _check_message(registry, entry: dict) -> None:
     assert registry.parse_obj(dumped) == model
 
 
-@pytest.mark.parametrize("entry", recorded("http"), ids=_ids("http"))
-def test_http_body_parses_and_keeps_every_field(entry: dict) -> None:
-    model_cls = HTTP_MODELS[entry["expect"]]
+@pytest.mark.parametrize(
+    "entry",
+    recorded("http") + recorded("socket_replies"),
+    ids=_ids("http") + _ids("socket_replies"),
+)
+def test_body_parses_and_keeps_every_field(entry: dict) -> None:
+    model_cls = {**HTTP_MODELS, **SOCKET_REPLIES}[entry["expect"]]
     model = model_cls.model_validate(entry["message"])
     dumped = json_keys(model.model_dump(mode="json"))
-    if isinstance(entry["message"], list):  # a RootModel body
+    if isinstance(entry["message"], list):  # a RootModel body: every item, every key
         assert len(dumped) == len(entry["message"])
+        for item, seen in zip(entry["message"], dumped, strict=True):
+            assert set(item) - set(seen) == set()
         return
     missing = set(entry["message"]) - set(dumped)
     assert missing == set(), f"fields without a model field: {sorted(missing)}"

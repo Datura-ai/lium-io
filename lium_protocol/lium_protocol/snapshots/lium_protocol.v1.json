@@ -4510,6 +4510,7 @@
       "type": "object"
     },
     "RentedMachineResponse": {
+      "description": "The answer to `RentedMachineRequest`: every rented machine and the current bans.",
       "properties": {
         "banned_coldkeys": {
           "default": [],
@@ -4685,7 +4686,7 @@
     },
     "Response": {
       "additionalProperties": false,
-      "description": "The backend's answer to `AuthenticateRequest` on the WebSocket.",
+      "description": "The backend's answer to `AuthenticateRequest`. The one strict model of the protocol: the validator's\ncopy forbids unknown keys and this mirrors it, so an unexpected key here is an error, not ignored.",
       "properties": {
         "errors": {
           "default": [],
@@ -4922,6 +4923,7 @@
       "type": "object"
     },
     "RevenuePerGpuTypeResponse": {
+      "description": "The answer to `RevenuePerGpuTypeRequest`.",
       "properties": {
         "revenues": {
           "additionalProperties": {
@@ -5272,7 +5274,10 @@
     },
     "RentedExecutorsResponse": {
       "$ref": "#/$defs/RentedExecutorsResponse"
-    },
+    }
+  },
+  "protocol_version": "1.0.0",
+  "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
     },
@@ -5283,7 +5288,6 @@
       "$ref": "#/$defs/RevenuePerGpuTypeResponse"
     }
   },
-  "protocol_version": "1.0.0",
   "validator_to_backend": {
     "AuthenticateRequest": {
       "$ref": "#/$defs/AuthenticateRequest"

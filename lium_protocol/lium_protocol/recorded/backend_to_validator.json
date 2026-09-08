@@ -1,6 +1,6 @@
 {
   "direction": "backend_to_validator",
-  "about": "One message per BackendMessageType, shaped as the backend's src/protocol/compute_app_requests.py models serialise them (model_dump_json). The validator parses these with payload_models.BaseServerRequest.parse — neurons/validators/tests/test_protocol_compat.py proves every one of them goes through it. Addresses are TEST-NET; credentials are placeholders.",
+  "about": "One message per BackendMessageType. Those the backend sends are shaped as its src/protocol/compute_app_requests.py models serialise them (model_dump_json); ContainerStartRequest, ContainerStopRequest and GetPodLogsRequestFromServer are declared by the validator only (payload_models) — the backend has no model for them and never sends them — and are shaped from the validator's models. The validator parses all of them with payload_models.BaseServerRequest.parse (test_protocol_compat.py). Addresses are TEST-NET; credentials are placeholders.",
   "messages": [
     {
       "expect": "ContainerCreateRequest",
@@ -152,7 +152,8 @@
         "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
         "container_name": "container_0b1c2d3e",
         "local_volume_path": "/root"
-      }
+      },
+      "note": "declared by the validator only (payload_models); the backend has no model for it and never sends it today"
     },
     {
       "expect": "ContainerStopRequest",
@@ -162,7 +163,8 @@
         "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
         "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
         "container_name": "container_0b1c2d3e"
-      }
+      },
+      "note": "declared by the validator only (payload_models); the backend has no model for it and never sends it today"
     },
     {
       "expect": "ContainerDeleteRequest",
@@ -242,7 +244,8 @@
         "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
         "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
         "container_name": "container_0b1c2d3e"
-      }
+      },
+      "note": "declared by the validator only (payload_models); the backend has no model for it and never sends it today"
     },
     {
       "expect": "AddDebugSshKeyRequest",

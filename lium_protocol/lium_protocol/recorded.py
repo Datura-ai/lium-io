@@ -14,7 +14,7 @@ RECORDED_DIR = Path(__file__).parent / "recorded"
 
 def recorded(direction: str) -> list[dict[str, Any]]:
     """[{"expect": <model name>, "message": <object>, "note": …}, …] for one direction:
-    validator_to_backend · backend_to_validator · http."""
+    validator_to_backend · backend_to_validator · socket_replies · http."""
     document = json.loads((RECORDED_DIR / f"{direction}.json").read_text())
     assert document["direction"] == direction
     return document["messages"]

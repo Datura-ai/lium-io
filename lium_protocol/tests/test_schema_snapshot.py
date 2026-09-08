@@ -23,11 +23,12 @@ def test_snapshot_names_the_protocol_version_and_every_section() -> None:
         "protocol_version",
         "validator_to_backend",
         "backend_to_validator",
+        "socket_replies",
         "http",
         "$defs",
     }
     # every directory entry points into the shared $defs
-    for section in ("validator_to_backend", "backend_to_validator", "http"):
+    for section in ("validator_to_backend", "backend_to_validator", "socket_replies", "http"):
         for name, ref in document[section].items():
             target = ref["$ref"].removeprefix("#/$defs/")
             assert target in document["$defs"], (section, name)

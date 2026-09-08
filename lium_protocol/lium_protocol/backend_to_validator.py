@@ -10,7 +10,7 @@ required and the other optional is optional here.
 from __future__ import annotations
 
 import enum
-from typing import Any
+from typing import Any, Literal
 
 import pydantic
 
@@ -307,3 +307,58 @@ class ForcedValidationCycleRequest(BackendMessage):
     """Staging only: start the validation cycle now. No executor — the cycle validates the whole fleet."""
 
     message_type: BackendMessageType = BackendMessageType.ForcedValidationCycleRequest
+
+
+# --- typeless replies on the socket -----------------------------------------------------------------
+
+
+class Error(pydantic.BaseModel, extra="allow"):
+    msg: str
+    type: str
+    help: str = ""
+
+
+class Response(pydantic.BaseModel, extra="forbid"):
+    """The backend's answer to `AuthenticateRequest`. The one strict model of the protocol: the validator's
+    copy forbids unknown keys and this mirrors it, so an unexpected key here is an error, not ignored."""
+
+    status: Literal["error", "success"]
+    errors: list[Error] = []
+
+
+class RentedContainer(pydantic.BaseModel):
+    name: str
+    pod_id: str
+    # sent by the backend; the validator's copy does not declare it (test_protocol_compat.VALIDATOR_IGNORES)
+    rented_ports: list[int] = []
+
+
+class RentedMachine(pydantic.BaseModel):
+    miner_hotkey: str
+    executor_id: str
+    executor_ip_address: str
+    executor_ip_port: str
+    containers: list[RentedContainer]
+    owner_flag: bool = False
+    rented_ports: list[int] = []  # as above
+
+
+class RentedMachineResponse(pydantic.BaseModel):
+    """The answer to `RentedMachineRequest`: every rented machine and the current bans."""
+
+    machines: list[RentedMachine]
+    banned_guids: list[str] = []
+    banned_hotkeys: list[str] = []
+    banned_coldkeys: list[str] = []
+    banned_provider_guids: list[str] = []
+
+
+class RevenuePerGpuTypeResponse(pydantic.BaseModel):
+    """The answer to `RevenuePerGpuTypeRequest`."""
+
+    revenues: dict[str, float]
+
+
+SOCKET_REPLIES: dict[str, type[pydantic.BaseModel]] = {
+    model.__name__: model for model in (Response, RentedMachineResponse, RevenuePerGpuTypeResponse)
+}

@@ -1,75 +1,146 @@
 {
   "direction": "http",
-  "about": "Bodies the validator reads from the backend HTTP API, as the backend's compute_app_requests.py models serialise them; the validator parses them with vc_protocol.compute_requests (test_protocol_compat.py). Addresses are TEST-NET.",
+  "about": "Bodies the validator reads from the backend HTTP API (clients/backend_client.py), as the backend's compute_app_requests.py models serialise them; the validator parses them with vc_protocol.compute_requests (test_protocol_compat.py). The three typeless WebSocket replies are in socket_replies.json. Addresses are TEST-NET.",
   "messages": [
-    {
-      "expect": "Response",
-      "message": {"status": "success", "errors": []}
-    },
-    {
-      "expect": "Response",
-      "message": {"status": "error", "errors": [{"msg": "signature invalid", "type": "auth", "help": ""}]}
-    },
-    {
-      "expect": "RentedMachineResponse",
-      "message": {"machines": [{"miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c", "executor_ip_address": "203.0.113.10", "executor_ip_port": "8001", "containers": [{"name": "container_0b1c2d3e", "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9", "rented_ports": [40001, 40002]}], "owner_flag": false, "rented_ports": [40001, 40002]}], "banned_guids": [], "banned_hotkeys": [], "banned_coldkeys": [], "banned_provider_guids": []}
-    },
     {
       "expect": "RentedExecutorsResponse",
       "message": {
-        "executors": {"6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c": {"miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty", "executor_ip_address": "203.0.113.10", "executor_ip_port": "8001", "pods": [{"pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9", "container_name": "container_0b1c2d3e", "rented_ports": [40001, 40002], "created_at": "2026-09-08T20:33:00Z", "gpu_count": 2}]}},
+        "executors": {
+          "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c": {
+            "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+            "executor_ip_address": "203.0.113.10",
+            "executor_ip_port": "8001",
+            "pods": [
+              {
+                "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+                "container_name": "container_0b1c2d3e",
+                "rented_ports": [
+                  40001,
+                  40002
+                ],
+                "created_at": "2026-09-08T20:33:00Z",
+                "gpu_count": 2
+              }
+            ]
+          }
+        },
         "banned_guids": [],
-        "banned_hotkeys": ["5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy"],
+        "banned_hotkeys": [
+          "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy"
+        ],
         "banned_coldkeys": [],
-        "banned_provider_guids": ["GPU-99999999-8888-7777-6666-555555555555"],
-        "filler_containers_by_executor": {"7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": "filler_11111111"},
-        "all_filler_containers_by_executor": {"7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": ["filler_11111111", "filler_22222222"]},
-        "filler_ports_by_executor": {"7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": [41000]},
-        "gpu_splitting_config": {"6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c": 1},
-        "network_ema": {"6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c": {"ema_download_speed": 912.5, "ema_upload_speed": 880.1, "ema_verifyx_download_speed": null, "ema_verifyx_upload_speed": null}},
+        "banned_provider_guids": [
+          "GPU-99999999-8888-7777-6666-555555555555"
+        ],
+        "filler_containers_by_executor": {
+          "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": "filler_11111111"
+        },
+        "all_filler_containers_by_executor": {
+          "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": [
+            "filler_11111111",
+            "filler_22222222"
+          ]
+        },
+        "filler_ports_by_executor": {
+          "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": [
+            41000
+          ]
+        },
+        "gpu_splitting_config": {
+          "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c": 1
+        },
+        "network_ema": {
+          "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c": {
+            "ema_download_speed": 912.5,
+            "ema_upload_speed": 880.1,
+            "ema_verifyx_download_speed": null,
+            "ema_verifyx_upload_speed": null
+          }
+        },
         "spot_executor_ids": [],
         "new_rentals_paused_executor_ids": [],
         "filler_create_kill_executor_ids": [],
-        "provider_discord_connected_executor_ids": ["6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c"],
-        "default_job_owner_by_executor": {"7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": "lium"},
-        "manual_rental_executors": {"8b7c6d5e-4f3a-4b2c-8d1e-0f9a8b7c6d5e": {"gpu_model": "NVIDIA H200", "gpu_count": 8}}
+        "provider_discord_connected_executor_ids": [
+          "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c"
+        ],
+        "default_job_owner_by_executor": {
+          "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": "lium"
+        },
+        "manual_rental_executors": {
+          "8b7c6d5e-4f3a-4b2c-8d1e-0f9a8b7c6d5e": {
+            "gpu_model": "NVIDIA H200",
+            "gpu_count": 8
+          }
+        }
       }
     },
     {
       "expect": "PodRentalActiveResponse",
-      "message": {"active": false, "status": "BROKEN", "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c", "rental_closed_at": "2026-09-08T21:00:00Z", "local_volume_path": null}
+      "message": {
+        "active": false,
+        "status": "BROKEN",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "rental_closed_at": "2026-09-08T21:00:00Z",
+        "local_volume_path": null
+      }
     },
     {
       "expect": "PodHostRebootRecoveredRequest",
-      "message": {"container_finished_at": "2026-09-08T20:59:30Z"}
+      "message": {
+        "container_finished_at": "2026-09-08T20:59:30Z"
+      }
     },
     {
       "expect": "PodHostRebootRecoveredResponse",
-      "message": {"recorded": true}
+      "message": {
+        "recorded": true
+      }
     },
     {
       "expect": "FillerRunActiveResponse",
-      "message": {"active": true, "executor_id": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d", "status": "RUNNING", "started_at": "2026-09-08T12:35:00Z"}
+      "message": {
+        "active": true,
+        "executor_id": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+        "status": "RUNNING",
+        "started_at": "2026-09-08T12:35:00Z"
+      }
     },
     {
       "expect": "ExecutorUptimeResponse",
-      "message": {"executor_ip_address": "203.0.113.10", "executor_ip_port": "8001", "uptime_in_minutes": 4321}
-    },
-    {
-      "expect": "RevenuePerGpuTypeResponse",
-      "message": {"revenues": {"NVIDIA H100 80GB HBM3": 1234.5}}
+      "message": {
+        "executor_ip_address": "203.0.113.10",
+        "executor_ip_port": "8001",
+        "uptime_in_minutes": 4321
+      }
     },
     {
       "expect": "ExecutorHealthCheckResponse",
-      "message": {"success": false, "error": "ping timed out", "details": {"latency_ms": null}, "reason_code": "PING_TIMEOUT"}
+      "message": {
+        "success": false,
+        "error": "ping timed out",
+        "details": {
+          "latency_ms": null
+        },
+        "reason_code": "PING_TIMEOUT"
+      }
     },
     {
       "expect": "DefaultDockerImagesResponse",
-      "message": [{"docker_image": "daturaai/pytorch", "docker_image_tag": "2.4.1-py3.11-cuda12.4.1-devel-ubuntu22.04", "docker_image_size": 9876543210, "docker_image_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "cuda_driver_min": "550"}]
+      "message": [
+        {
+          "docker_image": "daturaai/pytorch",
+          "docker_image_tag": "2.4.1-py3.11-cuda12.4.1-devel-ubuntu22.04",
+          "docker_image_size": 9876543210,
+          "docker_image_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "cuda_driver_min": "550"
+        }
+      ]
     },
     {
       "expect": "NvmlReportAckResponse",
-      "message": {"status": "recorded"}
+      "message": {
+        "status": "recorded"
+      }
     }
   ]
 }

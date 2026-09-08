@@ -22,7 +22,9 @@ import pydantic
 
 class ProtocolError(Exception):
     """Text that is not a message of this protocol: not JSON, no/unknown `message_type`, or fields the
-    model refuses. `.msg` is the human-readable reason; pydantic's error list travels as JSON in it."""
+    model refuses. `.msg` is the reason; for a refused field it is pydantic's error list as JSON, without
+    the input — a message that fails because one field is missing would otherwise carry every other field,
+    `auth_token` and `repository_password` included, into whatever logs the error."""
 
     def __init__(self, msg: str):
         super().__init__(msg)
@@ -34,7 +36,7 @@ class ProtocolError(Exception):
 
     @classmethod
     def from_pydantic_validation_error(cls, exc: pydantic.ValidationError) -> ProtocolError:
-        return cls(json.dumps(exc.json()))
+        return cls(exc.json(include_input=False, include_url=False))
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.msg})"
@@ -92,14 +94,21 @@ class Registry(Generic[M]):
     def __init__(self, type_enum: type[enum.Enum], *, base: Registry[M] | None = None):
         self.type_enum = type_enum
         self._models: dict[str, type[M]] = dict(base._models) if base else {}
+        self._inherited: set[str] = set(self._models)
 
     def register(self, model: type[M]) -> type[M]:
         """Decorator and function: `@REGISTRY.register` on a message class, or `REGISTRY.register(Sub)`.
-        The model's `message_type` default must be a member of this registry's enum."""
+        The model's `message_type` default must be a member of this registry's enum. A value already bound
+        in THIS registry cannot be rebound (two shipped classes with one wire type would make the second
+        dead code); a value inherited from `base` can — that is how a consumer overrides a model."""
         wire_type = model.wire_type()
         if not isinstance(wire_type, self.type_enum):
             raise TypeError(f"{model.__name__}.message_type is {wire_type!r}, not a {self.type_enum.__name__}")
+        bound = self._models.get(wire_type.value)
+        if bound is not None and bound is not model and wire_type.value not in self._inherited:
+            raise TypeError(f"{wire_type.value!r} is already bound to {bound.__name__} in this registry")
         self._models[wire_type.value] = model
+        self._inherited.discard(wire_type.value)
         return model
 
     def model_for(self, wire_type: str | enum.Enum) -> type[M]:
@@ -110,7 +119,7 @@ class Registry(Generic[M]):
             raise ProtocolError(f"unknown message_type {key!r}") from None
 
     def models(self) -> dict[str, type[M]]:
-        """Every registered model by wire value, in registration order (the schema snapshot's order)."""
+        """Every registered model by wire value, in registration order."""
         return dict(self._models)
 
     def missing_types(self) -> list[str]:

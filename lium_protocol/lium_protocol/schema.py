@@ -1,7 +1,9 @@
 """The protocol as one JSON document, and the drift check against the committed snapshot.
 
-`build_schema()` renders every registered message and every HTTP body to JSON Schema (pydantic's
-`model_json_schema`, `$defs` inlined per model so each entry stands alone) under the protocol version.
+`build_schema()` renders every registered message, every typeless socket reply and every HTTP body to one
+JSON Schema document (pydantic's `models_json_schema`: a shared `$defs` where each model and enum appears
+once, and per-section directories mapping a wire `message_type` or body name to its `$ref`) under the
+protocol version.
 `snapshots/lium_protocol.v<major>.json` is that document, committed; CI runs `--check` and fails when the
 models and the file disagree, so a wire change is visible in the PR diff and reviewed as such — the
 same mechanism as the visual baselines of lium-platform#199. A change is accepted by re-running
@@ -24,7 +26,7 @@ from typing import Any
 from pydantic.json_schema import models_json_schema
 
 from . import PROTOCOL_VERSION
-from .backend_to_validator import BACKEND_MESSAGES
+from .backend_to_validator import BACKEND_MESSAGES, SOCKET_REPLIES
 from .http import HTTP_MODELS
 from .validator_to_backend import VALIDATOR_MESSAGES
 
@@ -36,11 +38,12 @@ def snapshot_path(version: str = PROTOCOL_VERSION) -> Path:
 
 
 def build_schema() -> dict[str, Any]:
-    """One document: the three directories map a wire `message_type` (or an HTTP body name) to a `$ref`
+    """One document: the four directories map a wire `message_type` (or a reply / body name) to a `$ref`
     into the shared `$defs`, where every model and enum appears once."""
     sections = {
         "validator_to_backend": VALIDATOR_MESSAGES.models(),
         "backend_to_validator": BACKEND_MESSAGES.models(),
+        "socket_replies": SOCKET_REPLIES,
         "http": HTTP_MODELS,
     }
     entries = [(model, "validation") for models in sections.values() for model in models.values()]

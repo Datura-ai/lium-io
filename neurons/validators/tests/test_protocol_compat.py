@@ -19,6 +19,7 @@ if str(REPO_ROOT / "lium_protocol") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "lium_protocol"))
 
 import lium_protocol  # noqa: E402
+from lium_protocol.backend_to_validator import SOCKET_REPLIES  # noqa: E402
 from lium_protocol.http import HTTP_MODELS  # noqa: E402
 from lium_protocol.recorded import json_keys, recorded  # noqa: E402
 from payload_models import payloads  # noqa: E402
@@ -70,6 +71,26 @@ def _dropped(recorded_value: object, view: object, path: str = "") -> set[str]:
     return set()
 
 
+def _disagreements(
+    recorded_value: object, ours: object, theirs: object, path: str = ""
+) -> list[str]:
+    """Recorded leaf paths where the two models' views differ; a path the validator's model does not
+    carry is not a disagreement (it is a drop, checked separately)."""
+    if isinstance(recorded_value, dict):
+        out: list[str] = []
+        for key, value in recorded_value.items():
+            here = f"{path}.{key}" if path else key
+            if isinstance(theirs, dict) and key in theirs and isinstance(ours, dict):
+                out += _disagreements(value, ours.get(key), theirs[key], here)
+        return out
+    if isinstance(recorded_value, list) and isinstance(ours, list) and isinstance(theirs, list):
+        out = []
+        for item, mine, its in zip(recorded_value, ours, theirs, strict=True):
+            out += _disagreements(item, mine, its, f"{path}[]")
+        return out
+    return [] if ours == theirs else [f"{path}: lium_protocol {ours!r} != validator {theirs!r}"]
+
+
 def _same_wire_view(
     message: dict,
     ours: pydantic.BaseModel,
@@ -77,17 +98,13 @@ def _same_wire_view(
     *,
     ignores: set[str] = frozenset(),
 ) -> None:
-    """Both models read every recorded field (but the validator's documented ignores) and agree on
-    every field the validator reads."""
+    """Both models read every recorded field (but the validator's documented ignores) and agree,
+    leaf by leaf, on every field the validator reads."""
     our_view = json_keys(ours.model_dump(mode="json"))
     their_view = json_keys(theirs.model_dump(mode="json"))
     assert _dropped(message, our_view) == set(), "lium_protocol drops a recorded field"
     assert _dropped(message, their_view) == ignores, "the validator's model drops a recorded field"
-    for key in message:
-        if key in their_view and not any(ignore.startswith(key) for ignore in ignores):
-            assert our_view[key] == their_view[key], (
-                f"{key}: lium_protocol {our_view[key]!r} != validator {their_view[key]!r}"
-            )
+    assert _disagreements(message, our_view, their_view) == []
 
 
 @pytest.mark.parametrize(
@@ -131,10 +148,17 @@ def test_what_the_backend_sends_parses_through_the_validators_own_parser(entry: 
     _same_wire_view(message, ours, theirs)
 
 
-@pytest.mark.parametrize("entry", recorded("http"), ids=_ids("http"))
-def test_http_bodies_parse_the_same_on_both_sides(entry: dict) -> None:
+@pytest.mark.parametrize(
+    "entry",
+    recorded("http") + recorded("socket_replies"),
+    ids=_ids("http") + _ids("socket_replies"),
+)
+def test_http_bodies_and_socket_replies_parse_the_same_on_both_sides(entry: dict) -> None:
+    """HTTP bodies via vc_protocol.compute_requests; the three typeless socket replies the same way,
+    which is what compute_client.handle_message does with the raw text
+    (`Response.model_validate_json`, `TypeAdapter(RentedMachineResponse)`)."""
     body = entry["message"]
-    ours = HTTP_MODELS[entry["expect"]].model_validate(body)
+    ours = {**HTTP_MODELS, **SOCKET_REPLIES}[entry["expect"]].model_validate(body)
     if entry["expect"] in HTTP_BODIES_WITHOUT_A_VALIDATOR_MODEL:
         assert not hasattr(compute_requests, entry["expect"])
         return
@@ -170,3 +194,11 @@ def test_enums_the_validator_emits_are_members_of_the_package_enums() -> None:
     assert values(payloads.VolumeEncryptionStatus) == values(v2b.VolumeEncryptionStatus)
     assert values(payloads.ContainerWarningCode) <= values(v2b.ContainerWarningCode)
     assert values(payloads.WorkloadKind) == values(lium_protocol.WorkloadKind)
+
+
+def test_the_excluded_executor_id_is_the_validators_failed_miner_uuid() -> None:
+    """The backend keys emission eligibility off it; the validator names the value differently."""
+    from core.validator import FAILED_MINER_EXECUTOR_UUID
+    from lium_protocol.validator_to_backend import EXCLUDED_PROVIDER_EMISSION_EXECUTOR_ID
+
+    assert EXCLUDED_PROVIDER_EMISSION_EXECUTOR_ID == FAILED_MINER_EXECUTOR_UUID

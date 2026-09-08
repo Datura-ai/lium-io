@@ -136,7 +136,8 @@ class IncentiveReason(pydantic.BaseModel):
     context: dict[str, Any] = pydantic.Field(default_factory=dict)
 
 
-# Miner-level failures use this placeholder id; it does not identify a provider node.
+# `ExecutorSpecRequest.executor_uuid` of a miner-level failure (the validator's FAILED_MINER_EXECUTOR_UUID,
+# core/validator.py): a placeholder, not a provider node. The backend keys its emission eligibility off it.
 EXCLUDED_PROVIDER_EMISSION_EXECUTOR_ID = "11111111-1111-1111-1111-111111111111"
 
 

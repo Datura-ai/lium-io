@@ -107,6 +107,45 @@ def test_a_consumer_registry_overrides_one_model_and_inherits_the_rest() -> None
     assert VALIDATOR_MESSAGES.model_for("ExecutorSpecRequest") is ExecutorSpecRequest  # the base is untouched
 
 
+def test_a_refused_message_never_carries_the_input_into_the_error() -> None:
+    """A BackupContainerRequest missing one field: the error names the field, not the credentials next to it."""
+    message = {
+        "message_type": "BackupContainerRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "auth_token": "placeholder-jwt-that-must-not-leak",
+        "repository_password": "placeholder-password-that-must-not-leak",
+    }
+    with pytest.raises(ProtocolError) as excinfo:
+        BACKEND_MESSAGES.parse_obj(message)
+    errors = json.loads(excinfo.value.msg)  # the error list itself, not a string of it
+    assert {e["loc"][0] for e in errors} >= {"source_volume", "backup_volume_info", "backup_log_id"}
+    assert "must-not-leak" not in excinfo.value.msg
+    assert all("input" not in e and "url" not in e for e in errors)
+
+
+def test_register_refuses_a_second_class_for_a_bound_wire_type() -> None:
+    class Twin(ContainerDeleted):
+        pass
+
+    with pytest.raises(TypeError):
+        VALIDATOR_MESSAGES.register(Twin)  # ContainerDeleted is bound in this registry itself
+    mine: Registry = Registry(ValidatorMessageType, base=VALIDATOR_MESSAGES)
+    assert mine.register(Twin) is Twin  # inherited from base: overriding is the point
+    with pytest.raises(TypeError):
+        mine.register(ContainerDeleted)  # and now Twin is bound in `mine`
+    assert VALIDATOR_MESSAGES.model_for("ContainerDeleted") is ContainerDeleted
+
+
+def test_package_version_is_the_protocol_version() -> None:
+    import importlib.metadata
+
+    from lium_protocol import PROTOCOL_VERSION
+
+    assert importlib.metadata.version("lium-protocol") == PROTOCOL_VERSION
+
+
 def test_register_refuses_a_model_of_the_other_enum_or_without_a_default() -> None:
     with pytest.raises(TypeError):
         VALIDATOR_MESSAGES.register(ContainerDeleteRequest)

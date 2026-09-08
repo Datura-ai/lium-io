@@ -1,55 +1,20 @@
-"""Bodies of the backend HTTP API the validator calls between cycles (`clients/compute_client.py` /
-`BackendClient`), as the validator must be able to parse them.
+"""Bodies of the backend HTTP API the validator calls between cycles (`clients/backend_client.py`), as
+the validator must be able to parse them. The three typeless replies the backend sends down the
+WebSocket (`Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse`) are in
+`backend_to_validator.SOCKET_REPLIES`, not here.
 
 Wire models only: the validator's copy (`vc_protocol/compute_requests.py`) adds filtering and lookup
 helpers on top of these shapes; the backend's (`compute_app_requests.py`) is what it serialises.
-Where the two differ (`RentedPod.created_at` required on one side, `RentedContainer.rented_ports`
-present on one side) the field is optional here, so either copy parses the other's output.
+Where the two differ (`RentedPod.created_at` required on one side) the field is optional here, so
+either copy parses the other's output.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any
 
 import pydantic
-
-
-class Error(pydantic.BaseModel, extra="allow"):
-    msg: str
-    type: str
-    help: str = ""
-
-
-class Response(pydantic.BaseModel, extra="forbid"):
-    """The backend's answer to `AuthenticateRequest` on the WebSocket."""
-
-    status: Literal["error", "success"]
-    errors: list[Error] = []
-
-
-class RentedContainer(pydantic.BaseModel):
-    name: str
-    pod_id: str
-    rented_ports: list[int] = []
-
-
-class RentedMachine(pydantic.BaseModel):
-    miner_hotkey: str
-    executor_id: str
-    executor_ip_address: str
-    executor_ip_port: str
-    containers: list[RentedContainer]
-    owner_flag: bool = False
-    rented_ports: list[int] = []
-
-
-class RentedMachineResponse(pydantic.BaseModel):
-    machines: list[RentedMachine]
-    banned_guids: list[str] = []
-    banned_hotkeys: list[str] = []
-    banned_coldkeys: list[str] = []
-    banned_provider_guids: list[str] = []
 
 
 class RentedPod(pydantic.BaseModel):
@@ -144,10 +109,6 @@ class ExecutorUptimeResponse(pydantic.BaseModel):
     uptime_in_minutes: int | None = None
 
 
-class RevenuePerGpuTypeResponse(pydantic.BaseModel):
-    revenues: dict[str, float]
-
-
 class ExecutorHealthCheckResponse(pydantic.BaseModel):
     success: bool
     error: str | None = None
@@ -179,15 +140,12 @@ class NvmlReportAckResponse(pydantic.BaseModel):
 HTTP_MODELS: dict[str, type[pydantic.BaseModel]] = {
     model.__name__: model
     for model in (
-        Response,
-        RentedMachineResponse,
         RentedExecutorsResponse,
         PodRentalActiveResponse,
         PodHostRebootRecoveredRequest,
         PodHostRebootRecoveredResponse,
         FillerRunActiveResponse,
         ExecutorUptimeResponse,
-        RevenuePerGpuTypeResponse,
         ExecutorHealthCheckResponse,
         DefaultDockerImagesResponse,
         NvmlReportAckResponse,
