@@ -568,21 +568,32 @@ class _EditSwap:
         return parked
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
+        # Nothing here may change the create's own outcome: the cleanup and the undo are best effort,
+        # and an SSH session that died (the very thing that fails an edit) must not turn the create's
+        # error into a ChannelOpenError from the undo.
         if self.parked_name is None:
             return False
-        if exc is None or isinstance(exc, _CreateCancelledByDelete):
-            # Replacement is up (or the pod was deleted meanwhile): the old container is now the
-            # stale one. Best effort — a wedged remove is left to the stale-container sweep.
-            removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_name)}")
-            if removed.exit_status != 0:
-                logger.warning(
-                    _m(
-                        "Parked container could not be removed after edit; left for the stale sweep",
-                        extra=get_extra_info({**self.default_extra, "parked": self.parked_name, "error": (removed.stderr or "").strip()}),
+        try:
+            if exc is None or isinstance(exc, _CreateCancelledByDelete):
+                # Replacement is up (or the pod was deleted meanwhile): the old container is now the
+                # stale one. Best effort — a wedged remove is left to the stale-container sweep.
+                removed = await self.ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(self.parked_name)}")
+                if removed.exit_status != 0:
+                    logger.warning(
+                        _m(
+                            "Parked container could not be removed after edit; left for the stale sweep",
+                            extra=get_extra_info({**self.default_extra, "parked": self.parked_name, "error": (removed.stderr or "").strip()}),
+                        )
                     )
+            else:
+                await self.restore()
+        except Exception as cleanup_exc:  # noqa: BLE001 — logged; the create's own result stands
+            logger.error(
+                _m(
+                    "Edit swap cleanup raised; the pod may need a hand",
+                    extra=get_extra_info({**self.default_extra, "parked": self.parked_name, "error": f"{type(cleanup_exc).__name__}: {cleanup_exc}"}),
                 )
-            return False
-        await self.restore()
+            )
         return False
 
     async def restore(self) -> None:
