@@ -242,3 +242,28 @@ async def test_a_sibling_create_sweep_keeps_the_parked_twin_of_an_active_pod(svc
     rm = next(c for c in [call.args[0] for call in ssh.run.await_args_list] if c.startswith("/usr/bin/docker rm -fv"))
     assert "pod_active__prev" not in rm and "pod_active" not in rm.replace("pod_active__prev", "")
     assert "pod_gone__prev" in rm and "pod_gone" in rm
+
+
+@pytest.mark.asyncio
+async def test_an_undo_whose_ssh_session_died_keeps_the_creates_own_error(svc, monkeypatch):
+    """The session that failed the edit is the one the undo runs on: a `run` that raises there must not
+    replace the create's failure_step/detail with the undo's exception."""
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("gocryptfs: EPERM")))
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+    inner = ssh.run.side_effect
+
+    def _dies_after_park(cmd, *args, **kwargs):
+        if "docker rm -fv" in cmd and cmd.endswith("2>/dev/null || true") and "__prev" not in cmd:
+            raise ConnectionResetError("Connection lost")  # the undo's first command on a dead session
+        return inner(cmd, *args, **kwargs)
+
+    ssh.run = AsyncMock(side_effect=_dies_after_park)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_run" and "gocryptfs: EPERM" in result.detail
+    assert "Connection lost" not in result.detail
