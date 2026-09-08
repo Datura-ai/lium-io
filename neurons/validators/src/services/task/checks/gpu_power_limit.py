@@ -25,6 +25,8 @@ class GpuPowerMeasurement(BaseModel):
     uuid: str | None
     power_limit: float | None
     power_default_limit: float | None
+    # Host floor for the cap; None on a validator scrape that predates the field.
+    power_min_limit: float | None = None
     power_max_limit: float | None
     power_limit_ratio: float | None = None
 
@@ -85,6 +87,7 @@ class GpuPowerLimitCheck:
                 uuid=detail.get("uuid"),
                 power_limit=current_limit,
                 power_default_limit=default_limit,
+                power_min_limit=_to_float(detail.get("power_min_limit")),
                 power_max_limit=max_limit,
             )
 
