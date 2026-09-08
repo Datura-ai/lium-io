@@ -369,6 +369,22 @@ def _missing_gpu_uuids(gpu_uuids: Sequence[str], uuid_to_minor: dict[str, int]) 
     return [uuid for uuid in gpu_uuids if uuid not in uuid_to_minor]
 
 
+async def read_kernel_gpu_uuids(ssh: asyncssh.SSHClientConnection) -> list[str] | None:
+    """GPU UUIDs as the kernel driver reports them in /proc/driver/nvidia/gpus/*/information.
+
+    DAH-2662: the ban list is matched against the UUIDs the host *reports* (NVML, which an
+    `ld.so.preload` shim rewrites — the 2026-08-10 case incremented the last hex digit). procfs is
+    the one inventory that shim does not author, so bans are matched against it too. None when the
+    read fails or procfs is empty/unreadable: the caller falls back to the reported list (fail-open,
+    as before), never treats "unreadable" as a spoof.
+    """
+    try:
+        uuids = list(await _query_gpu_minor_map_from_proc(ssh))
+    except Exception:
+        return None
+    return uuids or None
+
+
 async def _query_gpu_minor_map_from_proc(
     ssh: asyncssh.SSHClientConnection,
     *,
