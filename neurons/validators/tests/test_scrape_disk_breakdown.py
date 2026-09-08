@@ -13,7 +13,9 @@ import glob
 import http.client
 import json
 import os
+import shutil
 import socket
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,7 @@ DISK_HELPERS = {
     "docker_api_get",
     "get_vloopback_volume_bytes",
     "get_container_log_bytes",
+    "get_host_disk_usage",
     "get_docker_disk_usage",
 }
 
@@ -39,7 +42,7 @@ def scrape() -> dict:
     return build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         DISK_HELPERS,
-        {"glob": glob, "http": http, "json": json, "os": os, "socket": socket},
+        {"glob": glob, "http": http, "json": json, "os": os, "shutil": shutil, "socket": socket},
     )
 
 
@@ -317,3 +320,85 @@ def test_a_host_without_json_logs_reports_zero(scrape: dict[str, object], monkey
 
     # Act / Assert
     assert scrape["get_container_log_bytes"]("/var/lib/docker") == 0
+
+
+def _stub_filesystem(scrape: dict, monkeypatch, *, host_dirs: set[str], usage_by_path: dict) -> list[str]:
+    """isdir answers from `host_dirs`; disk_usage answers from `usage_by_path` and records the path asked."""
+    asked: list[str] = []
+
+    def disk_usage(path):
+        asked.append(path)
+        return usage_by_path[path]
+
+    monkeypatch.setitem(
+        scrape,
+        "os",
+        type("_Os", (), {"path": type("_Path", (), {"isdir": staticmethod(lambda path: path in host_dirs)})}),
+    )
+    monkeypatch.setitem(scrape, "shutil", type("_Shutil", (), {"disk_usage": staticmethod(disk_usage)}))
+    return asked
+
+
+_Usage = namedtuple("_Usage", "total used free")
+_ROOT_PARTITION = _Usage(2_112_647_088 * 1024, 28_045_744 * 1024, 1_977_210_780 * 1024)
+_DOCKER_PARTITION = _Usage(5_368_709_120 * 1024, 139_377_768 * 1024, 5_229_331_352 * 1024)
+
+
+def test_disk_usage_is_measured_on_dockers_data_root(scrape: dict, monkeypatch) -> None:
+    # Arrange — ticket-0286: a 2 TB root partition and /var/lib/docker on its own 5 TB partition.
+    # The scrape runs in the executor container, so `/` is the container overlay; the host's
+    # docker root is only reachable through PID 1's root.
+    _stub_docker_api(scrape, {"/info": {"DockerRootDir": "/var/lib/docker"}})
+    asked = _stub_filesystem(
+        scrape,
+        monkeypatch,
+        host_dirs={"/proc/1/root/var/lib/docker"},
+        usage_by_path={"/proc/1/root/var/lib/docker": _DOCKER_PARTITION, "/": _ROOT_PARTITION},
+    )
+
+    # Act
+    usage = scrape["get_host_disk_usage"]()
+
+    # Assert — the partition that holds the containers, not the one that holds the OS
+    assert usage == _DOCKER_PARTITION
+    assert asked == ["/proc/1/root/var/lib/docker"]
+
+
+def test_disk_usage_follows_a_custom_docker_data_root(scrape: dict, monkeypatch) -> None:
+    _stub_docker_api(scrape, {"/info": {"DockerRootDir": "/mnt/nvme/docker"}})
+    asked = _stub_filesystem(
+        scrape,
+        monkeypatch,
+        host_dirs={"/proc/1/root/mnt/nvme/docker", "/proc/1/root/var/lib/docker"},
+        usage_by_path={"/proc/1/root/mnt/nvme/docker": _DOCKER_PARTITION, "/proc/1/root/var/lib/docker": _ROOT_PARTITION},
+    )
+
+    assert scrape["get_host_disk_usage"]() == _DOCKER_PARTITION
+    assert asked == ["/proc/1/root/mnt/nvme/docker"]
+
+
+def test_disk_usage_falls_back_to_root_without_a_reachable_docker_root(scrape: dict, monkeypatch) -> None:
+    # outside the executor container (no pid: host) the host path does not exist; `/` is what there is
+    _stub_docker_api(scrape, {"/info": {"DockerRootDir": "/var/lib/docker"}})
+    asked = _stub_filesystem(scrape, monkeypatch, host_dirs=set(), usage_by_path={"/": _ROOT_PARTITION})
+
+    assert scrape["get_host_disk_usage"]() == _ROOT_PARTITION
+    assert asked == ["/"]
+
+
+def test_disk_usage_survives_a_silent_docker_socket(scrape: dict, monkeypatch) -> None:
+    # the docker socket is the fragile half (hard_disk_docker_scrape_error); total/used/free must
+    # still be reported, from the default data root when the host has it
+    def _no_docker(path):
+        raise RuntimeError("docker api: connection refused")
+
+    scrape["docker_api_get"] = _no_docker
+    asked = _stub_filesystem(
+        scrape,
+        monkeypatch,
+        host_dirs={"/proc/1/root/var/lib/docker"},
+        usage_by_path={"/proc/1/root/var/lib/docker": _DOCKER_PARTITION},
+    )
+
+    assert scrape["get_host_disk_usage"]() == _DOCKER_PARTITION
+    assert asked == ["/proc/1/root/var/lib/docker"]
