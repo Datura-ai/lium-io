@@ -7,10 +7,12 @@
 #   - every suite in tests/<name> runs even after an earlier one failed, so one push shows every failure;
 #   - artifacts/ always holds timings.txt, summary.md, <suite>-junit.xml, compose.log, compose-ps.txt and the
 #     suites' JSON dumps (cycle-result.json, rental-*.json), pass or fail; CI uploads the directory and posts summary.md on the PR;
-#   - the stack is torn down (volumes too) on every exit path; KEEP_UP=1 keeps it for debugging.
+#   - the stack is torn down (volumes too) on every exit the script itself takes — a failed step included; a kill
+#     from outside (the CI step's timeout-minutes, Ctrl-C) ends it before `finish`. KEEP_UP=1 keeps it for debugging.
 # Exit 0 only when build, up and every suite passed. CI's e2e-gate job runs this (`make e2e-full`); a GPU box or
 # a Lium DinD pod is meant to run the same script with E2E_GPU=1 (README: the GPU path has not been run yet).
-# (Same gate as lium-platform/e2e/gate.sh; keep the two in step.)
+# lium-platform#186 (not merged) adds the platform side's gate.sh from the same origin; that version also caps the
+# whole run with a T_TOTAL budget and traps INT/TERM. Keep the two in step when both land.
 #
 # Env: SUITES (default: every tests/<name>; each needs a test-<name> Makefile target), T_BUILD T_UP T_SUITE
 # T_MISC (timeout durations, defaults 25m 8m 20m 3m), KEEP_UP=1.

@@ -247,7 +247,7 @@ jobs:
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const summary = fs.existsSync('e2e/artifacts/summary.md')
               ? fs.readFileSync('e2e/artifacts/summary.md', 'utf8')
-              : `**e2e gate: FAIL** — no summary written: the gate did not reach its first step (outcome ${process.env.OUTCOME}); see the run log.`;
+              : `**e2e gate: FAIL** — no summary written: the gate did not finish (outcome ${process.env.OUTCOME}: it failed before its first step, or the 55-minute step limit killed it mid-run); see the run log.`;
             const body = [
               marker,
               `### e2e gate · ${context.payload.pull_request.head.sha.slice(0, 8)} · [run](${runUrl})${process.env.ARTIFACT_URL ? ` · [artifacts](${process.env.ARTIFACT_URL})` : ''}`,

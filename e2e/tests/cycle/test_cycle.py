@@ -139,7 +139,7 @@ def test_unreachable_miner_fails_the_job_fast(services):
 def test_sysbox_gate_names_its_reason(services):
     """REQUIRE_SYSBOX_FOR_UNRENTED is off in the stack (no sysbox on a CI box or a Lium pod). The check that enforces
     it must still be in the pipeline and, when on, refuse an unrented executor with SYSBOX_REQUIRED_MISSING — the
-    verdict PERSONA_TESTS saw on staging. Asserted at the check level: flipping the flag mid-process is not supported."""
+    verdict seen on staging. Asserted at the check level: flipping the flag mid-process is not supported."""
     from services.task.checks import SysboxRequiredCheck
     from services.task.messages import SysboxRequiredMessages
     from services.task.pipeline_factory import PipelineFactory

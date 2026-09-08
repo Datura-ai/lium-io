@@ -9,8 +9,8 @@ throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else i
 
 CI runs it on every PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
 **`e2e-gate`**, routed by `.github/actions/changed-packages`); a PR that touches none of those skips it, and
-`tests-ok` reports green either way. The lium-platform repo has the same gate for the platform side (its stub
-validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
+`tests-ok` reports green either way. lium-platform#186 (not merged) adds the same gate for the platform side (its
+stub validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
 container on the provider's host.
 
 ## The stack (`docker-compose.e2e.yml`)
@@ -28,7 +28,7 @@ Addresses are fixed on the `172.30.0.0/24` compose network (`stack.env`) because
 ## Run it
 
 Needs Docker with compose v2 (`additional_contexts` → v2.17+), `make`, ~8 GB of disk for the images. Docker-only:
-`dind` is privileged. A CI runner, a dev box (`tools/aws_run.sh` in the loop) or a Lium DinD pod; not a laptop.
+`dind` is privileged. A CI runner, a dev box or an EC2 sandbox, or a Lium DinD pod; not a laptop.
 
 ```sh
 cd e2e
@@ -55,11 +55,14 @@ the latest run.
 
 ## The merge gate (`make e2e-full` = `gate.sh`, CI job `e2e-gate`)
 
-Same script as lium-platform's: build → up → every `tests/<name>` suite → logs → down, each under GNU `timeout`
+The same shape as the gate lium-platform#186 adds for the platform side (not merged; that version also caps the whole
+run with a `T_TOTAL` budget): build → up → every `tests/<name>` suite → logs → down, each under GNU `timeout`
 (`T_BUILD` 25m, `T_UP` 8m, `T_SUITE` 20m per suite, SIGKILL 30 s after SIGTERM), every suite run even after one
-fails, `artifacts/` always holding `timings.txt`, `summary.md`, `<suite>-junit.xml`, `compose.log`, `compose-ps.txt`,
-`executor-docker-ps.txt` and the suites' JSON dumps. CI uploads the directory on every run and posts `summary.md` as
-one sticky PR comment. A new suite = `tests/<name>/` + nothing else (`test-%` in the Makefile).
+fails, `artifacts/` holding `timings.txt`, `summary.md`, `<suite>-junit.xml`, `compose.log`, `compose-ps.txt`,
+`executor-docker-ps.txt` and the suites' JSON dumps on every exit the script takes itself (the per-step ceilings sum
+to more than the CI step's 55 minutes, so a build and two suites all at their ceiling would be killed from outside
+before the summary is written; the PR comment then says so). CI uploads the directory on every run and posts
+`summary.md` as one sticky PR comment. A new suite = `tests/<name>/` + nothing else (`test-%` in the Makefile).
 
 ## What the suites prove
 

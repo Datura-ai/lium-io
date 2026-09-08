@@ -2,10 +2,10 @@
 # GPU-less dind, exactly as a provider's executor does — host network, /var/run/docker.sock, `--gpus all`. Rental
 # containers then run on the host daemon with real devices, and the scrape sees real GPUs. Meant for a GPU box or a
 # Lium DinD pod (nested docker with the NVIDIA runtime); the other services stay on the compose network and reach the
-# executor through the network gateway (E2E_EXECUTOR_IP=172.30.0.1, set by the Makefile when E2E_GPU is on) on
+# executor through the network gateway (E2E_EXECUTOR_IP=172.30.0.1, set by the Makefile and compose.sh when E2E_GPU is on) on
 # E2E_EXECUTOR_SSH_PORT (stack.env: 2222 — the host's own sshd holds :22 on a Lium pod). The base file's `command:`
 # makes sshd listen on that port (a sshd_config.d drop-in from SSH_PORT); with host networking there is no port map
-# to do it. Not yet run on a GPU host: e2e-all-repos/REPORT.md in the loop; the CPU path is what CI proves, and it
+# to do it. Not yet run on a GPU host (README); the CPU path is what CI proves, and it
 # runs the same listener-follows-SSH_PORT mechanism on the same port.
 # With host networking the executor's :8001 and sshd :2222 bind on every interface of the GPU host, the two hotkeys it
 # trusts are public test-vector keys (stack.env) and the container holds the host's docker socket: run E2E_GPU=1 only on a
