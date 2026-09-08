@@ -11,7 +11,11 @@ from protocol.miner_request import AuthenticateRequest
 
 logger = logging.getLogger(__name__)
 
-SNAPSHOT_TTL_SECONDS = 300
+# Short on purpose: rental key-submits refresh the snapshot between waves, and a node
+# registered after such a refresh is invisible to a wave that starts inside the TTL --
+# it then waits a whole extra 15-min cycle (DAH-2957). The wave itself still collapses
+# into one bulk request through the single-flight lock below.
+SNAPSHOT_TTL_SECONDS = 30
 FAILED_REFRESH_RETRY_SECONDS = 30
 BULK_FETCH_TIMEOUT_SECONDS = 15
 

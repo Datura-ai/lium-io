@@ -38,6 +38,10 @@ FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 # One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
 # ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
 FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
+# DAH-2958: every executor uuid this validator has ever published a spec for. The express lane
+# treats anything in the portal snapshot that is NOT here as never validated. Seeded by every
+# cycle's publish, so one completed cycle after deploy is enough to know the whole fleet.
+EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -153,6 +157,16 @@ class RedisService:
             await self.redis.set(
                 FORCED_VALIDATION_CYCLE_KEY, "1", ex=FORCED_VALIDATION_CYCLE_TTL_SECONDS
             )
+
+    async def mark_executors_validated(self, executor_ids: list[str]) -> None:
+        """DAH-2958: remember that a spec was published for these executors (one round-trip)."""
+        if executor_ids:
+            async with self.lock:
+                await self.redis.sadd(EXPRESS_LANE_VALIDATED_SET, *executor_ids)
+
+    async def get_validated_executors(self) -> set[str]:
+        members = await self.smembers(EXPRESS_LANE_VALIDATED_SET)
+        return {m.decode() if isinstance(m, bytes) else m for m in members}
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None

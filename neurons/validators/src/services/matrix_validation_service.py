@@ -425,7 +425,11 @@ class ValidationService:
         executor_info,
         default_extra: dict,
         machine_spec: dict,
+        vram_budget_mb: int | None = None,
     ) -> ValidationResult:
+        # vram_budget_mb (DAH-3011): size the matmul from min(card VRAM, budget) instead of the whole
+        # card. Same challenge, seal and UUID check — a wrong/absent GPU or a spoofed UUID still
+        # fails; only the "fill the card" capacity proof is deferred. None = today's full-card size.
         # DAH-2671 item 3: all-claimed-cards work-proof. Shadow (MATMUL_ALLCARDS_CHECK_ENABLED
         # without enforcement) logs timing + per-card outcome and NEVER changes the returned result;
         # enforcement fails a count lie (device-selection error / OOM / serialised aggregate
@@ -479,6 +483,8 @@ class ValidationService:
             # GpuVramPrecheck (before the rented short-circuit), so it is NOT
             # repeated here. gpu_capacity_mb is still needed to size the matmul.
             gpu_capacity_mb = self.get_gpu_memory(machine_spec)
+            if vram_budget_mb and gpu_capacity_mb:
+                gpu_capacity_mb = min(gpu_capacity_mb, vram_budget_mb)
 
             verifier_params = VerifierParams()
             verifier_params.generate()
@@ -501,6 +507,7 @@ class ValidationService:
                 **default_extra,
                 "dim_n": verifier_params.dim_n,
                 "dim_k": verifier_params.dim_k,
+                "sized_vram_mb": gpu_capacity_mb,
                 "seed": verifier_params.seed,
                 "uuid": verifier_params.uuid,
                 "cipher_text": verifier_params.cipher_text,
