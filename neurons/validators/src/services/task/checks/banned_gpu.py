@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ..messages import BannedGpuMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .banned_provider import kernel_gpu_uuids
 
 
 class BannedGpuCheck:
@@ -27,18 +28,21 @@ class BannedGpuCheck:
             return CheckResult(passed=True, event=event)
 
         uuids = [u for u in current_uuids.split(",") if u]
+        # DAH-2662: also the kernel's view of the cards (BannedProviderCheck read it this cycle);
+        # a shim that rewrites the reported UUIDs does not rewrite /proc/driver/nvidia.
+        kernel_uuids = await kernel_gpu_uuids(ctx)
 
         # Get banned GUIDs from backend API response
         rented_data = ctx.state.rented_data
         banned_guids = rented_data.banned_guids if rented_data else []
-        is_banned = any(guid in banned_guids for guid in uuids)
+        is_banned = any(guid in banned_guids for guid in uuids + (kernel_uuids or []))
 
         if is_banned:
             event = render_message(
                 Msg.GPU_BANNED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"gpu_uuids": current_uuids},
+                what={"gpu_uuids": current_uuids, "kernel_gpu_uuids": kernel_uuids},
             )
             return CheckResult(
                 passed=False,
