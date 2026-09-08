@@ -107,6 +107,9 @@ class ContextState:
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
     verified_port_count: int = 0
+    # DAH-2991: orphaned rental containers the stale cleanup could not remove this cycle; they still
+    # hold their published ports, so PortCountCheck names them in INSUFFICIENT_PORTS.
+    orphaned_containers: list[str] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None

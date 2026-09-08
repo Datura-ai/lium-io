@@ -37,6 +37,9 @@ class PortCountCheck:
         )
 
         if not is_rented and port_count < MIN_PORT_COUNT:
+            # DAH-2991: when the shortfall is our own leftover — an orphaned rental container the
+            # cleanup could not remove — say so, instead of a bare count (ticket-0287 diagnosed it by hand).
+            orphaned = ctx.state.orphaned_containers
             event = render_message(
                 Msg.INSUFFICIENT_PORTS,
                 ctx=ctx,
@@ -44,7 +47,15 @@ class PortCountCheck:
                 what={
                     "available_port_count": port_count,
                     "required": MIN_PORT_COUNT,
+                    "held_by_orphaned_containers": orphaned,
                 },
+                remediation=(
+                    f"Ports are held by orphaned rental container(s) {', '.join(orphaned)} that the validator "
+                    "could not remove (docker could not kill the process); no action on the port range is needed — "
+                    "the validator retries every cycle; a host reboot frees them at once."
+                )
+                if orphaned
+                else None,
             )
             return CheckResult(
                 passed=False,
