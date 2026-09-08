@@ -5,7 +5,6 @@ import string
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Annotated
 
@@ -14,9 +13,6 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles
 
 from services.ssh_service import SSHService
-
-# Where each cycle's job files (the frozen scrape) are written: one `cycle-*` directory per cycle.
-JOB_FILES_ROOT = Path(__file__).parent / "temp"
 
 # ORDER IS LOAD-BEARING: machine_scrape derives its encryption key from the literal key order of
 # gpu_details[0], so this list must stay an exact mirror of that dict — same members, same order.
@@ -338,35 +334,12 @@ class FileEncryptService:
         encryption_key = "".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
         return all_keys, encryption_key
 
-    @staticmethod
-    def fresh_job_files_directory(keep: Iterable[str] = ()) -> Path:
-        """A new, empty directory for this cycle's job files under JOB_FILES_ROOT; every earlier
-        cycle's directory is removed unless its path is in `keep`.
-
-        DAH-2958: an express verification reads the job files of the cycle that prepared them
-        (UploadFilesCheck, the scrape's binary fallback) and may still be running when the next
-        cycle starts, so the validator passes the lane's directories in use and they survive
-        until the first cycle that starts after those verifications ended.
-        """
-        root = JOB_FILES_ROOT
-        root.mkdir(exist_ok=True)
-        kept = {Path(path).resolve() for path in keep}
-        for entry in root.iterdir():
-            if entry.resolve() in kept:
-                continue
-            if entry.is_dir():
-                shutil.rmtree(entry)
-            else:
-                entry.unlink()
-        return Path(tempfile.mkdtemp(prefix="cycle-", dir=root))
-
-    def ecrypt_miner_job_files(self, keep_directories: Iterable[str] = ()):
+    def ecrypt_miner_job_files(self):
         """
         Encrypts and obfuscates miner job files for secure execution.
 
         This function performs the following steps:
-        1. Makes a fresh directory for this cycle's files and removes the earlier cycles' directories
-           (except `keep_directories`, still read by an express verification — DAH-2958).
+        1. Clears any existing temporary directory used for storing encrypted files.
         2. Defines file paths for the machine scrape script and its obfuscator.
         3. Runs the obfuscator script to generate an obfuscated version of the machine scrape script.
         4. Replaces dictionary keys in the obfuscated script with randomly generated names.
@@ -375,7 +348,9 @@ class FileEncryptService:
 
         Returns: MinerJobEnryptedFiles
         """
-        tmp_directory = self.fresh_job_files_directory(keep_directories)
+        tmp_directory = Path(__file__).parent / "temp"
+        if tmp_directory.exists() and tmp_directory.is_dir():
+            shutil.rmtree(tmp_directory)
 
         # file pathes
         machine_scrape_file_path = str(

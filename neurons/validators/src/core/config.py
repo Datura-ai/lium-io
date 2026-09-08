@@ -196,12 +196,6 @@ class Settings(BaseSettings):
 
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
-    # DAH-2959: a never-measured executor whose first VerifyX download sample is below the 100 Mbps
-    # EMA gate gets one more sample inside the same task, and the better one seeds the EMA. 11 of
-    # 80 fresh nodes (2–5 Sep) lost 1–3 cycles to a cold first sample (32–88 Mbps on one
-    # single-stream CDN object) and passed the next cycle at 205–760 Mbps. The gate, the threshold
-    # and known hosts (any prior EMA) are unchanged.
-    VERIFYX_COLD_SAMPLE_RETRY_ENABLED: bool = Field(env="VERIFYX_COLD_SAMPLE_RETRY_ENABLED", default=False)
     ENABLE_INSPECTOR: bool = True
     # DAH-2794: feed the obfuscated scrape to the executor's own interpreter over stdin
     # instead of freezing it into a ~13 MB onefile and uploading that every cycle.
@@ -211,21 +205,6 @@ class Settings(BaseSettings):
         default=True,
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
-    # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
-    # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
-    # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
-    # SCORED cycle expensive to fake, and the next scored cycle runs them anyway. Only a caller that
-    # passes `first_pass=True` to TaskService.create_task gets the fast path, and only with this
-    # flag on; the wave never does, so every scored verification is unchanged. Measured (Loki,
-    # 2–6 Sep, idle runs): matmul p50 26 s (74 s on the fresh dogfood node), VerifyX p50 78 s.
-    FIRST_PASS_FAST_PATH_ENABLED: bool = Field(env="FIRST_PASS_FAST_PATH_ENABLED", default=False)
-    # The matmul is sized from min(card VRAM, this) instead of the whole card: same challenge,
-    # seal and UUID check, 5–17x less data to generate and copy.
-    FIRST_PASS_MATMUL_VRAM_MB: int = Field(env="FIRST_PASS_MATMUL_VRAM_MB", default=8192)
-    # VerifyX challenge config for the first pass (defaults 128 GB / 5 GB in VerifyXSettings). The
-    # measurements are still taken and published; only the amount of RAM/disk written shrinks.
-    FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
-    FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
@@ -432,23 +411,6 @@ class Settings(BaseSettings):
 
     # Use REST API instead of WebSocket for miner communication
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
-
-    # DAH-2958 — express lane for never-validated executors. A new node is published only by
-    # the fleet-wide scored cycle today, so it waits for the 15-min boundary (mean 7.5 min) and
-    # then for the slowest miner in the fleet (2–9 min): node add → AVAILABLE p50 21.4 min over
-    # 175 onboardings, floor 8.2 min. With the flag on, core/express_lane.py polls the portal's
-    # executor snapshot every TICK seconds, runs the SAME pipeline the cycle runs on executors
-    # this validator has never published, and publishes the result spec-only (no scored_at, so
-    # no incentive ledger row); the next cycle scores and overwrites it as today. Off by default:
-    # flag off = today's behaviour, nothing else in this block is read.
-    EXPRESS_LANE_ENABLED: bool = Field(env="EXPRESS_LANE_ENABLED", default=False)
-    EXPRESS_LANE_TICK_SECONDS: int = Field(env="EXPRESS_LANE_TICK_SECONDS", default=30)
-    # Hard bound on the extra load a registration flood can add: at most this many express
-    # verifications in flight at once (so also per tick), and per miner.
-    EXPRESS_LANE_MAX_IN_FLIGHT: int = Field(env="EXPRESS_LANE_MAX_IN_FLIGHT", default=4)
-    EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
-        env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
-    )
 
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
