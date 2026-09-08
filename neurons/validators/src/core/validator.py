@@ -629,9 +629,11 @@ class Validator:
                     if settings.EXPRESS_LANE_ENABLED:
                         # DAH-2958: everything published by a cycle is "validated" for the
                         # express lane; only what the portal lists beyond this set is new.
-                        # Never lets a Redis blip end the cycle: the next cycle seeds again.
+                        # Never lets a Redis blip end the cycle: the next cycle seeds again, and
+                        # the wave's CYCLE_DONE claims keep the lane off those executors until then.
                         try:
                             await self.redis_service.mark_executors_validated(published_executor_ids)
+                            self.miner_service.forget_cycle_done()
                         except Exception as exc:
                             logger.error(
                                 _m(

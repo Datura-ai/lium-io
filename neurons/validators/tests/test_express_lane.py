@@ -4,11 +4,13 @@ Flag off: request_job_to_miner asks the miner for every executor (executor_id=No
 nothing, exactly as before. Flag on: a portal executor registered after the first cycle since
 start that this validator never published is verified alone, as a first pass, with the cycle's
 own pipeline inputs and published spec-only; an executor registered before that cycle is the
-cycle's; the wave and the lane never run on one executor at the same time; the next cycle keeps
-the job files a running express verification reads, and a cycle that starts during a tick moves
-the launch to its files; a verification without its job files is never published as the node's
-verdict; the in-flight caps bound a registration flood; an executor the miner does not return is
-retried a bounded number of times and then left to the cycle.
+cycle's; the wave and the lane never run on one executor at the same time, and one the wave
+verified is not run again before the cycle records it; the next cycle keeps the job files a
+running express verification reads, and a cycle that starts during a tick moves the launch to
+its files; a verification without its job files is never published as the node's verdict; a
+published result is never run again when recording it fails; the in-flight caps bound a
+registration flood; an executor the miner does not return is retried a bounded number of times
+and then left to the cycle.
 """
 
 import asyncio
@@ -32,7 +34,7 @@ from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.file_encrypt_service import FileEncryptService
-from services.miner_service import CYCLE_LANE, EXPRESS_LANE, MinerService
+from services.miner_service import CYCLE_DONE, CYCLE_LANE, EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_LANE_VALIDATED_SET, RedisService
 from services.task.models import JobResult
 
@@ -281,9 +283,11 @@ async def test_first_pass_reaches_the_task_only_when_the_caller_asks_for_it(rest
 
 
 @pytest.mark.asyncio
-async def test_the_wave_skips_an_executor_the_express_lane_holds_and_releases_its_own(
+async def test_the_wave_skips_an_executor_the_express_lane_holds_and_marks_its_own_done(
     rest_miner_service, monkeypatch, caplog
 ):
+    """The wave's claim turns into CYCLE_DONE when its pipeline ends (pass or fail) and is dropped
+    only once the cycle has recorded its published executors — the lane skips it in between."""
     from core.config import settings
 
     monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
@@ -295,7 +299,7 @@ async def test_the_wave_skips_an_executor_the_express_lane_holds_and_releases_it
     async def create_task(miner_info, executor_info, **_):
         seen_during_wave.update(rest_miner_service.in_flight)
         if executor_info.uuid == known:
-            raise RuntimeError("ssh dropped")  # a failing task must still release the claim
+            raise RuntimeError("ssh dropped")  # a failing task must still end the claim
         return _job_result(executor_info.uuid)
 
     rest_miner_service.task_service.create_task = AsyncMock(side_effect=create_task)
@@ -306,23 +310,34 @@ async def test_the_wave_skips_an_executor_the_express_lane_holds_and_releases_it
     verified = [c.kwargs["executor_info"].uuid for c in rest_miner_service.task_service.create_task.call_args_list]
     assert verified == [known]
     assert seen_during_wave == {on_express: EXPRESS_LANE, known: CYCLE_LANE}
-    assert rest_miner_service.in_flight == {on_express: EXPRESS_LANE}
+    assert rest_miner_service.in_flight == {on_express: EXPRESS_LANE, known: CYCLE_DONE}
     assert job["results"] == []
     assert "Executor left to the express lane this cycle" in caplog.text
+
+    rest_miner_service.forget_cycle_done()  # Validator.sync(), right after mark_executors_validated
+    assert rest_miner_service.in_flight == {on_express: EXPRESS_LANE}
 
 
 # --- ExpressLane: discovery, caps, publish, retries -----------------------------------------
 
 
 class _Harness:
-    def __init__(self, monkeypatch, snapshot: dict[str, list[PortalExecutor]], miners: list[_Neuron]):
+    def __init__(
+        self,
+        monkeypatch,
+        snapshot: dict[str, list[PortalExecutor]],
+        miners: list[_Neuron],
+        miner_service: MinerService | None = None,
+    ):
         from core.config import settings
 
         monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
         self.settings = settings
         self.redis_service = _redis_service()
-        self.miner_service = MinerService.__new__(MinerService)
-        self.miner_service.in_flight = {}
+        if miner_service is None:
+            miner_service = MinerService.__new__(MinerService)
+            miner_service.in_flight = {}
+        self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
         self.release = asyncio.Event()
         self.release.set()
@@ -423,6 +438,39 @@ async def test_validated_foreign_and_wave_held_executors_are_not_touched(monkeyp
     assert await harness.tick_and_settle() == 0
     harness.miner_service.request_job_to_miner.assert_not_awaited()
     harness.miner_service.publish_machine_specs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_executor_the_wave_verified_is_not_run_again_before_the_cycle_records_it(
+    rest_miner_service, monkeypatch, wallet
+):
+    """The cycle records its published executors once, after scoring and publishing — minutes
+    after a miner's wave returned. A node registered after fleet_known_since that the wave reached
+    first is, in that window, neither validated nor running; the lane must still leave it alone."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
+    new_node = str(uuid4())
+    rest_miner_service.miner_returns(new_node)
+
+    job = await _request(rest_miner_service)  # the wave, through the real request_job_to_miner
+    assert [r.executor_info.uuid for r in job["results"]] == [new_node]
+    assert rest_miner_service.in_flight == {new_node: CYCLE_DONE}
+
+    # the lane ticks before the cycle has published and seeded the validated set
+    harness = _Harness(
+        monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")], miner_service=rest_miner_service
+    )
+    assert await harness.tick_and_settle() == 0
+    harness.miner_service.request_job_to_miner.assert_not_awaited()
+
+    # the cycle's end: the publish is recorded, the wave's claims are dropped
+    await harness.redis_service.mark_executors_validated([new_node])
+    rest_miner_service.forget_cycle_done()
+    assert rest_miner_service.in_flight == {}
+    assert await harness.tick_and_settle() == 0
+    harness.miner_service.request_job_to_miner.assert_not_awaited()
+    assert new_node not in harness.lane._pending
 
 
 @pytest.mark.asyncio
@@ -668,6 +716,29 @@ async def test_an_executor_the_miner_does_not_return_is_retried_then_left_to_the
     assert harness.miner_service.in_flight == {}
     assert caplog.text.count("[express] Executor not verified yet, will retry") == MAX_ATTEMPTS - 1
     assert "[express] Executor left to the normal cycle" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_published_result_is_not_run_again_when_recording_it_fails(monkeypatch, wallet, caplog):
+    """Once the result reached the backend, a Redis error on the validated-set write must not
+    re-run the node: it is left to the cycle (whose next seed records it) and the metric line
+    is still emitted."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.redis_service.mark_executors_validated = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    with caplog.at_level(logging.INFO):
+        assert await harness.tick_and_settle() == 1
+
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert "[express] Published, but could not record the executor as validated; left to the cycle" in caplog.text
+    assert [r for r in caplog.records if r.getMessage() == EXPRESS_PUBLISHED_EVENT]
+    assert new_node not in harness.lane._pending
+    assert new_node in harness.lane._left_to_cycle
+    assert harness.miner_service.in_flight == {}
+
+    assert await harness.tick_and_settle() == 0
+    harness.miner_service.request_job_to_miner.assert_awaited_once()
 
 
 @pytest.mark.asyncio

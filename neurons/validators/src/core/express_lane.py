@@ -307,7 +307,19 @@ class ExpressLane:
             # but writes no incentive_per_validator_cycle row: is_provider_emission_cycle_eligible
             # needs scored_at. The next scored cycle overwrites the row as today.
             await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey)
-            await self.redis_service.mark_executors_validated([executor_id])
+            try:
+                await self.redis_service.mark_executors_validated([executor_id])
+            except Exception as exc:
+                # The result is published; a Redis blip must not run the node again. The cycle
+                # owns it from here (its next seed records it), like a node that used up its
+                # attempts.
+                self._left_to_cycle.add(executor_id)
+                logger.error(
+                    _m(
+                        "[express] Published, but could not record the executor as validated; left to the cycle",
+                        extra=get_extra_info({**extra, "error": str(exc)}),
+                    ),
+                )
             self._pending.pop(executor_id, None)
 
             published_at = datetime.now(UTC)

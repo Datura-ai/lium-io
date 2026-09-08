@@ -187,6 +187,10 @@ MANUAL_RENTAL_FORCED_PASS_EVENT = "Executor force-passed as special manual renta
 # DAH-2958: who is verifying an executor right now (values of MinerService.in_flight).
 CYCLE_LANE = "cycle"
 EXPRESS_LANE = "express"
+# The wave verified it this cycle and its result is not yet in the validated set (the cycle
+# seeds that set once, after scoring and publishing — minutes after the miner's wave returned).
+# Kept in in_flight so the express lane does not run the same node a second time meanwhile.
+CYCLE_DONE = "cycle-done"
 
 
 class MinerService:
@@ -201,9 +205,10 @@ class MinerService:
         self.task_service = task_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
-        # DAH-2958: executor uuid -> CYCLE_LANE | EXPRESS_LANE while its pipeline is running. The
-        # wave and the express lane run in this one process, so a plain dict is the whole
-        # coordination: each lane skips what the other holds. Stays empty with the flag off.
+        # DAH-2958: executor uuid -> CYCLE_LANE | EXPRESS_LANE while its pipeline is running, then
+        # CYCLE_DONE until the cycle's publish is recorded. The wave and the express lane run in
+        # this one process, so a plain dict is the whole coordination: each lane skips what the
+        # other holds. Stays empty with the flag off.
         self.in_flight: dict[str, str] = {}
 
     def _claim_for_cycle(
@@ -255,11 +260,18 @@ class MinerService:
         return requested
 
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
+        """The wave is done with these executors; they stay in in_flight as CYCLE_DONE until the
+        cycle has seeded the validated set (forget_cycle_done), so the lane keeps skipping them."""
         if not settings.EXPRESS_LANE_ENABLED:
             return
         for executor in executors:
             if self.in_flight.get(executor.uuid) == CYCLE_LANE:
-                del self.in_flight[executor.uuid]
+                self.in_flight[executor.uuid] = CYCLE_DONE
+
+    def forget_cycle_done(self) -> None:
+        """Called by the cycle right after it recorded its published executors as validated."""
+        for executor_id in [e for e, lane in self.in_flight.items() if lane == CYCLE_DONE]:
+            del self.in_flight[executor_id]
 
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
