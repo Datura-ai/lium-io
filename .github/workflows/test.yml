@@ -145,6 +145,36 @@ jobs:
       - name: Run tests
         run: pdm run pytest tests/ -v --tb=short
 
+  protocol:
+    # DAH-3247: the validator↔backend wire protocol package (lium_protocol/) — its tests, and the
+    # committed JSON-schema snapshot must equal the models: a model change without a regenerated,
+    # reviewed snapshot fails here (`python -m lium_protocol.schema --write` regenerates it)
+    name: Protocol package (tests + schema snapshot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    defaults:
+      run:
+        working-directory: lium_protocol
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        run: pip install -q . pytest
+
+      - name: Schema snapshot matches the models
+        run: python -m lium_protocol.schema --check
+
+      - name: Run tests
+        run: python -m pytest tests -v --tb=short
+
   lint:
     # ruff format is the repo's pre-commit hook (.pre-commit-config.yaml, same version pin)
     # and CI never ran it. REPORT-ONLY: on 6 Sep 2026 main had 207/301 validators, 30/51

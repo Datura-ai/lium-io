@@ -72,6 +72,7 @@ Three neurons, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and c
 - `neurons/executor/` — the agent installed on a GPU machine: exposes the machine to its miner's validators, runs the containers. `dstacktee/` runs it inside an Intel TDX confidential VM with attestation (its own README).
 - `datura/` — the protocol shared by the three: request/response models (`datura/requests`), consumers, errors.
 - `packages/lium-core/` — `lium_core.shared_config`, the shared-config client the validator and the miner install from PyPI as `lium-core` (its own README; CI `lium-core-ci.yml`, release by hand through `lium-core-release.yml`).
+- `lium_protocol/` — the validator↔backend wire protocol as one versioned package: every WebSocket message in both directions and every backend HTTP body the validator reads, as pydantic models, with a committed JSON-schema snapshot (`lium_protocol/snapshots/lium_protocol.v1.json`) that CI compares with the models. The backend repo pins it by tag (its README explains how); `neurons/validators/tests/test_protocol_compat.py` replays the recorded messages through it and through the validator's own models.
 - `watchtower/` — pulls validator-signed image updates and restarts containers (its own README).
 - `e2e/` — the whole loop on one machine without the chain: a real executor on its own dockerd, a real miner, the validator's services as the tester (`e2e/README.md`; `./gate.sh` is what CI runs).
 - `scripts/` — the `install_*_on_ubuntu.sh` installers referenced by the setup guides; `docs/` — operator notes; `contrib/` — contribution and style guides.
@@ -89,6 +90,7 @@ Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm proj
 
 (cd neurons/executor && pdm install && mkdir -p tmp && pdm run pytest tests/ -v --tb=short)
 (cd neurons/miners && pdm install && pdm run pytest tests/ -v --tb=short)
+(cd lium_protocol && pip install . pytest && python -m lium_protocol.schema --check && python -m pytest tests -v --tb=short)
 ```
 
 These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter; its jobs decide for themselves:

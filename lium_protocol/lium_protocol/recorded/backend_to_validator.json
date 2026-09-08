@@ -1,0 +1,365 @@
+{
+  "direction": "backend_to_validator",
+  "about": "One message per BackendMessageType, shaped as the backend's src/protocol/compute_app_requests.py models serialise them (model_dump_json). The validator parses these with payload_models.BaseServerRequest.parse — neurons/validators/tests/test_protocol_compat.py proves every one of them goes through it. Addresses are TEST-NET; credentials are placeholders.",
+  "messages": [
+    {
+      "expect": "ContainerCreateRequest",
+      "note": "a customer rental with a restore, Jupyter and a cluster membership; the backend's exact-size fields plus the validator's DAH-2183 disk_share",
+      "message": {
+        "message_type": "ContainerCreateRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "docker_image": "daturaai/pytorch:2.4.1-py3.11-cuda12.4.1-devel-ubuntu22.04",
+        "user_public_keys": [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYFORTHEWIREONLY0000000000000000 renter"
+        ],
+        "gpu_uuids": [
+          "GPU-11111111-2222-3333-4444-555555555555",
+          "GPU-66666666-7777-8888-9999-000000000000"
+        ],
+        "cpu_count": 32,
+        "memory_gb": 256,
+        "custom_options": {
+          "volumes": null,
+          "environment": {
+            "HF_HOME": "/root/hf"
+          },
+          "entrypoint": null,
+          "internal_ports": [
+            8000
+          ],
+          "startup_commands": null,
+          "shm_size": "16g",
+          "initial_port_count": 4
+        },
+        "debug": false,
+        "local_volume": "volume_0b1c2d3e",
+        "volume_limit_gb": 400,
+        "storage_limit_gb": 100,
+        "disk_share": 0.25,
+        "min_volume_gb": 50,
+        "external_volume_info": null,
+        "is_sysbox": true,
+        "docker_username": null,
+        "docker_password": null,
+        "timestamp": 1757363650,
+        "pre_dispatch_profilers": [
+          {
+            "name": "Filler preemption",
+            "duration": 1300
+          },
+          {
+            "name": "Backend rent prep",
+            "duration": 210
+          }
+        ],
+        "backup_log_id": null,
+        "restore_path": "/root",
+        "bootstrap_restore": {
+          "restore_log_id": "9a8b7c6d-5e4f-4a3b-2c1d-0e9f8a7b6c5d",
+          "backup_engine": "restic",
+          "repository_pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+          "repository_password": "placeholder-repository-password",
+          "backup_volume_info": {
+            "name": "celium-backup-volume-0b1c2d3e",
+            "plugin": "rclone",
+            "iam_user_access_key": "placeholder-access-key",
+            "iam_user_secret_key": "placeholder-secret",
+            "session_token": null
+          },
+          "snapshot_id": "5f3e2d1c",
+          "legacy_object_key": null,
+          "legacy_object_size_bytes": null,
+          "auth_token": "placeholder-jwt",
+          "restore_path": "/root",
+          "failure_timeout_seconds": 600
+        },
+        "enable_jupyter": true,
+        "enable_volume_encryption": false,
+        "available_ports": [
+          {
+            "docker_port": null,
+            "internal_port": 22,
+            "external_port": 40001
+          },
+          {
+            "docker_port": null,
+            "internal_port": 8888,
+            "external_port": 40002
+          }
+        ],
+        "pod_mapping": [
+          {
+            "docker_port": 22,
+            "internal_port": 22,
+            "external_port": 40001
+          }
+        ],
+        "active_container_names": [
+          "container_aaaaaaaa"
+        ],
+        "active_volume_names": [
+          "volume_aaaaaaaa"
+        ],
+        "cluster_membership": {
+          "node_index": 0,
+          "wireguard_conf": "[Interface]\nPrivateKey = placeholder\n",
+          "ssh_private_key": "",
+          "ssh_authorized_key": ""
+        },
+        "dockerfile_content": null,
+        "ships_sshd": true,
+        "gpu_power_limits": null,
+        "cache_volumes": null
+      }
+    },
+    {
+      "expect": "ContainerCreateRequest",
+      "note": "a Lium filler: workload_kind FILLER, DAH-2356 power caps, DAH-2475 cache volumes, the shape an older backend sent (no available_ports/pod_mapping keys)",
+      "message": {
+        "message_type": "ContainerCreateRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "filler-run-7c6b5a49-3827-4165-a4b3-c2d1e0f9a8b7",
+        "workload_kind": "FILLER",
+        "docker_image": "daturaai/pearl-miner:0.4.0",
+        "user_public_keys": [],
+        "gpu_uuids": [
+          "GPU-11111111-2222-3333-4444-555555555555"
+        ],
+        "gpu_power_limits": [
+          {
+            "gpu_uuid": "GPU-11111111-2222-3333-4444-555555555555",
+            "watts": 490
+          }
+        ],
+        "cache_volumes": [
+          {
+            "name": "dphn_cache_6f1d2c3b",
+            "target": "/root/.cache"
+          }
+        ]
+      }
+    },
+    {
+      "expect": "ContainerStartRequest",
+      "message": {
+        "message_type": "ContainerStartRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "container_name": "container_0b1c2d3e",
+        "local_volume_path": "/root"
+      }
+    },
+    {
+      "expect": "ContainerStopRequest",
+      "message": {
+        "message_type": "ContainerStopRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "container_name": "container_0b1c2d3e"
+      }
+    },
+    {
+      "expect": "ContainerDeleteRequest",
+      "message": {
+        "message_type": "ContainerDeleteRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e",
+        "local_volume": "volume_0b1c2d3e",
+        "external_volume": null
+      }
+    },
+    {
+      "expect": "AddSshPublicKeyRequest",
+      "message": {
+        "message_type": "AddSshPublicKey",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e",
+        "user_public_keys": [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYFORTHEWIREONLY0000000000000000 renter"
+        ]
+      }
+    },
+    {
+      "expect": "RemoveSshPublicKeysRequest",
+      "message": {
+        "message_type": "RemoveSshPublicKeysRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e",
+        "user_public_keys": [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYFORTHEWIREONLY0000000000000000 renter"
+        ]
+      }
+    },
+    {
+      "expect": "DuplicateExecutorsResponse",
+      "message": {
+        "message_type": "DuplicateExecutorsResponse",
+        "executors": {
+          "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty": [
+            {
+              "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+              "gpu_uuids": [
+                "GPU-11111111-2222-3333-4444-555555555555"
+              ]
+            }
+          ]
+        },
+        "rental_succeed_executors": [
+          "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c"
+        ]
+      }
+    },
+    {
+      "expect": "ExecutorRentFinishedRequest",
+      "message": {
+        "message_type": "ExecutorRentFinished",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL"
+      }
+    },
+    {
+      "expect": "GetPodLogsRequestFromServer",
+      "message": {
+        "message_type": "GetPodLogsRequestFromServer",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "container_name": "container_0b1c2d3e"
+      }
+    },
+    {
+      "expect": "AddDebugSshKeyRequest",
+      "message": {
+        "message_type": "AddDebugSshKeyRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYFORTHEWIREONLY0000000000000000 ops"
+      }
+    },
+    {
+      "expect": "BackupContainerRequest",
+      "message": {
+        "message_type": "BackupContainerRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "source_volume": "volume_0b1c2d3e",
+        "backup_volume_info": {
+          "name": "celium-backup-volume-0b1c2d3e",
+          "plugin": "rclone",
+          "iam_user_access_key": "placeholder-access-key",
+          "iam_user_secret_key": "placeholder-secret",
+          "session_token": null
+        },
+        "backup_path": "/root",
+        "source_volume_path": "/root",
+        "backup_target_path": "backups/0b1c2d3e/2026-09-08T20-40-00Z",
+        "auth_token": "placeholder-jwt",
+        "backup_log_id": "9a8b7c6d-5e4f-4a3b-2c1d-0e9f8a7b6c5d",
+        "volume_encrypted": false,
+        "container_name": "container_0b1c2d3e",
+        "backup_engine": "restic",
+        "repository_pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "repository_password": "placeholder-repository-password",
+        "failure_timeout_seconds": 600
+      }
+    },
+    {
+      "expect": "RestoreContainerRequest",
+      "message": {
+        "message_type": "RestoreContainerRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "target_volume": "volume_0b1c2d3e",
+        "backup_volume_info": {
+          "name": "celium-backup-volume-0b1c2d3e",
+          "plugin": "rclone",
+          "iam_user_access_key": "placeholder-access-key",
+          "iam_user_secret_key": "placeholder-secret",
+          "session_token": null
+        },
+        "restore_path": "/root",
+        "backup_source_path": "backups/0b1c2d3e/2026-09-08T20-40-00Z",
+        "target_volume_path": "/root",
+        "auth_token": "placeholder-jwt",
+        "restore_log_id": "9a8b7c6d-5e4f-4a3b-2c1d-0e9f8a7b6c5d",
+        "volume_encrypted": false,
+        "container_name": "container_0b1c2d3e",
+        "backup_engine": "tar_aws_cli",
+        "repository_pod_id": null,
+        "repository_password": null,
+        "snapshot_id": null,
+        "legacy_object_size_bytes": 734003200,
+        "failure_timeout_seconds": 600
+      }
+    },
+    {
+      "expect": "CancelStorageOperationRequest",
+      "message": {
+        "message_type": "CancelStorageOperationRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "operation_id": "9a8b7c6d-5e4f-4a3b-2c1d-0e9f8a7b6c5d"
+      }
+    },
+    {
+      "expect": "InstallJupyterServerRequest",
+      "message": {
+        "message_type": "InstallJupyterServer",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e",
+        "jupyter_port_map": [
+          8888,
+          40002
+        ],
+        "local_volume": "volume_0b1c2d3e",
+        "local_volume_path": "/root"
+      }
+    },
+    {
+      "expect": "ForcedValidationCycleRequest",
+      "message": {
+        "message_type": "ForcedValidationCycleRequest"
+      }
+    },
+    {
+      "expect": "GetEstimateRequest",
+      "message": {
+        "message_type": "GetEstimateRequest",
+        "request_id": "r-1",
+        "gpu_model": "NVIDIA H100 80GB HBM3",
+        "gpu_count": 8,
+        "is_rented": false,
+        "gpu_splitting": false,
+        "gpu_splitting_min_count": null,
+        "sysbox_runtime": true,
+        "collateral_deposited": true
+      }
+    }
+  ]
+}
