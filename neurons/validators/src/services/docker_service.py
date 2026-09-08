@@ -1216,7 +1216,7 @@ class DockerService:
         # move off /var/lib/docker (DAH-3217: `/mnt/lium-xfs/lium-docker` on ticket-0313's host —
         # the hard-coded default made findmnt look at nothing and rmdir fail every cycle).
         log_extra = {**default_extra, "local_volume": local_volume}
-        docker_root_dir = await self._docker_root_dir_for_repair(ssh_client, log_extra)
+        docker_root_dir = await self._docker_root_dir_or_default(ssh_client, log_extra)
         propagated_mount_dir = f"{docker_root_dir}/plugins/{plugin_id}/propagated-mount"
         target = f"{propagated_mount_dir}/{local_volume}"
         log_extra = {**log_extra, "target": target}
@@ -1266,7 +1266,7 @@ class DockerService:
         )
         return True
 
-    async def _docker_root_dir_for_repair(
+    async def _docker_root_dir_or_default(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         log_extra: dict,
