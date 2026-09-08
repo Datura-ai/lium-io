@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # a UUID is dropped here and the rest of the miner's batch still goes out.
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 # Most uuids one verification-started request carries; the backend refuses a longer list with 422.
-# Sized well above the largest miner seen (148 executors, prod 8 Sep 2026).
+# Sized well above the largest miners seen on prod (two miners with 148 executors between them, 8 Sep 2026).
 VERIFICATION_STARTED_BATCH_MAX = 512
 
 T = TypeVar("T", bound=BaseModel)
@@ -375,9 +375,10 @@ class BackendClient:
         in 17 s (222 in one second) on prod, per miner it is 104 with a peak second of 39. The provider
         portal turns the start, with the per-step durations of earlier runs, into "verifying · step
         3/6 · ~70 s left".
-        Fire-and-forget: never raises, no retry, a 10-s timeout — a missed report costs the provider a
-        progress bar, not a verdict. Until the backend has the route (lium-platform#120) the 404 is a
-        warning, not an error. Uuids that are not UUIDs are dropped; more than 512 are split.
+        Fire-and-forget: never raises, a 10-s timeout, no retry of its own (only `_request`'s two
+        connection-error retries that every call gets) — a missed report costs the provider a progress
+        bar, not a verdict. Until the backend has the route (lium-platform#120) the 404 is a warning,
+        not an error. Uuids that are not UUIDs are dropped; more than 512 are split.
         """
         uuids = [u for u in executor_uuids if UUID_RE.match(u or "")]
         if len(uuids) < len(executor_uuids):
