@@ -7,6 +7,10 @@
 # makes sshd listen on that port (a sshd_config.d drop-in from SSH_PORT); with host networking there is no port map
 # to do it. Not yet run on a GPU host: e2e-all-repos/REPORT.md in the loop; the CPU path is what CI proves, and it
 # runs the same listener-follows-SSH_PORT mechanism on the same port.
+# With host networking the executor's :8001 and sshd :2222 bind on every interface of the GPU host, the two hotkeys it
+# trusts are public test-vector keys (stack.env) and the container holds the host's docker socket: run E2E_GPU=1 only on a
+# box whose :8001/:2222 are not reachable from outside (a Lium pod's published ports, a firewalled dev box), never on a
+# provider's production host.
 services:
   dind:
     profiles: [cpu-only]   # not started
@@ -15,11 +19,9 @@ services:
     depends_on: !reset []
     environment:
       DOCKER_HOST: unix:///var/run/docker.sock
-      SSH_PORT: ${E2E_EXECUTOR_SSH_PORT}
-      SSH_PUBLIC_PORT: ${E2E_EXECUTOR_SSH_PORT}
     volumes:
+      # merged by target with the base file's trust_anchor mount; the base's SSH_PORT/SSH_PUBLIC_PORT and `command:` carry over
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./executor/trust_anchor.py:/root/app/src/core/config_override.py:ro
     deploy:
       resources:
         reservations:

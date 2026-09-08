@@ -42,8 +42,11 @@ E2E_GPU=1 make e2e-full   # on a GPU host: the executor uses this machine's dock
 caller's). On a GPU host the executor shares the host network, so its sshd cannot take :22 (a Lium pod's own sshd
 holds it); it listens on `E2E_EXECUTOR_SSH_PORT` (2222) the same way the CPU path does — the compose `command:`
 configures sshd's `Port` from `SSH_PORT`, and `tests/protocol` checks the SSH banner on the advertised port every run.
-**The GPU path has not been run yet** — CI and the loop's runs are the CPU path; what it is meant to prove is marked
-below.
+With host networking the executor's :8001 and sshd :2222 bind on every interface of the box, the hotkeys it trusts are
+the public test-vector keys from `stack.env` and the container holds the host's docker socket — run `E2E_GPU=1` only
+where those two ports are not reachable from outside (a Lium pod, a firewalled dev box), never on a provider's
+production host. **The GPU path has not been run yet** — CI and the loop's runs are the CPU path; what it is meant to
+prove is marked below.
 
 `make up` is idempotent (`--wait` on every healthcheck, seed is `ON CONFLICT DO NOTHING`). Cold build ≈ 4 min on
 16 vCPU, warm ≈ 10 s; the whole gate ≈ 10 min cold.
