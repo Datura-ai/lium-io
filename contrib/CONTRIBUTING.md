@@ -1,6 +1,6 @@
-# Contributing to Bittensor Subnet Development
+# Contributing to lium-io
 
-The following is a set of guidelines for contributing to the Bittensor ecosystem. These are **HIGHLY RECOMMENDED** guidelines, but not hard-and-fast rules. Use your best judgment, and feel free to propose changes to this document in a pull request.
+The following is a set of guidelines for contributing to `lium-io`, the Subnet 51 validator, executor and miner. These are **HIGHLY RECOMMENDED** guidelines, but not hard-and-fast rules. Use your best judgment, and feel free to propose changes to this document in a pull request.
 
 ## Table Of Contents
 1. [How Can I Contribute?](#how-can-i-contribute)
@@ -16,10 +16,10 @@ The following is a set of guidelines for contributing to the Bittensor ecosystem
 
 
 ## How Can I Contribute?
-TODO(developer): Define your desired contribution procedure.
+Open an issue on [Datura-ai/lium-io](https://github.com/Datura-ai/lium-io/issues) describing the bug or the change you want, or pick one that is open. Fork the repository, branch from `main`, and open a pull request against `main` — the [README](../README.md) lists the layout and the exact test command for each neuron. Every pull request needs one approving review before it merges; the **Tests** workflow (validator, executor and miner suites) runs on every pull request against `main` or `dev` — keep it green.
 
 ## Communication Channels
-TODO(developer): Place your communication channels here
+GitHub issues and pull requests on this repository. Providers running a node reach the team in the Lium Discord (linked from [docs.lium.io](https://docs.lium.io/providers)); questions about the code belong in an issue so the answer stays findable.
 
 > Please follow the Bittensor Subnet [style guide](./STYLE.md) regardless of your contribution type. 
 
@@ -99,7 +99,7 @@ After you submit a pull request, it will be reviewed by the maintainers. They ma
 > Note: Be sure to merge the latest from "upstream" before making a pull request:
 
 ```bash
-git remote add upstream https://github.com/opentensor/bittensor.git # TODO(developer): replace with your repo URL
+git remote add upstream https://github.com/Datura-ai/lium-io.git
 git fetch upstream
 git merge upstream/<your-branch-name>
 git push origin <your-branch-name>

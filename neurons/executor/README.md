@@ -1,8 +1,44 @@
 # Executor
 
-**[Executor Documentation](https://docs.lium.io/bittensor-subnet/executor)**
+**[Node Quickstart on docs.lium.io](https://docs.lium.io/providers/nodes/quickstart)**
 
-## Setup project
+## Quick setup with `lium mine` (recommended)
+
+Before the first command, the machine needs:
+
+- **Ubuntu 22.04 on x86_64**, kernel 5.19 or newer (6.x recommended; `hostnamectl` shows both), and root or passwordless `sudo`;
+- **the NVIDIA driver loaded** — `nvidia-smi` lists the GPUs;
+- **Docker Engine installed and running** — `docker ps` works. The Sysbox installer below refuses to run without it (`lium mine` runs the Docker install script too, but only after this step, and it is a no-op on a machine that already has Docker);
+- **a public IP** with the service port (`8080`) and the node SSH port (`2200`) reachable, and the SS58 hotkey of a provider registered on subnet 51.
+
+RAM, disk (including the 1.5× VRAM rule for the idle incentive) and the recommended XFS storage setup are in the [Node Quickstart requirements](https://docs.lium.io/providers/nodes/quickstart#requirements).
+
+Install [Sysbox](https://docs.lium.io/providers/nodes/sysbox) first — validators reject a node without the `sysbox-runc` runtime. The installer below also sets up the NVIDIA Container Toolkit:
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
+```
+
+Then run the node in one command, with your miner hotkey:
+
+```shell
+curl -fsSL https://lium.io/mine.sh | bash -s -- -k <your_miner_hotkey_ss58>
+```
+
+The script installs the [`lium`](https://github.com/Datura-ai/lium) CLI and runs `lium mine`, which:
+
+1. clones this repository into `./compute-subnet` (or pulls the branch if the directory already exists),
+2. runs `scripts/install_executor_on_ubuntu.sh` (Docker Engine and the compose plugin), then checks prerequisites — `nvidia-smi`, `nvidia-container-cli`, `docker info`,
+3. renders `neurons/executor/.env` from `.env.template` with the hotkey and the ports — you are prompted for the service port (`8080`), the node SSH port (`2200`), an optional public SSH port and an optional renting port range; pass `--auto` to accept the defaults without prompts,
+4. starts the executor with `docker compose up -d` and waits for the container to report `healthy`,
+5. runs the validator's own check against the node (`daturaai/lium-validator:latest`).
+
+At the end it prints the node's endpoint, GPU type and count, and a `provider.lium.io/nodes?action=add&…` link that pre-fills the **Add Node** form in the [Provider Portal](https://provider.lium.io) with those values. Other options: `-d/--dir` (checkout directory, default `compute-subnet`) and `-b/--branch` (default `main`); `lium mine --help` lists them.
+
+## Manual setup
+
+Use this path if you want to set every value yourself instead of running `lium mine`.
+
 ### Requirements
 * Ubuntu machine
 * install [docker](https://docs.docker.com/engine/install/ubuntu/)
@@ -11,14 +47,14 @@
 ### Step 1: Clone project
 
 ```
-git clone https://github.com/Datura-ai/compute-subnet.git
+git clone https://github.com/Datura-ai/lium-io.git
 ```
 
 ### Step 2: Install Required Tools
 
 Run following command to install required tools: 
 ```shell
-cd compute-subnet && chmod +x scripts/install_executor_on_ubuntu.sh && scripts/install_executor_on_ubuntu.sh
+cd lium-io && chmod +x scripts/install_executor_on_ubuntu.sh && scripts/install_executor_on_ubuntu.sh
 ```
 
 if you don't have sudo on your machine, run
