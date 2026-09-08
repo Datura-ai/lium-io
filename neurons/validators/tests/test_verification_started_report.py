@@ -13,7 +13,7 @@ from clients.backend_client import VERIFICATION_STARTED_BATCH_MAX, BackendClient
 from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo, RequestType
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.miner_service import MinerService
+from services.miner_service import CYCLE_DONE, EXPRESS_LANE, MinerService
 from services.task.service import TaskService
 
 from core.config import settings
@@ -274,6 +274,7 @@ def _miner_service_recording(order: list[str]) -> MinerService:
     service.redis_service = MagicMock()
     service.attestation_service = MagicMock()
     service.attestation_service.maybe_issue_nonce = AsyncMock(return_value=None)
+    service.in_flight = {}
 
     def report(miner_info, executors):
         order.append(f"report:{miner_info.miner_hotkey}:{','.join(e.uuid for e in executors)}")
@@ -350,9 +351,67 @@ async def test_rest_path_reports_the_miner_once_before_launching_its_executors(m
 
 
 @pytest.mark.asyncio
+async def test_the_report_carries_the_claimed_list_not_what_the_express_lane_holds(monkeypatch):
+    """The report names the executors this run launches. With the express lane on (DAH-2958) an
+    executor the lane is verifying right now is left out of the cycle's wave, so it is left out of
+    the cycle's report too — the lane's own run reports it."""
+    order: list[str] = []
+    service = _miner_service_recording(order)
+    service.in_flight = {"exec-b": EXPRESS_LANE}
+    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
+    monkeypatch.setattr(settings, "USE_REST_API", False)
+    monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
+    monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
+
+    with (
+        patch(
+            "services.miner_service.MinerClient",
+            return_value=_FakeMinerClient(_accepted("exec-a", "exec-b", "exec-c")),
+        ),
+        patch("services.miner_service.measure_and_attach", AsyncMock()),
+    ):
+        await service.request_job_to_miner(
+            _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}
+        )
+
+    assert order[0] == "report:5Miner:exec-a,exec-c"
+    assert sorted(order[1:]) == ["create_task:exec-a", "create_task:exec-c"]
+    # the run completed: the wave released its two claims and left the lane's executor alone
+    assert service.in_flight == {"exec-a": CYCLE_DONE, "exec-b": EXPRESS_LANE, "exec-c": CYCLE_DONE}
+
+
+@pytest.mark.asyncio
+async def test_an_express_lane_run_reports_its_one_executor(monkeypatch):
+    """The express lane asks for one executor; the report names that one, even when the miner
+    answers with more."""
+    order: list[str] = []
+    service = _miner_service_recording(order)
+    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
+    monkeypatch.setattr(settings, "USE_REST_API", False)
+    monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
+    monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
+
+    with (
+        patch(
+            "services.miner_service.MinerClient",
+            return_value=_FakeMinerClient(_accepted("exec-a", "exec-b")),
+        ),
+        patch("services.miner_service.measure_and_attach", AsyncMock()),
+    ):
+        await service.request_job_to_miner(
+            _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}, executor_id="exec-b"
+        )
+
+    assert order == ["report:5Miner:exec-b", "create_task:exec-b"]
+    # a lane run claims nothing for the cycle, so the release leaves in_flight untouched
+    assert service.in_flight == {}
+
+
+@pytest.mark.asyncio
 async def test_create_task_no_longer_reports_per_executor(monkeypatch):
-    """The per-executor report inside create_task is gone: with it, a 483-executor cycle was 483
-    requests. Only the miner-level call above remains."""
+    """Regression guard for the per-executor shape of this PR's first draft (483 requests for a
+    483-executor cycle); it passes on main too, where create_task never reported. Only the
+    miner-level call above remains."""
     ctx = SimpleNamespace(pipeline_id="pipe-1", verified=None)
 
     class _Shell:
