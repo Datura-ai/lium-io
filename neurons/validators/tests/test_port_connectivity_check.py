@@ -1,5 +1,4 @@
 import pytest
-from dataclasses import dataclass, field
 
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from neurons.validators.src.services.executor_connectivity.models import PortPair, PortVerificationResult

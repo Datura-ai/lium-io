@@ -1,9 +1,7 @@
-import enum
 import json
 import time
 
 from pydantic import BaseModel
-from datura.requests.base import BaseRequest
 
 
 class AuthenticationPayload(BaseModel):

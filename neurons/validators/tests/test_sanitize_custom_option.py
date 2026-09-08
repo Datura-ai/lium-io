@@ -1,4 +1,3 @@
-import pytest
 from payload_models.payloads import CustomOptions
 
 

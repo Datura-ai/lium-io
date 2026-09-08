@@ -1,5 +1,4 @@
 import docker
-import os
 import requests
 import bittensor
 import time
@@ -185,8 +184,6 @@ def pull_and_restart_containers(client: docker.DockerClient, image_name: str, re
                 return False
 
         # Create new container with proper configuration from docker-compose.yml
-        home_dir = os.path.expanduser("~")
-
         try:
             logger.info(_m("Creating new container with updated image", {
                 "name": container_name,
