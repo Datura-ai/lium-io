@@ -11,10 +11,14 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build Python distribution
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: packages/lium-core
@@ -43,6 +47,7 @@ jobs:
   approve-and-publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: release
     permissions:
       contents: read
