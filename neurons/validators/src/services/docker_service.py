@@ -219,6 +219,9 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # Shared with core.docker_utils so exactly one helper image lands on nodes.
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
+# dockerd's default data-root; the repair reads the real one from `docker info` and uses this only
+# when that lookup fails (DAH-3217).
+_DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
 # has to go. Covers the image layers and scratch the pod needs beyond its own volume.
@@ -1209,7 +1212,14 @@ class DockerService:
         plugin_id = (plugin_result.stdout or "").strip()
         if getattr(plugin_result, "exit_status", 0) != 0 or not plugin_id:
             return False
-        target = f"/var/lib/docker/plugins/{plugin_id}/propagated-mount/{local_volume}"
+        # The plugin's propagated-mount dir lives under dockerd's data-root, which a provider may
+        # move off /var/lib/docker (DAH-3217: `/mnt/lium-xfs/lium-docker` on ticket-0313's host —
+        # the hard-coded default made findmnt look at nothing and rmdir fail every cycle).
+        log_extra = {**default_extra, "local_volume": local_volume}
+        docker_root_dir = await self._docker_root_dir_for_repair(ssh_client, log_extra)
+        propagated_mount_dir = f"{docker_root_dir}/plugins/{plugin_id}/propagated-mount"
+        target = f"{propagated_mount_dir}/{local_volume}"
+        log_extra = {**log_extra, "target": target}
 
         # Recheck that the target is not currently mounted before removing it.
         mounted_result = await ssh_client.run(
@@ -1221,7 +1231,7 @@ class DockerService:
             logger.warning(
                 _m(
                     "VLOOPBACK_STALE_MOUNTPOINT_STILL_MOUNTED",
-                    extra=get_extra_info({**default_extra, "local_volume": local_volume}),
+                    extra=get_extra_info(log_extra),
                 )
             )
             return False
@@ -1231,7 +1241,7 @@ class DockerService:
         # Repair by removing only the empty stale mountpoint directory.
         helper_cmd = (
             "/usr/bin/docker run --rm "
-            f"-v {shlex.quote(str(Path(target).parent))}:/mnt "
+            f"-v {shlex.quote(propagated_mount_dir)}:/mnt "
             f"{_VLOOPBACK_REPAIR_IMAGE} rmdir /mnt/{shlex.quote(local_volume)}"
         )
         repair_result = await ssh_client.run(helper_cmd, timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC)
@@ -1240,8 +1250,7 @@ class DockerService:
                 _m(
                     "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED",
                     extra=get_extra_info({
-                        **default_extra,
-                        "local_volume": local_volume,
+                        **log_extra,
                         "exit_status": getattr(repair_result, "exit_status", None),
                         "stderr": getattr(repair_result, "stderr", ""),
                     }),
@@ -1252,10 +1261,45 @@ class DockerService:
         logger.info(
             _m(
                 "VLOOPBACK_STALE_MOUNTPOINT_REPAIRED",
-                extra=get_extra_info({**default_extra, "local_volume": local_volume}),
+                extra=get_extra_info(log_extra),
             )
         )
         return True
+
+    async def _docker_root_dir_for_repair(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        log_extra: dict,
+    ) -> str:
+        # one `docker info` per repair; a lookup that fails falls back to the default root and says
+        # so, so the repair runs where it always did. On the create path a raised lookup error would
+        # replace the original `docker run` failure with no repair event logged.
+        try:
+            docker_root_dir = await self.get_docker_root_dir(
+                ssh_client, timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # asyncssh's TimeoutError carries an empty str(); the type is the diagnosis then
+            docker_root_dir = ""
+            error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        else:
+            error = None if docker_root_dir.startswith("/") else "docker info returned no absolute path"
+        if error is not None:
+            logger.warning(
+                _m(
+                    "VLOOPBACK_REPAIR_DOCKER_ROOT_FALLBACK",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "docker_root_dir": docker_root_dir,
+                        "fallback": _DEFAULT_DOCKER_ROOT_DIR,
+                        "error": error,
+                    }),
+                )
+            )
+            return _DEFAULT_DOCKER_ROOT_DIR
+        return docker_root_dir.rstrip("/")
 
     async def _prepare_known_hosts_policy(
         self,
