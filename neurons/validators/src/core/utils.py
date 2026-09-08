@@ -254,7 +254,8 @@ async def retry_ssh_command(
     max_attempts: int = 5,
     wait_seconds: int = 10,
 ):
-    @retry(stop=stop_after_attempt(max_attempts), wait=wait_fixed(wait_seconds))
+    # reraise: the caller gets the last attempt's error (exit code, stderr), not RetryError[<Future>]
+    @retry(stop=stop_after_attempt(max_attempts), wait=wait_fixed(wait_seconds), reraise=True)
     async def execute_command():
         result = await ssh_client.run(command)
         if result.exit_status != 0:
