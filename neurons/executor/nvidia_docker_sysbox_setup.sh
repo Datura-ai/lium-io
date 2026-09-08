@@ -40,6 +40,45 @@ kernel_supports_idmapped() {
     version_ge "$(uname -r)" 5 19
 }
 
+apt_install() {
+    # apt's output is kept and shown on failure: with `set -e` a silenced apt-get ended the
+    # script after "Installing packages" with nothing on screen (DAH-2768)
+    local log
+    log=$(mktemp)
+    if ! apt-get "$@" > "$log" 2>&1; then
+        fail "apt-get $* failed:"
+        tail -n 20 "$log" | sed 's/^/      /'
+        rm -f "$log"
+        return 1
+    fi
+    rm -f "$log"
+}
+
+ensure_nvidia_container_toolkit_repo() {
+    # nvidia-container-toolkit ships from NVIDIA's apt repository, not Ubuntu's. Drivers installed
+    # from the Ubuntu archive or a .run file leave no such repository behind, so add it (NVIDIA's
+    # documented sequence) unless any apt source already points at it.
+    local root="${APT_ROOT:-}"
+    local keyring="$root/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+    local list="$root/etc/apt/sources.list.d/nvidia-container-toolkit.list"
+    if grep -rqs "nvidia.github.io/libnvidia-container" "$root/etc/apt/sources.list.d/" "$root/etc/apt/sources.list"; then
+        ok "NVIDIA container toolkit apt repository already configured."
+        return 0
+    fi
+    # downloads land in a temp file first: in a `curl | gpg` pipeline a failed curl is invisible
+    local tmp
+    tmp=$(mktemp)
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey -o "$tmp" \
+        || { rm -f "$tmp"; fail "Could not fetch the NVIDIA container toolkit signing key (https://nvidia.github.io/libnvidia-container/gpgkey)."; return 1; }
+    gpg --dearmor --yes -o "$keyring" "$tmp" \
+        || { rm -f "$tmp"; fail "Could not import the NVIDIA container toolkit signing key into $keyring."; return 1; }
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list -o "$tmp" \
+        || { rm -f "$tmp"; fail "Could not fetch the NVIDIA container toolkit apt source list."; return 1; }
+    sed "s#deb https://#deb [signed-by=$keyring] https://#g" "$tmp" > "$list"
+    rm -f "$tmp"
+    ok "NVIDIA container toolkit apt repository added."
+}
+
 sysbox_idmapped_report() {
     # what sysbox-mgr itself decided this boot: "yes", "no", or empty when unavailable
     journalctl -u sysbox-mgr -b --no-pager 2>/dev/null \
@@ -221,8 +260,9 @@ ok "Docker is clear for sysbox installation."
 
 step 3 7 "Installing packages"
 
-apt-get update -qq 2>/dev/null
-apt-get install -y -qq nvidia-container-toolkit jq > /dev/null 2>&1
+ensure_nvidia_container_toolkit_repo || exit 1
+apt_install update -qq || exit 1
+apt_install install -y -qq nvidia-container-toolkit jq || exit 1
 ok "nvidia-container-toolkit, jq"
 
 if [ "$SKIP_INSTALL" = false ]; then
@@ -237,7 +277,7 @@ if [ "$SKIP_INSTALL" = false ]; then
         actual=$(sha256sum "$SYSBOX_DEB" | cut -d' ' -f1)
         [ "$actual" = "$SYSBOX_SHA" ] || { fail "Checksum mismatch!"; exit 1; }
     fi
-    apt-get install -y -qq "$SYSBOX_DEB" > /dev/null 2>&1
+    apt_install install -y -qq "$SYSBOX_DEB" || exit 1
     ok "Sysbox v${SYSBOX_VERSION} installed."
 else
     ok "Sysbox already installed, skipping."
