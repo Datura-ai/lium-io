@@ -18,6 +18,7 @@ from protocol.vc_protocol.compute_requests import (
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
+    VerificationStartedResponse,
 )
 from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
@@ -346,6 +347,37 @@ class BackendClient:
             add_signature=True,  # Use standard signature headers
             timeout=300,  # 5 minutes - backend needs time to SSH and verify container
         )
+
+    async def report_verification_started(
+        self, executor_uuid: str, *, job_batch_id: str, pipeline_id: str, miner_hotkey: str
+    ) -> None:
+        """Tell the backend this executor's validation pipeline has just started (DAH-3019).
+
+        One call per executor per run. The provider portal turns it, together with the per-step
+        durations of earlier runs, into "verifying · step 3/6 · ~70 s left"; without it the portal
+        only learns of a run when the whole cycle publishes, minutes after the node's own checks.
+        Fire-and-forget: never raises, a failure costs the provider a progress bar, not a verdict.
+        Older backends 404 and that is logged at the client's error level like any non-200.
+        """
+        try:
+            await self.post(
+                f"/validator/{self.keypair.ss58_address}/executors/{executor_uuid}/verification-started",
+                VerificationStartedResponse,
+                json_data={
+                    "job_batch_id": job_batch_id,
+                    "pipeline_id": pipeline_id,
+                    "miner_hotkey": miner_hotkey,
+                },
+                add_signature=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to report verification start",
+                    extra={"executor_uuid": executor_uuid, "job_batch_id": job_batch_id, "error": str(exc)},
+                )
+            )
 
     async def report_unknown_driver(self, driver_version: str) -> None:
         """Ask the backend to verify an unknown NVIDIA driver (DAH-2451).
