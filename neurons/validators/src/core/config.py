@@ -217,6 +217,11 @@ class Settings(BaseSettings):
         default=True,
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
+    # DAH-3258: after `docker run`, start the inspector collector concurrently with the encrypted
+    # volume mount (a host-side process, independent of the container's filesystem) and write
+    # authorized_keys and /etc/environment in ONE `docker exec` after the mount. Every step still
+    # completes before ContainerCreated is returned. Off: the serial order as before.
+    RENTAL_POSTRUN_CONCURRENT_ENABLED: bool = Field(env="RENTAL_POSTRUN_CONCURRENT_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
