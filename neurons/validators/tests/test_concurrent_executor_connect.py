@@ -107,6 +107,7 @@ async def test_a_failed_ssh_connect_closes_the_docker_client_and_raises():
 
     # the docker side connected after ssh had already failed and is still closed, not leaked
     assert "docker:exit" in rec.events
+    assert "ssh:exit" not in rec.events
 
 
 @pytest.mark.asyncio
