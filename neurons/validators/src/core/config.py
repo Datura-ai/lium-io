@@ -267,7 +267,9 @@ class Settings(BaseSettings):
     # only — the two GPU steps run side by side there (max(45, 10) s instead of 55 s); a scored cycle
     # runs them serially at full size, where a VerifyX past ≈ 110 s pushes the whole call over the
     # matmul's 120 s wall-clock cap and a PASSING matmul is re-run over SSH (`step_overtime`). On by
-    # default: a scored cycle takes the SSH path without a `/version` round trip.
+    # default: a scored cycle takes the SSH path without a `/version` round trip. "First pass" here
+    # is the caller's word (`ContextConfig.unscored`, the express lane's first verification) and does
+    # NOT need FIRST_PASS_FAST_PATH_ENABLED, which only sizes the probes.
     LOCAL_VERIFY_FIRST_PASS_ONLY: bool = Field(env="LOCAL_VERIFY_FIRST_PASS_ONLY", default=True)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide

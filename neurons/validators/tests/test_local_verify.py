@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -50,7 +51,7 @@ from services.local_verify_client import (
     sign_intent,
 )
 
-from core.config import settings
+from core.config import Settings, settings
 from tests.helpers import build_context_config, build_services, build_state, make_context
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
@@ -266,8 +267,12 @@ def context(
             verifyx=verifyx,
             redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
         ),
+        # `unscored` mirrors the factory: the caller's word, `first_pass` the fast-path-sized one.
         config=build_context_config(
-            validator_keypair=keypair, first_pass=first_pass, verifyx_enabled=verifyx_enabled
+            validator_keypair=keypair,
+            first_pass=first_pass,
+            unscored=first_pass,
+            verifyx_enabled=verifyx_enabled,
         ),
         state=state or build_state(specs=SPECS),
     )
@@ -1236,12 +1241,21 @@ async def test_a_scored_cycle_takes_ssh_without_a_call_while_first_pass_only_is_
     keypair, monkeypatch, local_verify_on, verifyx_service
 ):
     """Phase 2 gate, the default: not the first pass → no `/version`, no `/verify`, no challenge
-    built; the event is the FALLBACK shape with reason `scored_cycle` and both consumers run over
-    SSH. The gate sits before any network so a scored cycle costs nothing extra."""
-    assert settings.LOCAL_VERIFY_FIRST_PASS_ONLY is True  # the shipped default
+    built by the check; the event is the FALLBACK shape with reason `not_first_pass` and both
+    consumers then run over SSH (each proves it with `transport == "ssh"` and one awaited SSH
+    call). The gate sits before any network so a scored cycle costs nothing extra."""
+    monkeypatch.setattr(settings, "LOCAL_VERIFY_FIRST_PASS_ONLY", True)
     validation = matmul_service(monkeypatch)
     prepare_matmul = MagicMock(wraps=validation.prepare_matmul_challenge)
     validation.prepare_matmul_challenge = prepare_matmul
+    validation.validate_gpu_model_and_process_job = AsyncMock(
+        return_value=mvs.ValidationResult(success=True, metrics={"t": 1})
+    )
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(
+            data={"success": True, "network": {"download_speed": 900.0}}
+        )
+    )
     # The client is built after the gate: a factory that raises proves no `/version` was fetched.
     factory = MagicMock(side_effect=AssertionError("no client on a gated cycle"))
     async with FakeExecutor(keypair) as executor:
@@ -1256,32 +1270,32 @@ async def test_a_scored_cycle_takes_ssh_without_a_call_while_first_pass_only_is_
             local = await LocalVerifyCheck(client_factory=factory).run(ctx)
         assert executor.intents == []
         prepare_matmul.assert_not_called()  # no challenge built by the gated check itself
-        # The consumers then run over SSH (the SSH matmul path builds its own challenge).
         ctx2 = ctx.model_copy(update={"state": local.updates.get("state", ctx.state)})
         verifyx = await VerifyXCheck().run(ctx2)
         capability = await CapabilityCheck().run(ctx2)
     factory.assert_not_called()
     assert local.passed and local.event.reason_code == "LOCAL_VERIFY_FALLBACK"
     assert local.event.what_we_saw["step"] == "call"
-    assert local.event.what_we_saw["reason"] == "scored_cycle"
+    assert local.event.what_we_saw["reason"] == "not_first_pass"
     assert "state" not in local.updates  # nothing consumed, nothing for the consumers to read
-    assert verifyx.event.what_we_saw.get("transport", "ssh") == "ssh"
-    assert capability.event.what_we_saw.get("transport", "ssh") == "ssh"
-    assert prepare_matmul.call_count == 1  # the SSH capability path, after the gate
+    assert verifyx.passed and verifyx.event.what_we_saw["transport"] == "ssh"
+    assert capability.passed and capability.event.what_we_saw["transport"] == "ssh"
+    validation.validate_gpu_model_and_process_job.assert_awaited_once()
+    verifyx_service.validate_verifyx_and_process_job.assert_awaited_once()
     outcomes = [
         call.args[0].extra
         for call in log.info.call_args_list
         if str(call.args[0]) == "[local_verify] outcome"
     ]
     assert [(o["outcome"], o["step"], o["reason"], o["first_pass"]) for o in outcomes] == [
-        ("fallback", "call", "scored_cycle", False)
+        ("fallback", "call", "not_first_pass", False)
     ]
 
 
 @pytest.mark.asyncio
 async def test_the_first_pass_is_not_gated(keypair, monkeypatch, local_verify_on, verifyx_service):
-    """The gate reads `ctx.config.first_pass` only: a first pass makes the call as in phase 1."""
-    assert settings.LOCAL_VERIFY_FIRST_PASS_ONLY is True
+    """The gate reads `ctx.config.unscored` only: a first pass makes the call as in phase 1."""
+    monkeypatch.setattr(settings, "LOCAL_VERIFY_FIRST_PASS_ONLY", True)
     validation = matmul_service(monkeypatch)
     async with FakeExecutor(keypair) as executor:
         ctx = context(
@@ -1290,6 +1304,34 @@ async def test_the_first_pass_is_not_gated(keypair, monkeypatch, local_verify_on
         local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
         assert len(executor.intents) == 1 and executor.intents[0]["parallel_gpu"] is True
     assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
+
+
+@pytest.mark.asyncio
+async def test_the_gate_reads_the_callers_unscored_flag_not_the_fast_path_sized_first_pass(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """`ContextConfig.first_pass` is `caller's first_pass AND FIRST_PASS_FAST_PATH_ENABLED` (DAH-3011),
+    off by default. The gate must not read it: with the fast path off, the express lane's first
+    verification still makes the one call (`unscored=True`, `first_pass=False`), at the full probe
+    size (`parallel_gpu` stays the first-pass shape only when `first_pass` is on)."""
+    monkeypatch.setattr(settings, "LOCAL_VERIFY_FIRST_PASS_ONLY", True)
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+        )
+        ctx = ctx.model_copy(
+            update={"config": replace(ctx.config, first_pass=False, unscored=True)}
+        )
+        local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+        assert len(executor.intents) == 1
+    assert local.event.reason_code == "LOCAL_VERIFY_OK"
+    assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
+
+
+def test_the_shipped_default_gates_the_one_call_to_the_first_pass():
+    assert Settings.model_fields["LOCAL_VERIFY_FIRST_PASS_ONLY"].default is True
+    assert build_context_config().unscored is False  # a scored cycle unless the caller says so
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():

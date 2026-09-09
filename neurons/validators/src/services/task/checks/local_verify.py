@@ -124,13 +124,15 @@ class LocalVerifyCheck:
         if _get_filler_only_container(ctx):
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
-        if settings.LOCAL_VERIFY_FIRST_PASS_ONLY and not ctx.config.first_pass:
+        if settings.LOCAL_VERIFY_FIRST_PASS_ONLY and not ctx.config.unscored:
             # Phase 2: the saving is first-pass only (side-by-side GPU steps). A scored cycle runs
             # them serially at full size, and a VerifyX past ≈ 110 s pushes the call over the
             # matmul's wall-clock cap — a passing matmul is then re-run over SSH. Decided before
-            # the `/version` round trip so a scored cycle costs nothing extra.
+            # the `/version` round trip so a scored cycle costs nothing extra. `unscored` is the
+            # caller's word (the express lane), NOT `first_pass`, which is also off whenever
+            # FIRST_PASS_FAST_PATH_ENABLED is off — the two flags stay independent.
             return self._fallback(
-                ctx, "call", "scored_cycle", "not the first pass: the one-call path is first-pass only"
+                ctx, "call", "not_first_pass", "not the first pass: the one-call path is first-pass only"
             )
         if ctx.config.validator_keypair is None:
             return self._fallback(

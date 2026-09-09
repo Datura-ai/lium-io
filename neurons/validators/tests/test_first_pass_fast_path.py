@@ -390,3 +390,56 @@ async def test_verifyx_service_applies_overrides_to_the_challenge_config_only():
     assert first_pass_config["memory_min_test_gb"] == default_config["memory_min_test_gb"]
     assert first_pass_config["storage_min_available_gb"] == default_config["storage_min_available_gb"]
     assert first_pass_config["network_timeout_seconds"] == default_config["network_timeout_seconds"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [False, True])
+async def test_context_unscored_is_the_callers_first_pass_whatever_the_fast_path_flag(monkeypatch, flag):
+    """liumd phase 2: `unscored` carries the caller's `first_pass` untouched — the one-call `/verify`
+    gate reads it, so the express lane's first verification makes the call with the fast path off."""
+    monkeypatch.setattr(settings, "FIRST_PASS_FAST_PATH_ENABLED", flag)
+    monkeypatch.setattr(pipeline_factory_module, "Context", lambda **kw: SimpleNamespace(**kw))
+    redis = SimpleNamespace(
+        get_verified_job_info=AsyncMock(return_value={}),
+        is_elem_exists_in_set=AsyncMock(return_value=False),
+    )
+    factory = PipelineFactory.__new__(PipelineFactory)
+    factory.redis_service = redis
+    for name in (
+        "ssh_service",
+        "validation_service",
+        "verifyx_validation_service",
+        "inspector_validation_service",
+        "collateral_contract_service",
+        "executor_connectivity_service",
+        "backend_client",
+        "pod_recovery",
+        "container_cleanup",
+    ):
+        setattr(factory, name, MagicMock())
+    shell = SimpleNamespace(ssh_client=MagicMock())
+    executor = SimpleNamespace(
+        uuid=EXECUTOR, address="1.2.3.4", port=8000, ssh_username="root", ssh_port=22, root_dir="/root/app"
+    )
+    encrypted_files = SimpleNamespace(
+        encrypt_key="k", machine_scrape_file_name="scrape", machine_scrape_source=None,
+        all_keys={}, tmp_directory="/tmp/x",
+    )
+    miner_info = SimpleNamespace(
+        job_batch_id="b", miner_hotkey="m", miner_coldkey="c", miner_address="1.1.1.1", miner_port=1
+    )
+    for first_pass in (False, True):
+        ctx = await factory.build_context(
+            shell=shell,
+            miner_info=miner_info,
+            executor_info=executor,
+            keypair=None,
+            private_key="p",
+            public_key="q",
+            encrypted_files=encrypted_files,
+            rented_data=None,
+            default_docker_image_digests={},
+            first_pass=first_pass,
+        )
+        assert ctx.config.unscored is first_pass
+        assert ctx.config.first_pass is (first_pass and flag)
