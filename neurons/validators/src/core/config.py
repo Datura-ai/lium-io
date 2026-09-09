@@ -259,6 +259,8 @@ class Settings(BaseSettings):
     VALIDATOR_LOCAL_VERIFY_ENABLED: bool = Field(env="VALIDATOR_LOCAL_VERIFY_ENABLED", default=False)
     # Whole-call budget for `POST /verify` (seconds). Sized for the first pass; a full-size VerifyX
     # may take longer and then falls back, so keep this above VERIFYX first-pass p90 (90 s) + matmul.
+    # The executor is told to stop 30 s earlier (`deadline_s` = this − 30, min 5) so a cut answer
+    # with finished steps inside still arrives inside the budget.
     LOCAL_VERIFY_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_TIMEOUT_SECONDS", default=240)
     LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather

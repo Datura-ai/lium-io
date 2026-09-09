@@ -19,12 +19,30 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
+from datura.requests.validator_requests import (
+    LOCAL_VERIFY_CAPABILITY,
+    LOCAL_VERIFY_SCHEMA,
+    local_verify_signing_blob,
+)
 
-SCHEMA = "lium.local_verify/1"
-CAPABILITY = "local_verify/1"
+# One definition for both sides (datura, #1339): the executor's payloads/verify.py and
+# local_verify_service.py import the same names, so the two ends cannot drift apart.
+SCHEMA = LOCAL_VERIFY_SCHEMA
+CAPABILITY = LOCAL_VERIFY_CAPABILITY
 # The executor refuses an intent whose issued_at is more than its window (120 s default) from its
 # clock and whose expiry is further than about two windows out; stay inside both.
 INTENT_TTL_SECONDS = 120
+# The executor's deadline clock starts after connect + signature check and its answer travels back
+# after the deadline; the intent's `deadline_s` is therefore the client's whole-call timeout minus
+# this margin, so a `deadline_hit` answer (finished steps inside) arrives before the client gives up.
+EXECUTOR_DEADLINE_MARGIN_SECONDS = 30
+# `VerifyIntentBody.deadline_s` on the executor: ge=5, le=3600.
+EXECUTOR_DEADLINE_MIN_SECONDS = 5
+
+
+def executor_deadline_s(timeout_s: int) -> int:
+    """The `deadline_s` to put in the intent for a client whole-call timeout of `timeout_s`."""
+    return max(EXECUTOR_DEADLINE_MIN_SECONDS, int(timeout_s) - EXECUTOR_DEADLINE_MARGIN_SECONDS)
 
 
 class LocalVerifyUnavailable(Exception):
@@ -36,11 +54,9 @@ class LocalVerifyUnavailable(Exception):
         self.detail = detail
 
 
-def canonical_intent_message(body: dict[str, Any]) -> str:
-    """The signed bytes: the wire document minus `signature`, sorted keys, no whitespace. The
-    executor rebuilds the same string from the request body it received."""
-    unsigned = {k: v for k, v in body.items() if k != "signature"}
-    return json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+# The signed bytes: the wire document minus `signature`, sorted keys, no whitespace. The executor
+# rebuilds the same string from the request body it received — with this very function.
+canonical_intent_message = local_verify_signing_blob
 
 
 def build_intent(
