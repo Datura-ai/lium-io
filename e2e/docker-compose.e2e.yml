@@ -151,10 +151,11 @@ services:
   # process takes every cycle, minus the chain (the subtensor client is never constructed).
   tester:
     build:
-      context: ..
-      dockerfile: e2e/tester/Dockerfile
+      context: ../neurons/validators
+      dockerfile: ../../e2e/tester/Dockerfile
       additional_contexts:
         datura: ../datura
+        e2e: .
     image: lium-e2e/tester
     profiles: [tools]
     depends_on:
