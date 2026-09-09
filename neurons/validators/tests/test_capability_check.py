@@ -18,6 +18,9 @@ class DummyValidationService:
         error_message: str = "",
         metrics: dict | None = None,
         timed_out: bool = False,
+        returned_uuid: str | None = None,
+        stdout: str | None = None,
+        stderr: str = "",
     ):
         """
         Args:
@@ -32,6 +35,9 @@ class DummyValidationService:
         self.error_message = error_message
         self.metrics = metrics
         self.timed_out = timed_out
+        self.returned_uuid = returned_uuid
+        self.stdout = stdout
+        self.stderr = stderr
         # Track what parameters the check called us with
         self.called_with: dict | None = None
 
@@ -60,9 +66,9 @@ class DummyValidationService:
         return ValidationResult(
             success=self.success,
             expected_uuid="test-uuid-123",
-            returned_uuid="test-uuid-123" if self.success else "wrong-uuid",
-            stdout="UUID: test-uuid-123" if self.success else "UUID: wrong-uuid",
-            stderr="",
+            returned_uuid=self.returned_uuid if self.returned_uuid is not None else ("test-uuid-123" if self.success else "wrong-uuid"),
+            stdout=self.stdout if self.stdout is not None else ("UUID: test-uuid-123" if self.success else "UUID: wrong-uuid"),
+            stderr=self.stderr,
             error_message="" if self.success else self.error_message or "Validation failed",
             metrics=self.metrics,
             timed_out=self.timed_out,
@@ -231,3 +237,98 @@ async def test_capability_check_no_metrics_leaves_state_none(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.VERIFY_OK.reason
     assert "state" not in result.updates
+
+
+# DAH-3264: the probe answered no uuid because cudaMalloc failed on the executor. Prod (8–9 Sep,
+# 26 h): 49 such verdicts on 31 executors, every one reported as "UUID mismatch … got 'None'".
+OOM_STDOUT = 'UUID:  None\nRESULT_JSON: {"uuid": null, "metrics": {}, "sealed": null}'
+OOM_STDERR = "Failed to allocate d_B: out of memory"
+
+
+@pytest.mark.asyncio
+async def test_capability_check_vram_allocation_failure_gets_its_own_reason(context_factory):
+    validation_service = DummyValidationService(
+        success=False,
+        error_message="UUID mismatch: expected 'abc-123', got 'None'",
+        returned_uuid="None",
+        stdout=OOM_STDOUT,
+        stderr=OOM_STDERR,
+    )
+    services = build_services(validation=validation_service)
+    ctx = context_factory(services=services, state=build_state(specs={"gpu": {"count": 1}}))
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED_VRAM_UNAVAILABLE.reason
+    assert result.event.severity == "error"
+    assert "allocate GPU memory" in result.event.remediation
+    # the service's own error stays visible next to the classified reason, plus the stderr tail
+    assert result.event.what_we_saw["error"] == "UUID mismatch: expected 'abc-123', got 'None'"
+    assert result.event.what_we_saw["stderr_tail"] == OOM_STDERR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "returned_uuid,stderr",
+    [
+        # a real wrong answer with an OOM line in stderr is still a mismatch (anti-spoof stays fail-closed)
+        ("wrong-uuid", OOM_STDERR),
+        # no uuid, but nothing says the allocation failed
+        ("None", "segmentation fault"),
+        ("", ""),
+    ],
+)
+async def test_capability_check_keeps_generic_failure_without_allocation_evidence(
+    context_factory, returned_uuid, stderr
+):
+    validation_service = DummyValidationService(
+        success=False,
+        error_message="UUID mismatch",
+        returned_uuid=returned_uuid,
+        stdout="UUID:  " + returned_uuid,
+        stderr=stderr,
+    )
+    services = build_services(validation=validation_service)
+    ctx = context_factory(services=services, state=build_state(specs={"gpu": {"count": 1}}))
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+    assert result.event.what_we_saw["stderr_tail"] == stderr
+
+
+@pytest.mark.asyncio
+async def test_capability_check_timeout_wins_over_allocation_marker(context_factory):
+    validation_service = DummyValidationService(
+        success=False,
+        error_message="Matrix multiplication timed out after 120s",
+        timed_out=True,
+        returned_uuid="",
+        stderr=OOM_STDERR,
+    )
+    services = build_services(validation=validation_service)
+    ctx = context_factory(services=services, state=build_state(specs={"gpu": {"count": 1}}))
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.VERIFY_TIMEOUT.reason
+
+
+@pytest.mark.asyncio
+async def test_capability_check_stderr_tail_is_bounded(context_factory):
+    long_stderr = "x" * 1000 + OOM_STDERR
+    validation_service = DummyValidationService(
+        success=False, error_message="UUID mismatch", returned_uuid="None", stdout=OOM_STDOUT, stderr=long_stderr
+    )
+    services = build_services(validation=validation_service)
+    ctx = context_factory(services=services, state=build_state(specs={"gpu": {"count": 1}}))
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.VERIFY_FAILED_VRAM_UNAVAILABLE.reason
+    tail = result.event.what_we_saw["stderr_tail"]
+    assert len(tail) == 300 and tail.endswith(OOM_STDERR)
+    # the full stderr is still there for anyone who needs it
+    assert result.event.what_we_saw["stderr"] == long_stderr
