@@ -7,6 +7,7 @@ author it (the DAH-2614 truth path). A ban keyed only on the reported UUID is vo
 banned operator re-registers with new UUIDs and a fresh hotkey.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,6 +16,7 @@ from neurons.validators.src.services.task.checks.banned_provider import BannedPr
 from neurons.validators.src.services.task.messages import BannedGpuMessages, BannedProviderMessages
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
+from services import nvidia_devices  # the module banned_provider.py reads the timeout from
 from tests.helpers import build_state
 
 REAL = "GPU-f2bfa67f-5281-aabc-aa90-c91764f90d17"  # what the kernel sees
@@ -103,3 +105,25 @@ async def test_gpu_ban_reuses_the_kernel_view_read_by_the_provider_check(context
 
     assert result.passed is False
     ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hung_procfs_read_is_bounded_and_falls_back_to_reported_uuids(
+    context_factory, monkeypatch
+):
+    """A wedged host cannot hold the fatal check open: the read times out and counts as unreadable."""
+    monkeypatch.setattr(nvidia_devices, "KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS", 0.01)
+
+    async def _never_returns(*_args, **_kwargs):
+        await asyncio.sleep(60)
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=_never_returns)
+    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    ctx = context_factory(state=build_state(gpu_uuids="GPU-honest", rented_data=rented), ssh=ssh)
+
+    result = await asyncio.wait_for(BannedProviderCheck().run(ctx), timeout=5)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
+    ssh.run.assert_awaited_once()
