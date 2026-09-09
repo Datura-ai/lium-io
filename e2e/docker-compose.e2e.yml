@@ -21,6 +21,11 @@ services:
     build: ./dind
     image: lium-e2e/dind
     privileged: true
+    # RENTING_PORT_RANGE (executor/e2e.env) lies inside this namespace's ephemeral range (32768-60999), which the
+    # executor's and dind's own outbound connections draw from; reserve it so a rental's publish never meets
+    # "address already in use" (test-rental failed that way once at 2d69e57 and passed on the re-run)
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "40000-40019"
     environment:
       DOCKER_TLS_CERTDIR: ""
     # a third listener on a host-bound directory: the executor bind-mounts that socket file as its
@@ -146,16 +151,26 @@ services:
       timeout: 3s
       retries: 30
 
+  # The validator image, built from its own Dockerfile unchanged. Never started: it exists so the tester below can be
+  # built FROM it (compose builds it first, `additional_contexts: validator: service:validator`).
+  validator:
+    build:
+      context: ../neurons/validators
+      additional_contexts:
+        datura: ../datura
+    image: lium-e2e/validator
+    profiles: [tools]
+    entrypoint: ["true"]
+
   # The validator image plus pytest. The suites import the validator's own services (MinerService, TaskService,
   # DockerService) and run them against the miner and the executor above — the same code path the validator
   # process takes every cycle, minus the chain (the subtensor client is never constructed).
   tester:
     build:
-      context: ../neurons/validators
-      dockerfile: ../../e2e/tester/Dockerfile
+      context: ./tester
+      dockerfile: Dockerfile
       additional_contexts:
-        datura: ../datura
-        e2e: .
+        validator: service:validator
     image: lium-e2e/tester
     profiles: [tools]
     depends_on:

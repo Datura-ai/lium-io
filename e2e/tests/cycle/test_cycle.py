@@ -16,6 +16,14 @@ import time
 import uuid
 
 import pytest
+import redis
+from payload_models.payloads import MinerJobRequestPayload
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from services.ioc import ioc  # constructs the validator's services from the tester's env (tests/conftest.py stubs the chain first)
+from services.redis_service import MACHINE_SPEC_CHANNEL
+from services.task.checks import SysboxRequiredCheck
+from services.task.messages import SysboxRequiredMessages
+from services.task.pipeline_factory import PipelineFactory
 
 from tests import lib
 
@@ -24,15 +32,10 @@ pytestmark = pytest.mark.timeout(900)
 
 @pytest.fixture(scope="module")
 def services():
-    from services.ioc import ioc  # constructs the validator's services from the tester's env (no subtensor)
-
     return ioc
 
 
-async def _one_cycle(ioc, miner_address=lib.MINER_IP, miner_port=lib.MINER_PORT):
-    from payload_models.payloads import MinerJobRequestPayload
-    from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-
+async def _one_cycle(svc, miner_address=lib.MINER_IP, miner_port=lib.MINER_PORT):
     payload = MinerJobRequestPayload(
         job_batch_id=f"e2e-{uuid.uuid4()}",
         miner_hotkey=lib.MINER_HOTKEY,
@@ -41,9 +44,9 @@ async def _one_cycle(ioc, miner_address=lib.MINER_IP, miner_port=lib.MINER_PORT)
         miner_port=miner_port,
     )
     t0 = time.monotonic()
-    encrypted_files = ioc["FileEncryptService"].ecrypt_miner_job_files()
+    encrypted_files = svc["FileEncryptService"].ecrypt_miner_job_files()
     t_build = time.monotonic() - t0
-    result = await ioc["MinerService"].request_job_to_miner(
+    result = await svc["MinerService"].request_job_to_miner(
         payload=payload,
         encrypted_files=encrypted_files,
         rented_data=RentedExecutorsResponse(executors={}),
@@ -81,10 +84,6 @@ def test_cycle_reaches_the_executor_and_returns_a_verdict(services):
 
 def test_cycle_verdict_is_published_for_the_platform(services):
     """publish_machine_specs → MACHINE_SPEC_CHANNEL: the connector relays exactly this to the compute app."""
-    import redis
-
-    from services.redis_service import MACHINE_SPEC_CHANNEL
-
     r = redis.Redis(host=lib.ENV["REDIS_HOST"], port=int(lib.ENV.get("REDIS_PORT", "6379")))
     sub = r.pubsub(ignore_subscribe_messages=True)
     sub.subscribe(MACHINE_SPEC_CHANNEL)
@@ -140,10 +139,6 @@ def test_sysbox_gate_names_its_reason(services):
     """REQUIRE_SYSBOX_FOR_UNRENTED is off in the stack (no sysbox on a CI box or a Lium pod). The check that enforces
     it must still be in the pipeline and, when on, refuse an unrented executor with SYSBOX_REQUIRED_MISSING — the
     verdict seen on staging. Asserted at the check level: flipping the flag mid-process is not supported."""
-    from services.task.checks import SysboxRequiredCheck
-    from services.task.messages import SysboxRequiredMessages
-    from services.task.pipeline_factory import PipelineFactory
-
     checks = PipelineFactory.build_checks()
     assert any(isinstance(c, SysboxRequiredCheck) for c in checks), [type(c).__name__ for c in checks]
     assert SysboxRequiredMessages.SYSBOX_MISSING.reason == "SYSBOX_REQUIRED_MISSING"

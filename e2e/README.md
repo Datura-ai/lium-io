@@ -21,13 +21,13 @@ container on the provider's host.
 | `executor` | built from `neurons/executor` | the real executor: FastAPI on :8001 (`/version`, `/upload_ssh_key`, …), sshd on :2222 — the port it advertises (`E2E_EXECUTOR_SSH_PORT`; the compose `command:` writes it into `sshd_config.d`, since the stack has no docker port map to bridge :22), `/var/run/docker.sock` = dind's socket (bind-mounted, as a provider's host socket is). Trusts the e2e validator through `executor/trust_anchor.py` (mounted as `core/config_override.py`) (the mechanism the `:dev` images use) and the e2e miner through `MINER_HOTKEY_SS58_ADDRESS` |
 | `miner` + `miner-db` | built from `neurons/miners`, Postgres 15 | the real miner: wallet from the stack mnemonic (`run.sh`), `alembic upgrade head`, uvicorn. `DEBUG_SKIP_SYNC_FLOW` keeps it off the chain; `DEFAULT_VALIDATOR_HOTKEY` is the e2e validator (the real registration check, not the debug bypass). `miner/seed.sql` gives it two executors: the stack's and one nobody answers on |
 | `redis`, `val-db` | Redis 7, Postgres 15 | the validator's stores (`MACHINE_SPEC_CHANNEL` is where verdicts go) |
-| `tester` | `tester/Dockerfile` = `neurons/validators/Dockerfile` + pytest | the validator. Each suite is one `docker compose run tester pytest tests/<suite>`; the suites import `services.ioc` and call `MinerService` / `TaskService` / `DockerService` directly |
+| `tester` | `tester/Dockerfile` = `FROM` the image compose builds from `neurons/validators/Dockerfile` (the build-only `validator` service) + pytest | the validator. Each suite is one `docker compose run tester pytest tests/<suite>`; the suites import `services.ioc` and call `MinerService` / `TaskService` / `DockerService` directly |
 
 Addresses are fixed on the `172.30.0.0/24` compose network (`stack.env`) because the miner stores executors by IP.
 
 ## Run it
 
-Needs Docker with compose v2 (`additional_contexts` → v2.17+), `make`, ~8 GB of disk for the images. Docker-only:
+Needs Docker with compose v2 (`additional_contexts: … service:validator` → v2.33+), `make`, ~8 GB of disk for the images. Docker-only:
 `dind` is privileged. A CI runner, a dev box or an EC2 sandbox, or a Lium DinD pod; not a laptop.
 
 ```sh
