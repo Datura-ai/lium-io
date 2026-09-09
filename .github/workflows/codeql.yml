@@ -1,0 +1,98 @@
+# CodeQL — advanced setup (DAH-3149). Replaces the "default setup" toggle for this repo.
+#
+# Why a workflow file instead of default setup: default setup analyses only pushes to the default branch and PRs based
+# against it. A PR opened against another PR's branch (a stacked PR) is never analysed; when its parent merges and GitHub
+# retargets it to main, the `code_scanning` ruleset rule waits for an analysis that only a new push would trigger —
+# the PR shows green CI and "BLOCKED" with no visible reason (lium-platform #76/#78/#81, 7 Sep 2026). This workflow:
+#   - analyses every PR whatever its base branch,
+#   - re-analyses on `edited` when the base branch changes (a retarget), so no push is needed,
+#   - runs on merge-queue groups (`merge_group`) and keeps the weekly schedule,
+#   - keeps default setup's languages, `default` query suite and `/language:<lang>` categories, so alerts carry over.
+#
+# Cut-over: code scanning rejects SARIF from a workflow while default setup is enabled, so until default setup is
+# switched off this workflow analyses but does not upload (the "preflight" step says so in the run summary). Once this
+# file is on main, the loop runs tools/codeql_cutover.sh (disable default setup → dispatch this workflow on main →
+# verify); by hand: Settings → Advanced Security → CodeQL analysis → ⋯ → "Switch to advanced", then Actions → CodeQL →
+# "Run workflow" on main with force-upload ticked (a plain re-run still sees default setup's last analysis and skips the upload).
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+    # `edited` fires when the base branch changes (a retarget); the job skips title/body-only edits below.
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  merge_group:
+    types: [checks_requested]
+  schedule:
+    - cron: '31 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      force-upload:
+        description: Upload results even if the preflight thinks default setup is still enabled (used by the cut-over)
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # `edited` also fires on title/body edits; only a base-branch change needs a new analysis.
+    if: github.event.action != 'edited' || github.event.changes.base != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # job-level (not workflow-level) so a skipped title/body-edit run never cancels an analysis in progress.
+    # Only PR runs cancel each other: push, schedule and the cut-over dispatch all share the
+    # `codeql-<lang>-refs/heads/main` group, and a push to main must not kill the cut-over run.
+    concurrency:
+      group: codeql-${{ matrix.language }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, python]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight — is default setup still enabled?
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_UPLOAD: ${{ inputs.force-upload }}
+          DEFAULT_BRANCH: main
+        run: |
+          set -u
+          # (gh api prints the error body on stdout, so assign only on success)
+          state=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/default-setup" --jq .state 2>/dev/null) || state=unknown
+          if [ "$state" = unknown ]; then
+            # GITHUB_TOKEN gets 403 on that endpoint ("Resource not accessible by integration"): fall back to who produced
+            # the latest CodeQL analysis on the default branch — default setup's key is dynamic/github-code-scanning/codeql:analyze
+            key=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/analyses?tool_name=CodeQL&ref=refs/heads/$DEFAULT_BRANCH&per_page=1" --jq '.[0].analysis_key // ""' 2>/dev/null) || key=""
+            case "$key" in dynamic/github-code-scanning/*) state=configured;; "") state=unknown;; *) state=not-configured;; esac
+            echo "default-setup endpoint not readable by the workflow token; inferred '$state' from the latest analysis key '$key'"
+          fi
+          if [ "$state" = configured ] && [ "$FORCE_UPLOAD" != true ]; then
+            echo "upload=never" >> "$GITHUB_OUTPUT"
+            echo "::notice title=CodeQL default setup is still enabled::Code scanning rejects SARIF from a workflow while default setup is on, so this run analyses but does not upload. Cut-over: tools/codeql_cutover.sh in the loop repo, or Settings → Advanced Security → CodeQL → Switch to advanced, then Actions → CodeQL → Run workflow on $DEFAULT_BRANCH with force-upload ticked (a plain re-run still sees the last default-setup analysis and skips the upload)."
+            echo "default setup: $state → analyse only, no upload"
+          else
+            echo "upload=always" >> "$GITHUB_OUTPUT"
+            echo "default setup: $state → upload on"
+          fi
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+          upload: ${{ steps.preflight.outputs.upload }}
