@@ -5809,11 +5809,26 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     assert all("docker cp" not in command for command in commands)
     assert all(master_secret not in command for command in commands)
     assert all(passphrase not in command for command in commands)
-    assert all(call.kwargs.get("input") is None for call in ssh_client.run.await_args_list)
-    upload_cmds = [cmd for cmd in commands if "cat >" in cmd and "/tmp/.x" in cmd]
-    assert upload_cmds
-    assert passphrase not in upload_cmds[0]
-    assert passphrase.encode("ascii").hex() not in upload_cmds[0]
+    # The script that carries the (wrapped) passphrase travels on the SSH channel's stdin, never
+    # in a command string: the command string is the remote shell's argv, which every process on
+    # the host can read. Nothing else may use stdin here.
+    stdin_calls = [
+        call for call in ssh_client.run.await_args_list if call.kwargs.get("input") is not None
+    ]
+    assert len(stdin_calls) == 1
+    upload_call = stdin_calls[0]
+    upload_cmd = upload_call.args[0]
+    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c 'cat > ")
+    assert f"{docker_service_module._VOLUME_SETUP_TMPFS}/.x" in upload_cmd
+    assert "<<" not in upload_cmd
+    setup_script = upload_call.kwargs["input"]
+    assert "gocryptfs" in setup_script
+    assert passphrase not in setup_script
+    assert passphrase.encode("ascii").hex() not in setup_script
+    assert f'_pf={docker_service_module._VOLUME_SETUP_TMPFS}/.x' in setup_script
+    # nothing about the key ever lands on the container's writable layer
+    assert all("/tmp/.x" not in command for command in commands)
+    assert "/tmp/" not in setup_script
 
 
 def _run_gocryptfs_setup_script_in_sandbox(script: str) -> tuple[int, str, str]:
