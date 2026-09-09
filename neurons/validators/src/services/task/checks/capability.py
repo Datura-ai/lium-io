@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from core.config import settings
 
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
+
+if TYPE_CHECKING:
+    from services.matrix_validation_service import ValidationResult
 
 
 class CapabilityCheck:
@@ -121,7 +125,7 @@ def _tail(text: str | None, limit: int = STDERR_TAIL_CHARS) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
-def _failure_template(result) -> MessageTemplate:
+def _failure_template(result: ValidationResult | None) -> MessageTemplate:
     """Pick the reason for a failed capability probe.
 
     A timeout keeps its own reason. An answer with no uuid whose stderr/stdout carries a CUDA
