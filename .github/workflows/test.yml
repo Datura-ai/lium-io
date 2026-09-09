@@ -10,16 +10,21 @@ on:
   pull_request:
   push:
     branches: [main]
+  # merge queue: a queued group (main + the PRs ahead + this one) is merged only when the checks required
+  # on main report on the merge_group ref; without this trigger an enqueued PR waits forever.
+  merge_group:
+    branches: [main]
 
 permissions:
   contents: read
   # the router lists the PR's files
   pull-requests: read
 
-# a second push to the same PR cancels the first run
+# a merge-group run is never cancelled: each group has its own ref, and cancelling one would drop its
+# PRs from the queue.
 concurrency:
   group: tests-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   route:
