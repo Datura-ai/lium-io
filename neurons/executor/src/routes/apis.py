@@ -389,7 +389,8 @@ async def local_verify(request: Request):
     Auth is the validator hotkey signature every validator-facing route here uses
     (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
     (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
-    window. Flag off → 404, indistinguishable from an executor image without the route.
+    window. Flag off → 404. (An image without the route answers 422 from MinerMiddleware instead;
+    the validator treats every non-200 as "use SSH".)
     """
     if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
         raise HTTPException(status_code=404, detail="Not Found")
@@ -412,10 +413,14 @@ async def local_verify(request: Request):
     refused = check_intent_window(body, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS)
     if refused:
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
+    service = _get_local_verify_service()
+    # Busy is answered before the nonce is claimed, so a refused-because-busy intent is not burnt:
+    # the validator may re-send the same signed intent once the executor is free.
+    if service.busy:
+        raise HTTPException(status_code=409, detail="a verification is already running")
     if not _local_verify_nonces.claim(body.nonce, float(body.expires_at)):
         raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
 
-    service = _get_local_verify_service()
     try:
         result = await service.run(body)
     except BusyError as exc:

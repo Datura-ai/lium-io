@@ -7,14 +7,18 @@ matmul and VerifyX outputs with the code it already has, so a local run and an S
 challenge are judged by the same function.
 """
 
-from typing import Any
+from typing import Annotated, Any, Literal
 
+from datura.requests.validator_requests import LOCAL_VERIFY_CAPABILITY, LOCAL_VERIFY_SCHEMA
 from pydantic import BaseModel, Field
 
-SCHEMA = "lium.local_verify/1"
-CAPABILITY = "local_verify/1"
+# One definition for both sides (datura): the validator client imports the same names.
+SCHEMA = LOCAL_VERIFY_SCHEMA
+CAPABILITY = LOCAL_VERIFY_CAPABILITY
 
 STEP_NAMES = ("matmul", "verifyx", "docker", "ports", "inspector")
+# The largest card count one host can claim; bounds the matmul fan-out an intent can ask for.
+MAX_DEVICES = 64
 
 
 class MatmulStep(BaseModel):
@@ -25,7 +29,7 @@ class MatmulStep(BaseModel):
     seed: int
     cipher_text: str = Field(min_length=1, max_length=4096)
     # CUDA device indexes to pin one run to each (the all-cards work-proof); None = one unpinned run.
-    devices: list[int] | None = None
+    devices: list[Annotated[int, Field(ge=0)]] | None = Field(default=None, max_length=MAX_DEVICES)
 
 
 class VerifyXStep(BaseModel):
@@ -46,7 +50,8 @@ class VerifySteps(BaseModel):
 class VerifyIntentBody(BaseModel):
     """What the validator signs. `signature` covers the canonical JSON of these fields."""
 
-    schema_id: str = Field(alias="schema", default=SCHEMA)
+    # Only this schema is understood: another version is refused (422) rather than run as v1.
+    schema_id: Literal["lium.local_verify/1"] = Field(alias="schema", default=SCHEMA)
     nonce: str = Field(min_length=16, max_length=128)
     issued_at: int  # unix seconds, validator clock
     expires_at: int  # unix seconds; refused after this
@@ -69,7 +74,7 @@ class StepResult(BaseModel):
     """One step's evidence. `status` is about the run, not the verdict: `ok` means the step produced
     output the validator can judge; the judging happens on the validator."""
 
-    status: str  # ok | failed | timeout | skipped | unsupported
+    status: str  # ok | failed | timeout | skipped
     ms: int = 0
     exit_status: int | None = None
     stdout: str | None = None
