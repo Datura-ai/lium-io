@@ -150,9 +150,20 @@ def is_executor_stack_container(name: str) -> bool:
     return name == "executor" or name.startswith("executor-") or "-executor-" in name
 
 
+def _kind(finding: dict[str, Any]) -> str | None:
+    """`kind` as a string, or None — the report is peer-produced, a field may be any JSON type."""
+    kind = finding.get("kind")
+    return kind if isinstance(kind, str) else None
+
+
+def _tags(finding: dict[str, Any]) -> list[str]:
+    tags = finding.get("tags")
+    return [tag for tag in tags if isinstance(tag, str)] if isinstance(tags, list) else []
+
+
 def nested_from_executor(finding: dict[str, Any]) -> bool:
-    for tag in finding.get("tags") or []:
-        if isinstance(tag, str) and tag.startswith(NESTED_FROM_TAG_PREFIX):
+    for tag in _tags(finding):
+        if tag.startswith(NESTED_FROM_TAG_PREFIX):
             if is_executor_stack_container(tag[len(NESTED_FROM_TAG_PREFIX) :]):
                 return True
     return False
@@ -164,7 +175,7 @@ def is_platform_origin(finding: dict[str, Any]) -> bool:
     reaches sshd or the container's pid 1, so every such finding is one whose ancestry it could
     not trust; until DAH-3278 hardens that on the verifier, all of them count as the platform's.
     Everything else is the provider's."""
-    if finding.get("kind") not in _DOCKER_EXEC_KINDS:
+    if _kind(finding) not in _DOCKER_EXEC_KINDS:
         return False
     if finding.get("host") is True:
         return False
@@ -172,8 +183,8 @@ def is_platform_origin(finding: dict[str, Any]) -> bool:
 
 
 def finding_class(finding: dict[str, Any]) -> str:
-    kind = finding.get("kind")
-    return kind if isinstance(kind, str) and kind in KNOWN_FINDING_KINDS else UNKNOWN_KIND
+    kind = _kind(finding)
+    return kind if kind in KNOWN_FINDING_KINDS else UNKNOWN_KIND
 
 
 def _named_container(finding: dict[str, Any]) -> str | None:
@@ -211,7 +222,7 @@ def _named_resource(finding: dict[str, Any]) -> str | None:
     name = _named_container(finding)
     if name is not None:
         return name
-    if finding.get("kind") in _PATH_SHAPED_KINDS or RENTAL_VOLUME_TAG in (finding.get("tags") or []):
+    if _kind(finding) in _PATH_SHAPED_KINDS or RENTAL_VOLUME_TAG in _tags(finding):
         command = finding.get("command")
         if isinstance(command, str):
             return volume_name_from_path(command)
@@ -265,7 +276,9 @@ def build_verdict(
     action = ACTION_QUARANTINE if (provider and enforce) else ACTION_NONE
     extra: dict[str, Any] = {"platform_payloads": _platform_payloads(platform)}
     if unmatched:
-        extra["unmatched_containers"] = sorted(unmatched)
+        names = sorted(unmatched)
+        extra["unmatched_containers"] = [name[:128] for name in names[:_PAYLOAD_PREVIEW_MAX]]
+        extra["unmatched_containers_count"] = len(names)
     return InspectorVerdict(
         provider_findings=provider,
         platform_findings=platform,

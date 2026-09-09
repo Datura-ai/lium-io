@@ -250,6 +250,34 @@ def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
     assert len(verdict.provider_findings) == 1
 
 
+@pytest.mark.parametrize("kind", [["DockerExec"], {"k": 1}, 7, None])
+@pytest.mark.parametrize("tags", [7, "nested_from:executor-executor-1", {"a": 1}, None, [1, None, "rental_volume"]])
+def test_any_json_type_in_kind_or_tags_classifies_without_raising(kind, tags):
+    finding = _finding(VALIDATOR_LIVENESS)
+    finding["kind"] = kind
+    finding["tags"] = tags
+    verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=False, enforce=True)
+
+    assert is_platform_origin(finding) is False    # not a string kind → not an exec we can vouch for
+    assert verdict.classes == ["unknown"]
+    assert verdict.affected_pod_ids == [POD]       # `container` still names the pod
+
+
+def test_unmatched_containers_are_capped_in_the_verdict():
+    findings = []
+    for i in range(30):
+        f = _finding(HUMAN_SHELL, host=True, nested=False)
+        f["container"] = f"pod_gone-{i:02d}-" + "x" * 300
+        findings.append(f)
+    verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+    payload = verdict.as_payload()
+
+    assert len(payload["unmatched_containers"]) == 20
+    assert all(len(name) <= 128 for name in payload["unmatched_containers"])
+    assert payload["unmatched_containers_count"] == 30
+    assert verdict.affected_pod_ids == []
+
+
 def test_renter_visible_classes_come_from_a_fixed_vocabulary():
     odd = _finding(HUMAN_SHELL, host=True, nested=False, kind="<script>alert(1)</script>" + "x" * 500)
     verdict = build_verdict({}, [odd, _finding(HUMAN_SHELL, host=True, nested=False, kind="NamespaceEnter")],
