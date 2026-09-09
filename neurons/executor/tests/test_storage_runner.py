@@ -46,6 +46,7 @@ def _operation_payload(
     action: str = "backup",
     mode: str = "plain_volume",
     requested_path: str = "/root/checkpoints",
+    bootstrap: bool | None = None,
 ) -> dict[str, object]:
     workspace: dict[str, object] = {
         "mode": mode,
@@ -55,6 +56,8 @@ def _operation_payload(
     }
     if mode == "encrypted_running":
         workspace["container_name"] = "rental-pod"
+    if bootstrap is not None:
+        workspace["bootstrap"] = bootstrap
     return {
         "operation_id": str(OPERATION_ID),
         "pod_id": str(POD_ID),
@@ -441,6 +444,89 @@ def test_encrypted_workspace_resolves_verified_plaintext_view(
     assert preflight[preflight.index("--entrypoint") + 1] == "/usr/bin/nsenter"
     assert "-U" in preflight
     assert "-m" not in preflight
+
+
+def _running_encrypted_pod(tmp_path: Path, plaintext_relative: str = "root/root") -> str:
+    process_root = tmp_path / "4321"
+    (process_root / plaintext_relative).mkdir(parents=True)
+    (process_root / "cgroup").write_text(f"0::/docker/{CONTAINER_ID}\n")
+    (process_root / "mountinfo").write_text(
+        "36 25 0:32 / /root rw,nosuid,nodev - fuse.gocryptfs gocryptfs rw,user_id=0\n"
+    )
+    return json.dumps(
+        [
+            {
+                "Id": CONTAINER_ID,
+                "State": {"Running": True, "Pid": 4321},
+                "Mounts": [{"Name": "customer-volume", "Destination": "/lium-cipher"}],
+            }
+        ]
+    )
+
+
+@pytest.mark.parametrize("bootstrap", (None, False))
+def test_online_encrypted_restore_still_refuses_a_nonempty_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    bootstrap: bool | None,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(
+        _operation_payload(action="restore", mode="encrypted_running", requested_path="/root", bootstrap=bootstrap)
+    )
+    inspection = _running_encrypted_pod(tmp_path)
+
+    def run_docker(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout=inspection, stderr="")
+        return SimpleNamespace(returncode=21, stdout="", stderr="")   # the target has entries
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", run_docker)
+
+    with pytest.raises(WorkspaceResolutionError, match="new or empty"):
+        WorkspaceResolver(
+            docker_binary="docker", proc_root=tmp_path, environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}
+        ).resolve(operation)
+
+
+def test_bootstrap_encrypted_restore_writes_over_what_the_entrypoint_left(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # DAH-3274: at create time the pod has been running since `docker run`, so `.jupyter` or
+    # `.bashrc` may already sit in the fresh mount. Nothing there is the customer's; the
+    # preflight only checks the target is a directory and the restore writes over it.
+    operation = StorageOperationSpec.from_mapping(
+        _operation_payload(action="restore", mode="encrypted_running", requested_path="/root", bootstrap=True)
+    )
+    inspection = _running_encrypted_pod(tmp_path)
+    scripts: list[str] = []
+
+    def run_docker(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout=inspection, stderr="")
+        scripts.append(command[command.index("-c") + 1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", run_docker)
+
+    workspace = WorkspaceResolver(
+        docker_binary="docker", proc_root=tmp_path, environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}
+    ).resolve(operation)
+
+    assert workspace.read_only is False
+    (preflight,) = scripts
+    assert "exit 20" in preflight          # a file where the directory should be still fails
+    assert "find" not in preflight         # emptiness is not required
+    assert "-mindepth" not in preflight
+
+
+def test_bootstrap_flag_is_refused_outside_encrypted_running() -> None:
+    with pytest.raises(OperationSpecError, match="bootstrap is only meaningful"):
+        StorageOperationSpec.from_mapping(_operation_payload(action="restore", bootstrap=True))
+    with pytest.raises(OperationSpecError, match="must be a boolean"):
+        StorageOperationSpec.from_mapping(
+            _operation_payload(action="restore", mode="encrypted_running", bootstrap="yes")  # type: ignore[arg-type]
+        )
 
 
 def test_encrypted_workspace_fails_closed_without_gocryptfs_mount(

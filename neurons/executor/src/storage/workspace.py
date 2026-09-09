@@ -106,6 +106,7 @@ class WorkspaceResolver:
             visible_path=visible_path,
             requested_path=requested_path,
             action=operation.action,
+            overwrite_fresh_target=operation.workspace.bootstrap,
         )
 
         confirmed_identity, _ = self._inspect_running_container(container_name)
@@ -176,10 +177,18 @@ class WorkspaceResolver:
         visible_path: PurePosixPath,
         requested_path: PurePosixPath,
         action: StorageAction,
+        overwrite_fresh_target: bool = False,
     ) -> None:
         if action is StorageAction.BACKUP:
             check_script = 'test -d "$1"'
             error = f"backup source is not a directory: {requested_path}"
+        elif overwrite_fresh_target:
+            # Create-time restore into the pod's fresh mount (DAH-3274): the entrypoint may have
+            # dropped `.jupyter`, `.bashrc` or a shell history there since `docker run`; the
+            # backup wins, as it did when the restore preceded the entrypoint. Only the shape is
+            # checked — the target must be absent or a directory, never a file.
+            check_script = 'target="$1"; if [ ! -e "$target" ]; then exit 0; fi; if [ ! -d "$target" ]; then exit 20; fi'
+            error = f"restore target is not a directory: {requested_path}"
         else:
             check_script = (
                 'target="$1"; '
