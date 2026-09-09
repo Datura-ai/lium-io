@@ -1200,9 +1200,10 @@ async def test_an_oversized_capability_list_and_answer_are_bounded_before_use(
 async def test_a_scored_cycle_sends_full_size_challenges_serially(
     keypair, monkeypatch, local_verify_on, verifyx_service
 ):
-    """Not the first pass: `parallel_gpu` is off (the two GPU steps run one after the other, the
-    OOM-safety rule of the SSH path), the matmul has no VRAM budget and VerifyX no first-pass
-    overrides, and every metric line says `first_pass: False`."""
+    """Not the first pass, with the first-pass-only gate OFF: `parallel_gpu` is off (the two GPU
+    steps run one after the other, the OOM-safety rule of the SSH path), the matmul has no VRAM
+    budget and VerifyX no first-pass overrides, and every metric line says `first_pass: False`."""
+    monkeypatch.setattr(settings, "LOCAL_VERIFY_FIRST_PASS_ONLY", False)
     validation = matmul_service(monkeypatch)
     prepare_matmul = MagicMock(wraps=validation.prepare_matmul_challenge)
     prepare_verifyx = MagicMock(wraps=verifyx_service.prepare_verifyx_challenge)
@@ -1228,6 +1229,67 @@ async def test_a_scored_cycle_sends_full_size_challenges_serially(
         if str(call.args[0]) == "[local_verify] outcome"
     ]
     assert outcomes and all(o["first_pass"] is False for o in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_a_scored_cycle_takes_ssh_without_a_call_while_first_pass_only_is_on(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """Phase 2 gate, the default: not the first pass → no `/version`, no `/verify`, no challenge
+    built; the event is the FALLBACK shape with reason `scored_cycle` and both consumers run over
+    SSH. The gate sits before any network so a scored cycle costs nothing extra."""
+    assert settings.LOCAL_VERIFY_FIRST_PASS_ONLY is True  # the shipped default
+    validation = matmul_service(monkeypatch)
+    prepare_matmul = MagicMock(wraps=validation.prepare_matmul_challenge)
+    validation.prepare_matmul_challenge = prepare_matmul
+    # The client is built after the gate: a factory that raises proves no `/version` was fetched.
+    factory = MagicMock(side_effect=AssertionError("no client on a gated cycle"))
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair,
+            executor.executor_info,
+            validation=validation,
+            verifyx=verifyx_service,
+            first_pass=False,
+        )
+        with patch("neurons.validators.src.services.task.checks.local_verify.logger") as log:
+            local = await LocalVerifyCheck(client_factory=factory).run(ctx)
+        assert executor.intents == []
+        prepare_matmul.assert_not_called()  # no challenge built by the gated check itself
+        # The consumers then run over SSH (the SSH matmul path builds its own challenge).
+        ctx2 = ctx.model_copy(update={"state": local.updates.get("state", ctx.state)})
+        verifyx = await VerifyXCheck().run(ctx2)
+        capability = await CapabilityCheck().run(ctx2)
+    factory.assert_not_called()
+    assert local.passed and local.event.reason_code == "LOCAL_VERIFY_FALLBACK"
+    assert local.event.what_we_saw["step"] == "call"
+    assert local.event.what_we_saw["reason"] == "scored_cycle"
+    assert "state" not in local.updates  # nothing consumed, nothing for the consumers to read
+    assert verifyx.event.what_we_saw.get("transport", "ssh") == "ssh"
+    assert capability.event.what_we_saw.get("transport", "ssh") == "ssh"
+    assert prepare_matmul.call_count == 1  # the SSH capability path, after the gate
+    outcomes = [
+        call.args[0].extra
+        for call in log.info.call_args_list
+        if str(call.args[0]) == "[local_verify] outcome"
+    ]
+    assert [(o["outcome"], o["step"], o["reason"], o["first_pass"]) for o in outcomes] == [
+        ("fallback", "call", "scored_cycle", False)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_first_pass_is_not_gated(keypair, monkeypatch, local_verify_on, verifyx_service):
+    """The gate reads `ctx.config.first_pass` only: a first pass makes the call as in phase 1."""
+    assert settings.LOCAL_VERIFY_FIRST_PASS_ONLY is True
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+        )
+        local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+        assert len(executor.intents) == 1 and executor.intents[0]["parallel_gpu"] is True
+    assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():
