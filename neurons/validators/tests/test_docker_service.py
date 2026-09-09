@@ -5339,6 +5339,8 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_
     monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", docker_run)
     restore_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_bootstrap_restore", restore_spy)
+    volume_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "create_local_volume", volume_spy)
 
     payload = _create_payload(str(uuid4()), encrypted=True)
     result = await docker_service.create_container(
@@ -5351,6 +5353,8 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_
     assert isinstance(result, FailedContainerRequest), result
     assert result.failure_step == "bootstrap_restore_probe"
     assert "workspace.bootstrap" in result.detail
+    # nothing to orphan: the probe runs before the volume, the pod and the restore
+    volume_spy.assert_not_awaited()
     docker_run.assert_not_awaited()
     restore_spy.assert_not_awaited()
 

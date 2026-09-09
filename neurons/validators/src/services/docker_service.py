@@ -4702,6 +4702,51 @@ class DockerService:
                 effective_volume_limit_gb = payload.volume_limit_gb
                 effective_storage_limit_gb = payload.storage_limit_gb
 
+                # Decided before the volume exists so a refusal below leaves nothing behind.
+                use_encrypted_volume = _should_encrypt_local_volume(
+                    local_volume or f"volume_{payload.pod_id}",
+                    payload.workload_kind,
+                    payload.is_sysbox,
+                    payload.enable_volume_encryption,
+                )
+                if use_encrypted_volume:
+                    current_step = "encrypted_volume_image_inspect"
+                    if not await self._image_has_encrypted_volume_label(
+                        ssh_client,
+                        payload.docker_image,
+                        host_probe=host_probe,
+                    ):
+                        use_encrypted_volume = False
+                        volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
+                        await self.stream_log(
+                            "Image missing lium.volume_encryption.enable=1; using plain local volume",
+                            "warning",
+                            log_tag,
+                        )
+                        logger.warning(
+                            _m(
+                                "Image missing volume-encryption label; falling back to plain volume",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "container_name": container_name,
+                                    "docker_image": payload.docker_image,
+                                    "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
+                                }),
+                            ),
+                        )
+
+                if payload.bootstrap_restore and use_encrypted_volume:
+                    # The encrypted restore after `docker run` sends `workspace.bootstrap`; an
+                    # executor image from before DAH-3274 ignores the key and refuses the target
+                    # the entrypoint has already written to, so the create would fail with the
+                    # pod half-built. Stop here, before the volume and the pod exist: no
+                    # fallback keeps the passphrase off the executor.
+                    current_step = "bootstrap_restore_probe"
+                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
+                        raise RuntimeError(
+                            "executor image cannot restore into an encrypted volume at create time "
+                            "(no workspace.bootstrap); the provider must update the executor image"
+                        )
                 if not local_volume:
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
@@ -4743,38 +4788,6 @@ class DockerService:
                     prev_timestamp = now_ms()
 
                 external_volume_name = None
-                use_encrypted_volume = _should_encrypt_local_volume(
-                    local_volume,
-                    payload.workload_kind,
-                    payload.is_sysbox,
-                    payload.enable_volume_encryption,
-                )
-                if use_encrypted_volume:
-                    current_step = "encrypted_volume_image_inspect"
-                    if not await self._image_has_encrypted_volume_label(
-                        ssh_client,
-                        payload.docker_image,
-                        host_probe=host_probe,
-                    ):
-                        use_encrypted_volume = False
-                        volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
-                        await self.stream_log(
-                            "Image missing lium.volume_encryption.enable=1; using plain local volume",
-                            "warning",
-                            log_tag,
-                        )
-                        logger.warning(
-                            _m(
-                                "Image missing volume-encryption label; falling back to plain volume",
-                                extra=get_extra_info({
-                                    **default_extra,
-                                    "container_name": container_name,
-                                    "docker_image": payload.docker_image,
-                                    "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
-                                }),
-                            ),
-                        )
-
                 if payload.bootstrap_restore and not use_encrypted_volume:
                     # A plain volume is restored before the container exists: the data is in
                     # place when the image's entrypoint starts. An encrypted volume cannot be:
@@ -4791,18 +4804,6 @@ class DockerService:
                         local_volume_path=local_volume_path,
                         encrypted=False,
                     )
-                elif payload.bootstrap_restore:
-                    # The encrypted restore after `docker run` sends `workspace.bootstrap`; an
-                    # executor image from before DAH-3274 ignores the key and refuses the target
-                    # the entrypoint has already written to, so the create would fail with the
-                    # pod half-built. Stop here instead: no fallback keeps the passphrase off the
-                    # executor.
-                    current_step = "bootstrap_restore_probe"
-                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
-                        raise RuntimeError(
-                            "executor image cannot restore into an encrypted volume at create time "
-                            "(no workspace.bootstrap); the provider must update the executor image"
-                        )
                 if external_volume_info:
                     current_step = "external_volume_creation"
                     sysbox_subuid_base: int | None = None
