@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from services.port_utils import get_all_ports
-
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -39,55 +37,17 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
-        # liumd phase 2: ports the executor's docker already publishes (checks/local_facts) are not
-        # probed — a bind there fails like a bind on a rented port. The fact can only take
-        # candidates away from the set built above; every port kept is still proven by the
-        # connect-back, and the DinD/sysbox probe runs exactly as before.
+        # liumd phase 2: ports the executor's docker already publishes (checks/local_facts) leave
+        # the probed batch — a bind there fails like a bind on a rented port. Host-reported, so the
+        # service applies it to the window it would probe today and never to the selection (it can
+        # shrink the batch, not move it); every port kept is still proven by the connect-back and
+        # the DinD/sysbox probe runs exactly as before. No skip and no verdict comes from the fact.
         facts = ctx.state.local_facts
         published_ports = (
             sorted(facts.published_ports)
             if facts is not None and getattr(facts, "published_ports", None) is not None
             else None
         )
-        if published_ports is not None and (rented_ports or filler_ports):
-            try:
-                candidates = {
-                    external
-                    for _, external in get_all_ports(
-                        ctx.executor.port_range, ctx.executor.port_mappings, ctx.executor.ssh_port
-                    )
-                }
-            except (ValueError, TypeError):
-                candidates = set()  # a malformed range is verify_ports' `error` verdict, as today
-            taken = set(rented_ports) | set(filler_ports) | set(published_ports)
-            if candidates and candidates <= taken:
-                # DAH-3266 (B-2): a fully rented node has no port to probe; today that is a red
-                # `no_ports` every cycle, though the verdict below it (PortCountCheck) already
-                # exempts rented nodes. Same verdict, an info event, and no probe attempt. Only
-                # with a rental the BACKEND reports — the executor's word alone cannot skip it.
-                event = render_message(
-                    Msg.SKIPPED_ALL_PORTS_RENTED,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={
-                        "candidate_ports": len(candidates),
-                        "rented_ports": len(rented_ports),
-                        "filler_ports": len(filler_ports),
-                        "published_by_docker": len(published_ports),
-                    },
-                )
-                # The same state `no_ports` leaves today: no verified ports, sysbox as known.
-                return CheckResult(
-                    passed=True,
-                    event=event,
-                    updates={
-                        "state": replace(
-                            ctx.state,
-                            specs={**ctx.state.specs, "verified_ports": []},
-                            verified_port_count=0,
-                        )
-                    },
-                )
 
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
