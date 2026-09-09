@@ -230,7 +230,7 @@ def _tail(text: str | None, limit: int = STDERR_TAIL_CHARS) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
-def _failure_template(result) -> MessageTemplate:
+def _failure_template(result: ValidationResult | None) -> MessageTemplate:
     """Pick the reason for a failed capability probe.
 
     A timeout keeps its own reason. An answer with no uuid whose stderr/stdout carries a CUDA
