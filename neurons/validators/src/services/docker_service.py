@@ -1238,6 +1238,25 @@ class DockerService:
                         continue
                     if port_maps is None:
                         continue
+                    # The size labels sit on a container the miner's daemon holds: the volume the
+                    # rental would be granted is read from the volume plugin itself before adoption.
+                    volume_reason = await self._warm_slot_volume_mismatch(ssh_client, slot)
+                    if volume_reason is not None:
+                        logger.warning(
+                            _m(
+                                "warm_pool slot=remove reason=volume differs",
+                                extra=get_extra_info(
+                                    {**default_extra, "slot": slot.name, "volume": slot.volume_name, "detail": volume_reason}
+                                ),
+                            )
+                        )
+                        with contextlib.suppress(Exception):
+                            await ssh_client.run(
+                                warm_pool.remove_slot_command(slot.name, slot.volume_name),
+                                check=False,
+                                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+                            )
+                        continue
                     logger.info(
                         _m(
                             "warm_pool adopt=candidate",
@@ -1248,6 +1267,25 @@ class DockerService:
                 reason = "no fresh slot of this image fits" if slot_docs else "no slot"
         logger.info(_m("warm_pool adopt=miss", extra=get_extra_info({**default_extra, "reason": reason})))
         return None
+
+    async def _warm_slot_volume_mismatch(
+        self, ssh_client: asyncssh.SSHClientConnection, slot: warm_pool.WarmSlot
+    ) -> str | None:
+        """Why the slot's live volume is not what its labels say (`warm_pool.volume_mismatch`); a
+        failed inspect is a mismatch too — the volume is never adopted on the label alone."""
+        try:
+            result = await ssh_client.run(
+                warm_pool.inspect_volume_command(slot.volume_name),
+                check=False,
+                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return f"volume inspect failed: {exc}"
+        if result.exit_status != 0:
+            return f"volume inspect exit {result.exit_status}"
+        return warm_pool.volume_mismatch(slot, result.stdout or "")
 
     async def _adopt_warm_slot(
         self,
@@ -1328,16 +1366,9 @@ class DockerService:
                 return
             now = datetime.now(UTC)
             max_age = timedelta(hours=settings.WARM_POOL_MAX_AGE_HOURS)
-            listing = await ssh_client.run(
-                warm_pool.list_slots_command(), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
+            await self._sweep_stale_warm_slots(
+                ssh_client=ssh_client, now=now, max_age=max_age, default_extra=default_extra
             )
-            for name in warm_pool.stale_slots(listing.stdout or "", now=now, max_age=max_age):
-                await ssh_client.run(
-                    warm_pool.remove_slot_command(name, warm_pool.slot_volume_name(warm_pool.slot_id_from_name(name))),
-                    check=False,
-                    timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
-                )
-                logger.info(_m("warm_pool slot=remove reason=stale", extra=get_extra_info({**default_extra, "slot": name})))
             for image in await self._warm_pool_images(ssh_client):
                 probe = await ssh_client.run(
                     warm_pool.find_slots_command(image), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
@@ -1406,6 +1437,26 @@ class DockerService:
             logger.warning(_m("warm_pool maintain failed", extra=get_extra_info({**default_extra, "error": str(exc)})))
         finally:
             self._warm_pool_maintaining.discard(executor_id)
+
+    async def _sweep_stale_warm_slots(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        now: datetime,
+        max_age: timedelta,
+        default_extra: dict,
+    ) -> None:
+        """Remove every slot past `max_age` (or with an unreadable age), with its volume."""
+        listing = await ssh_client.run(
+            warm_pool.list_slots_command(), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
+        )
+        for name in warm_pool.stale_slots(listing.stdout or "", now=now, max_age=max_age):
+            await ssh_client.run(
+                warm_pool.remove_slot_command(name, warm_pool.slot_volume_name(warm_pool.slot_id_from_name(name))),
+                check=False,
+                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+            )
+            logger.info(_m("warm_pool slot=remove reason=stale", extra=get_extra_info({**default_extra, "slot": name})))
 
     async def _warm_pool_images(self, ssh_client: asyncssh.SSHClientConnection) -> list[str]:
         """Image refs the executor's prefetch loop reports as pulled (DAH-2470 state file)."""
@@ -4052,12 +4103,19 @@ class DockerService:
         A slot's volume is sparse and holds no bytes yet, but declares a whole-host size; counting
         it would inflate the pool every later sizing sees (speed/WARM_POOL.md). Every path that sums
         vloopback volumes by name — `_get_existing_vloopback_bytes` here, and the host-probe fast
-        path lium-io#1332 adds — must filter its names through this set. Empty with the flag off."""
-        if not settings.WARM_POOL_ENABLED:
+        path lium-io#1332 adds — must filter its names through this set. Not gated on the flag: a
+        slot left behind when the flag goes off would otherwise count again for as long as it exists.
+        A listing that fails or times out is an empty set: the sizing then counts every volume, as it
+        did before the pool, rather than falling back to the legacy passthrough."""
+        try:
+            slot_result = await ssh_client.run(
+                warm_pool.slot_volumes_command(), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info(_m("warm_pool slot volumes unlisted", extra=get_extra_info({"error": str(exc)})))
             return set()
-        slot_result = await ssh_client.run(
-            warm_pool.slot_volumes_command(), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
-        )
         if getattr(slot_result, "exit_status", 0) != 0:
             return set()
         return {line.strip() for line in (slot_result.stdout or "").splitlines() if line.strip()}
