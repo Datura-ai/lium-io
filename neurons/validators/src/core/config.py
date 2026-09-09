@@ -227,6 +227,10 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
+    # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the
+    # plugin is already enabled — instead of five serial commands. Off: the per-command path.
+    RENTAL_VOLUME_FAST_PATH_ENABLED: bool = Field(env="RENTAL_VOLUME_FAST_PATH_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a

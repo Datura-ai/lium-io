@@ -166,18 +166,30 @@ async def df_available_bytes(ssh_client: asyncssh.SSHClientConnection, host_path
 
     Raises on anything unexpected; callers decide whether that is fatal.
     """
-    result = await ssh_client.run(
-        f"/usr/bin/docker run --rm -v {shlex.quote(host_path)}:/hostfs:ro "
-        f"{ALPINE_HELPER_IMAGE} df -P -B1 /hostfs"
-    )
+    result = await ssh_client.run(df_command(shlex.quote(host_path)))
     if getattr(result, "exit_status", 0) != 0:
         raise Exception(f"df via helper container failed: {getattr(result, 'stderr', '')}")
-    lines = (result.stdout or "").strip().splitlines()
+    return parse_df_available_bytes(result.stdout or "")
+
+
+def df_command(host_path_shell_word: str) -> str:
+    """The helper-container df invocation `df_available_bytes` runs; shared with the volume host
+    probe so both measure free disk the same way. `host_path_shell_word` is already a shell word
+    (a quoted path, or a variable reference such as `"$root"`)."""
+    return (
+        f"/usr/bin/docker run --rm -v {host_path_shell_word}:/hostfs:ro "
+        f"{ALPINE_HELPER_IMAGE} df -P -B1 /hostfs"
+    )
+
+
+def parse_df_available_bytes(stdout: str) -> int:
+    """Column 4 of the data line of a POSIX `df -P -B1` output; raises when the shape is off."""
+    lines = stdout.strip().splitlines()
     if len(lines) < 2:
-        raise Exception(f"Unexpected df output: {result.stdout!r}")
+        raise Exception(f"Unexpected df output: {stdout!r}")
     columns = lines[1].split()
     if len(columns) < 4 or not columns[3].isdigit():
-        raise Exception(f"Unexpected df output: {result.stdout!r}")
+        raise Exception(f"Unexpected df output: {stdout!r}")
     return int(columns[3])
 
 
