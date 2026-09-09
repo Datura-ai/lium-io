@@ -207,6 +207,7 @@ class PrePuller:
             image_ref = f"{repo}:{tag}"
             size = int(data.get("docker_image_size") or 0)
             if await asyncio.to_thread(_has_digest, self.client, repo, digest):
+                await self._retire_superseded(image_ref, repo, digest)
                 self.state.record_present(image_ref, digest, size)
                 continue
 
@@ -236,10 +237,20 @@ class PrePuller:
                 + (f" detail={detail}" if detail else "")
             )
             if outcome == "pull_ok":
+                await self._retire_superseded(image_ref, repo, digest)
                 self.state.record_present(image_ref, digest, size)
             break  # one pull per sweep per node
 
         self.state.flush()
+
+    async def _retire_superseded(self, image_ref: str, repo: str, digest: str) -> None:
+        """When a tracked tag moved to a new digest, drop the old ``repo@<digest>`` reference:
+        the re-tag leaves it behind as neither dangling nor a tag, so the disk guard could never
+        reclaim its layers and the leak would grow by one image per refresh per pre-pulled tag."""
+        old = (self.state.images.get(image_ref) or {}).get("digest")
+        if old and old != digest:
+            if await asyncio.to_thread(_remove_ref, self.client, f"{repo}@{old}"):
+                logger.info(f"pre-pull: retired superseded {repo}@{old} for {image_ref}")
 
     async def _make_room(self, keep_ref: str, need_bytes: int) -> tuple[bool, str | None]:
         """Keep ``PRE_PULL_MIN_FREE_GB`` free after the pull, evicting LRU pre-pulled images first."""

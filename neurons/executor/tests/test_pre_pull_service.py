@@ -92,7 +92,7 @@ def _sweep(puller: PrePuller, entries: list[dict]) -> None:
 # --- flag off = today's behaviour -------------------------------------------------------
 
 
-def _one_loop_iteration(monkeypatch, templates: list[dict]) -> dict:
+def _one_loop_iteration(monkeypatch, templates: list[dict], puller: type | None = None) -> dict:
     """Run run_cache_template_prefetch through exactly one sweep and record what it did."""
     seen: dict = {"params": None, "ensured": [], "swept": [], "pullers": 0}
 
@@ -115,7 +115,7 @@ def _one_loop_iteration(monkeypatch, templates: list[dict]) -> dict:
 
     monkeypatch.setattr(cache_template_service, "_fetch_templates", fetch)
     monkeypatch.setattr(cache_template_service, "_ensure_template", ensure)
-    monkeypatch.setattr(cache_template_service, "PrePuller", FakePuller)
+    monkeypatch.setattr(cache_template_service, "PrePuller", puller or FakePuller)
     monkeypatch.setattr(cache_template_service, "_get_gpu_info", lambda: ("NVIDIA H100 80GB HBM3", "580.65.06", None))
     monkeypatch.setattr(cache_template_service.asyncio, "sleep", stop)
     with pytest.raises(asyncio.CancelledError):
@@ -145,6 +145,51 @@ def test_flag_on_asks_backend_and_routes_pre_pull_entries_to_the_puller(monkeypa
     # the mandatory path still handles only the default image, now shielding the extra's tag
     assert seen["ensured"] == [(DEFAULT_TAG, {CU128_TAG})]
     assert seen["swept"] == [[CU128_TAG]]
+
+
+def test_a_pre_pull_entry_that_is_the_default_image_never_reaches_the_puller(monkeypatch):
+    # the backend's top-N is global; when it repeats this node's default image, the default must not
+    # become a tracked (evictable) pre-pull
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    default = _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False)
+    default_again = _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=True)
+    extra = _entry(REPO, CU128_TAG, DIGEST_CU128)
+
+    seen = _one_loop_iteration(monkeypatch, [default, default_again, extra])
+
+    assert seen["ensured"] == [(DEFAULT_TAG, {CU128_TAG})]
+    assert seen["swept"] == [[CU128_TAG]]
+
+
+def test_state_is_published_before_the_sweep_can_block(monkeypatch):
+    # the DAH-2470 document carries the default image's outcome; a sweep may wait out the start
+    # jitter and one pull, so the flush must not wait for it
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    order: list[str] = []
+    real_flush = cache_template_service.CachePrefetchState.flush
+
+    def flush(self):
+        order.append("flush")
+        return real_flush(self)
+
+    class Puller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries):
+            order.append("sweep")
+
+    monkeypatch.setattr(cache_template_service.CachePrefetchState, "flush", flush)
+    _one_loop_iteration(
+        monkeypatch,
+        [
+            _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False),
+            _entry(REPO, CU128_TAG, DIGEST_CU128),
+        ],
+        puller=Puller,
+    )
+
+    assert "sweep" in order and "flush" in order[: order.index("sweep")], order
 
 
 def test_cleanup_old_tags_keeps_pre_pull_tags_of_the_same_repository():
@@ -356,6 +401,41 @@ def test_disk_guard_never_evicts_what_docker_refuses_to_remove(quiet_node, monke
 
     assert quiet_node == []
     assert "daturaai/b:1" in puller.state.images  # still there, still tracked
+
+
+def test_a_refreshed_tag_retires_its_superseded_digest_reference(quiet_node):
+    # the re-tag moves repo:tag to the new pull and leaves repo@<old digest> behind — neither
+    # dangling nor a tag, so nothing else would ever reclaim its layers
+    client = _client()
+    puller = PrePuller(client, state_path=None)
+    puller.state.images = {CU128_REF: {"digest": "sha256:old", "pulled_at": 1.0, "size": 1}}
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert len(quiet_node) == 1
+    client.images.remove.assert_called_once_with(f"{REPO}@sha256:old")
+    assert puller.state.images[CU128_REF]["digest"] == DIGEST_CU128
+
+
+def test_an_already_present_refreshed_tag_retires_the_old_digest_too(quiet_node):
+    client = _client(present_digests={DIGEST_CU128})
+    puller = PrePuller(client, state_path=None)
+    puller.state.images = {CU128_REF: {"digest": "sha256:old", "pulled_at": 1.0, "size": 1}}
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    assert quiet_node == []  # nothing to pull
+    client.images.remove.assert_called_once_with(f"{REPO}@sha256:old")
+
+
+def test_an_unchanged_digest_removes_nothing(quiet_node):
+    client = _client(present_digests={DIGEST_CU128})
+    puller = PrePuller(client, state_path=None)
+    puller.state.record_present(CU128_REF, DIGEST_CU128, 1)
+
+    _sweep(puller, [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+
+    client.images.remove.assert_not_called()
 
 
 # --- rate limiting and state ------------------------------------------------------------
