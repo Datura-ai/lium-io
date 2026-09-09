@@ -21,7 +21,14 @@ class StorageEngine(StrEnum):
 class WorkspaceMode(StrEnum):
     PLAIN_VOLUME = "plain_volume"
     ENCRYPTED_RUNNING = "encrypted_running"
-    ENCRYPTED_BOOTSTRAP = "encrypted_bootstrap"
+    # `encrypted_bootstrap` (DAH-3274) is gone on purpose: it carried the pod's gocryptfs
+    # passphrase in this spec and into the helper's `docker run -e`, i.e. onto the provider's
+    # disk. An encrypted volume is restored through the running pod's own mount only.
+
+
+# Keys a spec must not carry at all. A validator that still sends one is refused before any
+# command is built, so the secret is never read past the parser.
+FORBIDDEN_WORKSPACE_KEYS = frozenset({"volume_passphrase"})
 
 
 class ReporterResource(StrEnum):
@@ -73,10 +80,15 @@ class WorkspaceSpec:
     volume_path: PurePosixPath
     requested_path: PurePosixPath
     container_name: str | None = None
-    volume_passphrase: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> WorkspaceSpec:
+        forbidden = sorted(FORBIDDEN_WORKSPACE_KEYS.intersection(value))
+        if forbidden:
+            raise OperationSpecError(
+                f"workspace must not carry {', '.join(forbidden)}: "
+                "encrypted volumes are reached through the running pod, not unlocked here"
+            )
         try:
             mode = WorkspaceMode(_required_string(value, "mode"))
         except ValueError as error:
@@ -84,11 +96,8 @@ class WorkspaceSpec:
             raise OperationSpecError(f"workspace.mode must be one of: {supported}") from error
 
         container_name = _optional_nullable_string(value, "container_name")
-        volume_passphrase = _optional_nullable_string(value, "volume_passphrase")
         if mode is WorkspaceMode.ENCRYPTED_RUNNING and not container_name:
             raise OperationSpecError("workspace.container_name is required for encrypted_running")
-        if mode is WorkspaceMode.ENCRYPTED_BOOTSTRAP and not volume_passphrase:
-            raise OperationSpecError("workspace.volume_passphrase is required for encrypted_bootstrap")
 
         return cls(
             mode=mode,
@@ -96,7 +105,6 @@ class WorkspaceSpec:
             volume_path=_absolute_path(_required_string(value, "volume_path"), "workspace.volume_path"),
             requested_path=_absolute_path(_required_string(value, "requested_path"), "workspace.requested_path"),
             container_name=_safe_identifier(container_name, "workspace.container_name") if container_name else None,
-            volume_passphrase=volume_passphrase,
         )
 
 
@@ -180,8 +188,6 @@ class StorageOperationSpec:
                 raise OperationSpecError("tar_aws_cli is supported only for legacy restore")
             if not legacy_object_key:
                 raise OperationSpecError("legacy_object_key is required for tar_aws_cli restore")
-        if workspace.mode is WorkspaceMode.ENCRYPTED_BOOTSTRAP and action is not StorageAction.RESTORE:
-            raise OperationSpecError("encrypted_bootstrap is supported only for restore")
         if snapshot_id and not re.fullmatch(r"[0-9a-f]{8,64}", snapshot_id):
             raise OperationSpecError("snapshot_id must be a hexadecimal restic snapshot ID")
 

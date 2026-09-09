@@ -679,6 +679,75 @@ def test_encrypted_restore_preserves_user_xattrs() -> None:
     assert "user.*" not in excluded_xattrs
 
 
+def test_spec_refuses_a_volume_passphrase() -> None:
+    # DAH-3274: the spec file lands on the provider's disk; a validator that still puts the
+    # gocryptfs passphrase in it is refused before anything is built from it.
+    payload = _operation_payload(action="restore", mode="encrypted_running")
+    payload["workspace"]["volume_passphrase"] = "gocryptfs-secret"
+
+    with pytest.raises(OperationSpecError, match="must not carry volume_passphrase"):
+        StorageOperationSpec.from_mapping(payload)
+
+
+def test_encrypted_bootstrap_mode_no_longer_exists() -> None:
+    payload = _operation_payload(action="restore", mode="encrypted_bootstrap")
+
+    with pytest.raises(OperationSpecError, match="workspace.mode must be one of"):
+        StorageOperationSpec.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        DockerVolumeWorkspace(
+            image="executor:test",
+            volume_name="customer-volume",
+            path=PurePosixPath("/workspace"),
+            read_only=False,
+        ),
+        DockerUserNamespaceWorkspace(
+            image="executor:test",
+            container_name="rental-pod",
+            container_id=CONTAINER_ID,
+            pid=4321,
+            path=PurePosixPath("/proc/4321/root/root"),
+            read_only=False,
+        ),
+    ],
+    ids=["plain_volume", "encrypted_running"],
+)
+def test_no_rendered_helper_spec_carries_a_volume_passphrase(
+    workspace: DockerVolumeWorkspace | DockerUserNamespaceWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The rendered `docker run` argv plus the environment handed to it IS the helper's
+    # container spec — what `docker inspect` and config.v2.json show the provider. Grep it.
+    monkeypatch.setenv("LIUM_VOLUME_PASSPHRASE", "leaked-from-the-executor-environment")
+    mode = "encrypted_running" if isinstance(workspace, DockerUserNamespaceWorkspace) else "plain_volume"
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload(action="restore", mode=mode)),
+        workspace,
+    )
+
+    rendered: list[str] = []
+    forwarded_env: set[str] = set()
+    for command, _ in (
+        runner._restore_execution_command(SNAPSHOT_ID),
+        runner._legacy_restore_execution_command("legacy/object.tgz"),
+        runner._execution_command(["backup", "--json", "."], working_directory=True),
+    ):
+        rendered.extend(command)
+        forwarded_env.update(
+            command[index + 1] for index, argument in enumerate(command) if argument == "-e"
+        )
+
+    # only `-e NAME` entries cross from the executor's environment into the container
+    assert "LIUM_VOLUME_PASSPHRASE" not in forwarded_env, forwarded_env
+    assert not any("passphrase" in item.lower() for item in rendered), rendered
+    assert not any("gocryptfs" in item for item in rendered), rendered
+    assert "leaked-from-the-executor-environment" not in " ".join(rendered)
+
+
 def test_local_cancellation_marker_is_observed() -> None:
     events = JsonEventWriter(
         str(OPERATION_ID),
