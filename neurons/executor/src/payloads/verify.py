@@ -23,10 +23,10 @@ MAX_DEVICES = 64
 
 class DeviceChallenge(BaseModel):
     """One card's own challenge for the all-cards work-proof: a run pinned to `index`
-    (`CUDA_VISIBLE_DEVICES`) with a seed and cipher text sealed for that card alone. The validator
-    derives them per device (domain-separated from the intent's nonce), so the output of one real
-    run unseals for one card only — a host with fewer cards than it claims cannot answer for all of
-    them with a single computation."""
+    (`CUDA_VISIBLE_DEVICES`) with a cipher text sealed for that card alone (seeds may repeat, as
+    on the SSH path). The validator derives the cipher text per device (domain-separated from the
+    intent's nonce), so the output of one real run unseals for one card only — a host with fewer
+    cards than it claims cannot answer for all of them with a single computation."""
 
     index: int = Field(ge=0)
     seed: int

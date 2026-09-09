@@ -265,7 +265,9 @@ async def run_verifyx(step: VerifyXStep, *, python: str = sys.executable) -> Ste
             loop.run_in_executor(_facts_executor, sha256_of_file, LIBVERIFYX_PATH),
             timeout=FAST_STEP_TIMEOUT_SECONDS,
         )
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError):
+        # The script has run and is reaped; a deadline that lands during the digest keeps its
+        # output and only leaves lib_sha256 empty.
         digest = None
     result.data = VerifyXData(lib_sha256=digest)
     return result
