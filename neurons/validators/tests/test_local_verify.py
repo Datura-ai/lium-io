@@ -1312,8 +1312,9 @@ async def test_the_gate_reads_the_callers_unscored_flag_not_the_fast_path_sized_
 ):
     """`ContextConfig.first_pass` is `caller's first_pass AND FIRST_PASS_FAST_PATH_ENABLED` (DAH-3011),
     off by default. The gate must not read it: with the fast path off, the express lane's first
-    verification still makes the one call (`unscored=True`, `first_pass=False`), at the full probe
-    size (`parallel_gpu` stays the first-pass shape only when `first_pass` is on)."""
+    verification still makes the one call (`unscored=True`, `first_pass=False`) — serial and at
+    the full probe size, the same shape as a scored cycle's (`parallel_gpu` is the first-pass
+    shape only when `first_pass` is on)."""
     monkeypatch.setattr(settings, "LOCAL_VERIFY_FIRST_PASS_ONLY", True)
     validation = matmul_service(monkeypatch)
     async with FakeExecutor(keypair) as executor:
@@ -1325,6 +1326,7 @@ async def test_the_gate_reads_the_callers_unscored_flag_not_the_fast_path_sized_
         )
         local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
         assert len(executor.intents) == 1
+        assert executor.intents[0]["parallel_gpu"] is False  # serial, full size: not first_pass-shaped
     assert local.event.reason_code == "LOCAL_VERIFY_OK"
     assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
 
