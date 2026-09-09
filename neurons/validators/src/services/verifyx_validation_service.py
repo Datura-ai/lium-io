@@ -141,9 +141,129 @@ class VerifyXResponse:
     diagnostics: Optional[Dict[str, Any]] = None
 
 
+OUTDATED_LIBRARY_ERROR = (
+    "Executor using outdated VerifyX library. Run docker compose restart to update to the latest executor image"
+)
+
+
+@dataclass
+class VerifyXChallenge:
+    """One prepared VerifyX challenge and the validator object that judges its answer (see
+    `VerifyXValidationService.prepare_verifyx_challenge`)."""
+
+    validator: "VerifyXValidator"
+    seed: int
+    cipher_text: str
+    challenge_input: Dict[str, Any]
+    log_extra: Dict[str, Any]
+    # sha256 of the validator's own libverifyx.so; the executor's must match before its answer counts.
+    expected_lib_sha256: str
+
+
 class VerifyXValidationService:
     def __init__(self):
         self.lib_name = "/usr/lib/libverifyx.so"
+
+    def prepare_verifyx_challenge(
+        self,
+        machine_spec: dict,
+        default_extra: dict,
+        challenge_config_overrides: dict | None = None,
+    ) -> "VerifyXChallenge":
+        """Encrypt one VerifyX challenge; the caller decides how it reaches the executor.
+
+        The SSH path runs `verifyx_executor.py --seed … --cipher_text …` over the shell; the local
+        path (liumd phase 1, `POST /verify`) sends the same two arguments in the intent. Either way
+        the response comes back to `evaluate_verifyx_capture`, the one place that decides.
+        """
+        # challenge_config_overrides (DAH-3011): keys of the challenge `config` block to replace for
+        # this run — a first, unscored verification writes less RAM/disk. None = today's config.
+        gpu_details = machine_spec.get("gpu", {}).get("details", [])
+        gpu_count = machine_spec.get("gpu", {}).get("count", 0)
+        gpu_uuids = ",".join([detail.get("uuid", "") for detail in gpu_details])
+        gpu_model = gpu_details[0].get("name", "") if gpu_details else ""
+
+        gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
+
+        seed = random.getrandbits(64)
+        verifyx_validator = VerifyXValidator(self.lib_name, seed)
+
+        challenge_config = {
+            "memory_allocation_percentage": settings.verifyx.MEMORY_ALLOCATION_PERCENTAGE,
+            "memory_min_test_gb": settings.verifyx.MEMORY_MIN_TEST_GB,
+            "memory_max_test_gb": settings.verifyx.MEMORY_MAX_TEST_GB,
+            "storage_min_available_gb": settings.verifyx.STORAGE_MIN_AVAILABLE_GB,
+            "storage_throughput_test_gb": settings.verifyx.STORAGE_THROUGHPUT_TEST_GB,
+            "network_timeout_seconds": settings.verifyx.NETWORK_TIMEOUT_SECONDS,
+            "enable_xet_challenge": settings.verifyx.ENABLE_XET_CHALLENGE,
+        }
+        if challenge_config_overrides:
+            challenge_config.update(challenge_config_overrides)
+        challenge_input = {
+            "seed": seed,
+            "machine_info": gpu_info,
+            "config": challenge_config,
+        }
+
+        cipher_text = verifyx_validator.generate_challenge(challenge_input)
+        log_extra = {
+            **default_extra,
+            "seed": seed,
+            "cipher_text": cipher_text,
+            "challenge_input": challenge_input,
+        }
+        return VerifyXChallenge(
+            validator=verifyx_validator,
+            seed=seed,
+            cipher_text=cipher_text,
+            challenge_input=challenge_input,
+            log_extra=log_extra,
+            expected_lib_sha256=sha256_from_path(self.lib_name),
+        )
+
+    def evaluate_verifyx_capture(
+        self,
+        challenge: "VerifyXChallenge",
+        capture: SSHCapture,
+        default_extra: dict,
+    ) -> "VerifyXResponse":
+        """Judge the executor's `verifyx_executor.py` output — SSH capture or `/verify` step alike."""
+        if capture.transport_error is not None:
+            return self._failure_response(
+                error=f"SSH transport error ({capture.transport_error})",
+                ssh_capture=capture,
+                default_extra=default_extra,
+            )
+
+        challenge_response = (capture.stdout or "").strip()
+
+        logger.info(_m("Challenge response received", extra=get_extra_info({**challenge.log_extra, "challenge_response": challenge_response})))
+
+        # A crashing process may flush partial output before dying; exit_status wins over stdout shape.
+        if capture.exit_status is not None and capture.exit_status != 0:
+            return self._failure_response(
+                error=f"Executor process exited with status {capture.exit_status}",
+                ssh_capture=capture,
+                default_extra=default_extra,
+            )
+
+        if len(challenge_response) < MIN_CIPHER_LEN:
+            return self._failure_response(
+                error=f"Executor returned empty or truncated response (stdout_len={len(challenge_response)})",
+                ssh_capture=capture,
+                default_extra=default_extra,
+            )
+
+        try:
+            payload = challenge.validator.verify_response(challenge_response)
+            verification_result = _perform_verification_checks(payload)
+            return VerifyXResponse(data=verification_result)
+        except Exception as e:
+            return self._failure_response(
+                error=f"challenge verification failed ({str(e)})",
+                ssh_capture=capture,
+                default_extra=default_extra,
+            )
 
     async def validate_verifyx_and_process_job(
         self,
@@ -153,94 +273,27 @@ class VerifyXValidationService:
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
     ):
-        # challenge_config_overrides (DAH-3011): keys of the challenge `config` block to replace for
-        # this run — a first, unscored verification writes less RAM/disk. None = today's config.
+        # The SSH transport: library checksum over the shell → prepare_verifyx_challenge → one
+        # remote `verifyx_executor.py` run → evaluate_verifyx_capture. The local transport
+        # (checks/local_verify.py) calls the same prepare/evaluate around `POST /verify`.
         try:
             # Verify checksum before proceeding with validation
             local_checksum = sha256_from_path(self.lib_name)
             executor_checksum = await sha256_from_executor(shell, self.lib_name)
 
             if local_checksum != executor_checksum:
-                return VerifyXResponse(error="Executor using outdated VerifyX library. Run docker compose restart to update to the latest executor image")
+                return VerifyXResponse(error=OUTDATED_LIBRARY_ERROR)
 
-            gpu_details = machine_spec.get("gpu", {}).get("details", [])
-            gpu_count = machine_spec.get("gpu", {}).get("count", 0)
-            gpu_uuids = ",".join([detail.get("uuid", "") for detail in gpu_details])
-            gpu_model = gpu_details[0].get("name", "") if gpu_details else ""
+            challenge = self.prepare_verifyx_challenge(
+                machine_spec, default_extra, challenge_config_overrides
+            )
 
-            gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
+            command = f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py --seed {challenge.seed} --cipher_text {challenge.cipher_text}"
 
-            seed = random.getrandbits(64)
-            verifyx_validator = VerifyXValidator(self.lib_name, seed)
-
-            challenge_config = {
-                "memory_allocation_percentage": settings.verifyx.MEMORY_ALLOCATION_PERCENTAGE,
-                "memory_min_test_gb": settings.verifyx.MEMORY_MIN_TEST_GB,
-                "memory_max_test_gb": settings.verifyx.MEMORY_MAX_TEST_GB,
-                "storage_min_available_gb": settings.verifyx.STORAGE_MIN_AVAILABLE_GB,
-                "storage_throughput_test_gb": settings.verifyx.STORAGE_THROUGHPUT_TEST_GB,
-                "network_timeout_seconds": settings.verifyx.NETWORK_TIMEOUT_SECONDS,
-                "enable_xet_challenge": settings.verifyx.ENABLE_XET_CHALLENGE,
-            }
-            if challenge_config_overrides:
-                challenge_config.update(challenge_config_overrides)
-            challenge_input = {
-                "seed": seed,
-                "machine_info": gpu_info,
-                "config": challenge_config,
-            }
-
-            cipher_text = verifyx_validator.generate_challenge(challenge_input)
-
-            command = f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py --seed {seed} --cipher_text {cipher_text}"
-
-            log_extra = {
-                **default_extra,
-                "seed": seed,
-                "cipher_text": cipher_text,
-                "challenge_input": challenge_input,
-            }
-
-            logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(log_extra)))
+            logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
             ssh_capture = await self._run_ssh_command(shell, command)
-
-            if ssh_capture.transport_error is not None:
-                return self._failure_response(
-                    error=f"SSH transport error ({ssh_capture.transport_error})",
-                    ssh_capture=ssh_capture,
-                    default_extra=default_extra,
-                )
-
-            challenge_response = (ssh_capture.stdout or "").strip()
-
-            logger.info(_m("Challenge response received", extra=get_extra_info({**log_extra, "challenge_response": challenge_response})))
-
-            # A crashing process may flush partial output before dying; exit_status wins over stdout shape.
-            if ssh_capture.exit_status is not None and ssh_capture.exit_status != 0:
-                return self._failure_response(
-                    error=f"Executor process exited with status {ssh_capture.exit_status}",
-                    ssh_capture=ssh_capture,
-                    default_extra=default_extra,
-                )
-
-            if len(challenge_response) < MIN_CIPHER_LEN:
-                return self._failure_response(
-                    error=f"Executor returned empty or truncated response (stdout_len={len(challenge_response)})",
-                    ssh_capture=ssh_capture,
-                    default_extra=default_extra,
-                )
-
-            try:
-                payload = verifyx_validator.verify_response(challenge_response)
-                verification_result = _perform_verification_checks(payload)
-                return VerifyXResponse(data=verification_result)
-            except Exception as e:
-                return self._failure_response(
-                    error=f"challenge verification failed ({str(e)})",
-                    ssh_capture=ssh_capture,
-                    default_extra=default_extra,
-                )
+            return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
         except Exception as e:
             # Pre-SSH failure (checksum fetch, challenge generation, etc.) — emit a structured

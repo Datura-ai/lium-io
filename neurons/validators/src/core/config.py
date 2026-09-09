@@ -251,6 +251,16 @@ class Settings(BaseSettings):
     # measurements are still taken and published; only the amount of RAM/disk written shrinks.
     FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
     FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
+    # liumd phase 1 (DAH-2834): for an executor whose `/version` advertises `local_verify/1`, run the
+    # capability matmul and VerifyX with ONE signed `POST /verify` instead of the SSH commands, and
+    # judge the answer with the same unseal/verify code. Any refusal, timeout, mismatch or local
+    # failure falls back to the SSH path for that step (logged per outcome, `[local_verify]`).
+    # Off by default; the SSH path is unchanged either way.
+    VALIDATOR_LOCAL_VERIFY_ENABLED: bool = Field(env="VALIDATOR_LOCAL_VERIFY_ENABLED", default=False)
+    # Whole-call budget for `POST /verify` (seconds). Sized for the first pass; a full-size VerifyX
+    # may take longer and then falls back, so keep this above VERIFYX first-pass p90 (90 s) + matmul.
+    LOCAL_VERIFY_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_TIMEOUT_SECONDS", default=240)
+    LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
