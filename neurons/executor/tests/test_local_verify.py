@@ -374,6 +374,24 @@ def test_the_verifyx_library_is_hashed_off_the_event_loop(fake_scripts, fake_doc
     assert pool_thread[0].startswith("local-verify-facts")  # the facts pool, not asyncio's default
 
 
+def test_a_slow_digest_neither_blocks_the_loop_nor_loses_the_run(fake_scripts, fake_docker, monkeypatch):
+    """The digest starts before the script and is awaited after it: a slow one (here 0.4 s, the
+    script instant) delays the answer by its remainder only and the run keeps its output."""
+    real = lvs.sha256_of_file
+
+    def slow(path):
+        time.sleep(0.4)
+        return real(path)
+
+    monkeypatch.setattr(lvs, "sha256_of_file", slow)
+    started = time.perf_counter()
+    result = asyncio.run(_service().run(_body(steps=VerifySteps(verifyx=VerifyXStep(seed=1, cipher_text="d")))))
+    assert result.steps["verifyx"].status == "ok" and result.steps["verifyx"].data.lib_sha256 == real(
+        str(fake_scripts / "verifyx_executor.py")
+    )
+    assert time.perf_counter() - started < 3
+
+
 def test_steps_not_asked_for_are_skipped(fake_scripts, fake_docker):
     result = asyncio.run(_service().run(_body(steps=VerifySteps(docker=True))))
     assert result.steps["docker"].status == "ok"

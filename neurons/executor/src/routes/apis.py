@@ -1,9 +1,9 @@
 import asyncio
 import functools
+import json
 import logging
 import os
 import threading
-import json
 import time
 import tomllib
 from collections.abc import Callable
