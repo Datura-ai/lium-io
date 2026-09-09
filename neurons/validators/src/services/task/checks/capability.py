@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Literal
 
 from core.config import settings
 
-from ..messages import CapabilityMessages as Msg, render_message
+from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 
 if TYPE_CHECKING:
@@ -103,6 +103,7 @@ class CapabilityCheck:
                 "returned_uuid": result.returned_uuid,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
+                "stderr_tail": _tail(result.stderr),
                 "metrics": result.metrics,
             }
         elif failure_reason:
@@ -129,7 +130,7 @@ class CapabilityCheck:
                     updates={"state": replace(ctx.state, rented_data=lium_workload.snapshot)},
                 )
 
-        template = Msg.VERIFY_TIMEOUT if result is not None and result.timed_out else Msg.VERIFY_FAILED
+        template = _failure_template(result)
         event = render_message(
             template,
             ctx=ctx,
@@ -209,6 +210,42 @@ async def _lium_workload_live_now(ctx: Context) -> _LiumWorkload | None:
             snapshot=fresh,
         )
     return None
+
+
+STDERR_TAIL_CHARS = 300
+
+# What the probe prints when it cannot get GPU memory (cudaMalloc failing in the native verifier:
+# "Failed to allocate d_B: out of memory"). The executor then answers no uuid at all, which the
+# service reports as "UUID mismatch: expected '<uuid>', got 'None'" — the wrong story for the
+# provider (DAH-3264: 49 such verdicts on 31 executors in 26 h, every one an allocation failure).
+_VRAM_UNAVAILABLE_MARKERS = (
+    "out of memory",
+    "failed to allocate",
+    "cudaErrorMemoryAllocation",
+)
+
+
+def _tail(text: str | None, limit: int = STDERR_TAIL_CHARS) -> str:
+    text = (text or "").strip()
+    return text[-limit:] if len(text) > limit else text
+
+
+def _failure_template(result) -> MessageTemplate:
+    """Pick the reason for a failed capability probe.
+
+    A timeout keeps its own reason. An answer with no uuid whose stderr/stdout carries a CUDA
+    allocation failure is `VERIFY_FAILED_VRAM_UNAVAILABLE`. A returned uuid that does not match —
+    the anti-spoof case — stays `VERIFY_FAILED`, whatever stderr says.
+    """
+    if result is None:
+        return Msg.VERIFY_FAILED
+    if result.timed_out:
+        return Msg.VERIFY_TIMEOUT
+    returned = (result.returned_uuid or "").strip().lower()
+    output = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+    if returned in _NO_UUID and any(m.lower() in output for m in _VRAM_UNAVAILABLE_MARKERS):
+        return Msg.VERIFY_FAILED_VRAM_UNAVAILABLE
+    return Msg.VERIFY_FAILED
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:
