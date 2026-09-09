@@ -1011,6 +1011,18 @@ class CapabilityMessages:
         impact="Score set to 0",
         remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
     )
+    VERIFY_FAILED_VRAM_UNAVAILABLE = MessageTemplate(
+        event="GPU capability verification could not allocate VRAM",
+        reason="GPU_VERIFY_VRAM_UNAVAILABLE",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The matrix-multiplication probe could not allocate GPU memory: another process held "
+            "VRAM while it ran. Check nvidia-smi for processes or leftover containers on the GPU; "
+            "the next verification cycle retries."
+        ),
+    )
     VERIFY_TIMEOUT = MessageTemplate(
         event="GPU capability verification timed out",
         reason="GPU_VERIFY_TIMEOUT",
