@@ -4939,14 +4939,14 @@ class DockerService:
                 if not local_volume:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (flag off → None → the per-command path below, unchanged).
-                    host_probe: VolumeHostProbe | None = None
+                    volume_probe: VolumeHostProbe | None = None
                     measures_host = self.measures_host_for_volume_sizing(payload)
                     # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
                     if settings.RENTAL_VOLUME_FAST_PATH_ENABLED and (measures_host or payload.volume_limit_gb):
                         current_step = "volume_host_probe"
-                        host_probe = await self.probe_volume_host(
+                        volume_probe = await self.probe_volume_host(
                             ssh_client,
                             with_df=measures_host,
                             log_extra=default_extra,
@@ -4959,7 +4959,7 @@ class DockerService:
                         payload=payload,
                         log_tag=log_tag,
                         log_extra=default_extra,
-                        host_probe=host_probe,
+                        host_probe=volume_probe,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb
@@ -4983,7 +4983,7 @@ class DockerService:
                         log_extra=default_extra,
                         limit=effective_volume_limit_gb,
                         sparse=full_node_rental,
-                        host_probe=host_probe,
+                        host_probe=volume_probe,
                     )
                     created_local_volume = True
 
