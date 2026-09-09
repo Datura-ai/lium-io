@@ -8,8 +8,10 @@ challenges the SSH-driven checks would (`ValidationService.prepare_matmul_challe
 `ctx.state.local_verify`; `CapabilityCheck` and `VerifyXCheck` consume it and skip their SSH run.
 
 Everything else — flag off, capability absent, refusal, timeout, a mismatched answer, a step that
-did not run, or a step that ran and FAILED the judgement — leaves that step to the SSH path, so the
-new transport can only save time, never change a verdict on its own. The matmul is not asked for
+did not run, a step that ran and FAILED the judgement, or a pass that arrived later than the SSH
+path's own cap for that step (`STEP_WALL_CLOCK_CAP_MS`, measured on the validator's clock) — leaves
+that step to the SSH path, so the new transport can only save time, never change a verdict on its
+own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on: the all-cards work-proof runs inside the SSH
 matmul path and a consumed local pass must not skip it. Every outcome is one `[local_verify]
 outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric). Off by default
@@ -30,7 +32,8 @@ from services.local_verify_client import (
     build_intent,
     executor_deadline_s,
 )
-from services.verifyx_validation_service import SSHCapture
+from services.matrix_validation_service import MATRIX_VERIFY_TIMEOUT_SECONDS
+from services.verifyx_validation_service import VERIFYX_COMMAND_TIMEOUT_SECONDS, SSHCapture
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -51,6 +54,20 @@ def _step_reason(step) -> str:
     statuses (failed | timeout | skipped | unsupported, `malformed` from the parser), and
     `step_no_stdout` for an `ok` step that carries nothing to judge."""
     return "step_no_stdout" if step.status == "ok" else f"step_{step.status}"
+
+
+# The SSH path fails a matmul that runs past MATRIX_VERIFY_TIMEOUT_SECONDS and a VerifyX run past
+# VERIFYX_COMMAND_TIMEOUT_SECONDS. The executor's own per-step caps and `step.ms` are its word, so
+# the same bound is applied to the one clock the validator holds: the whole call's round trip,
+# which is an upper bound on any step's wall-clock (serial or side by side).
+STEP_WALL_CLOCK_CAP_MS = {
+    "matmul": MATRIX_VERIFY_TIMEOUT_SECONDS * 1000,
+    "verifyx": VERIFYX_COMMAND_TIMEOUT_SECONDS * 1000,
+}
+
+
+def _over_time(name: str, answer: LocalVerifyAnswer) -> bool:
+    return answer.round_trip_ms > STEP_WALL_CLOCK_CAP_MS[name]
 
 
 @dataclass
@@ -230,6 +247,11 @@ class LocalVerifyCheck:
             reason = _step_reason(step)
             outcome.fallbacks["matmul"] = reason
             self._metric(ctx, "fallback", "matmul", reason, detail=step.error or "", **common)
+        elif _over_time("matmul", answer):
+            # Past the cap the SSH run would have failed it as timed out; a pass that slow is
+            # not consumed — the SSH run decides.
+            outcome.fallbacks["matmul"] = "step_overtime"
+            self._metric(ctx, "fallback", "matmul", "step_overtime", **common)
         else:
             result = ctx.services.validation.evaluate_matmul_output(
                 matmul_challenge, stdout=step.stdout, stderr=step.stderr_tail or ""
@@ -245,6 +267,11 @@ class LocalVerifyCheck:
                     ctx, "fallback", "matmul", "local_failed", detail=result.error_message, **common
                 )
 
+        for name in ("docker", "ports", "inspector"):
+            fact = answer.step(name)
+            if fact.status == "ok":
+                outcome.facts[name] = fact.data
+
         if verifyx_challenge is None:
             return outcome
         step = answer.step("verifyx")
@@ -252,6 +279,9 @@ class LocalVerifyCheck:
             reason = _step_reason(step)
             outcome.fallbacks["verifyx"] = reason
             self._metric(ctx, "fallback", "verifyx", reason, detail=step.error or "", **common)
+        elif _over_time("verifyx", answer):
+            outcome.fallbacks["verifyx"] = "step_overtime"
+            self._metric(ctx, "fallback", "verifyx", "step_overtime", **common)
         elif step.data.get("lib_sha256") != verifyx_challenge.expected_lib_sha256:
             # The SSH path refuses an outdated libverifyx before running; here the digest rides
             # along with the answer and the same refusal applies.
@@ -272,11 +302,6 @@ class LocalVerifyCheck:
                 self._metric(
                     ctx, "fallback", "verifyx", "local_failed", detail=str(response.error), **common
                 )
-
-        for name in ("docker", "ports", "inspector"):
-            fact = answer.step(name)
-            if fact.status == "ok":
-                outcome.facts[name] = fact.data
         return outcome
 
     def _skipped(self, ctx: Context, why: str) -> CheckResult:
