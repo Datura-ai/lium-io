@@ -6,7 +6,8 @@ authors = [
     {name = "Datura", email = "dev@datura.ai"},
 ]
 dependencies = [
-    "pydantic>=2.10,<3",
+    # 2.12 is the first release whose JSON Schema equals the committed snapshot (2.10 omits `additionalProperties`)
+    "pydantic>=2.12,<3",
 ]
 requires-python = ">=3.11"
 readme = "README.md"

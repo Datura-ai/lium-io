@@ -171,7 +171,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install
-        run: pip install -q . pytest
+        # the renderer is pinned: the snapshot is pydantic's JSON Schema, and a pydantic release can change it
+        # (2.10 → 2.12 did); 2.13 wrote the committed snapshot and is the validator's lock (neurons/validators/pdm.lock)
+        run: pip install -q . pytest "pydantic==2.13.*"
 
       - name: Schema snapshot matches the models
         run: python -m lium_protocol.schema --check

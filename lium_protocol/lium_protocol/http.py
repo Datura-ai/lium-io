@@ -1,5 +1,5 @@
-"""Bodies of the backend HTTP API the validator calls between cycles (`clients/backend_client.py`), as
-the validator must be able to parse them. The three typeless replies the backend sends down the
+"""Bodies of the backend HTTP API the validator calls between cycles (`clients/backend_client.py`, and
+`clients/compute_client.py` for the uptime poll), as the validator must be able to parse them. The three typeless replies the backend sends down the
 WebSocket (`Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse`) are in
 `backend_to_validator.SOCKET_REPLIES`, not here.
 
@@ -52,7 +52,7 @@ class ManualRentalInfo(pydantic.BaseModel):
 
 
 class RentedExecutorsResponse(pydantic.BaseModel):
-    """`GET /validator/rented-executors`: every rented executor, the fillers to protect, the bans."""
+    """`GET /internal/executors/rented`: every rented executor, the fillers to protect, the bans."""
 
     executors: dict[str, RentedExecutor]  # key = executor_id
     banned_guids: list[str] = []
@@ -103,6 +103,8 @@ class FillerRunActiveResponse(pydantic.BaseModel):
     started_at: datetime | None = None
 
 
+# One item of `POST /executors` on the compute-app REST API, read by `compute_client.get_executors_uptime`
+# every 20 minutes (`poll_executors_uptime`). A comment, not a docstring: a docstring lands in the schema snapshot.
 class ExecutorUptimeResponse(pydantic.BaseModel):
     executor_ip_address: str
     executor_ip_port: str

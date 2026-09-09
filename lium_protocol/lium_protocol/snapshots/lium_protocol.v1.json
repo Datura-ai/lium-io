@@ -4265,7 +4265,7 @@
       "type": "object"
     },
     "RentedExecutorsResponse": {
-      "description": "`GET /validator/rented-executors`: every rented executor, the fillers to protect, the bans.",
+      "description": "`GET /internal/executors/rented`: every rented executor, the fillers to protect, the bans.",
       "properties": {
         "all_filler_containers_by_executor": {
           "additionalProperties": {

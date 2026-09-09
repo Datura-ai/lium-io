@@ -4,8 +4,9 @@
 JSON Schema document (pydantic's `models_json_schema`: a shared `$defs` where each model and enum appears
 once, and per-section directories mapping a wire `message_type` or body name to its `$ref`) under the
 protocol version.
-`snapshots/lium_protocol.v<major>.json` is that document, committed; CI runs `--check` and fails when the
-models and the file disagree, so a wire change is visible in the PR diff and reviewed as such — the
+`snapshots/lium_protocol.v<major>.json` is that document, committed — rendered with pydantic 2.13, which CI
+pins: a pydantic release can change the rendering (2.10 omits `additionalProperties`) without the wire
+changing. CI runs `--check` and fails when the models and the file disagree, so a wire change is visible in the PR diff and reviewed as such — the
 same mechanism as the visual baselines of lium-platform#199. A change is accepted by re-running
 `--write` and committing the file next to the model change.
 
