@@ -1,3 +1,6 @@
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -197,3 +200,12 @@ async def test_supports_bootstrap_restore_asks_the_executor_models_for_the_field
     command = ssh_client.run.await_args.args[0]
     assert command.startswith("/usr/bin/python3 -c ")
     assert "WorkspaceSpec.__dataclass_fields__" in command and "'bootstrap'" in command
+
+
+def test_bootstrap_probe_finds_the_field_in_this_repo_s_executor_models() -> None:
+    # The probe imports the executor's own storage.models; run it against this checkout's copy
+    # so a renamed field or a wrong sys.path root fails here, not on every encrypted create.
+    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
+    probe = storage_operations._BOOTSTRAP_PROBE.replace("/root/app/src", str(executor_src))
+
+    assert subprocess.run([sys.executable, "-c", probe], check=False).returncode == 0
