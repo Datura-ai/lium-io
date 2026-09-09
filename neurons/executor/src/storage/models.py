@@ -80,6 +80,11 @@ class WorkspaceSpec:
     volume_path: PurePosixPath
     requested_path: PurePosixPath
     container_name: str | None = None
+    # True for the create-time restore into a pod that has just been started (DAH-3274): the
+    # target is the pod's fresh gocryptfs mount, and anything already in it was written by the
+    # image's entrypoint in the seconds since `docker run`, not by the customer. The restore
+    # is allowed to write over it; an online restore (bootstrap=False) still needs an empty target.
+    bootstrap: bool = False
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> WorkspaceSpec:
@@ -98,6 +103,11 @@ class WorkspaceSpec:
         container_name = _optional_nullable_string(value, "container_name")
         if mode is WorkspaceMode.ENCRYPTED_RUNNING and not container_name:
             raise OperationSpecError("workspace.container_name is required for encrypted_running")
+        bootstrap = value.get("bootstrap", False)
+        if not isinstance(bootstrap, bool):
+            raise OperationSpecError("workspace.bootstrap must be a boolean")
+        if bootstrap and mode is not WorkspaceMode.ENCRYPTED_RUNNING:
+            raise OperationSpecError("workspace.bootstrap is only meaningful for encrypted_running")
 
         return cls(
             mode=mode,
@@ -105,6 +115,7 @@ class WorkspaceSpec:
             volume_path=_absolute_path(_required_string(value, "volume_path"), "workspace.volume_path"),
             requested_path=_absolute_path(_required_string(value, "requested_path"), "workspace.requested_path"),
             container_name=_safe_identifier(container_name, "workspace.container_name") if container_name else None,
+            bootstrap=bootstrap,
         )
 
 

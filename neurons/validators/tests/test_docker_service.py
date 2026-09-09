@@ -5282,7 +5282,10 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
     monkeypatch.setattr(
         docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=_docker_run)
     )
-    keys_spy = AsyncMock()
+    async def _keys(*args, **kwargs):
+        order.append("keys")
+
+    keys_spy = AsyncMock(side_effect=_keys)
     monkeypatch.setattr(docker_service, "add_ssh_public_keys_with_rental_docker", keys_spy)
 
     pod_id = str(uuid4())
@@ -5298,13 +5301,12 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
     restore_spy.assert_awaited_once()
     kwargs = restore_spy.await_args.kwargs
     if encrypted:
-        assert order == ["docker_run", "mount", "restore"]
+        # the customer's keys land in /root/.ssh only after the restore has written /root
+        assert order == ["docker_run", "mount", "restore", "keys"]
         assert kwargs["encrypted"] is True
         assert kwargs["container_name"] == docker_service.get_container_name(payload)
-        # the target is still empty: the customer's keys land in /root/.ssh only afterwards
-        assert keys_spy.await_count == 1
     else:
-        assert order == ["restore", "docker_run"]
+        assert order == ["restore", "docker_run", "keys"]
         assert kwargs["encrypted"] is False
         assert "container_name" not in kwargs
 

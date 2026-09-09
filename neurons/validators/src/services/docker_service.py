@@ -5402,6 +5402,11 @@ class DockerService:
         }
         if encrypted:
             workspace["container_name"] = container_name
+            # The pod has been running since `docker run`; its entrypoint may already have
+            # written under the fresh mount (`.jupyter`, `.bashrc`). At create time nothing
+            # there is the customer's, so the executor lets the backup write over it instead
+            # of refusing a non-empty target as an online restore would.
+            workspace["bootstrap"] = True
 
         repository: dict[str, object] = {
             "bucket": restore.backup_volume_info.name,

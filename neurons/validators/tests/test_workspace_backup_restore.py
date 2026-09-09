@@ -629,6 +629,8 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
     assert spec["workspace"]["mode"] == "encrypted_running"
     assert spec["workspace"]["container_name"] == "pod_pod-1"
     assert spec["workspace"]["requested_path"] == "/root"
+    # create-time: the entrypoint may have touched the fresh mount already; the backup wins
+    assert spec["workspace"]["bootstrap"] is True
 
 
 @pytest.mark.asyncio
