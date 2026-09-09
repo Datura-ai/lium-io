@@ -4739,8 +4739,12 @@ class DockerService:
                     # The encrypted restore after `docker run` sends `workspace.bootstrap`; an
                     # executor image from before DAH-3274 ignores the key and refuses the target
                     # the entrypoint has already written to, so the create would fail with the
-                    # pod half-built. Stop here, before the volume and the pod exist: no
-                    # fallback keeps the passphrase off the executor.
+                    # pod half-built. Stop here, before the volume and the pod exist. This is a
+                    # hard failure on purpose, unlike the label check above: that one downgrades
+                    # because the renter's own image can never encrypt (and the status says so),
+                    # while an old executor is the provider's to update — a plain-volume restore
+                    # would put the backup's plaintext on a disk the renter asked to encrypt, and
+                    # the old encrypted mode would hand the executor the passphrase.
                     current_step = "bootstrap_restore_probe"
                     if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
                         raise RuntimeError(
@@ -5095,7 +5099,9 @@ class DockerService:
                             # gocryptfs (the executor nsenters the pod's user namespace, as the
                             # online `lium restore` does). The passphrase stays in the
                             # validator→pod channel; the executor never sees it. Runs before the
-                            # key injection below so the restore target (/root) is still empty.
+                            # key injection below: the entrypoint may already have written to the
+                            # fresh mount, but the restore comes first, so it cannot erase the
+                            # keys the injection puts under /root.
                             current_step = "bootstrap_restore"
                             await self._run_bootstrap_restore(
                                 ssh_client=ssh_client,
