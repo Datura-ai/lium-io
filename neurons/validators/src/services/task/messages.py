@@ -588,7 +588,7 @@ class InspectorMessages:
         severity="warning",
         category="runtime",
         impact="Provider-origin findings recorded; score unchanged",
-        remediation="Review the verdict's evidence and the renter's pod events; the backend acts on the requested quarantine.",
+        remediation="Review the verdict's evidence; under INSPECTOR_ENFORCE_ENABLED the renters were told and the backend acts on the requested quarantine.",
     )
     PLATFORM_ORIGIN_ONLY = MessageTemplate(
         event="Inspector findings were the platform's own execs",

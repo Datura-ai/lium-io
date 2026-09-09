@@ -148,7 +148,11 @@ class InspectorRentedCheck:
             inspector_event = _build_inspector_event(
                 ctx, event, rented_pods, result, outcome="MALICIOUS", report=report, verdict=verdict
             )
-            await _tell_renters(ctx, verdict, when=event.when.isoformat())
+            if enforce:
+                # The renter hears about it only when the verdict acts: in shadow mode the
+                # classifier is still being measured against the sensor's false positives, and a
+                # "the provider read your pod" event on a wrong call cannot be taken back.
+                await _tell_renters(ctx, verdict, when=event.when.isoformat())
             updates: dict[str, Any] = {
                 "default_extra": extra,
                 "state": replace(ctx.state, inspector_event=inspector_event),

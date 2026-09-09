@@ -411,7 +411,10 @@ async def test_platform_only_findings_are_clean_and_no_renter_is_told(context_fa
 
 
 @pytest.mark.asyncio
-async def test_provider_finding_in_shadow_records_the_verdict_and_tells_the_renter(context_factory, monkeypatch):
+async def test_provider_finding_in_shadow_records_the_verdict_and_does_not_tell_the_renter(
+    context_factory, monkeypatch
+):
+    """Shadow mode measures the classifier; the renter is told only when enforcement acts on it."""
     monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", False)
     redis = AsyncMock()
     provider = _finding(HUMAN_KEY_READ, host=True, nested=False)
@@ -434,16 +437,7 @@ async def test_provider_finding_in_shadow_records_the_verdict_and_tells_the_rent
     # the sensor's own diagnostics stay next to the verdict
     assert result.updates["state"].inspector_event["context"]["sensor_integrity"] == "shell_sha256_unattested"
 
-    redis.publish.assert_awaited_once()
-    channel, message = redis.publish.await_args.args
-    assert channel == STREAMING_LOG_CHANNEL
-    assert message["pod_id"] == POD
-    assert message["executor_uuid"] == ctx.executor.uuid
-    (log,) = message["logs"]
-    assert log["log_tag"] == "provider_access_detected"
-    assert log["log_status"] == "error"
-    assert log["evidence_sha256"] == verdict["evidence_sha256"]
-    assert "removed the host" not in log["log_text"]
+    redis.publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -463,7 +457,15 @@ async def test_provider_finding_under_enforcement_fails_the_check_and_requests_q
     verdict = result.updates["state"].inspector_event["context"]["verdict"]
     assert verdict["action"] == ACTION_QUARANTINE
     assert verdict["ban_source"] == "inspector_auto"
-    (log,) = redis.publish.await_args.args[1]["logs"]
+    redis.publish.assert_awaited_once()
+    channel, message = redis.publish.await_args.args
+    assert channel == STREAMING_LOG_CHANNEL
+    assert message["pod_id"] == POD
+    assert message["executor_uuid"] == ctx.executor.uuid
+    (log,) = message["logs"]
+    assert log["log_tag"] == "provider_access_detected"
+    assert log["log_status"] == "error"
+    assert log["evidence_sha256"] == verdict["evidence_sha256"]
     assert "removed the host from the marketplace" in log["log_text"]
 
 
@@ -504,14 +506,16 @@ async def test_tdx_attested_host_marks_the_sensor_attested_and_skips_the_shell_c
 
 @pytest.mark.asyncio
 async def test_renter_event_failure_does_not_lose_the_verdict(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", False)
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)  # the only mode that publishes
     redis = AsyncMock()
     redis.publish.side_effect = ConnectionError("redis down")
     ctx, _ = _ctx(context_factory, [_finding(HUMAN_SHELL, host=True, nested=False)], redis=redis)
 
     result = await InspectorRentedCheck().run(ctx)
 
+    redis.publish.assert_awaited_once()
     assert result.event.reason_code == Msg.MALICIOUS_FINDINGS.reason
+    assert result.updates["inspector_passed"] is False
     assert result.updates["state"].inspector_event["context"]["verdict"]["provider_findings"] == 1
 
 
