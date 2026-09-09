@@ -210,6 +210,11 @@ class Settings(BaseSettings):
         env="INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK",
         default=True,
     )
+    # DAH-3275: a provider-origin Inspector finding on a rented pod fails the check, zeroes the
+    # score and asks the backend for an inspector_auto quarantine (off the marketplace + renters
+    # told; nothing deleted). Off = shadow: the verdict, the evidence hashes and the renter's
+    # pod event are still recorded, the score is untouched.
+    INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is

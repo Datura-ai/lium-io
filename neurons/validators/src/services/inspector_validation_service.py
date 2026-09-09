@@ -24,6 +24,10 @@ INSPECTOR_LIB_PATH = "/usr/lib/libinspector.so"
 INSPECTOR_COMMAND_TIMEOUT_SECONDS = 30
 INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS = 10
 INSPECTOR_STDERR_CAPTURE_MAX_BYTES = 8192
+# the sensor is inside the executor image measured by the CVM's TDX quote
+SENSOR_INTEGRITY_MEASURED = "tdx_measured_image"
+# a sha256sum run through the provider's own shell — unattested
+SENSOR_INTEGRITY_SHELL = "shell_sha256_unattested"
 
 
 class InspectionFailed(Exception):
@@ -133,6 +137,8 @@ class InspectorValidationService:
         ssh: asyncssh.SSHClientConnection,
         executor: ExecutorSSHInfo,
         default_extra: dict[str, Any],
+        *,
+        sensor_attested: bool = False,
     ) -> InspectorValidationResponse:
         from services.task.messages import InspectorMessages as Msg
 
@@ -142,24 +148,31 @@ class InspectorValidationService:
         diagnostics: dict[str, Any] = {
             "command": command,
             "executor_uuid": executor.uuid,
+            # DAH-3275: what vouches for the sensor binary this report came from. On a dstack
+            # CVM the executor image (and the .so in it) is part of the stack the validator
+            # measured against TDX_WHITELIST; asking the provider's shell for a sha256sum on
+            # top proves nothing (the shell is theirs), so the shell read is skipped there and
+            # every other host is marked as what it is.
+            "sensor_integrity": SENSOR_INTEGRITY_MEASURED if sensor_attested else SENSOR_INTEGRITY_SHELL,
         }
 
         try:
-            executor_checksum = await sha256_from_executor(shell, self.lib_path)
-            if self.local_checksum != executor_checksum:
-                return self._failure_response(
-                    error=(
-                        "Executor using outdated libinspector library. "
-                        "Run docker compose restart to update to the latest executor image"
-                    ),
-                    message=Msg.FAILED_LIB_MISMATCH,
-                    diagnostics={
-                        **diagnostics,
-                        "local_sha256": self.local_checksum,
-                        "executor_sha256": executor_checksum or None,
-                    },
-                    default_extra=default_extra,
-                )
+            if not sensor_attested:
+                executor_checksum = await sha256_from_executor(shell, self.lib_path)
+                if self.local_checksum != executor_checksum:
+                    return self._failure_response(
+                        error=(
+                            "Executor using outdated libinspector library. "
+                            "Run docker compose restart to update to the latest executor image"
+                        ),
+                        message=Msg.FAILED_LIB_MISMATCH,
+                        diagnostics={
+                            **diagnostics,
+                            "local_sha256": self.local_checksum,
+                            "executor_sha256": executor_checksum or None,
+                        },
+                        default_extra=default_extra,
+                    )
 
             validator = InspectorValidator(self.inspector_lib)
             validator.start_session()

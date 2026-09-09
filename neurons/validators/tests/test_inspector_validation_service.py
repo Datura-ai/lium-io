@@ -557,3 +557,39 @@ async def test_capture_stderr_does_not_wait_forever():
     captured = await service._capture_stderr(process)
 
     assert captured is None
+
+
+@pytest.mark.asyncio
+async def test_validate_rented_executor_on_an_attested_host_trusts_the_measured_image_not_the_shell():
+    # DAH-3275: on a dstack CVM the executor image is measured by the TDX quote; a sha256sum
+    # answered by the provider's shell adds nothing, so it is not asked for — and the
+    # diagnostics say which of the two vouched for the sensor.
+    service = InspectorValidationService()
+    ssh = FakeSSH()
+    shell = FakeShell(sha256="different")
+
+    result = await service.validate_rented_executor(
+        shell,
+        ssh,
+        SimpleNamespace(uuid="exec-1", python_path="/usr/bin/python3", root_dir="/root/app"),
+        {"executor_uuid": "exec-1"},
+        sensor_attested=True,
+    )
+
+    assert result.error is None
+    assert shell.remote_checksum_calls == 0
+    assert result.diagnostics["sensor_integrity"] == "tdx_measured_image"
+
+
+@pytest.mark.asyncio
+async def test_validate_rented_executor_marks_the_shell_checksum_unattested():
+    service = InspectorValidationService()
+    result = await service.validate_rented_executor(
+        FakeShell(),
+        FakeSSH(),
+        SimpleNamespace(uuid="exec-1", python_path="/usr/bin/python3", root_dir="/root/app"),
+        {"executor_uuid": "exec-1"},
+    )
+
+    assert result.error is None
+    assert result.diagnostics["sensor_integrity"] == "shell_sha256_unattested"

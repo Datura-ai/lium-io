@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
 from typing import Any
 
 from services.const import SECONDS_PER_BLOCK
 from services.inspector_validation_service import InspectorValidationResponse
+from services.redis_service import STREAMING_LOG_CHANNEL
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 
+from ..inspector_verdict import InspectorVerdict, build_verdict, renter_access_event
 from ..messages import InspectorMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from ..models import ValidationEvent
 from protocol.vc_protocol.compute_requests import RentedPod
+
+logger = logging.getLogger(__name__)
 
 
 class InspectorRentedCheck:
@@ -50,11 +56,13 @@ class InspectorRentedCheck:
             "rented_pods": [{"name": p.container_name, "pod_id": p.pod_id} for p in rented_pods],
         }
 
+        sensor_attested = _sensor_attested(ctx)
         result = await ctx.services.inspector.validate_rented_executor(
             ctx.services.shell,
             ctx.ssh,
             ctx.executor,
             ctx.default_extra,
+            sensor_attested=sensor_attested,
         )
 
         if result.error:
@@ -84,9 +92,19 @@ class InspectorRentedCheck:
         report = dict(result.report or {})
         findings = _findings(report)
         warnings = _collector_start_warnings(report)
-        if findings:
+        enforce = settings.INSPECTOR_ENFORCE_ENABLED
+        verdict = build_verdict(
+            report,
+            findings,
+            rented_pod_ids=[p.pod_id for p in rented_pods],
+            sensor_attested=sensor_attested,
+            enforce=enforce,
+        )
+        if verdict.provider_origin:
             what: dict[str, Any] = {
-                "findings": findings,
+                "findings": verdict.provider_findings,
+                "platform_findings": len(verdict.platform_findings),
+                "verdict": verdict.as_payload(),
                 "summary": report.get("summary", {}),
                 "canary_ok": report.get("canary_ok"),
             }
@@ -96,25 +114,38 @@ class InspectorRentedCheck:
                 Msg.MALICIOUS_FINDINGS,
                 ctx=ctx,
                 check_id=self.check_id,
+                severity="error" if enforce else None,
+                impact=(
+                    "Provider-origin access to a rented pod: score zeroed, quarantine requested"
+                    if enforce
+                    else "Provider-origin access to a rented pod recorded; score unchanged (INSPECTOR_ENFORCE_ENABLED off)"
+                ),
                 what=what,
                 extra=extra,
             )
             inspector_event = _build_inspector_event(
-                ctx, event, rented_pods, result, outcome="MALICIOUS", report=report
+                ctx, event, rented_pods, result, outcome="MALICIOUS", report=report, verdict=verdict
             )
-            return CheckResult(
-                passed=True,
-                event=event,
-                updates={
-                    "default_extra": extra,
-                    "state": replace(ctx.state, inspector_event=inspector_event),
-                },
-            )
+            await _tell_renters(ctx, verdict, when=event.when.isoformat())
+            updates: dict[str, Any] = {
+                "default_extra": extra,
+                "state": replace(ctx.state, inspector_event=inspector_event),
+            }
+            if enforce:
+                # Non-fatal check: passed=False alone changes nothing downstream, the score gate
+                # in calculate_scores reads this flag (same mechanics as cpu_truth_passed).
+                updates["inspector_passed"] = False
+            return CheckResult(passed=not enforce, event=event, updates=updates)
 
         clean_what: dict[str, Any] = {
             "summary": report.get("summary", {}),
             "canary_ok": report.get("canary_ok"),
+            "verdict": verdict.as_payload(),
         }
+        if verdict.platform_findings:
+            # every finding was one of our own execs seen from a host whose Tetragon lost the
+            # sshd ancestry — recorded, not malicious (the 8 Sep false positives)
+            clean_what["platform_findings"] = verdict.platform_findings
         if _canary_failed(report):
             outcome = "CANARY_FAILED"
             event = render_message(
@@ -148,6 +179,15 @@ class InspectorRentedCheck:
                 },
                 extra=extra,
             )
+        elif verdict.platform_findings:
+            outcome = "CLEAN"
+            event = render_message(
+                Msg.PLATFORM_ORIGIN_ONLY,
+                ctx=ctx,
+                check_id=self.check_id,
+                what=clean_what,
+                extra=extra,
+            )
         else:
             outcome = "CLEAN"
             event = render_message(
@@ -158,7 +198,7 @@ class InspectorRentedCheck:
                 extra=extra,
             )
         inspector_event = _build_inspector_event(
-            ctx, event, rented_pods, result, outcome=outcome, report=report
+            ctx, event, rented_pods, result, outcome=outcome, report=report, verdict=verdict
         )
         return CheckResult(
             passed=True,
@@ -178,6 +218,7 @@ def _build_inspector_event(
     *,
     outcome: str,
     report: dict[str, Any] | None = None,
+    verdict: InspectorVerdict | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "executor_id": ctx.executor.uuid,
@@ -197,8 +238,47 @@ def _build_inspector_event(
     else:
         payload["report"] = report
         payload["error"] = None
-        payload["context"] = result.diagnostics or {}
+        # `context` is the one free-form field InspectorEventRequest carries to the backend;
+        # the verdict rides there (evidence hashes, sensor state, requested action + ban source)
+        # so the consumer can act on it without re-deriving the classification.
+        payload["context"] = {
+            **(result.diagnostics or {}),
+            **({"verdict": verdict.as_payload()} if verdict is not None else {}),
+        }
     return payload
+
+
+def _sensor_attested(ctx: Context) -> bool:
+    # The sensor (libinspector.so + Tetragon) ships inside the executor image. On a dstack CVM
+    # the image is part of the measured stack the validator checked against TDX_WHITELIST, so
+    # the report comes from a measured binary; elsewhere its checksum was read through the
+    # provider's own shell and proves nothing — say so in the verdict.
+    return bool(ctx.tdx_attestation_passed)
+
+
+async def _tell_renters(ctx: Context, verdict: InspectorVerdict, *, when: str) -> None:
+    redis = ctx.services.redis
+    if redis is None or not verdict.affected_pod_ids:
+        return
+    for pod_id in verdict.affected_pod_ids:
+        try:
+            await redis.publish(
+                STREAMING_LOG_CHANNEL,
+                {
+                    "logs": [renter_access_event(verdict, pod_id=pod_id, when=when)],
+                    "miner_hotkey": ctx.miner_hotkey,
+                    "executor_uuid": ctx.executor.uuid,
+                    "pod_id": pod_id,
+                },
+            )
+        except Exception as exc:  # the verdict itself is already in the inspector event
+            logger.warning(
+                _m(
+                    "Failed to publish provider_access_detected to the pod stream",
+                    extra=get_extra_info({**ctx.default_extra, "pod_id": pod_id, "error": str(exc)}),
+                )
+            )
+
 
 def _canary_failed(report: dict[str, Any]) -> bool:
     return report.get("canary_ok") is False
