@@ -36,13 +36,22 @@ INTENT_TTL_SECONDS = 120
 # after the deadline; the intent's `deadline_s` is therefore the client's whole-call timeout minus
 # this margin, so a `deadline_hit` answer (finished steps inside) arrives before the client gives up.
 EXECUTOR_DEADLINE_MARGIN_SECONDS = 30
-# `VerifyIntentBody.deadline_s` on the executor: ge=5, le=3600.
+# `VerifyIntentBody.deadline_s` on the executor: ge=5, le=3600 — anything outside is a 422.
 EXECUTOR_DEADLINE_MIN_SECONDS = 5
+EXECUTOR_DEADLINE_MAX_SECONDS = 3600
 
 
 def executor_deadline_s(timeout_s: int) -> int:
-    """The `deadline_s` to put in the intent for a client whole-call timeout of `timeout_s`."""
-    return max(EXECUTOR_DEADLINE_MIN_SECONDS, int(timeout_s) - EXECUTOR_DEADLINE_MARGIN_SECONDS)
+    """The `deadline_s` to put in the intent for a client whole-call timeout of `timeout_s`,
+    clamped to what the executor accepts."""
+    wanted = int(timeout_s) - EXECUTOR_DEADLINE_MARGIN_SECONDS
+    return max(EXECUTOR_DEADLINE_MIN_SECONDS, min(EXECUTOR_DEADLINE_MAX_SECONDS, wanted))
+
+
+def _wire_int(value: Any) -> int:
+    """An executor-reported count; anything that is not a plain int reads as 0 (the answer stays
+    parseable — a bad number is not worth losing the other steps' evidence for)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 class LocalVerifyUnavailable(Exception):
@@ -109,7 +118,7 @@ class StepEvidence:
             return cls(status="malformed", error="step is not an object with a status")
         return cls(
             status=raw["status"],
-            ms=int(raw.get("ms") or 0),
+            ms=_wire_int(raw.get("ms")),
             exit_status=raw.get("exit_status"),
             stdout=raw.get("stdout") if isinstance(raw.get("stdout"), str) else None,
             stderr_tail=raw.get("stderr_tail") if isinstance(raw.get("stderr_tail"), str) else None,
@@ -149,7 +158,7 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
         nonce=raw["nonce"],
         executor_uuid=raw["executor_uuid"],
         executor_version=str(raw.get("executor_version") or ""),
-        elapsed_ms=int(raw.get("elapsed_ms") or 0),
+        elapsed_ms=_wire_int(raw.get("elapsed_ms")),
         deadline_hit=bool(raw.get("deadline_hit")),
         steps={name: StepEvidence.from_wire(step) for name, step in steps.items()},
         round_trip_ms=round_trip_ms,

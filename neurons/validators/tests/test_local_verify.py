@@ -24,14 +24,17 @@ from aiohttp.test_utils import TestServer
 from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.checks.local_verify import (
+    STEP_WALL_CLOCK_CAP_MS,
     LocalVerifyCheck,
     LocalVerifyOutcome,
 )
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.local_verify_client import (
     CAPABILITY,
     EXECUTOR_DEADLINE_MARGIN_SECONDS,
+    EXECUTOR_DEADLINE_MAX_SECONDS,
     SCHEMA,
     LocalVerifyClient,
     LocalVerifyUnavailable,
@@ -378,6 +381,43 @@ def test_wire_contract_with_the_executor_side(keypair):
     answer = parse_answer(result.model_dump(by_alias=True), intent=intent, round_trip_ms=7)
     assert answer.step("matmul").stdout == "RESULT_JSON: {}"
     assert answer.step("verifyx").status == "timeout" and answer.step("ports").status == "skipped"
+
+    # A number the executor got wrong reads as 0 and labels nothing else: the other steps' evidence
+    # stays parseable instead of the whole answer becoming an internal error.
+    doc = result.model_dump(by_alias=True)
+    doc["elapsed_ms"] = "fast"
+    doc["steps"]["matmul"]["ms"] = None
+    answer = parse_answer(doc, intent=intent, round_trip_ms=7)
+    assert answer.elapsed_ms == 0 and answer.step("matmul").ms == 0
+    assert answer.step("matmul").stdout == "RESULT_JSON: {}"
+
+
+@pytest.mark.asyncio
+async def test_the_intent_the_check_sends_is_what_the_executor_accepts(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """Not a hand-built intent: the document `LocalVerifyCheck._run` actually put on the wire (both
+    GPU steps, the facts, the deadline) goes through the executor's own model."""
+    import importlib.util
+    import pathlib
+
+    path = (
+        pathlib.Path(__file__).resolve().parents[2] / "executor" / "src" / "payloads" / "verify.py"
+    )
+    spec = importlib.util.spec_from_file_location("executor_payloads_verify_2", path)
+    exe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exe)
+
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+        )
+        await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+    parsed = exe.VerifyIntent.model_validate(executor.intents[0])
+    assert parsed.steps.matmul is not None and parsed.steps.verifyx is not None
+    assert parsed.steps.docker and parsed.steps.ports and parsed.steps.inspector
+    assert parsed.deadline_s == executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -848,6 +888,8 @@ def test_executor_deadline_leaves_the_answer_room_inside_the_client_timeout():
     executor's minimum, so a cut answer can be consumed instead of timing out on the wire."""
     assert executor_deadline_s(240) == 240 - EXECUTOR_DEADLINE_MARGIN_SECONDS == 210
     assert executor_deadline_s(31) == 5 and executor_deadline_s(5) == 5
+    # …and never above what the executor's `deadline_s` field accepts (le=3600 → a 422 otherwise).
+    assert executor_deadline_s(10_000) == EXECUTOR_DEADLINE_MAX_SECONDS == 3600
     assert EXECUTOR_DEADLINE_MARGIN_SECONDS >= 10
 
 
@@ -960,6 +1002,76 @@ async def test_no_specs_or_filler_only_skip_without_a_call(
     )
     result = await LocalVerifyCheck(client_factory=factory).run(ctx)
     assert result.passed and result.event.reason_code == "LOCAL_VERIFY_SKIPPED"
+
+
+@pytest.mark.asyncio
+async def test_filler_only_node_is_skipped_without_a_call(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """A node running only Lium's own filler (no customer pod) is not probed — the same rule as
+    `CapabilityCheck` (`_get_filler_only_container`); a filler beside a customer pod is a rental
+    and is handled by the rented branch, not here."""
+    validation = matmul_service(monkeypatch)
+    factory = MagicMock(side_effect=AssertionError("no client for a filler-only node"))
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair,
+            executor.executor_info,
+            validation=validation,
+            verifyx=verifyx_service,
+            state=build_state(
+                specs=SPECS,
+                rented_data=RentedExecutorsResponse(
+                    executors={},
+                    banned_guids=[],
+                    filler_containers_by_executor={EXECUTOR_UUID: "filler_active"},
+                ),
+            ),
+        )
+        result = await LocalVerifyCheck(client_factory=factory).run(ctx)
+        assert executor.intents == []
+    assert result.passed and result.event.reason_code == "LOCAL_VERIFY_SKIPPED"
+    assert result.event.what_we_saw["why"] == "filler only"
+    factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_step", ["matmul", "verifyx"])
+async def test_a_pass_slower_than_the_ssh_cap_is_left_to_ssh(
+    keypair, monkeypatch, local_verify_on, verifyx_service, slow_step
+):
+    """The SSH path fails a matmul past MATRIX_VERIFY_TIMEOUT_SECONDS and a VerifyX past
+    VERIFYX_COMMAND_TIMEOUT_SECONDS; the executor's `ms` is its own word, so the validator's round
+    trip is held to the same cap and a slower pass is not consumed — the SSH run decides."""
+    validation = matmul_service(monkeypatch)
+    ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
+    ssh_verifyx = AsyncMock(
+        return_value=vvs.VerifyXResponse(
+            data={"success": True, "network": {"download_speed": 1.0, "upload_speed": 1.0}}
+        )
+    )
+    validation.validate_gpu_model_and_process_job = ssh_matmul
+    verifyx_service.validate_verifyx_and_process_job = ssh_verifyx
+    # The fake answers in under a millisecond; only the slow step's cap is pulled under that.
+    monkeypatch.setitem(STEP_WALL_CLOCK_CAP_MS, slow_step, -1)
+    other = "verifyx" if slow_step == "matmul" else "matmul"
+
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+        )
+        local, verifyx, capability = await run_local_then_consumers(
+            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+        )
+    assert local.event.what_we_saw["fallbacks"] == {slow_step: "step_overtime"}
+    assert local.event.what_we_saw["consumed"] == [other]
+    assert local.event.what_we_saw["round_trip_ms"] > STEP_WALL_CLOCK_CAP_MS[slow_step]
+    slow, fast = (capability, verifyx) if slow_step == "matmul" else (verifyx, capability)
+    assert slow.event.what_we_saw["transport"] == "ssh"
+    assert fast.event.what_we_saw["transport"] == "local_verify"
+    assert (ssh_matmul.await_count, ssh_verifyx.await_count) == (
+        (1, 0) if slow_step == "matmul" else (0, 1)
+    )
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():
