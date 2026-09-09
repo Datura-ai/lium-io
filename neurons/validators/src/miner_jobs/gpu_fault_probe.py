@@ -6,7 +6,7 @@ through nvidia-ml-py when it is importable. One forked worker per GPU runs, for 
 access patterns a cuBLAS matmul never exercises: a random permutation built on the device, a gather
 through it, a scatter back (plain stores and atomics), a dependent pointer chase, and a pinned-memory
 async H2D/D2H round-trip. Every result is verified on the device (mismatch counters) and a sample of
-the chase on the host. A fault is any non-zero CUDA return code once the context exists
+the chase on the host. A fault is any non-zero CUDA return code once the kernels run
 (CUDA_ERROR_ILLEGAL_ADDRESS is what Blender prints as "Illegal address in CUDA queue"), a data
 mismatch, a worker that crashes or hangs once its kernels run, or an uncorrected-ECC / remapped-row /
 recovery-action change in NVML across the run. A probe that cannot start (no libcuda, cuInit, PTX JIT,
@@ -24,6 +24,7 @@ import json
 import multiprocessing
 import multiprocessing.connection
 import os
+import re
 import subprocess
 import sys
 import time
@@ -43,6 +44,12 @@ WORKER_GRACE_SECONDS = 30  # on top of --seconds: JIT, allocations, copies, host
 WORKER_GRACE_PER_GPU_SECONDS = (
     5  # more of it per extra worker: they fork, JIT and allocate at the same time
 )
+NVML_GRACE_SECONDS = 10  # an NVML snapshot runs in its own fork: nvmlInit hangs on a wedged card
+WORKER_REAP_SECONDS = 5  # one shared wait for killed workers to be reaped, whatever their number
+DMESG_TIMEOUT_SECONDS = 5
+# Xid types an application raises on a healthy card (graphics exception, MMU fault, channel reset, preemptive
+# cleanup): a rented pod's own bug, not the hardware. The probe's own kernels report those through CUresult.
+SOFTWARE_XIDS = {13, 31, 43, 45}
 
 # fmix32-style mixer whose every step is a bijection on [0, 2**k): (x + seed) mod 2**k, odd multiplier
 # mod 2**k, xorshift within k bits. Mirrored in PTX by k_perm; the host replays it to check the chase.
@@ -474,6 +481,10 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
     name = ctypes.create_string_buffer(256)
     lib.cuDeviceGetName(name, 256, device)
     report["name"] = name.value.decode(errors="replace")
+    bus_id = ctypes.create_string_buffer(64)
+    lib.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    if lib.cuDeviceGetPCIBusId(bus_id, 64, device) == 0:
+        report["pci_bus_id"] = bus_id.value.decode(errors="replace")
 
     # setup: everything up to the first kernel launch is "could the probe start", not "is the card faulty" —
     # a context the driver refuses, a busy or full card, a memlock cap on pinned memory all raise ProbeError
@@ -603,7 +614,17 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
     return report
 
 
+def _quiet_child() -> None:
+    # a forked worker inherits the SSH session's stdout/stderr; one the driver holds unreaped would keep the
+    # channel open after the parent has printed its verdict. Children talk to the parent over their pipe only.
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+
+
 def _worker(index: int, seconds: float, vram_mb: int, conn) -> None:
+    _quiet_child()
     started = time.perf_counter()
 
     def on_phase(phase: str) -> None:
@@ -625,6 +646,7 @@ def _worker(index: int, seconds: float, vram_mb: int, conn) -> None:
 
 
 def _count_worker(conn) -> None:
+    _quiet_child()
     try:
         cuda = Cuda()
         cuda.call("cuInit", 0, fault=False)
@@ -675,6 +697,7 @@ def nvml_snapshot() -> dict:
             gpu: dict = {"index": i}
             for key, read in (
                 ("uuid", lambda h: pynvml.nvmlDeviceGetUUID(h)),
+                ("pci_bus_id", lambda h: pynvml.nvmlDeviceGetPciInfo(h).busId),
                 (
                     "ecc_uncorrected",
                     lambda h: pynvml.nvmlDeviceGetTotalEccErrors(
@@ -693,6 +716,34 @@ def nvml_snapshot() -> dict:
     finally:
         pynvml.nvmlShutdown()
     return {"available": True, "gpus": gpus}
+
+
+def _nvml_worker(conn) -> None:
+    _quiet_child()
+    try:
+        conn.send(nvml_snapshot())
+    except Exception as exc:  # noqa: BLE001
+        conn.send({"available": False, "error": f"{type(exc).__name__}: {exc}"})
+    conn.close()
+
+
+def nvml_snapshot_forked(mp) -> dict:
+    # in its own fork with a deadline: nvmlInit and the per-GPU reads block on a card that has wedged the
+    # driver, and this parent must always print its verdict
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    process = mp.Process(target=_nvml_worker, args=(child_conn,))
+    process.start()
+    child_conn.close()
+    snapshot = (
+        parent_conn.recv()
+        if parent_conn.poll(NVML_GRACE_SECONDS)
+        else {"available": False, "error": f"NVML snapshot hung for {NVML_GRACE_SECONDS}s"}
+    )
+    process.join(1)
+    if process.is_alive():
+        process.kill()
+        process.join(5)
+    return snapshot
 
 
 def nvml_faults(before: dict, after: dict) -> list[str]:
@@ -735,13 +786,49 @@ def nvml_faults(before: dict, after: dict) -> list[str]:
 def xid_lines() -> dict:
     """The kernel log's NVRM Xid lines when the container may read it; most cannot, and that is fine."""
     try:
-        out = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5)
+        out = subprocess.run(
+            ["dmesg"], capture_output=True, text=True, timeout=DMESG_TIMEOUT_SECONDS
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"available": False, "error": str(exc)}
     if out.returncode != 0:
         return {"available": False, "error": (out.stderr or "").strip()[:200]}
     lines = [line.strip() for line in out.stdout.splitlines() if "NVRM: Xid" in line]
-    return {"available": True, "count": len(lines), "last": lines[-5:]}
+    return {"available": True, "count": len(lines), "last": lines[-5:], "lines": lines}
+
+
+def pci_key(bus_id) -> str | None:
+    """`0000:81:00.0`, `00000000:81:00.0` and dmesg's `PCI:0000:81:00` all become `0000:81:00`."""
+    if not isinstance(bus_id, str):
+        return None
+    parts = bus_id.strip().lower().split(".")[0].split(":")
+    if len(parts) == 2:
+        parts = ["0000", *parts]
+    if len(parts) != 3:
+        return None
+    return f"{parts[0][-4:].rjust(4, '0')}:{parts[1]}:{parts[2]}"
+
+
+def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list[str]]:
+    """New Xid lines split into this executor's hardware faults and evidence about other cards.
+
+    dmesg is host-wide: a rented pod's illegal address on another card, or a sibling executor's fault, must
+    not be scored against this one. A new line counts as a fault only when its PCI id is one of the probed
+    devices and its Xid type is not an application error (SOFTWARE_XIDS); everything else is kept as evidence.
+    """
+    if not (before.get("available") and after.get("available")):
+        return [], []
+    new_lines = (after.get("lines") or [])[len(before.get("lines") or []) :]
+    faults, other = [], []
+    for line in new_lines:
+        pci = re.search(r"Xid \(PCI:([0-9a-fA-F:.]+)\)", line)
+        code = re.search(r"Xid \([^)]*\): (\d+)", line)
+        xid = int(code.group(1)) if code else None
+        if pci and pci_key(pci.group(1)) in bus_ids and xid not in SOFTWARE_XIDS:
+            faults.append(f"new NVRM Xid on a probed GPU: {line[:200]}")
+        else:
+            other.append(line[:200])
+    return faults, other
 
 
 def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]:
@@ -795,8 +882,11 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
     for index in list(pending):
         pending[index]["process"].kill()
         no_verdict(index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s")
+    # one reap grace for all of them, not 5 s each: a killed worker the driver still holds must not push
+    # the verdict past the validator's SSH cap on an 8-GPU host
+    reap_by = time.perf_counter() + WORKER_REAP_SECONDS
     for _, process, _ in workers:
-        process.join(5)
+        process.join(max(0.0, reap_by - time.perf_counter()))
     return [reports[index] for index, _, _ in workers]
 
 
@@ -834,7 +924,7 @@ def main(argv: list[str]) -> int:
         print(JSON_MARKER, json.dumps(result, sort_keys=True))
         return 2
 
-    result["nvml_before"] = nvml_snapshot()
+    result["nvml_before"] = nvml_snapshot_forked(mp)
     xid_before = xid_lines()
 
     workers = []
@@ -851,12 +941,19 @@ def main(argv: list[str]) -> int:
     budget = args.seconds + grace
     result["devices"] = drain_workers(workers, time.perf_counter() + budget, budget)
 
-    result["nvml_after"] = nvml_snapshot()
-    result["xid"] = xid_lines()
-    if xid_before.get("available") and result["xid"].get("available"):
-        new_xids = result["xid"]["count"] - xid_before["count"]
-        if new_xids > 0:
-            result["faults"].append(f"{new_xids} new NVRM Xid line(s): {result['xid']['last']}")
+    result["nvml_after"] = nvml_snapshot_forked(mp)
+    xid_after = xid_lines()
+    # the cards this run speaks for: the workers' own PCI ids, plus NVML's when every device was probed
+    bus_ids = {pci_key(r.get("pci_bus_id")) for r in result["devices"]} - {None}
+    if not args.device:
+        bus_ids |= {
+            pci_key(g.get("pci_bus_id")) for g in result["nvml_before"].get("gpus") or []
+        } - {None}
+    xid_new, xid_other = xid_faults(xid_before, xid_after, bus_ids)
+    result["faults"].extend(xid_new)
+    result["xid"] = {k: v for k, v in xid_after.items() if k != "lines"}
+    if xid_other:
+        result["xid"]["other_new"] = xid_other[-5:]
     result["faults"].extend(nvml_faults(result["nvml_before"], result["nvml_after"]))
     for report in result["devices"]:
         if report["status"] == "fault":
@@ -873,4 +970,10 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    code = main(sys.argv[1:])
+    # the verdict is printed into a pipe (block-buffered) and multiprocessing joins live children at exit
+    # without a timeout: flush, then leave without the exit handlers so a child the driver still holds
+    # cannot keep the verdict from the validator
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

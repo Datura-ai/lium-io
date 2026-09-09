@@ -21,10 +21,13 @@ PROBE_JSON_MARKER = "GPU_FAULT_PROBE_JSON:"
 # working set. A hung card is caught INSIDE the probe: the workers share one wall-clock budget (--seconds
 # + 30 s + 5 s per extra GPU) and are drained together, so every card gets the whole budget and a verdict —
 # a hang in setup is an error (scored UNKNOWN), a hang in the kernels is a fault. This cap sits above the
-# largest budget (8 GPUs: 4 + 65 s) and only catches an interpreter that never printed or an SSH channel that stalled;
+# largest budget (8 GPUs: 4 + 65 s) plus the parent's bounded tail after the drain (one reap grace, two NVML
+# snapshots in a fork with their own deadline, two dmesg reads: 47 s when everything hangs at once) —
+# test_the_ssh_cap_sits_above_the_probes_own_largest_deadline adds it up — and only catches
+# an interpreter that never printed or an SSH channel that stalled;
 # the runner sets error_type "timeout" for any asyncio.TimeoutError around ssh.run, so that path cannot
 # tell a transport stall from a hung host and is scored UNKNOWN, like the other no-report outcomes.
-PROBE_TIMEOUT_SECONDS = 120
+PROBE_TIMEOUT_SECONDS = 150
 PROBE_SECONDS = 4
 OUTPUT_TAIL_CHARS = 800
 # the report is executor-controlled: bound what is copied into the event
@@ -113,10 +116,14 @@ class GpuFaultProbeCheck:
                 event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
             )
         if status == "fault":
-            return self._fault(
-                ctx, what, error="; ".join(report.get("faults") or []) or "fault", report=report
+            faults = _cap(report.get("faults"))
+            error = (
+                "; ".join(str(fault) for fault in faults if fault is not None)
+                if isinstance(faults, list)
+                else ""
             )
-        what["error"] = report.get("error") or f"probe status {status!r}"
+            return self._fault(ctx, what, error=error or "fault", report=report)
+        what["error"] = _cap(report.get("error")) or f"probe status {_cap(status)!r}"
         return CheckResult(
             passed=True,
             event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
@@ -152,16 +159,35 @@ def _parse_report(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def _cap(value: Any) -> Any:
+    """Bound anything copied out of the executor-written report: strings cut, lists cut and capped
+    element-wise, numbers and None kept, dicts and everything else dropped."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:MAX_FAULT_CHARS]
+    if isinstance(value, list):
+        return [
+            _cap(item) if isinstance(item, (str, bool, int, float)) or item is None else None
+            for item in value[:MAX_FAULT_LINES]
+        ]
+    return None
+
+
+def _capped_list(value: Any, limit: int) -> list[Any]:
+    return value[:limit] if isinstance(value, list) else []
+
+
 def _summary(report: dict[str, Any]) -> dict[str, Any]:
     # what the operator needs from the report without the per-round noise: verdict, timing, devices, NVML
-    # deltas — every list and string bounded, since the executor wrote the report
+    # deltas — every scalar and list bounded by _cap, since the executor wrote the report
     devices = []
-    for device in (report.get("devices") or [])[:MAX_NVML_GPUS]:
+    for device in _capped_list(report.get("devices"), MAX_NVML_GPUS):
         if not isinstance(device, dict):
             continue
         devices.append(
             {
-                key: device.get(key)
+                key: _cap(device.get(key))
                 for key in (
                     "index",
                     "name",
@@ -176,16 +202,11 @@ def _summary(report: dict[str, Any]) -> dict[str, Any]:
                 if key in device
             }
         )
-    faults = report.get("faults")
     return {
-        "status": report.get("status"),
-        "elapsed_s": report.get("elapsed_s"),
+        "status": _cap(report.get("status")),
+        "elapsed_s": _cap(report.get("elapsed_s")),
         "devices": devices,
-        "faults": (
-            [str(fault)[:MAX_FAULT_CHARS] for fault in faults[:MAX_FAULT_LINES]]
-            if isinstance(faults, list)
-            else faults
-        ),
+        "faults": _cap(report.get("faults")),
         "nvml_after": _capped_nvml(report.get("nvml_after")),
     }
 
@@ -194,16 +215,15 @@ def _capped_nvml(snapshot: Any) -> dict[str, Any] | None:
     if not isinstance(snapshot, dict):
         return None
     gpus = []
-    for gpu in (snapshot.get("gpus") or [])[:MAX_NVML_GPUS]:
+    for gpu in _capped_list(snapshot.get("gpus"), MAX_NVML_GPUS):
         if isinstance(gpu, dict):
             gpus.append(
                 {
-                    key: (
-                        str(gpu[key])[:MAX_FAULT_CHARS] if isinstance(gpu[key], str) else gpu[key]
-                    )
+                    key: _cap(gpu[key])
                     for key in (
                         "index",
                         "uuid",
+                        "pci_bus_id",
                         "ecc_uncorrected",
                         "remapped_rows",
                         "recovery_action",
@@ -225,6 +245,11 @@ def _capped_xid(xid: Any) -> dict[str, Any] | None:
         capped["count"] = xid["count"]
     if isinstance(xid.get("last"), list):
         capped["last"] = [str(line)[:MAX_XID_CHARS] for line in xid["last"][-MAX_XID_LINES:]]
+    if isinstance(xid.get("other_new"), list):
+        # new Xid lines on other cards (or of application types): evidence, not this executor's fault
+        capped["other_new"] = [
+            str(line)[:MAX_XID_CHARS] for line in xid["other_new"][-MAX_XID_LINES:]
+        ]
     if xid.get("error") is not None:
         capped["error"] = str(xid["error"])[:MAX_FAULT_CHARS]
     return capped
