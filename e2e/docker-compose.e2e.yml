@@ -186,6 +186,7 @@ services:
       E2E_GPU: ${E2E_GPU:-}
       REDIS_HOST: redis
     volumes:
+      - ./pytest.ini:/e2e/pytest.ini:ro
       - ./tests:/e2e/tests:ro
       - ./tester:/e2e/tester:ro
       - ./artifacts:/e2e/artifacts
