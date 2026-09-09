@@ -276,10 +276,13 @@ def _build_inspector_event(
 
 def _sensor_attested(ctx: Context) -> bool:
     # The sensor (libinspector.so + Tetragon) ships inside the executor image. On a dstack CVM
-    # the image is part of the measured stack the validator checked against TDX_WHITELIST, so
-    # the report comes from a measured binary; elsewhere its checksum was read through the
-    # provider's own shell and proves nothing — say so in the verdict.
-    return bool(ctx.tdx_attestation_passed)
+    # the image is part of the measured stack — but only when ENABLE_ATTESTATION_WHITELIST is on
+    # does the validator compare that stack against TDX_WHITELIST (attestation_service._verify_tdx);
+    # with the flag off (prod today) a passed attestation says the quote is genuine, not that the
+    # image is ours, so the report is not from a measured binary and the shell checksum stays.
+    # Elsewhere the checksum was read through the provider's own shell and proves nothing — say
+    # so in the verdict.
+    return bool(ctx.tdx_attestation_passed) and settings.ENABLE_ATTESTATION_WHITELIST
 
 
 async def _tell_renters(ctx: Context, verdict: InspectorVerdict, *, when: str) -> None:

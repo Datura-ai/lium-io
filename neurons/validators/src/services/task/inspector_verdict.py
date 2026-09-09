@@ -10,10 +10,11 @@ all run from inside the executor container — the validator's SSH session lands
 sensor tags them `nested_from:executor-…` with `host=false`. On hosts where Tetragon lost the
 ancestry to sshd they surfaced as findings: 607 of the 632 MALICIOUS rounds on 8 Sep.
 
-Classification is by that ancestry, as `design/RENTER_DATA_PRIVACY.md` row 16 intends: a
-`DockerExec` from inside the executor container is *platform-origin* (the sensor itself already
-drops execs whose ancestry reaches sshd or pid 1, so these are the ones it could not trust); anything from the host, a
-`NamespaceEnter`, a memory read, an exec the sensor could not attribute is *provider-origin* and is
+Classification is by that ancestry, as `design/RENTER_DATA_PRIVACY.md` row 16 intends: a Docker
+control-plane action (`DockerExec`, and the `docker cp` / `docker rm` / … the executor runs on a
+pod's behalf) from inside the executor container is *platform-origin* (the sensor itself already
+drops docker-policy findings whose ancestry reaches sshd or pid 1, so these are the ones it could
+not trust); anything from the host, a `NamespaceEnter`, a memory read, an exec the sensor could not attribute is *provider-origin* and is
 what the check, the score gate and the renter event act on. The payloads are too many and too
 script-shaped for an exact allow-list to be honest, so the platform execs' payloads are recorded
 in the verdict (`platform_payloads`) for the daily digest instead of gating anything. What keeps
@@ -39,7 +40,20 @@ _EXEC_OPTIONS_WITH_VALUE = {"-u", "--user", "-e", "--env", "-w", "--workdir"}
 _EXEC_FLAGS = {"-i", "-t", "-it", "-ti", "-d", "--detach", "--privileged", "--interactive", "--tty"}
 _SHELL_WRAPPERS = {"sh", "/bin/sh", "bash", "/bin/bash", "/usr/bin/sh", "/usr/bin/bash"}
 _SHELL_COMMAND_FLAGS = {"-c", "-lc", "-ec", "-lec"}
-_DOCKER_EXEC_KINDS = {"DockerExec"}
+# The kinds the sensor's two docker policies emit (`tamper-docker-cli`, `tamper-docker-sock-write`;
+# docker_cli.rs `finding_is_rental_interference`). The executor drives a pod's whole life through
+# the Docker API from inside its own container — create, start, `docker cp` for a restore, `docker
+# rm` when the rental ends — so any of these with the executor's ancestry is the platform's, not
+# only the exec. `DockerVolumeMount` is mount.rs (path-shaped), never the executor's.
+_DOCKER_CONTROL_PLANE_KINDS = frozenset(
+    {
+        "DockerExec", "DockerAttach", "DockerCp", "DockerRun", "DockerCreate", "DockerStart", "DockerStop",
+        "DockerKill", "DockerPause", "DockerRm", "DockerRestart", "DockerRename", "DockerUpdate", "DockerCommit",
+        "DockerExport", "DockerPrune", "DockerInspect", "DockerPull", "DockerPush", "DockerBuild", "DockerLoad",
+        "DockerImport", "DockerRmi", "DockerNetworkConnect", "DockerNetworkDisconnect", "DockerNetworkRm",
+        "DockerVolumeRm", "DockerSave", "DockerSocketWrite",
+    }
+)
 _PATH_SHAPED_KINDS = {"OverlayFsRead", "OverlayFsWrite", "DockerVolumeMount"}
 RENTAL_VOLUME_TAG = "rental_volume"
 # the renter's pod-log entry carries at most this many evidence hashes; the finding count is the
@@ -79,14 +93,18 @@ RENTER_EVENT = "provider_access_detected"
 class InspectorVerdict:
     provider_findings: list[dict[str, Any]]
     platform_findings: list[dict[str, Any]]
-    evidence: list[str]
+    evidence_sha256: list[str]
     report_sha256: str
     classes: list[str]
     affected_pod_ids: list[str]
     sensor: str
     enforce: bool
     action: str
-    extra: dict[str, Any] = field(default_factory=dict)
+    # the platform execs' payloads, deduplicated, for the daily digest (never gate on them)
+    platform_payloads: list[str] = field(default_factory=list)
+    # provider findings on a container that is not in the rented list: recorded, no renter told
+    unmatched_containers: list[str] = field(default_factory=list)
+    unmatched_containers_count: int = 0
 
     @property
     def provider_origin(self) -> bool:
@@ -98,13 +116,21 @@ class InspectorVerdict:
             "platform_findings": len(self.platform_findings),
             "classes": self.classes,
             "affected_pod_ids": self.affected_pod_ids,
-            "evidence_sha256": self.evidence,
+            "evidence_sha256": self.evidence_sha256,
             "report_sha256": self.report_sha256,
             "sensor": self.sensor,
             "enforce": self.enforce,
             "action": self.action,
             "ban_source": BAN_SOURCE if self.action == ACTION_QUARANTINE else None,
-            **self.extra,
+            "platform_payloads": self.platform_payloads,
+            **(
+                {
+                    "unmatched_containers": self.unmatched_containers,
+                    "unmatched_containers_count": self.unmatched_containers_count,
+                }
+                if self.unmatched_containers
+                else {}
+            ),
         }
 
 
@@ -172,12 +198,13 @@ def nested_from_executor(finding: dict[str, Any]) -> bool:
 
 
 def is_platform_origin(finding: dict[str, Any]) -> bool:
-    """A `docker exec` the sensor traced to inside the executor container (`host=false`, a
-    `nested_from:<executor-stack container>` tag). The sensor already drops execs whose ancestry
-    reaches sshd or the container's pid 1, so every such finding is one whose ancestry it could
-    not trust; until DAH-3278 hardens that on the verifier, all of them count as the platform's.
-    Everything else is the provider's."""
-    if _kind(finding) not in _DOCKER_EXEC_KINDS:
+    """A Docker control-plane action the sensor traced to inside the executor container
+    (`host=false`, a `nested_from:<executor-stack container>` tag). The sensor already drops
+    docker-policy findings whose ancestry reaches sshd or the container's pid 1, so every such
+    finding is one whose ancestry it could not trust; until DAH-3278 hardens that on the verifier,
+    all of them count as the platform's. Everything else — an nsenter, a memory or overlayfs read,
+    anything from the host — is the provider's."""
+    if _kind(finding) not in _DOCKER_CONTROL_PLANE_KINDS:
         return False
     if finding.get("host") is True:
         return False
@@ -276,22 +303,20 @@ def build_verdict(
         affected |= rented
     classes = sorted({finding_class(f) for f in provider})
     action = ACTION_QUARANTINE if (provider and enforce) else ACTION_NONE
-    extra: dict[str, Any] = {"platform_payloads": _platform_payloads(platform)}
-    if unmatched:
-        names = sorted(unmatched)
-        extra["unmatched_containers"] = [name[:_UNMATCHED_NAME_CHARS] for name in names[:_UNMATCHED_MAX]]
-        extra["unmatched_containers_count"] = len(names)
+    names = sorted(unmatched)
     return InspectorVerdict(
         provider_findings=provider,
         platform_findings=platform,
-        evidence=[canonical_sha256(f) for f in provider],
+        evidence_sha256=[canonical_sha256(f) for f in provider],
         report_sha256=canonical_sha256(report),
         classes=classes,
         affected_pod_ids=sorted(affected),
         sensor=SENSOR_ATTESTED if sensor_attested else SENSOR_UNATTESTED,
         enforce=enforce,
         action=action,
-        extra=extra,
+        platform_payloads=_platform_payloads(platform),
+        unmatched_containers=[name[:_UNMATCHED_NAME_CHARS] for name in names[:_UNMATCHED_MAX]],
+        unmatched_containers_count=len(names),
     )
 
 
@@ -318,8 +343,8 @@ def renter_access_event(
         "classes": verdict.classes,
         "provider_findings": len(verdict.provider_findings),
         "report_sha256": verdict.report_sha256,
-        "evidence_sha256": verdict.evidence[:_RENTER_EVIDENCE_MAX],
-        "evidence_sha256_truncated": len(verdict.evidence) > _RENTER_EVIDENCE_MAX,
+        "evidence_sha256": verdict.evidence_sha256[:_RENTER_EVIDENCE_MAX],
+        "evidence_sha256_truncated": len(verdict.evidence_sha256) > _RENTER_EVIDENCE_MAX,
         "sensor": verdict.sensor,
         "action": verdict.action,
     }

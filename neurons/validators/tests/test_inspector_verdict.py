@@ -207,7 +207,7 @@ def test_the_renter_event_caps_the_evidence_list():
     verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
     event = renter_access_event(verdict, pod_id=POD, when="2026-09-09T00:00:00Z")
 
-    assert len(verdict.evidence) == 60
+    assert len(verdict.evidence_sha256) == 60
     assert len(event["evidence_sha256"]) == 20
     assert event["evidence_sha256_truncated"] is True
     assert event["provider_findings"] == 60
@@ -223,8 +223,17 @@ def test_platform_origin_is_the_executor_ancestry_not_the_payload():
     # …but without the executor tag, or from the host, it is the provider's
     assert not is_platform_origin(_finding(HUMAN_KEY_READ, nested=False))
     assert not is_platform_origin(_finding(HUMAN_SHELL, host=True))
-    # only execs can be ours; an nsenter never is
+    # the executor runs a pod's whole life through the Docker API: a `docker cp` for a restore or the
+    # `docker rm` at the rental's end from inside its container is ours too — taiberium, 9 Sep
+    assert is_platform_origin(_finding(f"docker cp /tmp/restore.tar pod_{POD}:/root", kind="DockerCp"))
+    assert is_platform_origin(_finding(f"docker rm -f pod_{POD}", kind="DockerRm"))
+    assert is_platform_origin(_finding(f"docker stop pod_{POD}", kind="DockerStop"))
+    assert not is_platform_origin(_finding(f"docker rm -f pod_{POD}", kind="DockerRm", host=True))
+    # only Docker control-plane actions can be ours; an nsenter, a memory or overlayfs read never is
     assert not is_platform_origin(_finding(VALIDATOR_LIVENESS, kind="NamespaceEnter"))
+    assert not is_platform_origin(_finding("/proc/4242/mem", kind="ProcessMemoryRead"))
+    assert not is_platform_origin(_finding(f"/var/lib/docker/volumes/volume_{POD}/_data/x", kind="OverlayFsRead"))
+    assert not is_platform_origin(_finding(f"/var/lib/docker/volumes/volume_{POD}/_data", kind="DockerVolumeMount"))
 
 
 def test_verdict_records_the_platform_payloads_for_the_digest():
@@ -233,6 +242,7 @@ def test_verdict_records_the_platform_payloads_for_the_digest():
     verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
 
     payloads = verdict.as_payload()["platform_payloads"]
+    assert payloads == verdict.platform_payloads
     assert "cat /root/.ssh/authorized_keys" in payloads
     assert "df -k /root" in payloads
     assert "tar --xattrs --acls -xzpf - -C /root/restored --strip-components=1" in payloads
@@ -246,8 +256,17 @@ def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
     verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=False, enforce=False)
 
     assert verdict.affected_pod_ids == []
+    assert verdict.unmatched_containers == ["pod_gone-since-the-list-was-fetched"]
+    assert verdict.unmatched_containers_count == 1
     assert verdict.as_payload()["unmatched_containers"] == ["pod_gone-since-the-list-was-fetched"]
     assert len(verdict.provider_findings) == 1
+
+
+def test_a_verdict_with_every_pod_matched_carries_no_unmatched_keys():
+    verdict = build_verdict({}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+
+    assert verdict.unmatched_containers == [] and verdict.unmatched_containers_count == 0
+    assert "unmatched_containers" not in verdict.as_payload()
 
 
 @pytest.mark.parametrize("kind", [["DockerExec"], {"k": 1}, 7, None])
@@ -308,7 +327,7 @@ def test_renter_visible_classes_come_from_a_fixed_vocabulary():
     assert "<script>" not in event["log_text"]
     assert event["classes"] == ["NamespaceEnter", "unknown"]
     # the raw kind survives only in the evidence
-    assert verdict.evidence[0] == canonical_sha256(odd)
+    assert verdict.evidence_sha256[0] == canonical_sha256(odd)
 
 
 def test_verdict_hashes_only_the_provider_findings_and_names_the_pod():
@@ -323,7 +342,7 @@ def test_verdict_hashes_only_the_provider_findings_and_names_the_pod():
 
     assert len(verdict.platform_findings) == 1
     assert len(verdict.provider_findings) == 1
-    assert verdict.evidence == [canonical_sha256(report["findings"][1])]
+    assert verdict.evidence_sha256 == [canonical_sha256(report["findings"][1])]
     assert verdict.report_sha256 == canonical_sha256(report)
     assert verdict.affected_pod_ids == [POD]
     assert verdict.classes == ["DockerExec"]
@@ -495,13 +514,27 @@ async def test_a_falsy_non_list_findings_is_still_a_sensor_error(context_factory
 
 
 @pytest.mark.asyncio
-async def test_tdx_attested_host_marks_the_sensor_attested_and_skips_the_shell_checksum(context_factory):
+async def test_tdx_attested_host_marks_the_sensor_attested_and_skips_the_shell_checksum(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", True)  # the image was compared to TDX_WHITELIST
     ctx, service = _ctx(context_factory, [], tdx_attestation_passed=True)
 
     result = await InspectorRentedCheck().run(ctx)
 
     assert service.sensor_attested is True
     assert result.updates["state"].inspector_event["context"]["verdict"]["sensor"] == SENSOR_ATTESTED
+
+
+@pytest.mark.asyncio
+async def test_a_passed_attestation_without_the_whitelist_leaves_the_sensor_unattested(context_factory, monkeypatch):
+    # prod runs ENABLE_ATTESTATION_WHITELIST=false: the quote is genuine but nothing compared the image
+    # against TDX_WHITELIST, so the sensor binary is not measured and the shell checksum must stay — taiberium, 9 Sep
+    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", False)
+    ctx, service = _ctx(context_factory, [], tdx_attestation_passed=True)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert service.sensor_attested is False
+    assert result.updates["state"].inspector_event["context"]["verdict"]["sensor"] == SENSOR_UNATTESTED
 
 
 @pytest.mark.asyncio
