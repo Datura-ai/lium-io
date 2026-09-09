@@ -184,7 +184,12 @@ class LocalVerifyCheck:
             )
 
         client = self._client_factory(ctx)
-        capabilities = await client.capabilities(ctx.executor)
+        # Phase 2: the early facts call (checks/local_facts) already read /version this cycle.
+        facts = ctx.state.local_facts
+        if facts is not None and getattr(facts, "capabilities", None):
+            capabilities = set(facts.capabilities)
+        else:
+            capabilities = await client.capabilities(ctx.executor)
         if CAPABILITY not in capabilities:
             self._metric(ctx, "fallback", "call", "not_advertised")
             return CheckResult(

@@ -847,6 +847,16 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
+    # liumd phase 2 / DAH-3266 (B-2): every configured port is held by a rental the backend reports
+    # (plus what the executor's docker publishes) — nothing left to probe, and the rented node is
+    # exempt from the port-count verdict anyway. Info instead of a red `no_ports` each cycle.
+    SKIPPED_ALL_PORTS_RENTED = MessageTemplate(
+        event="Port verification skipped: every configured port is rented",
+        reason="PORT_CHECK_SKIPPED_ALL_PORTS_RENTED",
+        severity="info",
+        category="runtime",
+        impact="Proceed — no free port to probe; the rented node keeps its verdict",
+    )
 
 
 class PortCountMessages:
@@ -1426,4 +1436,38 @@ class LocalVerifyMessages:
         severity="info",
         category="transport",
         impact="The matmul and VerifyX verdicts below come from the executor's local run, judged by the validator",
+    )
+
+
+class LocalFactsMessages:
+    """liumd phase 2: the read-only host facts (containers, published ports, inspector digest) from
+    one early `POST /verify`, standing in for the SSH listings the checks below would run."""
+
+    DISABLED = MessageTemplate(
+        event="Local host facts disabled",
+        reason="LOCAL_FACTS_DISABLED",
+        severity="info",
+        category="transport",
+        impact="None — every listing runs over SSH as before",
+    )
+    SKIPPED = MessageTemplate(
+        event="Local host facts skipped",
+        reason="LOCAL_FACTS_SKIPPED",
+        severity="info",
+        category="transport",
+        impact="None — the listings run over SSH this cycle",
+    )
+    UNAVAILABLE = MessageTemplate(
+        event="Local host facts not used, SSH listings taken",
+        reason="LOCAL_FACTS_UNAVAILABLE",
+        severity="info",
+        category="transport",
+        impact="None on any verdict — only the round trips saved are lost",
+    )
+    OK = MessageTemplate(
+        event="Local host facts answered in one call",
+        reason="LOCAL_FACTS_OK",
+        severity="info",
+        category="transport",
+        impact="Stale-container candidates and the port candidate set are read from the executor's answer; every verdict below is still SSH-proven",
     )

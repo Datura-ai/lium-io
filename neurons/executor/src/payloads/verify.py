@@ -115,6 +115,8 @@ class DockerFacts(WireModel):
     sysbox_runtime: bool
     disk: DiskFact | None
     containers: list[ContainerFact]
+    # Phase 2: the host's clock beside the containers' `created` (one clock for the age).
+    now: int
 
 
 class PortFacts(WireModel):

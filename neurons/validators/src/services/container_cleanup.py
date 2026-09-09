@@ -67,8 +67,17 @@ class ContainerCleanup:
         ssh_client,
         rented_data: Optional[RentedExecutorsResponse],
         executor_uuid: str,
+        host_facts=None,
     ) -> tuple[int, list[str]]:
         """Remove containers that are not in rented data and are older than threshold.
+
+        `host_facts` (liumd phase 2, `services.local_verify_facts.LocalFacts`) is the executor's own
+        container listing with its clock. When it can age containers it stands in for the two
+        read-only listings here — `docker ps -a --filter` and the `inspect .Created` + `date +%s`
+        pair per unrented candidate — and for nothing else: a container the fact calls stale is
+        re-aged over SSH before `docker rm`, so an executor's word alone never removes anything.
+        The fact can only narrow the candidate list; a name it omits is a name the SSH listing
+        would have shown, and the host controlled that listing just the same.
 
         Returns:
             Tuple of (number_removed, list_of_removed_container_names)
@@ -80,8 +89,13 @@ class ContainerCleanup:
         }
 
         try:
-            # Get all containers with rental prefixes.
-            all_containers = await self._get_all_rental_containers(ssh_client)
+            fact_ages = self._rental_container_ages_from_facts(host_facts)
+            extra["from_facts"] = fact_ages is not None
+            if fact_ages is not None:
+                all_containers = list(fact_ages)
+            else:
+                # Get all containers with rental prefixes.
+                all_containers = await self._get_all_rental_containers(ssh_client)
             extra["total_containers"] = len(all_containers)
 
             # Get currently rented containers for this executor
@@ -94,6 +108,11 @@ class ContainerCleanup:
                 if stripped_name in rented_containers:
                     continue
 
+                if fact_ages is not None:
+                    fact_age = fact_ages.get(stripped_name)
+                    if fact_age is not None and fact_age <= self.stale_threshold_minutes:
+                        continue  # young by the host's own clock; the SSH pair would say the same
+                # Stale (or unaged) by the fact: the removal verdict is SSH-proven, as before.
                 age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
                 if age_minutes and age_minutes > self.stale_threshold_minutes:
                     if self.dry_run:
@@ -444,6 +463,22 @@ class ContainerCleanup:
                 )
             )
             return 0
+
+    @staticmethod
+    def _rental_container_ages_from_facts(host_facts) -> dict[str, Optional[float]] | None:
+        """{name: age_minutes | None} for the fact's rental-prefixed containers, in the SSH
+        listing's order; None when the fact cannot age containers (no listing, or no host clock)."""
+        if host_facts is None or not getattr(host_facts, "can_age_containers", lambda: False)():
+            return None
+        ages: dict[str, Optional[float]] = {}
+        for container in host_facts.containers:
+            if not container.name.startswith(tuple(RENTAL_CONTAINER_PREFIXES)):
+                continue
+            if container.created_at is None:
+                ages[container.name] = None
+            else:
+                ages[container.name] = (host_facts.host_now - container.created_at) / 60
+        return ages
 
     async def _get_all_rental_containers(self, ssh_client) -> list[str]:
         """Get all containers with rental-related prefixes.
