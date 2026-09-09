@@ -709,22 +709,74 @@ def build_remove_authorized_keys_exec_spec(
     )
 
 
-def build_environment_exec_spec(
-    *,
-    container_name: str,
-    environment: dict[str, str] | None,
-) -> ContainerExecSpec | None:
+def _environment_file_text(environment: dict[str, str] | None) -> str:
+    """The `/etc/environment` lines a rental's custom environment appends ('' when there are none)."""
     env_lines = [
         f"{key}={value}"
         for key, value in (environment or {}).items()
         if key and value and key.strip() and str(value).strip()
     ]
-    if not env_lines:
+    return "".join(f"{line}\n" for line in env_lines)
+
+
+def build_environment_exec_spec(
+    *,
+    container_name: str,
+    environment: dict[str, str] | None,
+) -> ContainerExecSpec | None:
+    env_text = _environment_file_text(environment)
+    if not env_text:
         return None
     return ContainerExecSpec(
         container_name=container_name,
         argv=("sh", "-c", "cat >> /etc/environment"),
-        stdin="".join(f"{line}\n" for line in env_lines),
+        stdin=env_text,
+    )
+
+
+# The exec-process variable that carries the renter's environment lines into the combined exec.
+ENVIRONMENT_LINES_EXEC_VAR = "LIUM_ENVIRONMENT_LINES"
+# Linux refuses a single environment string above MAX_ARG_STRLEN (128 KiB) at execve; a renter
+# environment larger than this stays on the stdin-based exec of its own.
+MAX_ENVIRONMENT_EXEC_VAR_BYTES = 64 * 1024
+
+
+def environment_fits_exec_variable(environment: dict[str, str] | None) -> bool:
+    """True when the renter's /etc/environment lines may ride in the combined keys exec."""
+    return len(_environment_file_text(environment).encode()) <= MAX_ENVIRONMENT_EXEC_VAR_BYTES
+
+
+def build_authorized_keys_and_environment_exec_spec(
+    *,
+    container_name: str,
+    public_keys: list[str] | tuple[str, ...],
+    environment: dict[str, str] | None,
+    target_path: str = "/root/.ssh/authorized_keys",
+) -> ContainerExecSpec:
+    """DAH-3258: the authorized_keys exec and the /etc/environment exec as ONE `docker exec`.
+
+    The keys travel on stdin exactly as in `build_authorized_keys_exec_spec`; the environment
+    lines travel as an exec-process variable (the SDK sends only its NAME to the log, as it sends
+    only the stdin size), so no renter value lands in argv or in a log line. Without environment
+    lines the spec is the keys spec itself. The caller checks `environment_fits_exec_variable`
+    first: lines above MAX_ENVIRONMENT_EXEC_VAR_BYTES keep their own stdin-based exec.
+    """
+    keys_spec = build_authorized_keys_exec_spec(
+        container_name=container_name, public_keys=public_keys, target_path=target_path
+    )
+    env_text = _environment_file_text(environment)
+    if not env_text:
+        return keys_spec
+    keys_script = keys_spec.argv[2]
+    return ContainerExecSpec(
+        container_name=container_name,
+        argv=(
+            "sh",
+            "-c",
+            f'{keys_script} && printf \'%s\' "${ENVIRONMENT_LINES_EXEC_VAR}" >> /etc/environment',
+        ),
+        stdin=keys_spec.stdin,
+        environment={ENVIRONMENT_LINES_EXEC_VAR: env_text},
     )
 
 
