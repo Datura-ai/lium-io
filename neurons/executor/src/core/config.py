@@ -91,5 +91,15 @@ class Settings(BaseSettings):
     # host clock that runs ahead is treated like one that runs behind; wide enough for NTP drift.
     CONTAINER_SIGNATURE_MAX_AGE_SECONDS: int = Field(env="CONTAINER_SIGNATURE_MAX_AGE_SECONDS", default=300)
 
+    # liumd phase 1 (DAH-2834): `POST /verify` runs the verification suite locally from one
+    # validator-signed intent instead of 25–40 SSH commands. Off: the route answers 404 and
+    # `/version` does not advertise it, so validators keep the SSH path. On: only the signed,
+    # nonce'd, time-windowed intent of the pinned validator hotkey is accepted.
+    EXECUTOR_LOCAL_VERIFY_ENABLED: bool = Field(env="EXECUTOR_LOCAL_VERIFY_ENABLED", default=False)
+    # Longest a single /verify call may run before answering with what finished (seconds).
+    LOCAL_VERIFY_MAX_DEADLINE_SECONDS: int = Field(env="LOCAL_VERIFY_MAX_DEADLINE_SECONDS", default=600)
+    # How far the intent's issued_at may be from this host's clock (seconds, either way).
+    LOCAL_VERIFY_INTENT_WINDOW_SECONDS: int = Field(env="LOCAL_VERIFY_INTENT_WINDOW_SECONDS", default=120)
+
 
 settings = Settings()
