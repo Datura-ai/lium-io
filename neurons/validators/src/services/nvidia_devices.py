@@ -37,6 +37,7 @@ executor-side issues.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 import xml.etree.ElementTree as ET
@@ -147,6 +148,10 @@ def _emit_kernel_xml_disagreement(
         },
     )
 
+
+# Bound on the per-cycle procfs read in read_kernel_gpu_uuids (DAH-2662): reading a few procfs files
+# is instant on a live host; the same bound CpuTruthCheck puts on its sysfs read.
+KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS = 15
 
 PROC_GPU_INFO_CMD = (
     "for f in /proc/driver/nvidia/gpus/*/information; do "
@@ -377,9 +382,17 @@ async def read_kernel_gpu_uuids(ssh: asyncssh.SSHClientConnection) -> list[str] 
     the one inventory that shim does not author, so bans are matched against it too. None when the
     read fails or procfs is empty/unreadable: the caller falls back to the reported list (fail-open,
     as before), never treats "unreadable" as a spoof.
+
+    The read is bounded: it runs on the fatal-check path of every executor every cycle, and a
+    wedged host would otherwise hold the check open for the executor's whole validation budget.
+    A timeout is one more "unreadable" (None), never a failure of the host.
     """
     try:
-        uuids = list(await _query_gpu_minor_map_from_proc(ssh))
+        uuids = list(
+            await asyncio.wait_for(
+                _query_gpu_minor_map_from_proc(ssh), timeout=KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS
+            )
+        )
     except Exception:
         return None
     return uuids or None
