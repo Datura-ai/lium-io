@@ -91,6 +91,24 @@ class InspectorRentedCheck:
 
         report = dict(result.report or {})
         findings = _findings(report)
+        if findings is None:
+            # a report whose findings are not a list of objects is a broken sensor, not a
+            # provider caught in the act — it must not zero a score or request a quarantine
+            event = render_message(
+                Msg.VALIDATION_ERROR,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"error": "inspector report findings are not a list of objects", "findings": report.get("findings")},
+                extra=extra,
+            )
+            inspector_event = _build_inspector_event(
+                ctx, event, rented_pods, result, outcome="ERROR", report=report
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={"default_extra": extra, "state": replace(ctx.state, inspector_event=inspector_event)},
+            )
         warnings = _collector_start_warnings(report)
         enforce = settings.INSPECTOR_ENFORCE_ENABLED
         verdict = build_verdict(
@@ -309,8 +327,9 @@ def _collector_start_warnings(report: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _findings(report: dict[str, Any]) -> list[dict[str, Any]]:
+def _findings(report: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The report's findings as a list of objects, or None when the report is malformed."""
     findings = report.get("findings") or []
-    if not isinstance(findings, list):
-        return [{"value": findings}]
-    return [item if isinstance(item, dict) else {"value": item} for item in findings]
+    if not isinstance(findings, list) or not all(isinstance(item, dict) for item in findings):
+        return None
+    return findings

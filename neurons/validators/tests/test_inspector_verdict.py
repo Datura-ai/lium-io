@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shlex
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -19,6 +21,7 @@ from neurons.validators.src.services.task.inspector_verdict import (
     canonical_sha256,
     exec_payload,
     is_platform_origin,
+    renter_access_event,
 )
 from neurons.validators.src.services.task.messages import InspectorMessages as Msg
 from neurons.validators.src.services.task.score_calculator import calculate_scores
@@ -53,11 +56,41 @@ def _finding(command: str, *, host: bool = False, kind: str = "DockerExec", nest
 
 
 VALIDATOR_LIVENESS = f'/usr/bin/docker exec -u 0 -i pod_{POD} sh -c "cat /root/.ssh/authorized_keys"'
-EXECUTOR_DF = f"/usr/bin/docker exec -u root pod_{POD} df -k /lium-cipher"
-EXECUTOR_TAR = f"/usr/bin/docker exec -u 0 -i pod_{POD} tar --xattrs --acls -xzpf - -C /root/restored"
 HUMAN_SHELL = f"/usr/bin/docker exec -it pod_{POD} bash"
 HUMAN_KEY_READ = f"/usr/bin/docker exec -u 0 -i pod_{POD} sh -c 'cat /root/.ssh/id_ed25519'"
 CHAINED = f"/usr/bin/docker exec -u 0 -i pod_{POD} sh -c 'cat /root/.ssh/authorized_keys; cat /root/.ssh/id_rsa'"
+
+
+def _platform_execs() -> dict[str, str]:
+    """The argv the platform really runs against a pod, built by the code that runs it."""
+    import sys
+
+    miner_jobs = str(Path(__file__).resolve().parents[1] / "src" / "miner_jobs")
+    if miner_jobs not in sys.path:
+        sys.path.insert(0, miner_jobs)
+    import backup_storage
+    import restore_storage
+    from workspace_mount import VolumeAccess
+
+    access = VolumeAccess(volume_name="v", volume_path="/root", encrypted=True, container_name=f"pod_{POD}")
+    return {
+        "liveness": VALIDATOR_LIVENESS,
+        # executor hardware_service._get_filesystem_usage: `docker exec -u root <pod> df -k <Destination>`
+        "df_root": f"/usr/bin/docker exec -u root pod_{POD} df -k /root",
+        "df_cipher": f"/usr/bin/docker exec -u root pod_{POD} df -k /lium-cipher",
+        "restore_mkdir": shlex.join(restore_storage.workspace_command(None, access, "mkdir") + ["-p", "/root/restored"]),
+        "restore_chown": shlex.join(restore_storage.workspace_command(None, access, "chown") + ["1000", "/root/restored"]),
+        "restore_tar": shlex.join(
+            restore_storage.workspace_command(None, access, "tar", interactive=True)
+            + ["--xattrs", "--acls", "-xzpf", "-", "-C", "/root/restored", "--strip-components=1"]
+        ),
+        "backup_du": shlex.join(backup_storage.workspace_command(None, access, "du") + ["-sb", "/root/data"]),
+        "backup_tar": shlex.join(
+            backup_storage.workspace_command(None, access, "tar") + ["--xattrs", "--acls", "-C", "/root", "-czf", "-", "data"]
+        ),
+        "gocryptfs_setup": f"/usr/bin/docker exec -u 0 pod_{POD} sh /dev/shm/.s-abc",
+        "sshd_probe": f"/usr/bin/docker exec -u 0 pod_{POD} sh -lc 'test -S /run/sshd.sock && echo ok'",
+    }
 
 
 @pytest.mark.parametrize(
@@ -65,30 +98,75 @@ CHAINED = f"/usr/bin/docker exec -u 0 -i pod_{POD} sh -c 'cat /root/.ssh/authori
     [
         (VALIDATOR_LIVENESS, "cat /root/.ssh/authorized_keys"),
         (f"/usr/bin/docker exec -u 0 -i pod_{POD} sh -c cat /root/.ssh/authorized_keys", "cat /root/.ssh/authorized_keys"),
-        (EXECUTOR_DF, "df -k /lium-cipher"),
-        (EXECUTOR_TAR, "tar --xattrs --acls -xzpf - -C /root/restored"),
+        (f"/usr/bin/docker exec -u root pod_{POD} df -k /root", "df -k /root"),
         (HUMAN_SHELL, "bash"),
         (f"/usr/bin/docker exec --user=root pod_{POD} df -k /", "df -k /"),
+        (f"/usr/bin/docker exec -u 0 pod_{POD} sh -lc 'test -S /run/sshd.sock'", "test -S /run/sshd.sock"),
         ("/usr/bin/docker ps", None),
-        (f"/usr/bin/docker exec -u 0 -i executor-executor-1 sh -c 'cat x'", None),
+        ("/usr/bin/docker exec -u 0 -i executor-executor-1 sh -c 'cat x'", None),
     ],
 )
 def test_exec_payload_strips_options_and_shell_wrapper(command, payload):
     assert exec_payload(command) == payload
 
 
-def test_platform_origin_needs_both_the_executor_source_and_a_known_payload():
-    assert is_platform_origin(_finding(VALIDATOR_LIVENESS))
-    assert is_platform_origin(_finding(EXECUTOR_DF))
-    assert is_platform_origin(_finding(EXECUTOR_TAR))
-    # the same command from the host is a human at the keyboard
-    assert not is_platform_origin(_finding(VALIDATOR_LIVENESS, host=True, nested=False))
-    # a chain that starts with our command is not our command
-    assert not is_platform_origin(_finding(CHAINED))
-    assert not is_platform_origin(_finding(HUMAN_KEY_READ))
-    assert not is_platform_origin(_finding(HUMAN_SHELL))
+def test_the_real_platform_execs_are_recognised_from_the_executor_container():
+    execs = _platform_execs()
+    assert execs["restore_tar"].endswith("--strip-components=1")
+    for name, command in execs.items():
+        assert is_platform_origin(_finding(command)), name
+    # the very same commands from the host are a human at the keyboard
+    for name, command in execs.items():
+        assert not is_platform_origin(_finding(command, host=True, nested=False)), name
+
+
+def test_platform_origin_is_the_executor_ancestry_not_the_payload():
+    # the classifier does not judge the payload: what the platform runs changes too often for an
+    # exact list (DAH-3278 hardens the tag on the verifier); a chained read from the executor
+    # container is recorded as a platform payload, not as a provider
+    assert is_platform_origin(_finding(CHAINED))
+    assert is_platform_origin(_finding(HUMAN_KEY_READ))
+    # …but without the executor tag, or from the host, it is the provider's
+    assert not is_platform_origin(_finding(HUMAN_KEY_READ, nested=False))
+    assert not is_platform_origin(_finding(HUMAN_SHELL, host=True))
     # only execs can be ours; an nsenter never is
     assert not is_platform_origin(_finding(VALIDATOR_LIVENESS, kind="NamespaceEnter"))
+
+
+def test_verdict_records_the_platform_payloads_for_the_digest():
+    execs = _platform_execs()
+    findings = [_finding(c) for c in execs.values()] + [_finding(HUMAN_SHELL, host=True, nested=False)]
+    verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+
+    payloads = verdict.as_payload()["platform_payloads"]
+    assert "cat /root/.ssh/authorized_keys" in payloads
+    assert "df -k /root" in payloads
+    assert "tar --xattrs --acls -xzpf - -C /root/restored --strip-components=1" in payloads
+    assert len(verdict.provider_findings) == 1
+    assert len(payloads) == len(set(payloads)) <= 20
+
+
+def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = "pod_gone-since-the-list-was-fetched"
+    verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+
+    assert verdict.affected_pod_ids == []
+    assert verdict.as_payload()["unmatched_containers"] == ["pod_gone-since-the-list-was-fetched"]
+    assert len(verdict.provider_findings) == 1
+
+
+def test_renter_visible_classes_come_from_a_fixed_vocabulary():
+    odd = _finding(HUMAN_SHELL, host=True, nested=False, kind="<script>alert(1)</script>" + "x" * 500)
+    verdict = build_verdict({}, [odd, _finding(HUMAN_SHELL, host=True, nested=False, kind="NamespaceEnter")],
+                            rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+
+    assert verdict.classes == ["NamespaceEnter", "unknown"]
+    event = renter_access_event(verdict, pod_id=POD, when="2026-09-09T00:00:00Z")
+    assert "<script>" not in event["log_text"]
+    assert event["classes"] == ["NamespaceEnter", "unknown"]
+    # the raw kind survives only in the evidence
+    assert verdict.evidence[0] == canonical_sha256(odd)
 
 
 def test_verdict_hashes_only_the_provider_findings_and_names_the_pod():
@@ -175,7 +253,7 @@ def _ctx(context_factory, findings: list[dict], *, redis=None, **overrides):
 async def test_platform_only_findings_are_clean_and_no_renter_is_told(context_factory, monkeypatch):
     monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)
     redis = AsyncMock()
-    ctx, _ = _ctx(context_factory, [_finding(VALIDATOR_LIVENESS), _finding(EXECUTOR_DF)], redis=redis)
+    ctx, _ = _ctx(context_factory, [_finding(VALIDATOR_LIVENESS), _finding(_platform_execs()["df_root"])], redis=redis)
 
     result = await InspectorRentedCheck().run(ctx)
 
@@ -245,6 +323,21 @@ async def test_provider_finding_under_enforcement_fails_the_check_and_requests_q
     assert verdict["ban_source"] == "inspector_auto"
     (log,) = redis.publish.await_args.args[1]["logs"]
     assert "removed the host from the marketplace" in log["log_text"]
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_report_is_a_sensor_error_not_a_provider_finding(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)
+    redis = AsyncMock()
+    ctx, _ = _ctx(context_factory, ["not-a-finding", 42], redis=redis)  # type: ignore[list-item]
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VALIDATION_ERROR.reason
+    assert "inspector_passed" not in result.updates
+    assert result.updates["state"].inspector_event["outcome"] == "ERROR"
+    redis.publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio
