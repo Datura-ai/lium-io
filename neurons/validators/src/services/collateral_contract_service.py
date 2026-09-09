@@ -64,7 +64,7 @@ class CollateralContractService:
         try:
             executor_collateral_float = float(executor_collateral)
             required_deposit_amount_float = float(required_deposit_amount)
-        except (TypeError, ValueError) as e:
+        except (TypeError, ValueError):
             error_message = "Error converting collateral values to float"
             return False, error_message
 

@@ -8,7 +8,6 @@ import bittensor
 from datura.requests.validator_requests import SimpleValidatorRequest
 from fastapi import Depends, Header, HTTPException, status
 
-from core.config import settings
 from services.validator_service import ValidatorService
 
 logger = logging.getLogger(__name__)
