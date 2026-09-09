@@ -499,7 +499,9 @@ class ContainerCleanup:
             )
             if created_result.exit_status != 0:
                 return None
-            created_timestamp = int(created_result.stdout.strip())
+            # Created, then StartedAt (docker's zero time when never started): the age counts from
+            # the later one, so a pod adopted from a warm-pool slot is as young as its start.
+            created_timestamp = max(int(part) for part in created_result.stdout.split())
 
             # Get current time on the machine
             current_result = await ssh_client.run("date +%s")

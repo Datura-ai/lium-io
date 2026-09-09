@@ -81,10 +81,14 @@ class DockerCommand:
 
     @staticmethod
     def inspect_created_timestamp(container_id: str) -> str:
-        """Build docker inspect command to get creation timestamp in seconds."""
+        """Build docker inspect command printing the creation and last-start timestamps in seconds.
+
+        One per line; a never-started container prints docker's zero time (year 1) for the second.
+        A warm-pool slot (speed/WARM_POOL.md) is created long before the rental that adopts it
+        starts it, so a container's age is the later of the two."""
         return (
             f"/usr/bin/docker inspect {shlex.quote(container_id)} "
-            "--format '{{json .Created}}' | "
+            "--format '{{.Created}}{{\"\\n\"}}{{.State.StartedAt}}' | "
             "xargs -I {} date -d {} +%s"
         )
 
