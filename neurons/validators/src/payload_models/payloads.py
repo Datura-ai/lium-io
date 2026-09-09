@@ -539,6 +539,9 @@ class ProfilerStepName(str, enum.Enum):
     PORT_MAPPINGS_GENERATED = "Port mappings generated"
     SSH_CONNECTION_ESTABLISHED = "SSH connection established"
     DOCKER_LOGIN = "Docker login step finished"
+    # DAH-3246: the image-presence probe, once folded into DOCKER_PULL (whose value was ~0.4 s
+    # of probe on a rental whose pull was skipped). Its own step from here on.
+    DOCKER_IMAGE_INSPECT = "Docker image inspect step finished"
     CUSTOM_DOCKER_BUILD = "Custom docker build step finished"
     DOCKER_PULL = "Docker pull step finished"
     CONTAINER_CLEANING = "Container cleaning step finished"
