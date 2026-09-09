@@ -6,7 +6,11 @@ platform does not tear down) cannot keep binding the rental port range and deadl
 port verification.
 """
 
+import asyncio
+
 import pytest
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeRedis
 from helpers import build_services, build_state, default_executor, make_context
 from neurons.validators.src.services.task.checks import StaleContainerCleanupCheck
 from neurons.validators.src.services.task.checks.stale_container_cleanup import (
@@ -255,3 +259,17 @@ async def test_redis_trouble_skips_removal_and_stays_non_fatal():
     assert cleanup.calls == []
     assert result.passed is True
     assert result.event.what_we_saw["first_sight_grace"] is True
+
+
+@pytest.mark.asyncio
+async def test_redis_service_sadd_returns_one_only_for_a_new_member():
+    # the grace rests on `RedisService.sadd` returning what Redis returns: 1 the first time, 0 after
+    from neurons.validators.src.services.redis_service import CLEANUP_SEEN_EXECUTORS_SET, RedisService
+
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeRedis(server=FakeServer())
+    service.lock = asyncio.Lock()
+
+    assert await service.sadd(CLEANUP_SEEN_EXECUTORS_SET, "uuid-b") == 1
+    assert await service.sadd(CLEANUP_SEEN_EXECUTORS_SET, "uuid-b") == 0
+    assert await service.sadd(CLEANUP_SEEN_EXECUTORS_SET, "uuid-c") == 1

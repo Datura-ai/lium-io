@@ -58,10 +58,13 @@ class StaleContainerCleanupCheck:
     async def run(self, ctx: Context) -> CheckResult:
         # DAH-1932: when a miner re-adds an executor it gets a new subnet UUID for the same
         # IP:port. `rented_data` is keyed by UUID, so the tenant that is still running on the
-        # box is listed under the OLD uuid and this executor looks unrented; the backend only
-        # remaps the row after this cycle's spec publish. Removing "orphans" now would kill a
-        # paying customer's pod. A UUID this validator has never run the cleanup for gets one
-        # cycle of grace; the set lives in Redis so a validator restart does not reopen the race.
+        # box is listed under the OLD uuid and this executor looks unrented. Removing "orphans"
+        # now would kill a paying customer's pod. A UUID this validator has never run the cleanup
+        # for gets one cycle of grace; the set lives in Redis so a validator restart does not
+        # reopen the race. The grace is a bridge, not the fix: the backend remaps the row to the
+        # new UUID only on a publish with a positive score, and a first cycle that fails
+        # PortCountCheck publishes 0 — closing that (in the validator by address, or in the
+        # backend's zero-score publish) is the open question on the PR.
         first_sight = await self._first_sight(ctx)
         if first_sight:
             removed_count, removed_names = 0, []
@@ -115,7 +118,7 @@ class StaleContainerCleanupCheck:
         """Record the executor UUID; True the first time this validator meets it.
 
         Redis trouble counts as first sight: skipping one cycle of garbage collection
-        costs nothing, removing a live tenant's container cannot be undone.
+        costs one cycle of delayed GC, removing a live tenant's container cannot be undone.
         """
         try:
             return bool(await ctx.services.redis.sadd(CLEANUP_SEEN_EXECUTORS_SET, ctx.executor.uuid))
