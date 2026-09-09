@@ -20,6 +20,7 @@ from ..models import ValidationEvent
 from protocol.vc_protocol.compute_requests import RentedPod
 
 logger = logging.getLogger(__name__)
+LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
 
 
 class InspectorRentedCheck:
@@ -55,6 +56,7 @@ class InspectorRentedCheck:
             "rented": True,
             "rented_pods": [{"name": p.container_name, "pod_id": p.pod_id} for p in rented_pods],
         }
+        _observe_local_digest(ctx)
 
         sensor_attested = _sensor_attested(ctx)
         result = await ctx.services.inspector.validate_rented_executor(
@@ -263,6 +265,30 @@ class InspectorRentedCheck:
             # in calculate_scores reads this flag (same mechanics as cpu_truth_passed).
             updates["inspector_passed"] = False
         return CheckResult(passed=not acts, event=event, updates=updates)
+
+
+def _observe_local_digest(ctx: Context) -> None:
+    """liumd phase 2, observe-only: the executor's `inspector.lib_sha256` fact against the digest
+    `validate_rented_executor` is about to require over SSH (`sha256_from_executor`). Logged, never
+    consumed — the SSH pre-check and the inspector run below are unchanged; Loki's agreement rate
+    is what decides whether the fact may ever stand in for the pre-check (jam6099's call)."""
+    facts = ctx.state.local_facts
+    reported = getattr(facts, "inspector_lib_sha256", None) if facts is not None else None
+    if reported is None:
+        return
+    expected = getattr(ctx.services.inspector, "local_checksum", None)
+    logger.info(
+        _m(
+            LOCAL_VERIFY_OUTCOME_EVENT,
+            extra={
+                **ctx.default_extra,
+                "outcome": "observed",
+                "step": "inspector",
+                "reason": "digest_match" if reported == expected else "digest_mismatch",
+                "first_pass": ctx.config.first_pass,
+            },
+        )
+    )
 
 
 def _build_inspector_event(

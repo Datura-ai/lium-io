@@ -37,6 +37,7 @@ from datura.requests.validator_requests import MatmulStep, VerifyXStep
 from services.local_verify_client import (
     CAPABILITY,
     DETAIL_MAX_CHARS,
+    Advertised,
     LocalVerifyAnswer,
     LocalVerifyClient,
     LocalVerifyOutcome,
@@ -207,7 +208,15 @@ class LocalVerifyCheck:
             )
 
         client = self._client_factory(ctx)
-        advertised = await client.advertised(ctx.executor)
+        # Phase 2: the early facts call (checks/local_facts) already read /version this cycle —
+        # its capability list and the loopback port the tunnel targets come from the fact table.
+        facts = ctx.state.local_facts
+        if facts is not None and facts.capabilities:
+            advertised = Advertised(
+                capabilities=set(facts.capabilities), local_verify_port=facts.local_verify_port
+            )
+        else:
+            advertised = await client.advertised(ctx.executor)
         if CAPABILITY not in advertised.capabilities:
             self._metric(ctx, "fallback", "call", "not_advertised")
             return CheckResult(

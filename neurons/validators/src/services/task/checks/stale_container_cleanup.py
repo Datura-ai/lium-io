@@ -70,6 +70,8 @@ class StaleContainerCleanupCheck:
         if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
+            # liumd phase 2: the executor's own listing (checks/local_facts) replaces the `docker ps`
+            # and the per-candidate age pair when present; the `docker rm` stays SSH-proven.
             (
                 removed_count,
                 removed_names,
@@ -78,6 +80,7 @@ class StaleContainerCleanupCheck:
                 ssh_client=ctx.ssh,
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
+                **({"host_facts": ctx.state.local_facts} if ctx.state.local_facts is not None else {}),
             )
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
