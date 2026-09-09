@@ -329,7 +329,9 @@ def _collector_start_warnings(report: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _findings(report: dict[str, Any]) -> list[dict[str, Any]] | None:
     """The report's findings as a list of objects, or None when the report is malformed."""
-    findings = report.get("findings") or []
+    findings = report.get("findings")
+    if findings is None:
+        findings = []
     if not isinstance(findings, list) or not all(isinstance(item, dict) for item in findings):
         return None
     return findings

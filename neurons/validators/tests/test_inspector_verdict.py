@@ -155,16 +155,63 @@ def test_known_finding_kinds_are_the_sensors_runtime_interference_kinds():
     assert len(expected) == 39
 
 
-def test_a_read_of_the_pods_volume_names_the_pod():
-    # the 8 Sep class-D shape: tamper-fs OverlayFsRead on /var/lib/docker/volumes/volume_<pod>/_data
-    finding = _finding("", host=True, nested=False, kind="OverlayFsRead")
+def _path_finding(kind: str, path: str) -> dict:
+    """The shape fs.rs / mount.rs emit: no container, the path in `command`, tag `rental_volume`."""
+    return {
+        "category": "runtime_interference",
+        "kind": kind,
+        "severity": "high",
+        "time": "2026-09-08T00:11:00Z",
+        "command": path,
+        "binary": "/usr/bin/cat",
+        "pid": 4242,
+        "cwd": "/root",
+        "container": None,
+        "docker": None,
+        "parent": {"pid": 4000, "binary": "/bin/bash"},
+        "host": True,
+        "policy": "tamper-fs",
+        "tags": ["tamper:fs", "rental_volume", "severity:high"],
+        "details": {},
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "path"),
+    [
+        ("OverlayFsRead", f"/var/lib/docker/volumes/volume_{POD}/_data/.ssh/id_ed25519"),
+        ("OverlayFsWrite", f"/var/lib/docker/volumes/volume_{POD}/_data/.bashrc"),
+        ("DockerVolumeMount", f"/var/lib/docker/plugins/<eight hex characters>/propagated-mount/volume_{POD}"),
+    ],
+)
+def test_a_read_of_the_pods_volume_names_the_pod_and_only_that_pod(kind, path):
+    # the 8 Sep class-D shape: tamper-fs on the pod's volume data, container unset
+    verdict = build_verdict({}, [_path_finding(kind, path)], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
+
+    assert verdict.affected_pod_ids == [POD]
+    assert verdict.classes == [kind]
+    assert "unmatched_containers" not in verdict.as_payload()
+
+
+def test_a_volume_named_in_the_container_field_names_the_pod_too():
+    # DockerVolumeRm carries the volume as the container name
+    finding = _finding("/usr/bin/docker volume rm volume_x", host=True, nested=False, kind="DockerVolumeRm")
     finding["container"] = f"volume_{POD}"
-    finding["binary"] = "/usr/bin/cat"
     verdict = build_verdict({}, [finding], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
 
     assert verdict.affected_pod_ids == [POD]
-    assert verdict.classes == ["OverlayFsRead"]
-    assert "unmatched_containers" not in verdict.as_payload()
+
+
+def test_the_renter_event_caps_the_evidence_list():
+    findings = [_finding(f"/usr/bin/docker exec -it pod_{POD} cat /root/f{i}", host=True, nested=False) for i in range(60)]
+    verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+    event = renter_access_event(verdict, pod_id=POD, when="2026-09-09T00:00:00Z")
+
+    assert len(verdict.evidence) == 60
+    assert len(event["evidence_sha256"]) == 20
+    assert event["evidence_sha256_truncated"] is True
+    assert event["provider_findings"] == 60
+    assert event["report_sha256"] == verdict.report_sha256
 
 
 def test_platform_origin_is_the_executor_ancestry_not_the_payload():
@@ -282,7 +329,7 @@ def _ctx(context_factory, findings: list[dict], *, redis=None, **overrides):
                 "canary_ok": True,
                 "health": {"collector_started_unix": 1},
                 "findings": findings,
-                "summary": {"findings": len(findings)},
+                "summary": {"findings": len(findings) if isinstance(findings, list) else 0},
             },
             diagnostics={"sensor_integrity": "shell_sha256_unattested"},
         )
@@ -385,6 +432,16 @@ async def test_a_malformed_report_is_a_sensor_error_not_a_provider_finding(conte
     assert "inspector_passed" not in result.updates
     assert result.updates["state"].inspector_event["outcome"] == "ERROR"
     redis.publish.assert_not_awaited()
+
+
+@pytest.mark.parametrize("findings", [{}, "", 0])
+@pytest.mark.asyncio
+async def test_a_falsy_non_list_findings_is_still_a_sensor_error(context_factory, findings):
+    ctx, _ = _ctx(context_factory, findings)  # type: ignore[arg-type]
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.VALIDATION_ERROR.reason
 
 
 @pytest.mark.asyncio

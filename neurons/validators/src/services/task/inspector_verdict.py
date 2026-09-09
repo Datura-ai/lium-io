@@ -40,6 +40,12 @@ _EXEC_FLAGS = {"-i", "-t", "-it", "-ti", "-d", "--detach", "--privileged", "--in
 _SHELL_WRAPPERS = {"sh", "/bin/sh", "bash", "/bin/bash", "/usr/bin/sh", "/usr/bin/bash"}
 _SHELL_COMMAND_FLAGS = {"-c", "-lc", "-ec", "-lec"}
 _DOCKER_EXEC_KINDS = {"DockerExec"}
+_PATH_SHAPED_KINDS = {"OverlayFsRead", "OverlayFsWrite", "DockerVolumeMount"}
+RENTAL_VOLUME_TAG = "rental_volume"
+# the renter's pod-log entry carries at most this many evidence hashes; the finding count is the
+# sensor's to choose (21,694 OverlayFsRead in one day, 8 Sep), the full list stays in the
+# inspector event's `context.verdict`
+_RENTER_EVIDENCE_MAX = 20
 # The sensor's `RuntimeInterferenceKind` (celium-gpu-verifier inspector/src/collector/analysis/
 # types.rs, serde PascalCase) — the only strings a renter is shown as a class. Anything else — the
 # report is produced on the provider's root when the sensor is unattested — is shown as `unknown`
@@ -187,6 +193,31 @@ def pod_id_of(name: str) -> str | None:
     return None
 
 
+def volume_name_from_path(path: str) -> str | None:
+    """The sensor's own rule (rental.rs `volume_name_from_path`): the segment after `volumes`
+    (`/var/lib/docker/volumes/<name>/_data/…`) or after `propagated-mount` (vloopback)."""
+    segments = [segment for segment in path.split("/") if segment]
+    for first, second in zip(segments, segments[1:]):
+        if first in ("volumes", "propagated-mount"):
+            return second
+    return None
+
+
+def _named_resource(finding: dict[str, Any]) -> str | None:
+    """What the finding is about: the container it names, or — for the path-shaped kinds the
+    sensor emits with `container: None` (`OverlayFsRead`/`OverlayFsWrite` from fs.rs,
+    `DockerVolumeMount` from mount.rs; the path is in `command`, tag `rental_volume`) — the
+    volume named in that path."""
+    name = _named_container(finding)
+    if name is not None:
+        return name
+    if finding.get("kind") in _PATH_SHAPED_KINDS or RENTAL_VOLUME_TAG in (finding.get("tags") or []):
+        command = finding.get("command")
+        if isinstance(command, str):
+            return volume_name_from_path(command)
+    return None
+
+
 def _platform_payloads(platform: list[dict[str, Any]]) -> list[str]:
     seen: list[str] = []
     for finding in platform:
@@ -217,7 +248,7 @@ def build_verdict(
     unmatched: set[str] = set()
     unnamed = False
     for finding in provider:
-        name = _named_container(finding)
+        name = _named_resource(finding)
         pod_id = pod_id_of(name) if name else None
         if name is None:
             unnamed = True
@@ -270,7 +301,10 @@ def renter_access_event(
         "pod_id": pod_id,
         "when": when,
         "classes": verdict.classes,
-        "evidence_sha256": verdict.evidence,
+        "provider_findings": len(verdict.provider_findings),
+        "report_sha256": verdict.report_sha256,
+        "evidence_sha256": verdict.evidence[:_RENTER_EVIDENCE_MAX],
+        "evidence_sha256_truncated": len(verdict.evidence) > _RENTER_EVIDENCE_MAX,
         "sensor": verdict.sensor,
         "action": verdict.action,
     }
