@@ -26,6 +26,7 @@ from typing import Any
 
 from services.local_verify_client import (
     CAPABILITY,
+    DETAIL_MAX_CHARS,
     LocalVerifyAnswer,
     LocalVerifyClient,
     LocalVerifyUnavailable,
@@ -122,6 +123,16 @@ class LocalVerifyCheck:
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"
             )
 
+        # DAH-2671 item 3: the all-cards work-proof (`_probe_all_claimed_cards`, one pinned run per
+        # card) lives inside the SSH matmul path only. While that check is on, the matmul stays on
+        # SSH so a consumed local pass can never skip the probe or its enforcement; phase 2 carries
+        # `devices` in the intent and judges the per-card output here.
+        matmul_on_ssh = settings.MATMUL_ALLCARDS_CHECK_ENABLED
+        if matmul_on_ssh and not ctx.config.verifyx_enabled:
+            return self._fallback(
+                ctx, "call", "allcards_ssh", "all-cards check on and VerifyX off: nothing to run"
+            )
+
         client = self._client_factory(ctx)
         capabilities = await client.capabilities(ctx.executor)
         if CAPABILITY not in capabilities:
@@ -140,15 +151,6 @@ class LocalVerifyCheck:
         first_pass = ctx.config.first_pass
         matmul_challenge = None
         verifyx_challenge = None
-        # DAH-2671 item 3: the all-cards work-proof (`_probe_all_claimed_cards`, one pinned run per
-        # card) lives inside the SSH matmul path only. While that check is on, the matmul stays on
-        # SSH so a consumed local pass can never skip the probe or its enforcement; phase 2 carries
-        # `devices` in the intent and judges the per-card output here.
-        matmul_on_ssh = settings.MATMUL_ALLCARDS_CHECK_ENABLED
-        if matmul_on_ssh and not ctx.config.verifyx_enabled:
-            return self._fallback(
-                ctx, "call", "allcards_ssh", "all-cards check on and VerifyX off: nothing to run"
-            )
         try:
             try:
                 if not matmul_on_ssh:
@@ -311,6 +313,7 @@ class LocalVerifyCheck:
         )
 
     def _fallback(self, ctx: Context, step: str, reason: str, detail: str) -> CheckResult:
+        detail = detail[:DETAIL_MAX_CHARS]  # executor-derived text: same cap as the metric line
         self._metric(ctx, "fallback", step, reason, detail=detail)
         return CheckResult(
             passed=True,
@@ -336,7 +339,7 @@ class LocalVerifyCheck:
                         "outcome": outcome,
                         "step": step,
                         "reason": reason,
-                        "detail": detail[:300],
+                        "detail": detail[:DETAIL_MAX_CHARS],
                         "first_pass": ctx.config.first_pass,
                         **fields,
                     }
