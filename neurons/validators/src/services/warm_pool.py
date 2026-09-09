@@ -18,7 +18,9 @@ Trust: the validator created the slot, but the miner owns the daemon in between.
 therefore never trusts the slot's labels alone; it compares the live `docker inspect` output
 against the spec it would use now (image id, mounts, ports, devices, GPU requests, runtime,
 capabilities, sysctls, ulimits, restart policy, storage-opt, env, cmd, entrypoint) and requires
-`State.Status == created` with a zero `StartedAt` — a container that ever ran is not a slot.
+`State.Status == created` with a zero `StartedAt` — a container that ever ran is not a slot. The
+slot's volume is inspected as well (`volume_mismatch`): the size the rental is granted is the one
+the volume plugin recorded, never the label alone.
 """
 
 from __future__ import annotations
@@ -258,6 +260,36 @@ def slot_limits_fit(slot: WarmSlot, payload: ContainerCreateRequest) -> str | No
     return None
 
 
+def inspect_volume_command(volume_name: str) -> str:
+    """Driver, declared size, sparse flag and the plugin's own size record of one volume."""
+    return (
+        f"/usr/bin/docker volume inspect {shlex.quote(volume_name)} --format "
+        "'{{.Driver}}|{{index .Options \"size\"}}|{{index .Options \"sparse\"}}|{{index .Status \"size-max\"}}'"
+    )
+
+
+def volume_mismatch(slot: WarmSlot, inspect_output: str) -> str | None:
+    """Why the slot's live volume is not the one its labels describe; None when it is.
+
+    The size labels are on a container the miner's daemon holds, so the rental's volume limit is
+    proved against the volume plugin's own record before adoption: a vloopback volume, sparse,
+    whose declared size is the labelled one."""
+    lines = [line for line in (inspect_output or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return "volume not inspectable"
+    driver, size_option, sparse, size_max = (lines[0].strip().split("|") + ["", "", "", ""])[:4]
+    if not driver.startswith("vloopback"):
+        return "volume driver"
+    declared_gb = _size_to_gb(size_option)
+    if declared_gb is None:
+        declared_gb = _size_to_gb(size_max)
+    if declared_gb is None or declared_gb != slot.volume_limit_gb:
+        return "volume size"
+    if sparse != "true":
+        return "volume not sparse"
+    return None
+
+
 def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str | None:
     """Why the live slot differs from the container the rental would create now; None when equal.
 
@@ -273,9 +305,11 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
         f"{v.source}:{v.target}:{'ro' if v.read_only else 'rw'}" for v in spec.volumes
     }:
         return "binds"
+    # An image `VOLUME` line gives every container of the image an anonymous mount at that path,
+    # the slot and a fresh rental alike; the rental's own volumes are the rest.
     if set(m.get("Destination") for m in doc.get("Mounts") or []) != {
         v.target for v in spec.volumes
-    }:
+    } | set((image_config.get("Volumes") or {}).keys()):
         return "mounts"
     if _port_bindings(host) != {
         f"{p.container_port}/{p.protocol}": p.host_port for p in spec.ports
@@ -507,3 +541,16 @@ def _int_or_none(value: str | None) -> int | None:
         return int(value) if value is not None else None
     except ValueError:
         return None
+
+
+def _size_to_gb(value: str) -> int | None:
+    """Whole gigabytes from a vloopback size: the `size` option (`40g`, `40G`, `40gb`) or the
+    plugin's `size-max` byte count; None for anything else or a size that is not whole GB."""
+    text = (value or "").strip().lower()
+    if not text:
+        return None
+    if text.isdigit():
+        size_bytes = int(text)
+        return size_bytes // 1024**3 if size_bytes % 1024**3 == 0 else None
+    number = text.removesuffix("gb").removesuffix("g")
+    return int(number) if number != text and number.isdigit() else None

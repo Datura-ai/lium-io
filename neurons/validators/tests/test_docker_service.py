@@ -4913,6 +4913,9 @@ def _make_sizing_ssh_client(
             )
         if "volume ls" in command:
             return Mock(stdout=volume_ls_stdout, exit_status=0)
+        if "lium.warm_pool=1" in command:
+            # the warm-pool slot volumes the sum leaves out (flag on or off): none on this host
+            return Mock(stdout="", exit_status=0)
         if "volume inspect" in command:
             return Mock(stdout=volume_inspect_stdout, exit_status=0)
         raise AssertionError(f"unexpected ssh command: {command}")
