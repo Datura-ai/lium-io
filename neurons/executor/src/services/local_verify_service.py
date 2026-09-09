@@ -25,15 +25,23 @@ import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
 
 from datura.requests.validator_requests import local_verify_signing_blob
 from payloads.verify import (
     STEP_NAMES,
+    CardRun,
+    ContainerFact,
+    DiskFact,
+    DockerFacts,
+    InspectorFacts,
+    MatmulData,
     MatmulStep,
+    PortFacts,
+    StepData,
     StepResult,
     VerifyIntentBody,
     VerifyResult,
+    VerifyXData,
     VerifyXStep,
 )
 
@@ -183,9 +191,12 @@ async def _kill(proc) -> None:
         pass
 
 
-def matmul_argv(step: MatmulStep, python: str) -> list[str]:
+def matmul_argv(
+    step: MatmulStep, python: str, *, seed: int | None = None, cipher_text: str | None = None
+) -> list[str]:
     # Byte-for-byte the SSH path's `python decrypt_challenge.py --dim_n … --dim_k … --seed …
-    # --cipher_text …` (VerifierParams.__str__ on the validator).
+    # --cipher_text …` (VerifierParams.__str__ on the validator); a pinned card run passes its own
+    # seed and cipher text.
     return [
         python,
         str(MATMUL_SCRIPT),
@@ -194,9 +205,9 @@ def matmul_argv(step: MatmulStep, python: str) -> list[str]:
         "--dim_k",
         str(step.dim_k),
         "--seed",
-        str(step.seed),
+        str(step.seed if seed is None else seed),
         "--cipher_text",
-        step.cipher_text,
+        step.cipher_text if cipher_text is None else cipher_text,
     ]
 
 
@@ -216,19 +227,21 @@ async def run_matmul(step: MatmulStep, *, python: str = sys.executable) -> StepR
     if step.devices:
         # The all-cards work-proof: one run pinned per card, together, like the validator's fan-out.
         started = time.perf_counter()
+        # Each card answers its own challenge (DeviceChallenge): one computation cannot stand in for
+        # every card the host claims.
         per_card = await asyncio.gather(
             *(
                 run_script(
-                    matmul_argv(step, python),
+                    matmul_argv(step, python, seed=device.seed, cipher_text=device.cipher_text),
                     timeout=MATMUL_TIMEOUT_SECONDS,
-                    env={"CUDA_VISIBLE_DEVICES": str(index)},
+                    env={"CUDA_VISIBLE_DEVICES": str(device.index)},
                 )
-                for index in step.devices
+                for device in step.devices
             )
         )
         cards = [
-            {"card_index": index, **card.model_dump(exclude_none=True)}
-            for index, card in zip(step.devices, per_card)
+            CardRun(card_index=device.index, **card.model_dump(exclude={"data"}))
+            for device, card in zip(step.devices, per_card)
         ]
         failed = [c for c in per_card if c.status != "ok"]
         return StepResult(
@@ -236,7 +249,7 @@ async def run_matmul(step: MatmulStep, *, python: str = sys.executable) -> StepR
             if not failed
             else ("timeout" if any(c.status == "timeout" for c in failed) else "failed"),
             ms=int((time.perf_counter() - started) * 1000),
-            data={"per_card": cards},
+            data=MatmulData(per_card=cards),
         )
     return await run_script(matmul_argv(step, python), timeout=MATMUL_TIMEOUT_SECONDS)
 
@@ -244,12 +257,21 @@ async def run_matmul(step: MatmulStep, *, python: str = sys.executable) -> StepR
 async def run_verifyx(step: VerifyXStep, *, python: str = sys.executable) -> StepResult:
     result = await run_script(verifyx_argv(step, python), timeout=VERIFYX_TIMEOUT_SECONDS)
     # The validator compares the library digest before it trusts a response (core/checksums);
-    # over SSH that is one more command, here it rides along.
-    result.data = {"lib_sha256": sha256_of_file(LIBVERIFYX_PATH)}
+    # over SSH that is one more command, here it rides along — hashed off the event loop (10 MB),
+    # on the facts pool like `_inspector_facts`.
+    loop = asyncio.get_running_loop()
+    try:
+        digest = await asyncio.wait_for(
+            loop.run_in_executor(_facts_executor, sha256_of_file, LIBVERIFYX_PATH),
+            timeout=FAST_STEP_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        digest = None
+    result.data = VerifyXData(lib_sha256=digest)
     return result
 
 
-def _docker_facts() -> dict[str, Any]:
+def _docker_facts() -> DockerFacts:
     import docker  # local import: the module is mocked in unit tests
 
     client = docker.from_env(timeout=FAST_STEP_TIMEOUT_SECONDS)
@@ -260,26 +282,26 @@ def _docker_facts() -> dict[str, Any]:
     for container in client.containers.list(all=True):
         attrs = container.attrs or {}
         containers.append(
-            {
-                "name": container.name,
-                "status": container.status,
-                "image": (attrs.get("Config") or {}).get("Image"),
-                "created": attrs.get("Created"),
-            }
+            ContainerFact(
+                name=container.name,
+                status=container.status,
+                image=(attrs.get("Config") or {}).get("Image"),
+                created=attrs.get("Created"),
+            )
         )
     disk = None
     if root_dir and os.path.isdir(root_dir):
         usage = shutil.disk_usage(root_dir)
-        disk = {"total_bytes": usage.total, "free_bytes": usage.free, "used_bytes": usage.used}
-    return {
-        "server_version": info.get("ServerVersion"),
-        "root_dir": root_dir,
-        "runtimes": runtimes,
-        "default_runtime": info.get("DefaultRuntime"),
-        "sysbox_runtime": "sysbox-runc" in runtimes,
-        "disk": disk,
-        "containers": containers,
-    }
+        disk = DiskFact(total_bytes=usage.total, free_bytes=usage.free, used_bytes=usage.used)
+    return DockerFacts(
+        server_version=info.get("ServerVersion"),
+        root_dir=root_dir,
+        runtimes=runtimes,
+        default_runtime=info.get("DefaultRuntime"),
+        sysbox_runtime="sysbox-runc" in runtimes,
+        disk=disk,
+        containers=containers,
+    )
 
 
 def _published_host_ports() -> set[int]:
@@ -297,6 +319,11 @@ def _published_host_ports() -> set[int]:
     return published
 
 
+# What the validator counts when an executor configures neither setting (port_utils.DEFAULT_PORT_RANGE):
+# the same default here, or the facts would say "none" for a host the validator rents on 20000–65535.
+DEFAULT_PORT_RANGE = (20000, 65536)
+
+
 def parse_port_range(port_range: str | None, port_mappings: str | None) -> list[tuple[int, int]]:
     """(internal, external) pairs the way the validator's `port_utils.get_all_ports` reads them."""
     if port_mappings:
@@ -306,10 +333,10 @@ def parse_port_range(port_range: str | None, port_mappings: str | None) -> list[
             lo, hi = (int(p.strip()) for p in port_range.split("-"))
             return [(p, p) for p in range(lo, hi + 1)]
         return sorted((int(p.strip()), int(p.strip())) for p in port_range.split(","))
-    return []
+    return [(p, p) for p in range(*DEFAULT_PORT_RANGE)]
 
 
-def _port_facts(port_range: str | None, port_mappings: str | None, ssh_port: int) -> dict[str, Any]:
+def _port_facts(port_range: str | None, port_mappings: str | None, ssh_port: int) -> PortFacts:
     pairs = [
         (i, e)
         for i, e in parse_port_range(port_range, port_mappings)
@@ -318,25 +345,25 @@ def _port_facts(port_range: str | None, port_mappings: str | None, ssh_port: int
     sample = pairs[:PORT_SAMPLE_MAX]
     published = _published_host_ports()
     in_use = sorted(e for _, e in sample if e in published)
-    return {
-        "port_range": port_range,
-        "port_mappings": port_mappings,
-        "configured": len(pairs),
-        "sampled": len(sample),
-        "published_by_docker": in_use,
-        "free": len(sample) - len(in_use),
-    }
+    return PortFacts(
+        port_range=port_range,
+        port_mappings=port_mappings,
+        configured=len(pairs),
+        sampled=len(sample),
+        published_by_docker=in_use,
+        free=len(sample) - len(in_use),
+    )
 
 
-def _inspector_facts() -> dict[str, Any]:
-    return {
-        "lib_present": os.path.isfile(LIBINSPECTOR_PATH),
-        "lib_sha256": sha256_of_file(LIBINSPECTOR_PATH),
-        "script_present": INSPECTOR_SCRIPT.is_file(),
-    }
+def _inspector_facts() -> InspectorFacts:
+    return InspectorFacts(
+        lib_present=os.path.isfile(LIBINSPECTOR_PATH),
+        lib_sha256=sha256_of_file(LIBINSPECTOR_PATH),
+        script_present=INSPECTOR_SCRIPT.is_file(),
+    )
 
 
-async def run_facts(name: str, func: Callable[[], dict[str, Any]]) -> StepResult:
+async def run_facts(name: str, func: Callable[[], StepData]) -> StepResult:
     """A read-only fact collector, off the event loop, bounded like every other step."""
     started = time.perf_counter()
     loop = asyncio.get_running_loop()
