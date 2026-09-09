@@ -48,19 +48,28 @@ class CapabilityCheck:
 
         result = None
         failure_reason = None
-        try:
-            result = await validation_service.validate_gpu_model_and_process_job(
-                ssh_client=ctx.ssh,
-                executor_info=ctx.executor,
-                default_extra=ctx.default_extra,
-                machine_spec=specs,
-                **sizing,
-            )
-        except Exception as exc:
-            failure_reason = str(exc)
+        # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
+        # judged it with evaluate_matmul_output — the same function the SSH path ends in. Only a
+        # PASSING local result is consumed; anything else runs over SSH exactly as before.
+        local = getattr(ctx.state, "local_verify", None)
+        transport = "ssh"
+        if local is not None and local.matmul is not None:
+            result = local.matmul
+            transport = "local_verify"
+        else:
+            try:
+                result = await validation_service.validate_gpu_model_and_process_job(
+                    ssh_client=ctx.ssh,
+                    executor_info=ctx.executor,
+                    default_extra=ctx.default_extra,
+                    machine_spec=specs,
+                    **sizing,
+                )
+            except Exception as exc:
+                failure_reason = str(exc)
 
         if result and result.success:
-            what: dict = {"metrics": result.metrics}
+            what: dict = {"metrics": result.metrics, "transport": transport}
             if sizing:
                 what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]
             event = render_message(

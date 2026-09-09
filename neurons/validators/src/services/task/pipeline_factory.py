@@ -46,6 +46,7 @@ from .checks import (
     GpuUsageCheck,
     GpuVramPrecheck,
     InspectorRentedCheck,
+    LocalVerifyCheck,
     MachineSpecScrapeCheck,
     NvmlDigestCheck,
     PortConnectivityCheck,
@@ -319,6 +320,10 @@ class PipelineFactory:
                 InspectorRentedCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
+                # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
+                # challenges on the executor side by side; the two checks below consume a judged,
+                # passing answer and run over SSH otherwise. Off by default, never fatal.
+                LocalVerifyCheck(),
                 VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),
