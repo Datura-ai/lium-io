@@ -187,7 +187,9 @@ async def _kill(proc) -> None:
         return
     try:
         await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=KILL_WAIT_SECONDS)
-    except (TimeoutError, asyncio.CancelledError):
+    except TimeoutError:
+        # The SIGKILL is sent; the child watcher reaps it. A CancelledError propagates: no step
+        # may return a result after its task was cancelled (the group would run on, see `_run`).
         pass
 
 
@@ -257,8 +259,9 @@ async def run_matmul(step: MatmulStep, *, python: str = sys.executable) -> StepR
 async def run_verifyx(step: VerifyXStep, *, python: str = sys.executable) -> StepResult:
     # The validator compares the library digest before it trusts a response (core/checksums);
     # over SSH that is one more command, here it rides along — hashed off the event loop (10 MB) on
-    # the facts pool like `_inspector_facts`, started BEFORE the script so it is long done when the
-    # script's seconds are over: a deadline that lands here lands in the script, never in the digest.
+    # the facts pool like `_inspector_facts`, started BEFORE the script so it is normally long done
+    # when the script's seconds are over. A deadline that still lands in the digest drops this run:
+    # re-raised, never swallowed (a swallowed cancellation would let the GPU group run on, `_run`).
     loop = asyncio.get_running_loop()
     digest_future = loop.run_in_executor(_facts_executor, sha256_of_file, LIBVERIFYX_PATH)
     try:

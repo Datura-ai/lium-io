@@ -374,6 +374,33 @@ def test_the_verifyx_library_is_hashed_off_the_event_loop(fake_scripts, fake_doc
     assert pool_thread[0].startswith("local-verify-facts")  # the facts pool, not asyncio's default
 
 
+def test_a_deadline_during_the_library_digest_does_not_start_the_next_gpu_step(
+    fake_scripts, fake_docker, monkeypatch, tmp_path
+):
+    """Serial order, VerifyX instant, its library digest 2 s, the matmul 3 s, deadline 1 s: the
+    cancellation lands in the digest await. It must end the GPU group there — the matmul never
+    starts and `run` returns at the deadline. (A step that swallowed the cancellation would run the
+    matmul afterwards and hold the answer for it: ≥ 5 s and a matmul that ran.)"""
+    mark = tmp_path / "matmul_ran"
+    slow_matmul = fake_scripts / "decrypt_challenge.py"
+    slow_matmul.write_text(
+        FAKE_MATMUL.replace('time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))', f'open({str(mark)!r}, "w").close(); time.sleep(3)')
+    )
+    real = lvs.sha256_of_file
+
+    def slow_digest(path):
+        time.sleep(2)
+        return real(path)
+
+    monkeypatch.setattr(lvs, "sha256_of_file", slow_digest)
+    started = time.perf_counter()
+    result = asyncio.run(_service(max_deadline_s=1).run(_body()))  # serial: verifyx, then matmul
+    assert time.perf_counter() - started < 2.5
+    assert result.deadline_hit
+    assert result.steps["verifyx"].status == "timeout" and result.steps["matmul"].status == "timeout"
+    assert not mark.exists()  # the matmul never started
+
+
 def test_a_slow_digest_neither_blocks_the_loop_nor_loses_the_run(fake_scripts, fake_docker, monkeypatch):
     """The digest starts before the script and is awaited after it: a slow one (here 0.4 s, the
     script instant) delays the answer by its remainder only and the run keeps its output."""
