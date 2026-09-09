@@ -425,6 +425,7 @@ class LocalVerifyCheck:
                         "reason": reason,
                         "detail": detail[:DETAIL_MAX_CHARS],
                         "first_pass": ctx.config.first_pass,
+                        "unscored": ctx.config.unscored,
                         **fields,
                     }
                 ),
