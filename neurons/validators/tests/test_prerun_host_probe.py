@@ -5,8 +5,8 @@ volumes, mounted volumes, volume names again, GPU minor map, shared device nodes
 state, the image's encryption label). With the flag on, one probe command returns them all; every
 consumer reads its section and keeps its removals / writes as they are. Covered here:
 
-- the probe command carries every section and the exact per-command texts (`_PROC_GPU_INFO_CMD`,
-  `_POWER_STATE_CMD`, the shared-node loop, the label inspect); `with_power=False` has no nvidia-smi;
+- the probe command carries every section and the exact per-command texts (`PROC_GPU_INFO_CMD`,
+  `POWER_STATE_CMD`, the shared-node loop, the label inspect); `with_power=False` has no nvidia-smi;
 - the parser: every section, a failed section → None, a missing `_RC` / an untagged line / an
   unknown tag → raise, the label's whole-stdout semantics;
 - the command and the parser together through `sh -c` with a docker stub (containers, volumes,
@@ -15,11 +15,12 @@ consumer reads its section and keeps its removals / writes as they are. Covered 
 - each consumer with a probe runs no listing command and produces the same result / the same
   removal commands as the per-command path for the same host facts; a failed section falls back;
 - `create_container`: flag off → never probes; flag on → one probe handed to every consumer; the
-  docker listings are withdrawn after a removal; the power state is withdrawn after a restore.
+  docker listings are withdrawn after a removal; the last-resort power raise never reads the probe.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 import stat
 import subprocess
@@ -30,13 +31,13 @@ from core.config import settings
 from services import nvidia_devices as nd
 from services.docker_service import DockerService, _ENCRYPTED_VOLUME_IMAGE_LABEL
 from services.gpu_power_limit import (
-    _POWER_STATE_CMD,
+    POWER_STATE_CMD,
     raise_low_power_limits_to_default,
     restore_tracked_gpu_power_limits,
 )
 from services.nvidia_devices import (
-    _GPU_DEVICE_NODES_CMD,
-    _PROC_GPU_INFO_CMD,
+    GPU_DEVICE_NODES_CMD,
+    PROC_GPU_INFO_CMD,
     build_gpu_docker_config_for_executor,
     shared_device_nodes_command,
 )
@@ -47,6 +48,7 @@ from services.prerun_host_probe import (
     PREFIX_FAILED_MARKER,
     PrerunHostProbe,
     PrerunHostProbeParseError,
+    ProbedVolume,
     image_label_command,
     parse_prerun_host_probe,
     prerun_host_probe_command,
@@ -67,7 +69,7 @@ def _probe(**over) -> PrerunHostProbe:
         container_names=(),
         volumes=(),
         mounted_volume_names=(),
-        gpu_proc_stdout="",
+        gpu_minor_map_stdout="",
         gpu_device_nodes=(),
         shared_nodes=(),
         shared_nodes_whole_host_only=(),
@@ -90,8 +92,8 @@ def _stdout(
     vol_rc: int = 0,
     mnt: tuple[str, ...] = ("volume_a",),
     mnt_rc: int = 0,
-    gpuproc: tuple[str, ...] = ("GPU-1, 0", "GPU-2, 1"),
-    gpuproc_rc: int = 0,
+    gpu_minor_map: tuple[str, ...] = ("GPU-1, 0", "GPU-2, 1"),
+    gpu_minor_map_rc: int = 0,
     gpudev: tuple[str, ...] = ("/dev/nvidia0", "/dev/nvidia1"),
     shared: tuple[str, ...] = ("/dev/nvidiactl", "/dev/nvidia-uvm"),
     sharedw: tuple[str, ...] = ("/dev/infiniband/uverbs0", "/dev/nvidia-caps/nvidia-cap1"),
@@ -104,7 +106,7 @@ def _stdout(
         _tagged("PS", *ps, rc=ps_rc)
         + _tagged("VOL", *vol, rc=vol_rc)
         + _tagged("MNT", *mnt, rc=mnt_rc)
-        + _tagged("GPUPROC", *gpuproc, rc=gpuproc_rc)
+        + _tagged("GPUMINORMAP", *gpu_minor_map, rc=gpu_minor_map_rc)
         + _tagged("GPUDEV", *gpudev)
         + _tagged("SHARED", *shared)
         + _tagged("SHAREDW", *sharedw)
@@ -144,7 +146,7 @@ def test_probe_command_carries_every_section_and_the_per_command_texts():
         docker_image=_IMAGE, image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL, with_power=True
     )
     assert "\n" not in cmd
-    for tag in ("PS", "VOL", "MNT", "GPUPROC", "GPUDEV", "SHARED", "SHAREDW", "POWER", "LABEL"):
+    for tag in ("PS", "VOL", "MNT", "GPUMINORMAP", "GPUDEV", "SHARED", "SHAREDW", "POWER", "LABEL"):
         assert f"t {tag} " in cmd
     # shlex.quote wraps each section command; the quoted forms of the shared texts are inside
     import shlex
@@ -154,9 +156,9 @@ def test_probe_command_carries_every_section_and_the_per_command_texts():
     assert shlex.quote(DOCKER_MOUNTED_VOLUME_NAMES_CMD) in cmd
     assert f"|| echo {PREFIX_FAILED_MARKER}" in cmd
 
-    assert shlex.quote(_PROC_GPU_INFO_CMD) in cmd
-    assert shlex.quote(_GPU_DEVICE_NODES_CMD) in cmd
-    assert shlex.quote(_POWER_STATE_CMD) in cmd
+    assert shlex.quote(PROC_GPU_INFO_CMD) in cmd
+    assert shlex.quote(GPU_DEVICE_NODES_CMD) in cmd
+    assert shlex.quote(POWER_STATE_CMD) in cmd
     assert shlex.quote(shared_device_nodes_command(is_whole_host_rental=False)) in cmd
     assert (
         shlex.quote(shared_device_nodes_command(is_whole_host_rental=True, whole_host_only=True))
@@ -206,10 +208,13 @@ def test_shared_device_nodes_command_whole_host_only_is_the_tail_of_the_whole_ho
 def test_parser_reads_every_section():
     probe = parse_prerun_host_probe(_stdout(), with_power=True)
     assert probe.container_names == ("pod_a", "other")
-    assert probe.volumes == (("volume_a", "vloopback:latest"), ("dphn_cache_x", "local"))
+    assert probe.volumes == (
+        ProbedVolume("volume_a", "vloopback:latest"),
+        ProbedVolume("dphn_cache_x", "local"),
+    )
     assert probe.volume_names == ("volume_a", "dphn_cache_x")
     assert probe.mounted_volume_names == ("volume_a",)
-    assert probe.gpu_proc_stdout == "GPU-1, 0\nGPU-2, 1"
+    assert probe.gpu_minor_map_stdout == "GPU-1, 0\nGPU-2, 1"
     assert probe.gpu_device_nodes == ("/dev/nvidia0", "/dev/nvidia1")
     assert probe.shared_nodes_for(is_whole_host_rental=False) == (
         "/dev/nvidiactl",
@@ -242,7 +247,7 @@ def test_parser_empty_sections_are_empty_not_none():
         ({"ps_rc": 1}, "container_names"),
         ({"vol_rc": 125}, "volumes"),
         ({"mnt_rc": 123}, "mounted_volume_names"),
-        ({"gpuproc_rc": 2}, "gpu_proc_stdout"),
+        ({"gpu_minor_map_rc": 2}, "gpu_minor_map_stdout"),
         ({"power_rc": 127}, "power_state_stdout"),
         ({"label_rc": 1}, "image_label_value"),
     ],
@@ -394,12 +399,15 @@ def test_probe_through_sh_lists_docker_sections_and_marks_absent_nvidia_smi(tmp_
     out = _run_probe_in_sh(tmp_path)
     probe = parse_prerun_host_probe(out, with_power=True)
     assert probe.container_names == ("pod_a", "filler_b", "other")
-    assert probe.volumes == (("volume_a", "vloopback:latest"), ("volume_b", "local"))
+    assert probe.volumes == (
+        ProbedVolume("volume_a", "vloopback:latest"),
+        ProbedVolume("volume_b", "local"),
+    )
     assert probe.mounted_volume_names == ("volume_a", "volume_a")  # blank lines dropped as before
     assert probe.image_label_value == "1"
     # the GPU / device-node sections list whatever the test host has (a GPU workstation has
     # /dev/nvidia*, a CI runner may have /dev/infiniband/*) — they are listings, never failures
-    assert probe.gpu_proc_stdout is not None and probe.gpu_device_nodes is not None
+    assert probe.gpu_minor_map_stdout is not None and probe.gpu_device_nodes is not None
     assert probe.shared_nodes_for(is_whole_host_rental=True) is not None
     # the nvidia-smi stub exits 1 → the section failed → None → the live query would run
     assert probe.power_state_stdout is None
@@ -600,11 +608,11 @@ async def test_clean_stale_vloopback_with_probe_removes_the_same_and_lists_nothi
     ran.clear()
     probe = _probe(
         volumes=(
-            ("volume_a", "vloopback:latest"),
-            ("volume_b", "vloopback"),
-            ("volume_c", "local"),
-            ("volume_d", "vloopback:latest"),
-            ("other", "vloopback"),
+            ProbedVolume("volume_a", "vloopback:latest"),
+            ProbedVolume("volume_b", "vloopback"),
+            ProbedVolume("volume_c", "local"),
+            ProbedVolume("volume_d", "vloopback:latest"),
+            ProbedVolume("other", "vloopback"),
         ),
         mounted_volume_names=("volume_a", "volume_c"),
     )
@@ -627,7 +635,7 @@ async def test_clean_stale_vloopback_probe_without_vloopback_volumes_runs_nothin
         await docker_service.clean_stale_vloopback_volumes(
             ssh_client=ssh,
             default_extra={},
-            host_probe=_probe(volumes=(("volume_c", "local"),)),
+            host_probe=_probe(volumes=(ProbedVolume("volume_c", "local"),)),
         )
         == []
     )
@@ -639,7 +647,7 @@ async def test_clean_stale_vloopback_failed_mount_section_inspects_itself(
     docker_service, monkeypatch
 ):
     monkeypatch.setattr("services.docker_service.retry_ssh_command", AsyncMock())
-    probe = _probe(volumes=(("volume_a", "vloopback"),), mounted_volume_names=None)
+    probe = _probe(volumes=(ProbedVolume("volume_a", "vloopback"),), mounted_volume_names=None)
     ssh = _ssh(_ssh_result(stdout="volume_a\n"))
     assert (
         await docker_service.clean_stale_vloopback_volumes(
@@ -656,9 +664,9 @@ async def test_find_cache_volumes_with_probe_matches_live(docker_service):
     from_live = await docker_service._find_cache_volumes_to_sweep(live, {"dphn_cache_new"}, {})
     probe = _probe(
         volumes=(
-            ("dphn_cache_old", "local"),
-            ("dphn_cache_new", "local"),
-            ("volume_a", "vloopback"),
+            ProbedVolume("dphn_cache_old", "local"),
+            ProbedVolume("dphn_cache_new", "local"),
+            ProbedVolume("volume_a", "vloopback"),
         )
     )
     probed = _ssh()
@@ -709,7 +717,7 @@ async def test_gpu_config_with_probe_matches_live_partial_rental(monkeypatch):
     live = _ssh(_ssh_result(stdout=proc), _ssh_result(stdout="/dev/nvidiactl\n/dev/nvidia-uvm\n"))
     from_live = await build_gpu_docker_config_for_executor(live, ["GPU-2"])
     probe = _probe(
-        gpu_proc_stdout=proc,
+        gpu_minor_map_stdout=proc,
         shared_nodes=("/dev/nvidiactl", "/dev/nvidia-uvm"),
         shared_nodes_whole_host_only=("/dev/infiniband/uverbs0", "/dev/nvidia-caps/nvidia-cap1"),
     )
@@ -728,7 +736,7 @@ async def test_gpu_config_with_probe_matches_live_partial_rental(monkeypatch):
 async def test_gpu_config_with_probe_whole_host_gets_the_whole_host_nodes(monkeypatch):
     monkeypatch.setattr(nd.settings, "KERNEL_GPU_VERDICT_CHECK_ENABLED", False)
     probe = _probe(
-        gpu_proc_stdout="GPU-1, 0\nGPU-2, 1\n",
+        gpu_minor_map_stdout="GPU-1, 0\nGPU-2, 1\n",
         gpu_device_nodes=("/dev/nvidia0", "/dev/nvidia1"),
         shared_nodes=("/dev/nvidiactl",),
         shared_nodes_whole_host_only=("/dev/infiniband/uverbs0", "/dev/nvidia-caps/nvidia-cap1"),
@@ -751,7 +759,7 @@ async def test_gpu_config_with_probe_whole_host_gets_the_whole_host_nodes(monkey
 @pytest.mark.asyncio
 async def test_gpu_config_with_probe_missing_uuid_still_consults_xml_live(monkeypatch):
     monkeypatch.setattr(nd.settings, "KERNEL_GPU_VERDICT_CHECK_ENABLED", False)
-    probe = _probe(gpu_proc_stdout="GPU-1, 0\n", shared_nodes=("/dev/nvidiactl",))
+    probe = _probe(gpu_minor_map_stdout="GPU-1, 0\n", shared_nodes=("/dev/nvidiactl",))
     ssh = _ssh(_ssh_result(exit_status=1, stderr="no nvidia-smi"))
     config = await build_gpu_docker_config_for_executor(ssh, ["GPU-9"], host_probe=probe)
     # the kernel map lacks GPU-9 → nvidia-smi XML is asked live → fails → legacy --gpus-only fallback
@@ -762,41 +770,21 @@ async def test_gpu_config_with_probe_missing_uuid_still_consults_xml_live(monkey
 @pytest.mark.asyncio
 async def test_gpu_config_failed_proc_section_queries_live(monkeypatch):
     monkeypatch.setattr(nd.settings, "KERNEL_GPU_VERDICT_CHECK_ENABLED", False)
-    probe = _probe(gpu_proc_stdout=None, shared_nodes=("/dev/nvidiactl",))
+    probe = _probe(gpu_minor_map_stdout=None, shared_nodes=("/dev/nvidiactl",))
     ssh = _ssh(_ssh_result(stdout="GPU-1, 0\n"))
     config = await build_gpu_docker_config_for_executor(ssh, ["GPU-1"], host_probe=probe)
-    assert _cmds(ssh) == [_PROC_GPU_INFO_CMD]
+    assert _cmds(ssh) == [PROC_GPU_INFO_CMD]
     assert [d.path_on_host for d in config.device_mounts] == ["/dev/nvidia0", "/dev/nvidiactl"]
 
 
 @pytest.mark.asyncio
-async def test_raise_low_power_limits_with_probe_queries_nothing_and_still_raises():
-    state = "GPU-1, 100.00, 450.00, 100.00, 450.00\nGPU-2, 450.00, 450.00, 100.00, 450.00\n"
-    probe = _probe(power_state_stdout=state)
-    # -pm 1, -pl 450, readback
-    ssh = _ssh(
-        _ssh_result(stdout=""),
-        _ssh_result(stdout=""),
-        _ssh_result(stdout="450, Enabled\n"),
-    )
-    raised = await raise_low_power_limits_to_default(
-        ssh, "exec-1", ["GPU-1", "GPU-2"], host_probe=probe
-    )
-    assert raised == 1
-    assert _POWER_STATE_CMD not in _cmds(ssh)
-    assert any("-pl 450" in c and "GPU-1" in c for c in _cmds(ssh))
-
-
-@pytest.mark.asyncio
-async def test_raise_low_power_limits_failed_power_section_queries_live():
+async def test_raise_low_power_limits_takes_no_probe_and_queries_live():
+    # The last-resort raise runs minutes after the probe (volume creation, bootstrap restore), so
+    # it has no probe parameter at all: the state it acts on is always a live query.
+    assert "host_probe" not in inspect.signature(raise_low_power_limits_to_default).parameters
     ssh = _ssh(_ssh_result(stdout="GPU-1, 450.00, 450.00, 100.00, 450.00\n"))
-    assert (
-        await raise_low_power_limits_to_default(
-            ssh, "exec-1", ["GPU-1"], host_probe=_probe(power_state_stdout=None)
-        )
-        == 0
-    )
-    assert _cmds(ssh) == [_POWER_STATE_CMD]
+    assert await raise_low_power_limits_to_default(ssh, "exec-1", ["GPU-1"]) == 0
+    assert _cmds(ssh) == [POWER_STATE_CMD]
 
 
 @pytest.mark.asyncio
@@ -809,25 +797,7 @@ async def test_restore_tracked_limits_with_probe_uses_it_for_before_values():
     probe = _probe(power_state_stdout="GPU-1, 250.00, 450.00, 100.00, 450.00\n")
     ssh = _ssh(_ssh_result(stdout=""), _ssh_result(stdout=""), _ssh_result(stdout="400, Enabled\n"))
     assert await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-1"], host_probe=probe) == 1
-    assert _POWER_STATE_CMD not in _cmds(ssh)
-
-
-@pytest.mark.asyncio
-async def test_restore_counts_a_written_limit_even_when_its_record_cannot_be_cleared():
-    # create_container withdraws the probe's power state from the raise when restore_* returns > 0;
-    # a limit that was written but whose Redis record could not be deleted still changed the GPU
-    redis = AsyncMock()
-    redis.get = AsyncMock(
-        return_value='{"gpu_uuid":"GPU-1","watts":400,"pod_id":"p","executor_id":"e","capped_at":1.0}'
-    )
-    redis.delete = AsyncMock(side_effect=ConnectionError("redis gone"))
-    ssh = _ssh(
-        _ssh_result(stdout="GPU-1, 250.00, 450.00, 100.00, 450.00\n"),
-        _ssh_result(stdout=""),
-        _ssh_result(stdout=""),
-        _ssh_result(stdout="400, Enabled\n"),
-    )
-    assert await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-1"]) == 1
+    assert POWER_STATE_CMD not in _cmds(ssh)
 
 
 # ------------------------------------------------------------------
@@ -918,7 +888,8 @@ async def test_create_container_flag_on_probes_once_and_hands_it_to_every_consum
 
     assert _probe_kwarg(ds.build_gpu_docker_config_for_executor) is probe
     assert _probe_kwarg(ds.restore_tracked_gpu_power_limits) is probe
-    assert _probe_kwarg(ds.raise_low_power_limits_to_default) is probe
+    # the last-resort raise runs minutes after the probe and never takes it
+    assert "host_probe" not in ds.raise_low_power_limits_to_default.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -943,7 +914,7 @@ async def test_create_container_withdraws_docker_listings_after_a_removal(svc_fi
 
     # a docker removal does not touch the GPU / power sections
     assert _probe_kwarg(ds.build_gpu_docker_config_for_executor) is probe
-    assert _probe_kwarg(ds.raise_low_power_limits_to_default) is probe
+    assert _probe_kwarg(ds.restore_tracked_gpu_power_limits) is probe
 
 
 @pytest.mark.asyncio
@@ -962,24 +933,6 @@ async def test_create_container_withdraws_docker_listings_after_a_vloopback_swee
     assert _probe_kwarg(svc.clean_stale_vloopback_volumes) is probe
     assert _probe_kwarg(svc.sweep_stale_cache_volumes) is None
     assert _probe_kwarg(svc.reclaim_dphn_cache_for_rental) is None
-
-
-@pytest.mark.asyncio
-async def test_create_container_withdraws_power_state_after_a_restore(svc_fixture, monkeypatch):
-    svc = svc_fixture
-    monkeypatch.setattr(settings, "RENTAL_PRERUN_HOST_PROBE_ENABLED", True)
-    ssh_client = _deploy_ssh_client()
-    probe = _probe()
-    _wire(svc, monkeypatch, ssh_client, probe_result=probe)
-    from services import docker_service as ds
-
-    monkeypatch.setattr(
-        "services.docker_service.restore_tracked_gpu_power_limits", AsyncMock(return_value=1)
-    )
-    result = await _run_create_container(svc, _deploy_payload())
-    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    assert _probe_kwarg(ds.restore_tracked_gpu_power_limits) is probe
-    assert _probe_kwarg(ds.raise_low_power_limits_to_default) is None
 
 
 @pytest.mark.asyncio

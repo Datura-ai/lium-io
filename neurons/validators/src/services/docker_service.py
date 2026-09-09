@@ -73,7 +73,7 @@ from services.const import (
 )
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.gpu_power_limit import (
-    _NVIDIA_SMI_TIMEOUT_SECONDS,
+    NVIDIA_SMI_TIMEOUT_SECONDS,
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
     restore_all_host_gpu_power_limits,
@@ -266,7 +266,7 @@ _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
 # DAH-3257: the pre-run probe carries one nvidia-smi query plus seven docker/procfs listings that
 # take milliseconds, so its bound is the one the per-command path puts on that nvidia-smi query
 # (30 s); a probe slower than this is a hung host, and the per-command path takes over.
-_PRERUN_HOST_PROBE_TIMEOUT_SECONDS = _NVIDIA_SMI_TIMEOUT_SECONDS
+_PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 
 
 def _missing_rental_docker_host_key_log_text(
@@ -1835,7 +1835,9 @@ class DockerService:
 
         try:
             if host_probe is not None and host_probe.volumes is not None:
-                volume_rows: list[tuple[str, str]] = list(host_probe.volumes)
+                volume_rows: list[tuple[str, str]] = [
+                    (volume.name, volume.driver) for volume in host_probe.volumes
+                ]
             else:
                 volume_result = await ssh_client.run(list_volumes_cmd)
                 if getattr(volume_result, "exit_status", 0) != 0:
@@ -2349,7 +2351,7 @@ class DockerService:
                             ("ps", probe.container_names),
                             ("volumes", probe.volumes),
                             ("mounted", probe.mounted_volume_names),
-                            ("gpu_proc", probe.gpu_proc_stdout),
+                            ("gpu_minor_map", probe.gpu_minor_map_stdout),
                             ("gpu_devices", probe.gpu_device_nodes),
                             ("shared_nodes", probe.shared_nodes),
                             ("shared_nodes_whole_host", probe.shared_nodes_whole_host_only),
@@ -4854,7 +4856,7 @@ class DockerService:
                     # without its own cap starts, so a customer (or an uncapped filler) never
                     # inherits a reduced limit. Best-effort, never blocks the rental.
                     if payload.gpu_uuids:
-                        restored_limits = await restore_tracked_gpu_power_limits(
+                        await restore_tracked_gpu_power_limits(
                             ssh_client,
                             self.redis_service,
                             payload.gpu_uuids,
@@ -4863,20 +4865,19 @@ class DockerService:
                         )
                     else:
                         # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
-                        restored_limits = await restore_all_host_gpu_power_limits(
+                        await restore_all_host_gpu_power_limits(
                             ssh_client, self.redis_service, log_extra=default_extra, host_probe=host_probe
                         )
                     # State-free last-resort net: if a pre-cap record was lost, the record-based
                     # restore above did nothing — lift anything still below the check's floor back
                     # to the GPU's own default, so the customer never starts on a capped GPU.
-                    # A restore just wrote a limit → the probe's power state is stale → live query
-                    # (restore_* count every `-pl` that stuck, whether or not its record cleared).
+                    # Always a live query: volume creation and a bootstrap restore ran since the
+                    # probe, so its power state can be minutes old.
                     await raise_low_power_limits_to_default(
                         ssh_client,
                         payload.executor_id,
                         payload.gpu_uuids or None,
                         log_extra=default_extra,
-                        host_probe=host_probe if restored_limits == 0 else None,
                     )
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor

@@ -55,12 +55,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_POWER_STATE_CMD = (
+POWER_STATE_CMD = (
     "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit "
     "--format=csv,noheader,nounits"
 )
 # Bound each nvidia-smi call so a hung driver can't stall filler deploy/undeploy (PoC #1120).
-_NVIDIA_SMI_TIMEOUT_SECONDS = 30
+NVIDIA_SMI_TIMEOUT_SECONDS = 30
 _RESTORE_KEY_PREFIX = "gpu_power_restore:"
 _POD_INDEX_KEY_PREFIX = "gpu_power_restore_pod:"
 # A record younger than this may belong to a filler the check's backend snapshot doesn't report yet
@@ -190,11 +190,11 @@ async def _query_power_state(
     *,
     host_probe: PrerunHostProbe | None = None,
 ) -> dict[str, GpuPowerState]:
-    # DAH-3257: the pre-run probe already ran _POWER_STATE_CMD; a probe without the section
+    # DAH-3257: the pre-run probe already ran POWER_STATE_CMD; a probe without the section
     # (nvidia-smi failed there, or the caller did not ask for it) means the live query below.
     if host_probe is not None and host_probe.power_state_stdout is not None:
         return _parse_power_state_csv(host_probe.power_state_stdout)
-    result = await ssh.run(_POWER_STATE_CMD, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS)
+    result = await ssh.run(POWER_STATE_CMD, timeout=NVIDIA_SMI_TIMEOUT_SECONDS)
     if result.exit_status != 0:
         raise RuntimeError(
             f"nvidia-smi power-state query failed: exit_status={result.exit_status}, "
@@ -215,7 +215,7 @@ async def _enable_persistence_mode(
     failure: str | None = None
     try:
         result = await ssh.run(
-            f"nvidia-smi -i {shlex.quote(uuid)} -pm 1", timeout=_NVIDIA_SMI_TIMEOUT_SECONDS
+            f"nvidia-smi -i {shlex.quote(uuid)} -pm 1", timeout=NVIDIA_SMI_TIMEOUT_SECONDS
         )
         if result.exit_status != 0:
             failure = f"exit={result.exit_status}, stderr={result.stderr!r}"
@@ -239,7 +239,7 @@ async def _read_back_power_state(ssh: asyncssh.SSHClientConnection, uuid: str) -
         f"--format=csv,noheader,nounits"
     )
     try:
-        result = await ssh.run(readback_command, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS)
+        result = await ssh.run(readback_command, timeout=NVIDIA_SMI_TIMEOUT_SECONDS)
     except Exception:
         return _UNREADABLE_READBACK
     if result.exit_status != 0:
@@ -257,7 +257,7 @@ async def _set_power_limit(
     proves the cap exists."""
     try:
         result = await ssh.run(
-            f"nvidia-smi -i {shlex.quote(uuid)} -pl {watts}", timeout=_NVIDIA_SMI_TIMEOUT_SECONDS
+            f"nvidia-smi -i {shlex.quote(uuid)} -pl {watts}", timeout=NVIDIA_SMI_TIMEOUT_SECONDS
         )
     except Exception as exc:
         return PowerLimitSetOutcome(failure=f"nvidia-smi -pl errored: {exc}", persistence_enabled=None)
@@ -407,8 +407,7 @@ async def _restore_records(
     log_extra: dict[str, object] | None,
 ) -> int:
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
-    (a failed restore keeps it for the safety nets to retry). Returns the number of limits written
-    back (a record whose delete then failed still counts: the GPU's limit did change)."""
+    (a failed restore keeps it for the safety nets to retry). Returns the restored count."""
     restored = 0
     for record in records:
         state = state_by_uuid.get(record.gpu_uuid)
@@ -418,9 +417,9 @@ async def _restore_records(
         )
         if not changed:
             continue
-        restored += 1
         try:
             await redis.delete(_restore_key(record.gpu_uuid))
+            restored += 1
         except Exception as exc:
             _log(
                 logging.ERROR,
@@ -481,8 +480,6 @@ async def raise_low_power_limits_to_default(
     executor_id: str,
     gpu_uuids: list[str] | None,
     log_extra: dict[str, object] | None = None,
-    *,
-    host_probe: PrerunHostProbe | None = None,
 ) -> int:
     """State-free last-resort net for rental start: lift every GPU sitting below
     ``MIN_POWER_LIMIT_RATIO`` x its default limit back to the default.
@@ -493,11 +490,12 @@ async def raise_low_power_limits_to_default(
     floor and the default are left alone (a miner may legitimately run there). ``gpu_uuids=None``
     means every host GPU. Best-effort (never raises); returns the raised count.
 
-    ``host_probe`` (DAH-3257) stands in for the state query only while nothing has changed a
-    limit since the probe ran — the caller passes None after a restore wrote one.
+    Always a live query, never the pre-run probe (DAH-3257): volume creation and a bootstrap
+    restore run between the probe and this call, so the probe's power state can be minutes old,
+    and this net is the last read before the customer's container starts.
     """
     try:
-        state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
+        state_by_uuid = await _query_power_state(ssh)
     except Exception as exc:
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0

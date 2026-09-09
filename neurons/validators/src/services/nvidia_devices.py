@@ -148,7 +148,7 @@ def _emit_kernel_xml_disagreement(
     )
 
 
-_PROC_GPU_INFO_CMD = (
+PROC_GPU_INFO_CMD = (
     "for f in /proc/driver/nvidia/gpus/*/information; do "
     '[ -r "$f" ] || continue; '
     "awk -F: '"
@@ -262,7 +262,7 @@ def _device_flags(nodes: Sequence[str]) -> str:
     return " ".join(f"--device={node}" for node in nodes)
 
 
-_GPU_DEVICE_NODES_CMD = "ls -1d /dev/nvidia[0-9]* 2>/dev/null || true"
+GPU_DEVICE_NODES_CMD = "ls -1d /dev/nvidia[0-9]* 2>/dev/null || true"
 
 
 async def _query_all_gpu_nodes(
@@ -272,7 +272,7 @@ async def _query_all_gpu_nodes(
 ) -> tuple[str, ...]:
     if host_probe is not None and host_probe.gpu_device_nodes is not None:
         return host_probe.gpu_device_nodes
-    res = await ssh.run(_GPU_DEVICE_NODES_CMD)
+    res = await ssh.run(GPU_DEVICE_NODES_CMD)
     return _stdout_lines(res.stdout)
 
 
@@ -295,7 +295,7 @@ async def _query_gpu_nodes_for_uuids(
     except RuntimeError as exc:
         errors.append(str(exc))
         uuid_to_minor = {}
-    # An empty map is the real signal, not the exception: _PROC_GPU_INFO_CMD swallows an
+    # An empty map is the real signal, not the exception: PROC_GPU_INFO_CMD swallows an
     # unreadable procfs (unexpanded glob, `|| continue`, stderr discarded) and exits 0, so an
     # honest host with no readable procfs would otherwise log identically to a spoof.
     proc_unreadable = not uuid_to_minor
@@ -374,9 +374,9 @@ async def _query_gpu_minor_map_from_proc(
     *,
     host_probe: PrerunHostProbe | None = None,
 ) -> dict[str, int]:
-    if host_probe is not None and host_probe.gpu_proc_stdout is not None:
-        return _parse_uuid_minor_csv(host_probe.gpu_proc_stdout)
-    res = await ssh.run(_PROC_GPU_INFO_CMD)
+    if host_probe is not None and host_probe.gpu_minor_map_stdout is not None:
+        return _parse_uuid_minor_csv(host_probe.gpu_minor_map_stdout)
+    res = await ssh.run(PROC_GPU_INFO_CMD)
     if res.exit_status != 0:
         raise RuntimeError(
             "NVIDIA /proc GPU minor query failed on executor: "

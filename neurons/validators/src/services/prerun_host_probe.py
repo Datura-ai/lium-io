@@ -22,10 +22,10 @@ import shlex
 from dataclasses import dataclass
 
 # The probe reads the same commands the per-command path runs, so the two paths cannot drift.
-from services.gpu_power_limit import _POWER_STATE_CMD
+from services.gpu_power_limit import POWER_STATE_CMD
 from services.nvidia_devices import (
-    _GPU_DEVICE_NODES_CMD,
-    _PROC_GPU_INFO_CMD,
+    GPU_DEVICE_NODES_CMD,
+    PROC_GPU_INFO_CMD,
     shared_device_nodes_command,
 )
 
@@ -33,7 +33,7 @@ from services.nvidia_devices import (
 PS_TAG = "PS"
 VOL_TAG = "VOL"
 MNT_TAG = "MNT"
-GPUPROC_TAG = "GPUPROC"
+GPU_MINOR_MAP_TAG = "GPUMINORMAP"
 GPUDEV_TAG = "GPUDEV"
 SHARED_TAG = "SHARED"
 SHAREDW_TAG = "SHAREDW"
@@ -43,7 +43,7 @@ _ALWAYS_TAGS = (
     PS_TAG,
     VOL_TAG,
     MNT_TAG,
-    GPUPROC_TAG,
+    GPU_MINOR_MAP_TAG,
     GPUDEV_TAG,
     SHARED_TAG,
     SHAREDW_TAG,
@@ -79,6 +79,14 @@ def image_label_command(docker_image: str, label: str) -> str:
 
 
 @dataclass(frozen=True)
+class ProbedVolume:
+    """One `docker volume ls` row."""
+
+    name: str
+    driver: str  # `local`, `vloopback`, `vloopback:latest`, …
+
+
+@dataclass(frozen=True)
 class PrerunHostProbe:
     """The host listings a rent reads before `docker run`, from one SSH command.
 
@@ -87,9 +95,9 @@ class PrerunHostProbe:
     """
 
     container_names: tuple[str, ...] | None
-    volumes: tuple[tuple[str, str], ...] | None  # (name, driver), as `docker volume ls` prints them
+    volumes: tuple[ProbedVolume, ...] | None
     mounted_volume_names: tuple[str, ...] | None
-    gpu_proc_stdout: str | None  # raw `uuid, minor` lines for `_parse_uuid_minor_csv`
+    gpu_minor_map_stdout: str | None  # raw `uuid, minor` lines (the kernel's GPU UUID→minor map)
     gpu_device_nodes: tuple[str, ...] | None  # /dev/nvidiaN
     shared_nodes: tuple[str, ...] | None  # nodes every rental gets
     shared_nodes_whole_host_only: tuple[str, ...] | None  # nodes only a whole-host rental gets
@@ -102,7 +110,7 @@ class PrerunHostProbe:
     def volume_names(self) -> tuple[str, ...] | None:
         if self.volumes is None:
             return None
-        return tuple(name for name, _driver in self.volumes)
+        return tuple(volume.name for volume in self.volumes)
 
     def shared_nodes_for(self, *, is_whole_host_rental: bool) -> tuple[str, ...] | None:
         """The node list `_query_shared_nodes` would have printed for this rental shape."""
@@ -130,7 +138,7 @@ def prerun_host_probe_command(*, docker_image: str, image_label: str, with_power
     """
     parts = [
         # awk, not sed: `\t` in a sed replacement is GNU-only; awk's "\t" is POSIX (and
-        # _PROC_GPU_INFO_CMD already needs awk on the host).
+        # PROC_GPU_INFO_CMD already needs awk on the host).
         't() { tag=$1; shift; out="$(sh -c "$1" 2>/dev/null)"; rc=$?; '
         'if [ -n "$out" ]; then printf \'%s\\n\' "$out" | awk -v t="$tag" \'{ print t "\\t" $0 }\' '
         f"|| echo {PREFIX_FAILED_MARKER}; fi; "
@@ -138,8 +146,8 @@ def prerun_host_probe_command(*, docker_image: str, image_label: str, with_power
         _section(PS_TAG, DOCKER_PS_ALL_NAMES_CMD),
         _section(VOL_TAG, DOCKER_VOLUME_LS_NAME_DRIVER_CMD),
         _section(MNT_TAG, DOCKER_MOUNTED_VOLUME_NAMES_CMD),
-        _section(GPUPROC_TAG, _PROC_GPU_INFO_CMD),
-        _section(GPUDEV_TAG, _GPU_DEVICE_NODES_CMD),
+        _section(GPU_MINOR_MAP_TAG, PROC_GPU_INFO_CMD),
+        _section(GPUDEV_TAG, GPU_DEVICE_NODES_CMD),
         _section(SHARED_TAG, shared_device_nodes_command(is_whole_host_rental=False)),
         _section(
             SHAREDW_TAG,
@@ -147,7 +155,7 @@ def prerun_host_probe_command(*, docker_image: str, image_label: str, with_power
         ),
     ]
     if with_power:
-        parts.append(_section(POWER_TAG, _POWER_STATE_CMD))
+        parts.append(_section(POWER_TAG, POWER_STATE_CMD))
     parts.append(_section(LABEL_TAG, image_label_command(docker_image, image_label)))
     return "; ".join(parts)
 
@@ -204,14 +212,14 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
     def stripped_lines(tag: str) -> tuple[str, ...]:
         return tuple(line.strip() for line in lines.get(tag, ()) if line.strip())
 
-    volumes: tuple[tuple[str, str], ...] | None = None
+    volumes: tuple[ProbedVolume, ...] | None = None
     if ok(VOL_TAG):
         # `{{.Name}} {{.Driver}}` — the per-command path splits on the first space too.
         parsed = []
         for line in lines.get(VOL_TAG, ()):
             parts = line.strip().split(maxsplit=1)
             if len(parts) == 2:
-                parsed.append((parts[0], parts[1]))
+                parsed.append(ProbedVolume(name=parts[0], driver=parts[1]))
         volumes = tuple(parsed)
 
     label_value: str | None = None
@@ -224,7 +232,9 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
         container_names=stripped_lines(PS_TAG) if ok(PS_TAG) else None,
         volumes=volumes,
         mounted_volume_names=stripped_lines(MNT_TAG) if ok(MNT_TAG) else None,
-        gpu_proc_stdout="\n".join(lines.get(GPUPROC_TAG, ())) if ok(GPUPROC_TAG) else None,
+        gpu_minor_map_stdout="\n".join(lines.get(GPU_MINOR_MAP_TAG, ()))
+        if ok(GPU_MINOR_MAP_TAG)
+        else None,
         gpu_device_nodes=stripped_lines(GPUDEV_TAG) if ok(GPUDEV_TAG) else None,
         shared_nodes=stripped_lines(SHARED_TAG) if ok(SHARED_TAG) else None,
         shared_nodes_whole_host_only=stripped_lines(SHAREDW_TAG) if ok(SHAREDW_TAG) else None,
