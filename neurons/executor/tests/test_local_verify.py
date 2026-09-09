@@ -13,6 +13,7 @@ import json
 import secrets
 import sys
 import textwrap
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -26,9 +27,15 @@ from middlewares.miner import MinerMiddleware
 from payloads.verify import (
     CAPABILITY,
     SCHEMA,
+    DeviceChallenge,
+    DockerFacts,
+    InspectorFacts,
     MatmulStep,
+    PortFacts,
     VerifyIntentBody,
+    VerifyResult,
     VerifySteps,
+    VerifyXData,
     VerifyXStep,
 )
 from routes.apis import apis_router
@@ -44,6 +51,11 @@ from core.config import settings
 from routes import apis as apis_module
 
 EXECUTOR_UUID = "exec-0001"
+
+
+def _loop_thread_id() -> int:
+    """The thread asyncio.run is on in these tests (the main thread)."""
+    return threading.main_thread().ident
 
 FAKE_MATMUL = textwrap.dedent(
     """
@@ -181,22 +193,29 @@ def test_all_steps_run_and_return_raw_evidence(fake_scripts, fake_docker):
 
     verifyx = result.steps["verifyx"]
     assert verifyx.stdout.strip().endswith("deadbeef")
-    assert verifyx.data["lib_sha256"] == lvs.sha256_of_file(
-        str(fake_scripts / "verifyx_executor.py")
+    assert verifyx.data == VerifyXData(
+        lib_sha256=lvs.sha256_of_file(str(fake_scripts / "verifyx_executor.py"))
     )
 
     docker = result.steps["docker"].data
-    assert docker["sysbox_runtime"] is True and docker["runtimes"] == ["runc", "sysbox-runc"]
-    assert docker["containers"][0]["name"] == "pod-1"
-    assert docker["disk"]["total_bytes"] > 0
+    assert isinstance(docker, DockerFacts)
+    assert docker.sysbox_runtime is True and docker.runtimes == ["runc", "sysbox-runc"]
+    assert docker.containers[0].name == "pod-1"
+    assert docker.disk.total_bytes > 0
 
     ports = result.steps["ports"].data
-    assert (
-        ports["configured"] == 10 and ports["published_by_docker"] == [40001] and ports["free"] == 9
-    )
+    assert isinstance(ports, PortFacts)
+    assert ports.configured == 10 and ports.published_by_docker == [40001] and ports.free == 9
 
     inspector = result.steps["inspector"].data
-    assert inspector["lib_present"] and inspector["script_present"] and inspector["lib_sha256"]
+    assert isinstance(inspector, InspectorFacts)
+    assert inspector.lib_present and inspector.script_present and inspector.lib_sha256
+
+    # The wire shape the validator reads is the typed models' field names, one round trip through JSON.
+    wire = json.loads(result.model_dump_json(by_alias=True))
+    assert wire["steps"]["ports"]["data"]["published_by_docker"] == [40001]
+    assert set(wire["steps"]["docker"]["data"]) == set(DockerFacts.model_fields)
+    assert VerifyResult.model_validate(wire).steps["docker"].data == docker
 
 
 def test_gpu_steps_run_side_by_side_only_when_asked(fake_scripts, fake_docker, monkeypatch):
@@ -251,21 +270,69 @@ def test_failed_script_is_evidence_not_an_exception(fake_scripts, fake_docker, m
     assert result.steps["verifyx"].status == "ok"
 
 
-def test_all_cards_pins_one_run_per_device(fake_scripts, fake_docker):
+def test_all_cards_pins_one_run_per_device_with_its_own_challenge(fake_scripts, fake_docker):
     body = _body(
         steps=VerifySteps(
             matmul=MatmulStep(
-                dim_n=1900, dim_k=2000000, seed=7, cipher_text="c0ffee", devices=[0, 1]
+                dim_n=1900,
+                dim_k=2000000,
+                seed=7,
+                cipher_text="c0ffee",
+                devices=[
+                    DeviceChallenge(index=0, seed=70, cipher_text="card0"),
+                    DeviceChallenge(index=1, seed=71, cipher_text="card1"),
+                ],
             )
         )
     )
     result = asyncio.run(_service().run(body))
-    cards = result.steps["matmul"].data["per_card"]
-    assert [c["card_index"] for c in cards] == [0, 1]
-    assert all(c["status"] == "ok" for c in cards)
-    assert [
-        json.loads(c["stdout"].splitlines()[-1].split("RESULT_JSON: ")[1])["device"] for c in cards
-    ] == ["0", "1"]
+    cards = result.steps["matmul"].data.per_card
+    assert [c.card_index for c in cards] == [0, 1]
+    assert all(c.status == "ok" for c in cards)
+    printed = [json.loads(c.stdout.splitlines()[-1].split("RESULT_JSON: ")[1]) for c in cards]
+    assert [p["device"] for p in printed] == ["0", "1"]
+    # Each card ran ITS challenge: the sealed output carries that card's cipher text, not the step's.
+    assert [p["sealed"] for p in printed] == ["cafecard0", "cafecard1"]
+
+
+@pytest.mark.parametrize(
+    "devices",
+    [
+        # two cards, one challenge: one real run could answer for both
+        [DeviceChallenge(index=0, seed=1, cipher_text="same"), DeviceChallenge(index=1, seed=2, cipher_text="same")],
+        # a card's challenge equal to the step's own
+        [DeviceChallenge(index=0, seed=1, cipher_text="c")],
+        # the same card twice
+        [DeviceChallenge(index=0, seed=1, cipher_text="a"), DeviceChallenge(index=0, seed=2, cipher_text="b")],
+    ],
+)
+def test_a_shared_or_repeated_card_challenge_is_refused(devices):
+    with pytest.raises(ValueError):
+        MatmulStep(dim_n=1, dim_k=1, seed=1, cipher_text="c", devices=devices)
+
+
+def test_no_configured_ports_means_the_validators_default_range(fake_docker):
+    """Both settings unset: the validator counts 20000–65535 (port_utils.DEFAULT_PORT_RANGE), so
+    the facts must count the same, not zero."""
+    assert lvs.parse_port_range(None, None) == [(p, p) for p in range(20000, 65536)]
+    assert lvs.parse_port_range("", "") == [(p, p) for p in range(20000, 65536)]
+    facts = lvs._port_facts(None, None, ssh_port=22)
+    assert facts.configured == 65536 - 20000 and facts.sampled == lvs.PORT_SAMPLE_MAX
+    assert lvs.parse_port_range("40000-40001", None) == [(40000, 40000), (40001, 40001)]
+
+
+def test_the_verifyx_library_is_hashed_off_the_event_loop(fake_scripts, fake_docker, monkeypatch):
+    on_loop: list[bool] = []
+    real = lvs.sha256_of_file
+
+    def observed(path):
+        on_loop.append(_loop_thread_id() == threading.get_ident())
+        return real(path)
+
+    monkeypatch.setattr(lvs, "sha256_of_file", observed)
+    result = asyncio.run(_service().run(_body(steps=VerifySteps(verifyx=VerifyXStep(seed=1, cipher_text="d")))))
+    assert result.steps["verifyx"].data.lib_sha256 == real(str(fake_scripts / "verifyx_executor.py"))
+    assert on_loop == [False]
 
 
 def test_steps_not_asked_for_are_skipped(fake_scripts, fake_docker):
@@ -439,9 +506,12 @@ def test_malformed_intent_is_422_before_any_signature_check(client, validator_ke
     assert client.post("/verify", json=other_schema).status_code == 422
     # The matmul fan-out is bounded: more devices than any host has, or a negative index, is 422.
     with pytest.raises(ValueError):
-        MatmulStep(dim_n=1, dim_k=1, seed=1, cipher_text="c", devices=list(range(65)))
+        MatmulStep(
+            dim_n=1, dim_k=1, seed=1, cipher_text="c",
+            devices=[DeviceChallenge(index=i, seed=i, cipher_text=f"card{i}") for i in range(65)],
+        )
     with pytest.raises(ValueError):
-        MatmulStep(dim_n=1, dim_k=1, seed=1, cipher_text="c", devices=[-1])
+        DeviceChallenge(index=-1, seed=1, cipher_text="x")
 
 
 def test_canonical_message_is_the_shared_datura_definition():
