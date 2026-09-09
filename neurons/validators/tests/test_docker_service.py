@@ -35,6 +35,7 @@ from services.rental_docker_sdk import (
 )
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    BootstrapRestoreSpec,
     ContainerCreated,
     ContainerCreateRequest,
     CustomOptions,
@@ -5202,6 +5203,110 @@ async def test_image_has_encrypted_volume_label(docker_service):
     )
     with pytest.raises(RuntimeError, match="docker image inspect failed"):
         await docker_service._image_has_encrypted_volume_label(ssh_client, "any/image:tag")
+
+
+def _bootstrap_restore_spec() -> BootstrapRestoreSpec:
+    return BootstrapRestoreSpec(
+        restore_log_id=str(uuid4()),
+        backup_engine="restic",
+        repository_pod_id=str(uuid4()),
+        repository_password="repo-password",
+        backup_volume_info=ExternalVolumeInfo(
+            name="backup-bucket",
+            plugin="s3",
+            iam_user_access_key="ak",
+            iam_user_secret_key="sk",
+        ),
+        snapshot_id="a" * 64,
+        auth_token="token",
+        restore_path="",
+    )
+
+
+def _create_payload(pod_id: str, *, encrypted: bool) -> ContainerCreateRequest:
+    return ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        is_sysbox=encrypted,
+        enable_volume_encryption=encrypted,
+        bootstrap_restore=_bootstrap_restore_spec(),
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encrypted", [True, False], ids=["encrypted", "plain"])
+async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
+    docker_service,
+    monkeypatch,
+    encrypted,
+):
+    # DAH-3274: a plain volume is restored before `docker run` (data present at entrypoint);
+    # an encrypted one only after its gocryptfs mount exists inside the running pod, through
+    # that pod — so the executor is never handed the passphrase.
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    order: list[str] = []
+
+    async def _setup(**kwargs):
+        order.append("mount")
+
+    async def _restore(**kwargs):
+        order.append("restore")
+        return None
+
+    async def _docker_run(*args, **kwargs):
+        order.append("docker_run")
+
+    monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", _setup)
+    restore_spy = AsyncMock(side_effect=_restore)
+    monkeypatch.setattr(docker_service, "_run_bootstrap_restore", restore_spy)
+    monkeypatch.setattr(
+        docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=_docker_run)
+    )
+    keys_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "add_ssh_public_keys_with_rental_docker", keys_spy)
+
+    pod_id = str(uuid4())
+    payload = _create_payload(pod_id, encrypted=encrypted)
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    restore_spy.assert_awaited_once()
+    kwargs = restore_spy.await_args.kwargs
+    if encrypted:
+        assert order == ["docker_run", "mount", "restore"]
+        assert kwargs["encrypted"] is True
+        assert kwargs["container_name"] == docker_service.get_container_name(payload)
+        # the target is still empty: the customer's keys land in /root/.ssh only afterwards
+        assert keys_spy.await_count == 1
+    else:
+        assert order == ["restore", "docker_run"]
+        assert kwargs["encrypted"] is False
+        assert "container_name" not in kwargs
 
 
 @pytest.mark.asyncio

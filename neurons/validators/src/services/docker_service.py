@@ -4774,7 +4774,12 @@ class DockerService:
                             ),
                         )
 
-                if payload.bootstrap_restore:
+                if payload.bootstrap_restore and not use_encrypted_volume:
+                    # A plain volume is restored before the container exists: the data is in
+                    # place when the image's entrypoint starts. An encrypted volume cannot be:
+                    # its plaintext exists only behind the gocryptfs mount inside the running
+                    # pod, so that restore runs after setup_encrypted_local_volume below —
+                    # through the pod's own mount, never with the passphrase (DAH-3274).
                     current_step = "bootstrap_restore"
                     await self._run_bootstrap_restore(
                         ssh_client=ssh_client,
@@ -4783,7 +4788,7 @@ class DockerService:
                         restore=payload.bootstrap_restore,
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
-                        encrypted=use_encrypted_volume,
+                        encrypted=False,
                     )
                 if external_volume_info:
                     current_step = "external_volume_creation"
@@ -5071,6 +5076,24 @@ class DockerService:
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                         prev_timestamp = now_ms()
 
+                        if payload.bootstrap_restore:
+                            # DAH-3274: restore into the mounted plaintext through the pod's own
+                            # gocryptfs (the executor nsenters the pod's user namespace, as the
+                            # online `lium restore` does). The passphrase stays in the
+                            # validator→pod channel; the executor never sees it. Runs before the
+                            # key injection below so the restore target (/root) is still empty.
+                            current_step = "bootstrap_restore"
+                            await self._run_bootstrap_restore(
+                                ssh_client=ssh_client,
+                                executor_info=executor_info,
+                                payload=payload,
+                                restore=payload.bootstrap_restore,
+                                local_volume=local_volume,
+                                local_volume_path=local_volume_path,
+                                encrypted=True,
+                                container_name=container_name,
+                            )
+
                     # DAH-2341: inject the customer's public keys before the sshd
                     # bootstrap. The keys are plain data (mkdir + append) with no
                     # dependency on a running sshd, and the bootstrap may now spend
@@ -5341,7 +5364,15 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
         encrypted: bool,
+        container_name: str | None = None,
     ) -> None:
+        if encrypted and not container_name:
+            # No mode exists that restores into an encrypted volume without the pod: the
+            # only other way is to hand the executor the passphrase, which is the leak this
+            # method must never reopen (DAH-3274).
+            raise RuntimeError(
+                "encrypted bootstrap restore needs the running rental container"
+            )
         if not await supports_storage_operation(ssh_client, restore.backup_engine):
             # Legacy archives must remain restorable while executor-image adoption
             # is gradual. Restic has no safe fallback without its pinned binary.
@@ -5358,16 +5389,19 @@ class DockerService:
                 f"executor does not support bootstrap restore engine {restore.backup_engine}"
             )
         operation_id = UUID(restore.restore_log_id)
+        # The spec is SFTP'd into the executor container — a file on the provider's disk — so
+        # it carries what the executor needs to reach the data and nothing that unlocks it.
+        # `encrypted_running` restores through the pod's live gocryptfs mount; the passphrase
+        # never appears here (DAH-3274 — the former `encrypted_bootstrap` mode put it in the
+        # helper's `docker run -e`, i.e. in `docker inspect` for the life of the pod).
         workspace: dict[str, object] = {
-            "mode": "encrypted_bootstrap" if encrypted else "plain_volume",
+            "mode": "encrypted_running" if encrypted else "plain_volume",
             "volume_name": local_volume,
             "volume_path": local_volume_path,
             "requested_path": restore.restore_path or local_volume_path,
         }
         if encrypted:
-            workspace["volume_passphrase"] = VolumeKeyDeriver.from_settings(settings).material(
-                payload.pod_id
-            ).passphrase
+            workspace["container_name"] = container_name
 
         repository: dict[str, object] = {
             "bucket": restore.backup_volume_info.name,
