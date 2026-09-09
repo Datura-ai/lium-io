@@ -325,8 +325,23 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
 
                 # Pre-pull entries are opportunistic and idle-only, so they never go
                 # through the mandatory default-image path below; their tags are only
-                # shielded from its old-tag cleanup (same repository).
-                pre_pull = [data for data in templates if data.get("pre_pull")]
+                # shielded from its old-tag cleanup (same repository). An entry the backend
+                # marks pre_pull that is also this node's default image stays out of the
+                # pre-pull set: tracked there it would be an eviction candidate, and the
+                # default image is never removed (the backend's top-N is global, the
+                # default is per gpu_model, so the overlap is decided here).
+                mandatory_refs = {
+                    (data.get("docker_image"), data.get("docker_image_tag"))
+                    for data in templates
+                    if not data.get("pre_pull")
+                }
+                pre_pull = [
+                    data
+                    for data in templates
+                    if data.get("pre_pull")
+                    and (data.get("docker_image"), data.get("docker_image_tag"))
+                    not in mandatory_refs
+                ]
                 keep_tags = frozenset(
                     data["docker_image_tag"] for data in pre_pull if data.get("docker_image_tag")
                 )
@@ -334,6 +349,9 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                     if not data.get("pre_pull"):
                         await _ensure_template(client, data, state, keep_tags)
                 if pre_puller:
+                    # The default image's outcome is what the validator reads (DAH-2470): publish
+                    # it now, not after a sweep that can wait out the start jitter and one pull.
+                    state.flush()
                     try:
                         await pre_puller.sweep(pre_pull)
                     except asyncio.CancelledError:
