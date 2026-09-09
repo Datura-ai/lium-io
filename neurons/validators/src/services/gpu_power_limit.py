@@ -41,7 +41,7 @@ import logging
 import shlex
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import asyncssh
 from payload_models.payloads import GpuPowerLimit
@@ -49,6 +49,9 @@ from pydantic import BaseModel, ValidationError
 from services.redis_service import RedisService
 
 from core.utils import _m, get_extra_info
+
+if TYPE_CHECKING:
+    from services.prerun_host_probe import PrerunHostProbe
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +185,15 @@ def _log(level: int, message: str, fields: dict[str, object], log_extra: dict[st
     logger.log(level, _m(message, extra=get_extra_info({**(log_extra or {}), **fields})))
 
 
-async def _query_power_state(ssh: asyncssh.SSHClientConnection) -> dict[str, GpuPowerState]:
+async def _query_power_state(
+    ssh: asyncssh.SSHClientConnection,
+    *,
+    host_probe: PrerunHostProbe | None = None,
+) -> dict[str, GpuPowerState]:
+    # DAH-3257: the pre-run probe already ran _POWER_STATE_CMD; a probe without the section
+    # (nvidia-smi failed there, or the caller did not ask for it) means the live query below.
+    if host_probe is not None and host_probe.power_state_stdout is not None:
+        return _parse_power_state_csv(host_probe.power_state_stdout)
     result = await ssh.run(_POWER_STATE_CMD, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS)
     if result.exit_status != 0:
         raise RuntimeError(
@@ -396,7 +407,8 @@ async def _restore_records(
     log_extra: dict[str, object] | None,
 ) -> int:
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
-    (a failed restore keeps it for the safety nets to retry). Returns the restored count."""
+    (a failed restore keeps it for the safety nets to retry). Returns the number of limits written
+    back (a record whose delete then failed still counts: the GPU's limit did change)."""
     restored = 0
     for record in records:
         state = state_by_uuid.get(record.gpu_uuid)
@@ -406,9 +418,9 @@ async def _restore_records(
         )
         if not changed:
             continue
+        restored += 1
         try:
             await redis.delete(_restore_key(record.gpu_uuid))
-            restored += 1
         except Exception as exc:
             _log(
                 logging.ERROR,
@@ -425,6 +437,8 @@ async def restore_tracked_gpu_power_limits(
     redis: RedisService,
     gpu_uuids: list[str],
     log_extra: dict[str, object] | None = None,
+    *,
+    host_probe: PrerunHostProbe | None = None,
 ) -> int:
     """Restore the frozen pre-cap limit of every tracked GPU among ``gpu_uuids``.
 
@@ -434,7 +448,8 @@ async def restore_tracked_gpu_power_limits(
     if not read_result.records:
         return 0
     try:
-        state_by_uuid = await _query_power_state(ssh)  # before-values for the change log only
+        # before-values for the change log only
+        state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
     except Exception as exc:
         _log(logging.WARNING, f"gpu power restore: state query failed: {exc}; restoring without before-values", {}, log_extra)
         state_by_uuid = {}
@@ -445,11 +460,13 @@ async def restore_all_host_gpu_power_limits(
     ssh: asyncssh.SSHClientConnection,
     redis: RedisService,
     log_extra: dict[str, object] | None = None,
+    *,
+    host_probe: PrerunHostProbe | None = None,
 ) -> int:
     """Enumerate the host's GPUs over SSH and restore every tracked one — for whole-node containers
     whose payload names no gpu_uuids. Best-effort; returns the restored count."""
     try:
-        state_by_uuid = await _query_power_state(ssh)
+        state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
     except Exception as exc:
         _log(logging.ERROR, f"gpu power restore: state query failed: {exc}; will retry later", {}, log_extra)
         return 0
@@ -464,6 +481,8 @@ async def raise_low_power_limits_to_default(
     executor_id: str,
     gpu_uuids: list[str] | None,
     log_extra: dict[str, object] | None = None,
+    *,
+    host_probe: PrerunHostProbe | None = None,
 ) -> int:
     """State-free last-resort net for rental start: lift every GPU sitting below
     ``MIN_POWER_LIMIT_RATIO`` x its default limit back to the default.
@@ -473,9 +492,12 @@ async def raise_low_power_limits_to_default(
     never starts on a below-floor GPU no matter what happened to our state. GPUs between the
     floor and the default are left alone (a miner may legitimately run there). ``gpu_uuids=None``
     means every host GPU. Best-effort (never raises); returns the raised count.
+
+    ``host_probe`` (DAH-3257) stands in for the state query only while nothing has changed a
+    limit since the probe ran — the caller passes None after a restore wrote one.
     """
     try:
-        state_by_uuid = await _query_power_state(ssh)
+        state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
     except Exception as exc:
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
