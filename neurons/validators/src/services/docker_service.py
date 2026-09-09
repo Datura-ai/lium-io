@@ -73,6 +73,7 @@ from services.const import (
 )
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.gpu_power_limit import (
+    _NVIDIA_SMI_TIMEOUT_SECONDS,
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
     restore_all_host_gpu_power_limits,
@@ -262,10 +263,10 @@ _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
 _DOCKER_PULL_TIMEOUT_SECONDS = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
 _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
-# DAH-3257: the pre-run probe carries one nvidia-smi query (bounded at 30 s on the per-command
-# path) plus seven docker/procfs listings that take milliseconds; a probe slower than this is a
-# hung host, and the per-command path takes over.
-_PRERUN_HOST_PROBE_TIMEOUT_SECONDS = 60
+# DAH-3257: the pre-run probe carries one nvidia-smi query plus seven docker/procfs listings that
+# take milliseconds, so its bound is the one the per-command path puts on that nvidia-smi query
+# (30 s); a probe slower than this is a hung host, and the per-command path takes over.
+_PRERUN_HOST_PROBE_TIMEOUT_SECONDS = _NVIDIA_SMI_TIMEOUT_SECONDS
 
 
 def _missing_rental_docker_host_key_log_text(
