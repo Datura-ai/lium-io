@@ -35,6 +35,7 @@ from services.local_verify_client import (
     CAPABILITY,
     EXECUTOR_DEADLINE_MARGIN_SECONDS,
     EXECUTOR_DEADLINE_MAX_SECONDS,
+    EXECUTOR_VERSION_MAX_CHARS,
     SCHEMA,
     LocalVerifyClient,
     LocalVerifyUnavailable,
@@ -796,7 +797,7 @@ async def test_a_verifyx_response_the_library_rejects_is_left_to_ssh(
             ["verifyx"],
         ),
         ({"status": "ok", "exit_status": 0}, None, {"matmul": "step_no_stdout"}, ["verifyx"]),
-        (None, {"status": "unsupported"}, {"verifyx": "step_unsupported"}, ["matmul"]),
+        (None, {"status": "unsupported"}, {"verifyx": "step_malformed"}, ["matmul"]),
         (None, {"status": "skipped"}, {"verifyx": "step_skipped"}, ["matmul"]),
         (None, "absent", {"verifyx": "step_skipped"}, ["matmul"]),
         (None, "not-an-object", {"verifyx": "step_malformed"}, ["matmul"]),
@@ -813,7 +814,8 @@ async def test_a_step_that_did_not_run_is_left_to_ssh_and_the_other_is_consumed(
     expected_consumed,
 ):
     """Every non-`ok` status the executor can answer with — and an `ok` without stdout, a step it
-    left out, a step that is not an object — falls back for THAT step only."""
+    left out, a step that is not an object, a status outside the executor's closed set — falls back
+    for THAT step only."""
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
     ssh_verifyx = AsyncMock(
@@ -1072,6 +1074,81 @@ async def test_a_pass_slower_than_the_ssh_cap_is_left_to_ssh(
     assert (ssh_matmul.await_count, ssh_verifyx.await_count) == (
         (1, 0) if slow_step == "matmul" else (0, 1)
     )
+
+
+def test_the_wall_clock_caps_are_the_ssh_paths_own():
+    assert (
+        STEP_WALL_CLOCK_CAP_MS
+        == {
+            "matmul": mvs.MATRIX_VERIFY_TIMEOUT_SECONDS * 1000,
+            "verifyx": vvs.VERIFYX_COMMAND_TIMEOUT_SECONDS * 1000,
+        }
+        == {"matmul": 120_000, "verifyx": 600_000}
+    )
+
+
+def test_executor_controlled_strings_never_reach_a_label_uncapped():
+    """PR_PROCESS §5: a status outside the executor's closed set is `malformed` (so every
+    `step_<status>` label is from a closed set), unknown step keys are dropped, `executor_version`
+    is capped, `exit_status` must be an int."""
+    intent = build_intent(
+        executor_uuid="e", matmul=None, verifyx=None, parallel_gpu=False, deadline_s=5
+    )
+    junk = "x" * 5000 + "\n"
+    answer = parse_answer(
+        {
+            "schema": SCHEMA,
+            "nonce": intent["nonce"],
+            "executor_uuid": "e",
+            "executor_version": "v" * 10_000,
+            "elapsed_ms": 1,
+            "steps": {
+                "matmul": {"status": junk, "stdout": "RESULT_JSON: {}"},
+                "verifyx": {"status": "ok", "exit_status": "0", "stdout": "x"},
+                **{f"junk{i}": {"status": "ok"} for i in range(2000)},
+            },
+        },
+        intent=intent,
+        round_trip_ms=3,
+    )
+    assert set(answer.steps) == {"matmul", "verifyx"}
+    assert answer.step("matmul").status == "malformed" and answer.step("matmul").stdout is None
+    assert answer.step("verifyx").exit_status is None
+    assert len(answer.executor_version) == EXECUTOR_VERSION_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_a_scored_cycle_sends_full_size_challenges_serially(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """Not the first pass: `parallel_gpu` is off (the two GPU steps run one after the other, the
+    OOM-safety rule of the SSH path), the matmul has no VRAM budget and VerifyX no first-pass
+    overrides, and every metric line says `first_pass: False`."""
+    validation = matmul_service(monkeypatch)
+    prepare_matmul = MagicMock(wraps=validation.prepare_matmul_challenge)
+    prepare_verifyx = MagicMock(wraps=verifyx_service.prepare_verifyx_challenge)
+    validation.prepare_matmul_challenge = prepare_matmul
+    verifyx_service.prepare_verifyx_challenge = prepare_verifyx
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair,
+            executor.executor_info,
+            validation=validation,
+            verifyx=verifyx_service,
+            first_pass=False,
+        )
+        with patch("neurons.validators.src.services.task.checks.local_verify.logger") as log:
+            local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+    assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
+    assert executor.intents[0]["parallel_gpu"] is False
+    assert prepare_matmul.call_args.kwargs["vram_budget_mb"] is None
+    assert prepare_verifyx.call_args.kwargs["challenge_config_overrides"] is None
+    outcomes = [
+        call.args[0].extra
+        for call in log.info.call_args_list
+        if str(call.args[0]) == "[local_verify] outcome"
+    ]
+    assert outcomes and all(o["first_pass"] is False for o in outcomes)
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():

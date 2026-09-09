@@ -51,7 +51,7 @@ LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
 
 def _step_reason(step) -> str:
     """The metric label for a step that cannot be judged: `step_<status>` for the executor's own
-    statuses (failed | timeout | skipped | unsupported, `malformed` from the parser), and
+    statuses (failed | timeout | skipped; `malformed` from the parser for anything else), and
     `step_no_stdout` for an `ok` step that carries nothing to judge."""
     return "step_no_stdout" if step.status == "ok" else f"step_{step.status}"
 

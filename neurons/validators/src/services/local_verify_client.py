@@ -54,6 +54,15 @@ def _wire_int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+# The step names the intent can ask for; anything else in an answer is dropped, not echoed.
+STEP_NAMES = ("matmul", "verifyx", "docker", "ports", "inspector")
+# The statuses the executor's `StepResult` emits. Any other string is `malformed` here, so every
+# `reason` label and event field built from a status comes from this closed set (PR_PROCESS §5:
+# peer-controlled strings never reach a log label uncapped).
+STEP_STATUSES = frozenset({"ok", "failed", "timeout", "skipped"})
+EXECUTOR_VERSION_MAX_CHARS = 64
+
+
 class LocalVerifyUnavailable(Exception):
     """The local path did not produce a usable answer; `reason` is the metric label."""
 
@@ -116,10 +125,13 @@ class StepEvidence:
     def from_wire(cls, raw: Any) -> StepEvidence:
         if not isinstance(raw, dict) or not isinstance(raw.get("status"), str):
             return cls(status="malformed", error="step is not an object with a status")
+        if raw["status"] not in STEP_STATUSES:
+            return cls(status="malformed", error="unknown step status")
+        exit_status = raw.get("exit_status")
         return cls(
             status=raw["status"],
             ms=_wire_int(raw.get("ms")),
-            exit_status=raw.get("exit_status"),
+            exit_status=exit_status if isinstance(exit_status, int) else None,
             stdout=raw.get("stdout") if isinstance(raw.get("stdout"), str) else None,
             stderr_tail=raw.get("stderr_tail") if isinstance(raw.get("stderr_tail"), str) else None,
             data=raw.get("data") if isinstance(raw.get("data"), dict) else {},
@@ -157,10 +169,10 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
     return LocalVerifyAnswer(
         nonce=raw["nonce"],
         executor_uuid=raw["executor_uuid"],
-        executor_version=str(raw.get("executor_version") or ""),
+        executor_version=str(raw.get("executor_version") or "")[:EXECUTOR_VERSION_MAX_CHARS],
         elapsed_ms=_wire_int(raw.get("elapsed_ms")),
         deadline_hit=bool(raw.get("deadline_hit")),
-        steps={name: StepEvidence.from_wire(step) for name, step in steps.items()},
+        steps={name: StepEvidence.from_wire(steps[name]) for name in STEP_NAMES if name in steps},
         round_trip_ms=round_trip_ms,
     )
 
