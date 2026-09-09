@@ -11,7 +11,8 @@ sensor tags them `nested_from:executor-…` with `host=false`. On hosts where Te
 ancestry to sshd they surfaced as findings: 607 of the 632 MALICIOUS rounds on 8 Sep.
 
 Classification is by that ancestry, as `design/RENTER_DATA_PRIVACY.md` row 16 intends: a
-`DockerExec` from inside the executor container is *platform-origin*; anything from the host, a
+`DockerExec` from inside the executor container is *platform-origin* (the sensor itself already
+drops execs whose ancestry reaches sshd or pid 1, so these are the ones it could not trust); anything from the host, a
 `NamespaceEnter`, a memory read, an exec the sensor could not attribute is *provider-origin* and is
 what the check, the score gate and the renter event act on. The payloads are too many and too
 script-shaped for an exact allow-list to be honest, so the platform execs' payloads are recorded
@@ -28,19 +29,31 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-EXECUTOR_CONTAINER_TAG_PREFIX = "nested_from:executor"
+NESTED_FROM_TAG_PREFIX = "nested_from:"
 POD_CONTAINER_PREFIX = "pod_"
+# the pod's volume is `volume_<pod_id>` (docker_service.py create flow; the sensor's
+# RENTAL_VOLUME_PREFIXES) — an OverlayFsRead on it is a finding about that pod
+VOLUME_CONTAINER_PREFIX = "volume_"
 
 _EXEC_OPTIONS_WITH_VALUE = {"-u", "--user", "-e", "--env", "-w", "--workdir"}
 _EXEC_FLAGS = {"-i", "-t", "-it", "-ti", "-d", "--detach", "--privileged", "--interactive", "--tty"}
 _SHELL_WRAPPERS = {"sh", "/bin/sh", "bash", "/bin/bash", "/usr/bin/sh", "/usr/bin/bash"}
 _SHELL_COMMAND_FLAGS = {"-c", "-lc", "-ec", "-lec"}
 _DOCKER_EXEC_KINDS = {"DockerExec"}
-# The sensor's finding classes the renter may be told about, verbatim. Anything else — the report
-# is produced on the provider's root when the sensor is unattested — is shown as `unknown` and
-# kept raw only inside the evidence.
+# The sensor's `RuntimeInterferenceKind` (celium-gpu-verifier inspector/src/collector/analysis/
+# types.rs, serde PascalCase) — the only strings a renter is shown as a class. Anything else — the
+# report is produced on the provider's root when the sensor is unattested — is shown as `unknown`
+# and kept raw only inside the evidence. Keep in step with types.rs and inspector_summary/sql.py.
 KNOWN_FINDING_KINDS = frozenset(
-    {"DockerExec", "NamespaceEnter", "ProcFsRead", "ProcessMemoryRead", "PtraceAttach", "FileRead", "MountAccess"}
+    {
+        "DockerExec", "DockerAttach", "DockerCp", "DockerRun", "DockerCreate", "DockerStart", "DockerStop",
+        "DockerKill", "DockerPause", "DockerRm", "DockerRestart", "DockerRename", "DockerUpdate", "DockerCommit",
+        "DockerExport", "DockerPrune", "DockerInspect", "DockerPull", "DockerPush", "DockerBuild", "DockerLoad",
+        "DockerImport", "DockerRmi", "DockerNetworkConnect", "DockerNetworkDisconnect", "DockerNetworkRm",
+        "DockerVolumeRm", "DockerSave", "NamespaceEnter", "DockerSocketWrite", "OverlayFsRead", "OverlayFsWrite",
+        "ProcFsRead", "ProcFsWrite", "ContainerChroot", "ProcessAttach", "ProcessMemoryRead", "ProcessMemoryWrite",
+        "DockerVolumeMount",
+    }
 )
 UNKNOWN_KIND = "unknown"
 _PAYLOAD_PREVIEW_CHARS = 160
@@ -125,15 +138,31 @@ def exec_payload(command: str) -> str | None:
     return " ".join(payload) if payload else None
 
 
+def is_executor_stack_container(name: str) -> bool:
+    """The sensor's own rule for the executor stack (docker_cli.rs): the compose project may be
+    `executor`, `executor-…` or `lium-executor-executor-1`."""
+    return name == "executor" or name.startswith("executor-") or "-executor-" in name
+
+
+def nested_from_executor(finding: dict[str, Any]) -> bool:
+    for tag in finding.get("tags") or []:
+        if isinstance(tag, str) and tag.startswith(NESTED_FROM_TAG_PREFIX):
+            if is_executor_stack_container(tag[len(NESTED_FROM_TAG_PREFIX) :]):
+                return True
+    return False
+
+
 def is_platform_origin(finding: dict[str, Any]) -> bool:
-    """A `docker exec` that the sensor traced to inside the executor container (`host=false`,
-    `nested_from:executor-…`). Everything else is the provider's."""
+    """A `docker exec` the sensor traced to inside the executor container (`host=false`, a
+    `nested_from:<executor-stack container>` tag). The sensor already drops execs whose ancestry
+    reaches sshd or the container's pid 1, so every such finding is one whose ancestry it could
+    not trust; until DAH-3278 hardens that on the verifier, all of them count as the platform's.
+    Everything else is the provider's."""
     if finding.get("kind") not in _DOCKER_EXEC_KINDS:
         return False
     if finding.get("host") is True:
         return False
-    tags = finding.get("tags") or []
-    return any(isinstance(tag, str) and tag.startswith(EXECUTOR_CONTAINER_TAG_PREFIX) for tag in tags)
+    return nested_from_executor(finding)
 
 
 def finding_class(finding: dict[str, Any]) -> str:
@@ -147,6 +176,14 @@ def _named_container(finding: dict[str, Any]) -> str | None:
     for name in (container, docker.get("resolved_name") if isinstance(docker, dict) else None):
         if isinstance(name, str) and name:
             return name
+    return None
+
+
+def pod_id_of(name: str) -> str | None:
+    """`pod_<id>` and `volume_<id>` both belong to pod `<id>`."""
+    for prefix in (POD_CONTAINER_PREFIX, VOLUME_CONTAINER_PREFIX):
+        if name.startswith(prefix) and len(name) > len(prefix):
+            return name[len(prefix) :]
     return None
 
 
@@ -181,10 +218,11 @@ def build_verdict(
     unnamed = False
     for finding in provider:
         name = _named_container(finding)
+        pod_id = pod_id_of(name) if name else None
         if name is None:
             unnamed = True
-        elif name.startswith(POD_CONTAINER_PREFIX) and name[len(POD_CONTAINER_PREFIX) :] in rented:
-            affected.add(name[len(POD_CONTAINER_PREFIX) :])
+        elif pod_id in rented:
+            affected.add(pod_id)
         else:
             # a pod that left or joined since the rented list was fetched, or not a pod at all:
             # recorded, but no renter is told about a container that was not theirs

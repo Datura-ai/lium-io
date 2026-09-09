@@ -19,6 +19,7 @@ from neurons.validators.src.services.task.inspector_verdict import (
     SENSOR_UNATTESTED,
     build_verdict,
     canonical_sha256,
+    KNOWN_FINDING_KINDS,
     exec_payload,
     is_platform_origin,
     renter_access_event,
@@ -36,7 +37,9 @@ from core.config import settings
 POD = "0f6a1c2e-1111-4222-8333-444455556666"
 
 
-def _finding(command: str, *, host: bool = False, kind: str = "DockerExec", nested: bool = True) -> dict:
+def _finding(
+    command: str, *, host: bool = False, kind: str = "DockerExec", nested: bool = True, nested_from: str = "executor-executor-1"
+) -> dict:
     return {
         "category": "runtime_interference",
         "kind": kind,
@@ -50,7 +53,7 @@ def _finding(command: str, *, host: bool = False, kind: str = "DockerExec", nest
         "parent": {"pid": 4000, "binary": "/bin/bash"},
         "host": host,
         "policy": "tamper-docker-cli",
-        "tags": ["tamper:docker-cli", "severity:high"] + (["nested_from:executor-executor-1"] if nested else []),
+        "tags": ["tamper:docker-cli", "severity:high"] + ([f"nested_from:{nested_from}"] if nested else []),
         "details": {},
     }
 
@@ -115,9 +118,53 @@ def test_the_real_platform_execs_are_recognised_from_the_executor_container():
     assert execs["restore_tar"].endswith("--strip-components=1")
     for name, command in execs.items():
         assert is_platform_origin(_finding(command)), name
+        # the digest depends on the argv parsing as a docker exec — the drift the builders could cause
+        assert exec_payload(command) is not None, name
     # the very same commands from the host are a human at the keyboard
     for name, command in execs.items():
         assert not is_platform_origin(_finding(command, host=True, nested=False)), name
+
+
+@pytest.mark.parametrize(
+    ("container", "platform"),
+    [
+        ("executor", True),
+        ("executor-executor-1", True),
+        ("lium-executor-executor-1", True),   # a compose project not literally `executor`
+        ("pod_other", False),
+        ("nginx", False),
+        ("myexecutor", False),
+    ],
+)
+def test_the_executor_stack_rule_matches_the_sensors(container, platform):
+    assert is_platform_origin(_finding(VALIDATOR_LIVENESS, nested_from=container)) is platform
+
+
+def test_known_finding_kinds_are_the_sensors_runtime_interference_kinds():
+    # celium-gpu-verifier inspector/src/collector/analysis/types.rs, RuntimeInterferenceKind (PascalCase)
+    expected = {
+        "DockerExec", "DockerAttach", "DockerCp", "DockerRun", "DockerCreate", "DockerStart", "DockerStop",
+        "DockerKill", "DockerPause", "DockerRm", "DockerRestart", "DockerRename", "DockerUpdate", "DockerCommit",
+        "DockerExport", "DockerPrune", "DockerInspect", "DockerPull", "DockerPush", "DockerBuild", "DockerLoad",
+        "DockerImport", "DockerRmi", "DockerNetworkConnect", "DockerNetworkDisconnect", "DockerNetworkRm",
+        "DockerVolumeRm", "DockerSave", "NamespaceEnter", "DockerSocketWrite", "OverlayFsRead", "OverlayFsWrite",
+        "ProcFsRead", "ProcFsWrite", "ContainerChroot", "ProcessAttach", "ProcessMemoryRead", "ProcessMemoryWrite",
+        "DockerVolumeMount",
+    }
+    assert KNOWN_FINDING_KINDS == frozenset(expected)
+    assert len(expected) == 39
+
+
+def test_a_read_of_the_pods_volume_names_the_pod():
+    # the 8 Sep class-D shape: tamper-fs OverlayFsRead on /var/lib/docker/volumes/volume_<pod>/_data
+    finding = _finding("", host=True, nested=False, kind="OverlayFsRead")
+    finding["container"] = f"volume_{POD}"
+    finding["binary"] = "/usr/bin/cat"
+    verdict = build_verdict({}, [finding], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
+
+    assert verdict.affected_pod_ids == [POD]
+    assert verdict.classes == ["OverlayFsRead"]
+    assert "unmatched_containers" not in verdict.as_payload()
 
 
 def test_platform_origin_is_the_executor_ancestry_not_the_payload():
