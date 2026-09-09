@@ -125,14 +125,8 @@ class LocalVerifyCheck:
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
         if settings.LOCAL_VERIFY_FIRST_PASS_ONLY and not ctx.config.unscored:
-            # Phase 2: the one call is for the first pass, where the SSH round trips it saves are
-            # the time the owner is waiting on (verification < 2 min). It carries a cost — a VerifyX
-            # past ≈ 110 s pushes the whole call over the matmul's wall-clock cap and a PASSING
-            # matmul is re-run over SSH — so the scored cycles, which have nothing to gain, keep
-            # the SSH path, decided before the `/version` round trip. `unscored` is the caller's
-            # word (the express lane), NOT `first_pass`, which is also off whenever
-            # FIRST_PASS_FAST_PATH_ENABLED is off. With that flag off the first pass's call is the
-            # same serial full-size shape as a scored cycle's (`parallel_gpu=first_pass` below).
+            # Scored cycles keep the SSH path, decided before the `/version` round trip; why is
+            # written once, on LOCAL_VERIFY_FIRST_PASS_ONLY in core/config.py.
             return self._fallback(
                 ctx, "call", "not_first_pass", "not the first pass: the one-call path is first-pass only"
             )
