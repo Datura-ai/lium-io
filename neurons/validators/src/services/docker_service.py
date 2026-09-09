@@ -1269,7 +1269,7 @@ class DockerService:
     async def _docker_root_dir_or_default(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-        log_extra: dict,
+        log_extra: dict[str, Any],
     ) -> str:
         # one `docker info` per repair; a lookup that fails falls back to the default root and says
         # so, so the repair runs where it always did. On the create path a raised lookup error would
