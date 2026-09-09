@@ -29,7 +29,7 @@ SELF_AUTHENTICATED_POST_PATTERNS = (
 )
 
 
-def _get_is_allowed(path: str) -> bool:
+def _is_get_path_allowed(path: str) -> bool:
     return path in PUBLIC_GET_PATHS or any(
         pattern.match(path) for pattern in SELF_AUTHENTICATED_GET_PATTERNS
     )
@@ -41,8 +41,14 @@ class MinerMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request, call_next):
         if request.method == "GET":
-            if _get_is_allowed(request.url.path):
+            if _is_get_path_allowed(request.url.path):
                 return await call_next(request)
+            logger.error(
+                _m(
+                    "Auth failed. GET route is not on the allowlist",
+                    extra={"url": request.url.path, "client_host": request.client.host},
+                )
+            )
             return JSONResponse(status_code=401, content="Unauthorized")
 
         # Skip middleware for endpoints with their own signature verification
