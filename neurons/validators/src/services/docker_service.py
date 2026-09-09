@@ -121,6 +121,7 @@ from services.rental_docker_sdk import (
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     start_storage_operation,
+    supports_bootstrap_restore,
     supports_storage_operation,
     wait_for_storage_operation,
 )
@@ -4790,6 +4791,18 @@ class DockerService:
                         local_volume_path=local_volume_path,
                         encrypted=False,
                     )
+                elif payload.bootstrap_restore:
+                    # The encrypted restore after `docker run` sends `workspace.bootstrap`; an
+                    # executor image from before DAH-3274 ignores the key and refuses the target
+                    # the entrypoint has already written to, so the create would fail with the
+                    # pod half-built. Stop here instead: no fallback keeps the passphrase off the
+                    # executor.
+                    current_step = "bootstrap_restore_probe"
+                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
+                        raise RuntimeError(
+                            "executor image cannot restore into an encrypted volume at create time "
+                            "(no workspace.bootstrap); the provider must update the executor image"
+                        )
                 if external_volume_info:
                     current_step = "external_volume_creation"
                     sysbox_subuid_base: int | None = None

@@ -181,3 +181,19 @@ async def test_cancel_waits_for_runner_then_reports_terminal_status(
     cancel_command = ssh_client.run.await_args_list[1].args[0]
     assert f"{OPERATION_ID}.cancel" in cancel_command
     assert "kill -0" in cancel_command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_status, expected", [(0, True), (1, False)])
+async def test_supports_bootstrap_restore_asks_the_executor_models_for_the_field(
+    exit_status, expected
+) -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status))
+
+    supported = await storage_operations.supports_bootstrap_restore(ssh_client, "/usr/bin/python3")
+    assert supported is expected
+
+    command = ssh_client.run.await_args.args[0]
+    assert command.startswith("/usr/bin/python3 -c ")
+    assert "WorkspaceSpec.__dataclass_fields__" in command and "'bootstrap'" in command

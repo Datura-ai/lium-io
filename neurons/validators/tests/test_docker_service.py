@@ -5276,6 +5276,13 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
     async def _docker_run(*args, **kwargs):
         order.append("docker_run")
 
+    async def _probe(*args, **kwargs):
+        order.append("probe")
+        return True
+
+    monkeypatch.setattr(
+        docker_service_module, "supports_bootstrap_restore", AsyncMock(side_effect=_probe)
+    )
     monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", _setup)
     restore_spy = AsyncMock(side_effect=_restore)
     monkeypatch.setattr(docker_service, "_run_bootstrap_restore", restore_spy)
@@ -5302,13 +5309,50 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
     kwargs = restore_spy.await_args.kwargs
     if encrypted:
         # the customer's keys land in /root/.ssh only after the restore has written /root
-        assert order == ["docker_run", "mount", "restore", "keys"]
+        # the executor is asked for `workspace.bootstrap` before the pod exists
+        assert order == ["probe", "docker_run", "mount", "restore", "keys"]
         assert kwargs["encrypted"] is True
         assert kwargs["container_name"] == docker_service.get_container_name(payload)
     else:
         assert order == ["restore", "docker_run", "keys"]
         assert kwargs["encrypted"] is False
         assert "container_name" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_old_executor(
+    docker_service,
+    monkeypatch,
+):
+    # DAH-3274 (review): an executor image without `workspace.bootstrap` would ignore the key and
+    # refuse the non-empty target after the pod is up; the create fails before `docker run` instead.
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        docker_service_module, "supports_bootstrap_restore", AsyncMock(return_value=False)
+    )
+    docker_run = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", docker_run)
+    restore_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_bootstrap_restore", restore_spy)
+
+    payload = _create_payload(str(uuid4()), encrypted=True)
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest), result
+    assert result.failure_step == "bootstrap_restore_probe"
+    assert "workspace.bootstrap" in result.detail
+    docker_run.assert_not_awaited()
+    restore_spy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
