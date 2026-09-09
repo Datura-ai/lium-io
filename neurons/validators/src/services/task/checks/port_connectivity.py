@@ -45,7 +45,7 @@ class PortConnectivityCheck:
         facts = ctx.state.local_facts
         published_ports = (
             sorted(facts.published_ports)
-            if facts is not None and getattr(facts, "published_ports", None) is not None
+            if facts is not None and facts.published_ports is not None
             else None
         )
 
@@ -65,7 +65,7 @@ class PortConnectivityCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "executor_ip": ctx.executor.address,
             },
-            **({"published_ports": published_ports} if published_ports is not None else {}),
+            published_ports=published_ports,
         )
         verified_port_count = len(result.successful_ports)
         extra_info = {

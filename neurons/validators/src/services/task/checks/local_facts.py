@@ -111,7 +111,7 @@ class LocalFactsCheck:
         what = {
             "round_trip_ms": facts.round_trip_ms,
             "executor_elapsed_ms": facts.executor_elapsed_ms,
-            "steps": facts.steps,
+            "steps": facts.step_statuses,
             "containers": None if facts.containers is None else len(facts.containers),
             "host_now": facts.host_now,
             "published_ports": None

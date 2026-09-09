@@ -484,7 +484,7 @@ class ContainerCleanup:
     ) -> dict[str, Optional[float]] | None:
         """{name: age_minutes | None} for the fact's rental-prefixed containers, in the SSH
         listing's order; None when the fact cannot age containers (no listing, or no host clock)."""
-        if host_facts is None or not getattr(host_facts, "can_age_containers", lambda: False)():
+        if host_facts is None or not host_facts.can_age_containers():
             return None
         ages: dict[str, Optional[float]] = {}
         for container in host_facts.containers:

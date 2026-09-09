@@ -149,7 +149,8 @@ def test_created_is_dockers_rfc3339_with_nine_digits_or_nothing():
 def test_containers_take_dockers_status_set_and_name_grammar_or_the_fact_is_dropped():
     good = {"containers": [{"name": "pod_a-1.x", "status": "exited", "created": created(20), "image": "img:1"}]}
     (one,) = parse_containers(good)
-    assert one == HostContainer(name="pod_a-1.x", status="exited", created_at=HOST_NOW - 1200, image="img:1")
+    # `image` is on the wire (the executor sends it) and dropped here: nothing reads it yet
+    assert one == HostContainer(name="pod_a-1.x", status="exited", created_at=HOST_NOW - 1200)
 
     for bad_item in (
         {"name": "pod_a", "status": "zombie", "created": created(1)},  # not docker's set
@@ -196,7 +197,7 @@ def test_parse_facts_reads_ok_steps_only_and_needs_the_host_clock_to_age():
     assert facts.can_age_containers()
     assert facts.published_ports is None  # a step that is not ok contributes nothing
     assert facts.inspector_lib_sha256 == DIGEST
-    assert facts.steps == {"docker": "ok", "ports": "failed", "inspector": "ok"}
+    assert facts.step_statuses == {"docker": "ok", "ports": "failed", "inspector": "ok"}
 
     no_clock = parse_facts(
         {"docker": StepEvidence(status="ok", data={"containers": [], "now": "1800000000"})},
@@ -543,11 +544,11 @@ async def test_published_ports_are_handed_to_the_selector_only_when_the_fact_is_
 
     ctx, connectivity = port_context(None)
     await PortConnectivityCheck().run(ctx)
-    assert "published_ports" not in connectivity.calls[0]
+    assert connectivity.calls[0]["published_ports"] is None
 
     ctx, connectivity = port_context(LocalFacts(published_ports=None))
     await PortConnectivityCheck().run(ctx)
-    assert "published_ports" not in connectivity.calls[0]
+    assert connectivity.calls[0]["published_ports"] is None
 
 
 @pytest.mark.asyncio

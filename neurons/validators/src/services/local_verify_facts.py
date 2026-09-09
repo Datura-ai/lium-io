@@ -45,7 +45,6 @@ MAX_CONTAINERS = 512
 HOST_NOW_MAX = 2**40
 MAX_PORTS = 4096
 NAME_MAX_CHARS = 128
-IMAGE_MAX_CHARS = 256
 # docker/api/types/container: the states `State.Status` can carry.
 DOCKER_STATUSES = frozenset(
     {"created", "restarting", "running", "removing", "paused", "exited", "dead"}
@@ -61,7 +60,6 @@ class HostContainer:
     name: str
     status: str  # one of DOCKER_STATUSES
     created_at: int | None  # epoch seconds, None when the executor's string did not parse
-    image: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,7 +73,7 @@ class LocalFacts:
     capabilities: frozenset[str] = field(default_factory=frozenset)
     round_trip_ms: int = 0
     executor_elapsed_ms: int = 0
-    steps: dict[str, str] = field(default_factory=dict)  # step -> status as answered
+    step_statuses: dict[str, str] = field(default_factory=dict)  # step -> status as answered
 
     def can_age_containers(self) -> bool:
         return self.containers is not None and self.host_now is not None
@@ -120,14 +118,8 @@ def parse_containers(data: Any) -> tuple[HostContainer, ...] | None:
             return None
         if not isinstance(status, str) or status not in DOCKER_STATUSES:
             return None
-        image = item.get("image")
         out.append(
-            HostContainer(
-                name=name,
-                status=status,
-                created_at=parse_created(item.get("created")),
-                image=image[:IMAGE_MAX_CHARS] if isinstance(image, str) else None,
-            )
+            HostContainer(name=name, status=status, created_at=parse_created(item.get("created")))
         )
     return tuple(out)
 
@@ -173,5 +165,5 @@ def parse_facts(
         capabilities=frozenset(capabilities),
         round_trip_ms=round_trip_ms,
         executor_elapsed_ms=executor_elapsed_ms,
-        steps={name: step.status for name, step in steps.items()},
+        step_statuses={name: step.status for name, step in steps.items()},
     )

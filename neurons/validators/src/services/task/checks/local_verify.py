@@ -184,9 +184,11 @@ class LocalVerifyCheck:
             )
 
         client = self._client_factory(ctx)
-        # Phase 2: the early facts call (checks/local_facts) already read /version this cycle.
+        # Phase 2: the early facts call (checks/local_facts) already read /version this cycle —
+        # also when that read came back empty (nothing advertised, or `capabilities()` folded a
+        # refusal/timeout into `set()`): this cycle takes the SSH path rather than paying a second call.
         facts = ctx.state.local_facts
-        if facts is not None and getattr(facts, "capabilities", None):
+        if facts is not None:
             capabilities = set(facts.capabilities)
         else:
             capabilities = await client.capabilities(ctx.executor)
