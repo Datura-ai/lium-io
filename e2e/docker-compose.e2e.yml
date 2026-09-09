@@ -86,7 +86,7 @@ services:
     environment:
       POSTGRES_DB: miner
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: password
     volumes:
       - miner-db-data:/var/lib/postgresql/data
     networks: [e2e]
@@ -141,7 +141,7 @@ services:
     environment:
       POSTGRES_DB: validator
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: password
     volumes:
       - val-db-data:/var/lib/postgresql/data
     networks: [e2e]
