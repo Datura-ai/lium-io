@@ -305,7 +305,7 @@ async def test_probe_volume_host_garbage_output_returns_none(docker_service):
         (dict(disk_share=None, storage_limit_gb=1), "legacy"),
     ],
 )
-async def test_uses_fresh_volume_sizing_is_the_predicate_resolve_volume_sizing_uses(
+async def test_measures_host_for_volume_sizing_is_the_predicate_resolve_volume_sizing_uses(
     docker_service, overrides, expected_path
 ):
     # The probe asks for df exactly when the sizing will measure: the same predicate decides both.
@@ -315,7 +315,7 @@ async def test_uses_fresh_volume_sizing_is_the_predicate_resolve_volume_sizing_u
     result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
 
     assert result.path == expected_path
-    assert DockerService.uses_fresh_volume_sizing(payload) is (result.path == "fresh")
+    assert DockerService.measures_host_for_volume_sizing(payload) is (result.path == "fresh")
     assert (ssh_client.run.await_count > 0) is (result.path == "fresh")
 
 

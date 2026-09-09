@@ -3481,7 +3481,7 @@ class DockerService:
         return total_bytes
 
     @staticmethod
-    def uses_fresh_volume_sizing(payload: ContainerCreateRequest) -> bool:
+    def measures_host_for_volume_sizing(payload: ContainerCreateRequest) -> bool:
         """True when `resolve_volume_sizing` will measure the host (the fresh DAH-2183 contract);
         False for the two passthrough contracts it returns without any SSH command."""
         return payload.storage_limit_gb is not None and payload.disk_share is not None
@@ -3565,7 +3565,7 @@ class DockerService:
         ``storage_limit_gb`` from ``disk_share`` and dockerd would reject
         the run with "supported only for overlay over xfs with 'pquota'".
         """
-        if not self.uses_fresh_volume_sizing(payload):
+        if not self.measures_host_for_volume_sizing(payload):
             return VolumeSizingResult(
                 volume_limit_gb=payload.volume_limit_gb,
                 storage_limit_gb=payload.storage_limit_gb,
@@ -4710,15 +4710,15 @@ class DockerService:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (flag off → None → the per-command path below, unchanged).
                     host_probe: VolumeHostProbe | None = None
-                    fresh_sizing = self.uses_fresh_volume_sizing(payload)
-                    # probe only when something reads it: the fresh sizing (df) or a limited
+                    measures_host = self.measures_host_for_volume_sizing(payload)
+                    # probe only when something reads it: the host-measuring sizing (df) or a limited
                     # volume's plugin install (root dir + plugin state); an unlimited volume on a
                     # passthrough contract needs neither, so it pays for no command
-                    if settings.RENTAL_VOLUME_FAST_PATH_ENABLED and (fresh_sizing or payload.volume_limit_gb):
+                    if settings.RENTAL_VOLUME_FAST_PATH_ENABLED and (measures_host or payload.volume_limit_gb):
                         current_step = "volume_host_probe"
                         host_probe = await self.probe_volume_host(
                             ssh_client,
-                            with_df=fresh_sizing,
+                            with_df=measures_host,
                             log_extra=default_extra,
                         )
 
