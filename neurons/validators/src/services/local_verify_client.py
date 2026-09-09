@@ -61,6 +61,25 @@ STEP_NAMES = ("matmul", "verifyx", "docker", "ports", "inspector")
 # peer-controlled strings never reach a log label uncapped).
 STEP_STATUSES = frozenset({"ok", "failed", "timeout", "skipped"})
 EXECUTOR_VERSION_MAX_CHARS = 64
+# Bounds on what is read from the executor before anything is parsed: the answer (five stdouts of
+# ≤ 256 KB each on the executor's side) and the `/version` capability list.
+MAX_ANSWER_BYTES = 2 * 1024 * 1024
+MAX_CAPABILITIES = 32
+MAX_CAPABILITY_CHARS = 64
+DETAIL_MAX_CHARS = 300
+
+
+async def _read_bounded(response, limit: int) -> bytes:
+    """The body up to `limit` bytes; one byte more marks it oversized (the caller checks the
+    length). `StreamReader.read(n)` may return short, so this collects until the cap or EOF."""
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > limit:
+            break
+    return b"".join(chunks)
 
 
 class LocalVerifyUnavailable(Exception):
@@ -158,11 +177,11 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
     if not isinstance(raw, dict):
         raise LocalVerifyUnavailable("malformed", "answer is not an object")
     if raw.get("schema") != SCHEMA:
-        raise LocalVerifyUnavailable("schema_mismatch", f"got {raw.get('schema')!r}")
+        raise LocalVerifyUnavailable("schema_mismatch", f"got {raw.get('schema')!r}"[:100])
     if raw.get("nonce") != intent["nonce"]:
         raise LocalVerifyUnavailable("nonce_mismatch", "answer does not echo the intent nonce")
     if raw.get("executor_uuid") != intent["executor_uuid"]:
-        raise LocalVerifyUnavailable("executor_mismatch", f"got {raw.get('executor_uuid')!r}")
+        raise LocalVerifyUnavailable("executor_mismatch", f"got {raw.get('executor_uuid')!r}"[:100])
     steps = raw.get("steps")
     if not isinstance(steps, dict):
         raise LocalVerifyUnavailable("malformed", "steps is not an object")
@@ -198,14 +217,23 @@ class LocalVerifyClient:
         )
         try:
             async with self._session_factory(timeout=timeout) as session:
-                async with session.get(f"{self.base_url(executor_info)}/version") as response:
+                async with session.get(
+                    f"{self.base_url(executor_info)}/version", allow_redirects=False
+                ) as response:
                     if response.status != 200:
                         return set()
-                    body = await response.json(content_type=None)
+                    body = json.loads(await _read_bounded(response, MAX_ANSWER_BYTES))
         except Exception:
             return set()
         caps = body.get("capabilities") if isinstance(body, dict) else None
-        return {c for c in caps if isinstance(c, str)} if isinstance(caps, list) else set()
+        if not isinstance(caps, list):
+            return set()
+        # A closed-size set: the event that lists them is a log sink, not a place for a novel.
+        return {
+            c
+            for c in caps[:MAX_CAPABILITIES]
+            if isinstance(c, str) and len(c) <= MAX_CAPABILITY_CHARS
+        }
 
     async def verify(self, executor_info, intent: dict[str, Any]) -> LocalVerifyAnswer:
         signed = sign_intent(intent, self.keypair)
@@ -214,15 +242,18 @@ class LocalVerifyClient:
         try:
             async with self._session_factory(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url(executor_info)}/verify", json=signed
+                    f"{self.base_url(executor_info)}/verify", json=signed, allow_redirects=False
                 ) as response:
-                    text = await response.text()
+                    # A redirect would re-send the signed intent to a host of the executor's
+                    # choosing: it is an http_error below. The body is bounded before it is parsed.
+                    body = await _read_bounded(response, MAX_ANSWER_BYTES)
                     status = response.status
         except TimeoutError:
             raise LocalVerifyUnavailable("timeout", f"no answer within {self.timeout_s}s")
         except Exception as exc:  # aiohttp client errors, DNS, refused connections
             raise LocalVerifyUnavailable("transport", f"{type(exc).__name__}: {exc}")
         round_trip_ms = int((time.perf_counter() - started) * 1000)
+        text = body[:MAX_ANSWER_BYTES].decode("utf-8", errors="replace")
         if status == 404:
             raise LocalVerifyUnavailable(
                 "not_supported", "executor answered 404 (route absent or flag off)"
@@ -234,6 +265,10 @@ class LocalVerifyClient:
             raise LocalVerifyUnavailable("refused", text[:200])
         if status != 200:
             raise LocalVerifyUnavailable("http_error", f"status {status}: {text[:200]}")
+        if len(body) > MAX_ANSWER_BYTES:
+            raise LocalVerifyUnavailable(
+                "malformed", f"answer longer than {MAX_ANSWER_BYTES} bytes"
+            )
         try:
             raw = json.loads(text)
         except ValueError:

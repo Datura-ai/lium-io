@@ -36,6 +36,9 @@ from services.local_verify_client import (
     EXECUTOR_DEADLINE_MARGIN_SECONDS,
     EXECUTOR_DEADLINE_MAX_SECONDS,
     EXECUTOR_VERSION_MAX_CHARS,
+    MAX_ANSWER_BYTES,
+    MAX_CAPABILITIES,
+    MAX_CAPABILITY_CHARS,
     SCHEMA,
     LocalVerifyClient,
     LocalVerifyUnavailable,
@@ -155,6 +158,7 @@ class FakeExecutor:
         self.seen_nonces: set[str] = set()
         self.intents: list[dict] = []
         self.answer_override = None  # callable(intent) -> dict | (status, body)
+        self.version_override = None  # dict served by /version instead of the default
         self.app = web.Application()
         self.app.router.add_get("/version", self.version)
         self.app.router.add_post("/verify", self.verify)
@@ -180,6 +184,8 @@ class FakeExecutor:
         )
 
     async def version(self, request):
+        if self.version_override is not None:
+            return web.json_response(self.version_override)
         return web.json_response(
             {"version": "4.1.0", "capabilities": [CAPABILITY] if self.advertise else []}
         )
@@ -954,10 +960,11 @@ async def test_all_cards_check_with_verifyx_off_makes_no_call(
             verifyx=verifyx_service,
             verifyx_enabled=False,
         )
-        result = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+        factory = MagicMock(side_effect=AssertionError("nothing to run: no client, no /version"))
+        result = await LocalVerifyCheck(client_factory=factory).run(ctx)
     assert result.passed and result.event.reason_code == "LOCAL_VERIFY_FALLBACK"
     assert result.event.what_we_saw["reason"] == "allcards_ssh"
-    assert executor.intents == []
+    assert executor.intents == [] and not factory.called
 
 
 @pytest.mark.asyncio
@@ -1115,6 +1122,62 @@ def test_executor_controlled_strings_never_reach_a_label_uncapped():
     assert answer.step("matmul").status == "malformed" and answer.step("matmul").stdout is None
     assert answer.step("verifyx").exit_status is None
     assert len(answer.executor_version) == EXECUTOR_VERSION_MAX_CHARS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer, reason",
+    [
+        ({"schema": "s" * 5000, "nonce": "n"}, "schema_mismatch"),
+        ((500, {"detail": "e" * 5000}), "http_error"),
+    ],
+)
+async def test_the_fallback_event_detail_is_capped_like_the_metric(
+    keypair, monkeypatch, local_verify_on, verifyx_service, answer, reason
+):
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        executor.answer_override = lambda raw: answer
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+        )
+        with patch("neurons.validators.src.services.task.checks.local_verify.logger") as log:
+            result = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+    assert result.event.reason_code == "LOCAL_VERIFY_FALLBACK"
+    assert result.event.what_we_saw["reason"] == reason
+    assert len(result.event.what_we_saw["detail"]) <= 300
+    lines = [
+        c.args[0].extra for c in log.info.call_args_list if str(c.args[0]).startswith("[local")
+    ]
+    assert lines and all(len(o["detail"]) <= 300 for o in lines)
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_capability_list_and_answer_are_bounded_before_use(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """`/version` may list anything; only ≤ 32 strings of ≤ 64 chars are kept, so the
+    NOT_ADVERTISED event is bounded. An answer longer than MAX_ANSWER_BYTES is `malformed`."""
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        executor.version_override = {
+            "version": "4.1.0",
+            "capabilities": ["c" * 100_000, 7, *[f"cap{i}" for i in range(500)]],
+        }
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+        )
+        result = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+        assert result.event.reason_code == "LOCAL_VERIFY_NOT_ADVERTISED"
+        caps = result.event.what_we_saw["capabilities"]
+        assert len(caps) <= MAX_CAPABILITIES and all(len(c) <= MAX_CAPABILITY_CHARS for c in caps)
+        assert executor.intents == []
+
+        executor.version_override = None
+        executor.answer_override = lambda raw: {"pad": "x" * (MAX_ANSWER_BYTES + 10)}
+        result = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+    assert result.event.what_we_saw["reason"] == "malformed"
+    assert result.event.what_we_saw["detail"].startswith("answer longer than")
 
 
 @pytest.mark.asyncio
