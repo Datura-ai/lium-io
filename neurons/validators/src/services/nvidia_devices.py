@@ -393,7 +393,11 @@ async def read_kernel_gpu_uuids(ssh: asyncssh.SSHClientConnection) -> list[str] 
                 _query_gpu_minor_map_from_proc(ssh), timeout=KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS
             )
         )
-    except Exception:
+    except Exception as exc:
+        # fail-open by design; the line is what tells ops the kernel view was missing on this host
+        logger.warning(
+            "kernel GPU UUID read failed, bans matched on the reported list only: %r", exc
+        )
         return None
     return uuids or None
 
