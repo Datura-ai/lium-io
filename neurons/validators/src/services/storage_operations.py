@@ -51,6 +51,27 @@ async def supports_storage_operation(
     return result.exit_status == 0
 
 
+# Asks the executor's own storage models whether `workspace.bootstrap` exists (DAH-3274). An
+# executor image from before it drops the unknown key and refuses the non-empty target the
+# pod's entrypoint has already written to, so the create must stop before `docker run`.
+_BOOTSTRAP_PROBE = (
+    "import sys; sys.path.insert(0, '/root/app/src'); "
+    "from storage.models import WorkspaceSpec; "
+    "sys.exit(0 if 'bootstrap' in WorkspaceSpec.__dataclass_fields__ else 1)"
+)
+
+
+async def supports_bootstrap_restore(
+    ssh_client: asyncssh.SSHClientConnection,
+    python_path: str,
+) -> bool:
+    result = await ssh_client.run(
+        f"{shlex.quote(python_path)} -c {shlex.quote(_BOOTSTRAP_PROBE)}",
+        check=False,
+    )
+    return result.exit_status == 0
+
+
 async def start_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
     python_path: str,
