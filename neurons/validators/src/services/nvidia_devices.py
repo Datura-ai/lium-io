@@ -41,11 +41,15 @@ import logging
 import shlex
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import asyncssh
 
 from core.config import settings
 from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
+
+if TYPE_CHECKING:
+    from services.prerun_host_probe import PrerunHostProbe
 
 logger = logging.getLogger(__name__)
 
@@ -194,16 +198,26 @@ async def build_gpu_docker_config_for_executor(
     *,
     executor_id: str | None = None,
     default_extra: dict | None = None,
+    host_probe: PrerunHostProbe | None = None,
 ) -> GpuDockerConfig:
-    """Resolve structured GPU Docker options for SDK container creation."""
+    """Resolve structured GPU Docker options for SDK container creation.
+
+    DAH-3257: with ``host_probe`` the kernel minor map, the /dev/nvidiaN list and the shared
+    nodes are read from the pre-run probe instead of three SSH commands; the nvidia-smi XML
+    fallback and every verdict below are unchanged.
+    """
     try:
         if gpu_uuids:
             per_gpu, host_total = await _query_gpu_nodes_for_uuids(
-                ssh_client, gpu_uuids, executor_id=executor_id, default_extra=default_extra
+                ssh_client,
+                gpu_uuids,
+                executor_id=executor_id,
+                default_extra=default_extra,
+                host_probe=host_probe,
             )
             is_partial_rental = len(per_gpu) < host_total
         else:
-            per_gpu = await _query_all_gpu_nodes(ssh_client)
+            per_gpu = await _query_all_gpu_nodes(ssh_client, host_probe=host_probe)
             is_partial_rental = False
 
         # On partial rentals (some-but-not-all GPUs on the host), withhold every host-wide node:
@@ -211,7 +225,9 @@ async def build_gpu_docker_config_for_executor(
         # manipulate another tenant's GPU, and the RDMA verbs devices belong to cards the other
         # tenant may be renting (DAH-2571). We don't sell MIG slices today, but stripping both
         # under partial rental closes the leak before either ever ships.
-        shared = await _query_shared_nodes(ssh_client, is_whole_host_rental=not is_partial_rental)
+        shared = await _query_shared_nodes(
+            ssh_client, is_whole_host_rental=not is_partial_rental, host_probe=host_probe
+        )
         return build_gpu_docker_config(gpu_uuids, device_nodes=(*per_gpu, *shared))
     except Exception as exc:
         # 1a: the kernel-truth verdict (a rented UUID absent from procfs) otherwise dies as a bare
@@ -246,8 +262,17 @@ def _device_flags(nodes: Sequence[str]) -> str:
     return " ".join(f"--device={node}" for node in nodes)
 
 
-async def _query_all_gpu_nodes(ssh: asyncssh.SSHClientConnection) -> tuple[str, ...]:
-    res = await ssh.run("ls -1d /dev/nvidia[0-9]* 2>/dev/null || true")
+_GPU_DEVICE_NODES_CMD = "ls -1d /dev/nvidia[0-9]* 2>/dev/null || true"
+
+
+async def _query_all_gpu_nodes(
+    ssh: asyncssh.SSHClientConnection,
+    *,
+    host_probe: PrerunHostProbe | None = None,
+) -> tuple[str, ...]:
+    if host_probe is not None and host_probe.gpu_device_nodes is not None:
+        return host_probe.gpu_device_nodes
+    res = await ssh.run(_GPU_DEVICE_NODES_CMD)
     return _stdout_lines(res.stdout)
 
 
@@ -257,6 +282,7 @@ async def _query_gpu_nodes_for_uuids(
     *,
     executor_id: str | None = None,
     default_extra: dict | None = None,
+    host_probe: PrerunHostProbe | None = None,
 ) -> tuple[tuple[str, ...], int]:
     """Resolve requested UUIDs to /dev/nvidiaN nodes, plus return host GPU count.
 
@@ -265,7 +291,7 @@ async def _query_gpu_nodes_for_uuids(
     """
     errors: list[str] = []
     try:
-        uuid_to_minor = await _query_gpu_minor_map_from_proc(ssh)
+        uuid_to_minor = await _query_gpu_minor_map_from_proc(ssh, host_probe=host_probe)
     except RuntimeError as exc:
         errors.append(str(exc))
         uuid_to_minor = {}
@@ -345,7 +371,11 @@ def _missing_gpu_uuids(gpu_uuids: Sequence[str], uuid_to_minor: dict[str, int]) 
 
 async def _query_gpu_minor_map_from_proc(
     ssh: asyncssh.SSHClientConnection,
+    *,
+    host_probe: PrerunHostProbe | None = None,
 ) -> dict[str, int]:
+    if host_probe is not None and host_probe.gpu_proc_stdout is not None:
+        return _parse_uuid_minor_csv(host_probe.gpu_proc_stdout)
     res = await ssh.run(_PROC_GPU_INFO_CMD)
     if res.exit_status != 0:
         raise RuntimeError(
@@ -367,10 +397,43 @@ async def _query_gpu_minor_map_from_nvidia_smi_xml(
     return _parse_nvidia_smi_xml_minor_map(res.stdout)
 
 
+def shared_device_nodes_command(*, is_whole_host_rental: bool, whole_host_only: bool = False) -> str:
+    """The `sh` command listing the shared device nodes a rental of this shape gets.
+
+    ``whole_host_only`` prints just the nodes a whole-host rental gets ON TOP of a partial one (the
+    RDMA verbs devices and the caps/IMEX directories), in the order the full command prints them
+    after the common nodes — the pre-run probe (DAH-3257) lists both parts once and picks later.
+    """
+    common_globs = (
+        "/dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
+        "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
+        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
+    )
+    whole_host_globs = "/dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
+    if whole_host_only:
+        globs = whole_host_globs
+    elif is_whole_host_rental:
+        globs = f"{common_globs} {whole_host_globs}"
+    else:
+        globs = common_globs
+    cmd = (
+        f"for p in {globs}; do "
+        '[ -e "$p" ] && printf "%s\\n" "$p"; '
+        "done"
+    )
+    if is_whole_host_rental:
+        cmd += (
+            "; find /dev/nvidia-caps /dev/nvidia-caps-imex-channels "
+            "-mindepth 1 -maxdepth 1 -print 2>/dev/null || true"
+        )
+    return cmd
+
+
 async def _query_shared_nodes(
     ssh: asyncssh.SSHClientConnection,
     *,
     is_whole_host_rental: bool = True,
+    host_probe: PrerunHostProbe | None = None,
 ) -> tuple[str, ...]:
     """Enumerate shared NVIDIA control nodes, and the RDMA verbs nodes, that exist on the host.
 
@@ -387,24 +450,11 @@ async def _query_shared_nodes(
     that also carries `issm*`, the subnet-manager interface, and `umad*`, raw MAD access. A renter
     holding `issm` can interfere with the fabric every other tenant on it depends on (DAH-2571).
     """
-    globs = (
-        "/dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
-        "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
-        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
-    )
-    if is_whole_host_rental:
-        globs += " /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
-    cmd = (
-        f"for p in {globs}; do "
-        '[ -e "$p" ] && printf "%s\\n" "$p"; '
-        "done"
-    )
-    if is_whole_host_rental:
-        cmd += (
-            "; find /dev/nvidia-caps /dev/nvidia-caps-imex-channels "
-            "-mindepth 1 -maxdepth 1 -print 2>/dev/null || true"
-        )
-    res = await ssh.run(cmd)
+    if host_probe is not None:
+        probed = host_probe.shared_nodes_for(is_whole_host_rental=is_whole_host_rental)
+        if probed is not None:
+            return probed
+    res = await ssh.run(shared_device_nodes_command(is_whole_host_rental=is_whole_host_rental))
     return _stdout_lines(res.stdout)
 
 

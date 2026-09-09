@@ -211,6 +211,11 @@ class Settings(BaseSettings):
         default=True,
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
+    # DAH-3257: on a rent, read the host listings the pre-run steps need (containers, volumes,
+    # mounted volumes, GPU minor map, device nodes, nvidia-smi power state, the image's
+    # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
+    # own command, and a probe that fails leaves every step on its own commands. Off: as before.
+    RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
