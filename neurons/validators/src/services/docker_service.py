@@ -356,7 +356,7 @@ class VolumeSizingResult:
     existing_volumes_bytes: int | None = None
 
 
-_LOOPBACK_PLUGIN_ALIAS = "vloopback"
+_LOOPBACK_PLUGIN_ALIAS = _VLOOPBACK_DRIVER_PREFIX  # the plugin is installed under the driver name `_is_vloopback_driver` matches
 _LOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
 _PROBE_OUTPUT_LOG_CAP = 512
 
@@ -392,8 +392,10 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
         f"{df_part}"
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
         "printf 'VOLS\\t%s\\n' \"$?\"; "
-        "printf 'PLUGIN\\t%s\\n' \"$(/usr/bin/docker plugin inspect --format '{{.Enabled}}' "
-        f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent)\""
+        # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
+        # so only the last line is the state: true / false / absent
+        "printf 'PLUGIN\\t%s\\n' \"$( (/usr/bin/docker plugin inspect --format '{{.Enabled}}' "
+        f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1)\""
     )
 
 

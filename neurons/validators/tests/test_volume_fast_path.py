@@ -201,7 +201,7 @@ case "$1 $2" in
       empty) ;;
       ls-fails) echo "Cannot connect to the Docker daemon" >&2; exit 1 ;;
     esac ;;
-  "plugin inspect") [ "$mode" = plugin-absent ] && exit 1; echo true ;;
+  "plugin inspect") [ "$mode" = plugin-absent ] && { echo; exit 1; }; echo true ;;  # real docker: blank stdout line, then exit 1
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 """
@@ -251,11 +251,12 @@ def test_probe_command_through_a_shell_failed_volume_ls_raises(tmp_path):
 
 
 def test_probe_command_through_a_shell_absent_plugin_is_not_enabled(tmp_path):
-    probe = _parse_volume_host_probe(
-        _run_probe_command_with_stub(tmp_path, "plugin-absent"), with_df=True
-    )
+    stdout = _run_probe_command_with_stub(tmp_path, "plugin-absent")
+    probe = _parse_volume_host_probe(stdout, with_df=True)
 
     assert probe.loopback_plugin_enabled is False
+    # the blank line docker prints before failing must not be what the field carries
+    assert "PLUGIN\tabsent\n" in stdout
 
 
 # ---------------------------------------------------------------------------
