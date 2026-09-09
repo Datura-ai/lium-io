@@ -64,6 +64,8 @@ KNOWN_FINDING_KINDS = frozenset(
 UNKNOWN_KIND = "unknown"
 _PAYLOAD_PREVIEW_CHARS = 160
 _PAYLOAD_PREVIEW_MAX = 20
+_UNMATCHED_MAX = 20
+_UNMATCHED_NAME_CHARS = 128
 
 SENSOR_ATTESTED = "attested"
 SENSOR_UNATTESTED = "unattested"
@@ -277,7 +279,7 @@ def build_verdict(
     extra: dict[str, Any] = {"platform_payloads": _platform_payloads(platform)}
     if unmatched:
         names = sorted(unmatched)
-        extra["unmatched_containers"] = [name[:128] for name in names[:_PAYLOAD_PREVIEW_MAX]]
+        extra["unmatched_containers"] = [name[:_UNMATCHED_NAME_CHARS] for name in names[:_UNMATCHED_MAX]]
         extra["unmatched_containers_count"] = len(names)
     return InspectorVerdict(
         provider_findings=provider,

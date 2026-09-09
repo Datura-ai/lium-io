@@ -98,7 +98,11 @@ class InspectorRentedCheck:
                 Msg.VALIDATION_ERROR,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"error": "inspector report findings are not a list of objects", "findings": report.get("findings")},
+                what={
+                    "error": "inspector report findings are not a list of objects",
+                    "findings_type": type(report.get("findings")).__name__,
+                    "findings_preview": repr(report.get("findings"))[:200],
+                },
                 extra=extra,
             )
             inspector_event = _build_inspector_event(

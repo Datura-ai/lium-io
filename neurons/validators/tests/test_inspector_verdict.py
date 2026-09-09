@@ -251,16 +251,36 @@ def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
 
 
 @pytest.mark.parametrize("kind", [["DockerExec"], {"k": 1}, 7, None])
-@pytest.mark.parametrize("tags", [7, "nested_from:executor-executor-1", {"a": 1}, None, [1, None, "rental_volume"]])
-def test_any_json_type_in_kind_or_tags_classifies_without_raising(kind, tags):
+def test_any_json_type_in_kind_classifies_without_raising(kind):
     finding = _finding(VALIDATOR_LIVENESS)
     finding["kind"] = kind
-    finding["tags"] = tags
     verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=False, enforce=True)
 
     assert is_platform_origin(finding) is False    # not a string kind → not an exec we can vouch for
     assert verdict.classes == ["unknown"]
     assert verdict.affected_pod_ids == [POD]       # `container` still names the pod
+
+
+@pytest.mark.parametrize(
+    ("tags", "platform"),
+    [
+        (7, False),
+        ("nested_from:executor-executor-1", False),      # a string is not a list of tags
+        ({"a": 1}, False),
+        (None, False),
+        ([1, None, "nested_from:executor-executor-1"], True),   # non-string entries are skipped
+    ],
+)
+def test_any_json_type_in_tags_reaches_the_ancestry_guard_without_raising(tags, platform):
+    finding = _finding(VALIDATOR_LIVENESS)      # kind DockerExec, host False: the tag decides
+    finding["tags"] = tags
+    assert is_platform_origin(finding) is platform
+
+    # the path-shaped branch reads tags too: no container, a rental-volume path, odd tags
+    path_finding = _path_finding("OverlayFsRead", f"/var/lib/docker/volumes/volume_{POD}/_data/x")
+    path_finding["tags"] = tags
+    verdict = build_verdict({}, [path_finding], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
+    assert verdict.affected_pod_ids == [POD]    # the kind alone routes it to the path rule
 
 
 def test_unmatched_containers_are_capped_in_the_verdict():
