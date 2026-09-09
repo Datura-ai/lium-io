@@ -505,6 +505,60 @@ def test_a_remap_already_pending_before_the_run_is_not_a_fault_on_every_cycle():
     ]
 
 
+def test_nvml_snapshots_are_paired_by_uuid_not_by_position():
+    # a card that fell off the bus mid-run must not be read as the card that took its index
+    nvml_faults = _probe_namespace("nvml_faults")["nvml_faults"]
+    gpu_a = {"index": 0, "uuid": "GPU-a", "ecc_uncorrected": 0, "remapped_rows": [3, 0, 0, 0], "recovery_action": 0}
+    gpu_b = {"index": 1, "uuid": "GPU-b", "ecc_uncorrected": 5, "remapped_rows": [0, 0, 0, 0], "recovery_action": 0}
+    before = {"gpus": [gpu_a, gpu_b]}
+    # GPU-a is gone; GPU-b now sits at index 0 with its own (unchanged) counters
+    after = {"gpus": [{**gpu_b, "index": 0}]}
+
+    assert nvml_faults(before, after) == ["gpu 0 (GPU-a): missing from the NVML snapshot after the run"]
+
+    # without UUIDs (an old binding) the position still pairs them
+    assert (
+        nvml_faults(
+            {"gpus": [{"index": 0, "ecc_uncorrected": 0}]}, {"gpus": [{"index": 0, "ecc_uncorrected": 1}]}
+        )
+        == ["gpu 0: uncorrected ECC errors 0 -> 1"]
+    )
+
+
+def test_a_dead_nvml_child_is_an_unavailable_snapshot_not_a_crash():
+    # the child closes its pipe without sending (a driver call aborted the process): recv() raises EOFError
+    # and the probe must still print its verdict
+    import multiprocessing
+
+    ns = _probe_namespace("nvml_snapshot_forked", "_nvml_worker", "NVML_GRACE_SECONDS", "_exit_code")
+
+    class DeadProcess:
+        exitcode = -6
+
+        def __init__(self, target, args):
+            self._conn = args[0]
+
+        def start(self):
+            self._conn.close()
+
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def kill(self):
+            raise AssertionError("a dead child is not killed again")
+
+    class FakeMp:
+        Pipe = staticmethod(multiprocessing.Pipe)
+        Process = DeadProcess
+
+    snapshot = ns["nvml_snapshot_forked"](FakeMp)
+
+    assert snapshot == {"available": False, "error": "NVML snapshot worker died with exit code -6"}
+
+
 def _fake_worker(index, behaviour, conn):
     # stands in for the probe's _worker: same pipe protocol ({"phase": ...} then one report), scripted
     import time as _time

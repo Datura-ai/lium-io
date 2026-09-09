@@ -414,10 +414,9 @@ def _read_counter(cuda: Cuda, d_ctr: int, h_ctr, stream) -> int:
     return ctypes.c_uint32.from_address(h_ctr.value).value
 
 
-def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dict:
-    report: dict = {"index": index}
-    cuda = Cuda()
-    lib = cuda.lib
+def _declare_driver_signatures(lib) -> None:
+    # ctypes defaults every argument to a C int: 64-bit device pointers and size_t lengths must be declared
+    # or they are truncated on the way into the driver
     lib.cuLaunchKernel.argtypes = [
         ctypes.c_void_p,
         ctypes.c_uint,
@@ -474,6 +473,14 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
         ctypes.c_char_p,
     ]
     lib.cuDeviceGetName.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    lib.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+
+
+def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dict:
+    report: dict = {"index": index}
+    cuda = Cuda()
+    lib = cuda.lib
+    _declare_driver_signatures(lib)
 
     cuda.call("cuInit", 0, fault=False)
     device = ctypes.c_int()
@@ -482,7 +489,6 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
     lib.cuDeviceGetName(name, 256, device)
     report["name"] = name.value.decode(errors="replace")
     bus_id = ctypes.create_string_buffer(64)
-    lib.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     if lib.cuDeviceGetPCIBusId(bus_id, 64, device) == 0:
         report["pci_bus_id"] = bus_id.value.decode(errors="replace")
 
@@ -664,11 +670,14 @@ def _device_count(mp) -> int:
     process = mp.Process(target=_count_worker, args=(child_conn,))
     process.start()
     child_conn.close()
-    reply = (
-        parent_conn.recv()
-        if parent_conn.poll(WORKER_GRACE_SECONDS)
-        else {"error": "device enumeration hung"}
-    )
+    try:
+        reply = (
+            parent_conn.recv()
+            if parent_conn.poll(WORKER_GRACE_SECONDS)
+            else {"error": "device enumeration hung"}
+        )
+    except EOFError:  # the pipe closed without a reply: the enumeration child died
+        reply = {"error": f"device enumeration worker died with exit code {_exit_code(process)}"}
     process.join(5)
     if process.is_alive():
         # multiprocessing joins live children at interpreter exit without a timeout: a hung enumeration
@@ -734,11 +743,14 @@ def nvml_snapshot_forked(mp) -> dict:
     process = mp.Process(target=_nvml_worker, args=(child_conn,))
     process.start()
     child_conn.close()
-    snapshot = (
-        parent_conn.recv()
-        if parent_conn.poll(NVML_GRACE_SECONDS)
-        else {"available": False, "error": f"NVML snapshot hung for {NVML_GRACE_SECONDS}s"}
-    )
+    try:
+        snapshot = (
+            parent_conn.recv()
+            if parent_conn.poll(NVML_GRACE_SECONDS)
+            else {"available": False, "error": f"NVML snapshot hung for {NVML_GRACE_SECONDS}s"}
+        )
+    except EOFError:  # the pipe closed without a snapshot: the NVML child died (a driver call that aborted)
+        snapshot = {"available": False, "error": f"NVML snapshot worker died with exit code {_exit_code(process)}"}
     process.join(1)
     if process.is_alive():
         process.kill()
@@ -748,7 +760,24 @@ def nvml_snapshot_forked(mp) -> dict:
 
 def nvml_faults(before: dict, after: dict) -> list[str]:
     faults = []
-    for b, a in zip(before.get("gpus", []), after.get("gpus", [])):
+    before_gpus, after_gpus = before.get("gpus", []), after.get("gpus", [])
+    # the UUID names the card; when any read of it failed (an old binding, one card) both snapshots fall
+    # back to the position, so the two sides are always keyed the same way
+    by_uuid = all(gpu.get("uuid") for gpu in before_gpus + after_gpus)
+
+    def key(gpu: dict):
+        return gpu["uuid"] if by_uuid else gpu.get("index")
+
+    after_by_key = {key(a): a for a in after_gpus}
+    for b in before_gpus:
+        a = after_by_key.get(key(b))
+        if a is None:
+            # matched by UUID, not by position: a card that fell off the bus mid-run must not be read
+            # as the card that took its index
+            faults.append(
+                f"gpu {b['index']} ({b.get('uuid') or b.get('pci_bus_id')}): missing from the NVML snapshot after the run"
+            )
+            continue
         if a.get("ecc_uncorrected") is not None and b.get("ecc_uncorrected") is not None:
             if a["ecc_uncorrected"] > b["ecc_uncorrected"]:
                 faults.append(
@@ -857,7 +886,7 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
         code = _exit_code(pending[index]["process"])
         no_verdict(index, lambda phase: f"worker died in {phase} with exit code {code}")
 
-    def sweep(timeout: float) -> None:
+    def poll_worker_pipes(timeout: float) -> None:
         by_conn = {worker["conn"]: index for index, worker in pending.items()}
         for conn in multiprocessing.connection.wait(list(by_conn), timeout=timeout):
             index = by_conn[conn]
@@ -876,9 +905,9 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
                 died(index)
 
     while pending and time.perf_counter() < deadline:
-        sweep(0.2)
+        poll_worker_pipes(0.2)
     if pending:
-        sweep(0)  # a message that landed as the deadline passed
+        poll_worker_pipes(0)  # a message that landed as the deadline passed
     for index in list(pending):
         pending[index]["process"].kill()
         no_verdict(index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s")
