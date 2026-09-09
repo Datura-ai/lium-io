@@ -1287,9 +1287,9 @@ async def test_a_scored_cycle_takes_ssh_without_a_call_while_first_pass_only_is_
         for call in log.info.call_args_list
         if str(call.args[0]) == "[local_verify] outcome"
     ]
-    assert [(o["outcome"], o["step"], o["reason"], o["first_pass"]) for o in outcomes] == [
-        ("fallback", "call", "not_first_pass", False)
-    ]
+    assert [
+        (o["outcome"], o["step"], o["reason"], o["first_pass"], o["unscored"]) for o in outcomes
+    ] == [("fallback", "call", "not_first_pass", False, False)]
 
 
 @pytest.mark.asyncio

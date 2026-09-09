@@ -272,6 +272,8 @@ class Settings(BaseSettings):
     # does NOT need FIRST_PASS_FAST_PATH_ENABLED; that flag sizes the probes, and only with it on
     # do the two GPU steps run side by side (max(45, 10) s instead of 55 s) — with it off the first
     # pass's call is serial and full size, the same shape and overtime exposure as a scored cycle's.
+    # It DOES need EXPRESS_LANE_ENABLED: the express lane (`core/express_lane.py`) is the only caller
+    # that passes `first_pass=True`; with it off and this flag on, `/verify` is never called.
     LOCAL_VERIFY_FIRST_PASS_ONLY: bool = Field(env="LOCAL_VERIFY_FIRST_PASS_ONLY", default=True)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
