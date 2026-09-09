@@ -9,9 +9,11 @@ challenges the SSH-driven checks would (`ValidationService.prepare_matmul_challe
 
 Everything else — flag off, capability absent, refusal, timeout, a mismatched answer, a step that
 did not run, or a step that ran and FAILED the judgement — leaves that step to the SSH path, so the
-new transport can only save time, never change a verdict on its own. Every outcome is one
-`[local_verify] outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric).
-Off by default (VALIDATOR_LOCAL_VERIFY_ENABLED).
+new transport can only save time, never change a verdict on its own. The matmul is not asked for
+at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on: the all-cards work-proof runs inside the SSH
+matmul path and a consumed local pass must not skip it. Every outcome is one `[local_verify]
+outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric). Off by default
+(VALIDATOR_LOCAL_VERIFY_ENABLED).
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from services.local_verify_client import (
     LocalVerifyClient,
     LocalVerifyUnavailable,
     build_intent,
+    executor_deadline_s,
 )
 from services.verifyx_validation_service import SSHCapture
 
@@ -41,6 +44,13 @@ from .verifyx import _first_pass_challenge_config
 logger = logging.getLogger(__name__)
 
 LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
+
+
+def _step_reason(step) -> str:
+    """The metric label for a step that cannot be judged: `step_<status>` for the executor's own
+    statuses (failed | timeout | skipped | unsupported, `malformed` from the parser), and
+    `step_no_stdout` for an `ok` step that carries nothing to judge."""
+    return "step_no_stdout" if step.status == "ok" else f"step_{step.status}"
 
 
 @dataclass
@@ -113,13 +123,23 @@ class LocalVerifyCheck:
         first_pass = ctx.config.first_pass
         matmul_challenge = None
         verifyx_challenge = None
+        # DAH-2671 item 3: the all-cards work-proof (`_probe_all_claimed_cards`, one pinned run per
+        # card) lives inside the SSH matmul path only. While that check is on, the matmul stays on
+        # SSH so a consumed local pass can never skip the probe or its enforcement; phase 2 carries
+        # `devices` in the intent and judges the per-card output here.
+        matmul_on_ssh = settings.MATMUL_ALLCARDS_CHECK_ENABLED
+        if matmul_on_ssh and not ctx.config.verifyx_enabled:
+            return self._fallback(
+                ctx, "call", "allcards_ssh", "all-cards check on and VerifyX off: nothing to run"
+            )
         try:
             try:
-                matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
-                    specs,
-                    ctx.default_extra,
-                    vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB if first_pass else None,
-                )
+                if not matmul_on_ssh:
+                    matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
+                        specs,
+                        ctx.default_extra,
+                        vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB if first_pass else None,
+                    )
                 if ctx.config.verifyx_enabled:
                     verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
                         specs,
@@ -131,21 +151,24 @@ class LocalVerifyCheck:
             except Exception as exc:  # a native library error is ours, not the node's
                 return self._fallback(ctx, "call", "prepare_failed", f"{type(exc).__name__}: {exc}")
 
-            if not matmul_challenge.params.cipher_text:
+            if matmul_challenge is not None and not matmul_challenge.params.cipher_text:
                 # Our own native error (the SSH path reports it the same way); nothing to send.
                 return self._fallback(
                     ctx, "call", "cipher_generation_failed", "matmul cipher text is empty"
                 )
 
-            params = matmul_challenge.params
-            intent = build_intent(
-                executor_uuid=ctx.executor.uuid,
-                matmul={
+            matmul_step = None
+            if matmul_challenge is not None:
+                params = matmul_challenge.params
+                matmul_step = {
                     "dim_n": params.dim_n,
                     "dim_k": params.dim_k,
                     "seed": params.seed,
                     "cipher_text": params.cipher_text,
-                },
+                }
+            intent = build_intent(
+                executor_uuid=ctx.executor.uuid,
+                matmul=matmul_step,
                 verifyx=(
                     {"seed": verifyx_challenge.seed, "cipher_text": verifyx_challenge.cipher_text}
                     if verifyx_challenge is not None
@@ -154,7 +177,10 @@ class LocalVerifyCheck:
                 # Side by side only at first-pass sizes: a full-size VerifyX beside the matmul OOMs
                 # 64–128 GB hosts (SWEEP_provider_verify §3 #6).
                 parallel_gpu=first_pass,
-                deadline_s=settings.LOCAL_VERIFY_TIMEOUT_SECONDS,
+                # Shorter than the client's whole-call timeout by a margin, so an answer the
+                # executor cut at its deadline (`deadline_hit`, finished steps inside) still arrives
+                # before the client gives up and is consumed step by step.
+                deadline_s=executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS),
             )
 
             try:
@@ -196,11 +222,14 @@ class LocalVerifyCheck:
         common = {"round_trip_ms": answer.round_trip_ms, "executor_elapsed_ms": answer.elapsed_ms}
 
         step = answer.step("matmul")
-        if step.status != "ok" or step.stdout is None:
-            outcome.fallbacks["matmul"] = f"step_{step.status}"
-            self._metric(
-                ctx, "fallback", "matmul", f"step_{step.status}", detail=step.error or "", **common
-            )
+        if matmul_challenge is None:
+            # Not asked for: the all-cards work-proof keeps the matmul on SSH (see _run).
+            outcome.fallbacks["matmul"] = "allcards_ssh"
+            self._metric(ctx, "fallback", "matmul", "allcards_ssh", **common)
+        elif step.status != "ok" or step.stdout is None:
+            reason = _step_reason(step)
+            outcome.fallbacks["matmul"] = reason
+            self._metric(ctx, "fallback", "matmul", reason, detail=step.error or "", **common)
         else:
             result = ctx.services.validation.evaluate_matmul_output(
                 matmul_challenge, stdout=step.stdout, stderr=step.stderr_tail or ""
@@ -220,10 +249,9 @@ class LocalVerifyCheck:
             return outcome
         step = answer.step("verifyx")
         if step.status != "ok" or step.stdout is None:
-            outcome.fallbacks["verifyx"] = f"step_{step.status}"
-            self._metric(
-                ctx, "fallback", "verifyx", f"step_{step.status}", detail=step.error or "", **common
-            )
+            reason = _step_reason(step)
+            outcome.fallbacks["verifyx"] = reason
+            self._metric(ctx, "fallback", "verifyx", reason, detail=step.error or "", **common)
         elif step.data.get("lib_sha256") != verifyx_challenge.expected_lib_sha256:
             # The SSH path refuses an outdated libverifyx before running; here the digest rides
             # along with the answer and the same refusal applies.
