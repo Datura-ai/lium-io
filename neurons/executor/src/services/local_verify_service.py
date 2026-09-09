@@ -255,19 +255,20 @@ async def run_matmul(step: MatmulStep, *, python: str = sys.executable) -> StepR
 
 
 async def run_verifyx(step: VerifyXStep, *, python: str = sys.executable) -> StepResult:
-    result = await run_script(verifyx_argv(step, python), timeout=VERIFYX_TIMEOUT_SECONDS)
     # The validator compares the library digest before it trusts a response (core/checksums);
-    # over SSH that is one more command, here it rides along — hashed off the event loop (10 MB),
-    # on the facts pool like `_inspector_facts`.
+    # over SSH that is one more command, here it rides along — hashed off the event loop (10 MB) on
+    # the facts pool like `_inspector_facts`, started BEFORE the script so it is long done when the
+    # script's seconds are over: a deadline that lands here lands in the script, never in the digest.
     loop = asyncio.get_running_loop()
+    digest_future = loop.run_in_executor(_facts_executor, sha256_of_file, LIBVERIFYX_PATH)
     try:
-        digest = await asyncio.wait_for(
-            loop.run_in_executor(_facts_executor, sha256_of_file, LIBVERIFYX_PATH),
-            timeout=FAST_STEP_TIMEOUT_SECONDS,
-        )
-    except (TimeoutError, asyncio.CancelledError):
-        # The script has run and is reaped; a deadline that lands during the digest keeps its
-        # output and only leaves lib_sha256 empty.
+        result = await run_script(verifyx_argv(step, python), timeout=VERIFYX_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        digest_future.cancel()
+        raise
+    try:
+        digest = await asyncio.wait_for(digest_future, timeout=FAST_STEP_TIMEOUT_SECONDS)
+    except TimeoutError:
         digest = None
     result.data = VerifyXData(lib_sha256=digest)
     return result
