@@ -847,16 +847,6 @@ class PortConnectivityMessages:
         category="runtime",
         impact="Proceed",
     )
-    # liumd phase 2 / DAH-3266 (B-2): every configured port is held by a rental the backend reports
-    # (plus what the executor's docker publishes) — nothing left to probe, and the rented node is
-    # exempt from the port-count verdict anyway. Info instead of a red `no_ports` each cycle.
-    SKIPPED_ALL_PORTS_RENTED = MessageTemplate(
-        event="Port verification skipped: every configured port is rented",
-        reason="PORT_CHECK_SKIPPED_ALL_PORTS_RENTED",
-        severity="info",
-        category="runtime",
-        impact="Proceed — no free port to probe; the rented node keeps its verdict",
-    )
 
 
 class PortCountMessages:

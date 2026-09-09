@@ -28,6 +28,7 @@ from services.container_cleanup import ContainerCleanup
 from services.executor_connectivity.models import PortPair, PortVerificationResult
 from services.local_verify_client import CAPABILITY, SCHEMA, LocalVerifyClient, StepEvidence
 from services.local_verify_facts import (
+    HOST_NOW_MAX,
     MAX_CONTAINERS,
     MAX_PORTS,
     HostContainer,
@@ -152,6 +153,7 @@ def test_containers_take_dockers_status_set_and_name_grammar_or_the_fact_is_drop
 
     for bad_item in (
         {"name": "pod_a", "status": "zombie", "created": created(1)},  # not docker's set
+        {"name": "pod_a", "status": ["running"], "created": created(1)},  # not even a string
         {"name": "pod a; rm -rf /", "status": "running", "created": created(1)},  # not docker's grammar
         {"name": "p" * 129, "status": "running", "created": created(1)},  # too long
         {"name": "-leading", "status": "running", "created": created(1)},
@@ -202,6 +204,15 @@ def test_parse_facts_reads_ok_steps_only_and_needs_the_host_clock_to_age():
     )
     assert no_clock.containers == () and no_clock.host_now is None
     assert not no_clock.can_age_containers()  # a string clock (or a bool) is no clock
+
+    # The clock is bounded: 0 < now < 2**40. A few-hundred-digit int parses as JSON and would
+    # overflow the float division in the cleanup; here it is no clock at all.
+    for bad_now in (0, -1, HOST_NOW_MAX, 10**300, True):
+        facts = parse_facts(
+            {"docker": StepEvidence(status="ok", data={"containers": [], "now": bad_now})},
+            capabilities=set(), round_trip_ms=0, executor_elapsed_ms=0,
+        )
+        assert facts.host_now is None and not facts.can_age_containers(), bad_now
 
 
 # --- the check -------------------------------------------------------------------------------------
@@ -283,6 +294,12 @@ async def test_a_refusal_or_a_malformed_answer_leaves_the_ssh_listings_in_place(
     assert facts.containers is None or not facts.can_age_containers()
     (line,) = outcome_lines(metric_log, "facts")
     assert line.outcome == "fallback" and line.reason == reason
+    # ... and the first reader proves it: the cleanup runs its SSH listing as today.
+    ssh, commands = ssh_recording({"pod_x": created(60)})
+    cleanup = ContainerCleanup(stale_threshold_minutes=15)
+    cleanup.prune_dangling_anonymous_volumes = AsyncMock()
+    await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=facts)
+    assert any("docker ps -a" in c for c in commands), "the SSH listing ran"
 
 
 @pytest.mark.asyncio
@@ -445,6 +462,21 @@ async def test_facts_that_cannot_age_leave_the_ssh_listing_in_place():
 
 
 @pytest.mark.asyncio
+async def test_a_fact_the_cleanup_cannot_age_lands_on_the_ssh_listing_not_on_removing_nothing():
+    """A bug or an odd value while aging the fact must not become "removed nothing this cycle":
+    the aging runs outside the cleanup's guarded block and falls to `docker ps -a`."""
+    ssh, commands = ssh_recording({"pod_old": created(60)})
+    cleanup = ContainerCleanup(stale_threshold_minutes=15)
+    cleanup.prune_dangling_anonymous_volumes = AsyncMock()
+    odd = host_facts({"pod_old": created(60)}, now=10**400)  # past the parser, hypothetically: float overflow
+
+    removed, names = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=odd)
+
+    assert (removed, names) == (1, ["pod_old"])
+    assert any("docker ps -a" in c for c in commands), "the SSH listing ran"
+
+
+@pytest.mark.asyncio
 async def test_the_stale_check_hands_the_state_facts_to_the_cleanup():
     cleanup = SimpleNamespace(
         cleanup=AsyncMock(return_value=(0, [])),
@@ -528,25 +560,9 @@ async def test_the_executors_word_alone_never_skips_the_probe():
 
 
 @pytest.mark.asyncio
-async def test_a_fully_rented_node_gets_an_info_event_and_no_probe_attempt():
-    ctx, connectivity = port_context(
-        LocalFacts(published_ports=frozenset({40002, 40003})), rented_ports=(40000,), filler_ports=(40001,)
-    )
-    result = await PortConnectivityCheck().run(ctx)
-    assert result.passed and result.event.reason_code == "PORT_CHECK_SKIPPED_ALL_PORTS_RENTED"
-    assert connectivity.calls == []
-    state = result.updates["state"]
-    assert state.verified_port_count == 0 and state.specs["verified_ports"] == []
-    assert state.sysbox_runtime is True  # as known; the probe that could change it did not run
-
-    # One port not accounted for: the probe runs as today.
-    ctx, connectivity = port_context(LocalFacts(published_ports=frozenset({40002})), rented_ports=(40000,), filler_ports=(40001,))
-    await PortConnectivityCheck().run(ctx)
-    assert len(connectivity.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_the_service_merges_published_ports_into_the_unavailable_set():
+async def test_the_service_hands_published_ports_to_the_orchestrator_apart_from_the_unavailable_set():
+    """`unavailable_ports` (backend rentals + fillers) decides WHICH window is probed; the fact
+    travels separately so it can only be applied to that window."""
     from services.executor_connectivity.service import ExecutorConnectivityService
 
     orchestrator = SimpleNamespace(verify=AsyncMock(return_value=SimpleNamespace(
@@ -555,10 +571,64 @@ async def test_the_service_merges_published_ports_into_the_unavailable_set():
     )))
     service = ExecutorConnectivityService(orchestrator)
     await service.verify_ports(None, "hk", MagicMock(), True, rented_ports=[1], filler_ports=[2], published_ports=[3, 4])
-    assert orchestrator.verify.await_args.kwargs["unavailable_ports"] == [1, 2, 3, 4]
+    assert orchestrator.verify.await_args.kwargs["unavailable_ports"] == [1, 2]
+    assert orchestrator.verify.await_args.kwargs["published_ports"] == [3, 4]
 
 
-# --- reader 3: the inspector digest, observe-only --------------------------------------------------
+def _orchestrator_with(selected, probed_ok):
+    from services.executor_connectivity.models import DindProbeResult, PortProbeResult
+    from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
+
+    selector = MagicMock()
+    selector.select.return_value = list(selected)
+    probe = SimpleNamespace(probe=AsyncMock(side_effect=lambda ports, **kw: PortProbeResult(
+        successful=tuple(p for p in ports if p in probed_ok), failed=tuple(p for p in ports if p not in probed_ok)
+    )))
+    dind = SimpleNamespace(verify=AsyncMock(side_effect=lambda port, **kw: DindProbeResult(
+        success=port in probed_ok, sysbox_runtime=True, port=port, log_text=""
+    )))
+    return ConnectivityOrchestrator(selector, probe, dind), selector, probe
+
+
+@pytest.mark.asyncio
+async def test_published_ports_shrink_the_probed_window_and_never_shift_it():
+    """Property: the ports probed WITH the fact ⊆ the ports probed WITHOUT it. A published list
+    that covered the first ports of the range must not move the 300-port window onto ports the
+    validator would never have probed (an executor could then choose its own sample)."""
+    window = [PortPair(p, p) for p in range(40000, 40006)]
+    executor = MagicMock()
+
+    # Without the fact: the selector's window, whole.
+    orch, selector, probe = _orchestrator_with(window, probed_ok=set(window[3:]))
+    await orch.verify(executor_info=executor, miner_hotkey="hk", sysbox_runtime=True, unavailable_ports=[7], ssh_client=None)
+    baseline = set(probe.probe.await_args.args[0])
+    assert baseline == set(window)
+    selector.select.assert_called_once_with(executor, 300, {7})
+
+    # With the fact: the SAME selection, the published ports removed from it, nothing added.
+    orch, selector, probe = _orchestrator_with(window, probed_ok=set(window[3:]))
+    result = await orch.verify(
+        executor_info=executor, miner_hotkey="hk", sysbox_runtime=True, unavailable_ports=[7], ssh_client=None,
+        published_ports=[40000, 40001, 40002, 50000],
+    )
+    probed = set(probe.probe.await_args.args[0])
+    selector.select.assert_called_once_with(executor, 300, {7})  # the fact never reaches the selector
+    assert probed == set(window[3:]) and probed <= baseline
+    assert result.status == "ok" and set(result.selected_ports) == probed
+
+
+@pytest.mark.asyncio
+async def test_a_published_list_that_covers_the_whole_window_keeps_the_window():
+    """The executor's word cannot empty the probe: every port 'published' → the full window is
+    probed and the connect-back decides (today's verdict, whatever it is)."""
+    window = [PortPair(p, p) for p in range(40000, 40003)]
+    orch, _, probe = _orchestrator_with(window, probed_ok=set())
+    result = await orch.verify(
+        executor_info=MagicMock(), miner_hotkey="hk", sysbox_runtime=True, unavailable_ports=[], ssh_client=None,
+        published_ports=[40000, 40001, 40002],
+    )
+    assert set(probe.probe.await_args.args[0]) == set(window)
+    assert result.status == "no_working_ports"
 
 
 @pytest.mark.asyncio
@@ -599,6 +669,11 @@ async def test_the_inspector_digest_is_logged_against_the_local_one_and_the_ssh_
 def test_the_facts_check_runs_before_its_readers_and_after_the_verdict_checks_it_needs_nothing_from():
     ids = [c.check_id for c in PipelineFactory.build_checks()]
     facts = ids.index("executor.local_facts")
+    # after the verdict checks it needs nothing from (a banned or duplicate executor makes no call) ...
+    assert ids.index("gpu.validate.collateral") < facts
+    assert ids.index("executor.validate.duplicate") < facts
+    assert ids.index("gpu.validate.banned") < facts
+    # ... and before every reader
     assert facts < ids.index("executor.cleanup.stale_containers") < ids.index("executor.validate.port_connectivity")
     assert facts < ids.index("executor.validate.inspector_rented") < ids.index("executor.local_verify")
     assert "executor.local_facts" not in [c.check_id for c in PipelineFactory.build_dry_run_checks()]

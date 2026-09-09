@@ -39,9 +39,10 @@ class ExecutorConnectivityService:
 
         `published_ports` (liumd phase 2): host ports the executor's own docker reports as already
         published — a bind on them fails the same way a bind on a rented port does. Host-reported,
-        so it only ever REMOVES candidates from the set the validator built; which of the remaining
-        ports work is still proven by the connect-back, and none of this changes `rented_ports`'
-        meaning for the sysbox fallback below.
+        so it is applied to the selected window, not to the selection: it only ever REMOVES ports
+        from the batch the validator would probe today, never moves the batch; which of the
+        remaining ports work is still proven by the connect-back, and none of this changes
+        `rented_ports`' meaning for the sysbox fallback below.
         """
         log_ctx = log_ctx or {}
         t1 = time.monotonic()
@@ -54,8 +55,9 @@ class ExecutorConnectivityService:
                 sysbox_runtime=sysbox_runtime,
                 # both sets are already taken on the executor, but only rented_ports means a
                 # customer rental — the sysbox fallback below reads it that way (DAH-2527)
-                unavailable_ports=(rented_ports or []) + (filler_ports or []) + (published_ports or []),
+                unavailable_ports=(rented_ports or []) + (filler_ports or []),
                 log_ctx=log_ctx,
+                published_ports=published_ports,
             )
             sysbox_result = verification.sysbox_runtime
             if not sysbox_result and rented_ports and sysbox_runtime:

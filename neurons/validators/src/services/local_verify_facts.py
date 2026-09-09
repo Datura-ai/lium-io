@@ -39,6 +39,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 MAX_CONTAINERS = 512
+# The host's clock (`now`, epoch seconds): a positive int below 2**40 (year ≈ 36 800) — outside
+# that the fact cannot age containers; an unbounded int would overflow the float division downstream.
+HOST_NOW_MAX = 2**40
 MAX_PORTS = 4096
 NAME_MAX_CHARS = 128
 IMAGE_MAX_CHARS = 256
@@ -98,6 +101,11 @@ def _int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _host_now(value: Any) -> int | None:
+    now = _int(value)
+    return now if now is not None and 0 < now < HOST_NOW_MAX else None
+
+
 def parse_containers(data: Any) -> tuple[HostContainer, ...] | None:
     raw = data.get("containers") if isinstance(data, dict) else None
     if not isinstance(raw, list) or len(raw) > MAX_CONTAINERS:
@@ -109,7 +117,7 @@ def parse_containers(data: Any) -> tuple[HostContainer, ...] | None:
         name, status = item.get("name"), item.get("status")
         if not isinstance(name, str) or len(name) > NAME_MAX_CHARS or not _NAME_RE.fullmatch(name):
             return None
-        if status not in DOCKER_STATUSES:
+        if not isinstance(status, str) or status not in DOCKER_STATUSES:
             return None
         image = item.get("image")
         out.append(
@@ -158,7 +166,7 @@ def parse_facts(
     docker = data_of("docker")
     return LocalFacts(
         containers=parse_containers(docker),
-        host_now=_int(docker.get("now")) if isinstance(docker, dict) else None,
+        host_now=_host_now(docker.get("now")) if isinstance(docker, dict) else None,
         published_ports=parse_published_ports(data_of("ports")),
         inspector_lib_sha256=parse_inspector_digest(data_of("inspector")),
         capabilities=frozenset(capabilities),

@@ -34,6 +34,7 @@ class ConnectivityOrchestrator:
         unavailable_ports: list[int] | None,
         ssh_client,
         log_ctx: dict | None = None,
+        published_ports: list[int] | None = None,
     ) -> PortVerificationResult:
         log_ctx = {
             **(log_ctx or {}),
@@ -43,6 +44,15 @@ class ConnectivityOrchestrator:
         ports = self.port_selector.select(
             executor_info, BATCH_PORT_VERIFICATION_SIZE, set(unavailable_ports or [])
         )
+        if published_ports:
+            # liumd phase 2: ports the executor's own docker reports as published. Applied AFTER
+            # the selection, never to it: `unavailable_ports` is backend-controlled and decides
+            # WHICH window of the range is probed; a host-reported list may only shrink that window
+            # (a bind on a published port fails as one on a rented port does), never shift it onto
+            # ports the validator would not have probed. An empty remainder keeps the full window:
+            # the connect-back proves it, not the executor's word.
+            published = set(published_ports)
+            ports = [pair for pair in ports if pair.external not in published] or ports
 
         if not ports:
             return PortVerificationResult(

@@ -88,8 +88,19 @@ class ContainerCleanup:
             "threshold_minutes": self.stale_threshold_minutes,
         }
 
+        # Outside the guarded block below: a fact that cannot be aged (a bug, an odd value the parser
+        # let through) must land on the SSH listing, not on "removed nothing this cycle".
         try:
             fact_ages = self._rental_container_ages_from_facts(host_facts)
+        except Exception as e:  # noqa: BLE001 — the fact is an optimisation; SSH is the source of truth
+            logger.warning(
+                _m(
+                    "Container facts unusable, falling back to the SSH listing",
+                    extra={**extra, "error": str(e)},
+                )
+            )
+            fact_ages = None
+        try:
             extra["from_facts"] = fact_ages is not None
             if fact_ages is not None:
                 all_containers = list(fact_ages)
