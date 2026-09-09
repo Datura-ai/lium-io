@@ -10,8 +10,9 @@ that proves something. What consumes them (`speed/LIUMD_PHASE2.md` §2):
   and each candidate's age (replaces `docker ps -a --filter` and one `inspect .Created` + `date +%s`
   per NON-stale candidate). The removal itself stays SSH-proven: a candidate the fact calls stale is
   re-read over SSH before `docker rm`.
-- `ports.published_by_docker` → `PortSelector`: host ports docker already publishes are not probed
-  (fewer failed binds). A fact can only REMOVE candidates from a set the validator built itself.
+- `ports.published_by_docker` → `ConnectivityOrchestrator.verify`: host ports docker already
+  publishes are removed from the SELECTED window, never fed to the selection (fewer failed binds).
+  A fact can only REMOVE candidates from a set the validator built itself.
 - `inspector.lib_sha256` → observe-only: logged against the validator's expected digest so the
   agreement rate is known before anything consumes it (jam6099's area).
 

@@ -552,8 +552,8 @@ async def test_published_ports_are_handed_to_the_selector_only_when_the_fact_is_
 
 @pytest.mark.asyncio
 async def test_the_executors_word_alone_never_skips_the_probe():
-    """Every port 'published' but no rental from the backend: the probe runs (and the selector
-    will find no port — the same `no_ports` the node gets today for holding every port itself)."""
+    """Every port 'published' but no rental from the backend: the probe runs — the orchestrator
+    keeps the full window when the fact would empty it, and the connect-back decides."""
     ctx, connectivity = port_context(LocalFacts(published_ports=frozenset(range(40000, 40004))))
     await PortConnectivityCheck().run(ctx)
     assert len(connectivity.calls) == 1

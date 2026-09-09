@@ -1459,5 +1459,5 @@ class LocalFactsMessages:
         reason="LOCAL_FACTS_OK",
         severity="info",
         category="transport",
-        impact="Stale-container candidates and the port candidate set are read from the executor's answer; every verdict below is still SSH-proven",
+        impact="Stale-container candidates are read from the executor's answer and the probed port window is shrunk by it; every verdict below is still SSH-proven",
     )

@@ -1,7 +1,7 @@
 import logging
 import re
 import shlex
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import asyncssh
 
@@ -18,6 +18,9 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     RENTAL_CONTAINER_PREFIXES,
 )
+
+if TYPE_CHECKING:
+    from services.local_verify_facts import LocalFacts
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +70,7 @@ class ContainerCleanup:
         ssh_client,
         rented_data: Optional[RentedExecutorsResponse],
         executor_uuid: str,
-        host_facts=None,
+        host_facts: "LocalFacts | None" = None,
     ) -> tuple[int, list[str]]:
         """Remove containers that are not in rented data and are older than threshold.
 
@@ -476,7 +479,9 @@ class ContainerCleanup:
             return 0
 
     @staticmethod
-    def _rental_container_ages_from_facts(host_facts) -> dict[str, Optional[float]] | None:
+    def _rental_container_ages_from_facts(
+        host_facts: "LocalFacts | None",
+    ) -> dict[str, Optional[float]] | None:
         """{name: age_minutes | None} for the fact's rental-prefixed containers, in the SSH
         listing's order; None when the fact cannot age containers (no listing, or no host clock)."""
         if host_facts is None or not getattr(host_facts, "can_age_containers", lambda: False)():
