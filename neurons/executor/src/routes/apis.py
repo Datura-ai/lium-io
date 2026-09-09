@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import threading
+import json
 import time
 import tomllib
 from collections.abc import Callable
@@ -404,7 +405,9 @@ async def local_verify(request: Request):
     try:
         intent = VerifyIntent.model_validate(raw)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        # `exc.errors()` carries the raising ValueError object in `ctx` for a model_validator
+        # refusal (a shared card challenge): serialised here, or the 422 would be a 500.
+        raise HTTPException(status_code=422, detail=json.loads(exc.json()))
     # Signed as sent: the validator signs the document it puts on the wire, so a field it left at
     # its default is not re-serialised here and a field it did send cannot be altered in flight.
     await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))

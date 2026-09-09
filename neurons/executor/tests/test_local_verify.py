@@ -57,6 +57,18 @@ def _loop_thread_id() -> int:
     """The thread asyncio.run is on in these tests (the main thread)."""
     return threading.main_thread().ident
 
+
+def _validator_module(name: str):
+    """Load one of the validator's leaf modules by path (no validator package on this side)."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "validators" / "src" / "services" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"validator_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 FAKE_MATMUL = textwrap.dedent(
     """
     import argparse, json, os, sys, time
@@ -67,7 +79,8 @@ FAKE_MATMUL = textwrap.dedent(
     time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
     print("UUID:  fake-uuid")
     print("RESULT_JSON: " + json.dumps({"uuid": "fake-uuid", "metrics": {"tflops": 1.0},
-          "sealed": "cafe" + a.cipher_text, "device": os.environ.get("CUDA_VISIBLE_DEVICES")}))
+          "sealed": "cafe" + a.cipher_text, "seed": a.seed,
+          "device": os.environ.get("CUDA_VISIBLE_DEVICES")}))
     sys.exit(int(os.environ.get("FAKE_EXIT", "0")))
     """
 )
@@ -291,8 +304,9 @@ def test_all_cards_pins_one_run_per_device_with_its_own_challenge(fake_scripts, 
     assert all(c.status == "ok" for c in cards)
     printed = [json.loads(c.stdout.splitlines()[-1].split("RESULT_JSON: ")[1]) for c in cards]
     assert [p["device"] for p in printed] == ["0", "1"]
-    # Each card ran ITS challenge: the sealed output carries that card's cipher text, not the step's.
+    # Each card ran ITS challenge: the sealed output carries that card's cipher text and seed, not the step's.
     assert [p["sealed"] for p in printed] == ["cafecard0", "cafecard1"]
+    assert [p["seed"] for p in printed] == ["70", "71"]
 
 
 @pytest.mark.parametrize(
@@ -311,9 +325,31 @@ def test_a_shared_or_repeated_card_challenge_is_refused(devices):
         MatmulStep(dim_n=1, dim_k=1, seed=1, cipher_text="c", devices=devices)
 
 
+def test_a_shared_card_challenge_is_a_422_on_the_route(client, validator_keypair):
+    """The model_validator's refusal reaches the wire as a JSON 422 (its `ctx` carries a ValueError
+    object that FastAPI cannot serialise by itself)."""
+    body = _body().model_dump(by_alias=True)
+    body["steps"] = {
+        "matmul": {
+            "dim_n": 1, "dim_k": 1, "seed": 1, "cipher_text": "c",
+            "devices": [
+                {"index": 0, "seed": 1, "cipher_text": "same"},
+                {"index": 1, "seed": 2, "cipher_text": "same"},
+            ],
+        }
+    }
+    body["signature"] = "0x" + validator_keypair.sign(canonical_intent_message(body)).hex()
+    response = client.post("/verify", json=body)
+    assert response.status_code == 422
+    assert "own cipher_text" in json.dumps(response.json())
+
+
 def test_no_configured_ports_means_the_validators_default_range(fake_docker):
     """Both settings unset: the validator counts 20000–65535 (port_utils.DEFAULT_PORT_RANGE), so
     the facts must count the same, not zero."""
+    port_utils = _validator_module("port_utils")  # the validator's own definition, same repo
+    assert lvs.DEFAULT_PORT_RANGE == port_utils.DEFAULT_PORT_RANGE
+    assert lvs.parse_port_range(None, None) == port_utils.get_all_ports(None, None, 0)
     assert lvs.parse_port_range(None, None) == [(p, p) for p in range(20000, 65536)]
     assert lvs.parse_port_range("", "") == [(p, p) for p in range(20000, 65536)]
     facts = lvs._port_facts(None, None, ssh_port=22)
@@ -323,16 +359,19 @@ def test_no_configured_ports_means_the_validators_default_range(fake_docker):
 
 def test_the_verifyx_library_is_hashed_off_the_event_loop(fake_scripts, fake_docker, monkeypatch):
     on_loop: list[bool] = []
+    pool_thread: list[str] = []
     real = lvs.sha256_of_file
 
     def observed(path):
         on_loop.append(_loop_thread_id() == threading.get_ident())
+        pool_thread.append(threading.current_thread().name)
         return real(path)
 
     monkeypatch.setattr(lvs, "sha256_of_file", observed)
     result = asyncio.run(_service().run(_body(steps=VerifySteps(verifyx=VerifyXStep(seed=1, cipher_text="d")))))
     assert result.steps["verifyx"].data.lib_sha256 == real(str(fake_scripts / "verifyx_executor.py"))
     assert on_loop == [False]
+    assert pool_thread[0].startswith("local-verify-facts")  # the facts pool, not asyncio's default
 
 
 def test_steps_not_asked_for_are_skipped(fake_scripts, fake_docker):
