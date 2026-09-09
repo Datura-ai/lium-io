@@ -225,6 +225,23 @@ def test_deadline_returns_what_finished_and_marks_the_rest(fake_scripts, fake_do
     assert result.steps["docker"].status == "ok" and result.steps["ports"].status == "ok"
 
 
+def test_deadline_keeps_the_finished_gpu_sibling_when_run_side_by_side(
+    fake_scripts, fake_docker, monkeypatch
+):
+    """parallel_gpu: VerifyX finishes at once, the matmul outlives the deadline. The finished
+    step's evidence must come back `ok`; only the unfinished one is `timeout`."""
+    slow_matmul = fake_scripts / "decrypt_challenge.py"
+    slow_matmul.write_text(FAKE_MATMUL.replace('os.environ.get("FAKE_SLEEP", "0")', '"3"'))
+    started = time.perf_counter()
+    result = asyncio.run(_service(max_deadline_s=1).run(_body(parallel_gpu=True)))
+
+    assert time.perf_counter() - started < 2.5
+    assert result.deadline_hit
+    assert result.steps["verifyx"].status == "ok", result.steps["verifyx"]
+    assert ("ab" * 40) in result.steps["verifyx"].stdout
+    assert result.steps["matmul"].status == "timeout"
+
+
 def test_failed_script_is_evidence_not_an_exception(fake_scripts, fake_docker, monkeypatch):
     monkeypatch.setenv("FAKE_EXIT", "3")
     result = asyncio.run(_service().run(_body()))
@@ -378,6 +395,30 @@ def test_replayed_nonce_is_refused(client, validator_keypair):
     assert replay.status_code == 409 and "nonce" in replay.text
 
 
+def test_busy_is_409_and_does_not_burn_the_nonce(client, validator_keypair, monkeypatch):
+    """A second intent while one runs is refused as busy WITHOUT claiming its nonce, so the same
+    signed intent is accepted once the executor is free (the validator need not re-sign)."""
+    monkeypatch.setenv("FAKE_SLEEP", "0.8")
+    first = _signed(_body(steps=VerifySteps(verifyx=_body().steps.verifyx)), validator_keypair)
+    second = _signed(_body(steps=VerifySteps(inspector=True)), validator_keypair)
+    with client:  # the TestClient's own loop, so the two requests share one service instance
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            running = loop.run_in_executor(None, lambda: client.post("/verify", json=first))
+            await asyncio.sleep(0.2)
+            while_busy = await loop.run_in_executor(
+                None, lambda: client.post("/verify", json=second)
+            )
+            return await running, while_busy
+
+        done, while_busy = client.portal.call(scenario)
+    assert done.status_code == 200
+    assert while_busy.status_code == 409 and "already running" in while_busy.text
+    after = client.post("/verify", json=second)
+    assert after.status_code == 200, after.text
+
+
 def test_expired_or_skewed_intent_is_401(client, validator_keypair):
     now = int(time.time())
     expired = _signed(_body(issued_at=now - 300, expires_at=now - 10), validator_keypair)
@@ -386,6 +427,30 @@ def test_expired_or_skewed_intent_is_401(client, validator_keypair):
     assert client.post("/verify", json=skewed).status_code == 401
 
 
-def test_malformed_intent_is_422_before_any_signature_check(client):
+def test_malformed_intent_is_422_before_any_signature_check(client, validator_keypair):
     assert client.post("/verify", json={"nonce": "short"}).status_code == 422
     assert client.post("/verify", json=[1, 2]).status_code == 422
+    # Another schema version is refused, not run under v1 semantics — even correctly signed.
+    other_schema = _body().model_dump(by_alias=True)
+    other_schema["schema"] = "lium.local_verify/2"
+    other_schema["signature"] = (
+        "0x" + validator_keypair.sign(canonical_intent_message(other_schema)).hex()
+    )
+    assert client.post("/verify", json=other_schema).status_code == 422
+    # The matmul fan-out is bounded: more devices than any host has, or a negative index, is 422.
+    with pytest.raises(ValueError):
+        MatmulStep(dim_n=1, dim_k=1, seed=1, cipher_text="c", devices=list(range(65)))
+    with pytest.raises(ValueError):
+        MatmulStep(dim_n=1, dim_k=1, seed=1, cipher_text="c", devices=[-1])
+
+
+def test_canonical_message_is_the_shared_datura_definition():
+    """One definition for signer and verifier (the validator client imports the same function)."""
+    from datura.requests.validator_requests import (
+        LOCAL_VERIFY_CAPABILITY,
+        LOCAL_VERIFY_SCHEMA,
+        local_verify_signing_blob,
+    )
+
+    assert canonical_intent_message is local_verify_signing_blob
+    assert SCHEMA == LOCAL_VERIFY_SCHEMA and CAPABILITY == LOCAL_VERIFY_CAPABILITY

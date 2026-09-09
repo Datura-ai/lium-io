@@ -23,9 +23,11 @@ import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from datura.requests.validator_requests import local_verify_signing_blob
 from payloads.verify import (
     STEP_NAMES,
     MatmulStep,
@@ -52,17 +54,16 @@ FAST_STEP_TIMEOUT_SECONDS = 20
 STDERR_TAIL_BYTES = 2048
 STDOUT_MAX_BYTES = 256 * 1024
 PORT_SAMPLE_MAX = 4096
+KILL_WAIT_SECONDS = 5
 
+# The fact collectors call docker-py, which must not run in asyncio's default executor (routes/
+# apis.py keeps its metrics pool separate for the same reason): a wedged daemon leaks a thread into
+# this pool only, never into the one asyncio uses for getaddrinfo and friends.
+_facts_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="local-verify-facts")
 
-def canonical_intent_message(body: dict[str, Any]) -> str:
-    """The bytes the validator signs: the intent without `signature`, canonical JSON.
-
-    Sorted keys, no whitespace, aliases as on the wire (`schema`). Both sides build the message
-    from the same dict shape, so any change to a signed field — nonce, expiry, a challenge cipher —
-    invalidates the signature.
-    """
-    unsigned = {k: v for k, v in body.items() if k != "signature"}
-    return json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+# The bytes the validator signs: the intent without `signature`, canonical JSON — ONE definition
+# for both sides, in datura (validator: services/local_verify_client.py imports the same function).
+canonical_intent_message = local_verify_signing_blob
 
 
 class NonceCache:
@@ -140,8 +141,9 @@ async def run_script(
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:
             # An SSH timeout leaves the remote matmul holding VRAM until a separate kill; here the
-            # process is ours to end.
-            _kill(proc)
+            # process is ours to end — and to wait for, so the next intent's matmul does not start
+            # while this one's VRAM is still being torn down.
+            await _kill(proc)
             return StepResult(
                 status="timeout",
                 ms=int((time.perf_counter() - started) * 1000),
@@ -158,7 +160,7 @@ async def run_script(
         )
     except asyncio.CancelledError:
         if proc is not None:
-            _kill(proc)
+            await _kill(proc)
         raise
     except Exception as exc:  # noqa: BLE001 — evidence, not control flow
         return StepResult(
@@ -168,10 +170,16 @@ async def run_script(
         )
 
 
-def _kill(proc) -> None:
+async def _kill(proc) -> None:
+    """SIGKILL the child and reap it (bounded), so its transport closes and its VRAM is released
+    before the suite lock is."""
     try:
         proc.kill()
     except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=KILL_WAIT_SECONDS)
+    except (TimeoutError, asyncio.CancelledError):
         pass
 
 
@@ -334,7 +342,7 @@ async def run_facts(name: str, func: Callable[[], dict[str, Any]]) -> StepResult
     loop = asyncio.get_running_loop()
     try:
         data = await asyncio.wait_for(
-            loop.run_in_executor(None, func), timeout=FAST_STEP_TIMEOUT_SECONDS
+            loop.run_in_executor(_facts_executor, func), timeout=FAST_STEP_TIMEOUT_SECONDS
         )
         return StepResult(status="ok", ms=int((time.perf_counter() - started) * 1000), data=data)
     except TimeoutError:
@@ -414,19 +422,20 @@ class LocalVerifyService:
         runners, gpu_order = self._runners(body)
         results: dict[str, StepResult] = {}
 
+        async def step(name: str) -> None:
+            # Each step writes its own result the moment it finishes, so a deadline that cancels
+            # the group keeps the evidence of every sibling that had already completed.
+            results[name] = await runners[name]()
+
         async def gpu_group() -> None:
             # VerifyX then matmul, the pipeline's order, unless the validator asked for both at once.
             if body.parallel_gpu:
-                outcomes = await asyncio.gather(*(runners[n]() for n in gpu_order))
-                results.update(zip(gpu_order, outcomes))
+                await asyncio.gather(*(step(n) for n in gpu_order))
                 return
             for name in sorted(gpu_order, key=lambda n: 0 if n == "verifyx" else 1):
-                results[name] = await runners[name]()
+                await step(name)
 
-        async def fact(name: str) -> None:
-            results[name] = await runners[name]()
-
-        tasks = [asyncio.ensure_future(fact(n)) for n in runners if n not in gpu_order]
+        tasks = [asyncio.ensure_future(step(n)) for n in runners if n not in gpu_order]
         if gpu_order:
             tasks.append(asyncio.ensure_future(gpu_group()))
 
