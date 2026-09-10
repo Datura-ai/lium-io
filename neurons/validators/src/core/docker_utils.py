@@ -100,8 +100,16 @@ class DockerCommand:
         `-u 0` because the exec would otherwise inherit the image's USER and lose
         access to the root-owned paths we write to. Numeric, so it does not need a
         root entry in the image's /etc/passwd (DAH-2534).
+
+        The result runs through the executor host's root shell over SSH, so both
+        values are quoted: the container name stays one argv token and the command
+        reaches the container's `sh -c` verbatim (a single quote inside it cannot
+        end the quoting and continue on the host).
         """
-        return f"/usr/bin/docker exec -u 0 -i {container_name} sh -c '{command}'"
+        return (
+            f"/usr/bin/docker exec -u 0 -i {shlex.quote(container_name)} "
+            f"sh -c {shlex.quote(command)}"
+        )
 
 
 @dataclass
