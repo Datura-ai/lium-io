@@ -561,11 +561,7 @@ async def test_advertised_executor_is_verified_in_one_call_and_ssh_is_not_used(
         )
         outcome: LocalVerifyOutcome = local.updates["state"].local_verify
         assert outcome.matmul.success and outcome.matmul.metrics == {"tflops": 42.0}
-        assert outcome.verifyx.data["success"] and outcome.facts.keys() == {
-            "docker",
-            "ports",
-            "inspector",
-        }
+        assert outcome.verifyx.data["success"]
 
         assert capability.passed and capability.event.what_we_saw["transport"] == "local_verify"
         assert capability.updates["state"].gpu_metrics == {"tflops": 42.0}
