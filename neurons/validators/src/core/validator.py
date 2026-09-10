@@ -34,6 +34,7 @@ from services.redis_service import (
     PENDING_PODS_PREFIX,
     RedisService,
 )
+from services.task.availability import silence_availability_errors_on_our_own_outage
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import VerifyXValidationService
 
@@ -575,6 +576,18 @@ class Validator:
                     # PHASE 3: Accumulate scores with burning applied
                     for miner_hotkey, score in cycle_scores.items():
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+
+                    # DAH-2748: a cycle where most nodes failed at the connect is our own
+                    # outage, not theirs; reporting it would empty the market in one cycle.
+                    cycle_results = [result for results in incentive.job_results.values() for result in results]
+                    silenced_count = silence_availability_errors_on_our_own_outage(cycle_results)
+                    if silenced_count:
+                        logger.error(
+                            _m(
+                                "[sync] Most of the cycle could not be reached; reporting no availability errors",
+                                extra={"silenced_results": silenced_count},
+                            )
+                        )
 
                     # Publish machine specs
                     for miner_hotkey, results in incentive.job_results.items():

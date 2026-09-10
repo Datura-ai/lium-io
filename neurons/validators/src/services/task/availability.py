@@ -14,7 +14,7 @@ from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
-from services.task.models import AVAILABILITY_CATEGORY, ValidationEvent, build_msg
+from services.task.models import AVAILABILITY_CATEGORY, JobResult, ValidationEvent, build_msg
 
 
 class ReachSource(StrEnum):
@@ -28,6 +28,13 @@ class ReachTarget(StrEnum):
     """What could not be reached. Add a member for every new reachability check."""
 
     EXECUTOR_SSH = "executor_ssh"
+
+
+# The longest peer-supplied text a reading may keep: the node writes it, the portal shows it.
+MAX_PEER_TEXT_LENGTH = 500
+# Above this share of one cycle failing at the connect, the validator itself is the suspect and
+# the cycle reports nothing about reachability.
+FLEET_SHARE_THAT_MEANS_OUR_OWN_OUTAGE = 0.5
 
 
 class AvailabilityErrorCode(StrEnum):
@@ -116,6 +123,37 @@ def build_ssh_unreachable_event(
             "executor_uuid": executor_uuid,
             "ssh_host": host,
             "ssh_port": port,
-            "error": error,
+            # The node's own sshd writes this text, and the provider portal renders it, so the
+            # node is not allowed to store a reading of any length it likes.
+            "error": error[:MAX_PEER_TEXT_LENGTH],
         },
     )
+
+
+def is_our_own_outage(unreachable_count: int, checked_count: int) -> bool:
+    """True when so much of one cycle failed at the connect that the validator is the suspect.
+
+    One node that refuses SSH is the node's problem. Most of a cycle refusing at once is ours —
+    our egress, our DNS, our keys — and hiding the whole market over it is worse than listing a
+    node nobody can reach for one more cycle. The backend's hourly sweep guards `active` the
+    same way (DAH-2658).
+    """
+    if checked_count == 0:
+        return False
+    return unreachable_count / checked_count > FLEET_SHARE_THAT_MEANS_OUR_OWN_OUTAGE
+
+
+def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) -> int:
+    """Report nothing about reachability when the cycle looks like our own outage.
+
+    Returns how many results were silenced, so the caller can log it; 0 means the cycle is
+    trusted and every result keeps what it found.
+    """
+    checked_results = [result for result in job_results if result.availability_errors is not None]
+    unreachable_results = [result for result in checked_results if result.availability_errors]
+    if not is_our_own_outage(len(unreachable_results), len(checked_results)):
+        return 0
+    for result in checked_results:
+        # None means "this cycle did not check": the backend leaves the stored errors alone.
+        result.availability_errors = None
+    return len(checked_results)

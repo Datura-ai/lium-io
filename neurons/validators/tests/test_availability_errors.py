@@ -10,12 +10,14 @@ from services.attestation_service import HostPolicyResult
 from services.task import service as task_service_module
 from services.task.availability import (
     AVAILABILITY_CATEGORY,
+    MAX_PEER_TEXT_LENGTH,
     AvailabilityErrorCode,
     ReachSource,
     ReachTarget,
     availability_errors,
     build_availability_event,
     build_ssh_unreachable_event,
+    silence_availability_errors_on_our_own_outage,
 )
 from services.task.models import JobResult, build_msg
 from services.task.service import TaskService, _is_ssh_transport_failure
@@ -264,3 +266,70 @@ async def test_a_failure_after_the_shell_opened_reports_the_node_as_reachable() 
         )
 
     assert result.availability_errors == []
+
+
+def _result_with(errors: list[dict] | None) -> "JobResult":
+    from datura.requests.miner_requests import ExecutorSSHInfo
+    from services.task.models import JobResult
+
+    return JobResult(
+        executor_info=ExecutorSSHInfo(
+            uuid="node", address="10.0.0.5", port=8080, ssh_username="root", ssh_port=2200,
+            python_path="/usr/bin/python3", root_dir="/root/app",
+        ),
+        score=0, job_score=0, job_batch_id="b", log_status="error", log_text="x",
+        availability_errors=errors,
+    )
+
+
+def test_one_unreachable_node_among_many_is_still_reported() -> None:
+    """A single node that refuses SSH is the node's problem, and it must stay hidden."""
+    # Arrange
+    unreachable = [{"reason_code": "EXECUTOR_SSH_UNREACHABLE"}]
+    results = [_result_with(unreachable)] + [_result_with([]) for _ in range(9)]
+
+    # Act
+    silenced = silence_availability_errors_on_our_own_outage(results)
+
+    # Assert
+    assert silenced == 0
+    assert results[0].availability_errors == unreachable
+
+
+def test_a_cycle_that_reached_almost_nothing_reports_nothing() -> None:
+    """Most of a cycle failing at the connect is our own outage; the market must not empty."""
+    # Arrange
+    unreachable = [{"reason_code": "EXECUTOR_SSH_UNREACHABLE"}]
+    results = [_result_with(unreachable) for _ in range(8)] + [_result_with([]) for _ in range(2)]
+
+    # Act
+    silenced = silence_availability_errors_on_our_own_outage(results)
+
+    # Assert - None, so the backend keeps whatever it already stored
+    assert silenced == 10
+    assert all(result.availability_errors is None for result in results)
+
+
+def test_results_that_never_checked_are_not_counted() -> None:
+    """A cycle that failed before the connect says nothing, so it cannot tip the share."""
+    # Arrange - one real failure, one real success, eight that never checked
+    results = [
+        _result_with([{"reason_code": "EXECUTOR_SSH_UNREACHABLE"}]),
+        _result_with([]),
+    ] + [_result_with(None) for _ in range(8)]
+
+    # Act
+    silenced = silence_availability_errors_on_our_own_outage(results)
+
+    # Assert - one of two checked is not "most of them"
+    assert silenced == 0
+
+
+def test_the_peer_text_of_an_ssh_failure_is_capped() -> None:
+    # Arrange / Act
+    event = build_ssh_unreachable_event(
+        executor_uuid="node-1", host="1.2.3.4", port=2200, error="x" * 5000
+    )
+
+    # Assert
+    assert len(event.what_we_saw["error"]) == MAX_PEER_TEXT_LENGTH
