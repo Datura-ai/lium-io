@@ -9,7 +9,6 @@ volumes left behind by historical `docker rm` without `-v`.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import pytest_asyncio
 
 from services.container_cleanup import VOLUME_RM_MAX_PER_PASS, ContainerCleanup
 

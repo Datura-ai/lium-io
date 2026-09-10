@@ -112,7 +112,6 @@ class CodeObfuscator(ast.NodeTransformer):
     def visit_Name(self, node: Name):
         # Only rename if it's not a built-in or special name
 
-        prev_id = node.id
 
         if not node.id.startswith('__'):
             if node.id not in self.name_mapping:
