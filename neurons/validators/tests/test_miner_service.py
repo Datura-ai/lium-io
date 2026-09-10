@@ -130,3 +130,95 @@ async def test_create_request_delegates_to_create_container(mocker, miner_servic
     assert create_mock.call_args.args[0] is payload
     # No pre-flag port-check removal in miner_service anymore.
     wait_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# DAH-3338: an executor the miner KNOWS but could not reach is ExecutorUnreachable;
+# InvalidExecutorId is kept for an id the miner does not list at all.
+# ---------------------------------------------------------------------------
+
+from payload_models.payloads import FailedContainerErrorCodes, FailedContainerRequest
+from services.miner_service import _missing_executor_failure
+
+
+def _wire_missing_executor(mocker, miner_service, executor_id: str, known: list[str] | None):
+    my_key = Mock(ss58_address="validator-hotkey")
+    my_key.sign.return_value = b"\x01\x02\x03"
+    mocker.patch(
+        "core.config.Settings.get_bittensor_wallet",
+        return_value=Mock(get_hotkey=Mock(return_value=my_key)),
+    )
+    # The miner accepted the key on none of its executors.
+    accept_msg = AcceptSSHKeyRequest(executors=[], known_executor_ids=known)
+    mocker.patch.object(
+        miner_service,
+        "_make_rest_request",
+        AsyncMock(return_value=(200, {"message_type": "AcceptSSHKeyRequest"})),
+    )
+    mocker.patch("services.miner_service._parse_miner_response", return_value=accept_msg)
+    remove_key = mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", AsyncMock())
+    return remove_key
+
+
+@pytest.mark.parametrize(
+    "known,expected_code,expected_headline",
+    [
+        pytest.param(
+            "the requested id",
+            FailedContainerErrorCodes.ExecutorUnreachable,
+            "Error: Executor unreachable",
+            id="known-but-not-accepted",
+        ),
+        pytest.param(
+            [str(uuid4())],
+            FailedContainerErrorCodes.InvalidExecutorId,
+            "Error: Invalid executor id",
+            id="not-known",
+        ),
+        pytest.param(
+            None,
+            FailedContainerErrorCodes.InvalidExecutorId,
+            "Error: Invalid executor id",
+            id="old-miner-without-the-field",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rest_twin_splits_unreachable_from_invalid_executor_id(
+    mocker, miner_service, known, expected_code, expected_headline
+):
+    executor_id = str(uuid4())
+    if known == "the requested id":
+        known = [executor_id]
+    payload = _make_create_payload(executor_id)
+    remove_key = _wire_missing_executor(mocker, miner_service, executor_id, known)
+
+    result = await miner_service._handle_container(payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == expected_code
+    assert result.msg == expected_headline
+    # The key the miner accepted nowhere is still withdrawn, as before.
+    remove_key.assert_awaited_once()
+
+
+def test_missing_executor_failure_is_shared_by_both_twins():
+    """The websocket twin (MinerService._route_container) and the REST twin (_handle_container)
+    both call _missing_executor_failure, so the split cannot drift between them."""
+    import inspect
+
+    from services.miner_service import MinerService
+
+    for method in (MinerService._route_container, MinerService._handle_container):
+        assert "_missing_executor_failure(msg, payload.executor_id)" in inspect.getsource(method)
+
+
+def test_missing_executor_failure_reads_known_executor_ids():
+    executor_id = str(uuid4())
+    known = AcceptSSHKeyRequest(executors=[], known_executor_ids=[executor_id])
+    unknown = AcceptSSHKeyRequest(executors=[], known_executor_ids=[])
+    old_miner = AcceptSSHKeyRequest(executors=[])
+
+    assert _missing_executor_failure(known, executor_id)[1] is FailedContainerErrorCodes.ExecutorUnreachable
+    assert _missing_executor_failure(unknown, executor_id)[1] is FailedContainerErrorCodes.InvalidExecutorId
+    assert _missing_executor_failure(old_miner, executor_id)[1] is FailedContainerErrorCodes.InvalidExecutorId

@@ -107,7 +107,7 @@ async def submit_ssh_pubkey(
     try:
         logger.info("Validator %s sent SSH Pubkey via REST API.", authenticated_validator)
         
-        executors = await executor_service.register_pubkey(
+        registration = await executor_service.register_pubkey(
             authenticated_validator,
             request.miner_hotkey,
             request.public_key,
@@ -115,7 +115,8 @@ async def submit_ssh_pubkey(
             request.executor_id,
             nonce=request.nonce,
         )
-        
+        executors = registration.accepted
+
         if request.is_rental_request and len(executors) == 1:
             # Invoke rental request hook if configured
             if settings.RENTAL_REQUEST_HOOK:
@@ -141,7 +142,9 @@ async def submit_ssh_pubkey(
             authenticated_validator,
             len(executors),
         )
-        return AcceptSSHKeyRequest(executors=executors)
+        return AcceptSSHKeyRequest(
+            executors=executors, known_executor_ids=registration.known_executor_ids
+        )
     except Exception as e:
         logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e), exc_info=True)
         return FailedRequest(details=str(e))

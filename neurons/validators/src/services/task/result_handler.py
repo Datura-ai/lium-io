@@ -223,6 +223,7 @@ class ResultHandler:
             gpu_attestation_passed=context.gpu_attestation_passed,
             executor_image_report=executor_image_report,
             inspector_outcome=inspector_outcome,
+            pod_states=list(context.state.pod_states) or None,
         )
 
     @staticmethod

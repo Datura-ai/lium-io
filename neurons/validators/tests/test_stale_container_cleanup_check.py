@@ -184,3 +184,37 @@ async def test_unremovable_orphan_is_recorded_in_state_for_the_port_check():
     assert result.passed is True
     assert result.event.what_we_saw["unremovable_containers"] == ["pod_orphan"]
     assert result.updates["state"].orphaned_containers == ["pod_orphan"]
+
+
+# ---------------------------------------------------------------------------
+# DAH-3338: what the sweep reaped is reported to the backend as container_state = reaped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reaped_pod_containers_are_reported_as_reaped_pod_states():
+    """Only pod_* names carry a pod id; a reaped health-check container belongs to no rental."""
+    cleanup = RecordingContainerCleanup(
+        result=(2, ["pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7", "container_healthcheck_abc"], [])
+    )
+    ctx = _make_ctx(cleanup)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    states = result.updates["state"].pod_states
+    assert [(s.pod_id, s.container_state.value) for s in states] == [
+        ("11655dc5-53ba-4a8d-a341-fe6c9d12bda7", "reaped")
+    ]
+    assert states[0].observed_at.tzinfo is not None
+    # DAH-2991's orphan list is carried in the same state object, untouched.
+    assert result.updates["state"].orphaned_containers == []
+
+
+@pytest.mark.asyncio
+async def test_nothing_reaped_and_nothing_unremovable_leaves_the_state_alone():
+    cleanup = RecordingContainerCleanup(result=(1, ["container_healthcheck_abc"], []))
+    ctx = _make_ctx(cleanup)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates == {}
