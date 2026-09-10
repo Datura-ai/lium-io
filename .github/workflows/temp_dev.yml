@@ -1,8 +1,8 @@
 name: Temp staging
 
-# `/temp-dev [<N>h|destroy]` on a PR: a temporary copy of staging (validator + central miner from
-# this branch, the miner portal from lium-platform), 4 hours by default. The work happens in
-# Datura-ai/lium-infra; see its TEMP_DEV.md.
+# `/temp-dev [<N>h|destroy]` on a PR: a temporary copy of the full staging stack, 4 hours by
+# default. Each repository contributes the branch with this name, or main when it has no such
+# branch. The work happens in Datura-ai/lium-infra; see its TEMP_DEV.md.
 
 on:
   issue_comment:
