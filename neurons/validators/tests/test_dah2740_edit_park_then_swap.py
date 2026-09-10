@@ -13,10 +13,17 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from payload_models.payloads import ContainerCreated, FailedContainerRequest
-from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result, svc  # noqa: F401
+from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
 
 from core.utils import retry_ssh_command
 from services.docker_service import EDIT_PARKED_SUFFIX, DockerService
+
+
+@pytest.fixture
+def svc():
+    # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
+    # pyflakes reads as a name every `svc` parameter below redefines (F811)
+    return DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
 
 
 def _edit_payload(**over):
