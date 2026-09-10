@@ -15,9 +15,11 @@ control-plane action (`DockerExec`, and the `docker cp` / `docker rm` / … the 
 pod's behalf) from inside the executor container is *platform-origin* (the sensor itself already
 drops docker-policy findings whose ancestry reaches sshd or pid 1, so these are the ones it could
 not trust); anything from the host, a `NamespaceEnter`, a memory read, an exec the sensor could not attribute is *provider-origin* and is
-what the check, the score gate and the renter event act on. The payloads are too many and too
+what the check, the score gate and the renter event act on when it names a rented pod (or names no
+container at all); a finding on any other container is recorded under `unmatched_containers` and
+acts on nobody. The payloads are too many and too
 script-shaped for an exact allow-list to be honest, so the platform execs' payloads are recorded
-in the verdict (`platform_payloads`) for the daily digest instead of gating anything. What keeps
+in the verdict (`platform_exec_commands`) for the daily digest instead of gating anything. What keeps
 the tag trustworthy — a provider `docker exec`-ing into the executor container to borrow its
 ancestry — is the verifier's job: DAH-3278 (stack-binary ancestry gating, sysbox-fs exemption).
 """
@@ -105,8 +107,9 @@ class VerdictPayload(BaseModel):
     action: str
     ban_source: str | None
     # the platform execs' payloads, deduplicated, for the daily digest (never gate on them)
-    platform_payloads: list[str]
-    # provider findings on a container that is not in the rented list: recorded, no renter told
+    platform_exec_commands: list[str]
+    # provider findings on a container that is not in the rented list: recorded, no renter told,
+    # no action
     unmatched_containers: list[str]
     unmatched_containers_count: int
 
@@ -141,8 +144,9 @@ class InspectorVerdict:
     enforce: bool
     action: str
     # the platform execs' payloads, deduplicated, for the daily digest (never gate on them)
-    platform_payloads: list[str] = field(default_factory=list)
-    # provider findings on a container that is not in the rented list: recorded, no renter told
+    platform_exec_commands: list[str] = field(default_factory=list)
+    # provider findings on a container that is not in the rented list: recorded, no renter told,
+    # no action
     unmatched_containers: list[str] = field(default_factory=list)
     unmatched_containers_count: int = 0
 
@@ -162,7 +166,7 @@ class InspectorVerdict:
             enforce=self.enforce,
             action=self.action,
             ban_source=BAN_SOURCE if self.action == ACTION_QUARANTINE else None,
-            platform_payloads=self.platform_payloads,
+            platform_exec_commands=self.platform_exec_commands,
             unmatched_containers=self.unmatched_containers,
             unmatched_containers_count=self.unmatched_containers_count,
         )
@@ -174,7 +178,7 @@ def canonical_sha256(value: Any) -> str:
     ).hexdigest()
 
 
-def exec_payload(command: str) -> str | None:
+def docker_exec_command(command: str) -> str | None:
     """The command a `docker exec` ran inside the target container, or None if not an exec.
 
     `docker exec -u 0 -i pod_x sh -c 'cat /root/.ssh/authorized_keys'` → the cat; a bare
@@ -293,10 +297,10 @@ def _named_resource(finding: dict[str, Any]) -> str | None:
     return None
 
 
-def _platform_payloads(platform: list[dict[str, Any]]) -> list[str]:
+def _platform_exec_commands(platform: list[dict[str, Any]]) -> list[str]:
     seen: list[str] = []
     for finding in platform:
-        payload = exec_payload(str(finding.get("command") or "")) or "(not a docker exec argv)"
+        payload = docker_exec_command(str(finding.get("command") or "")) or "(not a docker exec argv)"
         payload = payload[:_PAYLOAD_PREVIEW_CHARS]
         if payload not in seen:
             seen.append(payload)
@@ -336,7 +340,9 @@ def build_verdict(
     if has_unnamed_finding:
         # the sensor named no container at all: every renter on this host is told
         affected |= rented
-    action = ACTION_QUARANTINE if (provider and enforce) else ACTION_NONE
+    # Enforcement acts only for a rented pod: a provider inside their own container (a finding
+    # that names no rented pod) is recorded in `unmatched_containers` and quarantines nobody.
+    action = ACTION_QUARANTINE if (affected and enforce) else ACTION_NONE
     names = sorted(unmatched)
     return InspectorVerdict(
         provider_findings=provider,
@@ -348,7 +354,7 @@ def build_verdict(
         sensor_attestation=SENSOR_ATTESTED if sensor_attested else SENSOR_UNATTESTED,
         enforce=enforce,
         action=action,
-        platform_payloads=_platform_payloads(platform),
+        platform_exec_commands=_platform_exec_commands(platform),
         unmatched_containers=[name[:_UNMATCHED_NAME_CHARS] for name in names[:_UNMATCHED_MAX]],
         unmatched_containers_count=len(names),
     )

@@ -20,7 +20,7 @@ from neurons.validators.src.services.task.inspector_verdict import (
     build_verdict,
     canonical_sha256,
     KNOWN_FINDING_KINDS,
-    exec_payload,
+    docker_exec_command,
     is_platform_origin,
     renter_access_event,
 )
@@ -109,8 +109,8 @@ def _platform_execs() -> dict[str, str]:
         ("/usr/bin/docker exec -u 0 -i executor-executor-1 sh -c 'cat x'", None),
     ],
 )
-def test_exec_payload_strips_options_and_shell_wrapper(command, payload):
-    assert exec_payload(command) == payload
+def test_docker_exec_command_strips_options_and_shell_wrapper(command, payload):
+    assert docker_exec_command(command) == payload
 
 
 def test_the_real_platform_execs_are_recognised_from_the_executor_container():
@@ -119,7 +119,7 @@ def test_the_real_platform_execs_are_recognised_from_the_executor_container():
     for name, command in execs.items():
         assert is_platform_origin(_finding(command)), name
         # the digest depends on the argv parsing as a docker exec — the drift the builders could cause
-        assert exec_payload(command) is not None, name
+        assert docker_exec_command(command) is not None, name
     # the very same commands from the host are a human at the keyboard
     for name, command in execs.items():
         assert not is_platform_origin(_finding(command, host=True, nested=False)), name
@@ -236,13 +236,13 @@ def test_platform_origin_is_the_executor_ancestry_not_the_payload():
     assert not is_platform_origin(_finding(f"/var/lib/docker/volumes/volume_{POD}/_data", kind="DockerVolumeMount"))
 
 
-def test_verdict_records_the_platform_payloads_for_the_digest():
+def test_verdict_records_the_platform_exec_commands_for_the_digest():
     execs = _platform_execs()
     findings = [_finding(c) for c in execs.values()] + [_finding(HUMAN_SHELL, host=True, nested=False)]
     verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
 
-    payloads = verdict.as_payload().platform_payloads
-    assert payloads == verdict.platform_payloads
+    payloads = verdict.as_payload().platform_exec_commands
+    assert payloads == verdict.platform_exec_commands
     assert "cat /root/.ssh/authorized_keys" in payloads
     assert "df -k /root" in payloads
     assert "tar --xattrs --acls -xzpf - -C /root/restored --strip-components=1" in payloads
@@ -260,6 +260,29 @@ def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
     assert verdict.unmatched_containers_count == 1
     assert verdict.as_payload().unmatched_containers == ["pod_gone-since-the-list-was-fetched"]
     assert len(verdict.provider_findings) == 1
+
+
+@pytest.mark.parametrize("container", ["my-own-jupyter", "pod_gone-since-the-list-was-fetched"])
+def test_a_finding_on_a_container_that_is_not_a_rented_pod_takes_no_action(container):
+    """A provider inside their own container is provider-origin but harms no renter: under
+    enforcement the verdict still says `none` (taiberium, #1342)."""
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = container
+    verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=True, enforce=True)
+
+    assert verdict.provider_origin is True
+    assert verdict.affected_pod_ids == []
+    assert verdict.action == ACTION_NONE
+    assert verdict.as_payload().ban_source is None
+    assert verdict.unmatched_containers == [container]
+
+
+def test_a_rented_pod_named_under_enforcement_is_quarantined():
+    verdict = build_verdict(
+        {}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=True, enforce=True
+    )
+    assert verdict.affected_pod_ids == [POD]
+    assert verdict.action == ACTION_QUARANTINE
 
 
 def test_a_verdict_with_every_pod_matched_carries_empty_unmatched_fields():
@@ -494,6 +517,36 @@ async def test_provider_finding_under_enforcement_fails_the_check_and_requests_q
     assert log["evidence_sha256"] == verdict["evidence_sha256"]
     assert log["finding_kinds"] == ["DockerExec"]
     assert "asked to take the host off the marketplace" in log["log_text"]
+
+
+@pytest.mark.asyncio
+async def test_finding_on_a_non_rented_container_under_enforcement_is_recorded_and_acts_on_nobody(
+    context_factory, monkeypatch
+):
+    """The provider entered their own container: MALICIOUS is recorded with the container under
+    `unmatched_containers`, but the check passes, the score gate is not set and no renter is told."""
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)
+    redis = AsyncMock()
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = "my-own-jupyter"
+    ctx, _ = _ctx(context_factory, [finding], redis=redis)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.MALICIOUS_FINDINGS.reason
+    assert result.event.severity == "warning"
+    assert "not a rented pod" in result.event.impact
+    assert "inspector_passed" not in result.updates
+    event = result.updates["state"].inspector_event
+    assert event["outcome"] == "MALICIOUS"
+    verdict = event["context"]["verdict"]
+    assert verdict["enforce"] is True
+    assert verdict["action"] == ACTION_NONE
+    assert verdict["ban_source"] is None
+    assert verdict["affected_pod_ids"] == []
+    assert verdict["unmatched_containers"] == ["my-own-jupyter"]
+    redis.publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio

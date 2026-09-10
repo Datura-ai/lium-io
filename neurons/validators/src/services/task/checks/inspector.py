@@ -12,7 +12,7 @@ from services.redis_service import STREAMING_LOG_CHANNEL
 from core.config import settings
 from core.utils import _m, get_extra_info
 
-from ..inspector_verdict import InspectorVerdict, build_verdict, renter_access_event
+from ..inspector_verdict import ACTION_QUARANTINE, InspectorVerdict, build_verdict, renter_access_event
 from ..messages import InspectorMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -218,8 +218,16 @@ class InspectorRentedCheck:
         extra: dict[str, Any],
     ) -> CheckResult:
         """The act-and-publish half of the check: a provider-origin verdict becomes the MALICIOUS
-        event and, under INSPECTOR_ENFORCE_ENABLED, fails the check and tells the renters."""
-        enforce = verdict.enforce
+        event and, when the verdict's action is quarantine (INSPECTOR_ENFORCE_ENABLED and a rented
+        pod affected), fails the check and tells the renters. A finding that names no rented pod
+        is recorded with `unmatched_containers` and acts on nobody, whatever the flag."""
+        acts = verdict.action == ACTION_QUARANTINE
+        if acts:
+            impact = "Provider-origin access to a rented pod: score zeroed, quarantine requested"
+        elif verdict.enforce:
+            impact = "Provider-origin finding on a container that is not a rented pod recorded; score unchanged"
+        else:
+            impact = "Provider-origin access to a rented pod recorded; score unchanged (INSPECTOR_ENFORCE_ENABLED off)"
         what: dict[str, Any] = {
             "findings": verdict.provider_findings,
             "platform_findings": len(verdict.platform_findings),
@@ -233,19 +241,15 @@ class InspectorRentedCheck:
             Msg.MALICIOUS_FINDINGS,
             ctx=ctx,
             check_id=self.check_id,
-            severity="error" if enforce else None,
-            impact=(
-                "Provider-origin access to a rented pod: score zeroed, quarantine requested"
-                if enforce
-                else "Provider-origin access to a rented pod recorded; score unchanged (INSPECTOR_ENFORCE_ENABLED off)"
-            ),
+            severity="error" if acts else None,
+            impact=impact,
             what=what,
             extra=extra,
         )
         inspector_event = _build_inspector_event(
             ctx, event, rented_pods, result, outcome="MALICIOUS", report=report, verdict=verdict
         )
-        if enforce:
+        if acts:
             # The renter hears about it only when the verdict acts: in shadow mode the
             # classifier is still being measured against the sensor's false positives, and a
             # "the provider read your pod" event on a wrong call cannot be taken back.
@@ -254,11 +258,11 @@ class InspectorRentedCheck:
             "default_extra": extra,
             "state": replace(ctx.state, inspector_event=inspector_event),
         }
-        if enforce:
+        if acts:
             # Non-fatal check: passed=False alone changes nothing downstream, the score gate
             # in calculate_scores reads this flag (same mechanics as cpu_truth_passed).
             updates["inspector_passed"] = False
-        return CheckResult(passed=not enforce, event=event, updates=updates)
+        return CheckResult(passed=not acts, event=event, updates=updates)
 
 
 def _build_inspector_event(
