@@ -126,11 +126,16 @@ install_docker() {
       ok "Added ${SUDO_USER:-$USER} to docker group (activating for this session)"
     fi
   fi
-  # The executor stack bind-mounts $HOME/.docker (DAH-3376). Create it as the operator now:
-  # if the daemon creates a missing bind source it is root-owned and a later `docker login`
-  # by this user cannot write config.json.
-  mkdir -p "$HOME/.docker"
   ok "Docker installed"
+}
+
+# The executor stack bind-mounts $HOME/.docker (DAH-3376). Create it as the user running this
+# script — the same user `lium mine` starts the stack as — on every run, Docker pre-installed or
+# not: if the daemon creates a missing bind source it is root-owned and a later `docker login`
+# by this user cannot write config.json.
+prepare_docker_config_dir() {
+  mkdir -p "$HOME/.docker"
+  ok "Docker config directory ready: $HOME/.docker"
 }
 
 verify_docker() {
@@ -161,6 +166,8 @@ pause_if_needed
 
 install_docker
 pause_if_needed
+
+prepare_docker_config_dir
 
 verify_docker
 pause_if_needed
