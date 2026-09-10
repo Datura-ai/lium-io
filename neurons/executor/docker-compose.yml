@@ -1,5 +1,10 @@
 version: '3.7'
 
+# The host's Docker config directory ($HOME/.docker, written by `docker login`) is mounted
+# read-only into both containers so the update chain can authenticate against Docker Hub:
+# anonymous pulls are counted per source IP, and hosts behind a shared egress exhaust that
+# quota together (DAH-3376). An empty or missing directory changes nothing — the pulls stay
+# anonymous, as before.
 services:
   executor-runner:
     image: daturaai/compute-subnet-executor-runner:latest
@@ -7,6 +12,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
+      - "$HOME/.docker:/root/.docker:ro"
       - ./.env:/root/executor/.env
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
@@ -16,4 +22,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - "$HOME/.docker:/config:ro"
+    environment:
+      - DOCKER_CONFIG=/config
     command: --interval 60 --cleanup --label-enable
