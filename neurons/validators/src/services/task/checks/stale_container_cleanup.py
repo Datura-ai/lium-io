@@ -3,10 +3,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 
 from core.utils import _m
+from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
+from ...const import POD_CONTAINER_PREFIX
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -120,8 +123,17 @@ class StaleContainerCleanupCheck:
         )
         # DAH-2991: an orphan that survived removal still holds its ports; PortCountCheck names it
         # instead of reporting a bare count the provider has to diagnose by hand.
-        updates = {"state": replace(ctx.state, orphaned_containers=unremovable_names)} if unremovable_names else {}
-        return CheckResult(passed=True, event=event, updates=updates)
+        # DAH-3338: a reaped pod_* container is reported to the backend as `reaped`, so the rental
+        # it belonged to learns its container is confirmed gone without a route of its own.
+        reaped = _reaped_pod_states(removed_names)
+        if not unremovable_names and not reaped:
+            return CheckResult(passed=True, event=event)
+        state = replace(
+            ctx.state,
+            orphaned_containers=unremovable_names,
+            pod_states=[*ctx.state.pod_states, *reaped],
+        )
+        return CheckResult(passed=True, event=event, updates={"state": state})
 
     async def _first_sight(self, ctx: Context) -> bool:
         """Record the executor UUID; True the first time this validator meets it.
@@ -139,3 +151,18 @@ class StaleContainerCleanupCheck:
                 )
             )
             return True
+
+
+def _reaped_pod_states(removed_names: list[str]) -> list[PodContainerState]:
+    # Only rental containers carry a pod id; health-check and filler containers the sweep also
+    # removes belong to no rental and are not reported.
+    observed_at = datetime.now(UTC)
+    return [
+        PodContainerState(
+            pod_id=name.removeprefix(POD_CONTAINER_PREFIX),
+            container_state=ContainerState.REAPED,
+            observed_at=observed_at,
+        )
+        for name in removed_names
+        if name.startswith(POD_CONTAINER_PREFIX)
+    ]

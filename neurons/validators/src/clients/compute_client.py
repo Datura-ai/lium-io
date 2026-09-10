@@ -350,6 +350,7 @@ class ComputeClient:
                             sent_at=data.get("sent_at"),
                             batch_total=data.get("batch_total"),
                             availability_errors=data.get("availability_errors"),
+                            pod_states=data.get("pod_states"),
                         )
 
                         async with self.lock:
