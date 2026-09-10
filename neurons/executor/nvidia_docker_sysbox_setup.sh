@@ -44,7 +44,7 @@ docker_version_ge() { version_ge "$(docker_server_version)" "$1" "$2"; }
 version3_ge() {
     # "a.b.c" >= "x.y.z", all three components numeric (driver versions: 580.65.06 vs the validators' minimum)
     awk -v a="$1" -v b="$2" 'BEGIN {
-        n = split(a, x, "."); split(b, y, ".")
+        split(a, x, "."); split(b, y, ".")
         for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
         exit 0 }'
 }
@@ -269,9 +269,11 @@ check_nvidia_driver() {
             "sudo apt-get install -y nvidia-driver-580-server && sudo reboot   # Ubuntu; or your vendor's driver package"
         return 1
     fi
+    # nvidia-smi prints its errors on stdout ("Failed to initialize NVML: Driver/library version mismatch"), so only a
+    # dotted number counts as a version
     driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
-    if [ -z "$driver" ] || ! ls "$(host_path /proc/driver/nvidia)" &>/dev/null; then
-        pf_fix "NVIDIA driver is installed but not loaded (nvidia-smi gives no driver version or /proc/driver/nvidia is missing)." \
+    if ! echo "$driver" | grep -Eq '^[0-9]+(\.[0-9]+)+$' || ! ls "$(host_path /proc/driver/nvidia)" &>/dev/null; then
+        pf_fix "NVIDIA driver is installed but not loaded (nvidia-smi: ${driver:-no output}; /proc/driver/nvidia $(ls "$(host_path /proc/driver/nvidia)" &>/dev/null && echo present || echo missing))." \
             "sudo reboot   # then check 'nvidia-smi'; if it still fails: sudo dkms autoinstall && sudo reboot"
         return 1
     fi
@@ -355,13 +357,20 @@ port_listener() {
     ss -Hltnp "sport = :$1" 2>/dev/null | awk '{print $NF}' | head -1
 }
 
+port_container() {
+    # the container that publishes TCP $1 (a docker-proxy listener belongs to one); empty when none does
+    docker ps --filter "publish=$1" --format '{{.Names}}' 2>/dev/null | head -1
+}
+
 ufw_blocks_port() {
     # true when ufw is active and no ALLOW rule covers TCP $1 (single port or lo:hi range)
     local status
     status=$(ufw status 2>/dev/null) || return 1
     echo "$status" | grep -q '^Status: active' || return 1
     ! echo "$status" | awk -v p="$1" '
-        $2 == "ALLOW" || $3 == "ALLOW" {
+        {
+            allow = 0; for (i = 2; i <= NF; i++) if ($i == "ALLOW") allow = 1   # "ALLOW", "ALLOW IN", "… on eth0 ALLOW"
+            if (!allow) next
             split($1, spec, "/"); if (spec[2] != "" && spec[2] != "tcp") next
             n = split(spec[1], range, ":")
             if ((n == 1 && range[1] == p) || (n == 2 && range[1] + 0 <= p + 0 && p + 0 <= range[2] + 0)) found = 1
@@ -370,12 +379,23 @@ ufw_blocks_port() {
 }
 
 check_ports() {
-    local ports p listener label fixed=0
+    local ports p listener container label fixed=0
     read -r -a ports <<< "$(preflight_ports)"
+    command -v ss &>/dev/null || { pf_skip "Ports — 'ss' (iproute2) is missing, cannot tell what listens."; return 0; }
     for p in "${ports[0]}:executor" "${ports[1]}:SSH"; do
         label=${p#*:} p=${p%%:*}
         listener=$(port_listener "$p")
-        if [ -n "$listener" ] && ! echo "$listener" | grep -Eq 'docker-proxy|dockerd'; then
+        container=""
+        if [ -n "$listener" ] && echo "$listener" | grep -Eq 'docker-proxy|dockerd'; then
+            container=$(port_container "$p")
+            case "$container" in
+                executor-*|executor_*) ;;   # the executor itself, from an earlier install
+                *) pf_fix "TCP $p ($label port) is published by container ${container:-unknown} — the executor cannot bind it." \
+                       "docker stop ${container:-<name>}, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
+                   fixed=1
+                   continue ;;
+            esac
+        elif [ -n "$listener" ]; then
             pf_fix "TCP $p ($label port) is already in use by $listener — the executor cannot bind it." \
                 "Stop that process, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
             fixed=1
@@ -386,8 +406,8 @@ check_ports() {
             fixed=1
             continue
         fi
-        if [ -n "$listener" ]; then
-            pf_pass "TCP $p ($label port) is served by Docker and not blocked by ufw."
+        if [ -n "$container" ]; then
+            pf_pass "TCP $p ($label port) is served by the executor ($container) and not blocked by ufw."
         else
             pf_pass "TCP $p ($label port) is free and not blocked by ufw."
         fi
@@ -423,8 +443,9 @@ preflight_summary() {
 }
 
 preflight_host() {
-    # what this script cannot install for you; a FIX here stops the run before anything changes
-    check_root || true
+    # what this script cannot install for you; a FIX here stops the run before anything changes.
+    # Returns 1 without root: every other check reads Docker's socket or the process table.
+    check_root || return 1
     check_arch || true
     check_kernel || true
     check_docker || true
@@ -465,8 +486,7 @@ esac
 
 if [ -n "$PREFLIGHT_MODE_FLAG" ]; then
     echo -e "\n${B}Preflight${N} — host requirements, then what this script installs"
-    preflight_host
-    preflight_stack
+    if preflight_host; then preflight_stack; fi
     preflight_summary && exit 0
     echo "  Fix the lines above, then run: $(self_cmd)"
     exit 1
@@ -474,7 +494,7 @@ fi
 
 step 1 7 "Pre-flight checks"
 
-preflight_host
+preflight_host || true
 preflight_summary || { echo "  Fix the lines above and re-run. Nothing was installed."; exit 1; }
 
 echo -e "\n  This will install sysbox, configure Docker, restart Docker, and verify."

@@ -39,6 +39,7 @@ STUBS = {
         case "$1 $2" in
             "version --format") echo "${STUB_DOCKER_VERSION:-28.5.2}" ;;
             "ps ") exit 0 ;;
+            "ps --filter") echo "${STUB_PORT_CONTAINER:-executor-1}" ;;
             "info --format")
                 case "$3" in
                     *DockerRootDir*) echo "${STUB_DOCKER_ROOT:-$HOST_ROOT/var/lib/docker}" ;;
@@ -235,7 +236,14 @@ def test_docker_29_1_passes_but_says_untested(tmp_path):
 
 @pytest.mark.parametrize("with_jq", [False, True])
 def test_docker_29_7_without_the_two_settings_names_both(tmp_path, with_jq):
-    rc, out, _ = run_check(tmp_path, "check_docker_features", env={"STUB_DOCKER_VERSION": "29.7.0"}, with_jq=with_jq)
+    # a daemon.json that exists but carries neither key, so the jq path is the one that decides
+    rc, out, _ = run_check(
+        tmp_path,
+        "check_docker_features",
+        env={"STUB_DOCKER_VERSION": "29.7.0"},
+        files={"etc/docker/daemon.json": '{"runtimes": {"sysbox-runc": {"path": "/usr/bin/sysbox-runc"}}}\n'},
+        with_jq=with_jq,
+    )
     assert rc == 1
     assert "FIX  Docker 29.7.0 without features.cdi, time-namespaces = false" in out
     assert 'add {"features":{"cdi":false,"time-namespaces":false}} to /etc/docker/daemon.json' in out
@@ -266,13 +274,15 @@ def test_docker_29_3_needs_only_cdi(tmp_path):
     assert "time-namespaces" not in out.split("PASS")[1]
 
 
-def test_docker_29_3_with_cdi_still_on_is_a_fix(tmp_path):
-    # a daemon.json that mentions cdi but leaves it true is the negative control for the grep path
+@pytest.mark.parametrize("with_jq", [False, True])
+def test_docker_29_3_with_cdi_still_on_is_a_fix(tmp_path, with_jq):
+    # a daemon.json that mentions cdi but leaves it true is the negative control for both read paths
     rc, out, _ = run_check(
         tmp_path,
         "check_docker_features",
         env={"STUB_DOCKER_VERSION": "29.3.0"},
         files={"etc/docker/daemon.json": '{"features": {"cdi": true}}\n'},
+        with_jq=with_jq,
     )
     assert rc == 1
     assert "FIX  Docker 29.3.0 without features.cdi = false" in out
@@ -305,7 +315,17 @@ def test_nvidia_smi_missing_is_a_fix(tmp_path):
 def test_nvidia_driver_not_loaded_is_a_fix(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_nvidia_driver", files={"proc/driver/nvidia/version": None})
     assert rc == 1
-    assert "FIX  NVIDIA driver is installed but not loaded" in out
+    assert "FIX  NVIDIA driver is installed but not loaded" in out and "/proc/driver/nvidia missing" in out
+
+
+def test_nvidia_smi_error_text_is_not_read_as_a_version(tmp_path):
+    # nvidia-smi prints this on stdout; it must land in the "not loaded" line with the reboot fix, not in "below 580.65.06"
+    rc, out, _ = run_check(
+        tmp_path, "check_nvidia_driver", env={"STUB_NV_DRIVER": "Failed to initialize NVML: Driver/library version mismatch"}
+    )
+    assert rc == 1
+    assert "FIX  NVIDIA driver is installed but not loaded (nvidia-smi: Failed to initialize NVML" in out
+    assert "sudo reboot" in out and "below 580.65.06" not in out
 
 
 @pytest.mark.parametrize("driver", ["575.57.08", "580.65.05", "580.64.99"])
@@ -407,10 +427,28 @@ def test_port_held_by_another_process_is_a_fix(tmp_path):
     assert "PASS TCP 2200 (SSH port)" in out
 
 
-def test_port_served_by_docker_passes(tmp_path):
+def test_port_served_by_the_executor_container_passes(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "2200", "STUB_BUSY_PROC": "docker-proxy"})
     assert rc == 0
-    assert "PASS TCP 2200 (SSH port) is served by Docker" in out
+    assert "PASS TCP 2200 (SSH port) is served by the executor (executor-1)" in out
+
+
+def test_port_published_by_another_container_is_a_fix(tmp_path):
+    # a docker-proxy listener is not the executor's by definition: ask Docker whose it is
+    rc, out, _ = run_check(
+        tmp_path,
+        "check_ports",
+        env={"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "docker-proxy", "STUB_PORT_CONTAINER": "nginx-proxy"},
+    )
+    assert rc == 1
+    assert "FIX  TCP 8080 (executor port) is published by container nginx-proxy" in out
+    assert "docker stop nginx-proxy" in out
+
+
+def test_ports_are_skipped_without_ss(tmp_path):
+    rc, out, fix = run_check(tmp_path, "check_ports", without=("ss",))
+    assert rc == 0 and fix == 0
+    assert "SKIP Ports — 'ss' (iproute2) is missing" in out
 
 
 def test_ufw_active_without_a_rule_names_ufw_allow(tmp_path):
@@ -424,6 +462,13 @@ def test_ufw_active_without_a_rule_names_ufw_allow(tmp_path):
 
 def test_ufw_range_rule_covers_the_port(tmp_path):
     ufw = "Status: active\\n2000:9000/tcp   ALLOW   Anywhere"
+    rc, out, _ = run_check(tmp_path, "check_ports", env={"STUB_UFW_STATUS": ufw})
+    assert rc == 0, out
+
+
+def test_ufw_verbose_and_interface_rows_are_read(tmp_path):
+    # `ufw status verbose` prints "ALLOW IN"; an interface rule prints "8080/tcp on eth0"; v6 rows carry "(v6)"
+    ufw = "Status: active\\n8080/tcp on eth0   ALLOW IN   Anywhere\\n2200/tcp (v6)   ALLOW IN   Anywhere (v6)\\n2200   ALLOW IN   Anywhere"
     rc, out, _ = run_check(tmp_path, "check_ports", env={"STUB_UFW_STATUS": ufw})
     assert rc == 0, out
 
@@ -532,6 +577,8 @@ def test_not_root_is_a_fix_that_names_sudo(tmp_path):
     assert proc.returncode == 1
     assert "FIX  Not running as root" in proc.stdout
     assert f"sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
+    # nothing else runs without root: the other checks would read the process table and Docker's socket as a user
+    assert "Preflight: 0 PASS, 1 FIX, 0 SKIP." in proc.stdout
 
 
 def test_unknown_option_is_refused(tmp_path):
