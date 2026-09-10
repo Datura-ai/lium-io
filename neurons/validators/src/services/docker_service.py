@@ -404,6 +404,47 @@ class VolumeHostProbe:
     warm_slot_volume_names: list[str] = field(default_factory=list)  # the slot volumes the probe left out
 
 
+@dataclass(frozen=True)
+class RentalVolumeSizing:
+    """The sizing half of the rent path's volume stage, before anything is created: the host probe
+    (RENTAL_VOLUME_FAST_PATH_ENABLED, else None) and `resolve_volume_sizing`'s result. Computed once
+    per rental — by the warm-pool lookup when it has a slot to bound, else by
+    `_size_and_create_rental_volume` — and reused by the create."""
+
+    probe: VolumeHostProbe | None
+    sizing: VolumeSizingResult
+
+
+@dataclass(frozen=True)
+class CreatedRentalVolume:
+    """`_size_and_create_rental_volume`'s result: the volume it created and the limits it was sized to."""
+
+    name: str
+    volume_limit_gb: int | None
+    storage_limit_gb: int | None
+
+
+@dataclass(frozen=True)
+class WarmPoolLookup:
+    """`_find_warm_pool_adoption`'s result: the slot this rental adopts (None on a miss) and the
+    rental's volume sizing when the lookup computed it to bound a slot — on a miss the create path
+    reuses it instead of sizing again."""
+
+    adoption: WarmPoolAdoption | None
+    volume_sizing: RentalVolumeSizing | None
+
+
+@dataclass(frozen=True)
+class WarmSlotPlan:
+    """`_plan_warm_slot`'s result: the container spec of one slot, its volume and the sizes the slot
+    is labelled with — everything `_create_warm_slot` needs to create it."""
+
+    spec: ContainerRunSpec
+    volume_name: str
+    volume_limit_gb: int
+    storage_limit_gb: int
+
+
 def _volume_host_probe_command(*, with_df: bool) -> str:
     """One shell line: DockerRootDir, (optionally) df through the helper container, the volume
     list, the warm-pool slot volumes and the loopback plugin state, each output line tagged so the
@@ -1133,19 +1174,17 @@ class DockerService:
                 )
             )
 
-    async def _size_and_create_rental_volume(
+    async def _resolve_rental_volume_sizing(
         self,
         *,
         ssh_client: asyncssh.SSHClientConnection,
-        docker_client: RentalDockerSdkClient,
         payload: ContainerCreateRequest,
         log_tag: str,
         default_extra: dict,
         set_step: Callable[[str], None],
-    ) -> tuple[str, int | None, int | None]:
-        """Size and create `volume_<pod_id>` for a fresh rental; returns (name, volume_limit_gb,
-        storage_limit_gb). The body of the rent path's volume stage, callable again after a warm-pool
-        miss; `set_step` names the failing step for the caller's error report."""
+    ) -> RentalVolumeSizing:
+        """The sizing half of the rent path's volume stage: the host probe when the fast path is on,
+        then `resolve_volume_sizing`. `set_step` names the failing step for the caller's error report."""
         # DAH-3240: one round trip for the host facts the sizing and the create need
         # (flag off → None → the per-command path below, unchanged).
         volume_probe: VolumeHostProbe | None = None
@@ -1169,6 +1208,31 @@ class DockerService:
             log_extra=default_extra,
             host_probe=volume_probe,
         )
+        return RentalVolumeSizing(probe=volume_probe, sizing=sizing)
+
+    async def _size_and_create_rental_volume(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerCreateRequest,
+        log_tag: str,
+        default_extra: dict,
+        set_step: Callable[[str], None],
+        volume_sizing: RentalVolumeSizing | None = None,
+    ) -> CreatedRentalVolume:
+        """Size and create `volume_<pod_id>` for a fresh rental. The body of the rent path's volume
+        stage, callable again after a warm-pool miss; a `volume_sizing` the warm-pool lookup already
+        computed is used as-is instead of sizing a second time."""
+        if volume_sizing is None:
+            volume_sizing = await self._resolve_rental_volume_sizing(
+                ssh_client=ssh_client,
+                payload=payload,
+                log_tag=log_tag,
+                default_extra=default_extra,
+                set_step=set_step,
+            )
+        volume_probe, sizing = volume_sizing.probe, volume_sizing.sizing
         set_step("volume_creation")
         local_volume = f"volume_{payload.pod_id}"
         # DAH-2265 Plan 3: only full-node rentals (disk_share >= 1.0) get a
@@ -1188,7 +1252,11 @@ class DockerService:
             sparse=full_node_rental,
             host_probe=volume_probe,
         )
-        return local_volume, sizing.volume_limit_gb, sizing.storage_limit_gb
+        return CreatedRentalVolume(
+            name=local_volume,
+            volume_limit_gb=sizing.volume_limit_gb,
+            storage_limit_gb=sizing.storage_limit_gb,
+        )
 
     async def _find_warm_pool_adoption(
         self,
@@ -1200,14 +1268,19 @@ class DockerService:
         is_custom_build: bool,
         image_managed_jupyter: bool,
         in_cvm: bool,
+        log_tag: str,
         default_extra: dict,
-    ) -> WarmPoolAdoption | None:
-        """The slot this rental will adopt, or None (a *miss*, logged with its reason).
+        set_step: Callable[[str], None],
+    ) -> WarmPoolLookup:
+        """The slot this rental will adopt, or a *miss* (logged with its reason), plus the rental's
+        volume sizing when a slot had to be bounded by it.
 
         One host command lists the image and every created slot; the slot must be fresh, of this
-        image, sized within the backend's caps, and bound to ports the backend offers this rental.
-        The field-by-field HostConfig comparison happens in `_adopt_warm_slot`, once the run spec exists.
+        image, bound to ports the backend offers this rental, and sized between what this rental's
+        own sizing gives it now and the backend's caps. The field-by-field HostConfig comparison
+        happens in `_adopt_warm_slot`, once the run spec exists.
         """
+        volume_sizing: RentalVolumeSizing | None = None
         reason = warm_pool.adopt_block_reason(
             payload,
             custom_options,
@@ -1222,11 +1295,13 @@ class DockerService:
                     check=False,
                     timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
                 )
-                image_doc, slot_docs = warm_pool.parse_find_slots_output(result.stdout or "")
+                found = warm_pool.parse_find_slots_output(result.stdout or "")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                image_doc, slot_docs, reason = None, [], f"lookup failed: {exc}"
+                found = warm_pool.FindSlotsOutput(image_doc=None, slot_docs=[])
+                reason = f"lookup failed: {exc}"
+            image_doc, slot_docs = found.image_doc, found.slot_docs
             if reason is None and image_doc is None:
                 reason = "image not inspectable"
             if reason is None and slot_docs is None:
@@ -1241,15 +1316,60 @@ class DockerService:
                         slot = warm_pool.slot_from_inspect(
                             doc, image_id=image_doc.get("Id") or "", now=now, max_age=max_age
                         )
-                        if slot is None or warm_pool.slot_limits_fit(slot, payload) is not None:
-                            continue
-                        port_maps = warm_pool.slot_port_maps(slot, payload.available_ports, rental_port_maps)
+                        port_maps = (
+                            None
+                            if slot is None
+                            else warm_pool.slot_port_maps(slot, payload.available_ports, rental_port_maps)
+                        )
                     except Exception as exc:
                         logger.info(
                             _m("warm_pool slot=unreadable", extra=get_extra_info({**default_extra, "error": str(exc)}))
                         )
                         continue
-                    if port_maps is None:
+                    if slot is None or port_maps is None:
+                        continue
+                    if volume_sizing is None:
+                        # The floor a slot must meet is what this rental's own sizing gives it on
+                        # the host as it is now (a slot sized while a filler's data held the disk
+                        # is smaller); sized once here, and handed back so a miss does not size again.
+                        volume_sizing = await self._resolve_rental_volume_sizing(
+                            ssh_client=ssh_client,
+                            payload=payload,
+                            log_tag=log_tag,
+                            default_extra=default_extra,
+                            set_step=set_step,
+                        )
+                    size_reason = warm_pool.slot_disk_sizes_fit(
+                        slot,
+                        payload,
+                        sized_volume_gb=volume_sizing.sizing.volume_limit_gb,
+                        sized_storage_gb=volume_sizing.sizing.storage_limit_gb,
+                    )
+                    if size_reason in warm_pool.SLOT_BELOW_SIZING_REASONS:
+                        # smaller than what the host gives a whole-host rental now: rather than wait
+                        # for a rental with a cap small enough to fit it, it goes, and the next
+                        # filler start leaves one sized for the host as it is (one create's cost)
+                        logger.info(
+                            _m(
+                                "warm_pool slot=remove reason=undersized",
+                                extra=get_extra_info({**default_extra, "slot": slot.name, "detail": size_reason}),
+                            )
+                        )
+                        with contextlib.suppress(Exception):
+                            await ssh_client.run(
+                                warm_pool.remove_slot_command(slot.name, slot.volume_name),
+                                check=False,
+                                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+                            )
+                        continue
+                    if size_reason is not None:
+                        # larger than this rental's cap: the slot may fit a rental with a larger one
+                        logger.info(
+                            _m(
+                                "warm_pool slot=skip reason=sizes",
+                                extra=get_extra_info({**default_extra, "slot": slot.name, "detail": size_reason}),
+                            )
+                        )
                         continue
                     # The size labels sit on a container the miner's daemon holds: the volume the
                     # rental would be granted is read from the volume plugin itself before adoption.
@@ -1276,10 +1396,13 @@ class DockerService:
                             extra=get_extra_info({**default_extra, "slot": slot.name, "volume": slot.volume_name}),
                         )
                     )
-                    return WarmPoolAdoption(slot=slot, port_maps=port_maps, image_doc=image_doc)
+                    return WarmPoolLookup(
+                        adoption=WarmPoolAdoption(slot=slot, port_maps=port_maps, image_doc=image_doc),
+                        volume_sizing=volume_sizing,
+                    )
                 reason = "no fresh slot of this image fits" if slot_docs else "no slot"
         logger.info(_m("warm_pool adopt=miss", extra=get_extra_info({**default_extra, "reason": reason})))
-        return None
+        return WarmPoolLookup(adoption=None, volume_sizing=volume_sizing)
 
     async def _warm_slot_volume_mismatch(
         self, ssh_client: asyncssh.SSHClientConnection, slot: warm_pool.WarmSlot
@@ -1406,55 +1529,10 @@ class DockerService:
                 ssh_client=ssh_client, now=now, max_age=max_age, default_extra=default_extra
             )
             for image in await self._warm_pool_images(ssh_client):
-                probe = await ssh_client.run(
-                    warm_pool.find_slots_command(image), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
+                image_doc = await self._sweep_slots_of_image(
+                    ssh_client=ssh_client, image=image, now=now, max_age=max_age, default_extra=default_extra
                 )
-                image_doc, slot_docs = warm_pool.parse_find_slots_output(probe.stdout or "")
                 if image_doc is None:
-                    continue
-                if slot_docs is None:
-                    # the slot listing was cut or unreadable: unknown is not "none" — no create
-                    logger.info(
-                        _m("warm_pool slot=skip reason=listing unreadable", extra=get_extra_info({**default_extra, "image": image}))
-                    )
-                    continue
-                image_id = image_doc.get("Id") or ""
-                fresh: list[warm_pool.WarmSlot] = []
-                for doc in slot_docs:
-                    if (doc.get("Config") or {}).get("Image") != image:
-                        continue
-                    slot = warm_pool.slot_from_inspect(doc, image_id=image_id, now=now, max_age=max_age)
-                    if slot is not None:
-                        fresh.append(slot)
-                        continue
-                    # a slot of this image that is no longer fresh: the image was re-pulled since
-                    name = (doc.get("Name") or "").lstrip("/")
-                    if name.startswith(warm_pool.WARM_CONTAINER_PREFIX):
-                        await ssh_client.run(
-                            warm_pool.remove_slot_command(
-                                name, warm_pool.slot_volume_name(warm_pool.slot_id_from_name(name))
-                            ),
-                            check=False,
-                            timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
-                        )
-                        logger.info(
-                            _m("warm_pool slot=remove reason=not fresh", extra=get_extra_info({**default_extra, "slot": name}))
-                        )
-                # one slot per image: anything beyond the newest (two fillers once raced) goes
-                fresh.sort(key=lambda s: s.created_at or datetime.min.replace(tzinfo=UTC), reverse=True)
-                for extra_slot in fresh[1:]:
-                    await ssh_client.run(
-                        warm_pool.remove_slot_command(extra_slot.name, extra_slot.volume_name),
-                        check=False,
-                        timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
-                    )
-                    logger.info(
-                        _m(
-                            "warm_pool slot=remove reason=duplicate",
-                            extra=get_extra_info({**default_extra, "slot": extra_slot.name}),
-                        )
-                    )
-                if fresh:
                     continue
                 # one slot per filler start: the create sits on the filler's response path
                 await self._create_warm_slot(
@@ -1473,6 +1551,68 @@ class DockerService:
             logger.warning(_m("warm_pool maintain failed", extra=get_extra_info({**default_extra, "error": str(exc)})))
         finally:
             self._warm_pool_maintaining.discard(executor_id)
+
+    async def _sweep_slots_of_image(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        image: str,
+        now: datetime,
+        max_age: timedelta,
+        default_extra: dict,
+    ) -> dict | None:
+        """The sweep half of one image's maintenance: remove its slots that are no longer fresh and
+        all but the newest fresh one. Returns the image's inspect when the image is left with no slot
+        — the create should follow — and None when it has one, is not on the host, or its slot
+        listing could not be read (unknown is not "none": no create)."""
+        probe = await ssh_client.run(
+            warm_pool.find_slots_command(image), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
+        )
+        found = warm_pool.parse_find_slots_output(probe.stdout or "")
+        if found.image_doc is None:
+            return None
+        if found.slot_docs is None:
+            logger.info(
+                _m("warm_pool slot=skip reason=listing unreadable", extra=get_extra_info({**default_extra, "image": image}))
+            )
+            return None
+        image_id = found.image_doc.get("Id") or ""
+        fresh: list[warm_pool.WarmSlot] = []
+        for doc in found.slot_docs:
+            if (doc.get("Config") or {}).get("Image") != image:
+                continue
+            slot = warm_pool.slot_from_inspect(doc, image_id=image_id, now=now, max_age=max_age)
+            if slot is not None:
+                fresh.append(slot)
+                continue
+            # a slot of this image that is no longer fresh: the image was re-pulled since
+            name = (doc.get("Name") or "").lstrip("/")
+            if name.startswith(warm_pool.WARM_CONTAINER_PREFIX):
+                await ssh_client.run(
+                    warm_pool.remove_slot_command(
+                        name, warm_pool.slot_volume_name(warm_pool.slot_id_from_name(name))
+                    ),
+                    check=False,
+                    timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+                )
+                logger.info(
+                    _m("warm_pool slot=remove reason=not fresh", extra=get_extra_info({**default_extra, "slot": name}))
+                )
+        # one slot per image: anything beyond the newest (two fillers once raced) goes
+        fresh.sort(key=lambda s: s.created_at or datetime.min.replace(tzinfo=UTC), reverse=True)
+        for extra_slot in fresh[1:]:
+            await ssh_client.run(
+                warm_pool.remove_slot_command(extra_slot.name, extra_slot.volume_name),
+                check=False,
+                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+            )
+            logger.info(
+                _m(
+                    "warm_pool slot=remove reason=duplicate",
+                    extra=get_extra_info({**default_extra, "slot": extra_slot.name}),
+                )
+            )
+        return None if fresh else found.image_doc
 
     async def _sweep_stale_warm_slots(
         self,
@@ -1512,20 +1652,19 @@ class DockerService:
             return []
         return [ref for ref, record in images.items() if isinstance(record, dict) and record.get("last_pull_ok_at")]
 
-    async def _create_warm_slot(
+    async def _plan_warm_slot(
         self,
         *,
         ssh_client: asyncssh.SSHClientConnection,
-        docker_client: RentalDockerSdkClient,
         executor_info: ExecutorSSHInfo,
         filler_payload: ContainerCreateRequest,
         image: str,
         image_doc: dict,
         default_extra: dict,
-    ) -> None:
-        """One slot: the rental spec for a whole-host rental of `image` with no renter input, a fresh
-        sparse volume sized as `resolve_volume_sizing` sizes a whole-host rental, all GPUs, and the
-        highest ports of the executor's range — created, never started."""
+    ) -> WarmSlotPlan | None:
+        """The sizing half of a slot create: the rental spec for a whole-host rental of `image` with
+        no renter input — all GPUs, the highest ports of the executor's range, a volume sized as
+        `resolve_volume_sizing` sizes a whole-host rental. None (logged) when the host cannot hold one."""
         slot_id = str(uuid4())
         gpu_result = await ssh_client.run(
             "nvidia-smi --query-gpu=uuid --format=csv,noheader", check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
@@ -1533,7 +1672,7 @@ class DockerService:
         gpu_uuids = [line.strip() for line in (gpu_result.stdout or "").splitlines() if line.strip().startswith("GPU-")]
         if gpu_result.exit_status != 0 or not gpu_uuids:
             logger.info(_m("warm_pool slot=skip reason=no gpus", extra=get_extra_info(default_extra)))
-            return
+            return None
         runtimes = await ssh_client.run(
             "/usr/bin/docker info --format '{{json .Runtimes}}'", check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
         )
@@ -1542,7 +1681,7 @@ class DockerService:
         all_ports = get_all_ports(executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port)
         if len(all_ports) < len(docker_ports):
             logger.info(_m("warm_pool slot=skip reason=port range too small", extra=get_extra_info(default_extra)))
-            return
+            return None
         host_ports = all_ports[-len(docker_ports) :]
         port_maps = [(d, internal, external) for d, (internal, external) in zip(docker_ports, host_ports)]
         slot_payload = ContainerCreateRequest(
@@ -1564,14 +1703,14 @@ class DockerService:
         )
         if sizing.storage_limit_gb is None or sizing.volume_limit_gb is None:
             logger.info(_m("warm_pool slot=skip reason=no sizing", extra=get_extra_info(default_extra)))
-            return
+            return None
+        volume_name = warm_pool.slot_volume_name(slot_id)
         encrypted = _should_encrypt_local_volume(
-            "slot", WorkloadKind.CUSTOMER_RENTAL, is_sysbox, True
+            volume_name, WorkloadKind.CUSTOMER_RENTAL, is_sysbox, True
         ) and ((image_doc.get("Config") or {}).get("Labels") or {}).get(_ENCRYPTED_VOLUME_IMAGE_LABEL) == "1"
         gpu_config = await build_gpu_docker_config_for_executor(
             ssh_client, gpu_uuids, executor_id=filler_payload.executor_id, default_extra=default_extra
         )
-        volume_name = warm_pool.slot_volume_name(slot_id)
         spec = self._build_rental_container_run_spec(
             payload=slot_payload,
             container_name=warm_pool.slot_name(slot_id),
@@ -1590,29 +1729,59 @@ class DockerService:
         # applied at adoption) and `docker update` cannot add a ulimit, so it gets the same memlock
         # here or every rental on such a host would miss on `ulimits`.
         spec = replace(spec, ulimits=self._memlock_ulimit_for(spec.devices, memory_gb=1))
+        return WarmSlotPlan(
+            spec=spec,
+            volume_name=volume_name,
+            volume_limit_gb=sizing.volume_limit_gb,
+            storage_limit_gb=sizing.storage_limit_gb,
+        )
+
+    async def _create_warm_slot(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_client: RentalDockerSdkClient,
+        executor_info: ExecutorSSHInfo,
+        filler_payload: ContainerCreateRequest,
+        image: str,
+        image_doc: dict,
+        default_extra: dict,
+    ) -> None:
+        """One slot of `image` (`_plan_warm_slot`): its fresh sparse volume, then the container —
+        created, never started. A create that fails half-way removes both."""
+        plan = await self._plan_warm_slot(
+            ssh_client=ssh_client,
+            executor_info=executor_info,
+            filler_payload=filler_payload,
+            image=image,
+            image_doc=image_doc,
+            default_extra=default_extra,
+        )
+        if plan is None:
+            return
         try:
             await self.create_local_volume(
                 ssh_client=ssh_client,
                 docker_client=docker_client,
-                local_volume=volume_name,
+                local_volume=plan.volume_name,
                 log_tag="warm_pool",
-                log_text=f"Creating warm pool volume {volume_name}",
+                log_text=f"Creating warm pool volume {plan.volume_name}",
                 log_extra=default_extra,
-                limit=sizing.volume_limit_gb,
+                limit=plan.volume_limit_gb,
                 sparse=True,
             )
             await docker_client.create_container(
-                spec,
+                plan.spec,
                 labels=warm_pool.slot_labels(
-                    volume_limit_gb=sizing.volume_limit_gb,
-                    storage_limit_gb=sizing.storage_limit_gb,
+                    volume_limit_gb=plan.volume_limit_gb,
+                    storage_limit_gb=plan.storage_limit_gb,
                     now=datetime.now(UTC),
                 ),
             )
         except Exception as exc:
             with contextlib.suppress(Exception):
                 await ssh_client.run(
-                    warm_pool.remove_slot_command(spec.name, volume_name),
+                    warm_pool.remove_slot_command(plan.spec.name, plan.volume_name),
                     check=False,
                     timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
                 )
@@ -1623,7 +1792,9 @@ class DockerService:
         logger.info(
             _m(
                 "warm_pool slot=create",
-                extra=get_extra_info({**default_extra, "slot": spec.name, "image": image, "volume": volume_name}),
+                extra=get_extra_info(
+                    {**default_extra, "slot": plan.spec.name, "image": image, "volume": plan.volume_name}
+                ),
             )
         )
 
@@ -4141,10 +4312,14 @@ class DockerService:
         vloopback volumes by name must leave these out: `_get_existing_vloopback_bytes` filters
         through this set; the host-probe fast path (lium-io#1332) carries the same listing as the
         `SLOT` section of its one command and filters at parse time (`_parse_volume_host_probe`).
-        Not gated on the flag: a slot left behind when the flag goes off would otherwise count again
-        for as long as it exists. A listing that fails or times out is an empty set: the sizing then
-        counts every volume, as it did before the pool, rather than falling back to the legacy
-        passthrough."""
+        With WARM_POOL_ENABLED off there is no listing and no round trip. A slot left behind by a
+        flag flip then counts until the stale-container sweep removes it (`warm_` in
+        RENTAL_CONTAINER_PREFIXES, at WARM_POOL_MAX_AGE_HOURS); the `df_guard` candidate keeps that
+        sizing inside the disk's real free space meanwhile. A listing that fails or times out is an
+        empty set: the sizing then counts every volume, as it did before the pool, rather than
+        falling back to the legacy passthrough."""
+        if not settings.WARM_POOL_ENABLED:
+            return set()
         try:
             slot_result = await ssh_client.run(
                 warm_pool.slot_volumes_command(), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
@@ -5501,9 +5676,12 @@ class DockerService:
                 # `docker run` step below, the slot container itself. Decided here from one host command,
                 # before anything is created; a miss changes nothing about the path below.
                 warm_adoption: WarmPoolAdoption | None = None
+                # the rental's volume sizing, when the lookup computed it to bound a slot: the create
+                # path reuses it on a miss instead of sizing again
+                warm_volume_sizing: RentalVolumeSizing | None = None
                 if settings.WARM_POOL_ENABLED and not local_volume:
                     current_step = "warm_pool_lookup"
-                    warm_adoption = await self._find_warm_pool_adoption(
+                    lookup = await self._find_warm_pool_adoption(
                         ssh_client=ssh_client,
                         payload=payload,
                         custom_options=custom_options,
@@ -5511,31 +5689,40 @@ class DockerService:
                         is_custom_build=is_custom_build,
                         image_managed_jupyter=image_managed_jupyter,
                         in_cvm=bool(executor_info.tdx_quote),
+                        log_tag=log_tag,
                         default_extra=default_extra,
+                        set_step=_set_current_step,
                     )
+                    warm_adoption, warm_volume_sizing = lookup.adoption, lookup.volume_sizing
                     if warm_adoption is not None:
                         local_volume = warm_adoption.slot.volume_name
                         effective_volume_limit_gb = warm_adoption.slot.volume_limit_gb
                         effective_storage_limit_gb = warm_adoption.slot.storage_limit_gb
                         port_maps = warm_adoption.port_maps
+                    # a miss that measured a slot against the rental's sizing did that sizing here,
+                    # so the step is not "skipped": its time is real and the volume step's is less
                     profilers.append(
                         ProfilerStep.since(
-                            ProfilerStepName.WARM_POOL_LOOKUP, prev_timestamp, skipped=warm_adoption is None
+                            ProfilerStepName.WARM_POOL_LOOKUP,
+                            prev_timestamp,
+                            skipped=warm_adoption is None and warm_volume_sizing is None,
                         )
                     )
                     prev_timestamp = now_ms()
 
                 if not local_volume:
-                    local_volume, effective_volume_limit_gb, effective_storage_limit_gb = (
-                        await self._size_and_create_rental_volume(
-                            ssh_client=ssh_client,
-                            docker_client=docker_client,
-                            payload=payload,
-                            log_tag=log_tag,
-                            default_extra=default_extra,
-                            set_step=_set_current_step,
-                        )
+                    created_volume = await self._size_and_create_rental_volume(
+                        ssh_client=ssh_client,
+                        docker_client=docker_client,
+                        payload=payload,
+                        log_tag=log_tag,
+                        default_extra=default_extra,
+                        set_step=_set_current_step,
+                        volume_sizing=warm_volume_sizing,
                     )
+                    local_volume = created_volume.name
+                    effective_volume_limit_gb = created_volume.volume_limit_gb
+                    effective_storage_limit_gb = created_volume.storage_limit_gb
                     created_local_volume = True
 
                     # DAH-1524: profile local volume sizing + creation on its own;
@@ -5778,16 +5965,18 @@ class DockerService:
                             created_local_volume = True
                         else:
                             warm_adoption = None
-                            local_volume, effective_volume_limit_gb, effective_storage_limit_gb = (
-                                await self._size_and_create_rental_volume(
-                                    ssh_client=ssh_client,
-                                    docker_client=docker_client,
-                                    payload=payload,
-                                    log_tag=log_tag,
-                                    default_extra=default_extra,
-                                    set_step=_set_current_step,
-                                )
+                            created_volume = await self._size_and_create_rental_volume(
+                                ssh_client=ssh_client,
+                                docker_client=docker_client,
+                                payload=payload,
+                                log_tag=log_tag,
+                                default_extra=default_extra,
+                                set_step=_set_current_step,
+                                volume_sizing=warm_volume_sizing,
                             )
+                            local_volume = created_volume.name
+                            effective_volume_limit_gb = created_volume.volume_limit_gb
+                            effective_storage_limit_gb = created_volume.storage_limit_gb
                             created_local_volume = True
                             run_spec = self._build_rental_container_run_spec(
                                 payload=payload,
@@ -6096,6 +6285,19 @@ class DockerService:
                         )
                     raise
 
+                if settings.WARM_POOL_ENABLED and payload.workload_kind == WorkloadKind.FILLER:
+                    # The node just entered idle work and this session is already on it: leave a
+                    # warm slot per pre-pulled image for the next rental. Never fails the filler.
+                    # Before the FINISHED_IN_SUBNET stamp, so its seconds are the subnet's, not the
+                    # backend's finalize span.
+                    await self._maintain_warm_pool(
+                        ssh_client=ssh_client,
+                        docker_client=docker_client,
+                        executor_info=executor_info,
+                        filler_payload=payload,
+                        default_extra=default_extra,
+                    )
+
                 # DAH-2458: final step. Stamp the subnet's wall-clock finish time onto it (in
                 # addition to its duration) so the backend derives its finalize span directly as
                 # pending_finished_at - this timestamp, instead of reconstructing the subnet's
@@ -6115,16 +6317,6 @@ class DockerService:
                         payload.executor_id,
                         payload.pod_id,
                     )
-                    if settings.WARM_POOL_ENABLED:
-                        # The node just entered idle work and this session is already on it: leave a
-                        # warm slot per pre-pulled image for the next rental. Never fails the filler.
-                        await self._maintain_warm_pool(
-                            ssh_client=ssh_client,
-                            docker_client=docker_client,
-                            executor_info=executor_info,
-                            filler_payload=payload,
-                            default_extra=default_extra,
-                        )
 
                 # DAH-1524: one structured, Loki-queryable summary of the deploy
                 # profile. Reuses the `profilers` list (now typed `ProfilerStep`s).

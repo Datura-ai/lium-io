@@ -36,14 +36,15 @@ def _make_ssh_mock(containers: list[str], ages_by_name: dict[str, int], current_
         # current time on host
         if cmd.strip() == "date +%s":
             return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
-        # docker inspect --format '{{json .Created}}' | xargs -I {} date -d {} +%s
+        # docker inspect … Created / StartedAt through `date +%s`, then RestartCount (DAH-3265):
+        # a never-started container prints docker's zero time; none of these was restarted
         if "docker inspect" in cmd and "Created" in cmd:
             # match which container
             for name in ages_by_name:
                 if name in cmd:
                     age_min = ages_by_name[name]
                     created_ts = current_ts - int(age_min * 60)
-                    return MagicMock(exit_status=0, stdout=str(created_ts), stderr="")
+                    return MagicMock(exit_status=0, stdout=f"{created_ts}\n-62135596800\n0\n", stderr="")
             return MagicMock(exit_status=1, stdout="", stderr="not found")
         # docker rm -f / docker rm -fv
         if "docker rm -f" in cmd:
@@ -187,6 +188,7 @@ async def test_cleanup_filter_includes_all_rental_prefixes():
     assert "filler_*" in ps_cmd
     assert "container_*" in ps_cmd
     assert "health_check_*" in ps_cmd
+    assert "warm_*" in ps_cmd  # DAH-3265: a warm-pool slot left behind with the flag off
 
 
 @pytest.mark.asyncio

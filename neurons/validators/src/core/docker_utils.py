@@ -81,15 +81,20 @@ class DockerCommand:
 
     @staticmethod
     def inspect_created_timestamp(container_id: str) -> str:
-        """Build docker inspect command printing the creation and last-start timestamps in seconds.
+        """Build docker inspect command printing, one per line, the creation and last-start timestamps
+        in seconds and the container's `RestartCount`.
 
-        One per line; a never-started container prints docker's zero time (year 1) for the second.
-        A warm-pool slot (speed/WARM_POOL.md) is created long before the rental that adopts it
-        starts it, so a container's age is the later of the two."""
+        A never-started container prints docker's zero time (year 1) for the second line. A warm-pool
+        slot (services/warm_pool.py) is created long before the rental that adopts it starts it, so
+        `ContainerCleanup` ages a container from its start — while the restart count is 0, which tells
+        that start from a restart-policy restart. Not gated on WARM_POOL_ENABLED: an adopted pod is
+        swept by every validator's cleanup, whatever that validator's flag says."""
+        quoted = shlex.quote(container_id)
         return (
-            f"/usr/bin/docker inspect {shlex.quote(container_id)} "
+            f"/usr/bin/docker inspect {quoted} "
             "--format '{{.Created}}{{\"\\n\"}}{{.State.StartedAt}}' | "
-            "xargs -I {} date -d {} +%s"
+            "xargs -I {} date -d {} +%s; "
+            f"/usr/bin/docker inspect {quoted} --format '{{{{.RestartCount}}}}'"
         )
 
     @staticmethod

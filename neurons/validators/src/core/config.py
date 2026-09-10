@@ -234,9 +234,10 @@ class Settings(BaseSettings):
     # Warm container pool (speed/WARM_POOL.md in the loop's docs). ON: after this validator starts a
     # filler on a node it also leaves one created-never-started `warm_<uuid>` container per image
     # the executor keeps pre-pulled, with a fresh sparse volume and the rental HostConfig; a
-    # whole-host rental of that image then adopts it (inspect → rename → start) instead of sizing
-    # and creating a volume and running a new container. Any mismatch or failure takes the path
-    # below as if the pool did not exist. OFF (default): nothing is created, nothing is adopted.
+    # whole-host rental of that image then adopts it (inspect → rename → start) instead of creating
+    # a volume and running a new container; the rental is still sized, and the slot must hold at
+    # least that. Any mismatch or failure takes the path below as if the pool did not exist.
+    # OFF (default): nothing is created, nothing is adopted.
     WARM_POOL_ENABLED: bool = Field(env="WARM_POOL_ENABLED", default=False)
     # A slot older than this is removed and recreated on the next filler start, so a node never
     # serves a container created from an image it has since re-pulled.
