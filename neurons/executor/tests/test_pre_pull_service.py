@@ -94,7 +94,7 @@ def _sweep(puller: PrePuller, entries: list[dict]) -> None:
 
 def _one_loop_iteration(monkeypatch, templates: list[dict], puller: type | None = None) -> dict:
     """Run run_cache_template_prefetch through exactly one sweep and record what it did."""
-    seen: dict = {"params": None, "ensured": [], "swept": [], "pullers": 0}
+    seen: dict = {"params": None, "ensured": [], "swept": [], "protected": [], "pullers": 0}
 
     async def fetch(session, url, params):
         seen["params"] = dict(params)
@@ -107,8 +107,9 @@ def _one_loop_iteration(monkeypatch, templates: list[dict], puller: type | None 
         def __init__(self, client, state_path=None):
             seen["pullers"] += 1
 
-        async def sweep(self, entries):
+        async def sweep(self, entries, protected=frozenset()):
             seen["swept"].append([e["docker_image_tag"] for e in entries])
+            seen["protected"].append(set(protected))
 
     async def stop(_seconds):
         raise asyncio.CancelledError
@@ -159,6 +160,8 @@ def test_a_pre_pull_entry_that_is_the_default_image_never_reaches_the_puller(mon
 
     assert seen["ensured"] == [(DEFAULT_TAG, {CU128_TAG})]
     assert seen["swept"] == [[CU128_TAG]]
+    # and the puller is told which ref is mandatory, so one it tracked earlier is untracked
+    assert seen["protected"] == [{f"{REPO}:{DEFAULT_TAG}"}]
 
 
 def test_state_is_published_before_the_sweep_can_block(monkeypatch):
@@ -176,7 +179,7 @@ def test_state_is_published_before_the_sweep_can_block(monkeypatch):
         def __init__(self, client, state_path=None):
             pass
 
-        async def sweep(self, entries):
+        async def sweep(self, entries, protected=frozenset()):
             order.append("sweep")
 
     monkeypatch.setattr(cache_template_service.CachePrefetchState, "flush", flush)
@@ -375,6 +378,22 @@ def test_disk_guard_evicts_least_recently_used_pre_pulled_image_first(quiet_node
     assert set(puller.state.images) == {"daturaai/a:1", CU128_REF}
     assert len(quiet_node) == 1
     assert any("evicted daturaai/b:1" in r.getMessage() for r in caplog.records)
+
+
+def test_disk_guard_never_evicts_a_tracked_image_that_became_the_default(quiet_node, monkeypatch):
+    # pre-pulled on an earlier sweep, then the backend made it this node's default: the mandatory
+    # path owns it now, so the disk guard must not untag it to make room for another pre-pull
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=150 * GIB))
+    client = _client()
+    puller = PrePuller(client, state_path=None)
+    default_ref = f"{REPO}:{DEFAULT_TAG}"
+    puller.state.images = {default_ref: {"digest": DIGEST_DEFAULT, "pulled_at": 50.0}}
+
+    asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], protected=frozenset({default_ref})))
+
+    client.images.remove.assert_not_called()
+    assert quiet_node == []  # insufficient disk: nothing evictable, so nothing pulled
+    assert default_ref not in puller.state.images
 
 
 def test_disk_guard_skips_the_pull_when_nothing_can_be_evicted(quiet_node, monkeypatch, caplog):

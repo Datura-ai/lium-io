@@ -181,9 +181,17 @@ class PrePuller:
         self.state = PrePullState(state_path)
         self._first_sweep = True
 
-    async def sweep(self, entries: list[dict]) -> None:
-        """Pull at most one missing ``pre_pull`` entry, if the node is idle and has room."""
+    async def sweep(self, entries: list[dict], protected: frozenset[str] = frozenset()) -> None:
+        """Pull at most one missing ``pre_pull`` entry, if the node is idle and has room.
+
+        ``protected`` are the mandatory refs (``repo:tag``) the default-image path owns this
+        sweep: a ref pre-pulled earlier that has since become this node's default is untracked
+        here so the disk guard never evicts it."""
+        for image_ref in protected & self.state.images.keys():
+            self.state.forget(image_ref)
+            logger.info(f"pre-pull: {image_ref} is now a mandatory image; no longer tracked for eviction")
         if not entries:
+            self.state.flush()
             return
         if self._first_sweep:
             self._first_sweep = False

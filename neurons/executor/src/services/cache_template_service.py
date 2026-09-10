@@ -327,9 +327,10 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                 # through the mandatory default-image path below; their tags are only
                 # shielded from its old-tag cleanup (same repository). An entry the backend
                 # marks pre_pull that is also this node's default image stays out of the
-                # pre-pull set: tracked there it would be an eviction candidate, and the
-                # default image is never removed (the backend's top-N is global, the
-                # default is per gpu_model, so the overlap is decided here).
+                # pre-pull set, and the puller is told the mandatory refs so one it tracked
+                # from an earlier sweep stops being an eviction candidate: the default image
+                # is never removed (the backend's top-N is global, the default is per
+                # gpu_model, so the overlap is decided here).
                 mandatory_refs = {
                     (data.get("docker_image"), data.get("docker_image_tag"))
                     for data in templates
@@ -353,7 +354,10 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                     # it now, not after a sweep that can wait out the start jitter and one pull.
                     state.flush()
                     try:
-                        await pre_puller.sweep(pre_pull)
+                        await pre_puller.sweep(
+                            pre_pull,
+                            protected=frozenset(f"{repo}:{tag}" for repo, tag in mandatory_refs if repo and tag),
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
