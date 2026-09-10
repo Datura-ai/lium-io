@@ -188,6 +188,7 @@ def rental_run_spec_log_fields(run_spec: ContainerRunSpec) -> dict:
         ],
         "restart_policy": run_spec.restart_policy,
         "runtime": run_spec.runtime,
+        "network": run_spec.network,
         "cap_add": list(run_spec.cap_add),
         "sysctls": run_spec.sysctls,
         "device_mounts": [

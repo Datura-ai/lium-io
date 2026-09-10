@@ -12,7 +12,6 @@ import bittensor
 import numpy as np
 from bittensor.utils.weight_utils import process_weights_for_netuid
 from pydantic import BaseModel, Field, ValidationError
-from websockets.protocol import State as WebSocketClientState
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
 from core.config import settings

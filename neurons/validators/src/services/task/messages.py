@@ -9,6 +9,13 @@ if TYPE_CHECKING:  # pragma: no cover
     from .pipeline import Context
 
 
+# Where every failing verdict sends the provider when its template names no page of its
+# own: the docs table that lists each reason code with its cause and fix. The miner portal
+# renders `help_uri` as the "Learn more" link on the node's error panel.
+REASON_CODE_DOCS_URL = "https://docs.lium.io/providers/troubleshooting#6-validator-reason-codes"
+_HELP_URI_SEVERITIES = frozenset({"error", "warning"})
+
+
 @dataclass(frozen=True)
 class MessageTemplate:
     event: str
@@ -34,10 +41,14 @@ def render_message(
     extra: dict[str, Any] | None = None,
 ) -> Any:
     """Render a `MessageTemplate` into a structured message via `build_msg`."""
+    resolved_severity = severity or template.severity
+    resolved_help_uri = help_uri or template.help_uri
+    if resolved_help_uri is None and resolved_severity in _HELP_URI_SEVERITIES:
+        resolved_help_uri = REASON_CODE_DOCS_URL
     return build_msg(
         event=template.event,
         reason=template.reason,
-        severity=severity or template.severity,
+        severity=resolved_severity,
         category=category or template.category,
         impact=impact or template.impact,
         remediation=(remediation if remediation is not None else template.remediation) or "",
@@ -45,7 +56,7 @@ def render_message(
         check_id=check_id,
         pipeline_id=ctx.pipeline_id,
         ctx={**ctx.default_extra, **(extra or {})},
-        help_uri=help_uri or template.help_uri,
+        help_uri=resolved_help_uri,
     )
 
 
