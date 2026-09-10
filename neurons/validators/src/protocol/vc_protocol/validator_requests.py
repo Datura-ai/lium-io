@@ -146,6 +146,12 @@ class ResetVerifiedJobRequest(BaseValidatorRequest):
     miner_hotkey: str
     executor_uuid: str
     reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
+    # DAH-3386: the check that cleared the verified job (its event reason_code and check_id) and what it saw —
+    # for POD_NOT_RUNNING the container's status, exit code, OOM flag and finish time. The backend writes them
+    # into the penalty it raises (lium-platform DAH-3385 details.evidence.validator). Optional both ways.
+    reason_code: str | None = None
+    check_id: str | None = None
+    evidence: dict | None = None
 
 
 class DuplicateExecutorsRequest(BaseValidatorRequest):

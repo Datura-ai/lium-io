@@ -306,6 +306,7 @@ class ResultHandler:
                     executor_id=executor_id,
                     prev_info=verified_job_info,
                     reason=reason,
+                    evidence=context.clear_verified_job_evidence,
                 )
             else:
                 await self.redis_service.set_verified_job_info(

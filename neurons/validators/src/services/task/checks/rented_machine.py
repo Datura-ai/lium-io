@@ -347,6 +347,15 @@ class TenantEnforcementCheck:
                     "default_extra": extra,
                     "clear_verified_job_info": True,
                     "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
+                    # DAH-3386: the backend's penalty row shows why the container was not running — a renter's
+                    # entrypoint exiting with its own code and a host that lost the container look different here.
+                    "clear_verified_job_evidence": {
+                        "reason_code": event.reason_code,
+                        "check_id": self.check_id,
+                        "pod_id": pod_id,
+                        "container_name": container_name,
+                        "container": _penalty_evidence_from_diagnostics(diagnostics),
+                    },
                 },
             ),
             ssh_pub_keys=[],
@@ -473,6 +482,26 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
         ssh_keys = []
 
     return pod_running, ssh_keys
+
+
+# The diagnostics fields that decide whether a not-running container is the provider's fault (host lost the
+# container or it never came back after a reboot) or the workload's own exit (the renter's entrypoint returned,
+# the process was OOM-killed inside the tenant's ceiling). Logs and host context stay in Loki.
+_PENALTY_EVIDENCE_FIELDS = (
+    "container_status",
+    "container_exit_code",
+    "container_oom_killed",
+    "container_error",
+    "container_started_at",
+    "container_finished_at",
+    "container_missing",
+    "diagnostics_capture_error",
+)
+
+
+def _penalty_evidence_from_diagnostics(diagnostics: dict[str, object]) -> dict[str, object]:
+    """The subset of a pod's death diagnostics that travels with the reset to the backend (DAH-3386)."""
+    return {key: diagnostics.get(key) for key in _PENALTY_EVIDENCE_FIELDS if key in diagnostics}
 
 
 async def _collect_pod_diagnostics(
