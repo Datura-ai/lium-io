@@ -499,9 +499,33 @@ _PENALTY_EVIDENCE_FIELDS = (
 )
 
 
+# Every value came from the provider's host (`docker inspect` stdout/stderr); the backend writes the dict into a
+# JSONB row and a log line, so each one is typed and bounded here (PR_PROCESS §5 bounded input).
+_PENALTY_EVIDENCE_STR_MAX = 256
+
+
 def _penalty_evidence_from_diagnostics(diagnostics: dict[str, object]) -> dict[str, object]:
-    """The subset of a pod's death diagnostics that travels with the reset to the backend (DAH-3386)."""
-    return {key: diagnostics.get(key) for key in _PENALTY_EVIDENCE_FIELDS if key in diagnostics}
+    """The subset of a pod's death diagnostics that travels with the reset to the backend (DAH-3386).
+
+    Strings are cut to _PENALTY_EVIDENCE_STR_MAX, `container_exit_code` is kept only as an int, the two flags only
+    as bools; anything else the host answered is dropped rather than forwarded.
+    """
+    evidence: dict[str, object] = {}
+    for key in _PENALTY_EVIDENCE_FIELDS:
+        if key not in diagnostics:
+            continue
+        value = diagnostics[key]
+        if key == "container_exit_code":
+            if isinstance(value, int) and not isinstance(value, bool):
+                evidence[key] = value
+        elif key in ("container_oom_killed", "container_missing"):
+            if isinstance(value, bool):
+                evidence[key] = value
+        elif isinstance(value, str):
+            evidence[key] = value[:_PENALTY_EVIDENCE_STR_MAX]
+        elif value is None:
+            evidence[key] = None
+    return evidence
 
 
 async def _collect_pod_diagnostics(
