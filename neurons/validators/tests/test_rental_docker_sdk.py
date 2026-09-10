@@ -8,12 +8,15 @@ from unittest.mock import Mock
 
 import pytest
 from docker import auth as docker_auth
-from docker.errors import APIError
+from docker.errors import APIError, NotFound
 from docker.types import ContainerConfig
 
 import services.rental_docker_sdk as rental_docker_sdk
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.rental_docker_sdk import (
+    RENTAL_NETWORK_ICC_OPTION,
+    RENTAL_NETWORK_LABELS,
+    RENTAL_NETWORK_NAME,
     ContainerExecSpec,
     ContainerRunSpec,
     DeviceMount,
@@ -48,6 +51,11 @@ CGROUP_OCI_EXEC_ERROR = (
     "to cgroups caused: failed to write 123: openat2 "
     "/sys/fs/cgroup/init.scope (deleted)/cgroup.procs: no such file or directory\r\n"
 )
+
+
+def _bridge_network(options: dict | None) -> dict:
+    """The part of `docker network inspect` the SDK reads: driver and the options it was created with."""
+    return {"Name": RENTAL_NETWORK_NAME, "Driver": "bridge", "Options": dict(options or {})}
 
 
 def _container_state(
@@ -92,12 +100,35 @@ class FakeApiClient:
         self.pruned_images = False
         self.created_volumes = []
         self.removed_volumes = []
+        self.networks = {}  # name -> what inspect_network returns
+        self.created_networks = []
+        self.inspect_network_error = None  # raised by inspect_network instead of answering
+        self.create_network_error = None  # raised by create_network
+        self.lose_create_race = False  # with create_network_error: the network exists anyway (another create won)
         self.timeout = 60
         self.closed = False
 
     def create_host_config(self, **kwargs):
         self.host_config_kwargs = kwargs
         return {"host_config": True}
+
+    def inspect_network(self, net_id, **_kwargs):
+        self.events.append("inspect_network")
+        if self.inspect_network_error is not None:
+            raise self.inspect_network_error
+        if net_id not in self.networks:
+            raise NotFound(f"network {net_id} not found")
+        return self.networks[net_id]
+
+    def create_network(self, name, **kwargs):
+        self.events.append("create_network")
+        self.created_networks.append({"name": name, **kwargs})
+        if self.create_network_error is not None:
+            if self.lose_create_race:
+                self.networks[name] = _bridge_network(kwargs.get("options"))
+            raise self.create_network_error
+        self.networks[name] = _bridge_network(kwargs.get("options"))
+        return {"Id": "network-id"}
 
     def login(self, **kwargs):
         self.login_calls.append(kwargs)
@@ -111,10 +142,12 @@ class FakeApiClient:
         return {"Id": "image-id"}
 
     def create_container(self, **kwargs):
+        self.events.append("create_container")
         self.created_container = kwargs
         return {"Id": "container-id"}
 
     def start(self, container_name):
+        self.events.append("start")
         self.started.append(container_name)
 
     def stop(self, container_name, timeout=None):
@@ -545,6 +578,134 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
     assert api_client.host_config_kwargs["mem_limit"] == "8g"
     assert api_client.host_config_kwargs["storage_opt"] == {"size": "20g"}
     assert api_client.started == ["pod_test"]
+
+
+# --- DAH-3199: a rental joins the ICC-off bridge, never docker0 ---
+
+
+def _rental_spec(network: str | None = RENTAL_NETWORK_NAME) -> ContainerRunSpec:
+    return ContainerRunSpec(image="registry.example/app:tag", name="pod_test", network=network)
+
+
+@pytest.mark.asyncio
+async def test_run_container_creates_the_icc_off_network_before_the_container():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    await client.run_container(_rental_spec())
+
+    # on a host that has never seen a rental the network is created first, then the container joins it
+    assert api_client.events == ["inspect_network", "create_network", "inspect_network", "create_container", "start"]
+    assert api_client.created_networks == [
+        {
+            "name": RENTAL_NETWORK_NAME,
+            "driver": "bridge",
+            "options": {RENTAL_NETWORK_ICC_OPTION: "false"},
+            "labels": RENTAL_NETWORK_LABELS,
+        }
+    ]
+    assert api_client.host_config_kwargs["network_mode"] == RENTAL_NETWORK_NAME
+
+
+@pytest.mark.asyncio
+async def test_run_container_reuses_the_existing_icc_off_network():
+    api_client = FakeApiClient()
+    api_client.networks[RENTAL_NETWORK_NAME] = _bridge_network({RENTAL_NETWORK_ICC_OPTION: "false"})
+    client = RentalDockerSdkClient(api_client)
+
+    await client.run_container(_rental_spec())
+
+    assert api_client.events == ["inspect_network", "create_container", "start"]
+    assert api_client.created_networks == []
+    assert api_client.host_config_kwargs["network_mode"] == RENTAL_NETWORK_NAME
+
+
+@pytest.mark.asyncio
+async def test_run_container_tolerates_losing_the_create_race_for_the_network():
+    api_client = FakeApiClient()
+    api_client.create_network_error = APIError(
+        f'409 Client Error: Conflict ("network with name {RENTAL_NETWORK_NAME} already exists")'
+    )
+    api_client.lose_create_race = True
+    client = RentalDockerSdkClient(api_client)
+
+    await client.run_container(_rental_spec())
+
+    # the second inspect finds the network the other create made, and the rental goes ahead on it
+    assert api_client.events == ["inspect_network", "create_network", "inspect_network", "create_container", "start"]
+    assert api_client.host_config_kwargs["network_mode"] == RENTAL_NETWORK_NAME
+
+
+@pytest.mark.asyncio
+async def test_run_container_surfaces_a_real_create_network_failure_and_starts_nothing():
+    api_client = FakeApiClient()
+    api_client.create_network_error = APIError(
+        '500 Server Error: Internal Server Error ("could not find an available, non-overlapping IPv4 address pool")'
+    )
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match=f"create network {RENTAL_NETWORK_NAME} failed.*address pool"):
+        await client.run_container(_rental_spec())
+
+    # not a lost race: the second inspect still finds nothing, so the daemon's error is the answer
+    assert api_client.events == ["inspect_network", "create_network", "inspect_network"]
+    assert api_client.created_container is None
+    assert api_client.started == []
+
+
+@pytest.mark.asyncio
+async def test_run_container_propagates_an_inspect_network_error_instead_of_creating():
+    api_client = FakeApiClient()
+    api_client.inspect_network_error = APIError("500 Server Error: Internal Server Error (\"daemon busy\")")
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="daemon busy"):
+        await client.run_container(_rental_spec())
+
+    # only a 404 means "absent"; any other answer is not a reason to create or to run
+    assert api_client.events == ["inspect_network"]
+    assert api_client.created_networks == []
+    assert api_client.created_container is None
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        pytest.param({"Name": RENTAL_NETWORK_NAME, "Driver": "bridge", "Options": {}}, id="icc-left-on"),
+        pytest.param(
+            {"Name": RENTAL_NETWORK_NAME, "Driver": "bridge", "Options": {RENTAL_NETWORK_ICC_OPTION: "true"}},
+            id="icc-explicitly-on",
+        ),
+        pytest.param(
+            {"Name": RENTAL_NETWORK_NAME, "Driver": "macvlan", "Options": {RENTAL_NETWORK_ICC_OPTION: "false"}},
+            id="not-a-bridge",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_container_refuses_a_same_named_network_that_does_not_isolate(existing):
+    api_client = FakeApiClient()
+    api_client.networks[RENTAL_NETWORK_NAME] = existing
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match=f"{RENTAL_NETWORK_ICC_OPTION}=false"):
+        await client.run_container(_rental_spec())
+
+    # fail closed: no container is created on a network that would let co-tenants talk
+    assert api_client.created_container is None
+    assert api_client.started == []
+
+
+@pytest.mark.asyncio
+async def test_run_container_without_a_network_stays_on_the_default_bridge():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    await client.run_container(_rental_spec(network=None))
+
+    # the CVM quote broker and other helper containers keep the daemon default; no network calls at all
+    assert api_client.events == ["create_container", "start"]
+    assert "network_mode" not in api_client.host_config_kwargs
 
 
 @pytest.mark.asyncio

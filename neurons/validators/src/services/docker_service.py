@@ -109,6 +109,7 @@ from services.rental_docker_sdk import (
     ContainerUlimit,
     DeviceMount,
     PortBinding,
+    RENTAL_NETWORK_NAME,
     RentalDockerConnectionError,
     RentalDockerOperationError,
     RentalDockerSdkClient,
@@ -1141,6 +1142,7 @@ class DockerService:
             storage_limit_gb=effective_storage_limit_gb,
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
+            network=RENTAL_NETWORK_NAME,
         )
 
     async def _ensure_pod_quote_socket(
