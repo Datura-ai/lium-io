@@ -427,6 +427,7 @@ check_sysbox() {
         pf_fix "sysbox-runc is not installed — validators reject a node without it." "$(self_cmd)"
         return 1
     fi
+    docker ps &>/dev/null || { pf_skip "sysbox-runc — Docker is not running."; return 0; }
     if ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q sysbox-runc; then
         pf_fix "sysbox-runc is installed but not registered in Docker's runtimes." \
             "$(self_cmd)   # writes the runtime into /etc/docker/daemon.json and restarts Docker"
@@ -512,7 +513,8 @@ if [ -n "$CHECK_MODE_OPTION" ]; then
         preflight_stack
     fi
     preflight_summary && exit 0
-    echo "  Fix the lines above, then run: $(self_cmd)"
+    # every FIX line above carries its own command; the installer is one of them, never all of them
+    echo "  Fix the lines above, then re-run: $(self_cmd "$CHECK_MODE_OPTION")"
     exit 1
 fi
 

@@ -561,6 +561,14 @@ def test_sysbox_not_registered_in_docker_is_a_fix(tmp_path):
     assert "FIX  sysbox-runc is installed but not registered" in out
 
 
+def test_sysbox_is_skipped_when_docker_is_not_running(tmp_path):
+    # a failed `docker info` says nothing about the runtime registration
+    rc, out, _ = run_check(tmp_path, "check_sysbox", env={"STUB_NO_DOCKER_DAEMON": "1"})
+    assert rc == 0
+    assert "SKIP sysbox-runc — Docker is not running." in out
+    assert "not registered" not in out
+
+
 def test_sysbox_container_start_failure_is_a_fix(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_sysbox", env={"STUB_SYSBOX_RUN_FAILS": "1"})
     assert rc == 1
@@ -586,7 +594,7 @@ def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_pat
     assert "SKIP Disk >= 1.5x VRAM" in proc.stdout
     assert "PASS Kernel 6.8.0-45-generic" in proc.stdout
     assert "Preflight: 9 PASS, 2 FIX, 1 SKIP." in proc.stdout
-    assert f"Fix the lines above, then run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'}" in proc.stdout
+    assert f"Fix the lines above, then re-run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
 
 
 @pytest.mark.parametrize(
@@ -656,6 +664,9 @@ def test_check_mode_still_exits_one_on_an_advisory_fix(tmp_path):
     assert "FIX  NVIDIA driver 575.57.08 is below 580.65.06" in proc.stdout
     assert "Preflight: 11 PASS, 1 FIX, 0 SKIP." in proc.stdout
     assert "do not stop the install" not in proc.stdout
+    # the installer never installs a driver: pointing at it is the reinstall loop of ticket-0309
+    script = tmp_path / "executor" / "nvidia_docker_sysbox_setup.sh"
+    assert f"Fix the lines above, then re-run: sudo bash {script} --check" in proc.stdout
 
 
 @pytest.mark.parametrize("args", [("--check",), ()])
