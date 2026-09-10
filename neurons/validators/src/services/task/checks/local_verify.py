@@ -33,8 +33,17 @@ from services.local_verify_client import (
     build_intent,
     executor_deadline_s,
 )
-from services.matrix_validation_service import MATRIX_VERIFY_TIMEOUT_SECONDS
-from services.verifyx_validation_service import VERIFYX_COMMAND_TIMEOUT_SECONDS, SSHCapture
+from services.matrix_validation_service import (
+    MATRIX_VERIFY_TIMEOUT_SECONDS,
+    MatmulChallenge,
+    ValidationResult,
+)
+from services.verifyx_validation_service import (
+    VERIFYX_COMMAND_TIMEOUT_SECONDS,
+    SSHCapture,
+    VerifyXChallenge,
+    VerifyXResponse,
+)
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -71,14 +80,22 @@ def _over_time(name: str, answer: LocalVerifyAnswer) -> bool:
     return answer.round_trip_ms > STEP_WALL_CLOCK_CAP_MS[name]
 
 
+class _NothingToSend(Exception):
+    """The challenges could not be built on our side; the check falls back with this reason."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
 @dataclass
 class LocalVerifyOutcome:
     """What the consuming checks read. A field is set only when the local step ran AND passed the
     validator's judgement; None means "run it over SSH"."""
 
-    matmul: Any | None = None  # matrix_validation_service.ValidationResult
-    verifyx: Any | None = None  # verifyx_validation_service.VerifyXResponse
-    facts: dict[str, Any] = field(default_factory=dict)  # docker / ports / inspector evidence
+    matmul: ValidationResult | None = None
+    verifyx: VerifyXResponse | None = None
     round_trip_ms: int = 0
     executor_elapsed_ms: int = 0
     executor_version: str = ""
@@ -147,71 +164,91 @@ class LocalVerifyCheck:
                 ),
             )
 
-        # The same challenges the SSH checks would build, sized the same way (DAH-3011 first pass).
-        first_pass = ctx.config.first_pass
-        matmul_challenge = None
-        verifyx_challenge = None
         try:
-            try:
-                if not matmul_on_ssh:
-                    matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
-                        specs,
-                        ctx.default_extra,
-                        vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB if first_pass else None,
-                    )
-                if ctx.config.verifyx_enabled:
-                    verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
-                        specs,
-                        ctx.default_extra,
-                        challenge_config_overrides=_first_pass_challenge_config()
-                        if first_pass
-                        else None,
-                    )
-            except Exception as exc:  # a native library error is ours, not the node's
-                return self._fallback(ctx, "call", "prepare_failed", f"{type(exc).__name__}: {exc}")
-
-            if matmul_challenge is not None and not matmul_challenge.params.cipher_text:
-                # Our own native error (the SSH path reports it the same way); nothing to send.
-                return self._fallback(
-                    ctx, "call", "cipher_generation_failed", "matmul cipher text is empty"
-                )
-
-            matmul_step = None
-            if matmul_challenge is not None:
-                params = matmul_challenge.params
-                matmul_step = {
-                    "dim_n": params.dim_n,
-                    "dim_k": params.dim_k,
-                    "seed": params.seed,
-                    "cipher_text": params.cipher_text,
-                }
-            intent = build_intent(
-                executor_uuid=ctx.executor.uuid,
-                matmul=matmul_step,
-                verifyx=(
-                    {"seed": verifyx_challenge.seed, "cipher_text": verifyx_challenge.cipher_text}
-                    if verifyx_challenge is not None
-                    else None
-                ),
-                # Side by side only at first-pass sizes: a full-size VerifyX beside the matmul OOMs
-                # 64–128 GB hosts (SWEEP_provider_verify §3 #6).
-                parallel_gpu=first_pass,
-                # Shorter than the client's whole-call timeout by a margin, so an answer the
-                # executor cut at its deadline (`deadline_hit`, finished steps inside) still arrives
-                # before the client gives up and is consumed step by step.
-                deadline_s=executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS),
+            matmul_challenge, verifyx_challenge = self._prepare_challenges(
+                ctx, specs, matmul_on_ssh=matmul_on_ssh
             )
-
-            try:
-                answer = await client.verify(ctx.executor, intent)
-            except LocalVerifyUnavailable as exc:
-                return self._fallback(ctx, "call", exc.reason, exc.detail)
-
-            outcome = self._judge(ctx, answer, matmul_challenge, verifyx_challenge)
+        except _NothingToSend as exc:
+            return self._fallback(ctx, "call", exc.reason, exc.detail)
+        try:
+            return await self._call_and_judge(ctx, client, matmul_challenge, verifyx_challenge)
         finally:
             if matmul_challenge is not None:
                 matmul_challenge.close()
 
+    def _prepare_challenges(
+        self, ctx: Context, specs: dict, *, matmul_on_ssh: bool
+    ) -> tuple[MatmulChallenge | None, VerifyXChallenge | None]:
+        """The same challenges the SSH checks would build, sized the same way (DAH-3011 first pass).
+        Raises _NothingToSend when they cannot be built; a matmul challenge built by then is closed."""
+        first_pass = ctx.config.first_pass
+        matmul_challenge = None
+        verifyx_challenge = None
+        try:
+            if not matmul_on_ssh:
+                matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
+                    specs,
+                    ctx.default_extra,
+                    vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB if first_pass else None,
+                )
+            if ctx.config.verifyx_enabled:
+                verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
+                    specs,
+                    ctx.default_extra,
+                    challenge_config_overrides=(
+                        _first_pass_challenge_config() if first_pass else None
+                    ),
+                )
+        except Exception as exc:  # a native library error is ours, not the node's
+            if matmul_challenge is not None:
+                matmul_challenge.close()
+            raise _NothingToSend("prepare_failed", f"{type(exc).__name__}: {exc}") from exc
+        if matmul_challenge is not None and not matmul_challenge.params.cipher_text:
+            # Our own native error (the SSH path reports it the same way); nothing to send.
+            matmul_challenge.close()
+            raise _NothingToSend("cipher_generation_failed", "matmul cipher text is empty")
+        return matmul_challenge, verifyx_challenge
+
+    async def _call_and_judge(
+        self,
+        ctx: Context,
+        client: LocalVerifyClient,
+        matmul_challenge: MatmulChallenge | None,
+        verifyx_challenge: VerifyXChallenge | None,
+    ) -> CheckResult:
+        first_pass = ctx.config.first_pass
+        matmul_step = None
+        if matmul_challenge is not None:
+            params = matmul_challenge.params
+            matmul_step = {
+                "dim_n": params.dim_n,
+                "dim_k": params.dim_k,
+                "seed": params.seed,
+                "cipher_text": params.cipher_text,
+            }
+        intent = build_intent(
+            executor_uuid=ctx.executor.uuid,
+            matmul=matmul_step,
+            verifyx=(
+                {"seed": verifyx_challenge.seed, "cipher_text": verifyx_challenge.cipher_text}
+                if verifyx_challenge is not None
+                else None
+            ),
+            # Side by side only at first-pass sizes: a full-size VerifyX beside the matmul OOMs
+            # 64–128 GB hosts (SWEEP_provider_verify §3 #6).
+            parallel_gpu=first_pass,
+            # Shorter than the client's whole-call timeout by a margin, so an answer the
+            # executor cut at its deadline (`deadline_hit`, finished steps inside) still arrives
+            # before the client gives up and is consumed step by step.
+            deadline_s=executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS),
+        )
+
+        try:
+            answer = await client.verify(ctx.executor, intent)
+        except LocalVerifyUnavailable as exc:
+            return self._fallback(ctx, "call", exc.reason, exc.detail)
+
+        outcome = self._judge(ctx, answer, matmul_challenge, verifyx_challenge)
         what = {
             "round_trip_ms": outcome.round_trip_ms,
             "executor_elapsed_ms": outcome.executor_elapsed_ms,
@@ -231,7 +268,11 @@ class LocalVerifyCheck:
         )
 
     def _judge(
-        self, ctx: Context, answer: LocalVerifyAnswer, matmul_challenge, verifyx_challenge
+        self,
+        ctx: Context,
+        answer: LocalVerifyAnswer,
+        matmul_challenge: MatmulChallenge | None,
+        verifyx_challenge: VerifyXChallenge | None,
     ) -> LocalVerifyOutcome:
         outcome = LocalVerifyOutcome(
             round_trip_ms=answer.round_trip_ms,
@@ -268,11 +309,6 @@ class LocalVerifyCheck:
                 self._metric(
                     ctx, "fallback", "matmul", "local_failed", detail=result.error_message, **common
                 )
-
-        for name in ("docker", "ports", "inspector"):
-            fact = answer.step(name)
-            if fact.status == "ok":
-                outcome.facts[name] = fact.data
 
         if verifyx_challenge is None:
             return outcome
