@@ -17,8 +17,9 @@ start — is a *miss*, logged with its reason, and the rental takes the path tha
 
 Trust: the validator created the slot, but the miner owns the daemon in between. Adoption
 therefore never trusts the slot's labels alone; it compares the live `docker inspect` output
-against the spec it would use now (image id, mounts, ports, devices, GPU requests, runtime,
-network, capabilities, sysctls, ulimits, restart policy, storage-opt, env, cmd, entrypoint) and requires
+against the spec it would use now (image id, mounts and tmpfs, ports, devices, GPU requests, runtime,
+network, namespaces, capabilities, sysctls, ulimits, cgroup limits, restart policy, storage-opt, env,
+cmd, entrypoint) and requires
 `State.Status == created` with a zero `StartedAt` — a container that ever ran is not a slot. The
 slot's volume is inspected as well (`volume_mismatch`): the size the rental is granted is the one
 the volume plugin recorded, never the label alone.
@@ -415,8 +416,13 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
         return "privileged"
     if (host.get("PidMode") or "") or (host.get("IpcMode") or "private") not in ("", "private", "shareable"):
         return "namespace mode"
-    if host.get("UsernsMode"):
+    if host.get("UsernsMode") or host.get("UTSMode"):
         return "namespace mode"
+    # `--tmpfs` is recorded only in HostConfig.Tmpfs — it never appears in `.Mounts` — so a slot
+    # with a tmpfs over the renter's data path would pass the mount checks above; `--mount` lands
+    # in HostConfig.Mounts (the spec mounts through Binds only).
+    if host.get("Tmpfs") or host.get("Mounts"):
+        return "tmpfs or mount"
     # The slot sits on the network the rental would run on — the ICC-off `lium-rentals` bridge
     # (DAH-3199, `spec.network`); a slot on docker0 or `host` would put the pod back on the network
     # that bridge exists to end. A spec without a network expects dockerd's default bridge.
@@ -444,6 +450,32 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
             "DnsOptions",
             "DnsSearch",
             "OomScoreAdj",
+            "AutoRemove",
+            "VolumeDriver",
+            "Cgroup",
+            # OCI annotations go straight to the runtime (runc reads `org.systemd.property.*` as
+            # cgroup unit properties) and are omitted from the document when empty
+            "Annotations",
+            # cgroup limits the spec never sets and `docker update --cpus/--memory` at adoption
+            # does not reset: a slot pinned to one core or capped on pids would throttle the renter
+            "CpuShares",
+            "CpuPeriod",
+            "CpuQuota",
+            "CpuRealtimePeriod",
+            "CpuRealtimeRuntime",
+            "CpusetCpus",
+            "CpusetMems",
+            "MemoryReservation",
+            "MemorySwap",
+            "KernelMemory",
+            "PidsLimit",
+            "BlkioWeight",
+            "BlkioWeightDevice",
+            "BlkioDeviceReadBps",
+            "BlkioDeviceWriteBps",
+            "BlkioDeviceReadIOps",
+            "BlkioDeviceWriteIOps",
+            "OomKillDisable",
         )
     ):
         return "extra host config"
