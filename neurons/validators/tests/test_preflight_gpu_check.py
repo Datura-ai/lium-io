@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import pytest
-
 from preflight.base import CheckStatus
 from preflight.checks import gpu_check as gpu_check_module
 from preflight.checks.gpu_check import GPUCheck
 from preflight.main import create_default_context
+
+from services import gpu_spec_table
 
 
 def _gpu_info(gpu_model: str, gpu_count: int = 1) -> dict:
@@ -70,3 +71,15 @@ async def test_gpu_check_still_refuses_an_unknown_model(monkeypatch):
 
     assert result.status == CheckStatus.FAILED
     assert result.message.startswith("GPU model 'NVIDIA A10Z' is not supported.")
+
+
+@pytest.mark.asyncio
+async def test_gpu_check_refusal_names_the_nvml_spelling_not_the_canonical_one(monkeypatch):
+    # An alias whose canonical model is not rated: the provider reads the name nvidia-smi shows.
+    monkeypatch.setitem(
+        gpu_spec_table.NORMALIZATION_MAP, "NVIDIA Probe X", "NVIDIA Probe X Tensor Core GPU"
+    )
+    result = await _run(monkeypatch, "NVIDIA Probe X")
+
+    assert result.status == CheckStatus.FAILED
+    assert result.message.startswith("GPU model 'NVIDIA Probe X' is not supported.")
