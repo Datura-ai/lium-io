@@ -433,13 +433,18 @@ def remove_slot_command(container_name: str, volume_name: str) -> str:
     )
 
 
-def slot_volumes_command() -> str:
+def slot_volumes_command(*, tag: str | None = None) -> str:
     """The volume name of every created slot on the host, one per line — `resolve_volume_sizing`
-    leaves them out of the declared-size sum, since a sparse slot volume holds no bytes yet."""
+    leaves them out of the declared-size sum, since a sparse slot volume holds no bytes yet.
+    With `tag`, each line is `<tag>\\t<name>`, so the listing can be one section of a larger
+    probe command (the volume host probe, lium-io#1332) whose parser reads tagged records."""
+    # `docker inspect --format` parses the template as-is (no `\t` → tab pass, unlike `docker ps`),
+    # so the tab is a template action, as the newline already is
+    prefix = f'{tag}{{{{"\\t"}}}}' if tag else ""
     return (
         f"/usr/bin/docker ps -aq --filter label={WARM_POOL_LABEL}=1 --filter status=created "
         "| xargs -r /usr/bin/docker inspect --format "
-        '\'{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\\n"}}{{end}}{{end}}\''
+        f'\'{{{{range .Mounts}}}}{{{{if eq .Type "volume"}}}}{prefix}{{{{.Name}}}}{{{{"\\n"}}}}{{{{end}}}}{{{{end}}}}\''
     )
 
 

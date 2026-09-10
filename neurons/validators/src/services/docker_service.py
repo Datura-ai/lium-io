@@ -399,15 +399,18 @@ class VolumeHostProbe:
 
     docker_root_dir: str
     df_avail_bytes: int | None          # None when the probe was asked not to measure df
-    vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
+    vloopback_volume_names: list[str]   # names only, warm-pool slot volumes left out; sizes still need `docker volume inspect`
     loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true
+    warm_slot_volume_names: list[str] = field(default_factory=list)  # the slot volumes the probe left out
 
 
 def _volume_host_probe_command(*, with_df: bool) -> str:
     """One shell line: DockerRootDir, (optionally) df through the helper container, the volume
-    list and the loopback plugin state, each output line tagged so the parser never guesses.
-    Sections are joined with `;` — a failing section leaves its tag out (the volume list, whose
-    empty output is legitimate, is followed by a `VOLS\\t<exit status>` line) and the parser raises."""
+    list, the warm-pool slot volumes and the loopback plugin state, each output line tagged so the
+    parser never guesses. Sections are joined with `;` — a failing section leaves its tag out (the
+    volume list, whose empty output is legitimate, is followed by a `VOLS\\t<exit status>` line)
+    and the parser raises; a failed slot listing leaves no `SLOT` line, so every volume counts,
+    as it did before the pool (`_warm_slot_volume_names` does the same on the per-command path)."""
     df_cmd = df_command('"$root"')
     df_part = (
         # df prints two lines; fold them onto one tagged line (\n → \r) so every record stays one line
@@ -421,6 +424,9 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
         f"{df_part}"
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
         "printf 'VOLS\\t%s\\n' \"$?\"; "
+        # DAH-3265: the warm-pool slots' volumes, so the sizing sum leaves them out (one command,
+        # not a second probe)
+        f"{warm_pool.slot_volumes_command(tag='SLOT')}; "
         # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
         # so only the last line is the state: true / false / absent
         "printf 'PLUGIN\\t%s\\n' \"$( (/usr/bin/docker plugin inspect --format '{{.Enabled}}' "
@@ -432,6 +438,7 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
     docker_root_dir: str | None = None
     df_avail_bytes: int | None = None
     volume_names: list[str] = []
+    slot_volume_names: set[str] = set()
     volume_ls_status: str | None = None
     plugin_state: str | None = None
     # the echoed output is host-controlled: cap what reaches the log
@@ -453,6 +460,9 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
                 volume_names.append(name)
         elif tag == "VOLS":
             volume_ls_status = rest.strip()
+        elif tag == "SLOT":
+            if rest.strip():
+                slot_volume_names.add(rest.strip())
         elif tag == "PLUGIN":
             plugin_state = rest.strip()
     if not docker_root_dir:
@@ -465,11 +475,14 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
         raise Exception(f"volume host probe: docker volume ls exit status {volume_ls_status!r} in {shown!r}")
     if plugin_state is None:
         raise Exception(f"volume host probe: no plugin state in {shown!r}")
+    # a slot's sparse volume declares a whole-host size and holds no bytes: summing it would
+    # inflate the pool every later sizing sees (the per-command path filters the same way)
     return VolumeHostProbe(
         docker_root_dir=docker_root_dir,
         df_avail_bytes=df_avail_bytes,
-        vloopback_volume_names=volume_names,
+        vloopback_volume_names=[name for name in volume_names if name not in slot_volume_names],
         loopback_plugin_enabled=plugin_state == "true",
+        warm_slot_volume_names=[name for name in volume_names if name in slot_volume_names],
     )
 
 
@@ -4102,11 +4115,13 @@ class DockerService:
 
         A slot's volume is sparse and holds no bytes yet, but declares a whole-host size; counting
         it would inflate the pool every later sizing sees (speed/WARM_POOL.md). Every path that sums
-        vloopback volumes by name — `_get_existing_vloopback_bytes` here, and the host-probe fast
-        path lium-io#1332 adds — must filter its names through this set. Not gated on the flag: a
-        slot left behind when the flag goes off would otherwise count again for as long as it exists.
-        A listing that fails or times out is an empty set: the sizing then counts every volume, as it
-        did before the pool, rather than falling back to the legacy passthrough."""
+        vloopback volumes by name must leave these out: `_get_existing_vloopback_bytes` filters
+        through this set; the host-probe fast path (lium-io#1332) carries the same listing as the
+        `SLOT` section of its one command and filters at parse time (`_parse_volume_host_probe`).
+        Not gated on the flag: a slot left behind when the flag goes off would otherwise count again
+        for as long as it exists. A listing that fails or times out is an empty set: the sizing then
+        counts every volume, as it did before the pool, rather than falling back to the legacy
+        passthrough."""
         try:
             slot_result = await ssh_client.run(
                 warm_pool.slot_volumes_command(), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
@@ -4204,10 +4219,11 @@ class DockerService:
     ) -> VolumeHostProbe | None:
         """RENTAL_VOLUME_FAST_PATH_ENABLED: the volume-stage host facts in one SSH round trip.
 
-        Replaces `docker info` + the df helper container + `docker volume ls` (fresh sizing) and the
-        second `docker info` + the unconditional `docker plugin install` (create) — five serial
-        commands, one of them a Docker Hub round trip — with one command and, when vloopback
-        volumes exist, the same `docker volume inspect` as before. Never fatal: on any failure it
+        Replaces `docker info` + the df helper container + `docker volume ls` + the warm-pool slot
+        listing (fresh sizing) and the second `docker info` + the unconditional `docker plugin
+        install` (create) — six serial commands, one of them a Docker Hub round trip — with one
+        command and, when vloopback volumes exist, the same `docker volume inspect` as before.
+        Never fatal: on any failure it
         returns None and the callers take the exact path they take with the flag off.
         """
         started = now_ms()
@@ -4232,6 +4248,7 @@ class DockerService:
                     "docker_root_dir": probe.docker_root_dir,
                     "df_avail_bytes": probe.df_avail_bytes,
                     "vloopback_volumes": len(probe.vloopback_volume_names),
+                    "warm_slot_volumes": len(probe.warm_slot_volume_names),
                     "loopback_plugin_enabled": probe.loopback_plugin_enabled,
                     "probe_ms": now_ms() - started,
                 }),

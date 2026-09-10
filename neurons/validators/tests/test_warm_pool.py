@@ -40,7 +40,9 @@ from tests.test_deploy_optimizations import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
-NOW = datetime(2026, 9, 9, 3, 30, tzinfo=UTC)
+# Relative to the wall clock, not a literal: the service reads `datetime.now(UTC)` when it judges a
+# slot's age, so a slot labelled `NOW - 1h` must stay inside MAX_AGE on any day the suite runs.
+NOW = datetime.now(UTC).replace(microsecond=0)
 MAX_AGE = timedelta(hours=24)
 IMAGE = "daturaai/pytorch:1.0.0"
 IMAGE_ID = "sha256:" + "11" * 32
@@ -754,6 +756,55 @@ async def test_slot_that_differs_falls_back_to_a_fresh_create(svc, monkeypatch):
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
     assert result.volume_name == f"volume_{payload.pod_id}"
     assert (result.volume_limit_gb, result.storage_limit_gb) == (10, 20)
+
+
+@pytest.mark.asyncio
+async def test_miss_with_the_fast_path_on_probes_the_host_once_with_the_slot_listing_inside(
+    svc, monkeypatch
+):
+    """With RENTAL_VOLUME_FAST_PATH_ENABLED (lium-io#1332) a miss still pays one host probe: the
+    slot-volume listing is a section of that command, not a second round trip, and the slot's
+    volume is out of the names the sizing will inspect."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    monkeypatch.setattr(ds_module.settings, "RENTAL_VOLUME_FAST_PATH_ENABLED", True)
+    payload = _adoptable_payload()
+    spec = _spec(svc, payload)
+    image = _image_doc()
+    doc = _slot_doc(spec, image)
+    doc["Config"]["Env"].append("LD_PRELOAD=/evil.so")
+    ssh = _host(svc, spec, image, slot_doc=doc)
+    host_side = ssh.run.side_effect
+
+    def _side(cmd, *args, **kwargs):
+        if "DockerRootDir" in cmd:  # the volume host probe; the host has the slot's volume and a pod's
+            return _ssh_result(
+                stdout=(
+                    "ROOT\t/var/lib/docker\n"
+                    "DF\tFilesystem 1-blocks Used Available Capacity Mounted on\r"
+                    "/dev/vda1 1000 500 966367641600 80% /hostfs\r\n"
+                    "VOL\tvolume_pod1\tvloopback:latest\n"
+                    f"VOL\tvolume_{SLOT_ID}\tvloopback:latest\n"
+                    "VOLS\t0\n"
+                    f"SLOT\tvolume_{SLOT_ID}\n"
+                    "PLUGIN\ttrue\n"
+                )
+            )
+        return host_side(cmd, *args, **kwargs)
+
+    ssh.run = AsyncMock(side_effect=_side)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    probes = [c for c in _cmds(ssh) if "DockerRootDir" in c]
+    assert len(probes) == 1
+    assert warm_pool.slot_volumes_command(tag="SLOT") in probes[0]
+    assert warm_pool.slot_volumes_command() not in _cmds(ssh)  # no separate slot listing
+    probe = svc.resolve_volume_sizing.await_args.kwargs["host_probe"]
+    assert probe.vloopback_volume_names == ["volume_pod1"]
+    assert probe.warm_slot_volume_names == [f"volume_{SLOT_ID}"]
+    assert svc.create_local_volume.await_args.kwargs["host_probe"] is probe
 
 
 @pytest.mark.asyncio
