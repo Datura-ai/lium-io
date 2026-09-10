@@ -188,6 +188,9 @@ NORMALIZATION_MAP: dict[str, str] = {
     "Tesla T4":                             "NVIDIA T4 Tensor Core GPU",
     "NVIDIA T4":                            "NVIDIA T4 Tensor Core GPU",
     "NVIDIA A10":                           "NVIDIA A10 Tensor Core GPU",
+    # A10G is the AWS-only SKU of the A10 (GA102, 24 GB GDDR6; g5 instances report it as
+    # "NVIDIA A10G"). Rentable as an A10; A10's rate is 0.0, so no incentive either way.
+    "NVIDIA A10G":                          "NVIDIA A10 Tensor Core GPU",
     # Add observed CUDA names here as production logs surface them.
 }
 

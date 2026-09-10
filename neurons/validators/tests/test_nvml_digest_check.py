@@ -162,6 +162,24 @@ async def test_nvml_digest_check_allows_driver_580_167_08(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_nvml_digest_check_allows_driver_595_91_07(context_factory):
+    # The Deep Learning Base OSS NVIDIA Driver AMI (AWS g5/g6) ships this driver (DAH-3339).
+    specs = {
+        "gpu": {"driver": "595.91.07"},
+        "md5_checksums": {
+            "libnvidia_ml": "815eeecaf87fd8f947c66b2ef1ca7525:7515da5b856b805fc07811dfd72a37545c1bd9e78f4d8c16421e155ac8f4aec4",
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs))
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.DIGEST_OK.reason
+    assert "clear_verified_job_info" not in result.updates
+
+
+@pytest.mark.asyncio
 async def test_nvml_digest_check_allows_driver_610_43_02(context_factory):
     specs = {
         "gpu": {"driver": "610.43.02"},
