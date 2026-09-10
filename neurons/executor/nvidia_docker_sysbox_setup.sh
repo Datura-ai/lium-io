@@ -184,7 +184,7 @@ daemon_feature_off() {
 check_root() {
     [ "$(id -u)" -eq 0 ] && { pf_pass "Running as root."; return 0; }
     pf_fix "Not running as root — the checks read Docker's socket and the kernel modules." \
-        "$(self_cmd "${PREFLIGHT_MODE_FLAG:-}")"
+        "$(self_cmd "${CHECK_MODE_OPTION:-}")"
 }
 
 check_arch() {
@@ -258,11 +258,11 @@ check_docker_features() {
         pf_pass "Docker $version has the sysbox settings in /etc/docker/daemon.json (features.cdi$(docker_version_ge 29 5 && echo ' and features.time-namespaces') = false)."
         return 0
     fi
-    local block='{"features":{"cdi":false}}'
-    docker_version_ge 29 5 && block='{"features":{"cdi":false,"time-namespaces":false}}'
+    local daemon_features_block='{"features":{"cdi":false}}'
+    docker_version_ge 29 5 && daemon_features_block='{"features":{"cdi":false,"time-namespaces":false}}'
     pf_fix "Docker $version without features.$missing = false in /etc/docker/daemon.json — sysbox rejects its containers." \
         "$(self_cmd)   # writes the features block and restarts Docker; stop rentals first" \
-        "or by hand: add $block to /etc/docker/daemon.json && sudo systemctl restart docker"
+        "or by hand: add $daemon_features_block to /etc/docker/daemon.json && sudo systemctl restart docker"
 }
 
 check_nvidia_driver() {
@@ -486,10 +486,10 @@ if [ -n "${SYSBOX_SETUP_LIB:-}" ]; then
     return 0
 fi
 
-PREFLIGHT_MODE_FLAG=""
+CHECK_MODE_OPTION=""
 case "${1:-}" in
     "") ;;
-    --check) PREFLIGHT_MODE_FLAG="--check" ;;
+    --check) CHECK_MODE_OPTION="--check" ;;
     -h|--help)
         echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
@@ -503,7 +503,7 @@ esac
 
 # ── 1. Pre-flight ────────────────────────────────────────
 
-if [ -n "$PREFLIGHT_MODE_FLAG" ]; then
+if [ -n "$CHECK_MODE_OPTION" ]; then
     echo -e "\n${B}Preflight${N} — host requirements, then what this script installs"
     # without root nothing else is checked: every other check reads Docker's socket or the process table
     if check_root; then
