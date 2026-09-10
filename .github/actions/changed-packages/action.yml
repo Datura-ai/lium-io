@@ -15,7 +15,10 @@ description: >-
   anything: neurons/<pkg>/ selects that package; datura/ (the protocol package every neuron
   installs from a path) and .github/ (a router bug must not hide behind its own filter) select
   all three. Every other path — the root pyproject.toml and pdm.lock (dev tooling only),
-  scripts/, contrib/, watchtower/, tests/ (an empty package) — selects nothing.
+  scripts/, contrib/, watchtower/, tests/ (an empty package) — selects nothing. A fourth output,
+  e2e, is true when any package is or when e2e/ itself changed: the e2e stack builds every
+  neuron, so it runs whenever one of them could have changed and skips (green, via tests-ok) on
+  a PR that touches none.
 
 outputs:
   validators:
@@ -24,6 +27,8 @@ outputs:
     value: ${{ steps.route.outputs.executor }}
   miners:
     value: ${{ steps.route.outputs.miners }}
+  e2e:
+    value: ${{ steps.route.outputs.e2e }}
 
 runs:
   using: composite
@@ -60,11 +65,17 @@ runs:
           }
 
           const rows = [];
+          let anyPackage = false;
           for (const [pkg, prefix] of Object.entries(PACKAGES)) {
             const changed = files ? touches(files, prefix) : true;
+            anyPackage ||= changed;
             core.setOutput(pkg, changed);
             rows.push([pkg, changed ? 'changed' : 'unchanged', why]);
           }
+          // the e2e stack is built from every package: it runs when any of them did, or when e2e/ itself changed
+          const e2e = anyPackage || (files ? touches(files, 'e2e/') : true);
+          core.setOutput('e2e', e2e);
+          rows.push(['e2e', e2e ? 'changed' : 'unchanged', why]);
           core.summary
             .addHeading('Route', 3)
             .addTable([[{data: 'package', header: true}, {data: 'result', header: true}, {data: 'why', header: true}], ...rows])

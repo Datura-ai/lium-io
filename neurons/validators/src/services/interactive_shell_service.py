@@ -180,7 +180,7 @@ class InteractiveShellService:
         try:
             await self.ssh_client.run(f"rm -rf {self.remote_dir}", timeout=10)
             # await self.exec_shell_command(f"rm -rf {self.remote_dir}")
-        except Exception as e:
+        except Exception:
             pass
 
     async def read_file_content_over_scp(self, file_path: str) -> bytes:
@@ -222,29 +222,3 @@ class InteractiveShellService:
             return ""
 
         return digest
-
-    # async def get_checksums_by_path(self, file_path: str):
-    #     md5_output = await self.exec_shell_command(f'md5sum {file_path}')
-    #     sha256_output = await self.exec_shell_command(f'sha256sum {file_path}')
-
-    #     # Extract the checksums from the command outputs
-    #     md5_sum = md5_output.replace(file_path, '').strip() if md5_output else None
-    #     sha256_sum = sha256_output.replace(file_path, '').strip() if sha256_output else None
-
-    #     return f'{md5_sum}:{sha256_sum}'
-
-    # async def exec_shell_command(self, command: str):
-    #     # return await self.loop.run_in_executor(None, self._exec_shell_command, command)
-    #     return await asyncio.to_thread(self._exec_shell_command, command)
-
-    # def _exec_shell_command(self, command: str):
-    #     try:
-    #         self.i_shell.sendline(f"{command} && echo 'STOPPED'")
-    #         self.i_shell.expect(['STOPPED'], timeout=30)
-    #         self.i_shell.expect(['STOPPED'], timeout=30)
-    #         output_lines = [line.strip() for line in re.split(r'[\r\n]', self.i_shell.before.decode('utf-8')) if line.strip()]
-    #         return output_lines[-1]
-    #     except pexpect.TIMEOUT:
-    #         raise Exception("i-ssh connection Timeout")
-    #     except pexpect.EOF:
-    #         raise Exception("i-ssh connection EOF error")

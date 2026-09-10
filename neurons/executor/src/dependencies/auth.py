@@ -1,7 +1,8 @@
 from fastapi import HTTPException
 import bittensor
 import json
-from core.config import VALIDATOR_HOTKEY_SS58
+import time
+from core.config import VALIDATOR_HOTKEY_SS58, settings
 from core.logger import get_logger
 from payloads.backend import SignaturePayload, HardwareUtilizationPayload, PingPayload, ContainerUtilizationPayload
 
@@ -50,6 +51,29 @@ async def verify_signature(payload: SignaturePayload, message: str) -> None:
         )
 
 
+def require_fresh_timestamp(timestamp: int) -> None:
+    """The signed timestamp is within CONTAINER_SIGNATURE_MAX_AGE_SECONDS of this host's clock.
+
+    A valid signature proves who signed, not when the request was made: without this check a
+    captured /containers request stays accepted for as long as the container exists (DAH-3200).
+    The window is symmetric, so a host clock that runs ahead of the signer is refused the same way
+    as one that runs behind, and the 401 names the skew so a provider can see it is their clock.
+    """
+    max_age = settings.CONTAINER_SIGNATURE_MAX_AGE_SECONDS
+    # integer arithmetic: the signer's resolution is whole seconds, and a float subtraction would
+    # overflow (500) on an absurdly large int the header parser still admits
+    skew = int(time.time()) - timestamp
+    if abs(skew) > max_age:
+        detail = (
+            f"Signed timestamp is {abs(skew)}s "
+            f"{'behind' if skew > 0 else 'ahead of'} the executor clock; "
+            f"the accepted window is {max_age}s. Check that this host's clock is NTP-synced."
+        )
+        # the 401 body goes back to the platform; this line is what the provider sees in `docker logs`
+        logger.warning("Refusing a signed /containers request: %s", detail)
+        raise HTTPException(status_code=401, detail=detail)
+
+
 async def verify_allowed_hotkey_signature(payload: HardwareUtilizationPayload):
     FIXED_MESSAGE = "hardware_utilization_request"
     await verify_signature(payload, FIXED_MESSAGE)
@@ -61,6 +85,7 @@ async def verify_ping_signature(payload: PingPayload):
 
 
 async def verify_container_signature(payload: ContainerUtilizationPayload):
+    require_fresh_timestamp(payload.timestamp)
     signing_data  = {
         "gpu_uuids": payload.gpu_uuids,
         "timestamp": payload.timestamp,
@@ -78,6 +103,7 @@ async def verify_container_logs_signature(container_name: str, timestamp: int, s
         timestamp: Unix timestamp (part of signed message)
         signature: The signature from header
     """
+    require_fresh_timestamp(timestamp)
     signing_data = {
         "container_name": container_name,
         "timestamp": timestamp,
