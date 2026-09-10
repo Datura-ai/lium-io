@@ -187,12 +187,12 @@ async def test_cancel_waits_for_runner_then_reports_terminal_status(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exit_status, expected", [(0, True), (1, False)])
+@pytest.mark.parametrize("exit_status, expected", [(0, True), (3, False)])
 async def test_supports_bootstrap_restore_asks_the_executor_models_for_the_field(
     exit_status, expected
 ) -> None:
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status))
+    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status, stderr=""))
 
     supported = await storage_operations.supports_bootstrap_restore(ssh_client, "/usr/bin/python3")
     assert supported is expected
@@ -200,6 +200,27 @@ async def test_supports_bootstrap_restore_asks_the_executor_models_for_the_field
     command = ssh_client.run.await_args.args[0]
     assert command.startswith("/usr/bin/python3 -c ")
     assert "WorkspaceSpec.__dataclass_fields__" in command and "'bootstrap'" in command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_status, stderr",
+    [
+        (127, "bash: /usr/bin/python3: No such file or directory"),
+        (1, "ModuleNotFoundError: No module named 'storage'"),
+    ],
+)
+async def test_a_probe_that_cannot_run_is_reported_not_read_as_an_old_image(
+    exit_status, stderr
+) -> None:
+    # review (taiberium): every non-zero exit used to read as "old executor image"; a missing
+    # interpreter (127) or a broken import (1) is a different failure and says so
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status, stderr=stderr))
+
+    with pytest.raises(RuntimeError, match=rf"exit {exit_status}") as raised:
+        await storage_operations.supports_bootstrap_restore(ssh_client, "/usr/bin/python3")
+    assert stderr[-30:] in str(raised.value)
 
 
 def test_bootstrap_probe_finds_the_field_in_this_repo_s_executor_models() -> None:

@@ -488,7 +488,7 @@ def test_online_encrypted_restore_still_refuses_a_nonempty_target(
         ).resolve(operation)
 
 
-def test_bootstrap_encrypted_restore_writes_over_what_the_entrypoint_left(
+def test_bootstrap_encrypted_restore_skips_the_emptiness_preflight(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
