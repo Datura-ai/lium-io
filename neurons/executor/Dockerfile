@@ -1,4 +1,7 @@
-FROM python:3.11-slim
+# python:3.11-slim as published on 8 Sep 2026 (= 3.11-slim-trixie: Debian 13, OpenSSH 10.0), pinned by
+# digest. The bare tag moved from Debian 12 to Debian 13 on its own and changed sshd's defaults under
+# every executor (DAH-3236); a base bump is now a deliberate edit of this line, checked by sshd_setup.sh.
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ENV=prod
@@ -100,5 +103,9 @@ RUN useradd -m -s /bin/bash liumuser && \
 
 RUN echo 'AcceptEnv CONTAINER_NAME' >>/etc/ssh/sshd_config && \
     printf 'Match User liumuser\n    ForceCommand bash -c '"'"'[ -n "$CONTAINER_NAME" ] && exec docker exec -it "$CONTAINER_NAME" bash || { echo "CONTAINER_NAME not set"; exit 1; }'"'"'\n' >>/etc/ssh/sshd_config
+
+# PerSourcePenalties off via /etc/ssh/sshd_config.d/lium.conf when this sshd knows the directive,
+# then `sshd -T` must accept the whole rendered config or the build fails (sshd_setup.sh says why).
+RUN sh sshd_setup.sh
 
 CMD ["bash", "run.sh"]

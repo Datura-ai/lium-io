@@ -1,5 +1,4 @@
 import logging
-import os
 import subprocess
 import tempfile
 import re
@@ -10,7 +9,6 @@ from workspace_mount import VolumeAccess, detect_volume_access
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("restore_storage")
 
-plugin_name = "s3fs-restore"
 MAX_ERROR_DETAIL_CHARS = 1200
 # These scripts are copied to executor hosts and report status through the public API.
 # Some diagnostic path strings can be rejected before they reach the backend, so
@@ -69,19 +67,6 @@ def restore_failure_message(
     if len(message) > MAX_ERROR_DETAIL_CHARS:
         message = f"{message[:MAX_ERROR_DETAIL_CHARS]}...<truncated>"
     return message
-
-
-def run_command(command, command_label: str = "command"):
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"Command failed: {command_label}")
-        raise RuntimeError(
-            f"{command_label} failed with exit code {result.returncode}\n"
-            f"{compact_output('stderr', result.stderr)}"
-        )
-    else:
-        logger.info(f"Command succeeded: {command_label}")
-    return result
 
 
 def run_command_args(command: list[str], command_label: str = "command"):

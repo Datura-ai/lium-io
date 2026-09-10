@@ -111,6 +111,12 @@ class Settings(BaseSettings):
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
     REDIS_USERNAME: str | None = Field(env="REDIS_USERNAME", default=None)
     REDIS_PASSWORD: str | None = Field(env="REDIS_PASSWORD", default=None)
+    # DAH-3006: RedisService wraps every command in one process-wide asyncio.Lock. In a ~500-executor
+    # wave the lock's FIFO queue drains at ~0.4 s per command (each hold spans several starved
+    # event-loop iterations), so a 1-ms SISMEMBER waits p50 73 s (Loki, 6 Sep 12:03 wave) — ~45 %
+    # of the median idle pipeline. Off: commands go straight to the bounded BlockingConnectionPool
+    # (DAH-2475), which is what serialises them when it must. On = today's behaviour.
+    REDIS_COMMAND_LOCK_ENABLED: bool = Field(env="REDIS_COMMAND_LOCK_ENABLED", default=True)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
@@ -211,6 +217,15 @@ class Settings(BaseSettings):
         default=True,
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
+    # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
+    # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the
+    # plugin is already enabled — instead of five serial commands. Off: the per-command path.
+    RENTAL_VOLUME_FAST_PATH_ENABLED: bool = Field(env="RENTAL_VOLUME_FAST_PATH_ENABLED", default=False)
+    # DAH-3257: on a rent, read the host listings the pre-run steps need (containers, volumes,
+    # mounted volumes, GPU minor map, device nodes, nvidia-smi power state, the image's
+    # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
+    # own command, and a probe that fails leaves every step on its own commands. Off: as before.
+    RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a

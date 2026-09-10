@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-import aiohttp
 import asyncssh
 import bittensor
 import redis.exceptions
@@ -25,6 +24,8 @@ from core.docker_utils import (
     DockerCommand,
     collect_container_death_diagnostics,
     df_available_bytes,
+    df_command,
+    parse_df_available_bytes,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
@@ -73,11 +74,21 @@ from services.const import (
 )
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.gpu_power_limit import (
+    NVIDIA_SMI_TIMEOUT_SECONDS,
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
     restore_all_host_gpu_power_limits,
     restore_filler_pod_gpu_power_limits,
     restore_tracked_gpu_power_limits,
+)
+from services.prerun_host_probe import (
+    DOCKER_MOUNTED_VOLUME_NAMES_CMD,
+    DOCKER_PS_ALL_NAMES_CMD,
+    DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
+    PrerunHostProbe,
+    image_label_command,
+    parse_prerun_host_probe,
+    prerun_host_probe_command,
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
@@ -98,6 +109,7 @@ from services.rental_docker_sdk import (
     ContainerUlimit,
     DeviceMount,
     PortBinding,
+    RENTAL_NETWORK_NAME,
     RentalDockerConnectionError,
     RentalDockerOperationError,
     RentalDockerSdkClient,
@@ -253,6 +265,10 @@ _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
 _DOCKER_PULL_TIMEOUT_SECONDS = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
 _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
+# DAH-3257: the pre-run probe carries one nvidia-smi query plus seven docker/procfs listings that
+# take milliseconds, so its bound is the one the per-command path puts on that nvidia-smi query
+# (30 s); a probe slower than this is a hung host, and the per-command path takes over.
+_PRERUN_HOST_PROBE_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 
 
 def _missing_rental_docker_host_key_log_text(
@@ -352,6 +368,94 @@ class VolumeSizingResult:
     capped_by: str | None = None   # "pool" | "request_cap" | "df_guard" (fresh path only)
     df_avail_bytes: int | None = None
     existing_volumes_bytes: int | None = None
+
+
+_LOOPBACK_PLUGIN_ALIAS = _VLOOPBACK_DRIVER_PREFIX  # the plugin is installed under the driver name `_is_vloopback_driver` matches
+_LOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
+_PROBE_OUTPUT_LOG_CAP = 512
+
+
+@dataclass
+class VolumeHostProbe:
+    """What one SSH round trip learns about the host before a local volume is created
+    (RENTAL_VOLUME_FAST_PATH_ENABLED). The same facts the fresh-sizing path collected over
+    three commands, plus the loopback plugin state that lets `create_local_volume` skip
+    `docker plugin install` — a Docker Hub round trip — when the plugin is already enabled."""
+
+    docker_root_dir: str
+    df_avail_bytes: int | None          # None when the probe was asked not to measure df
+    vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
+    loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true
+
+
+def _volume_host_probe_command(*, with_df: bool) -> str:
+    """One shell line: DockerRootDir, (optionally) df through the helper container, the volume
+    list and the loopback plugin state, each output line tagged so the parser never guesses.
+    Sections are joined with `;` — a failing section leaves its tag out (the volume list, whose
+    empty output is legitimate, is followed by a `VOLS\\t<exit status>` line) and the parser raises."""
+    df_cmd = df_command('"$root"')
+    df_part = (
+        # df prints two lines; fold them onto one tagged line (\n → \r) so every record stays one line
+        f"printf 'DF\\t%s\\n' \"$({df_cmd} | tr '\\n' '\\r')\"; "
+        if with_df
+        else ""
+    )
+    return (
+        "root=\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\"; "
+        "printf 'ROOT\\t%s\\n' \"$root\"; "
+        f"{df_part}"
+        "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
+        "printf 'VOLS\\t%s\\n' \"$?\"; "
+        # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
+        # so only the last line is the state: true / false / absent
+        "printf 'PLUGIN\\t%s\\n' \"$( (/usr/bin/docker plugin inspect --format '{{.Enabled}}' "
+        f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1)\""
+    )
+
+
+def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
+    docker_root_dir: str | None = None
+    df_avail_bytes: int | None = None
+    volume_names: list[str] = []
+    volume_ls_status: str | None = None
+    plugin_state: str | None = None
+    # the echoed output is host-controlled: cap what reaches the log
+    shown = stdout[:_PROBE_OUTPUT_LOG_CAP]
+    # split on "\n" only: str.splitlines() would also split at the "\r" the DF record uses
+    for raw_line in stdout.split("\n"):
+        tag, _, rest = raw_line.partition("\t")
+        if tag == "ROOT":
+            docker_root_dir = rest.strip()
+        elif tag == "DF":
+            # the multi-line df output travels on one line with \r in place of \n
+            try:
+                df_avail_bytes = parse_df_available_bytes(rest.replace("\r", "\n"))
+            except Exception as exc:
+                raise Exception(f"volume host probe: unexpected df output in {shown!r}") from exc
+        elif tag == "VOL":
+            name, _, driver = rest.partition("\t")
+            if _is_vloopback_driver(driver.strip()) and _is_safe_docker_volume_name(name):
+                volume_names.append(name)
+        elif tag == "VOLS":
+            volume_ls_status = rest.strip()
+        elif tag == "PLUGIN":
+            plugin_state = rest.strip()
+    if not docker_root_dir:
+        raise Exception(f"volume host probe: no DockerRootDir in {shown!r}")
+    if with_df and df_avail_bytes is None:
+        raise Exception(f"volume host probe: no df output in {shown!r}")
+    if volume_ls_status != "0":
+        # an empty volume list is legitimate, a failed `docker volume ls` is not: without this the
+        # probe would report zero existing volumes and the fresh sizing would overstate the pool
+        raise Exception(f"volume host probe: docker volume ls exit status {volume_ls_status!r} in {shown!r}")
+    if plugin_state is None:
+        raise Exception(f"volume host probe: no plugin state in {shown!r}")
+    return VolumeHostProbe(
+        docker_root_dir=docker_root_dir,
+        df_avail_bytes=df_avail_bytes,
+        vloopback_volume_names=volume_names,
+        loopback_plugin_enabled=plugin_state == "true",
+    )
 
 
 def _parse_volume_size_to_bytes(value: str | None) -> int | None:
@@ -653,29 +757,6 @@ if ! {mount_check}; then
   gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
 fi
 """
-
-
-def build_startup_command_args(startup_commands: str | None) -> str:
-    """Quote user-supplied startup_commands into a safe argv fragment.
-
-    The fragment is appended to the host-side ``docker run ... <image>`` command
-    that runs via ``/bin/sh -c`` over SSH as root on the executor. The user value
-    is split into tokens (honouring its own quoting) and each token is
-    ``shlex.quote``-d, so the host shell cannot interpret any metacharacter
-    inside it: the tokens become the container's command + args, never a host
-    command. Legitimate quoted commands such as ``bash -c "a && b"`` are
-    preserved (the ``&&`` runs inside the container); break-out attempts such as
-    a leading newline collapse to harmless container arguments. Unbalanced
-    quotes or an empty value fall back to the image default command.
-    """
-    if not startup_commands or not startup_commands.strip():
-        return ""
-    try:
-        tokens = shlex.split(startup_commands)
-    except ValueError:
-        # Unbalanced quotes etc. — don't risk a malformed/unsafe host command.
-        return ""
-    return " ".join(shlex.quote(token) for token in tokens)
 
 
 class DockerService:
@@ -1061,6 +1142,7 @@ class DockerService:
             storage_limit_gb=effective_storage_limit_gb,
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
+            network=RENTAL_NETWORK_NAME,
         )
 
     async def _ensure_pod_quote_socket(
@@ -1310,7 +1392,7 @@ class DockerService:
         pod_mapping_raw: list[PayloadPortMapping] | None = None,
         workload_kind: WorkloadKind | None = None,
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
-        executor_uuid = UUID(executor_id)
+        UUID(executor_id)  # validates the id format, raises ValueError otherwise
 
         try:
             # Use distributed lock to prevent race conditions when allocating ports
@@ -1735,10 +1817,18 @@ class DockerService:
         clear_volume: bool = True,
         active_container_names: list[str] | None = None,
         active_volume_names: list[str] | None = None,
-    ):
-        command = '/usr/bin/docker ps -a --format "{{.Names}}"'
-        result = await ssh_client.run(command)
-        if result.stdout.strip():
+        host_probe: PrerunHostProbe | None = None,
+    ) -> list[str]:
+        """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
+
+        DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+        """
+        if host_probe is not None and host_probe.container_names is not None:
+            all_names: list[str] = list(host_probe.container_names)
+        else:
+            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
+            all_names = [name for name in (result.stdout or "").strip().split("\n") if name]
+        if all_names:
             # Optional pre-GC delay (default 0). DAH-1524 removed the 10s
             # deploy-path sleep; the port-race it hedged is now covered by
             # wait_for_port_check_containers + the 90s docker-run retry budget.
@@ -1748,7 +1838,7 @@ class DockerService:
             active_set = set(active_container_names) if active_container_names else set()
             active_volume_set = set(active_volume_names) if active_volume_names else set()
             pod_containers = [
-                name for name in result.stdout.strip().split("\n")
+                name for name in all_names
                 if name == pod_name
                 or name.startswith(POD_CONTAINER_PREFIX)
                 or name.startswith(FILLER_CONTAINER_PREFIX)
@@ -1760,7 +1850,7 @@ class DockerService:
                 stale_containers.append(name)
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
-                return
+                return []
 
             logger.info(
                 _m(
@@ -1791,40 +1881,52 @@ class DockerService:
                     volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            return stale_containers
+        return []
 
     async def clean_stale_vloopback_volumes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         skip_volume_names: list[str] | set[str] | None = None,
-    ) -> None:
+        host_probe: PrerunHostProbe | None = None,
+    ) -> list[str]:
+        """Remove vloopback `volume_*` volumes no container mounts (minus ``skip_volume_names``).
+
+        Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
+        failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
+        caller passes it only while nothing has removed a container since the probe ran.
+        """
         skip_set = {name for name in (skip_volume_names or []) if name}
-        list_volumes_cmd = '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
-        mounted_volumes_cmd = (
-            "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
-            "'{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}}{{\"\\n\"}}{{end}}{{end}}'"
-        )
+        list_volumes_cmd = DOCKER_VOLUME_LS_NAME_DRIVER_CMD
+        mounted_volumes_cmd = DOCKER_MOUNTED_VOLUME_NAMES_CMD
 
         try:
-            volume_result = await ssh_client.run(list_volumes_cmd)
-            if getattr(volume_result, "exit_status", 0) != 0:
-                logger.warning(
-                    _m(
-                        "Unable to list vloopback volumes",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "stderr": getattr(volume_result, "stderr", ""),
-                        }),
+            if host_probe is not None and host_probe.volumes is not None:
+                volume_rows: list[tuple[str, str]] = [
+                    (volume.name, volume.driver) for volume in host_probe.volumes
+                ]
+            else:
+                volume_result = await ssh_client.run(list_volumes_cmd)
+                if getattr(volume_result, "exit_status", 0) != 0:
+                    logger.warning(
+                        _m(
+                            "Unable to list vloopback volumes",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "stderr": getattr(volume_result, "stderr", ""),
+                            }),
+                        )
                     )
-                )
-                return
+                    return []
+                volume_rows = []
+                for line in (volume_result.stdout or "").splitlines():
+                    parts = line.strip().split(maxsplit=1)
+                    if len(parts) == 2:
+                        volume_rows.append((parts[0], parts[1]))
 
             vloopback_volumes = set()
-            for line in (volume_result.stdout or "").splitlines():
-                parts = line.strip().split(maxsplit=1)
-                if len(parts) != 2:
-                    continue
-                name, driver = parts
+            for name, driver in volume_rows:
                 if not (
                     name.startswith("volume_")
                     and (driver == "vloopback" or driver.startswith("vloopback:"))
@@ -1832,27 +1934,30 @@ class DockerService:
                     continue
                 vloopback_volumes.add(name)
             if not vloopback_volumes:
-                return
+                return []
 
-            mounted_result = await ssh_client.run(mounted_volumes_cmd)
-            if getattr(mounted_result, "exit_status", 0) != 0:
-                logger.warning(
-                    _m(
-                        "Unable to inspect mounted Docker volumes",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "stderr": getattr(mounted_result, "stderr", ""),
-                        }),
+            if host_probe is not None and host_probe.mounted_volume_names is not None:
+                mounted_volumes = set(host_probe.mounted_volume_names)
+            else:
+                mounted_result = await ssh_client.run(mounted_volumes_cmd)
+                if getattr(mounted_result, "exit_status", 0) != 0:
+                    logger.warning(
+                        _m(
+                            "Unable to inspect mounted Docker volumes",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "stderr": getattr(mounted_result, "stderr", ""),
+                            }),
+                        )
                     )
-                )
-                return
+                    return []
 
-            mounted_volumes = {
-                name.strip() for name in (mounted_result.stdout or "").splitlines() if name.strip()
-            }
+                mounted_volumes = {
+                    name.strip() for name in (mounted_result.stdout or "").splitlines() if name.strip()
+                }
             stale_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
             if not stale_volumes:
-                return
+                return []
 
             logger.info(
                 _m(
@@ -1870,6 +1975,7 @@ class DockerService:
                 f"/usr/bin/docker volume rm {volumes} 2>/dev/null || true",
                 "clean_stale_vloopback_volumes",
             )
+            return stale_volumes
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1880,6 +1986,7 @@ class DockerService:
                 ),
                 exc_info=True,
             )
+            return []
 
     async def _cache_rented_pod_best_effort(
         self,
@@ -1921,6 +2028,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         default_extra: dict,
+        host_probe: PrerunHostProbe | None = None,
     ) -> None:
         """Free the DPHN filler cache when a customer rental needs the disk it occupies.
 
@@ -1937,7 +2045,9 @@ class DockerService:
             return
         requested_gb: int | None = payload.volume_limit_gb
         try:
-            cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(ssh_client, set(), default_extra)
+            cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(
+                ssh_client, set(), default_extra, host_probe=host_probe
+            )
             if not cache_volumes:
                 return
 
@@ -1983,6 +2093,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         default_extra: dict,
+        host_probe: PrerunHostProbe | None = None,
     ) -> list[CacheVolume]:
         """Which of the requested cache volumes this node can actually take.
 
@@ -2001,7 +2112,11 @@ class DockerService:
         requested_names: list[str] = [cache_volume.name for cache_volume in payload.cache_volumes]
         existing: set[str] = set(
             await self._find_cache_volumes_to_sweep(
-                ssh_client, set(), default_extra, self._cache_volume_families(requested_names)
+                ssh_client,
+                set(),
+                default_extra,
+                self._cache_volume_families(requested_names),
+                host_probe=host_probe,
             )
         )
         present: list[CacheVolume] = [volume for volume in payload.cache_volumes if volume.name in existing]
@@ -2059,30 +2174,34 @@ class DockerService:
         keep_names: set[str],
         default_extra: dict,
         name_prefixes: tuple[str, ...] = (DPHN_CACHE_VOLUME_PREFIX,),
+        host_probe: PrerunHostProbe | None = None,
     ) -> list[str]:
         # Cache volumes present on the host that this create no longer names, i.e. left by an older
         # model or runtime. Empty on any listing failure — sweeping is never worth failing a launch.
         if not name_prefixes:
             return []
-        try:
-            listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                _m(
-                    "Failed to list filler cache volumes",
-                    extra=get_extra_info({**default_extra, "error": str(exc)}),
-                ),
-                exc_info=True,
-            )
-            return []
-        if listed.exit_status != 0:
-            return []
+        if host_probe is not None and host_probe.volume_names is not None:
+            # DAH-3257: the pre-run probe's `docker volume ls`, same filter below.
+            names: tuple[str, ...] = host_probe.volume_names
+        else:
+            try:
+                listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Failed to list filler cache volumes",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    ),
+                    exc_info=True,
+                )
+                return []
+            if listed.exit_status != 0:
+                return []
+            names = tuple(line.strip() for line in (listed.stdout or "").splitlines())
         return sorted(
-            name
-            for name in (line.strip() for line in (listed.stdout or "").splitlines())
-            if name.startswith(name_prefixes) and name not in keep_names
+            name for name in names if name.startswith(name_prefixes) and name not in keep_names
         )
 
     async def sweep_stale_cache_volumes(
@@ -2090,13 +2209,16 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         default_extra: dict,
-    ) -> None:
+        host_probe: PrerunHostProbe | None = None,
+    ) -> list[str]:
         """Remove every DPHN cache volume on the host except the ones THIS create asks for.
 
         The cache volume name carries the model + runtime version, so a Dolphin model update makes the
         backend ask for a different name. Without this sweep the previous ~37 GB set would sit on the
         host forever (a named volume outside the `volume_` prefix is untouched by every other GC path)
         and each update would leak another set — the invariant is at most ONE model's cache per host.
+
+        Returns the volumes it asked docker to remove (empty when nothing was swept).
         """
         if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
             # No cache requested -> this is version GC with nothing to compare against, NOT a reclaim.
@@ -2106,7 +2228,7 @@ class DockerService:
             # threshold, the next cycle would grant it again, and the node would re-download ~37 GB
             # every cycle. Reclaiming a cache the node can no longer afford is the rental/disk-pressure
             # path's job, where the decision is made against real free space.
-            return
+            return []
         # A live filler SIBLING holds this node's cache and docker cannot remove an in-use volume, so
         # the listing round-trip would be a no-op. The run being created is already STARTING in the
         # backend by the time it builds this request, so its OWN container name is in the list too —
@@ -2116,14 +2238,18 @@ class DockerService:
             name.startswith(FILLER_CONTAINER_PREFIX) and name != own_container_name
             for name in payload.active_container_names or []
         ):
-            return
+            return []
 
         keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
         stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(
-            ssh_client, keep_names, default_extra, self._cache_volume_families(sorted(keep_names))
+            ssh_client,
+            keep_names,
+            default_extra,
+            self._cache_volume_families(sorted(keep_names)),
+            host_probe=host_probe,
         )
         if not stale_volumes:
-            return
+            return []
         logger.info(
             _m(
                 "Sweeping stale filler cache volumes",
@@ -2150,6 +2276,7 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "stale_volumes": stale_volumes, "error": str(exc)}),
                 )
             )
+        return stale_volumes
 
     async def capture_failed_container_diagnostics(
         self,
@@ -2240,15 +2367,83 @@ class DockerService:
             )
         return container_missing
 
+    async def probe_prerun_host(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        *,
+        docker_image: str,
+        with_power: bool,
+        log_extra: dict,
+    ) -> PrerunHostProbe | None:
+        """DAH-3257: the pre-run host listings in one SSH command; None on any failure.
+
+        None means every consumer runs its own listing command, exactly as with the flag off; the
+        probe is then one extra round trip. It reads the host and writes nothing.
+        """
+        command = prerun_host_probe_command(
+            docker_image=docker_image,
+            image_label=_ENCRYPTED_VOLUME_IMAGE_LABEL,
+            with_power=with_power,
+        )
+        started = time.monotonic()
+        try:
+            # Bounded like the nvidia-smi query it carries (a hung driver must not stall the rent);
+            # asyncio.TimeoutError lands in the except below → None → the per-command path.
+            result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+            probe = parse_prerun_host_probe(result.stdout or "", with_power=with_power)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "prerun_host_probe_fallback",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "error": str(exc),
+                        "probe_ms": int((time.monotonic() - started) * 1000),
+                    }),
+                )
+            )
+            return None
+        logger.info(
+            _m(
+                "prerun_host_probe",
+                extra=get_extra_info({
+                    **log_extra,
+                    "probe_ms": int((time.monotonic() - started) * 1000),
+                    "containers": len(probe.container_names or ()),
+                    "volumes": len(probe.volumes or ()),
+                    "failed_sections": [
+                        name
+                        for name, value in (
+                            ("ps", probe.container_names),
+                            ("volumes", probe.volumes),
+                            ("mounted", probe.mounted_volume_names),
+                            ("gpu_minor_map", probe.gpu_minor_map_stdout),
+                            ("gpu_devices", probe.gpu_device_nodes),
+                            ("shared_nodes", probe.shared_nodes),
+                            ("shared_nodes_whole_host", probe.shared_nodes_whole_host_only),
+                            ("power", probe.power_state_stdout if with_power else ""),
+                            ("image_label", probe.image_label_value),
+                        )
+                        if value is None
+                    ],
+                }),
+            )
+        )
+        return probe
+
     async def _image_has_encrypted_volume_label(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         docker_image: str,
+        *,
+        host_probe: PrerunHostProbe | None = None,
     ) -> bool:
+        if host_probe is not None and host_probe.image_label_value is not None:
+            return host_probe.image_label_value == "1"
         result = await ssh_client.run(
-            "/usr/bin/docker image inspect "
-            f"--format '{{{{index .Config.Labels \"{_ENCRYPTED_VOLUME_IMAGE_LABEL}\"}}}}' "
-            f"{shlex.quote(docker_image)}",
+            image_label_command(docker_image, _ENCRYPTED_VOLUME_IMAGE_LABEL),
             check=False,
         )
         if result.exit_status != 0:
@@ -3229,6 +3424,7 @@ class DockerService:
         limit: int | None = None,
         timeout: int = 10,
         sparse: bool = False,
+        host_probe: VolumeHostProbe | None = None,
     ):
         requested_timeout = timeout
         _quote_safe_docker_volume_name(
@@ -3237,21 +3433,35 @@ class DockerService:
         )
         if limit:
             # install loopback plugin
-            loopback_plugin_name = "vloopback"
+            loopback_plugin_name = _LOOPBACK_PLUGIN_ALIAS
 
-            docker_root_dir = await self.get_docker_root_dir(ssh_client)
+            if host_probe is not None:
+                docker_root_dir = host_probe.docker_root_dir
+            else:
+                docker_root_dir = await self.get_docker_root_dir(ssh_client)
             logger.info(_m(f"Docker data root: {docker_root_dir}", extra=get_extra_info(log_extra)))
 
-            loopback_plugin_arg = shlex.quote(loopback_plugin_name)
-            data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
-            command = (
-                "/usr/bin/docker plugin install ashald/docker-volume-loopback "
-                f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
-            )
-            # TODO: migrate Docker plugin management if/when plugin setup becomes
-            # part of the SDK migration scope. The user-controlled volume name is
-            # not used in this shell command; volume creation below is SDK-backed.
-            await ssh_client.run(command)
+            if host_probe is not None and host_probe.loopback_plugin_enabled:
+                # The probe saw the plugin installed and enabled: `docker plugin install` would
+                # only ask Docker Hub for the plugin's privileges and then fail with "already
+                # exists" (~0.9 s measured on a 4090 node, every rent). Nothing to do.
+                logger.info(
+                    _m(
+                        "Loopback plugin already enabled; skipping plugin install",
+                        extra=get_extra_info({**log_extra, "loopback_plugin": loopback_plugin_name}),
+                    )
+                )
+            else:
+                loopback_plugin_arg = shlex.quote(loopback_plugin_name)
+                data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
+                command = (
+                    f"/usr/bin/docker plugin install {_LOOPBACK_PLUGIN_IMAGE} "
+                    f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
+                )
+                # TODO: migrate Docker plugin management if/when plugin setup becomes
+                # part of the SDK migration scope. The user-controlled volume name is
+                # not used in this shell command; volume creation below is SDK-backed.
+                await ssh_client.run(command)
 
             # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
             # by default (creation time scales with size). `sparse=true` writes a sparse
@@ -3331,6 +3541,15 @@ class DockerService:
             name, driver = parts
             if _is_vloopback_driver(driver) and _is_safe_docker_volume_name(name):
                 volume_names.append(name)
+        return await self._inspect_vloopback_volumes_bytes(ssh_client, volume_names)
+
+    async def _inspect_vloopback_volumes_bytes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        volume_names: list[str],
+    ) -> int:
+        """Sum of the declared sizes of the given vloopback volumes (one `docker volume inspect`);
+        0 without a command when there is nothing to inspect."""
         if not volume_names:
             return 0
 
@@ -3368,14 +3587,69 @@ class DockerService:
                 )
         return total_bytes
 
+    @staticmethod
+    def measures_host_for_volume_sizing(payload: ContainerCreateRequest) -> bool:
+        """True when `resolve_volume_sizing` will measure the host (the fresh DAH-2183 contract);
+        False for the two passthrough contracts it returns without any SSH command."""
+        return payload.storage_limit_gb is not None and payload.disk_share is not None
+
+    async def probe_volume_host(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        *,
+        with_df: bool,
+        log_extra: dict,
+    ) -> VolumeHostProbe | None:
+        """RENTAL_VOLUME_FAST_PATH_ENABLED: the volume-stage host facts in one SSH round trip.
+
+        Replaces `docker info` + the df helper container + `docker volume ls` (fresh sizing) and the
+        second `docker info` + the unconditional `docker plugin install` (create) — five serial
+        commands, one of them a Docker Hub round trip — with one command and, when vloopback
+        volumes exist, the same `docker volume inspect` as before. Never fatal: on any failure it
+        returns None and the callers take the exact path they take with the flag off.
+        """
+        started = now_ms()
+        try:
+            result = await ssh_client.run(_volume_host_probe_command(with_df=with_df))
+            probe = _parse_volume_host_probe(result.stdout or "", with_df=with_df)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "volume_host_probe_fallback",
+                    extra=get_extra_info({**log_extra, "error": str(exc)}),
+                ),
+            )
+            return None
+        logger.info(
+            _m(
+                "volume_host_probe",
+                extra=get_extra_info({
+                    **log_extra,
+                    "docker_root_dir": probe.docker_root_dir,
+                    "df_avail_bytes": probe.df_avail_bytes,
+                    "vloopback_volumes": len(probe.vloopback_volume_names),
+                    "loopback_plugin_enabled": probe.loopback_plugin_enabled,
+                    "probe_ms": now_ms() - started,
+                }),
+            )
+        )
+        return probe
+
     async def resolve_volume_sizing(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         log_tag: str,
         log_extra: dict,
+        host_probe: VolumeHostProbe | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        With `host_probe` (RENTAL_VOLUME_FAST_PATH_ENABLED) the fresh path reads DockerRootDir,
+        df and the vloopback volume names from the probe instead of running three commands;
+        only `docker volume inspect` still goes to the host, and only when volumes exist.
 
         Legacy contract (payload.disk_share is None): backend-sent
         volume_limit_gb/storage_limit_gb are exact sizes and are returned
@@ -3398,24 +3672,24 @@ class DockerService:
         ``storage_limit_gb`` from ``disk_share`` and dockerd would reject
         the run with "supported only for overlay over xfs with 'pquota'".
         """
-        if payload.storage_limit_gb is None:
+        if not self.measures_host_for_volume_sizing(payload):
             return VolumeSizingResult(
                 volume_limit_gb=payload.volume_limit_gb,
                 storage_limit_gb=payload.storage_limit_gb,
-                path="storage_opt_unsupported",
-            )
-
-        if payload.disk_share is None:
-            return VolumeSizingResult(
-                volume_limit_gb=payload.volume_limit_gb,
-                storage_limit_gb=payload.storage_limit_gb,
-                path="legacy",
+                path="storage_opt_unsupported" if payload.storage_limit_gb is None else "legacy",
             )
 
         try:
-            docker_root_dir = await self.get_docker_root_dir(ssh_client)
-            df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-            existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
+            if host_probe is not None and host_probe.df_avail_bytes is not None:
+                docker_root_dir = host_probe.docker_root_dir
+                df_avail_bytes = host_probe.df_avail_bytes
+                existing_volumes_bytes = await self._inspect_vloopback_volumes_bytes(
+                    ssh_client, host_probe.vloopback_volume_names
+                )
+            else:
+                docker_root_dir = await self.get_docker_root_dir(ssh_client)
+                df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4479,6 +4753,31 @@ class DockerService:
                 if local_volume:
                     protected_volume_names.add(local_volume)
 
+                # DAH-3257: one SSH command reads every host listing the steps down to `docker run`
+                # need (containers, volumes, mounted volumes, GPU minor map, device nodes, power
+                # state, the image's encryption label). Each consumer takes the probe in place of
+                # its own listing command; every removal and write below still runs as before.
+                # None (flag off, or the probe failed) leaves every consumer on its own commands.
+                host_probe: PrerunHostProbe | None = None
+                if settings.RENTAL_PRERUN_HOST_PROBE_ENABLED:
+                    current_step = "prerun_host_probe"
+                    host_probe = await self.probe_prerun_host(
+                        ssh_client,
+                        docker_image=payload.docker_image,
+                        # A PEARL filler caps its GPUs with live nvidia-smi queries of its own
+                        # (apply_filler_gpu_power_limits) and never reads the probe's power state.
+                        with_power=not (
+                            payload.workload_kind == WorkloadKind.FILLER and bool(payload.gpu_power_limits)
+                        ),
+                        log_extra=default_extra,
+                    )
+                # The probe is a snapshot. Once a step below removes a container or a volume, the
+                # container/volume listings are stale (a removed volume would still read as present,
+                # a removed container as still mounting its volume), so the later sweeps go back to
+                # their own commands. The GPU, power and image-label sections are unaffected by a
+                # docker removal and stay in use.
+                docker_listing_probe: PrerunHostProbe | None = host_probe
+
                 current_step = "container_cleanup"
                 # DAH-1524: the GC below (force-removing stale pod_/filler_
                 # containers + their volumes that aren't in active_*) stays on the
@@ -4489,20 +4788,26 @@ class DockerService:
                 # wait_for_port_check_containers just before `docker run`, and the
                 # 90s _run_docker_create_with_port_retry budget), so we no longer
                 # block the critical path for ~10s. (sleep defaults to 0.)
-                await self.clean_existing_containers(
+                removed_containers = await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     pod_name=container_name,
                     clear_volume=False if local_volume else True,
                     active_container_names=payload.active_container_names,
                     active_volume_names=payload.active_volume_names,
+                    host_probe=docker_listing_probe,
                 )
+                if removed_containers:
+                    docker_listing_probe = None
 
-                await self.clean_stale_vloopback_volumes(
+                removed_vloopback_volumes = await self.clean_stale_vloopback_volumes(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     skip_volume_names=protected_volume_names,
+                    host_probe=docker_listing_probe,
                 )
+                if removed_vloopback_volumes:
+                    docker_listing_probe = None
 
                 # DAH-2475: sweep FIRST, against the names the backend REQUESTED. The stale old-version
                 # cache is dead weight (its names will never be requested again), and it is often the
@@ -4510,11 +4815,14 @@ class DockerService:
                 # must happen before affordability is judged, or a renamed cache strands the node in a
                 # cold-start loop it can never leave. Sweeping requested-but-not-yet-granted names is
                 # safe: they either do not exist yet or are the current version worth keeping.
-                await self.sweep_stale_cache_volumes(
+                swept_cache_volumes = await self.sweep_stale_cache_volumes(
                     ssh_client=ssh_client,
                     payload=payload,
                     default_extra=default_extra,
+                    host_probe=docker_listing_probe,
                 )
+                if swept_cache_volumes:
+                    docker_listing_probe = None
 
                 # The backend asks for the cache it wants; only the host knows whether those volumes
                 # already exist, and therefore whether mounting them costs a download at all.
@@ -4522,12 +4830,14 @@ class DockerService:
                     ssh_client=ssh_client,
                     payload=payload,
                     default_extra=default_extra,
+                    host_probe=docker_listing_probe,
                 )
 
                 await self.reclaim_dphn_cache_for_rental(
                     ssh_client=ssh_client,
                     payload=payload,
                     default_extra=default_extra,
+                    host_probe=docker_listing_probe,
                 )
 
                 # Add profiler for docker volume creation
@@ -4540,6 +4850,21 @@ class DockerService:
                 effective_storage_limit_gb = payload.storage_limit_gb
 
                 if not local_volume:
+                    # DAH-3240: one round trip for the host facts the sizing and the create need
+                    # (flag off → None → the per-command path below, unchanged).
+                    volume_probe: VolumeHostProbe | None = None
+                    measures_host = self.measures_host_for_volume_sizing(payload)
+                    # probe only when something reads it: the host-measuring sizing (df) or a limited
+                    # volume's plugin install (root dir + plugin state); an unlimited volume on a
+                    # passthrough contract needs neither, so it pays for no command
+                    if settings.RENTAL_VOLUME_FAST_PATH_ENABLED and (measures_host or payload.volume_limit_gb):
+                        current_step = "volume_host_probe"
+                        volume_probe = await self.probe_volume_host(
+                            ssh_client,
+                            with_df=measures_host,
+                            log_extra=default_extra,
+                        )
+
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
                     sizing = await self.resolve_volume_sizing(
@@ -4547,6 +4872,7 @@ class DockerService:
                         payload=payload,
                         log_tag=log_tag,
                         log_extra=default_extra,
+                        host_probe=volume_probe,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb
@@ -4570,6 +4896,7 @@ class DockerService:
                         log_extra=default_extra,
                         limit=effective_volume_limit_gb,
                         sparse=full_node_rental,
+                        host_probe=volume_probe,
                     )
                     created_local_volume = True
 
@@ -4591,6 +4918,7 @@ class DockerService:
                     if not await self._image_has_encrypted_volume_label(
                         ssh_client,
                         payload.docker_image,
+                        host_probe=host_probe,
                     ):
                         use_encrypted_volume = False
                         volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
@@ -4665,6 +4993,7 @@ class DockerService:
                     payload.gpu_uuids,
                     executor_id=payload.executor_id,
                     default_extra=default_extra,
+                    host_probe=host_probe,
                 )
 
                 if payload.cluster_membership is not None:
@@ -4692,16 +5021,22 @@ class DockerService:
                     # inherits a reduced limit. Best-effort, never blocks the rental.
                     if payload.gpu_uuids:
                         await restore_tracked_gpu_power_limits(
-                            ssh_client, self.redis_service, payload.gpu_uuids, log_extra=default_extra
+                            ssh_client,
+                            self.redis_service,
+                            payload.gpu_uuids,
+                            log_extra=default_extra,
+                            host_probe=host_probe,
                         )
                     else:
                         # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
                         await restore_all_host_gpu_power_limits(
-                            ssh_client, self.redis_service, log_extra=default_extra
+                            ssh_client, self.redis_service, log_extra=default_extra, host_probe=host_probe
                         )
                     # State-free last-resort net: if a pre-cap record was lost, the record-based
                     # restore above did nothing — lift anything still below the check's floor back
                     # to the GPU's own default, so the customer never starts on a capped GPU.
+                    # Always a live query: volume creation and a bootstrap restore ran since the
+                    # probe, so its power state can be minutes old.
                     await raise_low_power_limits_to_default(
                         ssh_client,
                         payload.executor_id,
@@ -5307,11 +5642,10 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
+        asyncssh.import_private_key(private_key)  # validates the key, raises on a bad payload
 
-        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            known_hosts_policy = await self._prepare_known_hosts_policy(
+            await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
@@ -6323,9 +6657,8 @@ class DockerService:
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
 
-        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            known_hosts_policy = await self._prepare_known_hosts_policy(
+            await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,

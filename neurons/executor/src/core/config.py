@@ -9,7 +9,7 @@ VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
 try:
     from core.config_override import _VALIDATOR_HOTKEY_SS58 
     VALIDATOR_HOTKEY_SS58 = _VALIDATOR_HOTKEY_SS58
-except Exception as e:
+except Exception:
     pass
 
 class Settings(BaseSettings):
@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # nonce. Leave off until the validator fleet mints nonces (migration order:
     # executors accept optional nonce first, then validators send, then this).
     REQUIRE_ATTESTATION_NONCE: bool = Field(env="REQUIRE_ATTESTATION_NONCE", default=False)
+    # DAH-3200: the backend signs `timestamp = int(time.time())` into every /containers/{name}
+    # request (utilization and logs). A signed request older or newer than this many seconds is
+    # refused, so a captured one cannot be replayed for the life of the container. Symmetric so a
+    # host clock that runs ahead is treated like one that runs behind; wide enough for NTP drift.
+    CONTAINER_SIGNATURE_MAX_AGE_SECONDS: int = Field(env="CONTAINER_SIGNATURE_MAX_AGE_SECONDS", default=300)
 
 
 settings = Settings()
