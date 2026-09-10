@@ -3,8 +3,8 @@ set -e
 
 # Lium Executor — Sysbox Setup
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Datura-ai/compute-subnet/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
-#   or: cd compute-subnet/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
+#   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
+#   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
@@ -34,9 +34,19 @@ version_ge() {
     [ "$major" -gt "$2" ] 2>/dev/null || { [ "$major" -eq "$2" ] && [ "$minor" -ge "$3" ]; } 2>/dev/null
 }
 
-docker_version_ge() {
+docker_server_version() {
     # the DAEMON version — it writes the OCI spec sysbox has to accept, and it can differ from the client
-    version_ge "$(docker version --format '{{.Server.Version}}' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" "$1" "$2"
+    docker version --format '{{.Server.Version}}' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+docker_version_ge() { version_ge "$(docker_server_version)" "$1" "$2"; }
+
+version3_ge() {
+    # "a.b.c" >= "x.y.z", all three components numeric (driver versions: 580.65.06 vs the validators' minimum)
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        n = split(a, x, "."); split(b, y, ".")
+        for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+        exit 0 }'
 }
 
 kernel_supports_idmapped() {
@@ -137,11 +147,14 @@ pf_fix() {
 host_path() { echo "${HOST_ROOT:-}$1"; }
 
 self_cmd() {
-    # how to run this script again, with $@ as its options: the file when there is one, else the one-liner (curl | bash)
+    # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
+    # argument goes after sudo (sudo's env_reset drops variables set before it); the rest are the script's options.
+    local env=""
+    case "${1:-}" in *=*) env="$1 "; shift ;; esac
     if [ -f "$0" ]; then
-        echo "sudo bash $0${1:+ $*}"
+        echo "sudo ${env}bash $0${1:+ $*}"
     else
-        echo "curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash${1:+ -s -- $*}"
+        echo "curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo ${env}bash${1:+ -s -- $*}"
     fi
 }
 
@@ -150,10 +163,6 @@ os_release_field() {
     local file
     file=$(host_path /etc/os-release)
     [ -r "$file" ] && sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}$/\1/p" "$file" | head -1
-}
-
-docker_server_version() {
-    docker version --format '{{.Server.Version}}' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
 }
 
 daemon_feature_off() {
@@ -198,7 +207,7 @@ check_kernel() {
         22.04) pf_fix "Kernel $kernel is below 5.19 — sysbox cannot pass GPUs through without ID-mapped mounts." \
                    "sudo apt-get install -y linux-generic-hwe-22.04 && sudo reboot" \
                    "Before rebooting: stop any rentals; 'dkms status' must list the nvidia module or the driver will not load on the new kernel." \
-                   "If this kernel is known to carry the ID-mapped mounts backport: SYSBOX_SKIP_KERNEL_CHECK=1 $(self_cmd)" ;;
+                   "If this kernel is known to carry the ID-mapped mounts backport: $(self_cmd SYSBOX_SKIP_KERNEL_CHECK=1)" ;;
         20.04) pf_fix "Kernel $kernel is below 5.19 and Ubuntu 20.04 tops out at 5.15 even with HWE." \
                    "Upgrade the host to Ubuntu 22.04 or newer (sudo do-release-upgrade), then re-run this script." ;;
         *)     pf_fix "Kernel $kernel is below 5.19 — sysbox cannot pass GPUs through without ID-mapped mounts." \
@@ -246,9 +255,11 @@ check_docker_features() {
         pf_pass "Docker $version has the sysbox settings in /etc/docker/daemon.json (features.cdi$(docker_version_ge 29 5 && echo ' and features.time-namespaces') = false)."
         return 0
     fi
+    local block='{"features":{"cdi":false}}'
+    docker_version_ge 29 5 && block='{"features":{"cdi":false,"time-namespaces":false}}'
     pf_fix "Docker $version without features.$missing = false in /etc/docker/daemon.json — sysbox rejects its containers." \
         "$(self_cmd)   # writes the features block and restarts Docker; stop rentals first" \
-        "or by hand: add {\"features\":{\"cdi\":false,\"time-namespaces\":false}} to /etc/docker/daemon.json && sudo systemctl restart docker"
+        "or by hand: add $block to /etc/docker/daemon.json && sudo systemctl restart docker"
 }
 
 check_nvidia_driver() {
@@ -264,7 +275,7 @@ check_nvidia_driver() {
             "sudo reboot   # then check 'nvidia-smi'; if it still fails: sudo dkms autoinstall && sudo reboot"
         return 1
     fi
-    if version_ge "$driver" "${MIN_NVIDIA_DRIVER%%.*}" "$(echo "$MIN_NVIDIA_DRIVER" | cut -d. -f2)"; then
+    if version3_ge "$driver" "$MIN_NVIDIA_DRIVER"; then
         pf_pass "NVIDIA driver $driver ($(nvidia-smi --list-gpus 2>/dev/null | grep -c '^GPU') GPU(s))."
         return 0
     fi
@@ -317,7 +328,8 @@ check_disk_for_vram() {
     vram_gb=$(awk -v m="$vram_mib" 'BEGIN {printf "%.1f", m / 1024}')
     total_gb=$(awk -v k="$total_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
     needed_gb=$(awk -v v="$vram_gb" -v r="$MIN_DISK_TO_VRAM_RATE" 'BEGIN {printf "%.1f", v * r}')
-    if awk -v t="$total_gb" -v n="$needed_gb" 'BEGIN {exit !(t >= n)}'; then
+    # the validator rounds VRAM and disk to 0.1 GB, then compares VRAM x 1.5 unrounded with the disk
+    if awk -v t="$total_gb" -v v="$vram_gb" -v r="$MIN_DISK_TO_VRAM_RATE" 'BEGIN {exit !(t >= v * r)}'; then
         pf_pass "Disk ${total_gb} GB on $data_root >= ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — idle pay eligible."
         return 0
     fi
@@ -327,12 +339,12 @@ check_disk_for_vram() {
 
 preflight_ports() {
     # EXECUTOR_PORT / SSH_PORT from the environment, else the executor .env next to this script, else the defaults
-    local env_file
-    env_file="$(dirname "$0")/.env"
-    if [ -z "${EXECUTOR_PORT:-}" ] && [ -r "$env_file" ]; then
+    local env_file=""
+    [ -f "$0" ] && env_file="$(dirname "$0")/.env"   # piped from curl there is no file next to the script
+    if [ -z "${EXECUTOR_PORT:-}" ] && [ -n "$env_file" ] && [ -r "$env_file" ]; then
         EXECUTOR_PORT=$(sed -n 's/^EXTERNAL_PORT=\([0-9]*\).*/\1/p' "$env_file" | head -1)
     fi
-    if [ -z "${SSH_PORT:-}" ] && [ -r "$env_file" ]; then
+    if [ -z "${SSH_PORT:-}" ] && [ -n "$env_file" ] && [ -r "$env_file" ]; then
         SSH_PORT=$(sed -n 's/^SSH_PORT=\([0-9]*\).*/\1/p' "$env_file" | head -1)
     fi
     echo "${EXECUTOR_PORT:-8080} ${SSH_PORT:-2200}"

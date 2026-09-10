@@ -122,6 +122,15 @@ def _host_root(tmp_path, files=None):
     return root
 
 
+def _script_copy(tmp_path):
+    """The script in its own directory, so the `.env` it may read next to itself is the test's, never the checkout's."""
+    copy_dir = tmp_path / "executor"
+    copy_dir.mkdir(exist_ok=True)
+    copy = copy_dir / "nvidia_docker_sysbox_setup.sh"
+    shutil.copy(SCRIPT, copy)
+    return copy
+
+
 def run_check(tmp_path, function, *, env=None, files=None, with_jq=False, without=()):
     """Source the installer's functions and run one check; returns (rc, output, fix_count)."""
     stubs = _bin_dir(tmp_path, with_jq=with_jq, without=without)
@@ -133,6 +142,7 @@ def run_check(tmp_path, function, *, env=None, files=None, with_jq=False, withou
         ["bash", "-c", program],
         capture_output=True,
         text=True,
+        cwd=tmp_path,
         env={"PATH": str(stubs), "HOST_ROOT": str(root), **(env or {})},
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -146,10 +156,11 @@ def run_script(tmp_path, *args, env=None, files=None, without=()):
     stubs = _bin_dir(tmp_path, with_jq=False, without=without)
     root = _host_root(tmp_path, files)
     proc = subprocess.run(
-        ["bash", SCRIPT, *args],
+        ["bash", str(_script_copy(tmp_path)), *args],
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
         env={"PATH": str(stubs), "HOST_ROOT": str(root), **(env or {})},
     )
     proc.stdout = ANSI.sub("", proc.stdout)
@@ -173,7 +184,8 @@ def test_kernel_5_15_on_22_04_names_the_hwe_kernel(tmp_path):
     assert rc == 1 and fix == 1
     assert "FIX  Kernel 5.15.0-91-generic is below 5.19" in out
     assert "sudo apt-get install -y linux-generic-hwe-22.04 && sudo reboot" in out
-    assert "SYSBOX_SKIP_KERNEL_CHECK=1" in out
+    # the override goes after sudo: sudo's env_reset drops a variable set in front of it (sourced here, so the curl form)
+    assert "backport: curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo SYSBOX_SKIP_KERNEL_CHECK=1 bash" in out
 
 
 def test_kernel_5_15_on_20_04_says_upgrade_the_distro(tmp_path):
@@ -226,7 +238,7 @@ def test_docker_29_7_without_the_two_settings_names_both(tmp_path, with_jq):
     rc, out, _ = run_check(tmp_path, "check_docker_features", env={"STUB_DOCKER_VERSION": "29.7.0"}, with_jq=with_jq)
     assert rc == 1
     assert "FIX  Docker 29.7.0 without features.cdi, time-namespaces = false" in out
-    assert '{"features":{"cdi":false,"time-namespaces":false}}' in out
+    assert 'add {"features":{"cdi":false,"time-namespaces":false}} to /etc/docker/daemon.json' in out
 
 
 @pytest.mark.parametrize("with_jq", [False, True])
@@ -264,6 +276,8 @@ def test_docker_29_3_with_cdi_still_on_is_a_fix(tmp_path):
     )
     assert rc == 1
     assert "FIX  Docker 29.3.0 without features.cdi = false" in out
+    # below 29.5 the by-hand block names cdi only, like the install step
+    assert 'add {"features":{"cdi":false}} to /etc/docker/daemon.json' in out
 
 
 def test_docker_28_needs_no_features(tmp_path):
@@ -294,10 +308,17 @@ def test_nvidia_driver_not_loaded_is_a_fix(tmp_path):
     assert "FIX  NVIDIA driver is installed but not loaded" in out
 
 
-def test_nvidia_driver_below_validator_minimum_is_a_fix(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_nvidia_driver", env={"STUB_NV_DRIVER": "575.57.08"})
+@pytest.mark.parametrize("driver", ["575.57.08", "580.65.05", "580.64.99"])
+def test_nvidia_driver_below_validator_minimum_is_a_fix(tmp_path, driver):
+    rc, out, _ = run_check(tmp_path, "check_nvidia_driver", env={"STUB_NV_DRIVER": driver})
     assert rc == 1
-    assert "FIX  NVIDIA driver 575.57.08 is below 580.65.06" in out
+    assert f"FIX  NVIDIA driver {driver} is below 580.65.06" in out
+
+
+@pytest.mark.parametrize("driver", ["580.65.06", "580.65.10", "581.0.0"])
+def test_nvidia_driver_at_or_above_the_minimum_passes(tmp_path, driver):
+    rc, out, _ = run_check(tmp_path, "check_nvidia_driver", env={"STUB_NV_DRIVER": driver})
+    assert rc == 0, out
 
 
 def test_nvidia_toolkit_present_and_missing(tmp_path):
@@ -349,6 +370,17 @@ def test_disk_below_the_rule_is_a_fix_with_the_numbers(tmp_path):
     assert "FIX  Disk 500.0 GB on " in out
     assert "is below 955.8 GB (1.5x of 637.2 GB VRAM)" in out
     assert "earns nothing while idle" in out
+
+
+def test_disk_rule_compares_like_the_validator_at_the_boundary(tmp_path):
+    # 1x 81613 MiB = 79.7 GB VRAM -> 119.55 GB needed. The validator compares 79.7 * 1.5 unrounded with the rounded
+    # disk, so 119.5 GB fails; a compare against the displayed (rounded) 119.5 would have passed it.
+    env = {"STUB_NV_GPUS": "1", "STUB_NV_MEM_MIB": "81613"}
+    rc, out, _ = run_check(tmp_path, "check_disk_for_vram", env={**env, "STUB_DF_TOTAL_KB": str(int(119.5 * 1024 * 1024))})
+    assert rc == 1, out
+    assert "FIX  Disk 119.5 GB" in out and "(1.5x of 79.7 GB VRAM)" in out
+    rc, out, _ = run_check(tmp_path, "check_disk_for_vram", env={**env, "STUB_DF_TOTAL_KB": str(int(119.6 * 1024 * 1024))})
+    assert rc == 0, out
 
 
 def test_disk_rule_is_skipped_without_a_gpu(tmp_path):
@@ -403,21 +435,30 @@ def test_ports_come_from_env_then_the_env_file(tmp_path):
 
 
 def test_env_file_next_to_the_script_is_read(tmp_path):
-    # $0 is the script under test when sourced via a copy next to a .env
-    copy_dir = tmp_path / "executor"
-    copy_dir.mkdir()
-    shutil.copy(SCRIPT, copy_dir / "nvidia_docker_sysbox_setup.sh")
-    (copy_dir / ".env").write_text("INTERNAL_PORT=8001\nEXTERNAL_PORT=8123 # external\nSSH_PORT=2299\n")
+    copy = _script_copy(tmp_path)
+    (copy.parent / ".env").write_text("INTERNAL_PORT=8001\nEXTERNAL_PORT=8123 # external\nSSH_PORT=2299\n")
+    proc = run_script(tmp_path, "--check")
+    assert "TCP 8123 (executor port)" in proc.stdout and "TCP 2299 (SSH port)" in proc.stdout
+
+
+def test_env_file_in_the_working_directory_is_ignored_when_piped_from_curl(tmp_path):
+    # piped from curl $0 is `bash`; a `.env` in the provider's cwd must not steer the port check
+    (tmp_path / ".env").write_text("EXTERNAL_PORT=8123\nSSH_PORT=22\n")
     stubs = _bin_dir(tmp_path, with_jq=False)
     root = _host_root(tmp_path)
+    with open(SCRIPT) as fh:
+        script = fh.read()
     proc = subprocess.run(
-        ["bash", str(copy_dir / "nvidia_docker_sysbox_setup.sh"), "--check"],
+        ["bash", "-s", "--", "--check"],
+        input=script,
         capture_output=True,
         text=True,
-        stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
         env={"PATH": str(stubs), "HOST_ROOT": str(root)},
     )
-    assert "TCP 8123 (executor port)" in proc.stdout and "TCP 2299 (SSH port)" in proc.stdout
+    out = ANSI.sub("", proc.stdout)
+    assert "TCP 8080 (executor port)" in out and "TCP 2200 (SSH port)" in out
+    assert "TCP 22 " not in out
 
 
 # ── sysbox probe ─────────────────────────────────────────────────────────────
@@ -466,28 +507,31 @@ def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_pat
     assert "SKIP Disk >= 1.5x VRAM" in proc.stdout
     assert "PASS Kernel 6.8.0-45-generic" in proc.stdout
     assert "Preflight: 9 PASS, 2 FIX, 1 SKIP." in proc.stdout
-    assert f"Fix the lines above, then run: sudo bash {SCRIPT}" in proc.stdout
+    assert f"Fix the lines above, then run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'}" in proc.stdout
 
 
 def test_install_mode_stops_before_installing_on_a_fix(tmp_path):
-    apt = tmp_path / "bin" / "apt-get"
-    apt.parent.mkdir()
-    apt.write_text('#!/bin/bash\necho "apt-get $*" >> "$HOST_ROOT/apt.log"\n')
-    apt.chmod(0o755)
     proc = run_script(tmp_path, env={"STUB_KERNEL": "5.15.0-91-generic"})
-    root = tmp_path / "root"
     assert proc.returncode == 1
     assert "FIX  Kernel 5.15.0-91-generic is below 5.19" in proc.stdout
     assert "Nothing was installed." in proc.stdout
-    assert not (root / "apt.log").exists(), "apt must not run after a FIX"
-    assert "Installing packages" not in proc.stdout
+    # step 2 is the first thing after the preflight; on a good host the same stubs reach it (next test)
+    assert "Checking running containers" not in proc.stdout
+
+
+def test_install_mode_on_a_good_host_reaches_the_install_steps(tmp_path):
+    # the negative control for the test above: same stubs, kernel fine -> the preflight passes and the script goes on
+    proc = run_script(tmp_path)
+    assert "Preflight: 9 PASS, 0 FIX, 0 SKIP." in proc.stdout
+    assert "Nothing was installed." not in proc.stdout
+    assert "Checking running containers" in proc.stdout or "Sysbox is already working" in proc.stdout
 
 
 def test_not_root_is_a_fix_that_names_sudo(tmp_path):
     proc = run_script(tmp_path, "--check", env={"STUB_UID": "1000"})
     assert proc.returncode == 1
     assert "FIX  Not running as root" in proc.stdout
-    assert "sudo bash" in proc.stdout and "--check" in proc.stdout
+    assert f"sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
 
 
 def test_unknown_option_is_refused(tmp_path):
