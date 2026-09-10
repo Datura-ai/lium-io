@@ -843,6 +843,29 @@ async def test_slot_that_differs_falls_back_to_a_fresh_create(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_slot_with_an_extra_tmpfs_is_not_adopted(svc, monkeypatch):
+    """`--tmpfs /root` shadows the renter's volume at its data path and is recorded only in
+    HostConfig.Tmpfs, not in `.Mounts` (taiberium, #1337): the slot is removed, the rental created."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload()
+    spec = _spec(svc, payload)
+    image = _image_doc()
+    doc = _slot_doc(spec, image)
+    doc["HostConfig"]["Tmpfs"] = {spec.volumes[0].target: "rw,size=1g"}
+    slot = warm_pool.slot_from_inspect(doc, image_id=IMAGE_ID, now=NOW, max_age=MAX_AGE)
+    assert warm_pool.slot_matches(slot, spec, image) == "tmpfs or mount"
+    ssh = _host(svc, spec, image, slot_doc=doc)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert not any("docker rename" in c for c in _cmds(ssh))
+    assert any(f"docker rm -f {spec.name}" in c for c in _cmds(ssh))
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_miss_with_the_fast_path_on_probes_the_host_once_with_the_slot_listing_inside(
     svc, monkeypatch
 ):
@@ -1391,6 +1414,26 @@ async def test_flag_off_volume_failure_is_still_reported_as_the_volume_step(svc,
         (lambda d: d["HostConfig"].__setitem__("Dns", ["10.0.0.1"]), "extra host config"),
         (lambda d: d["HostConfig"].__setitem__("DnsSearch", ["evil.example"]), "extra host config"),
         (lambda d: d["HostConfig"].__setitem__("OomScoreAdj", -1000), "extra host config"),
+        (lambda d: d["HostConfig"].__setitem__("UTSMode", "host"), "namespace mode"),
+        # `--tmpfs` lives only in HostConfig.Tmpfs, never in `.Mounts`; `--mount` in HostConfig.Mounts
+        (lambda d: d["HostConfig"].__setitem__("Tmpfs", {"/root": ""}), "tmpfs or mount"),
+        (
+            lambda d: d["HostConfig"].__setitem__(
+                "Mounts", [{"Type": "bind", "Source": "/etc", "Target": "/root"}]
+            ),
+            "tmpfs or mount",
+        ),
+        # cgroup limits `docker update --cpus/--memory` at adoption would leave in place
+        (lambda d: d["HostConfig"].__setitem__("CpusetCpus", "0"), "extra host config"),
+        (lambda d: d["HostConfig"].__setitem__("PidsLimit", 16), "extra host config"),
+        (lambda d: d["HostConfig"].__setitem__("MemorySwap", 1 << 30), "extra host config"),
+        (lambda d: d["HostConfig"].__setitem__("AutoRemove", True), "extra host config"),
+        (
+            lambda d: d["HostConfig"].__setitem__(
+                "Annotations", {"org.systemd.property.CPUQuotaPerSecUSec": "uint64 100000"}
+            ),
+            "extra host config",
+        ),
         (
             lambda d: d["Config"].__setitem__(
                 "Healthcheck", {"Test": ["CMD-SHELL", "/opt/probe.sh"], "Interval": 5000000000}
