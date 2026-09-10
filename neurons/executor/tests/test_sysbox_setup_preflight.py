@@ -5,7 +5,7 @@ nobody had checked).
 
 Same harness as test_sysbox_setup_apt_repo.py: the script is run under bash with stub commands
 on PATH and the files it reads (/proc/modules, /etc/os-release, /etc/docker/daemon.json, ...)
-under a fixture HOST_ROOT. The check functions are sourced with SYSBOX_SETUP_LIB=1.
+under a fixture SYSBOX_SETUP_HOST_ROOT. The check functions are sourced with SYSBOX_SETUP_LIB=1.
 """
 
 import os
@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -40,9 +42,10 @@ STUBS = {
             "version --format") echo "${STUB_DOCKER_VERSION:-28.5.2}" ;;
             "ps ") exit 0 ;;
             "ps --filter") echo "${STUB_PORT_CONTAINER:-executor-1}" ;;
+            "info ") echo " Runtimes: io.containerd.runc.v2 nvidia runc sysbox-runc" ;;   # the "already working?" probe of install mode
             "info --format")
                 case "$3" in
-                    *DockerRootDir*) echo "${STUB_DOCKER_ROOT:-$HOST_ROOT/var/lib/docker}" ;;
+                    *DockerRootDir*) echo "${STUB_DOCKER_ROOT:-$SYSBOX_SETUP_HOST_ROOT/var/lib/docker}" ;;
                     *Runtimes*) echo "${STUB_DOCKER_RUNTIMES:-\\"runc\\", \\"sysbox-runc\\"}" ;;
                 esac ;;
             "run --rm") [ -z "${STUB_SYSBOX_RUN_FAILS:-}" ] && echo ok || { echo "OCI runtime create failed" >&2; exit 125; } ;;
@@ -60,7 +63,8 @@ STUBS = {
         """
     ),
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
-    "sysbox-runc": '#!/bin/bash\necho "sysbox-runc\\n\\tversion:\\t0.6.6"\n',
+    # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
+    "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t0.6.6\\n\\tcommit:\\tabc123\\n"\n',
     "ss": textwrap.dedent(
         """\
         #!/bin/bash
@@ -88,7 +92,7 @@ GOOD_FILES = {
 }
 
 
-def _bin_dir(tmp_path, *, with_jq: bool, without: tuple[str, ...] = ()):
+def _bin_dir(tmp_path: Path, *, with_jq: bool, without: tuple[str, ...] = ()) -> Path:
     """Stubs first, then the real tools the checks need — never the host's jq unless asked."""
     stubs = tmp_path / "bin"
     stubs.mkdir(exist_ok=True)
@@ -112,7 +116,8 @@ def _bin_dir(tmp_path, *, with_jq: bool, without: tuple[str, ...] = ()):
     return stubs
 
 
-def _host_root(tmp_path, files=None):
+def _host_root(tmp_path: Path, files: dict[str, str | None] | None = None) -> Path:
+    """The fixture tree the script reads through SYSBOX_SETUP_HOST_ROOT; a None value leaves that file out."""
     root = tmp_path / "root"
     for rel, content in {**GOOD_FILES, **(files or {})}.items():
         if content is None:
@@ -123,7 +128,7 @@ def _host_root(tmp_path, files=None):
     return root
 
 
-def _script_copy(tmp_path):
+def _script_copy(tmp_path: Path) -> Path:
     """The script in its own directory, so the `.env` it may read next to itself is the test's, never the checkout's."""
     copy_dir = tmp_path / "executor"
     copy_dir.mkdir(exist_ok=True)
@@ -132,27 +137,47 @@ def _script_copy(tmp_path):
     return copy
 
 
-def run_check(tmp_path, function, *, env=None, files=None, with_jq=False, without=()):
-    """Source the installer's functions and run one check; returns (rc, output, fix_count)."""
+class CheckResult(NamedTuple):
+    rc: int
+    output: str
+    fix_count: int
+
+
+def run_check(
+    tmp_path: Path,
+    function: str,
+    *,
+    env: dict[str, str] | None = None,
+    files: dict[str, str | None] | None = None,
+    with_jq: bool = False,
+    without: tuple[str, ...] = (),
+) -> CheckResult:
+    """Source the installer's functions and run one check."""
     stubs = _bin_dir(tmp_path, with_jq=with_jq, without=without)
     root = _host_root(tmp_path, files)
-    program = (
+    bash_snippet = (
         f"SYSBOX_SETUP_LIB=1 . {SCRIPT}\nset +e\n{function}\nrc=$?\necho \"RC=$rc FIX=$PREFLIGHT_FIX PASS=$PREFLIGHT_PASS SKIP=$PREFLIGHT_SKIP\"\n"
     )
     proc = subprocess.run(
-        ["bash", "-c", program],
+        ["bash", "-c", bash_snippet],
         capture_output=True,
         text=True,
         cwd=tmp_path,
-        env={"PATH": str(stubs), "HOST_ROOT": str(root), **(env or {})},
+        env={"PATH": str(stubs), "SYSBOX_SETUP_HOST_ROOT": str(root), **(env or {})},
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = ANSI.sub("", proc.stdout)
-    counts = dict(kv.split("=") for kv in out.strip().splitlines()[-1].split())
-    return int(counts["RC"]), out, int(counts["FIX"])
+    summary_counters = dict(kv.split("=") for kv in out.strip().splitlines()[-1].split())
+    return CheckResult(int(summary_counters["RC"]), out, int(summary_counters["FIX"]))
 
 
-def run_script(tmp_path, *args, env=None, files=None, without=()):
+def run_script(
+    tmp_path: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+    files: dict[str, str | None] | None = None,
+    without: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     """The installer itself, as a provider runs it, with the same stubs and fixture tree; stdout without colour."""
     stubs = _bin_dir(tmp_path, with_jq=False, without=without)
     root = _host_root(tmp_path, files)
@@ -162,7 +187,7 @@ def run_script(tmp_path, *args, env=None, files=None, without=()):
         text=True,
         stdin=subprocess.DEVNULL,
         cwd=tmp_path,
-        env={"PATH": str(stubs), "HOST_ROOT": str(root), **(env or {})},
+        env={"PATH": str(stubs), "SYSBOX_SETUP_HOST_ROOT": str(root), **(env or {})},
     )
     proc.stdout = ANSI.sub("", proc.stdout)
     return proc
@@ -378,14 +403,14 @@ def test_iptables_built_in_modules_count_as_loaded(tmp_path):
 
 def test_disk_rule_uses_total_size_of_dockers_filesystem(tmp_path):
     # 8 x 81559 MiB = 637.2 GB VRAM -> needs 955.8 GB; the fixture filesystem is 1000.0 GB
-    rc, out, _ = run_check(tmp_path, "check_disk_for_vram")
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram")
     assert rc == 0
     assert "PASS Disk 1000.0 GB on " in out
     assert ">= 955.8 GB (1.5x of 637.2 GB VRAM)" in out
 
 
 def test_disk_below_the_rule_is_a_fix_with_the_numbers(tmp_path):
-    rc, out, _ = run_check(tmp_path, "check_disk_for_vram", env={"STUB_DF_TOTAL_KB": str(500 * 1024 * 1024)})
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env={"STUB_DF_TOTAL_KB": str(500 * 1024 * 1024)})
     assert rc == 1
     assert "FIX  Disk 500.0 GB on " in out
     assert "is below 955.8 GB (1.5x of 637.2 GB VRAM)" in out
@@ -396,15 +421,15 @@ def test_disk_rule_compares_like_the_validator_at_the_boundary(tmp_path):
     # 1x 81613 MiB = 79.7 GB VRAM -> 119.55 GB needed. The validator compares 79.7 * 1.5 unrounded with the rounded
     # disk, so 119.5 GB fails; a compare against the displayed (rounded) 119.5 would have passed it.
     env = {"STUB_NV_GPUS": "1", "STUB_NV_MEM_MIB": "81613"}
-    rc, out, _ = run_check(tmp_path, "check_disk_for_vram", env={**env, "STUB_DF_TOTAL_KB": str(int(119.5 * 1024 * 1024))})
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env={**env, "STUB_DF_TOTAL_KB": str(int(119.5 * 1024 * 1024))})
     assert rc == 1, out
     assert "FIX  Disk 119.5 GB" in out and "(1.5x of 79.7 GB VRAM)" in out
-    rc, out, _ = run_check(tmp_path, "check_disk_for_vram", env={**env, "STUB_DF_TOTAL_KB": str(int(119.6 * 1024 * 1024))})
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env={**env, "STUB_DF_TOTAL_KB": str(int(119.6 * 1024 * 1024))})
     assert rc == 0, out
 
 
 def test_disk_rule_is_skipped_without_a_gpu(tmp_path):
-    rc, out, fix = run_check(tmp_path, "check_disk_for_vram", without=("nvidia-smi",))
+    rc, out, fix = run_check(tmp_path, "check_total_disk_for_vram", without=("nvidia-smi",))
     assert rc == 0 and fix == 0
     assert "SKIP Disk >= 1.5x VRAM — no NVIDIA driver" in out
 
@@ -456,7 +481,7 @@ def test_ufw_active_without_a_rule_names_ufw_allow(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_ports", env={"STUB_UFW_STATUS": ufw})
     assert rc == 1
     assert "PASS TCP 8080 (executor port)" in out
-    assert "FIX  TCP 2200 (SSH port) is blocked by ufw" in out
+    assert "FIX  TCP 2200 (SSH port) has no inbound allow rule in the active ufw" in out
     assert "sudo ufw allow 2200/tcp" in out
 
 
@@ -471,6 +496,15 @@ def test_ufw_verbose_and_interface_rows_are_read(tmp_path):
     ufw = "Status: active\\n8080/tcp on eth0   ALLOW IN   Anywhere\\n2200/tcp (v6)   ALLOW IN   Anywhere (v6)\\n2200   ALLOW IN   Anywhere"
     rc, out, _ = run_check(tmp_path, "check_ports", env={"STUB_UFW_STATUS": ufw})
     assert rc == 0, out
+
+
+def test_ufw_allow_out_row_does_not_open_an_inbound_port(tmp_path):
+    # an outbound rule (or a `ufw route` FWD rule) on the port is not a rule that lets validators in; only 2200 has an inbound ALLOW
+    ufw = "Status: active\\n8080/tcp   ALLOW OUT   Anywhere\\n8080/tcp   ALLOW FWD   Anywhere\\n2200/tcp   ALLOW IN   Anywhere"
+    rc, out, _ = run_check(tmp_path, "check_ports", env={"STUB_UFW_STATUS": ufw})
+    assert rc == 1
+    assert "FIX  TCP 8080 (executor port) has no inbound allow rule in the active ufw" in out
+    assert "PASS TCP 2200 (SSH port)" in out
 
 
 def test_ports_come_from_env_then_the_env_file(tmp_path):
@@ -499,7 +533,7 @@ def test_env_file_in_the_working_directory_is_ignored_when_piped_from_curl(tmp_p
         capture_output=True,
         text=True,
         cwd=tmp_path,
-        env={"PATH": str(stubs), "HOST_ROOT": str(root)},
+        env={"PATH": str(stubs), "SYSBOX_SETUP_HOST_ROOT": str(root)},
     )
     out = ANSI.sub("", proc.stdout)
     assert "TCP 8080 (executor port)" in out and "TCP 2200 (SSH port)" in out
@@ -555,30 +589,85 @@ def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_pat
     assert f"Fix the lines above, then run: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'}" in proc.stdout
 
 
-def test_install_mode_stops_before_installing_on_a_fix(tmp_path):
-    proc = run_script(tmp_path, env={"STUB_KERNEL": "5.15.0-91-generic"})
+@pytest.mark.parametrize(
+    "env, fix_line",
+    [
+        ({"STUB_KERNEL": "5.15.0-91-generic"}, "FIX  Kernel 5.15.0-91-generic is below 5.19"),
+        ({"STUB_NO_DOCKER_DAEMON": "1"}, "FIX  Docker daemon is not running"),
+        ({"STUB_ARCH": "aarch64"}, "FIX  Architecture aarch64"),
+    ],
+)
+def test_install_mode_stops_before_installing_on_a_blocking_fix(tmp_path, env, fix_line):
+    # sysbox itself cannot go on this host without these; nothing after the preflight runs
+    proc = run_script(tmp_path, env=env)
     assert proc.returncode == 1
-    assert "FIX  Kernel 5.15.0-91-generic is below 5.19" in proc.stdout
+    assert fix_line in proc.stdout
     assert "Nothing was installed." in proc.stdout
-    # step 2 is the first thing after the preflight; on a good host the same stubs reach it (next test)
-    assert "Checking running containers" not in proc.stdout
+    assert "Sysbox is already working" not in proc.stdout and "Checking running containers" not in proc.stdout
 
 
 def test_install_mode_on_a_good_host_reaches_the_install_steps(tmp_path):
-    # the negative control for the test above: same stubs, kernel fine -> the preflight passes and the script goes on
+    # the negative control for the test above: same stubs, host fine -> the preflight passes and the script goes on
+    # (the stubbed Docker already knows sysbox-runc and runs the GPU probe, so the script ends at "Nothing to do.")
     proc = run_script(tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Preflight: 9 PASS, 0 FIX, 0 SKIP." in proc.stdout
     assert "Nothing was installed." not in proc.stdout
-    assert "Checking running containers" in proc.stdout or "Sysbox is already working" in proc.stdout
+    assert "Sysbox is already working. Nothing to do." in proc.stdout
+    assert "FIX line(s) at the top" not in proc.stdout
 
 
-def test_not_root_is_a_fix_that_names_sudo(tmp_path):
-    proc = run_script(tmp_path, "--check", env={"STUB_UID": "1000"})
+@pytest.mark.parametrize(
+    "env, without, fix_line",
+    [
+        ({"STUB_NV_DRIVER": "575.57.08"}, (), "FIX  NVIDIA driver 575.57.08 is below 580.65.06"),
+        ({}, ("nvidia-smi",), "FIX  nvidia-smi not found"),
+        ({"STUB_DF_TOTAL_KB": str(500 * 1024 * 1024)}, (), "FIX  Disk 500.0 GB on "),
+        ({"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "nginx"}, (), "FIX  TCP 8080 (executor port) is already in use by "),
+        ({"STUB_UFW_STATUS": "Status: active"}, (), "FIX  TCP 2200 (SSH port) has no inbound allow rule in the active ufw"),
+    ],
+)
+def test_install_mode_goes_on_after_an_advisory_fix(tmp_path, env, without, fix_line):
+    # driver, disk and ports are what the validators want once the node runs; without sysbox the node is not
+    # listed at all, so the FIX is printed with its command and the install continues to a clean exit
+    proc = run_script(tmp_path, env=env, without=without)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert fix_line in proc.stdout
+    assert "The FIX lines above do not stop the install" in proc.stdout
+    assert "Nothing was installed." not in proc.stdout
+    assert "Sysbox is already working. Nothing to do." in proc.stdout
+    assert f"Run those commands, then: sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
+
+
+def test_install_mode_goes_on_without_the_iptables_modules(tmp_path):
+    # the ticket-0309 cause: the FIX names the modprobe, and the install no longer waits for it
+    proc = run_script(tmp_path, files={"proc/modules": "nf_tables 311296 0\n"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "FIX  Kernel modules ip_tables iptable_nat iptable_filter are not loaded" in proc.stdout
+    assert "sudo modprobe -a ip_tables iptable_nat iptable_filter" in proc.stdout
+    assert "Sysbox is already working. Nothing to do." in proc.stdout
+    assert "The preflight printed 1 FIX line(s) at the top." in proc.stdout
+
+
+def test_check_mode_still_exits_one_on_an_advisory_fix(tmp_path):
+    # --check reports; the advisory / blocking split is install mode's
+    proc = run_script(tmp_path, "--check", env={"STUB_NV_DRIVER": "575.57.08"})
+    assert proc.returncode == 1
+    assert "FIX  NVIDIA driver 575.57.08 is below 580.65.06" in proc.stdout
+    assert "Preflight: 11 PASS, 1 FIX, 0 SKIP." in proc.stdout
+    assert "do not stop the install" not in proc.stdout
+
+
+@pytest.mark.parametrize("args", [("--check",), ()])
+def test_not_root_is_a_fix_that_names_sudo(tmp_path, args):
+    proc = run_script(tmp_path, *args, env={"STUB_UID": "1000"})
     assert proc.returncode == 1
     assert "FIX  Not running as root" in proc.stdout
-    assert f"sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'} --check" in proc.stdout
+    assert f"sudo bash {tmp_path / 'executor' / 'nvidia_docker_sysbox_setup.sh'}{' --check' if args else ''}\n" in proc.stdout
     # nothing else runs without root: the other checks would read the process table and Docker's socket as a user
     assert "Preflight: 0 PASS, 1 FIX, 0 SKIP." in proc.stdout
+    if not args:
+        assert "Nothing was installed." in proc.stdout
 
 
 def test_unknown_option_is_refused(tmp_path):
@@ -598,7 +687,7 @@ def test_fix_lines_name_the_curl_one_liner_when_piped_from_curl(tmp_path):
         input=script,
         capture_output=True,
         text=True,
-        env={"PATH": str(stubs), "HOST_ROOT": str(root)},
+        env={"PATH": str(stubs), "SYSBOX_SETUP_HOST_ROOT": str(root)},
     )
     out = ANSI.sub("", proc.stdout)
     assert proc.returncode == 1

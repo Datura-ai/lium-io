@@ -9,6 +9,7 @@ set -e
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
 #   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
+#   SYSBOX_SETUP_HOST_ROOT      test-only: prefix for the host files the preflight reads (/proc/modules, /etc/os-release, ...)
 
 SYSBOX_VERSION="0.6.6"
 SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
@@ -124,9 +125,11 @@ fail_no_idmapped() {
 
 # ── Preflight ───────────────────────────────────────────
 # One PASS / FIX line per requirement, each FIX with the command that fixes it. The host checks
-# run before anything is installed (a FIX there ends the run with nothing changed); `--check`
-# runs them plus the checks on what this script installs. Paths under HOST_ROOT so tests can
-# point them at a fixture tree; commands are stubbed on PATH.
+# run before anything is installed: a FIX in what sysbox itself needs (root, x86_64, kernel,
+# Docker) ends the run with nothing changed; the rest (driver, iptables modules, disk, ports)
+# print the fix and the install goes on, because the node cannot be listed at all without
+# sysbox. `--check` runs them all plus the checks on what this script installs. Paths under
+# SYSBOX_SETUP_HOST_ROOT so tests can point them at a fixture tree; commands are stubbed on PATH.
 
 MIN_NVIDIA_DRIVER="580.65.06"   # validators' MIN_NVIDIA_DRIVER_VERSION: an idle node below it earns nothing after the cutoff
 MIN_DISK_TO_VRAM_RATE="1.5"     # validators' MIN_DISK_TO_VRAM_RATE (rental_price.py): idle pay needs total disk >= 1.5x total VRAM
@@ -144,7 +147,7 @@ pf_fix() {
     return 1
 }
 
-host_path() { echo "${HOST_ROOT:-}$1"; }
+host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }
 
 self_cmd() {
     # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
@@ -315,7 +318,7 @@ check_iptables_modules() {
         "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
 }
 
-check_disk_for_vram() {
+check_total_disk_for_vram() {
     # The validators compare the TOTAL size of the filesystem the executor sees as / (its
     # rootfs lives under Docker's data-root) with total GPU VRAM; free space is not the rule.
     local vram_mib vram_gb data_root total_kb total_gb needed_gb
@@ -339,7 +342,7 @@ check_disk_for_vram() {
         "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
 }
 
-preflight_ports() {
+resolve_preflight_ports() {
     # EXECUTOR_PORT / SSH_PORT from the environment, else the executor .env next to this script, else the defaults
     local env_file=""
     [ -f "$0" ] && env_file="$(dirname "$0")/.env"   # piped from curl there is no file next to the script
@@ -363,13 +366,14 @@ port_container() {
 }
 
 ufw_blocks_port() {
-    # true when ufw is active and no ALLOW rule covers TCP $1 (single port or lo:hi range)
+    # true when ufw is active and no inbound ALLOW rule covers TCP $1 (single port or lo:hi range)
     local status
     status=$(ufw status 2>/dev/null) || return 1
     echo "$status" | grep -q '^Status: active' || return 1
     ! echo "$status" | awk -v p="$1" '
         {
-            allow = 0; for (i = 2; i <= NF; i++) if ($i == "ALLOW") allow = 1   # "ALLOW", "ALLOW IN", "… on eth0 ALLOW"
+            # "ALLOW", "ALLOW IN", "… on eth0 ALLOW" open the port; "ALLOW OUT" / "ALLOW FWD" (ufw route) do not
+            allow = 0; for (i = 2; i <= NF; i++) if ($i == "ALLOW") { if ($(i+1) == "OUT" || $(i+1) == "FWD") next; allow = 1 }
             if (!allow) next
             split($1, spec, "/"); if (spec[2] != "" && spec[2] != "tcp") next
             n = split(spec[1], range, ":")
@@ -379,8 +383,8 @@ ufw_blocks_port() {
 }
 
 check_ports() {
-    local ports p listener container label fixed=0
-    read -r -a ports <<< "$(preflight_ports)"
+    local ports p listener container label has_fix=0
+    read -r -a ports <<< "$(resolve_preflight_ports)"
     command -v ss &>/dev/null || { pf_skip "Ports — 'ss' (iproute2) is missing, cannot tell what listens."; return 0; }
     for p in "${ports[0]}:executor" "${ports[1]}:SSH"; do
         label=${p#*:} p=${p%%:*}
@@ -392,18 +396,18 @@ check_ports() {
                 executor-*|executor_*) ;;   # the executor itself, from an earlier install
                 *) pf_fix "TCP $p ($label port) is published by container ${container:-unknown} — the executor cannot bind it." \
                        "docker stop ${container:-<name>}, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
-                   fixed=1
+                   has_fix=1
                    continue ;;
             esac
         elif [ -n "$listener" ]; then
             pf_fix "TCP $p ($label port) is already in use by $listener — the executor cannot bind it." \
                 "Stop that process, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
-            fixed=1
+            has_fix=1
             continue
         fi
         if ufw_blocks_port "$p"; then
-            pf_fix "TCP $p ($label port) is blocked by ufw — validators cannot reach the node." "sudo ufw allow $p/tcp"
-            fixed=1
+            pf_fix "TCP $p ($label port) has no inbound allow rule in the active ufw — open it for the validators." "sudo ufw allow $p/tcp"
+            has_fix=1
             continue
         fi
         if [ -n "$container" ]; then
@@ -414,7 +418,7 @@ check_ports() {
     done
     echo "         Cloud firewalls and routers are outside this host: after 'docker compose up', from ANY other machine run"
     echo "           nc -vz <this host's public IP> ${ports[0]} ${ports[1]}    # both must say 'succeeded'"
-    return $fixed
+    return $has_fix
 }
 
 check_sysbox() {
@@ -433,7 +437,8 @@ check_sysbox() {
             "$(self_cmd)   # re-applies the Docker 29 settings and re-verifies; then: journalctl -u sysbox-mgr --no-pager -n 20"
         return 1
     fi
-    pf_pass "sysbox-runc $(sysbox-runc --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo installed) runs a container."
+    # `sysbox-runc --version` prints its name on the first line and "version: 0.6.6" on the second
+    pf_pass "sysbox-runc $(sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep . || echo installed) runs a container."
 }
 
 preflight_summary() {
@@ -442,17 +447,30 @@ preflight_summary() {
     [ "$PREFLIGHT_FIX" -eq 0 ]
 }
 
-preflight_host() {
-    # what this script cannot install for you; a FIX here stops the run before anything changes.
-    # Returns 1 without root: every other check reads Docker's socket or the process table.
-    check_root || return 1
+preflight_blocking() {
+    # what sysbox itself needs before it can go on this host: x86_64 (the .deb is amd64 only), a kernel with
+    # ID-mapped mounts (or the override), Docker installed and running (the runtime is registered in its
+    # daemon.json and it is restarted). Returns 1 when any of them is a FIX; install mode stops there.
+    local fixes_before=$PREFLIGHT_FIX
     check_arch || true
     check_kernel || true
     check_docker || true
+    [ "$PREFLIGHT_FIX" -eq "$fixes_before" ]
+}
+
+preflight_advisory() {
+    # what the validators need once the node runs; sysbox installs without any of it and the node cannot be
+    # listed at all without sysbox, so a FIX here prints the fix and install mode goes on
     check_nvidia_driver || true
     check_iptables_modules || true
-    check_disk_for_vram || true
+    check_total_disk_for_vram || true
     check_ports || true
+}
+
+preflight_reminder() {
+    # after a successful install: the advisory FIX lines are far up the screen by now
+    [ "$PREFLIGHT_FIX" -gt 0 ] || return 0
+    warn "The preflight printed $PREFLIGHT_FIX FIX line(s) at the top. Run those commands, then: $(self_cmd --check)"
 }
 
 preflight_stack() {
@@ -474,7 +492,8 @@ case "${1:-}" in
     --check) PREFLIGHT_MODE_FLAG="--check" ;;
     -h|--help)
         echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
-        echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify"
+        echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
+        echo "               a FIX on root, x86_64, kernel or Docker stops the install, any other FIX is printed and the install goes on"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
         exit 0
@@ -486,7 +505,12 @@ esac
 
 if [ -n "$PREFLIGHT_MODE_FLAG" ]; then
     echo -e "\n${B}Preflight${N} — host requirements, then what this script installs"
-    if preflight_host; then preflight_stack; fi
+    # without root nothing else is checked: every other check reads Docker's socket or the process table
+    if check_root; then
+        preflight_blocking || true
+        preflight_advisory
+        preflight_stack
+    fi
     preflight_summary && exit 0
     echo "  Fix the lines above, then run: $(self_cmd)"
     exit 1
@@ -494,8 +518,13 @@ fi
 
 step 1 7 "Pre-flight checks"
 
-preflight_host || true
-preflight_summary || { echo "  Fix the lines above and re-run. Nothing was installed."; exit 1; }
+if ! check_root || ! preflight_blocking; then
+    preflight_summary || true
+    echo "  Fix the lines above and re-run. Nothing was installed."
+    exit 1
+fi
+preflight_advisory
+preflight_summary || echo "  The FIX lines above do not stop the install: the node is not listed at all without sysbox. Run those commands afterwards."
 
 echo -e "\n  This will install sysbox, configure Docker, restart Docker, and verify."
 if [ -t 0 ]; then
@@ -513,6 +542,7 @@ if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbo
     fi
     if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
         ok "Sysbox is already working. Nothing to do."
+        preflight_reminder
         exit 0
     fi
 fi
@@ -695,6 +725,7 @@ if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &
     echo -e "  ${G}╚══════════════════════════════════════════╝${N}"
     echo ""
     ok "Your executor now supports Docker-in-Docker."
+    preflight_reminder
 
     # ── 8. Restart executor ──────────────────────────────
     if [ -n "$EXECUTOR_COMPOSE_DIR" ]; then
