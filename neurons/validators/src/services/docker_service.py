@@ -24,6 +24,8 @@ from core.docker_utils import (
     DockerCommand,
     collect_container_death_diagnostics,
     df_available_bytes,
+    df_command,
+    parse_df_available_bytes,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
@@ -365,6 +367,94 @@ class VolumeSizingResult:
     capped_by: str | None = None   # "pool" | "request_cap" | "df_guard" (fresh path only)
     df_avail_bytes: int | None = None
     existing_volumes_bytes: int | None = None
+
+
+_LOOPBACK_PLUGIN_ALIAS = _VLOOPBACK_DRIVER_PREFIX  # the plugin is installed under the driver name `_is_vloopback_driver` matches
+_LOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
+_PROBE_OUTPUT_LOG_CAP = 512
+
+
+@dataclass
+class VolumeHostProbe:
+    """What one SSH round trip learns about the host before a local volume is created
+    (RENTAL_VOLUME_FAST_PATH_ENABLED). The same facts the fresh-sizing path collected over
+    three commands, plus the loopback plugin state that lets `create_local_volume` skip
+    `docker plugin install` — a Docker Hub round trip — when the plugin is already enabled."""
+
+    docker_root_dir: str
+    df_avail_bytes: int | None          # None when the probe was asked not to measure df
+    vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
+    loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true
+
+
+def _volume_host_probe_command(*, with_df: bool) -> str:
+    """One shell line: DockerRootDir, (optionally) df through the helper container, the volume
+    list and the loopback plugin state, each output line tagged so the parser never guesses.
+    Sections are joined with `;` — a failing section leaves its tag out (the volume list, whose
+    empty output is legitimate, is followed by a `VOLS\\t<exit status>` line) and the parser raises."""
+    df_cmd = df_command('"$root"')
+    df_part = (
+        # df prints two lines; fold them onto one tagged line (\n → \r) so every record stays one line
+        f"printf 'DF\\t%s\\n' \"$({df_cmd} | tr '\\n' '\\r')\"; "
+        if with_df
+        else ""
+    )
+    return (
+        "root=\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\"; "
+        "printf 'ROOT\\t%s\\n' \"$root\"; "
+        f"{df_part}"
+        "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
+        "printf 'VOLS\\t%s\\n' \"$?\"; "
+        # a missing plugin makes `docker plugin inspect` print a blank stdout line before it fails,
+        # so only the last line is the state: true / false / absent
+        "printf 'PLUGIN\\t%s\\n' \"$( (/usr/bin/docker plugin inspect --format '{{.Enabled}}' "
+        f"{_LOOPBACK_PLUGIN_ALIAS} 2>/dev/null || echo absent) | tail -n 1)\""
+    )
+
+
+def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
+    docker_root_dir: str | None = None
+    df_avail_bytes: int | None = None
+    volume_names: list[str] = []
+    volume_ls_status: str | None = None
+    plugin_state: str | None = None
+    # the echoed output is host-controlled: cap what reaches the log
+    shown = stdout[:_PROBE_OUTPUT_LOG_CAP]
+    # split on "\n" only: str.splitlines() would also split at the "\r" the DF record uses
+    for raw_line in stdout.split("\n"):
+        tag, _, rest = raw_line.partition("\t")
+        if tag == "ROOT":
+            docker_root_dir = rest.strip()
+        elif tag == "DF":
+            # the multi-line df output travels on one line with \r in place of \n
+            try:
+                df_avail_bytes = parse_df_available_bytes(rest.replace("\r", "\n"))
+            except Exception as exc:
+                raise Exception(f"volume host probe: unexpected df output in {shown!r}") from exc
+        elif tag == "VOL":
+            name, _, driver = rest.partition("\t")
+            if _is_vloopback_driver(driver.strip()) and _is_safe_docker_volume_name(name):
+                volume_names.append(name)
+        elif tag == "VOLS":
+            volume_ls_status = rest.strip()
+        elif tag == "PLUGIN":
+            plugin_state = rest.strip()
+    if not docker_root_dir:
+        raise Exception(f"volume host probe: no DockerRootDir in {shown!r}")
+    if with_df and df_avail_bytes is None:
+        raise Exception(f"volume host probe: no df output in {shown!r}")
+    if volume_ls_status != "0":
+        # an empty volume list is legitimate, a failed `docker volume ls` is not: without this the
+        # probe would report zero existing volumes and the fresh sizing would overstate the pool
+        raise Exception(f"volume host probe: docker volume ls exit status {volume_ls_status!r} in {shown!r}")
+    if plugin_state is None:
+        raise Exception(f"volume host probe: no plugin state in {shown!r}")
+    return VolumeHostProbe(
+        docker_root_dir=docker_root_dir,
+        df_avail_bytes=df_avail_bytes,
+        vloopback_volume_names=volume_names,
+        loopback_plugin_enabled=plugin_state == "true",
+    )
 
 
 def _parse_volume_size_to_bytes(value: str | None) -> int | None:
@@ -3355,6 +3445,7 @@ class DockerService:
         limit: int | None = None,
         timeout: int = 10,
         sparse: bool = False,
+        host_probe: VolumeHostProbe | None = None,
     ):
         requested_timeout = timeout
         _quote_safe_docker_volume_name(
@@ -3363,21 +3454,35 @@ class DockerService:
         )
         if limit:
             # install loopback plugin
-            loopback_plugin_name = "vloopback"
+            loopback_plugin_name = _LOOPBACK_PLUGIN_ALIAS
 
-            docker_root_dir = await self.get_docker_root_dir(ssh_client)
+            if host_probe is not None:
+                docker_root_dir = host_probe.docker_root_dir
+            else:
+                docker_root_dir = await self.get_docker_root_dir(ssh_client)
             logger.info(_m(f"Docker data root: {docker_root_dir}", extra=get_extra_info(log_extra)))
 
-            loopback_plugin_arg = shlex.quote(loopback_plugin_name)
-            data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
-            command = (
-                "/usr/bin/docker plugin install ashald/docker-volume-loopback "
-                f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
-            )
-            # TODO: migrate Docker plugin management if/when plugin setup becomes
-            # part of the SDK migration scope. The user-controlled volume name is
-            # not used in this shell command; volume creation below is SDK-backed.
-            await ssh_client.run(command)
+            if host_probe is not None and host_probe.loopback_plugin_enabled:
+                # The probe saw the plugin installed and enabled: `docker plugin install` would
+                # only ask Docker Hub for the plugin's privileges and then fail with "already
+                # exists" (~0.9 s measured on a 4090 node, every rent). Nothing to do.
+                logger.info(
+                    _m(
+                        "Loopback plugin already enabled; skipping plugin install",
+                        extra=get_extra_info({**log_extra, "loopback_plugin": loopback_plugin_name}),
+                    )
+                )
+            else:
+                loopback_plugin_arg = shlex.quote(loopback_plugin_name)
+                data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
+                command = (
+                    f"/usr/bin/docker plugin install {_LOOPBACK_PLUGIN_IMAGE} "
+                    f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
+                )
+                # TODO: migrate Docker plugin management if/when plugin setup becomes
+                # part of the SDK migration scope. The user-controlled volume name is
+                # not used in this shell command; volume creation below is SDK-backed.
+                await ssh_client.run(command)
 
             # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
             # by default (creation time scales with size). `sparse=true` writes a sparse
@@ -3457,6 +3562,15 @@ class DockerService:
             name, driver = parts
             if _is_vloopback_driver(driver) and _is_safe_docker_volume_name(name):
                 volume_names.append(name)
+        return await self._inspect_vloopback_volumes_bytes(ssh_client, volume_names)
+
+    async def _inspect_vloopback_volumes_bytes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        volume_names: list[str],
+    ) -> int:
+        """Sum of the declared sizes of the given vloopback volumes (one `docker volume inspect`);
+        0 without a command when there is nothing to inspect."""
         if not volume_names:
             return 0
 
@@ -3494,14 +3608,69 @@ class DockerService:
                 )
         return total_bytes
 
+    @staticmethod
+    def measures_host_for_volume_sizing(payload: ContainerCreateRequest) -> bool:
+        """True when `resolve_volume_sizing` will measure the host (the fresh DAH-2183 contract);
+        False for the two passthrough contracts it returns without any SSH command."""
+        return payload.storage_limit_gb is not None and payload.disk_share is not None
+
+    async def probe_volume_host(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        *,
+        with_df: bool,
+        log_extra: dict,
+    ) -> VolumeHostProbe | None:
+        """RENTAL_VOLUME_FAST_PATH_ENABLED: the volume-stage host facts in one SSH round trip.
+
+        Replaces `docker info` + the df helper container + `docker volume ls` (fresh sizing) and the
+        second `docker info` + the unconditional `docker plugin install` (create) — five serial
+        commands, one of them a Docker Hub round trip — with one command and, when vloopback
+        volumes exist, the same `docker volume inspect` as before. Never fatal: on any failure it
+        returns None and the callers take the exact path they take with the flag off.
+        """
+        started = now_ms()
+        try:
+            result = await ssh_client.run(_volume_host_probe_command(with_df=with_df))
+            probe = _parse_volume_host_probe(result.stdout or "", with_df=with_df)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "volume_host_probe_fallback",
+                    extra=get_extra_info({**log_extra, "error": str(exc)}),
+                ),
+            )
+            return None
+        logger.info(
+            _m(
+                "volume_host_probe",
+                extra=get_extra_info({
+                    **log_extra,
+                    "docker_root_dir": probe.docker_root_dir,
+                    "df_avail_bytes": probe.df_avail_bytes,
+                    "vloopback_volumes": len(probe.vloopback_volume_names),
+                    "loopback_plugin_enabled": probe.loopback_plugin_enabled,
+                    "probe_ms": now_ms() - started,
+                }),
+            )
+        )
+        return probe
+
     async def resolve_volume_sizing(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         log_tag: str,
         log_extra: dict,
+        host_probe: VolumeHostProbe | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        With `host_probe` (RENTAL_VOLUME_FAST_PATH_ENABLED) the fresh path reads DockerRootDir,
+        df and the vloopback volume names from the probe instead of running three commands;
+        only `docker volume inspect` still goes to the host, and only when volumes exist.
 
         Legacy contract (payload.disk_share is None): backend-sent
         volume_limit_gb/storage_limit_gb are exact sizes and are returned
@@ -3524,24 +3693,24 @@ class DockerService:
         ``storage_limit_gb`` from ``disk_share`` and dockerd would reject
         the run with "supported only for overlay over xfs with 'pquota'".
         """
-        if payload.storage_limit_gb is None:
+        if not self.measures_host_for_volume_sizing(payload):
             return VolumeSizingResult(
                 volume_limit_gb=payload.volume_limit_gb,
                 storage_limit_gb=payload.storage_limit_gb,
-                path="storage_opt_unsupported",
-            )
-
-        if payload.disk_share is None:
-            return VolumeSizingResult(
-                volume_limit_gb=payload.volume_limit_gb,
-                storage_limit_gb=payload.storage_limit_gb,
-                path="legacy",
+                path="storage_opt_unsupported" if payload.storage_limit_gb is None else "legacy",
             )
 
         try:
-            docker_root_dir = await self.get_docker_root_dir(ssh_client)
-            df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-            existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
+            if host_probe is not None and host_probe.df_avail_bytes is not None:
+                docker_root_dir = host_probe.docker_root_dir
+                df_avail_bytes = host_probe.df_avail_bytes
+                existing_volumes_bytes = await self._inspect_vloopback_volumes_bytes(
+                    ssh_client, host_probe.vloopback_volume_names
+                )
+            else:
+                docker_root_dir = await self.get_docker_root_dir(ssh_client)
+                df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4702,6 +4871,21 @@ class DockerService:
                 effective_storage_limit_gb = payload.storage_limit_gb
 
                 if not local_volume:
+                    # DAH-3240: one round trip for the host facts the sizing and the create need
+                    # (flag off → None → the per-command path below, unchanged).
+                    volume_probe: VolumeHostProbe | None = None
+                    measures_host = self.measures_host_for_volume_sizing(payload)
+                    # probe only when something reads it: the host-measuring sizing (df) or a limited
+                    # volume's plugin install (root dir + plugin state); an unlimited volume on a
+                    # passthrough contract needs neither, so it pays for no command
+                    if settings.RENTAL_VOLUME_FAST_PATH_ENABLED and (measures_host or payload.volume_limit_gb):
+                        current_step = "volume_host_probe"
+                        volume_probe = await self.probe_volume_host(
+                            ssh_client,
+                            with_df=measures_host,
+                            log_extra=default_extra,
+                        )
+
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
                     sizing = await self.resolve_volume_sizing(
@@ -4709,6 +4893,7 @@ class DockerService:
                         payload=payload,
                         log_tag=log_tag,
                         log_extra=default_extra,
+                        host_probe=volume_probe,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb
@@ -4732,6 +4917,7 @@ class DockerService:
                         log_extra=default_extra,
                         limit=effective_volume_limit_gb,
                         sparse=full_node_rental,
+                        host_probe=volume_probe,
                     )
                     created_local_volume = True
 

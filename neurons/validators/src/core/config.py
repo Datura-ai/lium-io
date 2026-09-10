@@ -217,6 +217,10 @@ class Settings(BaseSettings):
         default=True,
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
+    # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
+    # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the
+    # plugin is already enabled — instead of five serial commands. Off: the per-command path.
+    RENTAL_VOLUME_FAST_PATH_ENABLED: bool = Field(env="RENTAL_VOLUME_FAST_PATH_ENABLED", default=False)
     # DAH-3257: on a rent, read the host listings the pre-run steps need (containers, volumes,
     # mounted volumes, GPU minor map, device nodes, nvidia-smi power state, the image's
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
