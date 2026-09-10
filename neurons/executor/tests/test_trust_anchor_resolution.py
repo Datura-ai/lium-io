@@ -11,7 +11,7 @@ import pytest
 import core.config as config
 
 
-def _install_override(monkeypatch, **attrs):
+def _install_override(monkeypatch: pytest.MonkeyPatch, **attrs: str) -> None:
     module = types.ModuleType("core.config_override")
     module.__spec__ = importlib.machinery.ModuleSpec("core.config_override", None)
     for name, value in attrs.items():
