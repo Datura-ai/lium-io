@@ -30,6 +30,8 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel
+
 NESTED_FROM_TAG_PREFIX = "nested_from:"
 POD_CONTAINER_PREFIX = "pod_"
 # the pod's volume is `volume_<pod_id>` (docker_service.py create flow; the sensor's
@@ -40,30 +42,11 @@ _EXEC_OPTIONS_WITH_VALUE = {"-u", "--user", "-e", "--env", "-w", "--workdir"}
 _EXEC_FLAGS = {"-i", "-t", "-it", "-ti", "-d", "--detach", "--privileged", "--interactive", "--tty"}
 _SHELL_WRAPPERS = {"sh", "/bin/sh", "bash", "/bin/bash", "/usr/bin/sh", "/usr/bin/bash"}
 _SHELL_COMMAND_FLAGS = {"-c", "-lc", "-ec", "-lec"}
-# The kinds the sensor's two docker policies emit (`tamper-docker-cli`, `tamper-docker-sock-write`;
-# docker_cli.rs `finding_is_rental_interference`). The executor drives a pod's whole life through
-# the Docker API from inside its own container — create, start, `docker cp` for a restore, `docker
-# rm` when the rental ends — so any of these with the executor's ancestry is the platform's, not
-# only the exec. `DockerVolumeMount` is mount.rs (path-shaped), never the executor's.
-_DOCKER_CONTROL_PLANE_KINDS = frozenset(
-    {
-        "DockerExec", "DockerAttach", "DockerCp", "DockerRun", "DockerCreate", "DockerStart", "DockerStop",
-        "DockerKill", "DockerPause", "DockerRm", "DockerRestart", "DockerRename", "DockerUpdate", "DockerCommit",
-        "DockerExport", "DockerPrune", "DockerInspect", "DockerPull", "DockerPush", "DockerBuild", "DockerLoad",
-        "DockerImport", "DockerRmi", "DockerNetworkConnect", "DockerNetworkDisconnect", "DockerNetworkRm",
-        "DockerVolumeRm", "DockerSave", "DockerSocketWrite",
-    }
-)
-_PATH_SHAPED_KINDS = {"OverlayFsRead", "OverlayFsWrite", "DockerVolumeMount"}
-RENTAL_VOLUME_TAG = "rental_volume"
-# the renter's pod-log entry carries at most this many evidence hashes; the finding count is the
-# sensor's to choose (21,694 OverlayFsRead in one day, 8 Sep), the full list stays in the
-# inspector event's `context.verdict`
-_RENTER_EVIDENCE_MAX = 20
 # The sensor's `RuntimeInterferenceKind` (celium-gpu-verifier inspector/src/collector/analysis/
-# types.rs, serde PascalCase) — the only strings a renter is shown as a class. Anything else — the
-# report is produced on the provider's root when the sensor is unattested — is shown as `unknown`
-# and kept raw only inside the evidence. Keep in step with types.rs and inspector_summary/sql.py.
+# types.rs, serde PascalCase) — the only strings a renter is shown as a finding kind. Anything else
+# — the report is produced on the provider's root when the sensor is unattested — is shown as
+# `unknown` and kept raw only inside the evidence. Keep in step with types.rs and
+# inspector_summary/sql.py.
 KNOWN_FINDING_KINDS = frozenset(
     {
         "DockerExec", "DockerAttach", "DockerCp", "DockerRun", "DockerCreate", "DockerStart", "DockerStop",
@@ -75,6 +58,21 @@ KNOWN_FINDING_KINDS = frozenset(
         "DockerVolumeMount",
     }
 )
+# fs.rs / mount.rs kinds: no container, the path is in `command`
+_PATH_SHAPED_KINDS = frozenset({"OverlayFsRead", "OverlayFsWrite", "DockerVolumeMount"})
+# The kinds the sensor's two docker policies emit (`tamper-docker-cli`, `tamper-docker-sock-write`;
+# docker_cli.rs `finding_is_rental_interference`): every `Docker*` kind except the path-shaped
+# `DockerVolumeMount`. The executor drives a pod's whole life through the Docker API from inside
+# its own container — create, start, `docker cp` for a restore, `docker rm` when the rental ends —
+# so any of these with the executor's ancestry is the platform's, not only the exec.
+_DOCKER_CONTROL_PLANE_KINDS = (
+    frozenset(kind for kind in KNOWN_FINDING_KINDS if kind.startswith("Docker")) - _PATH_SHAPED_KINDS
+)
+RENTAL_VOLUME_TAG = "rental_volume"
+# the renter's pod-log entry carries at most this many evidence hashes; the finding count is the
+# sensor's to choose (21,694 OverlayFsRead in one day, 8 Sep), the full list stays in the
+# inspector event's `context.verdict`
+_RENTER_EVIDENCE_MAX = 20
 UNKNOWN_KIND = "unknown"
 _PAYLOAD_PREVIEW_CHARS = 160
 _PAYLOAD_PREVIEW_MAX = 20
@@ -89,15 +87,57 @@ BAN_SOURCE = "inspector_auto"
 RENTER_EVENT = "provider_access_detected"
 
 
+class VerdictPayload(BaseModel):
+    """The verdict as the inspector event carries it to the backend (`context.verdict`).
+
+    Wire keys: `sensor` is the attestation state (`attested` / `unattested`), `finding_kinds` the
+    sensor's kinds (`KNOWN_FINDING_KINDS`, else `unknown`). `model_dump()` at the emit boundary.
+    """
+
+    provider_findings: int
+    platform_findings: int
+    finding_kinds: list[str]
+    affected_pod_ids: list[str]
+    evidence_sha256: list[str]
+    report_sha256: str
+    sensor: str
+    enforce: bool
+    action: str
+    ban_source: str | None
+    # the platform execs' payloads, deduplicated, for the daily digest (never gate on them)
+    platform_payloads: list[str]
+    # provider findings on a container that is not in the rented list: recorded, no renter told
+    unmatched_containers: list[str]
+    unmatched_containers_count: int
+
+
+class RenterAccessEvent(BaseModel):
+    """One pod-log entry the renter sees in their pod's event stream."""
+
+    log_text: str
+    log_status: str
+    log_tag: str
+    event: str
+    pod_id: str
+    when: str
+    finding_kinds: list[str]
+    provider_findings: int
+    report_sha256: str
+    evidence_sha256: list[str]
+    evidence_sha256_truncated: bool
+    sensor: str
+    action: str
+
+
 @dataclass(frozen=True)
 class InspectorVerdict:
     provider_findings: list[dict[str, Any]]
     platform_findings: list[dict[str, Any]]
     evidence_sha256: list[str]
     report_sha256: str
-    classes: list[str]
+    finding_kinds: list[str]
     affected_pod_ids: list[str]
-    sensor: str
+    sensor_attestation: str
     enforce: bool
     action: str
     # the platform execs' payloads, deduplicated, for the daily digest (never gate on them)
@@ -110,28 +150,22 @@ class InspectorVerdict:
     def provider_origin(self) -> bool:
         return bool(self.provider_findings)
 
-    def as_payload(self) -> dict[str, Any]:
-        return {
-            "provider_findings": len(self.provider_findings),
-            "platform_findings": len(self.platform_findings),
-            "classes": self.classes,
-            "affected_pod_ids": self.affected_pod_ids,
-            "evidence_sha256": self.evidence_sha256,
-            "report_sha256": self.report_sha256,
-            "sensor": self.sensor,
-            "enforce": self.enforce,
-            "action": self.action,
-            "ban_source": BAN_SOURCE if self.action == ACTION_QUARANTINE else None,
-            "platform_payloads": self.platform_payloads,
-            **(
-                {
-                    "unmatched_containers": self.unmatched_containers,
-                    "unmatched_containers_count": self.unmatched_containers_count,
-                }
-                if self.unmatched_containers
-                else {}
-            ),
-        }
+    def as_payload(self) -> VerdictPayload:
+        return VerdictPayload(
+            provider_findings=len(self.provider_findings),
+            platform_findings=len(self.platform_findings),
+            finding_kinds=self.finding_kinds,
+            affected_pod_ids=self.affected_pod_ids,
+            evidence_sha256=self.evidence_sha256,
+            report_sha256=self.report_sha256,
+            sensor=self.sensor_attestation,
+            enforce=self.enforce,
+            action=self.action,
+            ban_source=BAN_SOURCE if self.action == ACTION_QUARANTINE else None,
+            platform_payloads=self.platform_payloads,
+            unmatched_containers=self.unmatched_containers,
+            unmatched_containers_count=self.unmatched_containers_count,
+        )
 
 
 def canonical_sha256(value: Any) -> str:
@@ -211,7 +245,8 @@ def is_platform_origin(finding: dict[str, Any]) -> bool:
     return nested_from_executor(finding)
 
 
-def finding_class(finding: dict[str, Any]) -> str:
+def finding_kind(finding: dict[str, Any]) -> str:
+    """The sensor's kind, or `unknown` for anything outside its vocabulary."""
     kind = _kind(finding)
     return kind if kind in KNOWN_FINDING_KINDS else UNKNOWN_KIND
 
@@ -286,22 +321,21 @@ def build_verdict(
     rented = set(rented_pod_ids)
     affected: set[str] = set()
     unmatched: set[str] = set()
-    unnamed = False
+    has_unnamed_finding = False
     for finding in provider:
         name = _named_resource(finding)
         pod_id = pod_id_of(name) if name else None
         if name is None:
-            unnamed = True
+            has_unnamed_finding = True
         elif pod_id in rented:
             affected.add(pod_id)
         else:
             # a pod that left or joined since the rented list was fetched, or not a pod at all:
             # recorded, but no renter is told about a container that was not theirs
             unmatched.add(name)
-    if unnamed:
+    if has_unnamed_finding:
         # the sensor named no container at all: every renter on this host is told
         affected |= rented
-    classes = sorted({finding_class(f) for f in provider})
     action = ACTION_QUARANTINE if (provider and enforce) else ACTION_NONE
     names = sorted(unmatched)
     return InspectorVerdict(
@@ -309,9 +343,9 @@ def build_verdict(
         platform_findings=platform,
         evidence_sha256=[canonical_sha256(f) for f in provider],
         report_sha256=canonical_sha256(report),
-        classes=classes,
+        finding_kinds=sorted({finding_kind(f) for f in provider}),
         affected_pod_ids=sorted(affected),
-        sensor=SENSOR_ATTESTED if sensor_attested else SENSOR_UNATTESTED,
+        sensor_attestation=SENSOR_ATTESTED if sensor_attested else SENSOR_UNATTESTED,
         enforce=enforce,
         action=action,
         platform_payloads=_platform_payloads(platform),
@@ -325,26 +359,29 @@ def renter_access_event(
     *,
     pod_id: str,
     when: str,
-) -> dict[str, Any]:
+) -> RenterAccessEvent:
     """One pod-log entry the renter sees in their pod's event stream."""
-    classes = ", ".join(verdict.classes) or "access"
-    sensor = "attested sensor" if verdict.sensor == SENSOR_ATTESTED else "unattested sensor"
-    return {
-        "log_text": (
-            f"Provider-side access to this pod detected ({classes}; {sensor}). "
-            "Lium has recorded the evidence"
-            + (" and removed the host from the marketplace." if verdict.action == ACTION_QUARANTINE else ".")
+    kinds = ", ".join(verdict.finding_kinds) or "access"
+    sensor = "attested sensor" if verdict.sensor_attestation == SENSOR_ATTESTED else "unattested sensor"
+    # `quarantine` only asks the backend to act; the ban itself is the backend's
+    outcome = (
+        " and asked to take the host off the marketplace." if verdict.action == ACTION_QUARANTINE else "."
+    )
+    return RenterAccessEvent(
+        log_text=(
+            f"Provider-side access to this pod detected ({kinds}; {sensor}). "
+            f"Lium has recorded the evidence{outcome}"
         ),
-        "log_status": "error",
-        "log_tag": RENTER_EVENT,
-        "event": RENTER_EVENT,
-        "pod_id": pod_id,
-        "when": when,
-        "classes": verdict.classes,
-        "provider_findings": len(verdict.provider_findings),
-        "report_sha256": verdict.report_sha256,
-        "evidence_sha256": verdict.evidence_sha256[:_RENTER_EVIDENCE_MAX],
-        "evidence_sha256_truncated": len(verdict.evidence_sha256) > _RENTER_EVIDENCE_MAX,
-        "sensor": verdict.sensor,
-        "action": verdict.action,
-    }
+        log_status="error",
+        log_tag=RENTER_EVENT,
+        event=RENTER_EVENT,
+        pod_id=pod_id,
+        when=when,
+        finding_kinds=verdict.finding_kinds,
+        provider_findings=len(verdict.provider_findings),
+        report_sha256=verdict.report_sha256,
+        evidence_sha256=verdict.evidence_sha256[:_RENTER_EVIDENCE_MAX],
+        evidence_sha256_truncated=len(verdict.evidence_sha256) > _RENTER_EVIDENCE_MAX,
+        sensor=verdict.sensor_attestation,
+        action=verdict.action,
+    )

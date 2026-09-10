@@ -189,8 +189,8 @@ def test_a_read_of_the_pods_volume_names_the_pod_and_only_that_pod(kind, path):
     verdict = build_verdict({}, [_path_finding(kind, path)], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
 
     assert verdict.affected_pod_ids == [POD]
-    assert verdict.classes == [kind]
-    assert "unmatched_containers" not in verdict.as_payload()
+    assert verdict.finding_kinds == [kind]
+    assert verdict.as_payload().unmatched_containers == []
 
 
 def test_a_volume_named_in_the_container_field_names_the_pod_too():
@@ -208,10 +208,10 @@ def test_the_renter_event_caps_the_evidence_list():
     event = renter_access_event(verdict, pod_id=POD, when="2026-09-09T00:00:00Z")
 
     assert len(verdict.evidence_sha256) == 60
-    assert len(event["evidence_sha256"]) == 20
-    assert event["evidence_sha256_truncated"] is True
-    assert event["provider_findings"] == 60
-    assert event["report_sha256"] == verdict.report_sha256
+    assert len(event.evidence_sha256) == 20
+    assert event.evidence_sha256_truncated is True
+    assert event.provider_findings == 60
+    assert event.report_sha256 == verdict.report_sha256
 
 
 def test_platform_origin_is_the_executor_ancestry_not_the_payload():
@@ -241,7 +241,7 @@ def test_verdict_records_the_platform_payloads_for_the_digest():
     findings = [_finding(c) for c in execs.values()] + [_finding(HUMAN_SHELL, host=True, nested=False)]
     verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
 
-    payloads = verdict.as_payload()["platform_payloads"]
+    payloads = verdict.as_payload().platform_payloads
     assert payloads == verdict.platform_payloads
     assert "cat /root/.ssh/authorized_keys" in payloads
     assert "df -k /root" in payloads
@@ -258,15 +258,16 @@ def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
     assert verdict.affected_pod_ids == []
     assert verdict.unmatched_containers == ["pod_gone-since-the-list-was-fetched"]
     assert verdict.unmatched_containers_count == 1
-    assert verdict.as_payload()["unmatched_containers"] == ["pod_gone-since-the-list-was-fetched"]
+    assert verdict.as_payload().unmatched_containers == ["pod_gone-since-the-list-was-fetched"]
     assert len(verdict.provider_findings) == 1
 
 
-def test_a_verdict_with_every_pod_matched_carries_no_unmatched_keys():
+def test_a_verdict_with_every_pod_matched_carries_empty_unmatched_fields():
     verdict = build_verdict({}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=False, enforce=False)
 
     assert verdict.unmatched_containers == [] and verdict.unmatched_containers_count == 0
-    assert "unmatched_containers" not in verdict.as_payload()
+    payload = verdict.as_payload().model_dump()
+    assert payload["unmatched_containers"] == [] and payload["unmatched_containers_count"] == 0
 
 
 @pytest.mark.parametrize("kind", [["DockerExec"], {"k": 1}, 7, None])
@@ -276,7 +277,7 @@ def test_any_json_type_in_kind_classifies_without_raising(kind):
     verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=False, enforce=True)
 
     assert is_platform_origin(finding) is False    # not a string kind → not an exec we can vouch for
-    assert verdict.classes == ["unknown"]
+    assert verdict.finding_kinds == ["unknown"]
     assert verdict.affected_pod_ids == [POD]       # `container` still names the pod
 
 
@@ -309,7 +310,7 @@ def test_unmatched_containers_are_capped_in_the_verdict():
         f["container"] = f"pod_gone-{i:02d}-" + "x" * 300
         findings.append(f)
     verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
-    payload = verdict.as_payload()
+    payload = verdict.as_payload().model_dump()
 
     assert len(payload["unmatched_containers"]) == 20
     assert all(len(name) <= 128 for name in payload["unmatched_containers"])
@@ -317,15 +318,16 @@ def test_unmatched_containers_are_capped_in_the_verdict():
     assert verdict.affected_pod_ids == []
 
 
-def test_renter_visible_classes_come_from_a_fixed_vocabulary():
+def test_renter_visible_finding_kinds_come_from_a_fixed_vocabulary():
     odd = _finding(HUMAN_SHELL, host=True, nested=False, kind="<script>alert(1)</script>" + "x" * 500)
     verdict = build_verdict({}, [odd, _finding(HUMAN_SHELL, host=True, nested=False, kind="NamespaceEnter")],
                             rented_pod_ids=[POD], sensor_attested=False, enforce=False)
 
-    assert verdict.classes == ["NamespaceEnter", "unknown"]
-    event = renter_access_event(verdict, pod_id=POD, when="2026-09-09T00:00:00Z")
+    assert verdict.finding_kinds == ["NamespaceEnter", "unknown"]
+    event = renter_access_event(verdict, pod_id=POD, when="2026-09-09T00:00:00Z").model_dump()
     assert "<script>" not in event["log_text"]
-    assert event["classes"] == ["NamespaceEnter", "unknown"]
+    assert event["finding_kinds"] == ["NamespaceEnter", "unknown"]
+    assert "classes" not in event
     # the raw kind survives only in the evidence
     assert verdict.evidence_sha256[0] == canonical_sha256(odd)
 
@@ -345,10 +347,12 @@ def test_verdict_hashes_only_the_provider_findings_and_names_the_pod():
     assert verdict.evidence_sha256 == [canonical_sha256(report["findings"][1])]
     assert verdict.report_sha256 == canonical_sha256(report)
     assert verdict.affected_pod_ids == [POD]
-    assert verdict.classes == ["DockerExec"]
-    assert verdict.sensor == SENSOR_UNATTESTED
+    assert verdict.finding_kinds == ["DockerExec"]
+    assert verdict.sensor_attestation == SENSOR_UNATTESTED
     assert verdict.action == ACTION_NONE
-    assert verdict.as_payload()["ban_source"] is None
+    payload = verdict.as_payload().model_dump()
+    assert payload["ban_source"] is None
+    assert payload["sensor"] == SENSOR_UNATTESTED and payload["finding_kinds"] == ["DockerExec"]
 
 
 def test_verdict_without_a_named_pod_tells_every_renter_on_the_host():
@@ -357,9 +361,9 @@ def test_verdict_without_a_named_pod_tells_every_renter_on_the_host():
     verdict = build_verdict({}, [finding], rented_pod_ids=["b", "a"], sensor_attested=True, enforce=True)
 
     assert verdict.affected_pod_ids == ["a", "b"]
-    assert verdict.sensor == SENSOR_ATTESTED
+    assert verdict.sensor_attestation == SENSOR_ATTESTED
     assert verdict.action == ACTION_QUARANTINE
-    assert verdict.as_payload()["ban_source"] == "inspector_auto"
+    assert verdict.as_payload().ban_source == "inspector_auto"
 
 
 # --- the check -----------------------------------------------------------------------------
@@ -421,9 +425,12 @@ async def test_platform_only_findings_are_clean_and_no_renter_is_told(context_fa
     assert result.passed is True
     assert result.event.reason_code == Msg.PLATFORM_ORIGIN_ONLY.reason
     assert result.event.severity == "info"
+    # the event carries the count; the findings themselves are in the report
+    assert result.event.what_we_saw["platform_findings"] == 2
     event = result.updates["state"].inspector_event
     assert event["outcome"] == "CLEAN"
     assert event["context"]["verdict"]["platform_findings"] == 2
+    assert event["context"]["verdict"]["finding_kinds"] == []
     assert event["context"]["verdict"]["provider_findings"] == 0
     assert "inspector_passed" not in result.updates
     redis.publish.assert_not_awaited()
@@ -485,7 +492,8 @@ async def test_provider_finding_under_enforcement_fails_the_check_and_requests_q
     assert log["log_tag"] == "provider_access_detected"
     assert log["log_status"] == "error"
     assert log["evidence_sha256"] == verdict["evidence_sha256"]
-    assert "removed the host from the marketplace" in log["log_text"]
+    assert log["finding_kinds"] == ["DockerExec"]
+    assert "asked to take the host off the marketplace" in log["log_text"]
 
 
 @pytest.mark.asyncio

@@ -123,55 +123,26 @@ class InspectorRentedCheck:
             enforce=enforce,
         )
         if verdict.provider_origin:
-            what: dict[str, Any] = {
-                "findings": verdict.provider_findings,
-                "platform_findings": len(verdict.platform_findings),
-                "verdict": verdict.as_payload(),
-                "summary": report.get("summary", {}),
-                "canary_ok": report.get("canary_ok"),
-            }
-            if warnings:
-                what["warnings"] = warnings
-            event = render_message(
-                Msg.MALICIOUS_FINDINGS,
-                ctx=ctx,
-                check_id=self.check_id,
-                severity="error" if enforce else None,
-                impact=(
-                    "Provider-origin access to a rented pod: score zeroed, quarantine requested"
-                    if enforce
-                    else "Provider-origin access to a rented pod recorded; score unchanged (INSPECTOR_ENFORCE_ENABLED off)"
-                ),
-                what=what,
+            return await self._act_on_provider_origin(
+                ctx,
+                verdict=verdict,
+                report=report,
+                warnings=warnings,
+                rented_pods=rented_pods,
+                result=result,
                 extra=extra,
             )
-            inspector_event = _build_inspector_event(
-                ctx, event, rented_pods, result, outcome="MALICIOUS", report=report, verdict=verdict
-            )
-            if enforce:
-                # The renter hears about it only when the verdict acts: in shadow mode the
-                # classifier is still being measured against the sensor's false positives, and a
-                # "the provider read your pod" event on a wrong call cannot be taken back.
-                await _tell_renters(ctx, verdict, when=event.when.isoformat())
-            updates: dict[str, Any] = {
-                "default_extra": extra,
-                "state": replace(ctx.state, inspector_event=inspector_event),
-            }
-            if enforce:
-                # Non-fatal check: passed=False alone changes nothing downstream, the score gate
-                # in calculate_scores reads this flag (same mechanics as cpu_truth_passed).
-                updates["inspector_passed"] = False
-            return CheckResult(passed=not enforce, event=event, updates=updates)
 
         clean_what: dict[str, Any] = {
             "summary": report.get("summary", {}),
             "canary_ok": report.get("canary_ok"),
-            "verdict": verdict.as_payload(),
+            "verdict": verdict.as_payload().model_dump(),
         }
         if verdict.platform_findings:
             # every finding was one of our own execs seen from a host whose Tetragon lost the
-            # sshd ancestry — recorded, not malicious (the 8 Sep false positives)
-            clean_what["platform_findings"] = verdict.platform_findings
+            # sshd ancestry — recorded, not malicious (the 8 Sep false positives); the findings
+            # themselves are in the inspector event's report
+            clean_what["platform_findings"] = len(verdict.platform_findings)
         if _canary_failed(report):
             outcome = "CANARY_FAILED"
             event = render_message(
@@ -235,6 +206,60 @@ class InspectorRentedCheck:
             },
         )
 
+    async def _act_on_provider_origin(
+        self,
+        ctx: Context,
+        *,
+        verdict: InspectorVerdict,
+        report: dict[str, Any],
+        warnings: list[dict[str, Any]],
+        rented_pods: list[RentedPod],
+        result: InspectorValidationResponse,
+        extra: dict[str, Any],
+    ) -> CheckResult:
+        """The act-and-publish half of the check: a provider-origin verdict becomes the MALICIOUS
+        event and, under INSPECTOR_ENFORCE_ENABLED, fails the check and tells the renters."""
+        enforce = verdict.enforce
+        what: dict[str, Any] = {
+            "findings": verdict.provider_findings,
+            "platform_findings": len(verdict.platform_findings),
+            "verdict": verdict.as_payload().model_dump(),
+            "summary": report.get("summary", {}),
+            "canary_ok": report.get("canary_ok"),
+        }
+        if warnings:
+            what["warnings"] = warnings
+        event = render_message(
+            Msg.MALICIOUS_FINDINGS,
+            ctx=ctx,
+            check_id=self.check_id,
+            severity="error" if enforce else None,
+            impact=(
+                "Provider-origin access to a rented pod: score zeroed, quarantine requested"
+                if enforce
+                else "Provider-origin access to a rented pod recorded; score unchanged (INSPECTOR_ENFORCE_ENABLED off)"
+            ),
+            what=what,
+            extra=extra,
+        )
+        inspector_event = _build_inspector_event(
+            ctx, event, rented_pods, result, outcome="MALICIOUS", report=report, verdict=verdict
+        )
+        if enforce:
+            # The renter hears about it only when the verdict acts: in shadow mode the
+            # classifier is still being measured against the sensor's false positives, and a
+            # "the provider read your pod" event on a wrong call cannot be taken back.
+            await _tell_renters(ctx, verdict, when=event.when.isoformat())
+        updates: dict[str, Any] = {
+            "default_extra": extra,
+            "state": replace(ctx.state, inspector_event=inspector_event),
+        }
+        if enforce:
+            # Non-fatal check: passed=False alone changes nothing downstream, the score gate
+            # in calculate_scores reads this flag (same mechanics as cpu_truth_passed).
+            updates["inspector_passed"] = False
+        return CheckResult(passed=not enforce, event=event, updates=updates)
+
 
 def _build_inspector_event(
     ctx: Context,
@@ -269,7 +294,7 @@ def _build_inspector_event(
         # so the consumer can act on it without re-deriving the classification.
         payload["context"] = {
             **(result.diagnostics or {}),
-            **({"verdict": verdict.as_payload()} if verdict is not None else {}),
+            **({"verdict": verdict.as_payload().model_dump()} if verdict is not None else {}),
         }
     return payload
 
@@ -294,7 +319,7 @@ async def _tell_renters(ctx: Context, verdict: InspectorVerdict, *, when: str) -
             await redis.publish(
                 STREAMING_LOG_CHANNEL,
                 {
-                    "logs": [renter_access_event(verdict, pod_id=pod_id, when=when)],
+                    "logs": [renter_access_event(verdict, pod_id=pod_id, when=when).model_dump()],
                     "miner_hotkey": ctx.miner_hotkey,
                     "executor_uuid": ctx.executor.uuid,
                     "pod_id": pod_id,
