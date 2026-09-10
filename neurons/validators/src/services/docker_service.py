@@ -1273,7 +1273,10 @@ class DockerService:
     ) -> str:
         # one `docker info` per repair; a lookup that fails falls back to the default root and says
         # so, so the repair runs where it always did. On the create path a raised lookup error would
-        # replace the original `docker run` failure with no repair event logged.
+        # replace the original `docker run` failure with no repair event logged. The `except` below
+        # also catches a dead SSH transport (asyncssh's connection and timeout errors): then the
+        # fallback event names a broken connection, not a failed `docker info`, through `error`,
+        # and the repair commands that follow fail on the same connection with their own events.
         try:
             docker_root_dir = await self.get_docker_root_dir(
                 ssh_client, timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC

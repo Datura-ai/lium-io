@@ -4273,7 +4273,7 @@ async def test_repair_stale_vloopback_mountpoint_uses_the_hosts_docker_root(
 
 
 @pytest.mark.parametrize(
-    "root_lookup",
+    "docker_info_outcome",
     [
         pytest.param(
             _make_ssh_command_result(exit_status=1, stdout=""), id="docker_info_fails_with_no_output"
@@ -4284,7 +4284,7 @@ async def test_repair_stale_vloopback_mountpoint_uses_the_hosts_docker_root(
 )
 @pytest.mark.asyncio
 async def test_repair_stale_vloopback_mountpoint_falls_back_to_the_default_root_when_the_lookup_fails(
-    docker_service, caplog, root_lookup
+    docker_service, caplog, docker_info_outcome
 ):
     # a root the repair cannot read is not a reason to stop: the repair runs against the default
     # root as it always did, and the fallback is logged with the cause rather than raised
@@ -4293,7 +4293,7 @@ async def test_repair_stale_vloopback_mountpoint_falls_back_to_the_default_root_
         side_effect=[
             _VLOOPBACK_REPAIR_INSPECT,
             _VLOOPBACK_REPAIR_PLUGIN_ID,
-            root_lookup,
+            docker_info_outcome,
             _make_ssh_command_result(exit_status=1),
             _make_ssh_command_result(exit_status=0),
         ]
@@ -4318,7 +4318,7 @@ async def test_repair_stale_vloopback_mountpoint_falls_back_to_the_default_root_
     assert fallback_extra["fallback"] == "/var/lib/docker"
     assert fallback_extra["executor_id"] == "executor-1"
     assert fallback_extra["local_volume"] == "volume_test"
-    if isinstance(root_lookup, Exception):
+    if isinstance(docker_info_outcome, Exception):
         # asyncssh's TimeoutError has an empty str(); the log still has to name the cause
         assert fallback_extra["error"].startswith("TimeoutError")
     else:
