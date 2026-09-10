@@ -126,6 +126,10 @@ install_docker() {
       ok "Added ${SUDO_USER:-$USER} to docker group (activating for this session)"
     fi
   fi
+  # The executor stack bind-mounts $HOME/.docker (DAH-3376). Create it as the operator now:
+  # if the daemon creates a missing bind source it is root-owned and a later `docker login`
+  # by this user cannot write config.json.
+  mkdir -p "$HOME/.docker"
   ok "Docker installed"
 }
 
