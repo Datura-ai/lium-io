@@ -52,7 +52,7 @@ cp .env.example .env
 
 `lium-cvm.sh` subcommands: `check`, `download`, `new <name> [--env local|staging|prod] [--enable-logs] [--enable-sysinfo]`
 (`--env` picks `app/docker-compose.local.yml`, `app/docker-compose.staging.yml` or `app/docker-compose.yml`; default `prod`),
-`run <name>`, `stop <name>`, `list`, `lsgpu`, `help`.
+`run <name> [--dry-run]`, `stop <name> [--timeout N] [--force]`, `list`, `lsgpu`, `help`.
 
 ## Architecture
 

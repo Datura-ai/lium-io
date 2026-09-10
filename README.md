@@ -65,7 +65,7 @@ For more details, visit the [Validator Setup Guide](neurons/validators/README.md
 
 ## Repository Layout
 
-Three neurons, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files; `watchtower/`, its own pdm project with a Dockerfile; one shared pdm package (`datura/`, a `pyproject.toml` only); and `packages/lium-core/`, the library published to PyPI. The root `pyproject.toml` (`compute-subnet`, Python 3.11) holds only the repo-wide dev tools (`ruff`, `pre-commit`):
+Three neurons, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files; `watchtower/`, its own pdm project with a Dockerfile; one shared pdm package (`datura/`, a `pyproject.toml` only); and `packages/lium-core/`, the library published to PyPI. The root `pyproject.toml` (`compute-subnet`, Python 3.11) holds the shared `[tool.ruff]` config and the repo-wide dev tools (`ruff`, `pre-commit`), plus one declared runtime dependency (`aiohttp`):
 
 - `neurons/validators/` — the validator: scores miners, verifies executors over SSH, creates and manages rental containers on them (`src/services/docker_service.py`), sets weights. `src/miner_jobs/` holds the scripts the validator uploads to an executor and runs there (`machine_scrape.py` hardware scrape, `backup_storage.py` / `restore_storage.py`, `workspace_mount.py`); `machine_scrape.py` is obfuscated per job by `src/services/file_encrypt_service.py` before upload, so its key order is load-bearing (see the comment at the top of that file).
 - `neurons/miners/` — the miner: registers executors with the network and answers validator requests; its database schema is Alembic migrations under `migrations/`.
@@ -91,11 +91,11 @@ Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm proj
 (cd neurons/miners && pdm install && pdm run pytest tests/ -v --tb=short)
 ```
 
-These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter: a `route` job reads the changed files and each neuron's job runs only when that neuron, `datura/` or `.github/` changed; `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251` over `neurons datura watchtower`) always runs and is part of `tests-ok`; `lint` (`ruff format --check`, report-only, not required) runs per changed neuron; `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `datura/`, `.github/` or `e2e/` changed; `tests-ok` is the one status check to require and reports on every PR. Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
+These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter: a `route` job reads the changed files and each neuron's job runs only when that neuron, `datura/` or `.github/` changed; `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`; `lint` (`ruff format --check`, report-only, not required) runs per changed neuron; `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `datura/`, `.github/` or `e2e/` changed; `tests-ok` is the one status check to require and reports on every PR. Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
 
 ## Releases
 
-Images are built and pushed to Docker Hub by the `*_cd_*` workflows from each neuron's `docker_build.sh` / `docker_publish.sh` (and the `*_runner_*` pair for the auto-updating runner image):
+Images are built and pushed to Docker Hub by the `*_cd_prod` and `*_cd_dev` workflows from each neuron's `docker_build.sh` / `docker_publish.sh` (and the `*_runner_*` pair for the auto-updating runner image):
 
 | Tag pushed | Workflow | Images |
 |---|---|---|
@@ -103,7 +103,7 @@ Images are built and pushed to Docker Hub by the `*_cd_*` workflows from each ne
 | `validator-v*` | `validator_cd_prod.yml` | `daturaai/compute-subnet-validator`, `daturaai/compute-subnet-validator-runner` |
 | `miner-v*` | `miner_cd_prod.yml` | `daturaai/compute-subnet-miner`, `daturaai/compute-subnet-miner-runner` |
 
-The `*_cd_dev.yml` and `*_cd_staging.yml` workflows are started by hand (`workflow_dispatch`); `validator_cd_staging.yml` publishes `ghcr.io/datura-ai/lium-validator:staging`. The deploy of the validator and central miner lives in the private `lium-io-deployment` repository.
+The `*_cd_dev.yml` and `*_cd_staging.yml` workflows are started by hand (`workflow_dispatch`); the two `*_cd_staging.yml` use `docker/build-push-action` to publish `ghcr.io/datura-ai/lium-validator:staging` and `ghcr.io/datura-ai/lium-miner:staging`. The deploy of the validator and central miner lives in the private `lium-io-deployment` repository.
 
 ## Contact and Support
 
