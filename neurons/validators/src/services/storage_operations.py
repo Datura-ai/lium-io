@@ -54,22 +54,40 @@ async def supports_storage_operation(
 # Asks the executor's own storage models whether `workspace.bootstrap` exists (DAH-3274). An
 # executor image from before it drops the unknown key and refuses the non-empty target the
 # pod's entrypoint has already written to, so the create must stop before `docker run`.
+# Exit 0 = the field exists, exit 3 = the models import but have no such field (an old image);
+# any other status is the probe itself failing (no python at that path = 127, an import error =
+# 1, …) and is reported as such, not read as an old image (review, taiberium).
 _BOOTSTRAP_PROBE = (
     "import sys; sys.path.insert(0, '/root/app/src'); "
     "from storage.models import WorkspaceSpec; "
-    "sys.exit(0 if 'bootstrap' in WorkspaceSpec.__dataclass_fields__ else 1)"
+    "sys.exit(0 if 'bootstrap' in WorkspaceSpec.__dataclass_fields__ else 3)"
 )
+_BOOTSTRAP_PROBE_FIELD_MISSING = 3
 
 
 async def supports_bootstrap_restore(
     ssh_client: asyncssh.SSHClientConnection,
     python_path: str,
 ) -> bool:
+    """True when the executor's models know `workspace.bootstrap`, False when they do not.
+
+    Raises RuntimeError, with the exit status and the tail of stderr, when the probe could not
+    answer — the caller must not take that for an old executor image.
+    """
     result = await ssh_client.run(
         f"{shlex.quote(python_path)} -c {shlex.quote(_BOOTSTRAP_PROBE)}",
         check=False,
     )
-    return result.exit_status == 0
+    if result.exit_status == 0:
+        return True
+    if result.exit_status == _BOOTSTRAP_PROBE_FIELD_MISSING:
+        return False
+    stderr = result.stderr if isinstance(result.stderr, str) else ""
+    tail = " ".join(stderr.strip().splitlines()[-3:])[-400:]
+    raise RuntimeError(
+        f"bootstrap-restore probe could not run on the executor (exit {result.exit_status}"
+        f"{': ' + tail if tail else ''})"
+    )
 
 
 async def start_storage_operation(
