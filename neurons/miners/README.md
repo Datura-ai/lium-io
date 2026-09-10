@@ -74,6 +74,8 @@ Fill in your information for:
 
 `INTERNAL_PORT` and `EXTERNAL_PORT`: Optionally customize these ports. Make sure the `EXTERNAL PORT` is open for external connections to connect to the validators.
 
+`COMPUTE_REST_API_URL`: The Lium backend the miner talks to (template default `https://lium.io/api`).
+
 
 #### Step 4: Start the Miner
 
@@ -271,6 +273,15 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-reclaim-
 ```
 
 This will print a JSON list of all reclaim requests made by the miner, including their status and details.
+
+### Contract versions
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py show-contract-versions
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py current-contract-version
+```
+
+`show-contract-versions` lists the collateral contract versions with their addresses; `current-contract-version` prints the one this miner uses. (`migrate-validator-hotkey` is a one-off data migration for a past validator hotkey change and is not part of normal operation.)
 
 ### Finalizing a Reclaim Request
 

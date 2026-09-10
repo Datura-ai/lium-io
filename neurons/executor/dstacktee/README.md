@@ -50,6 +50,10 @@ cp .env.example .env
 ./lium-cvm.sh run my-executor
 ```
 
+`lium-cvm.sh` subcommands: `check`, `download`, `new <name> [--env local|staging|prod] [--enable-logs] [--enable-sysinfo]`
+(`--env` picks `app/docker-compose.local.yml`, `app/docker-compose.staging.yml` or `app/docker-compose.yml`; default `prod`),
+`run <name>`, `stop <name>`, `list`, `lsgpu`, `help`.
+
 ## Architecture
 
 ```mermaid
@@ -97,8 +101,10 @@ SSH_PORT=2200
 RENTING_PORT_RANGE="19001,19002,19003"
 
 # Identity
-MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here
+MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here   # your provider hotkey (SS58)
+VALIDATOR_HOTKEY_SS58_ADDRESS=...            # measured into the CVM attestation (RTMR) by app/init_script.sh; the executor's trusted validator is fixed in src/core/config.py
 ENABLE_TDX_ATTESTATION=true
+ENABLE_GPU_ATTESTATION=false                 # optional; GPU_ATTESTATION_ARCH=HOPPER | BLACKWELL when on
 
 # Measured executor-runner release (from the release notes) — required
 EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
