@@ -27,7 +27,7 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 from services.docker_service import DockerService
-from services.rental_docker_sdk import build_gpu_docker_config
+from services.rental_docker_sdk import RENTAL_NETWORK_NAME, build_gpu_docker_config
 
 from services import warm_pool
 from tests.test_deploy_optimizations import (
@@ -120,6 +120,7 @@ def _slot_doc(spec, image_doc: dict, *, labels: dict | None = None, **over) -> d
                 for r in spec.device_requests
             ],
             "Runtime": spec.runtime or "runc",
+            "NetworkMode": spec.network or "default",
             "CapAdd": list(spec.cap_add),
             "Sysctls": dict(spec.sysctls),
             "Ulimits": [{"Name": u.name, "Soft": u.soft, "Hard": u.hard} for u in spec.ulimits],
@@ -515,6 +516,8 @@ def test_real_dockerd_inspect_documents_parse_and_match(svc):
     # the documents is what dockerd wrote.
     for doc in (plain, gpu):
         doc["Mounts"][0]["Driver"] = "vloopback:latest"
+        # the pod predates the ICC-off rental bridge (DAH-3199); a slot created today sits on it
+        doc["HostConfig"]["NetworkMode"] = RENTAL_NETWORK_NAME
 
     slot = warm_pool.slot_from_inspect(plain, image_id=image["Id"], now=now, max_age=MAX_AGE)
     assert slot is not None
@@ -591,6 +594,7 @@ def test_stale_slots_from_listing():
 
 
 VOLUME_INSPECT = "vloopback:latest|40g|true|42949672960\n"
+NETWORK_INSPECT = "bridge|false\n"  # the ICC-off rental bridge (DAH-3199), as `docker network inspect` prints it
 
 
 def _host(
@@ -602,6 +606,7 @@ def _host(
     slot_doc: dict | None = None,
     volume_inspect: str = VOLUME_INSPECT,
     volume_inspect_exit: int = 0,
+    network_inspect: str = NETWORK_INSPECT,
 ):
     """An ssh client whose host answers the warm-pool commands like a node with one slot."""
     ssh = _ssh_client(inspect_exit=0)
@@ -614,6 +619,8 @@ def _host(
             )
         if "docker volume inspect" in cmd:
             return _ssh_result(exit_status=volume_inspect_exit, stdout=volume_inspect)
+        if "docker network inspect" in cmd:
+            return _ssh_result(stdout=network_inspect)
         if "docker rename" in cmd:
             return _ssh_result(exit_status=adopt_exit, stderr="boom" if adopt_exit else "")
         return _ssh_result(exit_status=0)
@@ -672,6 +679,8 @@ async def test_flag_on_adopts_the_slot_instead_of_creating(svc, monkeypatch):
     # the slot's volume was read from the plugin before the rename, not taken from the label
     cmds = _cmds(ssh)
     assert cmds.index(warm_pool.inspect_volume_command(f"volume_{SLOT_ID}")) < cmds.index(adopt[0])
+    # and the rental network was read as an ICC-off bridge before the start (DAH-3199)
+    assert cmds.index(warm_pool.inspect_network_command(spec.network)) < cmds.index(adopt[0])
     # the renter's keys still land after the start, as on every rental
     assert any(
         "authorized_keys" in " ".join(s.argv)
@@ -825,6 +834,44 @@ async def test_failed_adopt_command_falls_back_and_removes_the_slot(svc, monkeyp
     svc.create_local_volume.assert_awaited_once()
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
     assert result.volume_name == f"volume_{payload.pod_id}"
+
+
+@pytest.mark.parametrize(
+    "network_inspect",
+    ["bridge|true\n", "bridge|\n", "macvlan|false\n", "", "a|false\nb|false\n"],
+    ids=["icc-on", "icc-unset", "not-bridge", "no-such-network", "two-lines"],
+)
+@pytest.mark.asyncio
+async def test_slot_is_not_started_on_a_network_that_lets_containers_talk(
+    svc, monkeypatch, network_inspect
+):
+    """`docker create` refuses a `lium-rentals` that is not an ICC-off bridge (DAH-3199); a slot was
+    created hours ago and only joins the network when it starts, so adoption re-reads the live
+    network and falls back to a fresh create — which then refuses the same way."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload()
+    spec = _spec(svc, payload)
+    ssh = _host(svc, spec, _image_doc(), network_inspect=network_inspect)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    cmds = _cmds(ssh)
+    assert warm_pool.inspect_network_command(spec.network) in cmds
+    assert not any("docker rename" in c for c in cmds)
+    assert any(f"docker rm -f {spec.name}" in c and f"volume rm volume_{SLOT_ID}" in c for c in cmds)
+    svc.create_local_volume.assert_awaited_once()
+    assert result.volume_name == f"volume_{payload.pod_id}"
+
+
+def test_network_mismatch_reads_the_inspect_line():
+    assert warm_pool.network_mismatch("bridge|false\n") is None
+    assert warm_pool.network_mismatch("bridge|true\n") == "network not an ICC-off bridge"
+    assert warm_pool.network_mismatch("host|false\n") == "network not an ICC-off bridge"
+    assert warm_pool.network_mismatch("") == "network not inspectable"
+    assert "'lium-rentals; rm -rf /'" in warm_pool.inspect_network_command("lium-rentals; rm -rf /")
+    assert 'index .Options "com.docker.network.bridge.enable_icc"' in warm_pool.inspect_network_command("n")
 
 
 @pytest.mark.asyncio
@@ -1142,7 +1189,9 @@ async def test_flag_off_volume_failure_is_still_reported_as_the_volume_step(svc,
     [
         (lambda d: d["HostConfig"].__setitem__("Privileged", True), "privileged"),
         (lambda d: d["HostConfig"].__setitem__("PidMode", "host"), "namespace mode"),
-        (lambda d: d["HostConfig"].__setitem__("NetworkMode", "host"), "namespace mode"),
+        (lambda d: d["HostConfig"].__setitem__("NetworkMode", "host"), "network"),
+        # a slot on docker0 while rentals run on the ICC-off `lium-rentals` bridge (DAH-3199)
+        (lambda d: d["HostConfig"].__setitem__("NetworkMode", "bridge"), "network"),
         (
             lambda d: d["HostConfig"].__setitem__("DeviceCgroupRules", ["a *:* rwm"]),
             "extra host config",
