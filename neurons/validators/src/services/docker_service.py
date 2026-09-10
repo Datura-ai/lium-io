@@ -1300,6 +1300,25 @@ class DockerService:
             return f"volume inspect exit {result.exit_status}"
         return warm_pool.volume_mismatch(slot, result.stdout or "")
 
+    async def _warm_slot_network_mismatch(
+        self, ssh_client: asyncssh.SSHClientConnection, network_name: str
+    ) -> str | None:
+        """Why the rental network is not the ICC-off bridge a rental may start on
+        (`warm_pool.network_mismatch`); a failed inspect is a mismatch too."""
+        try:
+            result = await ssh_client.run(
+                warm_pool.inspect_network_command(network_name),
+                check=False,
+                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return f"network inspect failed: {exc}"
+        if result.exit_status != 0:
+            return f"network inspect exit {result.exit_status}"
+        return warm_pool.network_mismatch(result.stdout or "")
+
     async def _adopt_warm_slot(
         self,
         *,
@@ -1313,6 +1332,10 @@ class DockerService:
         when the live slot differs from `run_spec` in any field or the command fails."""
         slot = adoption.slot
         reason = warm_pool.slot_matches(slot, run_spec, adoption.image_doc)
+        if reason is None and run_spec.network:
+            # A `docker create` proves the rental network is an ICC-off bridge (DAH-3199); the slot
+            # was created hours ago, so its start re-reads the live network the same way.
+            reason = await self._warm_slot_network_mismatch(ssh_client, run_spec.network)
         if reason is None:
             try:
                 result = await ssh_client.run(

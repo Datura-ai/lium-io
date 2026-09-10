@@ -17,7 +17,7 @@ start — is a *miss*, logged with its reason, and the rental takes the path tha
 Trust: the validator created the slot, but the miner owns the daemon in between. Adoption
 therefore never trusts the slot's labels alone; it compares the live `docker inspect` output
 against the spec it would use now (image id, mounts, ports, devices, GPU requests, runtime,
-capabilities, sysctls, ulimits, restart policy, storage-opt, env, cmd, entrypoint) and requires
+network, capabilities, sysctls, ulimits, restart policy, storage-opt, env, cmd, entrypoint) and requires
 `State.Status == created` with a zero `StartedAt` — a container that ever ran is not a slot. The
 slot's volume is inspected as well (`volume_mismatch`): the size the rental is granted is the one
 the volume plugin recorded, never the label alone.
@@ -36,7 +36,7 @@ from payload_models.payloads import (
     PayloadPortMapping,
     WorkloadKind,
 )
-from services.rental_docker_sdk import ContainerRunSpec, GpuDeviceRequest
+from services.rental_docker_sdk import RENTAL_NETWORK_ICC_OPTION, ContainerRunSpec, GpuDeviceRequest
 
 WARM_CONTAINER_PREFIX = "warm_"
 WARM_POOL_LABEL = "lium.warm_pool"
@@ -290,6 +290,28 @@ def volume_mismatch(slot: WarmSlot, inspect_output: str) -> str | None:
     return None
 
 
+def inspect_network_command(network_name: str) -> str:
+    """Driver and inter-container-traffic option of one docker network."""
+    return (
+        f"/usr/bin/docker network inspect {shlex.quote(network_name)} --format "
+        f"'{{{{.Driver}}}}|{{{{index .Options \"{RENTAL_NETWORK_ICC_OPTION}\"}}}}'"
+    )
+
+
+def network_mismatch(inspect_output: str) -> str | None:
+    """Why the rental network a slot sits on is not the ICC-off bridge the rental requires; None when
+    it is. A `docker create` proves this through `_ensure_rental_network_sync` (DAH-3199); a slot was
+    created hours ago and holds no endpoint until it starts, so the network could have been removed
+    and recreated with traffic on in between — adoption re-reads it, as the create would."""
+    lines = [line for line in (inspect_output or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return "network not inspectable"
+    driver, icc = (lines[0].strip().split("|") + ["", ""])[:2]
+    if driver != "bridge" or icc != "false":
+        return "network not an ICC-off bridge"
+    return None
+
+
 def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str | None:
     """Why the live slot differs from the container the rental would create now; None when equal.
 
@@ -360,8 +382,17 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
         return "privileged"
     if (host.get("PidMode") or "") or (host.get("IpcMode") or "private") not in ("", "private", "shareable"):
         return "namespace mode"
-    if (host.get("UsernsMode") or "") or (host.get("NetworkMode") or "default") not in ("default", "bridge"):
+    if host.get("UsernsMode"):
         return "namespace mode"
+    # The slot sits on the network the rental would run on — the ICC-off `lium-rentals` bridge
+    # (DAH-3199, `spec.network`); a slot on docker0 or `host` would put the pod back on the network
+    # that bridge exists to end. A spec without a network expects dockerd's default bridge.
+    network_mode = host.get("NetworkMode") or "default"
+    expected_network = spec.network or "default"
+    if network_mode != expected_network and not (
+        expected_network == "default" and network_mode == "bridge"
+    ):
+        return "network"
     if any(
         host.get(field)
         for field in (
