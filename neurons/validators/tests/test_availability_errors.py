@@ -312,17 +312,30 @@ def test_a_cycle_that_reached_almost_nothing_reports_nothing() -> None:
 
 def test_results_that_never_checked_are_not_counted() -> None:
     """A cycle that failed before the connect says nothing, so it cannot tip the share."""
-    # Arrange - one real failure, one real success, eight that never checked
+    # Arrange - two real failures, four real successes, eight that never checked
     results = [
-        _result_with([{"reason_code": "EXECUTOR_SSH_UNREACHABLE"}]),
-        _result_with([]),
-    ] + [_result_with(None) for _ in range(8)]
+        _result_with([{"reason_code": "EXECUTOR_SSH_UNREACHABLE"}]) for _ in range(2)
+    ] + [_result_with([]) for _ in range(4)] + [_result_with(None) for _ in range(8)]
 
     # Act
     silenced = silence_availability_errors_on_our_own_outage(results)
 
-    # Assert - one of two checked is not "most of them"
+    # Assert - two of six checked is not "most of them"
     assert silenced == 0
+
+
+def test_a_validator_with_a_few_nodes_still_reports_what_it_found() -> None:
+    """The share carries no signal on a small fleet, and a fleet that small cannot empty the market."""
+    # Arrange - every node of a four-node cycle refuses SSH
+    unreachable = [{"reason_code": "EXECUTOR_SSH_UNREACHABLE"}]
+    results = [_result_with(list(unreachable)) for _ in range(4)]
+
+    # Act
+    silenced = silence_availability_errors_on_our_own_outage(results)
+
+    # Assert
+    assert silenced == 0
+    assert all(result.availability_errors == unreachable for result in results)
 
 
 def test_the_peer_text_of_an_ssh_failure_is_capped() -> None:

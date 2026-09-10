@@ -35,6 +35,9 @@ MAX_PEER_TEXT_LENGTH = 500
 # Above this share of one cycle failing at the connect, the validator itself is the suspect and
 # the cycle reports nothing about reachability.
 FLEET_SHARE_THAT_MEANS_OUR_OWN_OUTAGE = 0.5
+# Below this many checked nodes a share says nothing: one bad node out of two is already "most of
+# them". A validator this small also cannot empty the market, so it reports what it found.
+SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE = 5
 
 
 class AvailabilityErrorCode(StrEnum):
@@ -137,8 +140,11 @@ def is_our_own_outage(unreachable_count: int, checked_count: int) -> bool:
     our egress, our DNS, our keys — and hiding the whole market over it is worse than listing a
     node nobody can reach for one more cycle. The backend's hourly sweep guards `active` the
     same way (DAH-2658).
+
+    A cycle with only a few nodes is exempt: there the share carries no signal, and a validator
+    that small cannot empty the market anyway.
     """
-    if checked_count == 0:
+    if checked_count < SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE:
         return False
     return unreachable_count / checked_count > FLEET_SHARE_THAT_MEANS_OUR_OWN_OUTAGE
 
