@@ -105,6 +105,22 @@ def _storage_repository_spec(
     }
 
 
+def _missing_executor_failure(
+    msg: AcceptSSHKeyRequest, executor_id: str
+) -> tuple[str, FailedContainerErrorCodes]:
+    """Headline and code for an AcceptSSHKeyRequest that does not carry the requested executor.
+
+    DAH-3338: the miner now says which executors it KNOWS (known_executor_ids) apart from which
+    ACCEPTED the key (executors). An id the miner lists but did not return is a node it could not
+    reach, ExecutorUnreachable; only an id the miner does not list is InvalidExecutorId. A miner
+    that predates known_executor_ids sends None, and every miss stays InvalidExecutorId as before.
+    Both twins of the container flow (websocket and REST) call this, so they cannot drift apart.
+    """
+    if msg.known_executor_ids is not None and executor_id in msg.known_executor_ids:
+        return "Error: Executor unreachable", FailedContainerErrorCodes.ExecutorUnreachable
+    return "Error: Invalid executor id", FailedContainerErrorCodes.InvalidExecutorId
+
+
 def _parse_miner_response(response_data: dict) -> AcceptSSHKeyRequest | FailedRequest | PodLogsResponse:
     """Parse miner REST API response based on message_type field.
 
@@ -815,6 +831,12 @@ class MinerService:
                         "executor_image": result.executor_image_report,
                         "sent_at": time.time(),
                         "batch_total": batch_total,
+                        # DAH-3338: None when the cycle observed no rented pod and reaped nothing.
+                        "pod_states": (
+                            [state.model_dump(mode="json") for state in result.pod_states]
+                            if result.pod_states is not None
+                            else None
+                        ),
                     },
                 )
             except Exception as e:
@@ -999,7 +1021,8 @@ class MinerService:
                         executor = None
 
                     if executor is None or executor.uuid != payload.executor_id:
-                        log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+                        headline, error_code = _missing_executor_failure(msg, payload.executor_id)
+                        log_text = _m(headline, extra=get_extra_info(default_extra))
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
@@ -1022,7 +1045,7 @@ class MinerService:
                         return self._handle_container_error(
                             payload=payload,
                             msg=log_text,
-                            error_code=FailedContainerErrorCodes.InvalidExecutorId
+                            error_code=error_code,
                         )
 
                     renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id, payload.pod_id)
@@ -2150,7 +2173,8 @@ class MinerService:
                     executor = None
 
                 if executor is None or executor.uuid != payload.executor_id:
-                    log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+                    headline, error_code = _missing_executor_failure(msg, payload.executor_id)
+                    log_text = _m(headline, extra=get_extra_info(default_extra))
 
                     # Remove SSH key only if it was accepted
                     if ssh_key_accepted:
@@ -2175,7 +2199,7 @@ class MinerService:
                     return self._handle_container_error(
                         payload=payload,
                         msg=log_text,
-                        error_code=FailedContainerErrorCodes.InvalidExecutorId
+                        error_code=error_code,
                     )
 
                 renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id, payload.pod_id)

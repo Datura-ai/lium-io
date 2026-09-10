@@ -1095,3 +1095,233 @@ def test_context_annotations_resolve_at_runtime():
     # annotation pydantic cannot resolve. A ContextServices field typed only under TYPE_CHECKING
     # leaves Context unbuildable, and then every real validation cycle raises instead of running.
     assert Context.model_rebuild(force=True) is True
+
+
+# ---------------------------------------------------------------------------
+# DAH-3338: the container state of every rented pod rides ctx.state.pod_states
+# ---------------------------------------------------------------------------
+
+
+class AbsentContainerSSHClient(DummySSHClient):
+    """`docker ps` lists nothing and `docker inspect` answers "No such container"."""
+
+    def __init__(self):
+        super().__init__(pod_running=False)
+
+    async def run(self, command: str):
+        if "docker inspect" in command:
+            self.commands_called.append(command)
+            return Mock(stdout="", stderr="Error: No such container: tenant-123")
+        return await super().run(command)
+
+
+def _pod_states(result) -> dict[str, str]:
+    return {s.pod_id: s.container_state.value for s in result.updates["state"].pod_states}
+
+
+def _tenant_ctx(context_factory, ssh_client, rented_machine, *, backend=None, prior_state=None):
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend or DummyBackendClient(active=True),
+    )
+    state = build_state(
+        gpu_processes=[],
+        gpu_details=[],
+        gpu_model="NVIDIA RTX 4090",
+        rented_data=build_rented_data("executor-123", rented_machine),
+        pod_states=prior_state or [],
+    )
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=ssh_client,
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pod_states_reports_running_for_a_healthy_rented_pod(context_factory):
+    ctx = _tenant_ctx(
+        context_factory,
+        DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA"]),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert _pod_states(result) == {"pod-1": "running"}
+    observed_at = result.updates["state"].pod_states[0].observed_at
+    assert observed_at.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_pod_states_reports_exited_when_inspect_shows_a_stopped_container(context_factory):
+    # DummySSHClient answers docker inspect with Status=exited; the rental is still open, so
+    # the cycle also fails with POD_NOT_RUNNING as before.
+    ctx = _tenant_ctx(
+        context_factory,
+        DummySSHClient(pod_running=False),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert _pod_states(result) == {"pod-1": "exited"}
+
+
+@pytest.mark.asyncio
+async def test_pod_states_reports_absent_when_no_container_of_that_name_exists(context_factory):
+    ctx = _tenant_ctx(
+        context_factory,
+        AbsentContainerSSHClient(),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert _pod_states(result) == {"pod-1": "absent"}
+
+
+@pytest.mark.asyncio
+async def test_pod_states_reports_the_state_when_the_backend_says_the_rental_is_closed(
+    context_factory,
+):
+    # STALE_POD_NOT_RUNNING is a pass, and still carries what the host showed.
+    ctx = _tenant_ctx(
+        context_factory,
+        AbsentContainerSSHClient(),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+        backend=DummyBackendClient(active=False),
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+    assert _pod_states(result) == {"pod-1": "absent"}
+
+
+@pytest.mark.asyncio
+async def test_pod_states_is_unknown_not_absent_on_ssh_transport_loss(context_factory):
+    ctx = _tenant_ctx(
+        context_factory,
+        DummySSHClient(raise_on_run=asyncssh.ConnectionLost("conntrack flush")),
+        {
+            "containers": [
+                {"name": "tenant-123", "pod_id": "pod-1"},
+                {"name": "tenant-456", "pod_id": "pod-2"},
+            ]
+        },
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    # Neither pod was inspected: the one the transport died on and the one never reached.
+    assert _pod_states(result) == {"pod-1": "unknown", "pod-2": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_pod_states_keeps_running_for_pods_seen_before_the_transport_died(context_factory):
+    ssh = DummySSHClient(pod_running=True)
+    seen: list[str] = []
+
+    async def run(command: str):
+        # The first pod's two commands (docker ps, authorized_keys) answer; then the link dies.
+        seen.append(command)
+        if "tenant-456" in command:
+            raise asyncssh.ConnectionLost("link dropped")
+        return await DummySSHClient.run(ssh, command)
+
+    ssh.run = run
+    ctx = _tenant_ctx(
+        context_factory,
+        ssh,
+        {
+            "containers": [
+                {"name": "tenant-123", "pod_id": "pod-1"},
+                {"name": "tenant-456", "pod_id": "pod-2"},
+            ]
+        },
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert _pod_states(result) == {"pod-1": "running", "pod-2": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_pod_states_is_unknown_when_the_recovery_recheck_loses_ssh(context_factory):
+    ssh = DummySSHClient(pod_running=False)
+    docker = AsyncMock()
+
+    async def start_pod_then_lose_transport(**kwargs):
+        ssh.raise_on_run = asyncssh.ConnectionLost("host rebooted again")
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = start_pod_then_lose_transport
+    ctx = build_recovery_context(context_factory, ssh, docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    # inspect said exited before the repair, but the re-check never answered: unknown wins.
+    assert _pod_states(result) == {"pod-1": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_pod_states_reports_running_after_a_successful_recovery(context_factory):
+    ssh = DummySSHClient(pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    docker = AsyncMock()
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.pod_running = True
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    ctx = build_recovery_context(context_factory, ssh, docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert _pod_states(result) == {"pod-1": "running"}
+
+
+@pytest.mark.asyncio
+async def test_pod_states_are_appended_to_what_the_stale_cleanup_reaped(context_factory):
+    from datetime import UTC, datetime
+
+    from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
+
+    reaped = PodContainerState(
+        pod_id="orphan-9", container_state=ContainerState.REAPED, observed_at=datetime.now(UTC)
+    )
+    ctx = _tenant_ctx(
+        context_factory,
+        DummySSHClient(pod_running=True),
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
+        prior_state=[reaped],
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert _pod_states(result) == {"orphan-9": "reaped", "pod-1": "running"}
+
+
+@pytest.mark.asyncio
+async def test_pod_states_is_untouched_when_the_executor_is_not_rented(context_factory):
+    ctx = _tenant_ctx(context_factory, DummySSHClient(pod_running=True), None)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.NOT_RENTED.reason
+    assert "state" not in result.updates

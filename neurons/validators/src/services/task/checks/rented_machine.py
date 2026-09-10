@@ -1,13 +1,19 @@
 import logging
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncssh
 
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
+from protocol.vc_protocol.compute_requests import RentedPod
+from protocol.vc_protocol.validator_requests import (
+    ContainerState,
+    PodContainerState,
+    ResetVerifiedJobReason,
+)
 
 from ...const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
@@ -92,6 +98,10 @@ class _DownedPodOutcome:
     failure: CheckResult | None
     # keys of the recovered container, reported instead of the ones read before it went down.
     ssh_pub_keys: list[str]
+    # DAH-3338: what the backend is told about the container — running when the recovery brought
+    # it back, unknown when the transport died, else the state the diagnostics read before the
+    # recovery was attempted.
+    container_state: ContainerState
 
 
 class TenantEnforcementCheck:
@@ -161,22 +171,34 @@ class TenantEnforcementCheck:
         if rented_pods and len(known_pod_gpu_counts) == len(rented_pods):
             extra["rented_gpu_count"] = sum(known_pod_gpu_counts)
 
+        # DAH-3338: pod_id -> what this cycle saw of its container. A pod the loop never reached
+        # (an earlier pod's verdict returned first, or the transport died) is reported unknown.
+        observed: dict[str, ContainerState] = {}
+
+        def with_pod_states(result: CheckResult) -> CheckResult:
+            return _with_pod_states(result, ctx, rented_pods, observed)
+
         for pod in rented_pods:
             pod_container_name = pod.container_name
             pod_id = pod.pod_id
             try:
                 pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_container_name)
             except (asyncssh.Error, OSError) as exc:
-                return _executor_transport_unreachable_result(
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    container_name=pod_container_name,
-                    pod_id=pod_id,
-                    transport_error=exc,
-                    extra=extra,
+                return with_pod_states(
+                    _executor_transport_unreachable_result(
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        container_name=pod_container_name,
+                        pod_id=pod_id,
+                        transport_error=exc,
+                        extra=extra,
+                    )
                 )
-            if not pod_running:
+            if pod_running:
+                observed[pod_id] = ContainerState.RUNNING
+            else:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
+                observed[pod_id] = _container_state_from_diagnostics(diagnostics)
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
                     event = render_message(
@@ -196,14 +218,16 @@ class TenantEnforcementCheck:
                         },
                         extra=extra,
                     )
-                    return CheckResult(
-                        passed=True,
-                        event=event,
-                        updates={
-                            "default_extra": extra,
-                            "rented": False,
-                            "ssh_pub_keys": None,
-                        },
+                    return with_pod_states(
+                        CheckResult(
+                            passed=True,
+                            event=event,
+                            updates={
+                                "default_extra": extra,
+                                "rented": False,
+                                "ssh_pub_keys": None,
+                            },
+                        )
                     )
 
                 outcome = await self._recover_downed_pod(
@@ -214,8 +238,9 @@ class TenantEnforcementCheck:
                     local_volume_path=rental_active.local_volume_path if rental_active else None,
                     extra=extra,
                 )
+                observed[pod_id] = outcome.container_state
                 if outcome.failure:
-                    return outcome.failure
+                    return with_pod_states(outcome.failure)
                 ssh_pub_keys = outcome.ssh_pub_keys
                 continue
 
@@ -241,10 +266,12 @@ class TenantEnforcementCheck:
                     },
                     extra=extra
                 )
-                return CheckResult(
-                    passed=False,
-                    event=event,
-                    updates={"default_extra": extra, "ssh_pub_keys": ssh_pub_keys},
+                return with_pod_states(
+                    CheckResult(
+                        passed=False,
+                        event=event,
+                        updates={"default_extra": extra, "ssh_pub_keys": ssh_pub_keys},
+                    )
                 )
 
         score_calculator = ctx.services.score_calculator
@@ -265,21 +292,23 @@ class TenantEnforcementCheck:
             extra=extra
         )
 
-        return CheckResult(
-            passed=True,
-            event=event,
-            updates={
-                "default_extra": extra,
-                "rented": True,
-                "ssh_pub_keys": ssh_pub_keys,
-                "score": actual_score,
-                "job_score": job_score,
-                "score_warning": warning_message or None,
-                "log_status": "info",
-                "log_text": event.event,
-                "success": True,
-            },
-            halt=True,
+        return with_pod_states(
+            CheckResult(
+                passed=True,
+                event=event,
+                updates={
+                    "default_extra": extra,
+                    "rented": True,
+                    "ssh_pub_keys": ssh_pub_keys,
+                    "score": actual_score,
+                    "job_score": job_score,
+                    "score_warning": warning_message or None,
+                    "log_status": "info",
+                    "log_text": event.event,
+                    "success": True,
+                },
+                halt=True,
+            )
         )
 
     async def _recover_downed_pod(
@@ -296,6 +325,7 @@ class TenantEnforcementCheck:
         # and report POD_NOT_RUNNING only if it is still down afterwards.
         pod_running = False
         ssh_pub_keys: list[str] = []
+        container_state = _container_state_from_diagnostics(diagnostics)
         if self.recover_stale_pods:
             try:
                 if await _recover_pod_after_stale_vloopback_mount(
@@ -320,11 +350,14 @@ class TenantEnforcementCheck:
                         extra=extra,
                     ),
                     ssh_pub_keys=[],
+                    container_state=ContainerState.UNKNOWN,
                 )
 
         if pod_running:
             extra.setdefault("recovered_pods", []).append(container_name)
-            return _DownedPodOutcome(failure=None, ssh_pub_keys=ssh_pub_keys)
+            return _DownedPodOutcome(
+                failure=None, ssh_pub_keys=ssh_pub_keys, container_state=ContainerState.RUNNING
+            )
 
         event = render_message(
             Msg.POD_NOT_RUNNING,
@@ -350,7 +383,48 @@ class TenantEnforcementCheck:
                 },
             ),
             ssh_pub_keys=[],
+            container_state=container_state,
         )
+
+
+def _container_state_from_diagnostics(diagnostics: dict[str, object]) -> ContainerState:
+    # DAH-3338: the wire state of a pod `docker ps` did not list as running, read from the
+    # `docker inspect` the diagnostics already ran. A container inspect could not answer for
+    # (daemon down, unparseable state) is unknown, not absent: only "No such container" is absent.
+    if diagnostics.get("container_missing"):
+        return ContainerState.ABSENT
+    status = diagnostics.get("container_status")
+    if status is None:
+        return ContainerState.UNKNOWN
+    if status == "running":
+        return ContainerState.RUNNING
+    return ContainerState.EXITED
+
+
+def _with_pod_states(
+    result: CheckResult,
+    ctx: Context,
+    rented_pods: list[RentedPod],
+    observed: dict[str, ContainerState],
+) -> CheckResult:
+    # DAH-3338: every verdict of the check carries one state per rented pod into ctx.state, on top
+    # of what StaleContainerCleanupCheck reaped earlier in the cycle. A pod without an observation
+    # is unknown — the check returned before reaching it, or the SSH transport died.
+    observed_at = datetime.now(UTC)
+    pod_states = [
+        *ctx.state.pod_states,
+        *(
+            PodContainerState(
+                pod_id=pod.pod_id,
+                container_state=observed.get(pod.pod_id, ContainerState.UNKNOWN),
+                observed_at=observed_at,
+            )
+            for pod in rented_pods
+        ),
+    ]
+    return result.model_copy(
+        update={"updates": {**result.updates, "state": replace(ctx.state, pod_states=pod_states)}}
+    )
 
 
 def _executor_transport_unreachable_result(

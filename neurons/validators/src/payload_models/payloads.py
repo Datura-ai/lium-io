@@ -690,6 +690,9 @@ class FailedContainerErrorCodes(enum.Enum):
     DeletionInProgress = "DeletionInProgress"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
+    # DAH-3338: the miner lists the executor but the node did not accept the validator's key. Was
+    # reported as InvalidExecutorId, which the backend cannot tell from an id nobody knows.
+    ExecutorUnreachable = "ExecutorUnreachable"
     ExceptionError = "ExceptionError"
     FailedMsgFromMiner = "FailedMsgFromMiner"
     RentingInProgress = "RentingInProgress"

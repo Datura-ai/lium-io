@@ -58,6 +58,26 @@ class AuthenticateRequest(BaseValidatorRequest):
         return cls(payload=payload, signature=f"0x{keypair.sign(payload.blob_for_signing()).hex()}")
 
 
+class ContainerState(str, enum.Enum):
+    """What the validator saw of one rented pod's container this cycle (DAH-3338)."""
+
+    RUNNING = "running"
+    # On the host but not running: docker inspect answered a status other than running.
+    EXITED = "exited"
+    # No container of that name on the host.
+    ABSENT = "absent"
+    # The SSH transport died before the container could be inspected; never read as absent.
+    UNKNOWN = "unknown"
+    # StaleContainerCleanupCheck removed it: an orphan the backend no longer lists as rented.
+    REAPED = "reaped"
+
+
+class PodContainerState(pydantic.BaseModel):
+    pod_id: str
+    container_state: ContainerState
+    observed_at: datetime
+
+
 class ExecutorSpecRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ExecutorSpecRequest
     miner_hotkey: str
@@ -99,6 +119,10 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # DAH-2792: specs the validator scored for this miner in this job_batch_id, counting the ones
     # whose redis publish failed; the backend reads expected minus received as lost on the websocket.
     batch_total: int | None = None
+    # DAH-3338: the container state of every rented pod this cycle observed, plus the orphans the
+    # stale cleanup reaped. None when the cycle never reached the rented-state check. The backend
+    # writes it onto rental_history; an older backend ignores the key.
+    pod_states: list[PodContainerState] | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

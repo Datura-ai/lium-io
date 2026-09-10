@@ -21,6 +21,7 @@ from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.validator_requests import PodContainerState
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
 
@@ -110,6 +111,10 @@ class ContextState:
     # DAH-2991: orphaned rental containers the stale cleanup could not remove this cycle; they still
     # hold their published ports, so PortCountCheck names them in INSUFFICIENT_PORTS.
     orphaned_containers: list[str] = field(default_factory=list)
+    # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
+    # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
+    # ExecutorSpecRequest.pod_states.
+    pod_states: list[PodContainerState] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None
