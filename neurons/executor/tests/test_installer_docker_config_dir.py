@@ -7,7 +7,7 @@ daemon creates the bind source as root and the operator's later ``docker login``
 ``install_docker`` returns early.
 
 Same harness as test_sysbox_setup_preflight.py: the script runs under bash with stub commands
-(apt-get, sudo, docker, id) ahead of the real PATH and a fixture ``$HOME``.
+(apt-get, sudo, docker) ahead of the real PATH and a fixture ``$HOME``.
 """
 
 import os
@@ -33,8 +33,6 @@ STUBS = {
         esac
         """
     ),
-    # the operator is already in the docker group: no usermod, no `sg` re-exec at the end
-    "id": '#!/bin/bash\n[ "$1" = "-nG" ] && { echo "docker"; exit 0; }\nexec /usr/bin/id "$@"\n',
 }
 
 
@@ -84,4 +82,5 @@ def test_installer_leaves_an_existing_docker_config_dir_alone(host):
     result = _run_installer(stubs, home)
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Docker config directory ready: {home}/.docker" in result.stdout
     assert config.read_text() == '{"auths": {}}\n'

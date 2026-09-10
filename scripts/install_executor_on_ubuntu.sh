@@ -132,7 +132,8 @@ install_docker() {
 # The executor stack bind-mounts $HOME/.docker (DAH-3376). Create it as the user running this
 # script — the same user `lium mine` starts the stack as — on every run, Docker pre-installed or
 # not: if the daemon creates a missing bind source it is root-owned and a later `docker login`
-# by this user cannot write config.json.
+# by this user cannot write config.json. Run the script as the operator (as `lium mine` does),
+# not through `sudo bash`: under sudo $HOME is root's and the directory lands in /root.
 prepare_docker_config_dir() {
   mkdir -p "$HOME/.docker"
   ok "Docker config directory ready: $HOME/.docker"

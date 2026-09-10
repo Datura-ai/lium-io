@@ -7,7 +7,10 @@ version: '3.7'
 # Create it as the user who runs the stack (`mkdir -p ~/.docker`; the installer does) before
 # the first `docker compose up`, or the daemon creates it as root and a later `docker login`
 # by that user cannot write config.json. The runner pins DOCKER_HOST so a `currentContext`
-# in the host's config.json cannot redirect its docker CLI.
+# in the host's config.json cannot redirect its docker CLI. The credentials must be inline
+# (`auths`): Watchtower has no credential helper, and a `credsStore` in config.json makes it
+# skip every container, public images included (the runner's CLI still pulls anonymously) —
+# `grep credsStore ~/.docker/config.json` must print nothing (remove the key, log in again).
 services:
   executor-runner:
     image: daturaai/compute-subnet-executor-runner:latest
