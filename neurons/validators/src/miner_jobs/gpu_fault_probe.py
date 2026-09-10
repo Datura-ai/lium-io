@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 MB = 1024 * 1024
 JSON_MARKER = "GPU_FAULT_PROBE_JSON:"
@@ -45,7 +46,9 @@ WORKER_GRACE_PER_GPU_SECONDS = (
     5  # more of it per extra worker: they fork, JIT and allocate at the same time
 )
 NVML_GRACE_SECONDS = 10  # an NVML snapshot runs in its own fork: nvmlInit hangs on a wedged card
-WORKER_REAP_SECONDS = 5  # one shared wait for killed workers to be reaped, whatever their number
+WORKER_REAP_AFTER_KILL_SECONDS = (
+    5  # one shared wait, after the kill, for the workers to be reaped, whatever their number
+)
 DMESG_TIMEOUT_SECONDS = 5
 # Xid types an application raises on a healthy card (graphics exception, MMU fault, channel reset, preemptive
 # cleanup): a rented pod's own bug, not the hardware. The probe's own kernels report those through CUresult.
@@ -389,11 +392,11 @@ class Cuda:
             return name.value.decode()
         return f"CUDA_ERROR_{code}"
 
-    def call(self, fn: str, *args, fault: bool = True) -> None:
+    def call(self, fn: str, *args, raise_as_fault: bool = True) -> None:
         code = getattr(self.lib, fn)(*args)
         if code != 0:
             message = f"{fn} -> {self.error_name(code)} ({code})"
-            raise CudaFault(message) if fault else ProbeError(message)
+            raise CudaFault(message) if raise_as_fault else ProbeError(message)
 
 
 class DevPtr(int):
@@ -476,15 +479,40 @@ def _declare_driver_signatures(lib) -> None:
     lib.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
 
 
-def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dict:
+@dataclass
+class ProbeSetup:
+    """What the allocation phase hands the kernel phase: the context, the JIT'd kernels, the stream and
+    the device and pinned host buffers, sized to the card. Built by ``_setup_device``, freed at the end
+    of ``probe_device``."""
+
+    report: dict
+    cuda: Cuda
+    context: ctypes.c_void_p
+    n: int
+    mask: int
+    funcs: dict
+    stream: ctypes.c_void_p
+    device_buffers: list
+    d_ctr: DevPtr
+    h_ctr: ctypes.c_void_p
+    copy_bytes: int
+    h_src: ctypes.c_void_p
+    h_dst: ctypes.c_void_p
+    pattern: bytes
+    h_sample: ctypes.c_void_p
+
+
+def _setup_device(index: int, vram_mb: int) -> ProbeSetup:
+    """The allocation phase: everything up to the first kernel launch is "could the probe start", not "is
+    the card faulty" — every CUDA call here is ``raise_as_fault=False`` (a ProbeError), never a CudaFault."""
     report: dict = {"index": index}
     cuda = Cuda()
     lib = cuda.lib
     _declare_driver_signatures(lib)
 
-    cuda.call("cuInit", 0, fault=False)
+    cuda.call("cuInit", 0, raise_as_fault=False)
     device = ctypes.c_int()
-    cuda.call("cuDeviceGet", ctypes.byref(device), index, fault=False)
+    cuda.call("cuDeviceGet", ctypes.byref(device), index, raise_as_fault=False)
     name = ctypes.create_string_buffer(256)
     lib.cuDeviceGetName(name, 256, device)
     report["name"] = name.value.decode(errors="replace")
@@ -495,9 +523,9 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
     # setup: everything up to the first kernel launch is "could the probe start", not "is the card faulty" —
     # a context the driver refuses, a busy or full card, a memlock cap on pinned memory all raise ProbeError
     context = ctypes.c_void_p()
-    cuda.call("cuCtxCreate_v2", ctypes.byref(context), 0, device, fault=False)
+    cuda.call("cuCtxCreate_v2", ctypes.byref(context), 0, device, raise_as_fault=False)
     free, total = ctypes.c_size_t(), ctypes.c_size_t()
-    cuda.call("cuMemGetInfo_v2", ctypes.byref(free), ctypes.byref(total), fault=False)
+    cuda.call("cuMemGetInfo_v2", ctypes.byref(free), ctypes.byref(total), raise_as_fault=False)
     report["vram_free_mb"] = free.value // MB
 
     budget = min(vram_mb * MB, max(free.value - VRAM_RESERVE_MB * MB, 0))
@@ -530,32 +558,67 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
     funcs = {}
     for kernel in KERNELS:
         func = ctypes.c_void_p()
-        cuda.call("cuModuleGetFunction", ctypes.byref(func), module, kernel.encode(), fault=False)
+        cuda.call(
+            "cuModuleGetFunction", ctypes.byref(func), module, kernel.encode(), raise_as_fault=False
+        )
         funcs[kernel] = func
     report["jit_ms"] = int((time.perf_counter() - t_jit) * 1000)
 
     stream = ctypes.c_void_p()
-    cuda.call("cuStreamCreate", ctypes.byref(stream), 1, fault=False)  # CU_STREAM_NON_BLOCKING
+    cuda.call(
+        "cuStreamCreate", ctypes.byref(stream), 1, raise_as_fault=False
+    )  # CU_STREAM_NON_BLOCKING
     device_buffers = []
     for _ in range(BUFFERS):
         ptr = ctypes.c_uint64()
-        cuda.call("cuMemAlloc_v2", ctypes.byref(ptr), n * 4, fault=False)
+        cuda.call("cuMemAlloc_v2", ctypes.byref(ptr), n * 4, raise_as_fault=False)
         device_buffers.append(DevPtr(ptr.value))
-    d_in, d_idx, d_out, d_aux = device_buffers
     d_ctr = ctypes.c_uint64()
-    cuda.call("cuMemAlloc_v2", ctypes.byref(d_ctr), 16, fault=False)
+    cuda.call("cuMemAlloc_v2", ctypes.byref(d_ctr), 16, raise_as_fault=False)
     d_ctr = DevPtr(d_ctr.value)
     h_ctr = ctypes.c_void_p()
-    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_ctr), 16, fault=False)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_ctr), 16, raise_as_fault=False)
     copy_bytes = min(32 * MB, n * 4)
     h_src, h_dst = ctypes.c_void_p(), ctypes.c_void_p()
-    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_src), copy_bytes, fault=False)
-    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_dst), copy_bytes, fault=False)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_src), copy_bytes, raise_as_fault=False)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_dst), copy_bytes, raise_as_fault=False)
     pattern = os.urandom(copy_bytes)
     ctypes.memmove(h_src, pattern, copy_bytes)
     h_sample = ctypes.c_void_p()
-    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_sample), CHASE_SAMPLES * 4, fault=False)
+    cuda.call("cuMemAllocHost_v2", ctypes.byref(h_sample), CHASE_SAMPLES * 4, raise_as_fault=False)
     report["copy_mb"] = copy_bytes // MB
+    return ProbeSetup(
+        report=report,
+        cuda=cuda,
+        context=context,
+        n=n,
+        mask=mask,
+        funcs=funcs,
+        stream=stream,
+        device_buffers=device_buffers,
+        d_ctr=d_ctr,
+        h_ctr=h_ctr,
+        copy_bytes=copy_bytes,
+        h_src=h_src,
+        h_dst=h_dst,
+        pattern=pattern,
+        h_sample=h_sample,
+    )
+
+
+def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dict:
+    setup = _setup_device(index, vram_mb)
+    report, cuda, context = setup.report, setup.cuda, setup.context
+    n, mask, funcs, stream = setup.n, setup.mask, setup.funcs, setup.stream
+    device_buffers, d_ctr, h_ctr = setup.device_buffers, setup.d_ctr, setup.h_ctr
+    copy_bytes, h_src, h_dst, pattern, h_sample = (
+        setup.copy_bytes,
+        setup.h_src,
+        setup.h_dst,
+        setup.pattern,
+        setup.h_sample,
+    )
+    d_in, d_idx, d_out, d_aux = device_buffers
     if on_phase is not None:
         on_phase("kernels")  # from here on a hang or a crash is the card's
 
@@ -655,9 +718,9 @@ def _count_worker(conn) -> None:
     _quiet_child()
     try:
         cuda = Cuda()
-        cuda.call("cuInit", 0, fault=False)
+        cuda.call("cuInit", 0, raise_as_fault=False)
         count = ctypes.c_int()
-        cuda.call("cuDeviceGetCount", ctypes.byref(count), fault=False)
+        cuda.call("cuDeviceGetCount", ctypes.byref(count), raise_as_fault=False)
         conn.send({"count": count.value})
     except Exception as exc:  # noqa: BLE001
         conn.send({"error": str(exc)})
@@ -749,8 +812,13 @@ def nvml_snapshot_forked(mp) -> dict:
             if parent_conn.poll(NVML_GRACE_SECONDS)
             else {"available": False, "error": f"NVML snapshot hung for {NVML_GRACE_SECONDS}s"}
         )
-    except EOFError:  # the pipe closed without a snapshot: the NVML child died (a driver call that aborted)
-        snapshot = {"available": False, "error": f"NVML snapshot worker died with exit code {_exit_code(process)}"}
+    except (
+        EOFError
+    ):  # the pipe closed without a snapshot: the NVML child died (a driver call that aborted)
+        snapshot = {
+            "available": False,
+            "error": f"NVML snapshot worker died with exit code {_exit_code(process)}",
+        }
     process.join(1)
     if process.is_alive():
         process.kill()
@@ -853,7 +921,13 @@ def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list
         pci = re.search(r"Xid \(PCI:([0-9a-fA-F:.]+)\)", line)
         code = re.search(r"Xid \([^)]*\): (\d+)", line)
         xid = int(code.group(1)) if code else None
-        if pci and pci_key(pci.group(1)) in bus_ids and xid not in SOFTWARE_XIDS:
+        # a line whose Xid number the regex misses is kept as "other", not scored as hardware (review)
+        if (
+            pci
+            and pci_key(pci.group(1)) in bus_ids
+            and xid is not None
+            and xid not in SOFTWARE_XIDS
+        ):
             faults.append(f"new NVRM Xid on a probed GPU: {line[:200]}")
         else:
             other.append(line[:200])
@@ -913,7 +987,7 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
         no_verdict(index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s")
     # one reap grace for all of them, not 5 s each: a killed worker the driver still holds must not push
     # the verdict past the validator's SSH cap on an 8-GPU host
-    reap_by = time.perf_counter() + WORKER_REAP_SECONDS
+    reap_by = time.perf_counter() + WORKER_REAP_AFTER_KILL_SECONDS
     for _, process, _ in workers:
         process.join(max(0.0, reap_by - time.perf_counter()))
     return [reports[index] for index, _, _ in workers]

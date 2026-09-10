@@ -218,7 +218,7 @@ def test_the_ssh_cap_sits_above_the_probes_own_largest_deadline():
     namespace = _probe_namespace(
         "WORKER_GRACE_SECONDS",
         "WORKER_GRACE_PER_GPU_SECONDS",
-        "WORKER_REAP_SECONDS",
+        "WORKER_REAP_AFTER_KILL_SECONDS",
         "NVML_GRACE_SECONDS",
         "DMESG_TIMEOUT_SECONDS",
     )
@@ -228,7 +228,11 @@ def test_the_ssh_cap_sits_above_the_probes_own_largest_deadline():
         + namespace["WORKER_GRACE_PER_GPU_SECONDS"] * 7
     )
     nvml_fork = namespace["NVML_GRACE_SECONDS"] + 1 + 5  # poll, join(1), kill + join(5)
-    tail = namespace["WORKER_REAP_SECONDS"] + 2 * nvml_fork + 2 * namespace["DMESG_TIMEOUT_SECONDS"]
+    tail = (
+        namespace["WORKER_REAP_AFTER_KILL_SECONDS"]
+        + 2 * nvml_fork
+        + 2 * namespace["DMESG_TIMEOUT_SECONDS"]
+    )
     assert PROBE_TIMEOUT_SECONDS > drain + tail + 5
 
 
@@ -406,6 +410,7 @@ def test_probe_source_is_standard_library_only_and_prints_the_marker():
         "__future__",
         "argparse",
         "ctypes",
+        "dataclasses",
         "json",
         "multiprocessing",
         "os",
@@ -508,21 +513,33 @@ def test_a_remap_already_pending_before_the_run_is_not_a_fault_on_every_cycle():
 def test_nvml_snapshots_are_paired_by_uuid_not_by_position():
     # a card that fell off the bus mid-run must not be read as the card that took its index
     nvml_faults = _probe_namespace("nvml_faults")["nvml_faults"]
-    gpu_a = {"index": 0, "uuid": "GPU-a", "ecc_uncorrected": 0, "remapped_rows": [3, 0, 0, 0], "recovery_action": 0}
-    gpu_b = {"index": 1, "uuid": "GPU-b", "ecc_uncorrected": 5, "remapped_rows": [0, 0, 0, 0], "recovery_action": 0}
+    gpu_a = {
+        "index": 0,
+        "uuid": "GPU-a",
+        "ecc_uncorrected": 0,
+        "remapped_rows": [3, 0, 0, 0],
+        "recovery_action": 0,
+    }
+    gpu_b = {
+        "index": 1,
+        "uuid": "GPU-b",
+        "ecc_uncorrected": 5,
+        "remapped_rows": [0, 0, 0, 0],
+        "recovery_action": 0,
+    }
     before = {"gpus": [gpu_a, gpu_b]}
     # GPU-a is gone; GPU-b now sits at index 0 with its own (unchanged) counters
     after = {"gpus": [{**gpu_b, "index": 0}]}
 
-    assert nvml_faults(before, after) == ["gpu 0 (GPU-a): missing from the NVML snapshot after the run"]
+    assert nvml_faults(before, after) == [
+        "gpu 0 (GPU-a): missing from the NVML snapshot after the run"
+    ]
 
     # without UUIDs (an old binding) the position still pairs them
-    assert (
-        nvml_faults(
-            {"gpus": [{"index": 0, "ecc_uncorrected": 0}]}, {"gpus": [{"index": 0, "ecc_uncorrected": 1}]}
-        )
-        == ["gpu 0: uncorrected ECC errors 0 -> 1"]
-    )
+    assert nvml_faults(
+        {"gpus": [{"index": 0, "ecc_uncorrected": 0}]},
+        {"gpus": [{"index": 0, "ecc_uncorrected": 1}]},
+    ) == ["gpu 0: uncorrected ECC errors 0 -> 1"]
 
 
 def test_a_dead_nvml_child_is_an_unavailable_snapshot_not_a_crash():
@@ -530,7 +547,9 @@ def test_a_dead_nvml_child_is_an_unavailable_snapshot_not_a_crash():
     # and the probe must still print its verdict
     import multiprocessing
 
-    ns = _probe_namespace("nvml_snapshot_forked", "_nvml_worker", "NVML_GRACE_SECONDS", "_exit_code")
+    ns = _probe_namespace(
+        "nvml_snapshot_forked", "_nvml_worker", "NVML_GRACE_SECONDS", "_exit_code"
+    )
 
     class DeadProcess:
         exitcode = -6
@@ -586,7 +605,7 @@ def test_a_hung_worker_does_not_swallow_the_verdicts_of_the_others():
     import multiprocessing
     import time
 
-    namespace = _probe_namespace("drain_workers", "_exit_code", "WORKER_REAP_SECONDS")
+    namespace = _probe_namespace("drain_workers", "_exit_code", "WORKER_REAP_AFTER_KILL_SECONDS")
     namespace["multiprocessing"] = multiprocessing
     namespace["time"] = time
     drain_workers = namespace["drain_workers"]
@@ -618,11 +637,25 @@ def test_a_hung_worker_does_not_swallow_the_verdicts_of_the_others():
 
 def test_setup_calls_in_the_probe_are_errors_not_faults():
     # an out-of-memory card, a busy card or a memlock cap must not be written up as broken hardware: every CUDA
-    # call before the first kernel launch is fault=False, and a budget below the smallest working set is a ProbeError
+    # call before the first kernel launch is raise_as_fault=False, and a budget below the smallest working set is
+    # a ProbeError. The allocation phase is its own function (_setup_device); probe_device runs the kernels.
     tree = ast.parse(PROBE_SOURCE)
+    setup_device = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_setup_device"
+    )
     probe_device = next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "probe_device"
     )
+    # the kernel phase makes none of the setup calls: a CudaFault there is the card's
+    kernel_phase_calls = {
+        node.args[0].value
+        for node in ast.walk(probe_device)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "call"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
     setup_calls = {
         "cuCtxCreate_v2",
         "cuMemGetInfo_v2",
@@ -630,21 +663,22 @@ def test_setup_calls_in_the_probe_are_errors_not_faults():
         "cuMemAlloc_v2",
         "cuMemAllocHost_v2",
     }
+    assert not (kernel_phase_calls & setup_calls), kernel_phase_calls & setup_calls
     seen = set()
-    for node in ast.walk(probe_device):
+    for node in ast.walk(setup_device):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "call"
             and node.args
             and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value in setup_calls
         ):
-            seen.add(node.args[0].value)
-            fault = [kw for kw in node.keywords if kw.arg == "fault"]
-            assert fault and fault[0].value.value is False, (
+            flag = [kw for kw in node.keywords if kw.arg == "raise_as_fault"]
+            assert flag and flag[0].value.value is False, (
                 f"{node.args[0].value} would raise CudaFault"
             )
+            if node.args[0].value in setup_calls:
+                seen.add(node.args[0].value)
     assert seen == setup_calls
     assert "not enough free VRAM" in PROBE_SOURCE
     assert 'on_phase("kernels")' in PROBE_SOURCE
@@ -674,6 +708,7 @@ def test_new_xid_lines_count_only_for_probed_cards_and_hardware_types():
             "NVRM: Xid (PCI:0000:c1:00): 79, pid=0, GPU has fallen off the bus.",  # another card
             "NVRM: Xid (PCI:0000:81:00): 31, pid=4242, name=python, Ch 00000008",  # ours, application
             "NVRM: Xid 48 with no PCI id at all",
+            "NVRM: Xid (PCI:0000:81:00): garbled, no number after the colon",  # ours, Xid unreadable: not scored
         ],
     }
     faults, other = xid_faults(before, after, {"0000:81:00"})

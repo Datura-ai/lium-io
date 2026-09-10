@@ -122,14 +122,14 @@ class GpuFaultProbeCheck:
                 if isinstance(faults, list)
                 else ""
             )
-            return self._fault(ctx, what, error=error or "fault", report=report)
+            return self._fault_verdict(ctx, what, error=error or "fault", report=report)
         what["error"] = _cap(report.get("error")) or f"probe status {_cap(status)!r}"
         return CheckResult(
             passed=True,
             event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
         )
 
-    def _fault(
+    def _fault_verdict(
         self, ctx: Context, what: dict[str, Any], *, error: str, report: dict[str, Any] | None
     ) -> CheckResult:
         enforce = settings.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED
