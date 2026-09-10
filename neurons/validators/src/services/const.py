@@ -242,6 +242,9 @@ FILLER_CONTAINER_PREFIX = "filler_"
 # Still a pod_* name, so both sweepers protect it while the pod is rented (they add this suffix to
 # every protected pod name) and reap it once the pod is gone.
 EDIT_PARKED_SUFFIX = "__prev"
+# DAH-3265: a warm-pool slot — a created-never-started container a whole-host rental adopts
+# (services/warm_pool.py, behind WARM_POOL_ENABLED).
+WARM_CONTAINER_PREFIX = "warm_"
 # DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.
@@ -283,7 +286,9 @@ DEFAULT_JOB_OWNER_LIUM = "lium"
 #   filler_*       — long-lived filler runtime (validator-owned, not customer-rented)
 #   container_*    — validator DinD/port-check probes (hotkey-scoped)
 #   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
-RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
+#   warm_*         — warm-pool slots (validator-owned, never started); the stale sweep ages them by
+#                    WARM_POOL_MAX_AGE_HOURS, not the rental grace, whatever the sweeper's flag says
+RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_", WARM_CONTAINER_PREFIX)
 
 # DAH-2667's RoCE link probe. Here rather than in roce_link_probe.py so a check can name it
 # without importing the probe service: that module reaches services.task.models, which pulls

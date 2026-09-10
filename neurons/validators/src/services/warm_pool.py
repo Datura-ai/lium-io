@@ -7,9 +7,10 @@ executor's ports, and the rental HostConfig (`_build_rental_container_run_spec`)
 renter env, no command override: the image's own entrypoint, exactly what a rental of the image
 gets. A stopped container holds no GPU, CPU or memory, so fillers run as before.
 
-A whole-host rental of that image *adopts* the slot instead of sizing + creating a volume and
-running a fresh container: one host command lists the slots and the image (`find_slots_command`),
-:func:`slot_matches` proves the slot is what the rental would create right now, and one host
+A whole-host rental of that image *adopts* the slot instead of creating a volume and running a
+fresh container: one host command lists the slots and the image (`find_slots_command`), the
+rental's own volume sizing bounds the slot from below (`slot_disk_sizes_fit`, the request cap from
+above), :func:`slot_matches` proves the slot is what the rental would create right now, and one host
 command renames it to the pod's name, applies the rental's CPU/memory limits and starts it
 (`adopt_command`). Anything else — no slot, a slot that differs in any field, a failed rename or
 start — is a *miss*, logged with its reason, and the rental takes the path that exists today.
@@ -36,9 +37,9 @@ from payload_models.payloads import (
     PayloadPortMapping,
     WorkloadKind,
 )
+from services.const import WARM_CONTAINER_PREFIX
 from services.rental_docker_sdk import RENTAL_NETWORK_ICC_OPTION, ContainerRunSpec, GpuDeviceRequest
 
-WARM_CONTAINER_PREFIX = "warm_"
 WARM_POOL_LABEL = "lium.warm_pool"
 WARM_POOL_CREATED_AT_LABEL = "lium.warm_pool.created_at"
 WARM_POOL_VOLUME_LIMIT_LABEL = "lium.warm_pool.volume_limit_gb"
@@ -46,8 +47,9 @@ WARM_POOL_STORAGE_LIMIT_LABEL = "lium.warm_pool.storage_limit_gb"
 # Docker's zero time: what `State.StartedAt` reads on a container that was never started.
 _NEVER_STARTED = "0001-01-01T00:00:00Z"
 _FIND_SEPARATOR = "__LIUM_WARM_POOL__"
-# A slot inspect is ~8 KB; room for a handful of slots, not for a host-sized document.
-_FIND_MAX_BYTES = 256 * 1024
+# Cap on the slot-inspect part of `find_slots_command`'s output: a slot inspect is ~8 KB; room for a
+# handful of slots, not for a host-sized document.
+_SLOT_INSPECT_MAX_BYTES = 256 * 1024
 # dockerd's default /dev/shm when the create request carries no ShmSize.
 _DEFAULT_SHM_SIZE = 64 * 1024 * 1024
 
@@ -68,6 +70,20 @@ class WarmPoolAdoption:
     slot: WarmSlot
     port_maps: list[tuple[int, int, int]]
     image_doc: dict
+
+
+@dataclass(frozen=True, slots=True)
+class FindSlotsOutput:
+    """What `find_slots_command` printed, parsed.
+
+    `image_doc` is the image's inspect, None when the image is not on the host (or its inspect did
+    not parse). `slot_docs` is the inspect of every created slot: `[]` when the host listed none
+    (xargs -r prints nothing) and None when it printed something that is not a JSON list — cut by
+    `_SLOT_INSPECT_MAX_BYTES`, or not JSON at all. None is not an empty pool: a caller that read it
+    as "no slots" would add one slot per filler start to a host with too many slot documents."""
+
+    image_doc: dict | None
+    slot_docs: list[dict] | None
 
 
 def slot_name(slot_id: str) -> str:
@@ -154,29 +170,25 @@ def find_slots_command(image: str) -> str:
         f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}; "
         f"echo {_FIND_SEPARATOR}; "
         f"/usr/bin/docker ps -aq --filter label={WARM_POOL_LABEL}=1 --filter status=created "
-        f"| xargs -r /usr/bin/docker inspect | head -c {_FIND_MAX_BYTES}"
+        f"| xargs -r /usr/bin/docker inspect | head -c {_SLOT_INSPECT_MAX_BYTES}"
     )
 
 
-def parse_find_slots_output(stdout: str) -> tuple[dict | None, list[dict] | None]:
-    """(image inspect or None, slot inspects) from the output of `find_slots_command`.
-
-    The slot part is `[]` when the host listed no created slot (xargs -r prints nothing) and None
-    when it printed something that is not a JSON list — cut by the byte cap, or not JSON at all.
-    A caller must not read None as an empty pool: that is how a host with too many slot documents
-    would get one more slot per filler start."""
+def parse_find_slots_output(stdout: str) -> FindSlotsOutput:
+    """The image inspect and the slot inspects from the output of `find_slots_command`; see
+    `FindSlotsOutput` for what None means in each field."""
     head, sep, tail = (stdout or "").partition(_FIND_SEPARATOR)
     if not sep:
-        return None, None
+        return FindSlotsOutput(image_doc=None, slot_docs=None)
     image = _load_json(head.strip())
     image_doc = image if isinstance(image, dict) else None
     tail = tail.strip()
     if not tail:
-        return image_doc, []
+        return FindSlotsOutput(image_doc=image_doc, slot_docs=[])
     slots = _load_json(tail)
     if not isinstance(slots, list):
-        return image_doc, None
-    return image_doc, [s for s in slots if isinstance(s, dict)]
+        return FindSlotsOutput(image_doc=image_doc, slot_docs=None)
+    return FindSlotsOutput(image_doc=image_doc, slot_docs=[s for s in slots if isinstance(s, dict)])
 
 
 def slot_from_inspect(
@@ -243,11 +255,30 @@ def slot_port_maps(
     return sorted(maps)
 
 
-def slot_limits_fit(slot: WarmSlot, payload: ContainerCreateRequest) -> str | None:
-    """The slot's fixed volume and storage-opt sizes must be what the rental's own sizing could
-    have produced: `resolve_volume_sizing` caps the slice at 1.5x the request and hands 2/3 of it to
-    the volume and 1/3 to storage-opt, so volume <= request, storage <= request / 2, and the volume
-    at least the backend's floor."""
+# `slot_disk_sizes_fit` reasons that mean the slot is smaller than the host sizes a rental now — the
+# caller removes such a slot, where one that is merely larger than this rental's cap is kept for the next.
+SLOT_VOLUME_BELOW_SIZING = "slot volume smaller than the rental's sizing"
+SLOT_STORAGE_BELOW_SIZING = "slot storage-opt smaller than the rental's sizing"
+SLOT_BELOW_SIZING_REASONS = frozenset({SLOT_VOLUME_BELOW_SIZING, SLOT_STORAGE_BELOW_SIZING})
+
+
+def slot_disk_sizes_fit(
+    slot: WarmSlot,
+    payload: ContainerCreateRequest,
+    *,
+    sized_volume_gb: int | None,
+    sized_storage_gb: int | None,
+) -> str | None:
+    """Why the slot's fixed volume and storage-opt sizes are not what this rental may be given now;
+    None when they fit.
+
+    The floor is the sizing the rental computes now (`resolve_volume_sizing` against the host as it
+    is at rent time, `sized_*`): a slot sized while a filler's data held the disk is smaller than
+    that, and adopting it would hand the renter less than a fresh create would. The ceiling is the
+    backend's request cap: the sizing caps the slice at 1.5x the request and hands 2/3 of it to the
+    volume and 1/3 to storage-opt, so volume <= request and storage <= request / 2. The two are not
+    the same number because the slot was sized without a request cap and the disk drifts by a few GB
+    between its create and the rental."""
     if slot.volume_limit_gb is None or slot.storage_limit_gb is None:
         return "slot has no recorded sizes"
     if payload.volume_limit_gb is not None:
@@ -255,8 +286,10 @@ def slot_limits_fit(slot: WarmSlot, payload: ContainerCreateRequest) -> str | No
             return "slot volume larger than the request cap"
         if slot.storage_limit_gb > max(payload.volume_limit_gb // 2, 1):
             return "slot storage-opt larger than the request cap"
-    if payload.min_volume_gb is not None and slot.volume_limit_gb < payload.min_volume_gb:
-        return "slot volume below the request floor"
+    if sized_volume_gb is not None and slot.volume_limit_gb < sized_volume_gb:
+        return SLOT_VOLUME_BELOW_SIZING
+    if sized_storage_gb is not None and slot.storage_limit_gb < sized_storage_gb:
+        return SLOT_STORAGE_BELOW_SIZING
     return None
 
 
@@ -337,7 +370,7 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
         f"{p.container_port}/{p.protocol}": p.host_port for p in spec.ports
     }:
         return "ports"
-    if set(_device_args(host)) != {
+    if set(_inspected_device_keys(host)) != {
         f"{d.path_on_host}:{d.path_in_container or d.path_on_host}:{d.permissions}"
         for d in spec.devices
     }:
@@ -521,7 +554,9 @@ def _port_bindings(host: dict) -> dict[str, int]:
     return out
 
 
-def _device_args(host: dict) -> list[str]:
+def _inspected_device_keys(host: dict) -> list[str]:
+    """`host:container:permissions` per device in a HostConfig — the key `slot_matches` compares with
+    the rental spec's devices."""
     return [
         f"{d.get('PathOnHost')}:{d.get('PathInContainer') or d.get('PathOnHost')}:{d.get('CgroupPermissions') or 'rwm'}"
         for d in host.get("Devices") or []

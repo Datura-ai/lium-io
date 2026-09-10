@@ -390,9 +390,9 @@ async def test_resolve_volume_sizing_with_probe_matches_per_command_result(docke
     # Assert: identical sizing, and the probe path ran exactly the inspect command.
     assert with_probe == per_command
     assert with_probe.path == "fresh" and with_probe.volume_limit_gb == 393
-    # info, df, volume ls, warm-pool slot volumes (DAH-3265), volume inspect
-    assert per_command_ssh.run.await_count == 5
-    assert probe_ssh.run.await_count == 1  # the slot listing rides in the probe, not a command here
+    # info, df, volume ls, volume inspect (the warm-pool slot listing, DAH-3265, only with its flag on)
+    assert per_command_ssh.run.await_count == 4
+    assert probe_ssh.run.await_count == 1
     assert probe_ssh.run.await_args.args[0].startswith("/usr/bin/docker volume inspect volume_abc ")
 
 
@@ -438,8 +438,9 @@ async def test_resolve_volume_sizing_probe_without_df_falls_back_to_per_command_
     )
 
     assert result.path == "fresh"
-    # info, df, volume ls, warm-pool slot volumes (DAH-3265); no vloopback volumes → no inspect
-    assert ssh_client.run.await_count == 4
+    assert (
+        ssh_client.run.await_count == 3
+    )  # info, df, volume ls (no vloopback volumes → no inspect)
 
 
 # ---------------------------------------------------------------------------

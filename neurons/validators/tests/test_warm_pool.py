@@ -2,7 +2,7 @@
 
 Off: the rent path never looks for a slot and creates its volume and container as before.
 On: a whole-host rental of an image with a fresh slot adopts it (one lookup command, one
-rename → update → start command), skipping volume sizing/creation and `docker run`; the slot must
+rename → update → start command), skipping volume creation and `docker run`; the slot must
 equal, field for field, the container the rental would create now; any difference, a failed
 adopt command, or a rental shape a slot cannot serve falls back to the path that exists today.
 After a filler start the validator leaves one slot per image the executor keeps pre-pulled.
@@ -287,16 +287,16 @@ def test_find_output_parses_image_and_slots():
         + json.dumps([{"Name": "/warm_a"}, {"Name": "/warm_b"}])
         + "\n"
     )
-    parsed_image, slots = warm_pool.parse_find_slots_output(stdout)
-    assert parsed_image == image
-    assert [s["Name"] for s in slots] == ["/warm_a", "/warm_b"]
+    found = warm_pool.parse_find_slots_output(stdout)
+    assert found.image_doc == image
+    assert [s["Name"] for s in found.slot_docs] == ["/warm_a", "/warm_b"]
 
 
 def test_find_output_without_image_or_slots():
-    assert warm_pool.parse_find_slots_output("__LIUM_WARM_POOL__\n") == (None, [])
-    assert warm_pool.parse_find_slots_output("Error: No such image\n__LIUM_WARM_POOL__\n") == (
-        None,
-        [],
+    none_listed = warm_pool.FindSlotsOutput(image_doc=None, slot_docs=[])
+    assert warm_pool.parse_find_slots_output("__LIUM_WARM_POOL__\n") == none_listed
+    assert (
+        warm_pool.parse_find_slots_output("Error: No such image\n__LIUM_WARM_POOL__\n") == none_listed
     )
 
 
@@ -306,11 +306,15 @@ def test_find_output_that_cannot_be_read_is_not_an_empty_pool():
     image = _image_doc()
     whole = json.dumps([{"Name": "/warm_a"}] * 40)
     cut = json.dumps(image) + "\n__LIUM_WARM_POOL__\n" + whole[: len(whole) // 2]
-    assert warm_pool.parse_find_slots_output(cut) == (image, None)
-    assert warm_pool.parse_find_slots_output(
-        json.dumps(image) + "\n__LIUM_WARM_POOL__\nError: something\n"
-    ) == (image, None)
-    assert warm_pool.parse_find_slots_output("garbage with no separator") == (None, None)
+    unreadable = warm_pool.FindSlotsOutput(image_doc=image, slot_docs=None)
+    assert warm_pool.parse_find_slots_output(cut) == unreadable
+    assert (
+        warm_pool.parse_find_slots_output(json.dumps(image) + "\n__LIUM_WARM_POOL__\nError: something\n")
+        == unreadable
+    )
+    assert warm_pool.parse_find_slots_output("garbage with no separator") == warm_pool.FindSlotsOutput(
+        image_doc=None, slot_docs=None
+    )
 
 
 def test_find_command_quotes_the_image_and_filters_created_slots():
@@ -395,18 +399,37 @@ def test_slot_ports_map_through_the_backends_offer(svc):
     assert warm_pool.slot_port_maps(slot, offered, rental + [(8000, 20003, 30003)]) is None
 
 
-def test_slot_sizes_must_fit_the_request_cap(svc):
+def test_slot_disk_sizes_must_sit_between_the_rentals_sizing_and_the_request_cap(svc):
+    """The slot is labelled volume 40 / storage 20. Ceiling: the backend's request cap. Floor: what
+    `resolve_volume_sizing` gives this rental on the host as it is now — a slot sized while a
+    filler's data held the disk is smaller than that and must not be adopted whole."""
     slot = warm_pool.slot_from_inspect(
         _slot_doc(_spec(svc, _adoptable_payload()), _image_doc()),
         image_id=IMAGE_ID,
         now=NOW,
         max_age=MAX_AGE,
     )
-    assert warm_pool.slot_limits_fit(slot, _adoptable_payload(volume_limit_gb=40)) is None
-    assert warm_pool.slot_limits_fit(slot, _adoptable_payload(volume_limit_gb=None)) is None
+
+    def fit(payload, *, sized_volume_gb, sized_storage_gb):
+        return warm_pool.slot_disk_sizes_fit(
+            slot, payload, sized_volume_gb=sized_volume_gb, sized_storage_gb=sized_storage_gb
+        )
+
+    assert fit(_adoptable_payload(volume_limit_gb=40), sized_volume_gb=38, sized_storage_gb=19) is None
+    assert fit(_adoptable_payload(volume_limit_gb=40), sized_volume_gb=40, sized_storage_gb=20) is None
+    # a passthrough sizing (legacy contract) carries no numbers: only the cap applies
+    assert fit(_adoptable_payload(volume_limit_gb=None), sized_volume_gb=None, sized_storage_gb=None) is None
     assert (
-        warm_pool.slot_limits_fit(slot, _adoptable_payload(volume_limit_gb=20))
+        fit(_adoptable_payload(volume_limit_gb=20), sized_volume_gb=20, sized_storage_gb=10)
         == "slot volume larger than the request cap"
+    )
+    assert (
+        fit(_adoptable_payload(volume_limit_gb=40), sized_volume_gb=41, sized_storage_gb=20)
+        == "slot volume smaller than the rental's sizing"
+    )
+    assert (
+        fit(_adoptable_payload(volume_limit_gb=40), sized_volume_gb=40, sized_storage_gb=21)
+        == "slot storage-opt smaller than the rental's sizing"
     )
 
 
@@ -643,9 +666,11 @@ async def test_flag_off_never_looks_for_a_slot(svc, monkeypatch):
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    # the flag gates the slot lookup and the adoption; the sizing's slot-volume listing is not
-    # gated (a slot left behind by a flag flip must stay out of the declared-size sum)
-    assert not any("__LIUM_WARM_POOL__" in c or "docker rename" in c for c in _cmds(ssh))
+    # the flag gates the slot lookup, the adoption and the sizing's slot-volume listing: no warm-pool
+    # command reaches the host
+    assert not any(
+        "__LIUM_WARM_POOL__" in c or "docker rename" in c or "lium.warm_pool" in c for c in _cmds(ssh)
+    )
     svc.create_local_volume.assert_awaited_once()
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
     assert result.volume_name == f"volume_{payload.pod_id}"
@@ -662,7 +687,9 @@ async def test_flag_on_adopts_the_slot_instead_of_creating(svc, monkeypatch):
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    svc.resolve_volume_sizing.assert_not_awaited()
+    # the rental's own sizing (volume 10 / storage 20 on this fake host) is the floor the slot
+    # (40 / 20) is measured against; it is the one thing of the volume stage a hit still pays
+    svc.resolve_volume_sizing.assert_awaited_once()
     svc.create_local_volume.assert_not_awaited()
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
     adopt = [c for c in _cmds(ssh) if "docker rename" in c]
@@ -722,6 +749,54 @@ async def test_volume_that_differs_from_the_labels_is_removed_not_adopted(
     svc.create_local_volume.assert_awaited_once()
     assert result.volume_name == f"volume_{payload.pod_id}"
     assert (result.volume_limit_gb, result.storage_limit_gb) == (10, 20)
+
+
+@pytest.mark.asyncio
+async def test_slot_smaller_than_the_rentals_sizing_is_removed_and_the_sizing_is_reused(svc, monkeypatch):
+    """A slot sized while a filler's data held the disk (volume 40) is smaller than what this rental's
+    own sizing gives it now (50): the rental is created fresh, at the sizing the lookup already
+    computed — no second sizing — and the slot goes rather than wait for a rental with a cap small
+    enough to fit it; the next filler start leaves one sized for the host as it is."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload(volume_limit_gb=60)
+    spec = _spec(svc, payload)
+    ssh = _host(svc, spec, _image_doc())
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(return_value=Mock(volume_limit_gb=50, storage_limit_gb=25))
+    )
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    cmds = _cmds(ssh)
+    assert not any("docker rename" in c for c in cmds)
+    assert any(f"docker rm -f {spec.name}" in c and f"volume rm volume_{SLOT_ID}" in c for c in cmds)
+    svc.resolve_volume_sizing.assert_awaited_once()
+    svc.create_local_volume.assert_awaited_once()
+    assert svc.create_local_volume.await_args.kwargs["limit"] == 50
+    assert result.volume_name == f"volume_{payload.pod_id}"
+    assert (result.volume_limit_gb, result.storage_limit_gb) == (50, 25)
+    # the lookup did the sizing, so its step carries that time and is not "skipped"
+    lookup = next(p for p in result.profilers if p.name == ProfilerStepName.WARM_POOL_LOOKUP)
+    assert lookup.skipped is False
+
+
+@pytest.mark.asyncio
+async def test_slot_larger_than_the_request_cap_is_kept_for_a_larger_rental(svc, monkeypatch):
+    """The ceiling is this rental's own cap: a slot above it may fit the next rental, so it stays."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload(volume_limit_gb=20)
+    spec = _spec(svc, payload)
+    ssh = _host(svc, spec, _image_doc())
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert not any("docker rename" in c or "docker rm -f" in c for c in _cmds(ssh))
+    svc.create_local_volume.assert_awaited_once()
+    assert result.volume_name == f"volume_{payload.pod_id}"
 
 
 def test_volume_mismatch_reads_the_plugin_record(svc):
@@ -955,23 +1030,23 @@ async def test_sizing_leaves_slot_volumes_out_of_the_declared_sum(svc, monkeypat
     ssh.run = AsyncMock(side_effect=_side)
     assert await svc._get_existing_vloopback_bytes(ssh) == 10 * 1024**3
 
-    # A slot left behind when the flag went off is still a sparse volume holding no bytes: it stays
-    # out of the sum whatever the flag says.
-    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", False)
-    ssh.run = AsyncMock(side_effect=_side)
-    assert await svc._get_existing_vloopback_bytes(ssh) == 10 * 1024**3
-    assert any("lium.warm_pool=1" in c.args[0] for c in ssh.run.await_args_list)
-
     # a listing that times out leaves the sum as it was before the pool: every volume counted
-    def _side_timeout(cmd, *args, **kwargs):
+    def _side_every_volume(cmd, *args, **kwargs):
         if "lium.warm_pool=1" in cmd:
             raise TimeoutError("slot listing")
         if "docker volume inspect" in cmd:
             return _ssh_result(stdout="10g|10g\n20g|20g\n")
         return _side(cmd, *args, **kwargs)
 
-    ssh.run = AsyncMock(side_effect=_side_timeout)
+    ssh.run = AsyncMock(side_effect=_side_every_volume)
     assert await svc._get_existing_vloopback_bytes(ssh) == 30 * 1024**3
+
+    # With the flag off the sizing pays no listing round trip and counts every volume, as before the
+    # pool; a slot left behind by a flag flip is the stale-container sweep's to remove.
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", False)
+    ssh.run = AsyncMock(side_effect=_side_every_volume)
+    assert await svc._get_existing_vloopback_bytes(ssh) == 30 * 1024**3
+    assert not any("lium.warm_pool" in c.args[0] for c in ssh.run.await_args_list)
 
 
 # ------------------------------------------------------------------
@@ -1107,6 +1182,35 @@ async def test_filler_start_skips_images_that_already_have_a_slot_and_drops_stal
 
 
 @pytest.mark.asyncio
+async def test_filler_start_maintains_the_pool_before_the_finished_stamp(svc, monkeypatch):
+    """`FINISHED_IN_SUBNET` carries the wall-clock moment the backend measures its finalize span
+    from (DAH-2458); the pool's seconds of maintenance run before that stamp, so they count as the
+    subnet's own time and not as the finished-to-pending span."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    ssh = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh)
+    maintained_at: list[int] = []
+
+    async def _maintain(**kwargs):
+        await asyncio.sleep(0.02)
+        maintained_at.append(ds_module.now_ms())
+
+    monkeypatch.setattr(svc, "_maintain_warm_pool", _maintain)
+    filler = _payload(workload_kind=WorkloadKind.FILLER, docker_image="daturaai/empty-job:1.0.0")
+
+    result = await svc.create_container(
+        payload=filler,
+        executor_info=_executor_info(filler),
+        keypair=Mock(ss58_address="v"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated)
+    finished = next(p for p in result.profilers if p.name == ProfilerStepName.FINISHED_IN_SUBNET)
+    assert maintained_at and finished.timestamp >= maintained_at[0]
+
+
+@pytest.mark.asyncio
 async def test_filler_start_with_the_flag_off_touches_no_pool(svc, monkeypatch):
     monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", False)
     ssh = _ssh_client(inspect_exit=0)
@@ -1131,37 +1235,109 @@ async def test_filler_start_with_the_flag_off_touches_no_pool(svc, monkeypatch):
 # ------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_container_age_counts_from_the_last_start():
-    """StaleContainerCleanupCheck ages a `pod_*` by this helper; an adopted slot was created hours
-    before the rental started it and must read as young as its start, or the sweep removes it."""
-    from services.container_cleanup import ContainerCleanup
+AGE_NOW = 1_800_000_000
+ZERO_TIME_EPOCH = -62135596800  # docker's `0001-01-01T00:00:00Z` through `date +%s`
 
-    now = 1_800_000_000
+
+def _age_host(inspect_stdout: str):
+    """An ssh client answering `date +%s` and the age inspect of `_get_container_age_minutes`."""
     ssh = AsyncMock()
 
     def _side(cmd, *args, **kwargs):
         if cmd.strip() == "date +%s":
-            return _ssh_result(stdout=str(now))
+            return _ssh_result(stdout=str(AGE_NOW))
         if "docker inspect" in cmd:
-            assert ".Created" in cmd and ".State.StartedAt" in cmd
-            return _ssh_result(stdout=f"{now - 20 * 3600}\n{now - 30}\n")
+            return _ssh_result(stdout=inspect_stdout)
         return _ssh_result()
 
     ssh.run = AsyncMock(side_effect=_side)
+    return ssh
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag_on", [False, True], ids=["flag-off", "flag-on"])
+async def test_container_age_counts_from_the_last_start_while_never_restarted(monkeypatch, flag_on):
+    """StaleContainerCleanupCheck ages a `pod_*` by this helper on EVERY validator; an adopted slot
+    was created hours before the rental started it and must read as young as its start on each of
+    them — a peer with the flag off reading `Created` alone would remove the live pod inside its
+    rented-snapshot window — so the rule does not depend on the flag."""
+    from services.container_cleanup import ContainerCleanup
+
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", flag_on)
+    ssh = _age_host(f"{AGE_NOW - 20 * 3600}\n{AGE_NOW - 30}\n0\n")
     age = await ContainerCleanup()._get_container_age_minutes(ssh, "pod_adopted")
     assert age is not None and age < 1
+    (cmd,) = [c.args[0] for c in ssh.run.await_args_list if "docker inspect" in c.args[0]]
+    assert ".Created" in cmd and ".State.StartedAt" in cmd and ".RestartCount" in cmd
 
     # a never-started container prints docker's zero time (a negative epoch): the create time wins
-    ssh.run = AsyncMock(
-        side_effect=lambda cmd, *a, **k: (
-            _ssh_result(stdout=str(now))
-            if cmd.strip() == "date +%s"
-            else _ssh_result(stdout=f"{now - 3600}\n-62135596800\n")
-        )
+    ssh = _age_host(f"{AGE_NOW - 3600}\n{ZERO_TIME_EPOCH}\n0\n")
+    assert await ContainerCleanup()._get_container_age_minutes(ssh, "warm_slot") == 60
+
+
+@pytest.mark.asyncio
+async def test_restarting_container_with_a_fresh_start_is_still_stale():
+    """dockerd refreshes `StartedAt` on every restart-policy restart, so a crash-looping `pod_*`
+    reads as seconds old for as long as it loops; its age must count from `Created`, or the stale
+    sweep never removes it."""
+    from services.container_cleanup import ContainerCleanup
+
+    ssh = _age_host(f"{AGE_NOW - 20 * 3600}\n{AGE_NOW - 30}\n7\n")
+    age = await ContainerCleanup()._get_container_age_minutes(ssh, "pod_crashlooping")
+    assert age == 20 * 60
+
+
+@pytest.mark.asyncio
+async def test_a_short_or_garbled_age_inspect_reads_as_unknown():
+    """One line, or a second inspect that printed an error, is `None` — the sweep leaves the
+    container alone this pass, as it did before the pool on any unreadable age."""
+    from services.container_cleanup import ContainerCleanup
+
+    assert await ContainerCleanup()._get_container_age_minutes(_age_host(f"{AGE_NOW - 3600}\n"), "pod_x") is None
+    garbled = _age_host(f"{AGE_NOW - 3600}\n{ZERO_TIME_EPOCH}\nError: No such object\n")
+    assert await ContainerCleanup()._get_container_age_minutes(garbled, "pod_x") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag_on", [False, True], ids=["flag-off", "flag-on"])
+@pytest.mark.parametrize("age_hours, removed_names", [(1, []), (25, ["warm_left"])], ids=["fresh", "past-max-age"])
+async def test_stale_sweep_ages_a_slot_by_the_pools_max_age_whatever_the_flag(
+    monkeypatch, flag_on, age_hours, removed_names
+):
+    """`warm_` is a rental prefix, so a slot nobody adopted is the stale sweep's to remove — with its
+    never-used volume, named like a pod's. Every validator sweeps every executor, so the age that
+    decides is the pool's own WARM_POOL_MAX_AGE_HOURS on each of them: a peer applying the 15-minute
+    rental grace would remove another validator's slots after every filler start, and a peer
+    skipping `warm_*` would never remove one a flag flip left behind."""
+    from services.container_cleanup import ContainerCleanup
+
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", flag_on)
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_MAX_AGE_HOURS", 24)
+    removed: list[str] = []
+
+    def _side(cmd, *args, **kwargs):
+        if "docker ps -a" in cmd:
+            assert "warm_*" in cmd
+            return _ssh_result(stdout="warm_left\n")
+        if cmd.strip() == "date +%s":
+            return _ssh_result(stdout=str(AGE_NOW))
+        if "docker inspect" in cmd:
+            return _ssh_result(stdout=f"{AGE_NOW - age_hours * 3600}\n{ZERO_TIME_EPOCH}\n0\n")
+        if "docker rm -f" in cmd or "docker volume rm" in cmd:
+            removed.append(cmd)
+        return _ssh_result()
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=_side)
+    count, names = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=None, executor_uuid="exec-1"
     )
-    age = await ContainerCleanup()._get_container_age_minutes(ssh, "warm_slot")
-    assert age == 60
+    assert (count, names) == (len(removed_names), removed_names)
+    if removed_names:
+        assert any("docker rm -fv warm_left" in c for c in removed)
+        assert any("docker volume rm volume_left" in c for c in removed)
+    else:
+        assert removed == []
 
 
 def test_preferred_ports_are_handed_out_as_a_copy(svc):
