@@ -5,8 +5,10 @@ set -e
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/compute-subnet/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd compute-subnet/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
+#   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
+#   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
 
 SYSBOX_VERSION="0.6.6"
 SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
@@ -20,7 +22,9 @@ warn() { echo -e "  ${Y}!${N} $1"; }
 fail() { echo -e "  ${R}✗${N} $1"; }
 step() { echo -e "\n${B}[$1/$2]${N} $3"; }
 
-cleanup() { [ -n "$DOWNLOADED_DEB" ] && rm -f "$DOWNLOADED_DEB"; }
+# an `if`, not `[ … ] && rm`: under `set -e` the failing test made the EXIT trap end every run
+# with status 1, including "Nothing to do." and SUCCESS
+cleanup() { if [ -n "$DOWNLOADED_DEB" ]; then rm -f "$DOWNLOADED_DEB"; fi; }
 trap cleanup EXIT
 
 version_ge() {
@@ -99,16 +103,6 @@ nvidia_hook_symptom() {
     fail "  nvidia-container-cli: mount error: .../merged/proc/driver/nvidia: no such file or directory"
 }
 
-fail_old_kernel() {
-    fail "Kernel $(uname -r) is too old for sysbox with GPUs — overlayfs gained ID-mapped mounts in 5.19 (6.x recommended)."
-    nvidia_hook_symptom
-    fail "Fix on Ubuntu 22.04: sudo apt-get install -y linux-generic-hwe-22.04 && sudo reboot"
-    fail "  Ubuntu 20.04 tops out at 5.15 even with HWE — upgrade the distro instead."
-    fail "Before rebooting: stop any rentals, and confirm the NVIDIA driver is DKMS-managed ('dkms status'),"
-    fail "otherwise a .run-installed driver will not load on the new kernel and the node comes back without GPUs."
-    fail "If this kernel is known to carry the backport, override with: sudo SYSBOX_SKIP_KERNEL_CHECK=1 bash $0"
-}
-
 fail_no_idmapped() {
     fail "Sysbox reports it cannot use ID-mapped mounts, although kernel $(uname -r) supports them."
     nvidia_hook_symptom
@@ -118,18 +112,358 @@ fail_no_idmapped() {
     fail "  journalctl -u sysbox-mgr -b | grep -i id-mapped"
 }
 
+# ── Preflight ───────────────────────────────────────────
+# One PASS / FIX line per requirement, each FIX with the command that fixes it. The host checks
+# run before anything is installed (a FIX there ends the run with nothing changed); `--check`
+# runs them plus the checks on what this script installs. Paths under HOST_ROOT so tests can
+# point them at a fixture tree; commands are stubbed on PATH.
+
+MIN_NVIDIA_DRIVER="580.65.06"   # validators' MIN_NVIDIA_DRIVER_VERSION: an idle node below it earns nothing after the cutoff
+MIN_DISK_TO_VRAM_RATE="1.5"     # validators' MIN_DISK_TO_VRAM_RATE (rental_price.py): idle pay needs total disk >= 1.5x total VRAM
+PREFLIGHT_PASS=0 PREFLIGHT_FIX=0 PREFLIGHT_SKIP=0
+
+pf_pass() { PREFLIGHT_PASS=$((PREFLIGHT_PASS + 1)); echo -e "  ${G}PASS${N} $1"; }
+pf_skip() { PREFLIGHT_SKIP=$((PREFLIGHT_SKIP + 1)); echo -e "  ${Y}SKIP${N} $1"; }
+pf_fix() {
+    # $1 what is wrong; every further argument is one line of the fix
+    PREFLIGHT_FIX=$((PREFLIGHT_FIX + 1))
+    echo -e "  ${R}FIX${N}  $1"
+    shift
+    local line
+    for line in "$@"; do echo "         $line"; done
+    return 1
+}
+
+host_path() { echo "${HOST_ROOT:-}$1"; }
+
+self_cmd() {
+    # how to run this script again, with $@ as its options: the file when there is one, else the one-liner (curl | bash)
+    if [ -f "$0" ]; then
+        echo "sudo bash $0${1:+ $*}"
+    else
+        echo "curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash${1:+ -s -- $*}"
+    fi
+}
+
+os_release_field() {
+    # VERSION_ID / ID from /etc/os-release, empty when the file or the key is missing
+    local file
+    file=$(host_path /etc/os-release)
+    [ -r "$file" ] && sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}$/\1/p" "$file" | head -1
+}
+
+docker_server_version() {
+    docker version --format '{{.Server.Version}}' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+daemon_feature_off() {
+    # true when /etc/docker/daemon.json sets features.<$1> to false (jq when present; jq itself
+    # is one of the packages this script installs, so fall back to grep before it exists)
+    local file
+    file=$(host_path /etc/docker/daemon.json)
+    [ -r "$file" ] || return 1
+    if command -v jq &>/dev/null; then
+        [ "$(jq -r --arg k "$1" '.features[$k]' "$file" 2>/dev/null)" = "false" ]
+    else
+        grep -Eq "\"$1\"[[:space:]]*:[[:space:]]*false" "$file"
+    fi
+}
+
+check_root() {
+    [ "$(id -u)" -eq 0 ] && { pf_pass "Running as root."; return 0; }
+    pf_fix "Not running as root — the checks read Docker's socket and the kernel modules." \
+        "$(self_cmd "${PREFLIGHT_MODE_FLAG:-}")"
+}
+
+check_arch() {
+    local arch
+    arch=$(uname -m)
+    [ "$arch" = "x86_64" ] && { pf_pass "Architecture $arch."; return 0; }
+    pf_fix "Architecture $arch — sysbox ships for x86_64 only." "Use an x86_64 host."
+}
+
+check_kernel() {
+    local kernel version_id
+    kernel=$(uname -r)
+    if kernel_supports_idmapped; then
+        pf_pass "Kernel $kernel (>= 5.19, ID-mapped mounts available)."
+        return 0
+    fi
+    if [ "${SYSBOX_SKIP_KERNEL_CHECK:-0}" = "1" ]; then
+        pf_pass "Kernel $kernel accepted because SYSBOX_SKIP_KERNEL_CHECK=1 is set."
+        return 0
+    fi
+    version_id=$(os_release_field VERSION_ID)
+    case "$version_id" in
+        22.04) pf_fix "Kernel $kernel is below 5.19 — sysbox cannot pass GPUs through without ID-mapped mounts." \
+                   "sudo apt-get install -y linux-generic-hwe-22.04 && sudo reboot" \
+                   "Before rebooting: stop any rentals; 'dkms status' must list the nvidia module or the driver will not load on the new kernel." \
+                   "If this kernel is known to carry the ID-mapped mounts backport: SYSBOX_SKIP_KERNEL_CHECK=1 $(self_cmd)" ;;
+        20.04) pf_fix "Kernel $kernel is below 5.19 and Ubuntu 20.04 tops out at 5.15 even with HWE." \
+                   "Upgrade the host to Ubuntu 22.04 or newer (sudo do-release-upgrade), then re-run this script." ;;
+        *)     pf_fix "Kernel $kernel is below 5.19 — sysbox cannot pass GPUs through without ID-mapped mounts." \
+                   "Install a 5.19+ kernel for your distribution and reboot, then re-run this script." ;;
+    esac
+}
+
+check_docker() {
+    local version
+    if ! command -v docker &>/dev/null; then
+        pf_fix "Docker is not installed." "curl -fsSL https://get.docker.com | sudo sh"
+        return 1
+    fi
+    if ! docker ps &>/dev/null; then
+        pf_fix "Docker daemon is not running (docker ps failed)." "sudo systemctl enable --now docker"
+        return 1
+    fi
+    version=$(docker_server_version)
+    if [ -z "$version" ]; then
+        pf_fix "Docker is running but reported no server version." "docker version   # then sudo systemctl restart docker"
+        return 1
+    fi
+    if docker_version_ge 29 0 && ! docker_version_ge 29 2; then
+        pf_pass "Docker $version (29.0–29.1 is untested with sysbox; 28.x and 29.2+ are)."
+    else
+        pf_pass "Docker $version."
+    fi
+}
+
+check_docker_features() {
+    # Docker 29.2 routes --gpus through CDI and 29.5 gives containers a time namespace; sysbox
+    # accepts neither. The install step writes both keys; this reports whether they are set.
+    local version missing=""
+    version=$(docker_server_version)
+    [ -n "$version" ] || { pf_skip "Docker 29 settings — Docker is not running."; return 0; }
+    if ! docker_version_ge 29 2; then
+        pf_pass "Docker $version needs no daemon.json features (cdi / time-namespaces appear in 29.2 / 29.5)."
+        return 0
+    fi
+    daemon_feature_off cdi || missing="cdi"
+    if docker_version_ge 29 5 && ! daemon_feature_off time-namespaces; then
+        missing="${missing:+$missing, }time-namespaces"
+    fi
+    if [ -z "$missing" ]; then
+        pf_pass "Docker $version has the sysbox settings in /etc/docker/daemon.json (features.cdi$(docker_version_ge 29 5 && echo ' and features.time-namespaces') = false)."
+        return 0
+    fi
+    pf_fix "Docker $version without features.$missing = false in /etc/docker/daemon.json — sysbox rejects its containers." \
+        "$(self_cmd)   # writes the features block and restarts Docker; stop rentals first" \
+        "or by hand: add {\"features\":{\"cdi\":false,\"time-namespaces\":false}} to /etc/docker/daemon.json && sudo systemctl restart docker"
+}
+
+check_nvidia_driver() {
+    local driver
+    if ! command -v nvidia-smi &>/dev/null; then
+        pf_fix "nvidia-smi not found — no NVIDIA driver installed." \
+            "sudo apt-get install -y nvidia-driver-580-server && sudo reboot   # Ubuntu; or your vendor's driver package"
+        return 1
+    fi
+    driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+    if [ -z "$driver" ] || ! ls "$(host_path /proc/driver/nvidia)" &>/dev/null; then
+        pf_fix "NVIDIA driver is installed but not loaded (nvidia-smi gives no driver version or /proc/driver/nvidia is missing)." \
+            "sudo reboot   # then check 'nvidia-smi'; if it still fails: sudo dkms autoinstall && sudo reboot"
+        return 1
+    fi
+    if version_ge "$driver" "${MIN_NVIDIA_DRIVER%%.*}" "$(echo "$MIN_NVIDIA_DRIVER" | cut -d. -f2)"; then
+        pf_pass "NVIDIA driver $driver ($(nvidia-smi --list-gpus 2>/dev/null | grep -c '^GPU') GPU(s))."
+        return 0
+    fi
+    pf_fix "NVIDIA driver $driver is below $MIN_NVIDIA_DRIVER, the validators' minimum — an idle node below it earns nothing." \
+        "sudo apt-get install -y nvidia-driver-580-server && sudo reboot   # stop rentals first"
+}
+
+check_nvidia_toolkit() {
+    local version
+    version=$(nvidia-container-cli --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$version" ]; then
+        pf_pass "NVIDIA container toolkit (nvidia-container-cli $version)."
+        return 0
+    fi
+    pf_fix "NVIDIA container toolkit is not installed — Docker cannot pass GPUs into containers." \
+        "$(self_cmd)   # adds NVIDIA's apt repository and installs nvidia-container-toolkit"
+}
+
+check_iptables_modules() {
+    # The validators' Docker-in-Docker probe runs legacy iptables inside the pod; on an nftables
+    # host without these modules its dockerd fails with "can't initialize iptables table 'nat'",
+    # sshd never starts and the node is scored as having no sysbox (ticket-0309: three reinstalls).
+    local mod missing=""
+    for mod in ip_tables iptable_nat iptable_filter; do
+        grep -q "^$mod " "$(host_path /proc/modules)" 2>/dev/null && continue
+        [ -d "$(host_path "/sys/module/$mod")" ] && continue
+        missing="${missing:+$missing }$mod"
+    done
+    if [ -z "$missing" ]; then
+        pf_pass "Legacy iptables modules loaded (ip_tables iptable_nat iptable_filter) for the validators' Docker-in-Docker probe."
+        return 0
+    fi
+    pf_fix "Kernel modules $missing are not loaded — the validators' Docker-in-Docker probe needs legacy iptables and reports sysbox missing without them." \
+        "sudo modprobe -a ip_tables iptable_nat iptable_filter   # -a: without it modprobe reads the 2nd and 3rd name as parameters of the 1st" \
+        "printf 'ip_tables\\niptable_nat\\niptable_filter\\n' | sudo tee /etc/modules-load.d/lium-iptables.conf >/dev/null   # survives reboots"
+}
+
+check_disk_for_vram() {
+    # The validators compare the TOTAL size of the filesystem the executor sees as / (its
+    # rootfs lives under Docker's data-root) with total GPU VRAM; free space is not the rule.
+    local vram_mib vram_gb data_root total_kb total_gb needed_gb
+    command -v nvidia-smi &>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — no NVIDIA driver, VRAM unknown."; return 0; }
+    vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
+    [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
+    data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
+    [ -d "$data_root" ] || data_root=/
+    total_kb=$(df -Pk "$data_root" 2>/dev/null | awk 'NR == 2 {print $2}')
+    [ "${total_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — cannot read the filesystem size of $data_root."; return 0; }
+    vram_gb=$(awk -v m="$vram_mib" 'BEGIN {printf "%.1f", m / 1024}')
+    total_gb=$(awk -v k="$total_kb" 'BEGIN {printf "%.1f", k / 1024 / 1024}')
+    needed_gb=$(awk -v v="$vram_gb" -v r="$MIN_DISK_TO_VRAM_RATE" 'BEGIN {printf "%.1f", v * r}')
+    if awk -v t="$total_gb" -v n="$needed_gb" 'BEGIN {exit !(t >= n)}'; then
+        pf_pass "Disk ${total_gb} GB on $data_root >= ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — idle pay eligible."
+        return 0
+    fi
+    pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
+        "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)."
+}
+
+preflight_ports() {
+    # EXECUTOR_PORT / SSH_PORT from the environment, else the executor .env next to this script, else the defaults
+    local env_file
+    env_file="$(dirname "$0")/.env"
+    if [ -z "${EXECUTOR_PORT:-}" ] && [ -r "$env_file" ]; then
+        EXECUTOR_PORT=$(sed -n 's/^EXTERNAL_PORT=\([0-9]*\).*/\1/p' "$env_file" | head -1)
+    fi
+    if [ -z "${SSH_PORT:-}" ] && [ -r "$env_file" ]; then
+        SSH_PORT=$(sed -n 's/^SSH_PORT=\([0-9]*\).*/\1/p' "$env_file" | head -1)
+    fi
+    echo "${EXECUTOR_PORT:-8080} ${SSH_PORT:-2200}"
+}
+
+port_listener() {
+    # the process listening on TCP $1, e.g. 'users:(("sshd",pid=812,fd=3))'; empty when the port is free
+    ss -Hltnp "sport = :$1" 2>/dev/null | awk '{print $NF}' | head -1
+}
+
+ufw_blocks_port() {
+    # true when ufw is active and no ALLOW rule covers TCP $1 (single port or lo:hi range)
+    local status
+    status=$(ufw status 2>/dev/null) || return 1
+    echo "$status" | grep -q '^Status: active' || return 1
+    ! echo "$status" | awk -v p="$1" '
+        $2 == "ALLOW" || $3 == "ALLOW" {
+            split($1, spec, "/"); if (spec[2] != "" && spec[2] != "tcp") next
+            n = split(spec[1], range, ":")
+            if ((n == 1 && range[1] == p) || (n == 2 && range[1] + 0 <= p + 0 && p + 0 <= range[2] + 0)) found = 1
+        }
+        END { exit !found }'
+}
+
+check_ports() {
+    local ports p listener label fixed=0
+    read -r -a ports <<< "$(preflight_ports)"
+    for p in "${ports[0]}:executor" "${ports[1]}:SSH"; do
+        label=${p#*:} p=${p%%:*}
+        listener=$(port_listener "$p")
+        if [ -n "$listener" ] && ! echo "$listener" | grep -Eq 'docker-proxy|dockerd'; then
+            pf_fix "TCP $p ($label port) is already in use by $listener — the executor cannot bind it." \
+                "Stop that process, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
+            fixed=1
+            continue
+        fi
+        if ufw_blocks_port "$p"; then
+            pf_fix "TCP $p ($label port) is blocked by ufw — validators cannot reach the node." "sudo ufw allow $p/tcp"
+            fixed=1
+            continue
+        fi
+        if [ -n "$listener" ]; then
+            pf_pass "TCP $p ($label port) is served by Docker and not blocked by ufw."
+        else
+            pf_pass "TCP $p ($label port) is free and not blocked by ufw."
+        fi
+    done
+    echo "         Cloud firewalls and routers are outside this host: after 'docker compose up', from ANY other machine run"
+    echo "           nc -vz <this host's public IP> ${ports[0]} ${ports[1]}    # both must say 'succeeded'"
+    return $fixed
+}
+
+check_sysbox() {
+    # installed, registered as a Docker runtime, and a container starts under it (the docs' probe)
+    if ! command -v sysbox-runc &>/dev/null; then
+        pf_fix "sysbox-runc is not installed — validators reject a node without it." "$(self_cmd)"
+        return 1
+    fi
+    if ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q sysbox-runc; then
+        pf_fix "sysbox-runc is installed but not registered in Docker's runtimes." \
+            "$(self_cmd)   # writes the runtime into /etc/docker/daemon.json and restarts Docker"
+        return 1
+    fi
+    if ! docker run --rm --runtime=sysbox-runc alpine echo ok &>/dev/null; then
+        pf_fix "sysbox-runc is registered but 'docker run --rm --runtime=sysbox-runc alpine echo ok' fails." \
+            "$(self_cmd)   # re-applies the Docker 29 settings and re-verifies; then: journalctl -u sysbox-mgr --no-pager -n 20"
+        return 1
+    fi
+    pf_pass "sysbox-runc $(sysbox-runc --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo installed) runs a container."
+}
+
+preflight_summary() {
+    echo ""
+    echo "  Preflight: $PREFLIGHT_PASS PASS, $PREFLIGHT_FIX FIX, $PREFLIGHT_SKIP SKIP."
+    [ "$PREFLIGHT_FIX" -eq 0 ]
+}
+
+preflight_host() {
+    # what this script cannot install for you; a FIX here stops the run before anything changes
+    check_root || true
+    check_arch || true
+    check_kernel || true
+    check_docker || true
+    check_nvidia_driver || true
+    check_iptables_modules || true
+    check_disk_for_vram || true
+    check_ports || true
+}
+
+preflight_stack() {
+    # what this script installs: reported in --check mode, done in install mode
+    check_nvidia_toolkit || true
+    check_docker_features || true
+    check_sysbox || true
+}
+
+
+# sourced by the tests: functions only, nothing below runs
+if [ -n "${SYSBOX_SETUP_LIB:-}" ]; then
+    return 0
+fi
+
+PREFLIGHT_MODE_FLAG=""
+case "${1:-}" in
+    "") ;;
+    --check) PREFLIGHT_MODE_FLAG="--check" ;;
+    -h|--help)
+        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
+        echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify"
+        echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
+        echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
+        exit 0
+        ;;
+    *)  fail "Unknown option: $1 (use --check or --help)"; exit 2 ;;
+esac
+
 # ── 1. Pre-flight ────────────────────────────────────────
+
+if [ -n "$PREFLIGHT_MODE_FLAG" ]; then
+    echo -e "\n${B}Preflight${N} — host requirements, then what this script installs"
+    preflight_host
+    preflight_stack
+    preflight_summary && exit 0
+    echo "  Fix the lines above, then run: $(self_cmd)"
+    exit 1
+fi
 
 step 1 7 "Pre-flight checks"
 
-[ "$(id -u)" -eq 0 ]                         || { fail "Run as root (use sudo)."; exit 1; }
-[ "$(uname -m)" = "x86_64" ]                 || { fail "Sysbox requires x86_64."; exit 1; }
-command -v docker &>/dev/null                 || { fail "Docker not installed."; exit 1; }
-docker ps &>/dev/null                         || { fail "Docker daemon not running."; exit 1; }
-command -v nvidia-smi &>/dev/null             || { fail "nvidia-smi not found. Install NVIDIA drivers first."; exit 1; }
-ls /proc/driver/nvidia &>/dev/null            || { fail "NVIDIA driver not loaded. Try: nvidia-smi"; exit 1; }
-
-ok "All checks passed."
+preflight_host
+preflight_summary || { echo "  Fix the lines above and re-run. Nothing was installed."; exit 1; }
 
 echo -e "\n  This will install sysbox, configure Docker, restart Docker, and verify."
 if [ -t 0 ]; then
@@ -152,23 +486,13 @@ if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbo
 fi
 
 # Reached only when the real GPU test above did not pass, so a working host is never rejected here.
+# The preflight already settled the kernel version, so a "no" from sysbox-mgr points at the
+# filesystem under Docker's data-root or at sysbox-mgr's own configuration.
 if [ "${SYSBOX_SKIP_KERNEL_CHECK:-0}" = "1" ]; then
     warn "SYSBOX_SKIP_KERNEL_CHECK=1 — installing without the ID-mapped mounts check."
-else
-    IDMAPPED=$(sysbox_idmapped_report)
-    case "$IDMAPPED" in
-        yes) ;;
-        no)
-            if kernel_supports_idmapped; then fail_no_idmapped; else fail_old_kernel; fi
-            exit 1
-            ;;
-        *)  # sysbox-mgr reported nothing this boot — fall back to the kernel version
-            if ! kernel_supports_idmapped; then
-                fail_old_kernel
-                exit 1
-            fi
-            ;;
-    esac
+elif [ "$(sysbox_idmapped_report)" = "no" ]; then
+    fail_no_idmapped
+    exit 1
 fi
 
 SKIP_INSTALL=false
@@ -238,7 +562,9 @@ if [ "$has_executor" = true ]; then
         # Compose file missing — stop and remove executor containers directly
         executor_ids=$(docker ps --filter "name=executor" -q 2>/dev/null || true)
         if [ -n "$executor_ids" ]; then
+            # shellcheck disable=SC2086  # one id per word
             docker stop $executor_ids > /dev/null 2>&1
+            # shellcheck disable=SC2086
             docker rm $executor_ids > /dev/null 2>&1
         fi
         ok "Executor containers stopped (compose file not found — restart manually after setup)."
@@ -250,6 +576,7 @@ fi
 stopped=$(docker ps -a -q 2>/dev/null || true)
 if [ -n "$stopped" ]; then
     warn "Removing stopped containers (sysbox requires none)..."
+    # shellcheck disable=SC2086  # one id per word
     docker rm -f $stopped > /dev/null 2>&1
     ok "Stopped containers removed."
 fi
@@ -340,9 +667,11 @@ if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &
     # ── 8. Restart executor ──────────────────────────────
     if [ -n "$EXECUTOR_COMPOSE_DIR" ]; then
         step 7 7 "Restarting executor"
-        docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" up -d 2>/dev/null \
-            && ok "Executor restarted ($EXECUTOR_COMPOSE_DIR)." \
-            || warn "Failed to restart executor. Run manually: cd $EXECUTOR_COMPOSE_DIR && docker compose up -d"
+        if docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" up -d 2>/dev/null; then
+            ok "Executor restarted ($EXECUTOR_COMPOSE_DIR)."
+        else
+            warn "Failed to restart executor. Run manually: cd $EXECUTOR_COMPOSE_DIR && docker compose up -d"
+        fi
     fi
 else
     echo ""
