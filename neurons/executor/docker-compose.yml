@@ -9,8 +9,9 @@ version: '3.7'
 # by that user cannot write config.json. The runner pins DOCKER_HOST so a `currentContext`
 # in the host's config.json cannot redirect its docker CLI. The credentials must be inline
 # (`auths`): Watchtower has no credential helper, and a `credsStore` in config.json makes it
-# skip every container, public images included (the runner's CLI still pulls anonymously) —
-# `grep credsStore ~/.docker/config.json` must print nothing (remove the key, log in again).
+# skip every container, public images included (a `credHelpers` entry for Docker Hub routes
+# through a helper the same way) — `grep -E 'credsStore|credHelpers' ~/.docker/config.json`
+# should print nothing; remove the key and log in again otherwise.
 services:
   executor-runner:
     image: daturaai/compute-subnet-executor-runner:latest
