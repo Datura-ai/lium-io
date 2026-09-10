@@ -479,6 +479,10 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
         )
     ):
         return "extra host config"
+    # `--memory-swappiness` is null by default and 0 is a real setting, so a truthiness test would
+    # let a slot that pins swappiness pass; any value set means the slot can swap the renter's pod
+    if host.get("MemorySwappiness") is not None:
+        return "extra host config"
     if config.get("User"):
         return "user"
     # What runs inside the pod besides Cmd/Entrypoint: a healthcheck is a command dockerd runs in

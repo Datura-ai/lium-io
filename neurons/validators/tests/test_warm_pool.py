@@ -1427,6 +1427,9 @@ async def test_flag_off_volume_failure_is_still_reported_as_the_volume_step(svc,
         (lambda d: d["HostConfig"].__setitem__("CpusetCpus", "0"), "extra host config"),
         (lambda d: d["HostConfig"].__setitem__("PidsLimit", 16), "extra host config"),
         (lambda d: d["HostConfig"].__setitem__("MemorySwap", 1 << 30), "extra host config"),
+        (lambda d: d["HostConfig"].__setitem__("MemorySwappiness", 60), "extra host config"),
+        # 0 is a setting too (never swap): the default is null, not 0
+        (lambda d: d["HostConfig"].__setitem__("MemorySwappiness", 0), "extra host config"),
         (lambda d: d["HostConfig"].__setitem__("AutoRemove", True), "extra host config"),
         (
             lambda d: d["HostConfig"].__setitem__(
