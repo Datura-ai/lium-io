@@ -89,6 +89,11 @@ class VerifyIntentBody(WireModel):
     issued_at: int  # unix seconds, validator clock
     expires_at: int  # unix seconds; refused after this
     executor_uuid: str = Field(min_length=1, max_length=128)
+    # The miner this executor belongs to, as the validator knows it. Signed like every other
+    # field, it binds the intent to that miner's executors: one relayed to another provider's
+    # executor is refused there (401) instead of running a GPU suite the sender never earned.
+    # The executor cannot check `executor_uuid` (it does not know its own); it does know its miner.
+    miner_hotkey: str = Field(min_length=1, max_length=128)
     # Seconds the executor may spend before answering with whatever finished; capped by settings.
     deadline_s: int = Field(default=300, ge=5, le=3600)
     # Run the two GPU/RAM probes side by side. The validator sets this only at first-pass sizes:
