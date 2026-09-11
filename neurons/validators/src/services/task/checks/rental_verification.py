@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
 import asyncssh
 
@@ -23,7 +26,7 @@ from protocol.vc_protocol.compute_requests import (
 from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
-from ..pipeline import CheckResult, Context
+from ..pipeline import RENTAL_PROBE_OUTCOME_EVENT, CheckResult, Context
 from .cpu_truth import advertised_cpu_count
 
 logger = logging.getLogger(__name__)
@@ -79,6 +82,119 @@ def _was_deliberately_stopped_on_the_host(diagnostics: ContainerDeathDiagnostics
     if diagnostics.exit_code not in _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL:
         return False
     return not diagnostics.oom_killed
+
+@dataclass(frozen=True)
+class HealthCheckRequest:
+    """The keyword arguments of `backend.check_executor_health` for one cycle, sent as
+    `**asdict(request)`. Frozen: field equality is what gates the consume step (`RentalProbe`)."""
+
+    miner_address: str
+    miner_port: int
+    miner_hotkey: str
+    container_port: int
+    executor_id: str
+    rental_in_progress: bool
+    gpu_uuids: list[str]
+    cpu_count: int | None
+
+
+@dataclass
+class RentalProbe:
+    """The backend health check started early (liumd phase 2, `LocalVerifyCheck`) so its ≈ 25 s
+    overlap the executor's GPU steps. `request` is the exact keyword set the check below would
+    have sent; the check consumes the task only when its own request equals it, so the probe can
+    move the call earlier but never change what is asked. `consumed` tells `Pipeline.run`'s
+    settle step that nothing is left to cancel."""
+
+    task: asyncio.Task
+    request: HealthCheckRequest
+    consumed: bool = False
+    started_at: float = field(default_factory=time.perf_counter)
+
+    async def cancel_and_await(self) -> str:
+        """Cancel if still running and retrieve the outcome so nothing is left un-awaited. Returns
+        the metric reason: `cancelled` (was still running), `done` (finished, never consumed)."""
+        was_running = not self.task.done()
+        if was_running:
+            self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+        return "cancelled" if was_running else "done"
+
+
+def health_check_request(ctx: Context, *, container_port: int, rental_in_progress: bool) -> HealthCheckRequest:
+    """The `check_executor_health` request for this cycle — ONE builder for
+    the check's own call and for the early probe (`rental_probe_request`), so the two cannot drift."""
+    # The UUIDs this cycle's scrape saw. The backend probes for exactly these instead of
+    # `--gpus all`, so a host advertising cards it cannot hand over fails here rather than in a
+    # customer's rental (DAH-2614). Sent from the scrape, not read from the backend's stored
+    # specs: those lag a cycle and do not exist at all on an executor's first pass.
+    gpu_details = ctx.state.gpu_details or (ctx.state.specs or {}).get("gpu", {}).get("details", [])
+    gpu_uuids = [detail["uuid"] for detail in gpu_details if isinstance(detail, dict) and detail.get("uuid")]
+
+    # DAH-2671 item 2b: hand the backend the advertised core count AS-IS so the probe is created
+    # with `--cpus=<advertised>`. The backend classifier compares it against the daemon's own N
+    # from the refusal message and only classifies CPU_QUOTA_EXCEEDS_HOST when
+    # advertised > 2*N + 4 (honest max divergence is 2x — SMT off; observed spoofs 4-8x), so an
+    # honest SMT-off host falls into the backend's retry-without-flag path. No host-read capping:
+    # any source read from the judged host (sysfs/procfs) is spoofable, and a cap computed from
+    # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
+    # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
+    # rent skips `--cpus` there too) and when the count is unreadable.
+    cpu_count = advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
+
+    return HealthCheckRequest(
+        miner_address=ctx.miner_address,
+        miner_port=ctx.miner_port,
+        miner_hotkey=ctx.miner_hotkey,
+        container_port=container_port,
+        executor_id=ctx.executor.uuid,
+        rental_in_progress=rental_in_progress,
+        gpu_uuids=gpu_uuids,
+        cpu_count=cpu_count,
+    )
+
+
+def rental_probe_request(ctx: Context) -> HealthCheckRequest | None:
+    """The request `RentalVerificationCheck.run` would send from this context when it reaches the
+    backend call with a pod to rent (`rental_in_progress=False` — the ≈ 25 s case), or None when it
+    would return earlier: verification skipped, a filler to verify instead, a create-time kill
+    under enforcement, no verified port, or an active customer rental (a cheap backend call the
+    probe has nothing to gain from). Mirrors the early returns of `run` in their order."""
+    if settings.SKIP_RENTAL_VERIFICATION:
+        return None
+    rented_data = ctx.state.rented_data
+    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    if rented_executor and rented_executor.pods:
+        return None
+    if rented_data and rented_data.get_filler_containers(ctx.executor.uuid):
+        return None
+    create_killed = bool(rented_data and ctx.executor.uuid in rented_data.filler_create_kill_executor_ids)
+    if create_killed and settings.FILLER_LIVENESS_CHECK_ENABLED and settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED:
+        return None
+    verified_ports = ctx.state.specs.get("verified_ports", []) if ctx.state.specs else []
+    if not verified_ports:
+        return None
+    return health_check_request(ctx, container_port=verified_ports[0], rental_in_progress=False)
+
+
+def _probe_metric(ctx: Context, outcome: str, reason: str, **fields: Any) -> None:
+    # The phase-1 `[local_verify] outcome` line, `step=rental_probe`; Loki counts by (outcome, reason).
+    logger.info(
+        _m(
+            RENTAL_PROBE_OUTCOME_EVENT,
+            extra=get_extra_info(
+                {
+                    **ctx.default_extra,
+                    "outcome": outcome,
+                    "step": "rental_probe",
+                    "reason": reason,
+                    "first_pass": ctx.config.first_pass,
+                    **fields,
+                }
+            ),
+        )
+    )
+
 
 _FILLER_VERDICT_SEVERITY: dict[str, int] = {
     Msg.FILLER_KILLED.reason: 3,
@@ -196,7 +312,6 @@ class RentalVerificationCheck:
         # Get required info from context
         backend_client = ctx.services.backend
         executor = ctx.executor
-        miner_hotkey = ctx.miner_hotkey
 
         # Get verified ports from PortConnectivityCheck
         verified_ports = ctx.state.specs.get("verified_ports", []) if ctx.state.specs else []
@@ -220,41 +335,24 @@ class RentalVerificationCheck:
                 updates={},
             )
 
-        # Use the first verified port
-        container_port = verified_ports[0]
-
-        # The UUIDs this cycle's scrape saw. The backend probes for exactly these instead of
-        # `--gpus all`, so a host advertising cards it cannot hand over fails here rather than in a
-        # customer's rental (DAH-2614). Sent from the scrape, not read from the backend's stored
-        # specs: those lag a cycle and do not exist at all on an executor's first pass.
-        gpu_details = ctx.state.gpu_details or (ctx.state.specs or {}).get("gpu", {}).get("details", [])
-        gpu_uuids = [detail["uuid"] for detail in gpu_details if isinstance(detail, dict) and detail.get("uuid")]
-
-        # DAH-2671 item 2b: hand the backend the advertised core count AS-IS so the probe is created
-        # with `--cpus=<advertised>`. The backend classifier compares it against the daemon's own N
-        # from the refusal message and only classifies CPU_QUOTA_EXCEEDS_HOST when
-        # advertised > 2*N + 4 (honest max divergence is 2x — SMT off; observed spoofs 4-8x), so an
-        # honest SMT-off host falls into the backend's retry-without-flag path. No host-read capping:
-        # any source read from the judged host (sysfs/procfs) is spoofable, and a cap computed from
-        # it would let a spoofer neutralise the daemon check (fake `present` == advertised while
-        # `/proc/cpuinfo` stays real → cap = online → daemon accepts). Skipped on TDX hosts (a real
-        # rent skips `--cpus` there too) and when the count is unreadable.
-        cpu_count = advertised_cpu_count(ctx) if settings.RENTAL_CPU_LIMIT_CHECK_ENABLED and not ctx.executor.tdx_quote else None
+        # Use the first verified port. The request is built by the one builder the early probe
+        # uses too (DAH-2614 GPU UUIDs, DAH-2671 advertised CPU count — see health_check_request).
+        request = health_check_request(
+            ctx, container_port=verified_ports[0], rental_in_progress=has_customer_rental
+        )
 
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
             # already sees an active customer rental, the backend skips the container-creating check
             # instead of disturbing the tenant (it still re-checks the DB itself when this is False).
-            response = await backend_client.check_executor_health(
-                miner_address=ctx.miner_address,
-                miner_port=ctx.miner_port,
-                miner_hotkey=miner_hotkey,
-                container_port=container_port,
-                executor_id=executor.uuid,
-                rental_in_progress=has_customer_rental,
-                gpu_uuids=gpu_uuids,
-                cpu_count=cpu_count,
-            )
+            # liumd phase 2: when `LocalVerifyCheck` started this very request early (the probe pod
+            # rented beside the executor's GPU steps), await that task instead of renting a second
+            # pod; a task exception takes the same API_ERROR path as a direct call's.
+            probe = await self._take_matching_probe(ctx, request)
+            if probe is not None:
+                response = await probe.task
+            else:
+                response = await backend_client.check_executor_health(**asdict(request))
 
             # Handle API failure (None response) - fail this executor
             if response is None:
@@ -362,6 +460,27 @@ class RentalVerificationCheck:
             await ctx.services.container_cleanup.force_remove_health_checks(
                 ctx.ssh, ctx.executor.uuid
             )
+
+    async def _take_matching_probe(self, ctx: Context, request: HealthCheckRequest) -> RentalProbe | None:
+        """The early probe from `ctx.state.local_verify`, when there is one for exactly this
+        request. A probe whose request differs (the state changed between the two checks) is
+        settled in the background and the check makes its own call — the verdict never rests on
+        a request other than the one this check would have sent."""
+        probe = getattr(ctx.state.local_verify, "rental_probe", None)
+        if not isinstance(probe, RentalProbe) or probe.consumed:
+            return None
+        probe.consumed = True
+        if probe.request != request:
+            _probe_metric(ctx, "fallback", "request_mismatch", settled=await probe.cancel_and_await())
+            return None
+        _probe_metric(
+            ctx,
+            "consumed",
+            "ok",
+            already_done=probe.task.done(),
+            probe_age_ms=int((time.perf_counter() - probe.started_at) * 1000),
+        )
+        return probe
 
     def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
         """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.
