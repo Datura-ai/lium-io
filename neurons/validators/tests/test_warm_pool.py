@@ -816,6 +816,20 @@ def test_volume_mismatch_reads_the_plugin_record(svc):
     assert "'volume_x; rm -rf /'" in warm_pool.inspect_volume_command("volume_x; rm -rf /")
 
 
+def test_slot_mounting_a_volume_that_is_not_its_own_is_not_a_slot(svc):
+    """The daemon's owner can create a `warm_*` container that mounts a previous renter's vloopback
+    volume; `slot_from_inspect` must reject any volume but `volume_<slot id>`, or the next renter
+    gets that data at /root (taiberium, #1337)."""
+    image = _image_doc()
+    doc = _slot_doc(_spec(svc, _adoptable_payload()), image)
+    own = warm_pool.slot_from_inspect(doc, image_id=IMAGE_ID, now=NOW, max_age=MAX_AGE)
+    assert own is not None and own.volume_name == f"volume_{SLOT_ID}"
+    for mount in doc["Mounts"]:
+        if mount.get("Type") == "volume":
+            mount["Name"] = "volume_previous_renter"
+    assert warm_pool.slot_from_inspect(doc, image_id=IMAGE_ID, now=NOW, max_age=MAX_AGE) is None
+
+
 @pytest.mark.asyncio
 async def test_slot_that_differs_falls_back_to_a_fresh_create(svc, monkeypatch):
     monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
@@ -1304,34 +1318,37 @@ def _age_host(inspect_stdout: str):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("flag_on", [False, True], ids=["flag-off", "flag-on"])
-async def test_container_age_counts_from_the_last_start_while_never_restarted(monkeypatch, flag_on):
+async def test_container_age_counts_from_the_last_start_for_an_adopted_slot(monkeypatch, flag_on):
     """StaleContainerCleanupCheck ages a `pod_*` by this helper on EVERY validator; an adopted slot
-    was created hours before the rental started it and must read as young as its start on each of
-    them — a peer with the flag off reading `Created` alone would remove the live pod inside its
-    rented-snapshot window — so the rule does not depend on the flag."""
+    was created hours before the rental started it, keeps the `lium.warm_pool` label through the
+    rename, and must read as young as its start on each of them — a peer with the flag off reading
+    `Created` alone would remove the live pod inside its rented-snapshot window — so the rule does
+    not depend on the flag. A restart-policy restart minutes into the rental refreshes `StartedAt`
+    and must not make the pod read 24 h old (taiberium, #1337)."""
     from services.container_cleanup import ContainerCleanup
 
     monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", flag_on)
-    ssh = _age_host(f"{AGE_NOW - 20 * 3600}\n{AGE_NOW - 30}\n0\n")
+    ssh = _age_host(f"{AGE_NOW - 20 * 3600}\n{AGE_NOW - 30}\n1\n")
     age = await ContainerCleanup()._get_container_age_minutes(ssh, "pod_adopted")
     assert age is not None and age < 1
     (cmd,) = [c.args[0] for c in ssh.run.await_args_list if "docker inspect" in c.args[0]]
-    assert ".Created" in cmd and ".State.StartedAt" in cmd and ".RestartCount" in cmd
+    assert ".Created" in cmd and ".State.StartedAt" in cmd and 'index .Config.Labels "lium.warm_pool"' in cmd
 
-    # a never-started container prints docker's zero time (a negative epoch): the create time wins
-    ssh = _age_host(f"{AGE_NOW - 3600}\n{ZERO_TIME_EPOCH}\n0\n")
+    # a never-started slot prints docker's zero time (a negative epoch): the create time wins
+    ssh = _age_host(f"{AGE_NOW - 3600}\n{ZERO_TIME_EPOCH}\n1\n")
     assert await ContainerCleanup()._get_container_age_minutes(ssh, "warm_slot") == 60
 
 
 @pytest.mark.asyncio
-async def test_restarting_container_with_a_fresh_start_is_still_stale():
-    """dockerd refreshes `StartedAt` on every restart-policy restart, so a crash-looping `pod_*`
-    reads as seconds old for as long as it loops; its age must count from `Created`, or the stale
-    sweep never removes it."""
+async def test_unlabelled_container_ages_from_created_whatever_its_start_says():
+    """A `pod_*` that was never a slot ages from `Created`, as before the pool: stopping and starting
+    it again refreshes `StartedAt` but must not take it out of the 15-minute sweep's reach
+    (taiberium, #1337), and a crash-looping one must not read as seconds old for as long as it
+    loops. The label line is empty for such a container."""
     from services.container_cleanup import ContainerCleanup
 
-    ssh = _age_host(f"{AGE_NOW - 20 * 3600}\n{AGE_NOW - 30}\n7\n")
-    age = await ContainerCleanup()._get_container_age_minutes(ssh, "pod_crashlooping")
+    ssh = _age_host(f"{AGE_NOW - 20 * 3600}\n{AGE_NOW - 30}\n\n")
+    age = await ContainerCleanup()._get_container_age_minutes(ssh, "pod_restarted_by_host")
     assert age == 20 * 60
 
 
