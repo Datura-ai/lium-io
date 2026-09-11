@@ -105,10 +105,10 @@ def echo(intent, **step):
 
 
 def test_the_phase_1_intent_is_unchanged_without_a_dind_step():
-    intent = build_intent(executor_uuid="e", matmul=None, verifyx=None, parallel_gpu=False, deadline_s=20)
+    intent = build_intent(executor_uuid="e", miner_hotkey="m", matmul=None, verifyx=None, parallel_gpu=False, deadline_s=20)
     assert "dind" not in intent["steps"]
     with_dind = build_intent(
-        executor_uuid="e", matmul=None, verifyx=None, parallel_gpu=False, deadline_s=20,
+        executor_uuid="e", miner_hotkey="m", matmul=None, verifyx=None, parallel_gpu=False, deadline_s=20,
         dind=DindStep(name="container_h_1", port=1, public_key="ssh-ed25519 A", sysbox=True),
     )
     assert with_dind["steps"]["dind"] == {"name": "container_h_1", "port": 1, "public_key": "ssh-ed25519 A", "sysbox": True}
