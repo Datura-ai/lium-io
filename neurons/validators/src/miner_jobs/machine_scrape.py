@@ -630,12 +630,18 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         raise NVMLError(ret)
 
 
-def run_cmd(cmd):
+def run_cmd_result(cmd) -> subprocess.CompletedProcess:
+    """`run_cmd` without the raise: the caller reads returncode / stdout / stderr itself (smartctl
+    reports a failing disk through its exit status AND its JSON, DAH-2928)."""
     # Strip LD_LIBRARY_PATH so PyInstaller's bundled libs don't leak into subprocesses
     # and conflict with system-linked shared libs (e.g. libssl vs libcrypto version mismatch).
     env = {**os.environ}
     env.pop("LD_LIBRARY_PATH", None)
-    proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
+    return subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
+
+
+def run_cmd(cmd):
+    proc = run_cmd_result(cmd)
     if proc.returncode != 0:
         raise RuntimeError(
             f"run_cmd error {cmd=!r} {proc.returncode=} {proc.stdout=!r} {proc.stderr=!r}"
@@ -1618,16 +1624,41 @@ def nvme_controller_states() -> dict[str, str]:
     return states
 
 
+# A drive that is dying is exactly the one that may not answer a SMART query; `timeout(1)` bounds it
+# so the fatal machine scrape is not held past its own budget (the docker daemon gets the same 30 s).
+SMARTCTL_TIMEOUT_S = 30
+TIMEOUT_EXIT_STATUS = 124
+
+
 def smart_health() -> dict[str, str] | str:
-    """smartctl's overall health verdict per disk, or 'unavailable' where smartctl is not installed."""
+    """smartctl's overall health verdict per disk, or 'unavailable' where smartctl is not installed.
+
+    `smartctl -H` exits non-zero when the disk is FAILING (bit 3) and when the device has no SMART or
+    cannot be opened (bits 1/2) — the verdict is in the JSON on stdout either way, so the exit status
+    alone is never the error; only a timeout or unreadable output is.
+    """
     if not shutil.which("smartctl"):
         return "unavailable"
     verdicts = {}
     for device in sorted(glob.glob("/dev/sd?") + glob.glob("/dev/nvme?n1")):
         try:
-            report = json.loads(run_cmd(f"smartctl -H -j {device}"))
+            proc = run_cmd_result(f"timeout {SMARTCTL_TIMEOUT_S} smartctl -H -j {device}")
+            if proc.returncode == TIMEOUT_EXIT_STATUS:
+                verdicts[device] = f"error: smartctl did not answer within {SMARTCTL_TIMEOUT_S}s"
+                continue
+            report = json.loads(proc.stdout)
             passed = (report.get("smart_status") or {}).get("passed")
-            verdicts[device] = "PASSED" if passed else ("FAILED" if passed is False else "unknown")
+            if passed is None:
+                messages = (report.get("smartctl") or {}).get("messages") or []
+                first = next(
+                    (m.get("string") for m in messages if isinstance(m, dict) and m.get("string")),
+                    "",
+                )
+                verdicts[device] = (
+                    f"error: {first[:KERNEL_ERROR_LINE_CHARS]}" if first else "unknown"
+                )
+            else:
+                verdicts[device] = "PASSED" if passed else "FAILED"
         except Exception as e:
             verdicts[device] = f"error: {str(e)[:KERNEL_ERROR_LINE_CHARS]}"
     return verdicts
