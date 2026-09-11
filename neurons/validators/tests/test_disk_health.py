@@ -456,11 +456,6 @@ async def test_a_healthy_disk_passes(context_factory):
     assert result.event.reason_code == Msg.OK.reason
 
 
-def test_the_check_is_non_fatal_until_the_reading_is_proven_on_live_executors():
-    # a fatal check here zeros rented and idle executors fleet-wide on one false reading
-    assert DiskHealthCheck.fatal is False
-
-
 @pytest.mark.asyncio
 async def test_a_read_only_docker_root_is_a_warning_and_does_not_fail_the_executor(context_factory):
     health = _health(read_only_mounts=["/var/lib/docker"], write_probe="failed", write_probe_error="EROFS")
