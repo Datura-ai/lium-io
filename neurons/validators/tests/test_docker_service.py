@@ -2141,6 +2141,38 @@ async def test_create_container_quote_socket_kill_switch(docker_service, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_create_container_takes_the_executors_answer_and_skips_the_sdk_run_and_the_running_poll(
+    docker_service, monkeypatch
+):
+    """liumd deploy: when `_create_with_local_rent` answers, the container exists and runs on the
+    executor's word — the SDK `run` of the same name and the `docker ps` poll are not issued; the
+    steps after the create (keys, sshd, environment) run as today on the very spec it was handed."""
+    run_spy, _ = _patch_quote_socket_path(docker_service, monkeypatch)
+    local_rent = AsyncMock(return_value=Mock(created=True))
+    monkeypatch.setattr(docker_service, "_create_with_local_rent", local_rent)
+
+    await _create(docker_service, _cvm_socket_payload(), tdx_quote=None)
+
+    local_rent.assert_awaited_once()
+    # the spec the executor is handed names the pod's own container (`pod_<pod_id>`, get_container_name)
+    assert local_rent.await_args.kwargs["run_spec"].name.startswith(docker_service_module.POD_CONTAINER_PREFIX)
+    run_spy.assert_not_awaited()
+    docker_service.check_container_running.assert_not_awaited()
+    docker_service.redis_service.add_rented_pod.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_container_without_an_executor_answer_runs_the_sdk_path_as_today(docker_service, monkeypatch):
+    run_spy, _ = _patch_quote_socket_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_create_with_local_rent", AsyncMock(return_value=None))
+
+    await _create(docker_service, _cvm_socket_payload(), tdx_quote=None)
+
+    run_spy.assert_awaited_once()
+    docker_service.check_container_running.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_filler_starts_inspector_collector(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_create_container_happy_path(docker_service, monkeypatch)
