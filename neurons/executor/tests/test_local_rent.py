@@ -304,7 +304,8 @@ def test_a_same_named_network_that_does_not_isolate_fails_the_step_and_creates_n
     assert f"{RENTAL_NETWORK_ICC_OPTION}=false" in result.steps["container"].error
     assert result.steps["ready"].status == "skipped"
     assert "create" not in [c[0] for c in api.calls] and api.made == {}
-    assert result.rolled_back is True  # nothing of ours exists — proven by the by-label search
+    # trivially rolled back: no create was ever issued, so no by-label search runs either
+    assert result.rolled_back is True and not any(c[0] == "list" for c in api.calls)
 
 
 def test_a_missing_image_is_a_fact_and_nothing_is_created():
@@ -348,6 +349,7 @@ def test_a_bad_spec_is_refused_before_docker_is_touched():
         (dict(network="none"), "network"),
         (dict(network="container:pod_other"), "network"),  # another rental's namespace
         (dict(network="bridge"), "network"),  # docker0 by name: inter-container traffic on
+        (dict(network=None), "network"),  # docker0 by omission: the SSH path never builds a rental without the network
     ],
 )
 def test_a_spec_beyond_a_rentals_is_refused_by_the_executor_whoever_signed_it(overrides, why):
@@ -374,7 +376,6 @@ def test_a_rentals_own_extras_pass_the_executors_policy():
     )
     assert refuse_spec(spec) is None
     assert refuse_spec(_spec(runtime=None)) is None
-    assert refuse_spec(_spec(network=None)) is None  # the daemon's default bridge (the quote broker's spec)
 
 
 @pytest.mark.parametrize(
