@@ -22,6 +22,7 @@ from services.executor_rollout import (
     ROLLOUT_GRACE,
     ExecutorRolloutTracker,
     RolloutWindow,
+    WithheldVerdict,
     withhold_rollout_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -537,7 +538,7 @@ class Validator:
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
                         if any(result.is_successful for result in results)
-                    } | {result_miner_hotkey for result_miner_hotkey, _ in withheld_results}
+                    } | {withheld.miner_hotkey for withheld in withheld_results}
 
                     incentive = IncentiveFactory.create(
                         config=self.incentive,
@@ -651,7 +652,7 @@ class Validator:
                     # DAH-3405: a withheld executor was handled by this cycle too — the express
                     # lane must not treat it as never validated and run a first pass on it.
                     published_executor_ids.extend(
-                        result.executor_info.uuid for _, result in withheld_results
+                        withheld.result.executor_info.uuid for withheld in withheld_results
                     )
 
                     if settings.EXPRESS_LANE_ENABLED:
@@ -814,7 +815,7 @@ class Validator:
         job_block: int,
         job_batch_id: str,
         window_at_cycle_start: RolloutWindow,
-    ) -> tuple[dict[str, list[JobResult]], list[tuple[str, JobResult]]]:
+    ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
         """DAH-3405: at cycle end, take the results the rollout explains out of the cycle.
 
         The push that recreates the fleet's containers can land in the middle of a cycle (11 Sep
@@ -824,14 +825,14 @@ class Validator:
         window = await self.observe_executor_rollout(
             await self.fetch_executor_digest_or_none(), job_block, fallback=window_at_cycle_start
         )
-        kept, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
+        standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
-        return kept, withheld_results
+        return standing, withheld_results
 
     async def record_withheld_verdicts(
         self,
         window: RolloutWindow,
-        withheld_results: list[tuple[str, JobResult]],
+        withheld_results: list[WithheldVerdict],
         job_batch_id: str,
         job_block: int,
     ) -> None:

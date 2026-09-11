@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from core.config import settings
@@ -85,6 +85,68 @@ _RUN_ENDED_WITHOUT_FAILING = frozenset(
 
 
 @dataclass(frozen=True)
+class RolloutState:
+    """What Redis remembers between cycles, under `ROLLOUT_STATE_KEY`, as one JSON object.
+
+    `opened_job_block` stays None until a digest change opens a window. `cycles_seen` counts the
+    cycles observed since that change, the opening one included, and `last_job_block` is the cycle
+    the last count was made for. `closed` records that the window-end line was logged, so it is
+    logged once.
+    """
+
+    digest: str | None = None
+    previous_digest: str | None = None
+    started_at: datetime | None = None
+    opened_job_block: int | None = None
+    last_job_block: int | None = None
+    cycles_seen: int = 0
+    withheld: int = 0
+    closed: bool = False
+
+    @classmethod
+    def from_json(cls, raw: str | bytes) -> RolloutState:
+        """Raises ValueError or TypeError on anything this class did not write."""
+        fields = json.loads(raw)
+        if not isinstance(fields, dict):
+            raise ValueError("rollout state is not a JSON object")
+        started_at = fields.get("started_at")
+        opened_job_block = fields.get("opened_job_block")
+        last_job_block = fields.get("last_job_block")
+        return cls(
+            digest=fields.get("digest"),
+            previous_digest=fields.get("previous_digest"),
+            started_at=datetime.fromisoformat(started_at) if started_at else None,
+            opened_job_block=int(opened_job_block) if opened_job_block is not None else None,
+            last_job_block=int(last_job_block) if last_job_block is not None else None,
+            cycles_seen=int(fields.get("cycles_seen", 0)),
+            withheld=int(fields.get("withheld", 0)),
+            closed=bool(fields.get("closed", False)),
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "digest": self.digest,
+                "previous_digest": self.previous_digest,
+                "started_at": self.started_at.isoformat() if self.started_at else None,
+                "opened_job_block": self.opened_job_block,
+                "last_job_block": self.last_job_block,
+                "cycles_seen": self.cycles_seen,
+                "withheld": self.withheld,
+                "closed": self.closed,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class WithheldVerdict:
+    """One result the rollout took out of the cycle, with the miner that reported it."""
+
+    miner_hotkey: str
+    result: JobResult
+
+
+@dataclass(frozen=True)
 class RolloutWindow:
     """What the validator knows about the current executor image and its last change.
 
@@ -121,25 +183,24 @@ class RolloutWindow:
 class ExecutorRolloutTracker:
     """Remembers the authorized executor digest, and when and in which cycle it last changed.
 
-    State lives in Redis under `ROLLOUT_STATE_KEY` as one JSON object: `digest`, `previous_digest`,
-    `started_at` (ISO-8601), `opened_job_block`, `last_job_block` and `cycles_seen` (the cycles
-    observed since the change, the opening one included), `withheld` (results withheld so far in
-    this window) and `closed` (the window-end line was logged). A Redis error propagates; the caller decides what
-    a cycle without this knowledge does. An unreadable value is treated as no state and re-seeded.
+    State lives in Redis as a `RolloutState`. A Redis error propagates; the caller decides what a
+    cycle without this knowledge does. An unreadable value is treated as no state and re-seeded.
     With `grace_cycles` 0 the digest is still tracked but no window ever covers a cycle and neither
     window line is logged.
     """
 
     def __init__(self, redis_service: RedisService, grace_cycles: int | None = None):
         self.redis_service = redis_service
-        wanted = settings.EXECUTOR_ROLLOUT_GRACE_CYCLES if grace_cycles is None else grace_cycles
-        self.grace_cycles = min(wanted, MAX_ROLLOUT_GRACE_CYCLES)
-        if wanted > MAX_ROLLOUT_GRACE_CYCLES:
+        configured_grace_cycles = (
+            settings.EXECUTOR_ROLLOUT_GRACE_CYCLES if grace_cycles is None else grace_cycles
+        )
+        self.grace_cycles = min(configured_grace_cycles, MAX_ROLLOUT_GRACE_CYCLES)
+        if configured_grace_cycles > MAX_ROLLOUT_GRACE_CYCLES:
             logger.warning(
                 _m(
                     "[rollout-grace] EXECUTOR_ROLLOUT_GRACE_CYCLES capped: more cycles without a "
                     "published row would trip the backend's 1-hour inactive sweep",
-                    extra={"wanted": wanted, "used": self.grace_cycles},
+                    extra={"wanted": configured_grace_cycles, "used": self.grace_cycles},
                 )
             )
 
@@ -159,125 +220,137 @@ class ExecutorRolloutTracker:
         # The same normalisation the image check applies to what the node reports, so the two
         # sides of the comparison in `rollout_grace_reason` are spelled the same way.
         digest = normalize_sha256_digest(digest)
-        state = await self._load()
-        remembered = state.get("digest")
-        if state.get("opened_job_block") is not None and job_block != state.get("last_job_block"):
-            state = {
-                **state,
-                "last_job_block": job_block,
-                "cycles_seen": int(state.get("cycles_seen", 0)) + 1,
-            }
-            await self._save(state)
-
-        if digest is not None and remembered is None:
-            state = {"digest": digest}
-            await self._save(state)
-        elif (
-            digest is not None
-            and digest != remembered
-            and state.get("opened_job_block") is not None
-            and int(state.get("cycles_seen", 0)) < self.grace_cycles + 2
-        ):
-            # A second push (a hotfix, a rollback) while the window is open or before one uncovered
-            # cycle has published: the new digest is what "current" means from here on, but the
-            # window is NOT reopened or extended — withheld cycles would chain, and three in a row
-            # are what trips the backend's 1-hour inactive sweep.
-            state = {**state, "digest": digest, "previous_digest": remembered}
-            await self._save(state)
-            window = self._window(state)
-            if self.grace_cycles > 0:
-                logger.warning(
-                    _m(
-                        "[rollout-grace] executor image changed again before one cycle after the "
-                        "rollout window has published; the window is not reopened",
-                        extra={"outcome": ROLLOUT_GRACE, "job_block": job_block, **window.as_extra()},
-                    )
-                )
-            return window
-        elif digest is not None and digest != remembered:
-            state = {
-                "digest": digest,
-                "previous_digest": remembered,
-                "started_at": now.isoformat(),
-                "opened_job_block": job_block,
-                "last_job_block": job_block,
-                "cycles_seen": 1,
-                "withheld": 0,
-            }
-            await self._save(state)
-            window = self._window(state)
-            if self.grace_cycles > 0:
-                logger.warning(
-                    _m(
-                        "[rollout-grace] executor image rollout detected; verdicts of executors "
-                        "that fail while restarting are withheld while the window is open",
-                        extra={"outcome": ROLLOUT_GRACE, "job_block": job_block, **window.as_extra()},
-                    )
-                )
-            return window
-
-        window = self._window(state)
-        if (
-            self.grace_cycles > 0
-            and window.opened_job_block is not None
-            and not window.covers(job_block)
-            and not state.get("closed")
-        ):
-            state["closed"] = True
-            await self._save(state)
-            logger.warning(
-                _m(
-                    "[rollout-grace] executor image rollout window ended",
-                    extra={
-                        "outcome": ROLLOUT_GRACE,
-                        "job_block": job_block,
-                        "withheld_total": state.get("withheld", 0),
-                        **window.as_extra(),
-                    },
-                )
-            )
-        return window
+        state = await self._count_this_cycle(await self._load(), job_block)
+        if digest is None or digest == state.digest:
+            return await self._close_the_window_when_it_is_over(state, job_block)
+        return await self._react_to_the_changed_digest(state, digest, job_block, now)
 
     async def record_withheld(self, count: int) -> None:
         """Add this cycle's withheld results to the window's running total."""
         if count <= 0:
             return
         state = await self._load()
-        state["withheld"] = int(state.get("withheld", 0)) + count
-        await self._save(state)
+        await self._save(replace(state, withheld=state.withheld + count))
 
-    def _window(self, state: dict) -> RolloutWindow:
-        started_at = state.get("started_at")
-        opened_job_block = state.get("opened_job_block")
+    async def _count_this_cycle(self, state: RolloutState, job_block: int) -> RolloutState:
+        """Count one more cycle of an open window, the first time this job block is observed.
+
+        The cycle-start and the cycle-end observation of one cycle share a job block, so the
+        second of the two counts nothing.
+        """
+        if state.opened_job_block is None or job_block == state.last_job_block:
+            return state
+        counted = replace(state, last_job_block=job_block, cycles_seen=state.cycles_seen + 1)
+        await self._save(counted)
+        return counted
+
+    async def _react_to_the_changed_digest(
+        self, state: RolloutState, digest: str, job_block: int, now: datetime
+    ) -> RolloutWindow:
+        """Seed the first digest ever seen, open a window on a change, or refuse a second push."""
+        if state.digest is None:
+            seeded = RolloutState(digest=digest)
+            await self._save(seeded)
+            return self._window(seeded)
+
+        if self._a_new_window_may_open(state):
+            opened = RolloutState(
+                digest=digest,
+                previous_digest=state.digest,
+                started_at=now,
+                opened_job_block=job_block,
+                last_job_block=job_block,
+                cycles_seen=1,
+            )
+            await self._save(opened)
+            return self._log_window(
+                "[rollout-grace] executor image rollout detected; verdicts of executors "
+                "that fail while restarting are withheld while the window is open",
+                self._window(opened),
+                job_block,
+            )
+
+        # A second push (a hotfix, a rollback) while the window is open or before one uncovered
+        # cycle has published: the new digest is what "current" means from here on, but the
+        # window is NOT reopened or extended — withheld cycles would chain, and three in a row
+        # are what trips the backend's 1-hour inactive sweep.
+        chained = replace(state, digest=digest, previous_digest=state.digest)
+        await self._save(chained)
+        return self._log_window(
+            "[rollout-grace] executor image changed again before one cycle after the "
+            "rollout window has published; the window is not reopened",
+            self._window(chained),
+            job_block,
+        )
+
+    def _a_new_window_may_open(self, state: RolloutState) -> bool:
+        """True when no window was ever opened, or one uncovered cycle has published since."""
+        return state.opened_job_block is None or state.cycles_seen >= self.grace_cycles + 2
+
+    async def _close_the_window_when_it_is_over(
+        self, state: RolloutState, job_block: int
+    ) -> RolloutWindow:
+        """Log the window-end line on the first cycle the window no longer covers, once."""
+        window = self._window(state)
+        if (
+            self.grace_cycles <= 0
+            or state.opened_job_block is None
+            or state.closed
+            or window.covers(job_block)
+        ):
+            return window
+        await self._save(replace(state, closed=True))
+        logger.warning(
+            _m(
+                "[rollout-grace] executor image rollout window ended",
+                extra={
+                    "outcome": ROLLOUT_GRACE,
+                    "job_block": job_block,
+                    "withheld_total": state.withheld,
+                    **window.as_extra(),
+                },
+            )
+        )
+        return window
+
+    def _log_window(self, message: str, window: RolloutWindow, job_block: int) -> RolloutWindow:
+        """Log one window line and give the window back, so a caller can return in one statement."""
+        if self.grace_cycles > 0:
+            logger.warning(
+                _m(
+                    message,
+                    extra={"outcome": ROLLOUT_GRACE, "job_block": job_block, **window.as_extra()},
+                )
+            )
+        return window
+
+    def _window(self, state: RolloutState) -> RolloutWindow:
         return RolloutWindow(
-            digest=state.get("digest"),
-            previous_digest=state.get("previous_digest"),
-            started_at=datetime.fromisoformat(started_at) if started_at else None,
-            opened_job_block=int(opened_job_block) if opened_job_block is not None else None,
-            cycles_seen=int(state.get("cycles_seen", 0)),
+            digest=state.digest,
+            previous_digest=state.previous_digest,
+            started_at=state.started_at,
+            opened_job_block=state.opened_job_block,
+            cycles_seen=state.cycles_seen,
             grace_cycles=self.grace_cycles,
         )
 
-    async def _load(self) -> dict:
+    async def _load(self) -> RolloutState:
         raw = await self.redis_service.get(ROLLOUT_STATE_KEY)
         if not raw:
-            return {}
+            return RolloutState()
         try:
-            state = json.loads(raw)
-        except ValueError:
-            state = None
-        if not isinstance(state, dict):
+            return RolloutState.from_json(raw)
+        except (ValueError, TypeError):
             logger.error(
                 _m(
-                    "[rollout-grace] rollout state is not a JSON object; starting over",
+                    "[rollout-grace] rollout state is unreadable; starting over",
                     extra={"raw": str(raw)[:200]},
                 )
             )
-            return {}
-        return state
+            return RolloutState()
 
-    async def _save(self, state: dict) -> None:
-        await self.redis_service.set(ROLLOUT_STATE_KEY, json.dumps(state))
+    async def _save(self, state: RolloutState) -> None:
+        await self.redis_service.set(ROLLOUT_STATE_KEY, state.to_json())
 
 
 def _observed_digest(result: JobResult) -> str | None:
@@ -321,27 +394,26 @@ def withhold_rollout_verdicts(
     job_results: dict[str, list[JobResult]],
     window: RolloutWindow,
     job_block: int,
-) -> tuple[dict[str, list[JobResult]], list[tuple[str, JobResult]]]:
+) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
     """Split a cycle's results into the ones that stand and the ones the rollout withholds.
 
-    Returns the standing results per miner and the withheld ones as (miner_hotkey, result). Every
-    withheld result is logged once with its reason, so Loki can count them
-    (`outcome="ROLLOUT_GRACE"`). Outside the window the input is returned as it is and nothing is
-    logged.
+    Returns the standing results per miner and the withheld ones. Every withheld result is logged
+    once with its reason, so Loki can count them (`outcome="ROLLOUT_GRACE"`). Outside the window
+    the input is returned as it is and nothing is logged.
     """
     if not window.covers(job_block):
         return job_results, []
 
-    kept: dict[str, list[JobResult]] = {}
-    withheld: list[tuple[str, JobResult]] = []
+    standing_by_miner: dict[str, list[JobResult]] = {}
+    withheld: list[WithheldVerdict] = []
     for miner_hotkey, results in job_results.items():
-        standing: list[JobResult] = []
+        standing_results: list[JobResult] = []
         for result in results:
             reason = rollout_grace_reason(result, window, job_block)
             if reason is None:
-                standing.append(result)
+                standing_results.append(result)
                 continue
-            withheld.append((miner_hotkey, result))
+            withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
             logger.warning(
                 _m(
                     "[rollout-grace] verdict withheld: the executor failed during a known "
@@ -358,5 +430,5 @@ def withhold_rollout_verdicts(
                     },
                 )
             )
-        kept[miner_hotkey] = standing
-    return kept, withheld
+        standing_by_miner[miner_hotkey] = standing_results
+    return standing_by_miner, withheld

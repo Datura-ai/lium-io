@@ -21,6 +21,7 @@ from services.executor_rollout import (
     ROLLOUT_STATE_KEY,
     ExecutorRolloutTracker,
     RolloutWindow,
+    WithheldVerdict,
     rollout_grace_reason,
     withhold_rollout_verdicts,
 )
@@ -303,7 +304,9 @@ async def test_a_corrupt_redis_value_is_replaced_instead_of_failing_every_cycle(
         window = await tracker.observe(OLD, J0, now=T0)
 
         assert window.digest == OLD
-        assert json.loads(redis.store[ROLLOUT_STATE_KEY]) == {"digest": OLD}
+        reseeded = json.loads(redis.store[ROLLOUT_STATE_KEY])
+        assert reseeded["digest"] == OLD
+        assert reseeded["opened_job_block"] is None
 
 
 @pytest.mark.asyncio
@@ -338,7 +341,7 @@ def test_an_unreachable_executor_inside_the_window_gets_no_verdict() -> None:
     kept, withheld = withhold_rollout_verdicts({"5Miner": [unreachable, healthy]}, window, J0)
 
     assert kept == {"5Miner": [healthy]}
-    assert [(hk, r.executor_info.uuid) for hk, r in withheld] == [("5Miner", "node-1")]
+    assert [(w.miner_hotkey, w.result.executor_info.uuid) for w in withheld] == [("5Miner", "node-1")]
 
 
 def test_the_same_failure_after_the_window_is_a_zero_as_today() -> None:
@@ -639,7 +642,7 @@ async def test_the_cycle_end_read_of_the_registry_withholds_this_cycles_results(
     )
 
     assert kept == {"5Miner": [healthy]}
-    assert [r.executor_info.uuid for _, r in withheld] == ["node-1"]
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
     assert json.loads(redis.store[ROLLOUT_STATE_KEY])["withheld"] == 1
 
 
@@ -652,7 +655,7 @@ async def test_the_cycle_adds_its_withheld_count_to_the_window_total_only_inside
     await tracker.observe(OLD, J0 - BPC, now=T0)
     window = await tracker.observe(NEW, J0, now=T0)
     validator_process = _validator_process(tracker)
-    withheld = [("5Miner", _failed("node-1", "EXECUTOR_SSH_UNREACHABLE"))] * 3
+    withheld = [WithheldVerdict("5Miner", _failed("node-1", "EXECUTOR_SSH_UNREACHABLE"))] * 3
 
     await validator_process.record_withheld_verdicts(window, withheld, job_batch_id="batch-1", job_block=J1)
     assert json.loads(redis.store[ROLLOUT_STATE_KEY])["withheld"] == 3
