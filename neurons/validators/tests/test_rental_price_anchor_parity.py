@@ -26,7 +26,10 @@ def test_incentive_config_anchors_server_edition_at_workstation_price():
 
 
 def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
+    """Fails when the resolver stops reading the anchored table for one edition (a custom-price entry
+    or a base-model mapping that treats the two editions differently)."""
     config = IncentiveConfig()
+    workstation_anchor = config.rental_prices_per_hour[WORKSTATION]
 
     for gpu_count in (1, 8):
         server_rate = get_hourly_rate(
@@ -35,11 +38,13 @@ def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
         workstation_rate = get_hourly_rate(
             WORKSTATION, gpu_count, config.gpu_count_custom_prices, config.rental_prices_per_hour
         )
-        assert server_rate == workstation_rate == 1.0
+        assert server_rate == workstation_rate == workstation_anchor
 
 
 def test_parity_override_changes_only_the_server_edition_entry():
-    # The algorithm asserts every key is in BASE_GPU_MAP, so the override must not add or drop a GPU.
+    """Holds by construction for today's `{**upstream, SERVER: upstream[WORKSTATION]}`; it guards a
+    future hand-edit of `RENTAL_PRICES_PER_HOUR` that adds, drops or re-prices another GPU — the
+    algorithm asserts every key is in BASE_GPU_MAP, and any other override belongs in lium-core."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys()
