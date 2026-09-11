@@ -4173,13 +4173,29 @@ async def test_create_container_skips_mountpoint_repair_without_local_volume(
     repair.assert_not_awaited()
 
 
+_VLOOPBACK_REPAIR_INSPECT = _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n")
+_VLOOPBACK_REPAIR_PLUGIN_ID = _make_ssh_command_result(stdout="plugin123\n")
+_VLOOPBACK_REPAIR_DEFAULT_ROOT = _make_ssh_command_result(stdout="/var/lib/docker\n")
+
+
+def _asyncssh_timeout_error() -> asyncssh.TimeoutError:
+    # what ssh_client.run(timeout=...) raises: it subclasses both asyncssh.Error and OSError, so
+    # every caller that treats those two as "transport died" also swallows a plain command timeout.
+    return asyncssh.TimeoutError(None, None, None, None, None, None, "", "")
+
+
+def _vloopback_repair_commands(ssh_client: AsyncMock) -> list[str]:
+    return [call.args[0] for call in ssh_client.run.await_args_list]
+
+
 @pytest.mark.asyncio
 async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_service):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(
         side_effect=[
-            _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
-            _make_ssh_command_result(stdout="plugin123\n"),
+            _VLOOPBACK_REPAIR_INSPECT,
+            _VLOOPBACK_REPAIR_PLUGIN_ID,
+            _VLOOPBACK_REPAIR_DEFAULT_ROOT,
             _make_ssh_command_result(exit_status=1),
             _make_ssh_command_result(exit_status=0),
         ]
@@ -4192,7 +4208,13 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
     )
 
     assert repaired is True
-    helper_cmd = ssh_client.run.await_args_list[-1].args[0]
+    commands = _vloopback_repair_commands(ssh_client)
+    assert commands[2] == "/usr/bin/docker info --format '{{.DockerRootDir}}'"
+    assert commands[3] == (
+        "/usr/bin/findmnt /var/lib/docker/plugins/plugin123/propagated-mount/volume_test "
+        ">/dev/null 2>&1"
+    )
+    helper_cmd = commands[-1]
     assert "docker.io/library/alpine:3.19" in helper_cmd
     assert "rmdir" in helper_cmd
     assert "rm -rf" not in helper_cmd
@@ -4204,13 +4226,112 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
     )
 
 
+@pytest.mark.parametrize(
+    "docker_info_stdout",
+    [
+        pytest.param("/mnt/lium-xfs/lium-docker\n", id="as_docker_info_prints_it"),
+        pytest.param("/mnt/lium-xfs/lium-docker/\n", id="trailing_slash_dropped"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_uses_the_hosts_docker_root(
+    docker_service, docker_info_stdout
+):
+    # DAH-3217 / ticket-0313: the provider's data-root is /mnt/lium-xfs/lium-docker; with the
+    # /var/lib/docker default, findmnt looked at a path that does not exist and rmdir failed
+    # with "No such file or directory" on every cycle. The bind-mount source and the findmnt
+    # target both follow `docker info`; the default appears in no command.
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _VLOOPBACK_REPAIR_INSPECT,
+            _VLOOPBACK_REPAIR_PLUGIN_ID,
+            _make_ssh_command_result(stdout=docker_info_stdout),
+            _make_ssh_command_result(exit_status=1),
+            _make_ssh_command_result(exit_status=0),
+        ]
+    )
+
+    repaired = await docker_service.repair_stale_vloopback_mountpoint(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        default_extra={},
+    )
+
+    assert repaired is True
+    commands = _vloopback_repair_commands(ssh_client)
+    assert commands[3] == (
+        "/usr/bin/findmnt /mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount/volume_test "
+        ">/dev/null 2>&1"
+    )
+    assert (
+        "-v /mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount:/mnt "
+        "docker.io/library/alpine:3.19 rmdir /mnt/volume_test"
+    ) in commands[4]
+    assert not any("/var/lib/docker" in command for command in commands)
+
+
+@pytest.mark.parametrize(
+    "docker_info_outcome",
+    [
+        pytest.param(
+            _make_ssh_command_result(exit_status=1, stdout=""), id="docker_info_fails_with_no_output"
+        ),
+        pytest.param(_make_ssh_command_result(stdout="overlay2\n"), id="docker_info_answers_with_no_path"),
+        pytest.param(_asyncssh_timeout_error(), id="docker_info_times_out"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_falls_back_to_the_default_root_when_the_lookup_fails(
+    docker_service, caplog, docker_info_outcome
+):
+    # a root the repair cannot read is not a reason to stop: the repair runs against the default
+    # root as it always did, and the fallback is logged with the cause rather than raised
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _VLOOPBACK_REPAIR_INSPECT,
+            _VLOOPBACK_REPAIR_PLUGIN_ID,
+            docker_info_outcome,
+            _make_ssh_command_result(exit_status=1),
+            _make_ssh_command_result(exit_status=0),
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        repaired = await docker_service.repair_stale_vloopback_mountpoint(
+            ssh_client=ssh_client,
+            local_volume="volume_test",
+            default_extra={"executor_id": "executor-1"},
+        )
+
+    assert repaired is True
+    commands = _vloopback_repair_commands(ssh_client)
+    assert "/usr/bin/findmnt /var/lib/docker/plugins/plugin123/propagated-mount/volume_test" in commands[3]
+    assert "-v /var/lib/docker/plugins/plugin123/propagated-mount:/mnt" in commands[4]
+    fallback_extra = next(
+        record.msg.extra
+        for record in caplog.records
+        if str(record.msg) == "VLOOPBACK_REPAIR_DOCKER_ROOT_FALLBACK"
+    )
+    assert fallback_extra["fallback"] == "/var/lib/docker"
+    assert fallback_extra["executor_id"] == "executor-1"
+    assert fallback_extra["local_volume"] == "volume_test"
+    if isinstance(docker_info_outcome, Exception):
+        # asyncssh's TimeoutError has an empty str(); the log still has to name the cause
+        assert fallback_extra["error"].startswith("TimeoutError")
+    else:
+        assert fallback_extra["error"] == "docker info returned no absolute path"
+
+
 @pytest.mark.asyncio
 async def test_repair_stale_vloopback_mountpoint_refuses_active_mount(docker_service):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(
         side_effect=[
-            _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
-            _make_ssh_command_result(stdout="plugin123\n"),
+            _VLOOPBACK_REPAIR_INSPECT,
+            _VLOOPBACK_REPAIR_PLUGIN_ID,
+            _VLOOPBACK_REPAIR_DEFAULT_ROOT,
             _make_ssh_command_result(exit_status=0),
         ]
     )
@@ -4222,7 +4343,7 @@ async def test_repair_stale_vloopback_mountpoint_refuses_active_mount(docker_ser
     )
 
     assert repaired is False
-    assert ssh_client.run.await_count == 3
+    assert ssh_client.run.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -4280,24 +4401,37 @@ async def test_repair_stale_vloopback_mountpoint_refuses_unexpected_mountpoint(d
 
 
 @pytest.mark.asyncio
-async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker_service):
+async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker_service, caplog):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(
         side_effect=[
-            _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
-            _make_ssh_command_result(stdout="plugin123\n"),
+            _VLOOPBACK_REPAIR_INSPECT,
+            _VLOOPBACK_REPAIR_PLUGIN_ID,
+            _make_ssh_command_result(stdout="/mnt/lium-xfs/lium-docker\n"),
             _make_ssh_command_result(exit_status=1),
             _make_ssh_command_result(exit_status=12, stderr="not empty"),
         ]
     )
 
-    repaired = await docker_service.repair_stale_vloopback_mountpoint(
-        ssh_client=ssh_client,
-        local_volume="volume_test",
-        default_extra={},
-    )
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        repaired = await docker_service.repair_stale_vloopback_mountpoint(
+            ssh_client=ssh_client,
+            local_volume="volume_test",
+            default_extra={},
+        )
 
     assert repaired is False
+    # the skipped-repair line names the path it tried, so the next wrong-root host is readable
+    # from the log alone
+    skipped_extra = next(
+        record.msg.extra
+        for record in caplog.records
+        if str(record.msg) == "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED"
+    )
+    assert skipped_extra["target"] == (
+        "/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount/volume_test"
+    )
+    assert skipped_extra["stderr"] == "not empty"
 
 
 @pytest.mark.asyncio
@@ -5911,12 +6045,6 @@ _STALE_MOUNT_ERROR = (
     "error while mounting volume '': VolumeDriver.Mount: cannot create mount point dir "
     "'/mnt/volume_pod-1': mkdir /mnt/volume_pod-1: file exists"
 )
-
-
-def _asyncssh_timeout_error() -> asyncssh.TimeoutError:
-    # what ssh_client.run(timeout=...) raises: it subclasses both asyncssh.Error and OSError, so
-    # every caller that treats those two as "transport died" also swallows a plain command timeout.
-    return asyncssh.TimeoutError(None, None, None, None, None, None, "", "")
 
 
 def _recovery_ssh_client(
