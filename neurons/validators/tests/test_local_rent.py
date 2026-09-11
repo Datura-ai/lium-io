@@ -36,7 +36,6 @@ from datura.rental_spec import (
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.docker_service import DockerService
 from services.local_rent_client import (
-    CAPABILITY,
     SCHEMA,
     LocalRentClient,
     LocalRentUnavailable,
@@ -127,11 +126,10 @@ def test_the_spec_the_validator_really_builds_reaches_the_executor_whole(svc):
     assert build_host_config_kwargs(parsed)["network_mode"] == RENTAL_NETWORK_NAME
 
 
-def test_the_quote_brokers_default_bridge_travels_as_no_network():
-    wire = json.loads(json.dumps(spec_to_wire(_spec(network=None))))
-    assert wire["network"] is None
-    assert spec_from_wire(wire).network is None
-    assert "network_mode" not in build_host_config_kwargs(spec_from_wire(wire))
+def test_a_spec_without_a_network_builds_no_network_mode():
+    """The SDK path's one create on the default bridge — the CVM quote broker (never a rental, never
+    on the wire): a `network=None` spec must not put `network_mode` in the HostConfig."""
+    assert "network_mode" not in build_host_config_kwargs(_spec(network=None))
 
 
 def test_a_zero_limit_travels_as_no_limit_and_builds_the_same_host_config():
@@ -696,8 +694,3 @@ def test_a_rolled_back_failure_leaves_the_name_alone(svc, keypair, monkeypatch):
     assert asyncio.run(scenario()) is None
     removed.assert_not_awaited()
 
-
-def test_the_capability_name_is_the_shared_datura_constant():
-    from datura.requests.validator_requests import LOCAL_RENT_CAPABILITY
-
-    assert CAPABILITY == LOCAL_RENT_CAPABILITY == "local_rent/1"
