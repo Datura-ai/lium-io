@@ -31,6 +31,7 @@ from services.local_verify_service import (
     LocalVerifyService,
     NonceCache,
     canonical_intent_message,
+    check_intent_target,
     check_intent_window,
 )
 
@@ -412,7 +413,9 @@ async def local_verify(request: Request):
     # its default is not re-serialised here and a field it did send cannot be altered in flight.
     await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))
 
-    refused = check_intent_window(intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS)
+    refused = check_intent_window(
+        intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
+    ) or check_intent_target(intent, settings.MINER_HOTKEY_SS58_ADDRESS)
     if refused:
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
     service = _get_local_verify_service()

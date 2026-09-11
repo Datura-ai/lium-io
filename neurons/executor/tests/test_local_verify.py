@@ -44,6 +44,7 @@ from services.local_verify_service import (
     LocalVerifyService,
     NonceCache,
     canonical_intent_message,
+    check_intent_target,
     check_intent_window,
 )
 
@@ -160,6 +161,7 @@ def _body(**overrides) -> VerifyIntentBody:
         issued_at=now,
         expires_at=now + 120,
         executor_uuid=EXECUTOR_UUID,
+        miner_hotkey=settings.MINER_HOTKEY_SS58_ADDRESS,
         deadline_s=60,
         parallel_gpu=False,
         steps=VerifySteps(
@@ -537,6 +539,26 @@ def test_wrong_key_or_tampered_field_is_401(client, validator_keypair):
     swapped_uuid = _signed(_body(), validator_keypair)
     swapped_uuid["executor_uuid"] = "someone-else"
     assert client.post("/verify", json=swapped_uuid).status_code == 401
+
+
+def test_an_intent_for_another_miners_executor_is_401_and_not_burnt(client, validator_keypair):
+    """Regression: a validator intent captured on provider A's wire and relayed to provider B's
+    executor (same validator signature, B's flag on) must not run B's GPU suite — B would answer
+    the real validator 409 busy meanwhile. The executor knows only its miner, so the signed
+    `miner_hotkey` is what binds the intent; the portal hotkey every executor trusts does not."""
+    other_miner = bittensor.Keypair.create_from_uri("//OtherMiner").ss58_address
+    relayed = client.post("/verify", json=_signed(_body(miner_hotkey=other_miner), validator_keypair))
+    assert relayed.status_code == 401 and "another miner" in relayed.text
+    portal = client.post(
+        "/verify", json=_signed(_body(miner_hotkey=settings.DEFAULT_MINER_HOTKEY), validator_keypair)
+    )
+    assert portal.status_code == 401
+    assert check_intent_target(_body(), settings.MINER_HOTKEY_SS58_ADDRESS) is None
+    # refused before the nonce is claimed: the same nonce, correctly addressed, still runs
+    body = _body(steps=VerifySteps(inspector=True))
+    foreign = _signed(body.model_copy(update={"miner_hotkey": other_miner}), validator_keypair)
+    assert client.post("/verify", json=foreign).status_code == 401
+    assert client.post("/verify", json=_signed(body, validator_keypair)).status_code == 200
 
 
 def test_replayed_nonce_is_refused(client, validator_keypair):
