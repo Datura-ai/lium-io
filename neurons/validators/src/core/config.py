@@ -263,6 +263,18 @@ class Settings(BaseSettings):
     # with finished steps inside still arrives inside the budget.
     LOCAL_VERIFY_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_TIMEOUT_SECONDS", default=240)
     LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
+    # liumd phase 2 (DAH-2834): make the one call on the first pass only. The first pass is where
+    # the SSH round trips it saves are waited on (verification < 2 min); every cycle that makes the
+    # call risks a VerifyX past ≈ 110 s pushing it over the matmul's 120 s wall-clock cap, after
+    # which a PASSING matmul is re-run over SSH (`step_overtime`) — so scored cycles, with nothing
+    # to gain, take the SSH path without a `/version` round trip. On by default. "First pass" here
+    # is the caller's word (`ContextConfig.unscored`, the express lane's first verification) and
+    # does NOT need FIRST_PASS_FAST_PATH_ENABLED; that flag sizes the probes, and only with it on
+    # do the two GPU steps run side by side (max(45, 10) s instead of 55 s) — with it off the first
+    # pass's call is serial and full size, the same shape and overtime exposure as a scored cycle's.
+    # It DOES need EXPRESS_LANE_ENABLED: the express lane (`core/express_lane.py`) is the only caller
+    # that passes `first_pass=True`; with it off and this flag on, `/verify` is never called.
+    LOCAL_VERIFY_FIRST_PASS_ONLY: bool = Field(env="LOCAL_VERIFY_FIRST_PASS_ONLY", default=True)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both

@@ -15,7 +15,9 @@ own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on: the all-cards work-proof runs inside the SSH
 matmul path and a consumed local pass must not skip it. Every outcome is one `[local_verify]
 outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric). Off by default
-(VALIDATOR_LOCAL_VERIFY_ENABLED).
+(VALIDATOR_LOCAL_VERIFY_ENABLED). Phase 2: the call is made on the first pass only while
+`LOCAL_VERIFY_FIRST_PASS_ONLY` is on (default) — the saving is first-pass only, and a scored
+cycle's serial full-size run can push a passing matmul past its cap and re-run it over SSH.
 """
 
 from __future__ import annotations
@@ -122,6 +124,12 @@ class LocalVerifyCheck:
         if _get_filler_only_container(ctx):
             # Both consuming checks skip on an idle filler; there is nothing to run locally.
             return self._skipped(ctx, "filler only")
+        if settings.LOCAL_VERIFY_FIRST_PASS_ONLY and not ctx.config.unscored:
+            # Scored cycles keep the SSH path, decided before the `/version` round trip; why is
+            # written once, on LOCAL_VERIFY_FIRST_PASS_ONLY in core/config.py.
+            return self._fallback(
+                ctx, "call", "not_first_pass", "not the first pass: the one-call path is first-pass only"
+            )
         if ctx.config.validator_keypair is None:
             return self._fallback(
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"
@@ -365,6 +373,7 @@ class LocalVerifyCheck:
                         "reason": reason,
                         "detail": detail[:DETAIL_MAX_CHARS],
                         "first_pass": ctx.config.first_pass,
+                        "unscored": ctx.config.unscored,
                         **fields,
                     }
                 ),
