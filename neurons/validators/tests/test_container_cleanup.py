@@ -36,15 +36,15 @@ def _make_ssh_mock(containers: list[str], ages_by_name: dict[str, int], current_
         # current time on host
         if cmd.strip() == "date +%s":
             return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
-        # docker inspect … Created / StartedAt through `date +%s`, then RestartCount (DAH-3265):
-        # a never-started container prints docker's zero time; none of these was restarted
+        # docker inspect … Created / StartedAt through `date +%s`, then the lium.warm_pool label
+        # (DAH-3265): a never-started container prints docker's zero time; none of these was a slot
         if "docker inspect" in cmd and "Created" in cmd:
             # match which container
             for name in ages_by_name:
                 if name in cmd:
                     age_min = ages_by_name[name]
                     created_ts = current_ts - int(age_min * 60)
-                    return MagicMock(exit_status=0, stdout=f"{created_ts}\n-62135596800\n0\n", stderr="")
+                    return MagicMock(exit_status=0, stdout=f"{created_ts}\n-62135596800\n\n", stderr="")
             return MagicMock(exit_status=1, stdout="", stderr="not found")
         # docker rm -f / docker rm -fv
         if "docker rm -f" in cmd:

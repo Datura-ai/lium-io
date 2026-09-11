@@ -218,7 +218,9 @@ def slot_from_inspect(
         and m.get("Name")
         and str(m.get("Driver") or "").startswith("vloopback")
     ]
-    if len(volumes) != 1:
+    if len(volumes) != 1 or volumes[0] != slot_volume_name(slot_id_from_name(name)):
+        # the slot's own never-used volume, and no other: a slot the daemon's owner pointed at a
+        # previous renter's vloopback volume would hand that data to the next renter at /root
         return None
     return WarmSlot(
         name=name,

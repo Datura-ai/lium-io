@@ -533,18 +533,24 @@ class ContainerCleanup:
 
     @staticmethod
     def _container_age_start(inspect_output: str) -> int:
-        """The epoch second a container's age counts from: `Created`, `StartedAt` and `RestartCount`
-        as `inspect_created_timestamp` prints them.
+        """The epoch second a container's age counts from: `Created`, `StartedAt` and the
+        `lium.warm_pool` label as `inspect_created_timestamp` prints them.
 
-        A pod adopted from a warm-pool slot was created hours before the rental started it, so its age
-        counts from its start — but only while `RestartCount` is 0. dockerd refreshes `StartedAt` on
-        every restart-policy restart, so a crash-looping container would otherwise never age out and
-        the stale sweep would stop removing it; that one counts from `Created`, as every container
-        did before the pool. Not gated on WARM_POOL_ENABLED: every validator sweeps every executor,
-        and one reading `Created` alone would remove another validator's adopted pod inside its
+        A pod adopted from a warm-pool slot was created hours before the rental started it and keeps
+        the slot's label through the rename, so a labelled container's age counts from its last
+        start — a restart-policy restart minutes into the rental must not make it read 24 h old
+        (taiberium, #1337). Every other container counts from `Created`, as before the pool: a
+        `pod_*` stopped and started again does not become young, so the 15-minute sweep still
+        reaches it. Not gated on WARM_POOL_ENABLED: every validator sweeps every executor, and one
+        reading `Created` alone would remove another validator's adopted pod inside its
         rented-snapshot window."""
-        created, started, restart_count = (int(part) for part in inspect_output.split())
-        return max(created, started) if restart_count == 0 else created
+        parts = inspect_output.split()
+        if len(parts) not in (2, 3):
+            # an absent label prints an empty line (two tokens); anything else is an error text
+            raise ValueError(f"age inspect printed {len(parts)} tokens")
+        created, started = int(parts[0]), int(parts[1])
+        adopted_slot = len(parts) == 3 and parts[2] == "1"
+        return max(created, started) if adopted_slot else created
 
     async def _remove_container(self, ssh_client, container_name: str) -> bool:
         """Remove a container and its associated resources."""
