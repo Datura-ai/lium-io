@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-
 
 # DAH-2805: how often the download-temporary sweep may run per executor. The check itself runs every
 # pipeline cycle (~15 min), but a temporary cannot become eligible until it is
@@ -95,4 +95,13 @@ class StaleContainerCleanupCheck:
                 "swept_download_temporaries": swept_download_temporaries,
             },
         )
-        return CheckResult(passed=True, event=event)
+        # liumd phase 2: the published-ports fact was collected BEFORE this check. A container
+        # removed here has just freed its host ports, so a port window narrowed by that fact would
+        # skip ports the connect-back could now bind and count. The fact is dropped for this cycle
+        # and the port check lists ports over SSH as today; the other facts stand (the removal is
+        # what they were for).
+        updates = {}
+        facts = ctx.state.local_facts
+        if removed_count > 0 and facts is not None and facts.published_ports is not None:
+            updates = {"state": replace(ctx.state, local_facts=replace(facts, published_ports=None))}
+        return CheckResult(passed=True, event=event, updates=updates)
