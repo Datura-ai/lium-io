@@ -215,6 +215,7 @@ class LocalVerifyCheck:
             )
         intent = build_intent(
             executor_uuid=ctx.executor.uuid,
+            miner_hotkey=ctx.miner_hotkey,
             matmul=matmul_step,
             verifyx=(
                 VerifyXStep(seed=verifyx_challenge.seed, cipher_text=verifyx_challenge.cipher_text)

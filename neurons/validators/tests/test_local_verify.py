@@ -55,6 +55,7 @@ from tests.helpers import build_context_config, build_services, build_state, mak
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
 EXECUTOR_UUID = "executor-123"
+MINER_HOTKEY = "5MinerHotkeyOfTheExecutorUnderTest"
 
 
 # --- fakes -------------------------------------------------------------------------------------
@@ -296,6 +297,7 @@ async def run_local_then_consumers(ctx, check: LocalVerifyCheck):
 def test_intent_is_signed_over_the_canonical_document(keypair):
     intent = build_intent(
         executor_uuid="e",
+        miner_hotkey=MINER_HOTKEY,
         matmul=MatmulStep(dim_n=1, dim_k=2, seed=3, cipher_text="c"),
         verifyx=None,
         parallel_gpu=True,
@@ -311,6 +313,11 @@ def test_intent_is_signed_over_the_canonical_document(keypair):
     assert keypair.verify(canonical_intent_message(signed), signed["signature"])
     tampered = {**signed, "executor_uuid": "other"}
     assert not keypair.verify(canonical_intent_message(tampered), tampered["signature"])
+    # the miner the intent is for is under the signature too: the executor refuses an intent
+    # naming another miner (401), and a relay cannot re-address one it captured
+    assert signed["miner_hotkey"] == MINER_HOTKEY
+    readdressed = {**signed, "miner_hotkey": "5AnotherMiner"}
+    assert not keypair.verify(canonical_intent_message(readdressed), readdressed["signature"])
     assert canonical_intent_message(signed) == canonical_intent_message(
         dict(reversed(list(signed.items())))
     )
@@ -358,6 +365,7 @@ def test_wire_contract_with_the_executor_side(keypair):
 
     intent = build_intent(
         executor_uuid="e",
+        miner_hotkey=MINER_HOTKEY,
         matmul=MatmulStep(dim_n=1900, dim_k=2_000_000, seed=3, cipher_text="c0ffee"),
         verifyx=None,
         parallel_gpu=True,
@@ -435,6 +443,7 @@ async def test_client_against_the_fake_executor(keypair, local_verify_on):
         assert await client.capabilities(executor.executor_info) == {CAPABILITY}
         intent = build_intent(
             executor_uuid=EXECUTOR_UUID,
+            miner_hotkey=MINER_HOTKEY,
             matmul=MatmulStep(dim_n=1, dim_k=2, seed=3, cipher_text="c"),
             verifyx=VerifyXStep(seed=1, cipher_text="v"),
             parallel_gpu=True,
@@ -455,6 +464,7 @@ async def test_client_against_the_fake_executor(keypair, local_verify_on):
                 executor.executor_info,
                 build_intent(
                     executor_uuid=EXECUTOR_UUID,
+                    miner_hotkey=MINER_HOTKEY,
                     matmul=None,
                     verifyx=None,
                     parallel_gpu=False,
@@ -476,6 +486,7 @@ async def test_client_reports_absent_route_and_dead_host_as_fallback_reasons(
                 executor.executor_info,
                 build_intent(
                     executor_uuid=EXECUTOR_UUID,
+                    miner_hotkey=MINER_HOTKEY,
                     matmul=None,
                     verifyx=None,
                     parallel_gpu=False,
@@ -498,6 +509,7 @@ async def test_client_reports_absent_route_and_dead_host_as_fallback_reasons(
             dead,
             build_intent(
                 executor_uuid=EXECUTOR_UUID,
+                miner_hotkey=MINER_HOTKEY,
                 matmul=None,
                 verifyx=None,
                 parallel_gpu=False,
@@ -573,6 +585,8 @@ async def test_advertised_executor_is_verified_in_one_call_and_ssh_is_not_used(
 
         # What went over the wire: the challenge as the SSH command would carry it, first-pass sized.
         sent = executor.intents[0]
+        # addressed to this executor's miner (the context's), which is what the executor checks
+        assert sent["executor_uuid"] == ctx.executor.uuid and sent["miner_hotkey"] == ctx.miner_hotkey
         assert sent["parallel_gpu"] is True and sent["steps"]["matmul"]["cipher_text"] == "deadbeef"
         assert set(sent["steps"]["matmul"]) == {"dim_n", "dim_k", "seed", "cipher_text"}
         assert sent["steps"]["verifyx"]["cipher_text"].startswith("vx")
@@ -1096,7 +1110,12 @@ def test_executor_controlled_strings_never_reach_a_label_uncapped():
     `step_<status>` label is from a closed set), unknown step keys are dropped, `executor_version`
     is capped, `exit_status` must be an int."""
     intent = build_intent(
-        executor_uuid="e", matmul=None, verifyx=None, parallel_gpu=False, deadline_s=5
+        executor_uuid="e",
+        miner_hotkey=MINER_HOTKEY,
+        matmul=None,
+        verifyx=None,
+        parallel_gpu=False,
+        deadline_s=5,
     )
     junk = "x" * 5000 + "\n"
     answer = parse_answer(

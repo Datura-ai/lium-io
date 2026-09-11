@@ -108,6 +108,7 @@ canonical_intent_message = local_verify_signing_blob
 def build_intent(
     *,
     executor_uuid: str,
+    miner_hotkey: str,
     matmul: MatmulStep | None,
     verifyx: VerifyXStep | None,
     parallel_gpu: bool,
@@ -125,6 +126,9 @@ def build_intent(
         "issued_at": int(now),
         "expires_at": int(now) + INTENT_TTL_SECONDS,
         "executor_uuid": executor_uuid,
+        # The executor cannot check the uuid (it does not know its own) but it knows its miner:
+        # an intent relayed to another provider's executor is refused there (401 → SSH here).
+        "miner_hotkey": miner_hotkey,
         "deadline_s": deadline_s,
         "parallel_gpu": parallel_gpu,
         "steps": {
