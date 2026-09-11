@@ -1,8 +1,9 @@
 """DAH-3230: the RTX PRO 6000 Server Edition anchors the unrented incentive at the Workstation price.
 
-The validator's `rental_prices_per_hour` comes from the pinned lium-core table, which still says
-Server 0.86 vs Workstation 1.0; `incentive.config.RENTAL_PRICES_PER_HOUR` pins the two editions to
-parity so an idle Server node earns the same subsidy as an idle Workstation node.
+The validator's `rental_prices_per_hour` comes from the installed lium-core table — `lium-core 0.1.8`
+per `pdm.lock`, where Server is 0.86 and Workstation 1.0; `incentive.config.RENTAL_PRICES_PER_HOUR`
+pins the two editions to parity so an idle Server node earns the same subsidy as an idle Workstation
+node until the 1.0 table in this PR is released and picked up by the pin.
 """
 
 from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
