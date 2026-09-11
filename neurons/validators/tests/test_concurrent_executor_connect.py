@@ -96,6 +96,21 @@ async def test_a_failed_docker_connect_closes_the_ssh_session_and_raises():
 
 
 @pytest.mark.asyncio
+async def test_when_both_connects_fail_the_docker_error_is_the_cause_of_the_ssh_one():
+    # A host that refuses both handshakes used to surface only the SSH error; the Docker one was dropped.
+    rec = _Recorder()
+
+    with pytest.raises(ConnectionError, match="sshd refused") as raised:
+        async with AsyncExitStack() as stack:
+            await DockerService._connect_ssh_and_docker(
+                stack, _ssh_context(rec, fail=True), _docker_context(rec, fail=True)
+            )
+
+    assert isinstance(raised.value.__cause__, ConnectionError)
+    assert str(raised.value.__cause__) == "docker over ssh refused"
+
+
+@pytest.mark.asyncio
 async def test_a_failed_ssh_connect_closes_the_docker_client_and_raises():
     rec = _Recorder()
 
