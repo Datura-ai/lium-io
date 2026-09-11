@@ -46,7 +46,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 ## Tests
 
 ```bash
-pip install . pytest
+pip install . pytest "pydantic==2.13.*"   # the renderer CI pins: the snapshot is pydantic's JSON Schema
 python -m lium_protocol.schema --check
 python -m pytest tests -v
 ```

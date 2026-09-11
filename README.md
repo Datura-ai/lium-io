@@ -65,7 +65,7 @@ For more details, visit the [Validator Setup Guide](neurons/validators/README.md
 
 ## Repository Layout
 
-Three neurons, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files; `watchtower/`, its own pdm project with a Dockerfile; one shared pdm package (`datura/`, a `pyproject.toml` only); and `packages/lium-core/`, the library published to PyPI. The root `pyproject.toml` (`compute-subnet`, Python 3.11) holds the shared `[tool.ruff]` config and the repo-wide dev tools (`ruff`, `pre-commit`), plus one declared runtime dependency (`aiohttp`):
+Three neurons, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files; `watchtower/`, its own pdm project with a Dockerfile; one shared pdm package (`datura/`, a `pyproject.toml` only); `packages/lium-core/`, the library published to PyPI; and `lium_protocol/`, the validator↔backend wire package (its own `pyproject.toml`). The root `pyproject.toml` (`compute-subnet`, Python 3.11) holds the shared `[tool.ruff]` config and the repo-wide dev tools (`ruff`, `pre-commit`), plus one declared runtime dependency (`aiohttp`):
 
 - `neurons/validators/` — the validator: scores miners, verifies executors over SSH, creates and manages rental containers on them (`src/services/docker_service.py`), sets weights. `src/miner_jobs/` holds the scripts the validator uploads to an executor and runs there (`machine_scrape.py` hardware scrape, `backup_storage.py` / `restore_storage.py`, `workspace_mount.py`); `machine_scrape.py` is obfuscated per job by `src/services/file_encrypt_service.py` before upload, so its key order is load-bearing (see the comment at the top of that file).
 - `neurons/miners/` — the miner: registers executors with the network and answers validator requests; its database schema is Alembic migrations under `migrations/`.
@@ -90,16 +90,17 @@ Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm proj
 
 (cd neurons/executor && pdm install && mkdir -p tmp && pdm run pytest tests/ -v --tb=short)
 (cd neurons/miners && pdm install && pdm run pytest tests/ -v --tb=short)
-(cd lium_protocol && pip install . pytest && python -m lium_protocol.schema --check && python -m pytest tests -v --tb=short)
+(cd lium_protocol && pip install . pytest "pydantic==2.13.*" && python -m lium_protocol.schema --check && python -m pytest tests -v --tb=short)
 ```
 
 These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter; its jobs decide for themselves:
 
 - `route` reads the changed files (`.github/actions/changed-packages`), after dropping `*.md`, `.gitignore` and the root `docs/` tree — a README-only PR runs no neuron job.
-- Each neuron's test job runs only when that neuron, `datura/` or `.github/` changed.
+- Each neuron's test job runs only when that neuron, `datura/` or `.github/` changed; the validators job also runs when `lium_protocol/` changed (its `tests/test_protocol_compat.py` replays the package's recordings).
+- `protocol` (the `lium_protocol` line above, pydantic pinned to `2.13.*` because the snapshot is pydantic's JSON Schema) runs when `lium_protocol/`, `datura/` or `.github/` changed.
 - `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`.
 - `lint` (`ruff format --check`, report-only, not required) runs per changed neuron.
-- `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `datura/`, `.github/` or `e2e/` changed.
+- `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `lium_protocol/`, `datura/`, `.github/` or `e2e/` changed.
 - `tests-ok` is the one status check to require; it reports on every PR.
 
 Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
