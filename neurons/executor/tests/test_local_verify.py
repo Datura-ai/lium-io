@@ -216,6 +216,8 @@ def test_all_steps_run_and_return_raw_evidence(fake_scripts, fake_docker):
     assert isinstance(docker, DockerFacts)
     assert docker.sysbox_runtime is True and docker.runtimes == ["runc", "sysbox-runc"]
     assert docker.containers[0].name == "pod-1"
+    # phase 2: the host clock rides beside the containers' `created` (one clock for the age)
+    assert isinstance(docker.now, int) and abs(docker.now - time.time()) < 60
     assert docker.disk.total_bytes > 0
 
     ports = result.steps["ports"].data

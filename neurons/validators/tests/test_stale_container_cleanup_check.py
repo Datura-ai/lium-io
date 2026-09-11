@@ -13,7 +13,6 @@ from neurons.validators.src.services.task.checks.stale_container_cleanup import 
     StaleContainerCleanupCheck as DirectImport,
 )
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
-
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -32,7 +31,7 @@ class RecordingContainerCleanup:
         self.reclaim_calls = []
         self.sweep_calls = []
 
-    async def cleanup(self, ssh_client, rented_data, executor_uuid):
+    async def cleanup(self, ssh_client, rented_data, executor_uuid, host_facts=None):
         self.calls.append(
             {
                 "ssh_client": ssh_client,
@@ -51,10 +50,28 @@ class RecordingContainerCleanup:
         return self._swept
 
 
-def _make_ctx(cleanup, rented_data=None):
+def _make_ctx(cleanup, rented_data=None, local_facts=None):
     services = build_services(container_cleanup=cleanup)
-    state = build_state(rented_data=rented_data)
+    state = build_state(rented_data=rented_data, local_facts=local_facts)
     return make_context(services=services, state=state, ssh="ssh-conn-sentinel")
+
+
+@pytest.mark.asyncio
+async def test_a_removal_drops_the_published_ports_fact_but_keeps_the_rest():
+    """liumd phase 2: the ports fact predates the removal. Without the drop, the ports of the
+    orphan removed here stay excluded from the connect-back window this cycle and the fatal port
+    count can fall short on a host that has just been cleaned."""
+    from services.local_verify_facts import LocalFacts
+
+    facts = LocalFacts(published_ports=frozenset({40001, 40002}), host_now=1_700_000_000, inspector_lib_sha256="a" * 64)
+    ctx = _make_ctx(RecordingContainerCleanup(result=(1, ["container_gone"])), local_facts=facts)
+    result = await StaleContainerCleanupCheck().run(ctx)
+    after = result.updates["state"].local_facts
+    assert after.published_ports is None
+    assert after.inspector_lib_sha256 == "a" * 64 and after.host_now == 1_700_000_000
+
+    untouched = _make_ctx(RecordingContainerCleanup(result=(0, [])), local_facts=facts)
+    assert (await StaleContainerCleanupCheck().run(untouched)).updates == {}
 
 
 @pytest.mark.asyncio

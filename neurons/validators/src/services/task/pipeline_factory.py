@@ -46,6 +46,7 @@ from .checks import (
     GpuUsageCheck,
     GpuVramPrecheck,
     InspectorRentedCheck,
+    LocalFactsCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
     NvmlDigestCheck,
@@ -294,6 +295,12 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
+                # liumd phase 2 (DAH-2834): one facts-only POST /verify (≈ 1 s, no GPU work) whose
+                # bounded answer stands in for the read-only SSH listings of the two checks after
+                # it — the stale cleanup's `docker ps`/age pair and the port selector's blind
+                # picks — and is observed by the inspector pre-check. Off by default; every
+                # verdict stays SSH-proven with or without it.
+                LocalFactsCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
                 # platform deliberately does not tear down) keeps binding the rental port range.

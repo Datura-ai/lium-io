@@ -1427,3 +1427,37 @@ class LocalVerifyMessages:
         category="transport",
         impact="The matmul and VerifyX verdicts below come from the executor's local run, judged by the validator",
     )
+
+
+class LocalFactsMessages:
+    """liumd phase 2: the read-only host facts (containers, published ports, inspector digest) from
+    one early `POST /verify`, standing in for the SSH listings the checks below would run."""
+
+    DISABLED = MessageTemplate(
+        event="Local host facts disabled",
+        reason="LOCAL_FACTS_DISABLED",
+        severity="info",
+        category="transport",
+        impact="None — every listing runs over SSH as before",
+    )
+    SKIPPED = MessageTemplate(
+        event="Local host facts skipped",
+        reason="LOCAL_FACTS_SKIPPED",
+        severity="info",
+        category="transport",
+        impact="None — the listings run over SSH this cycle",
+    )
+    UNAVAILABLE = MessageTemplate(
+        event="Local host facts not used, SSH listings taken",
+        reason="LOCAL_FACTS_UNAVAILABLE",
+        severity="info",
+        category="transport",
+        impact="None on any verdict — only the round trips saved are lost",
+    )
+    OK = MessageTemplate(
+        event="Local host facts answered in one call",
+        reason="LOCAL_FACTS_OK",
+        severity="info",
+        category="transport",
+        impact="Stale-container candidates are read from the executor's answer and the probed port window is shrunk by it; every verdict below is still SSH-proven",
+    )

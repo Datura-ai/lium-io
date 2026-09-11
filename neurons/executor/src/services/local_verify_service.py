@@ -316,6 +316,9 @@ def _docker_facts() -> DockerFacts:
         sysbox_runtime="sysbox-runc" in runtimes,
         disk=disk,
         containers=containers,
+        # Phase 2: the host's clock beside the containers' `created`, so the validator computes
+        # an age from one clock — the SSH path's `docker inspect .Created` + `date +%s` pair.
+        now=int(time.time()),
     )
 
 

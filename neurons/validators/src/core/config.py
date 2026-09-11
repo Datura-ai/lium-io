@@ -284,6 +284,16 @@ class Settings(BaseSettings):
     # safe only beside the right-sized first-pass steps (`ContextConfig.first_pass`, the `parallel_gpu`
     # rule) — with the fast path off no cycle starts a probe, the express lane's included.
     LOCAL_VERIFY_RENTAL_PROBE_PARALLEL: bool = Field(env="LOCAL_VERIFY_RENTAL_PROBE_PARALLEL", default=False)
+    # liumd phase 2 (DAH-2834): one more, facts-only `POST /verify` early in the pipeline (no matmul, no
+    # VerifyX; ≈ 1 s on the executor). Its bounded answer — containers with the host's clock, the ports
+    # docker publishes, the inspector digest — stands in for the read-only SSH listings the stale cleanup
+    # and the port selector run (`docker ps -a`, `inspect .Created` + `date +%s` per candidate, failed
+    # binds on taken ports) and is only OBSERVED by the inspector pre-check. Never a verdict: a removal
+    # is re-aged over SSH, a port is still proven by the connect-back. Off by default; needs
+    # VALIDATOR_LOCAL_VERIFY_ENABLED. Any refusal/timeout/malformed answer leaves the SSH listings in place.
+    LOCAL_VERIFY_FACTS_ENABLED: bool = Field(env="LOCAL_VERIFY_FACTS_ENABLED", default=False)
+    # Whole-call budget for the facts-only call; the executor caps each collector at 20 s.
+    LOCAL_VERIFY_FACTS_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_FACTS_TIMEOUT_SECONDS", default=25)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
