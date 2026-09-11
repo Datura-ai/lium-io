@@ -77,7 +77,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     echo -e "    ${RED}•  ${var}${RESET}" >&2
   done
   echo -e "\n${YELLOW}  Usage example:${RESET}"
-  echo -e "  ${DIM}TAG=latest [VALIDATOR_HOTKEY_SS58=<hotkey>] bash docker_build.sh${RESET}\n"
+  echo -e "  ${DIM}TAG=latest [VALIDATOR_HOTKEY_SS58=<hotkey>] [VALIDATOR_NEXT_HOTKEY_SS58=<hotkey>] bash docker_build.sh${RESET}\n"
   exit 1
 fi
 
@@ -89,17 +89,27 @@ IMAGE_NAME="daturaai/compute-subnet-executor:${TAG}"
 # ── Optionally generate config_override.py ────────────────────────────────────
 log_step "Validator hotkey configuration"
 
-if [[ -n "${VALIDATOR_HOTKEY_SS58:-}" ]]; then
-  log_info "VALIDATOR_HOTKEY_SS58 is set — generating config_override.py"
-  echo "_VALIDATOR_HOTKEY_SS58 = \"${VALIDATOR_HOTKEY_SS58}\"" > "${CONFIG_OVERRIDE_FILE}"
+# DAH-3394: VALIDATOR_NEXT_HOTKEY_SS58 is the hotkey the validator rotates to; the image accepts
+# both while it is set. Either variable alone is enough to write the override (the unset one keeps
+# the default from config.py).
+if [[ -n "${VALIDATOR_HOTKEY_SS58:-}" || -n "${VALIDATOR_NEXT_HOTKEY_SS58:-}" ]]; then
+  log_info "VALIDATOR_HOTKEY_SS58 / VALIDATOR_NEXT_HOTKEY_SS58 set — generating config_override.py"
+  : > "${CONFIG_OVERRIDE_FILE}"
+  if [[ -n "${VALIDATOR_HOTKEY_SS58:-}" ]]; then
+    echo "_VALIDATOR_HOTKEY_SS58 = \"${VALIDATOR_HOTKEY_SS58}\"" >> "${CONFIG_OVERRIDE_FILE}"
+    log_kv "Validator hotkey:" "${VALIDATOR_HOTKEY_SS58}"
+  fi
+  if [[ -n "${VALIDATOR_NEXT_HOTKEY_SS58:-}" ]]; then
+    echo "_VALIDATOR_NEXT_HOTKEY_SS58 = \"${VALIDATOR_NEXT_HOTKEY_SS58}\"" >> "${CONFIG_OVERRIDE_FILE}"
+    log_kv "Next validator hotkey:" "${VALIDATOR_NEXT_HOTKEY_SS58}"
+  fi
   log_success "Generated: ${CONFIG_OVERRIDE_FILE}"
-  log_kv "Validator hotkey:" "${VALIDATOR_HOTKEY_SS58}"
 else
-  log_warn "VALIDATOR_HOTKEY_SS58 not set — skipping config_override.py generation"
+  log_warn "Neither VALIDATOR_HOTKEY_SS58 nor VALIDATOR_NEXT_HOTKEY_SS58 is set — skipping config_override.py generation"
   if [[ -f "${CONFIG_OVERRIDE_FILE}" ]]; then
-    existing_hotkey=$(python3 -c "import ast, sys; tree=ast.parse(open('${CONFIG_OVERRIDE_FILE}').read()); [sys.stdout.write(n.value.s) for n in ast.walk(tree) if isinstance(n, ast.Assign)]" 2>/dev/null || true)
+    existing_hotkeys=$(python3 -c "import ast, sys; tree=ast.parse(open('${CONFIG_OVERRIDE_FILE}').read()); [sys.stdout.write(n.targets[0].id.strip('_') + '=' + n.value.value + ' ') for n in ast.walk(tree) if isinstance(n, ast.Assign)]" 2>/dev/null || true)
     log_info "Using existing config_override.py"
-    [[ -n "$existing_hotkey" ]] && log_kv "Validator hotkey:" "${existing_hotkey}"
+    [[ -n "$existing_hotkeys" ]] && log_kv "Validator hotkeys:" "${existing_hotkeys}"
   else
     log_info "No config_override.py found — will use hardcoded default in config.py"
   fi

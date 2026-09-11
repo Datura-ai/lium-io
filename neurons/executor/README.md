@@ -187,3 +187,9 @@ sudo systemctl restart docker
 ## The executor image
 
 `Dockerfile` starts from `python:3.11-slim` pinned by digest; the comment above the `FROM` line names the tag and the date the digest was taken. To move to a newer base, resolve the tag (`docker buildx imagetools inspect python:3.11-slim`), put the new digest on that line and rebuild. The build ends with `sshd_setup.sh`: it turns sshd's `PerSourcePenalties` off through `/etc/ssh/sshd_config.d/lium.conf` when the base's OpenSSH knows the directive (9.8 and later), and fails the build when `sshd -T` rejects the rendered configuration.
+
+### Validator hotkeys and uploaded ssh keys
+
+The executor accepts a request signed by the validator hotkey only. The hotkey is compiled into the image (`src/core/config.py`, `VALIDATOR_HOTKEY_SS58`, overridable at build time with `VALIDATOR_HOTKEY_SS58=<ss58> bash docker_build.sh`). During a hotkey rotation the image accepts a second one, `VALIDATOR_NEXT_HOTKEY_SS58` (same file, or `VALIDATOR_NEXT_HOTKEY_SS58=<ss58>` at build time), and a signature by either is valid; with it empty only the first hotkey is accepted. Neither hotkey is read from the environment: the signers an executor trusts are fixed by its image.
+
+An ssh key the validator installs through `/upload_ssh_key` is appended to the container's `~/.ssh/authorized_keys` with a `lium-uploaded-at=<unix time>` comment. The validator removes its key through `/remove_ssh_key` when its job is done; a key still present `EXECUTOR_UPLOADED_KEY_TTL_S` seconds after the upload (default 900) is removed by the executor itself, checked every `EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S` seconds (default 60). Only lines carrying that comment are ever touched; `authorized_keys` lives on the disk reserve (`setup_disk_reserve.sh`), so lines written before this release survive the upgrade unmarked and are not expired.

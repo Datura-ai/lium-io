@@ -1,4 +1,5 @@
 from typing import Optional
+from bittensor_wallet import Keypair
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -11,6 +12,40 @@ try:
     VALIDATOR_HOTKEY_SS58 = _VALIDATOR_HOTKEY_SS58
 except Exception:
     pass
+
+# DAH-3394: the validator hotkey is being rotated. A release that trusts only the new hotkey
+# would be refused by every executor that has not restarted onto it yet, so this release accepts
+# two: `current` (above) and `next`, the hotkey the validator swaps to. `next` is empty until the
+# new hotkey exists; it is then set here or in config_override at build time — like `current`,
+# never from the environment: the set of signers an executor trusts is fixed by the image, not by
+# whoever writes its .env. With `next` empty the executor behaves exactly as before.
+VALIDATOR_NEXT_HOTKEY_SS58 = ""
+try:
+    from core.config_override import _VALIDATOR_NEXT_HOTKEY_SS58
+    VALIDATOR_NEXT_HOTKEY_SS58 = _VALIDATOR_NEXT_HOTKEY_SS58
+except ImportError:
+    # no override module (the default build) or one that names only `current`
+    pass
+
+
+def _validator_hotkeys(current: str, next_: str) -> dict[str, str]:
+    """Key id -> ss58 of every hotkey whose signature the executor accepts, `current` first.
+
+    Each address is parsed here, at import: a mistyped `next` must stop the executor (and CI) now,
+    not surface as a 401 on the first request after the chain swap.
+    """
+    hotkeys = {"current": current}
+    if next_.strip() and next_.strip() != current:
+        hotkeys["next"] = next_.strip()
+    for key_id, ss58 in hotkeys.items():
+        try:
+            Keypair(ss58_address=ss58)
+        except ValueError as exc:
+            raise ValueError(f"the {key_id} validator hotkey is not a valid ss58 address") from exc
+    return hotkeys
+
+
+VALIDATOR_HOTKEYS_SS58: dict[str, str] = _validator_hotkeys(VALIDATOR_HOTKEY_SS58, VALIDATOR_NEXT_HOTKEY_SS58)
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -65,6 +100,16 @@ class Settings(BaseSettings):
     # refused, so a captured one cannot be replayed for the life of the container. Symmetric so a
     # host clock that runs ahead is treated like one that runs behind; wide enough for NTP drift.
     CONTAINER_SIGNATURE_MAX_AGE_SECONDS: int = Field(env="CONTAINER_SIGNATURE_MAX_AGE_SECONDS", default=300)
+    # DAH-3394: an ssh key the validator installed through /upload_ssh_key is removed by the
+    # executor itself this many seconds after the upload when no /remove_ssh_key came for it,
+    # so a leaked or forgotten upload is worth at most this window. The validator's own flows fit:
+    # a verification job authenticates with its key for up to ~820 s (tasks capped at
+    # JOB_TIME_OUT - 120 s, the RoCE sweep up to JOB_TIME_OUT - 80 s) and removes it right
+    # after; a rental create keeps ONE established ssh session for the image pull, which sshd
+    # does not re-check against authorized_keys. Do not set below 900.
+    EXECUTOR_UPLOADED_KEY_TTL_S: int = Field(env="EXECUTOR_UPLOADED_KEY_TTL_S", default=900, ge=1)
+    # How often the purge looks at authorized_keys; a key lives at most TTL + this.
+    EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S: int = Field(env="EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S", default=60, ge=1)
 
 
 settings = Settings()
