@@ -666,11 +666,9 @@ async def test_flag_off_never_looks_for_a_slot(svc, monkeypatch):
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    # the flag gates the slot lookup, the adoption and the sizing's slot-volume listing: no warm-pool
-    # command reaches the host
-    assert not any(
-        "__LIUM_WARM_POOL__" in c or "docker rename" in c or "lium.warm_pool" in c for c in _cmds(ssh)
-    )
+    # the flag gates the slot lookup and the adoption: neither reaches the host. The sizing's
+    # slot-volume listing is not gated (a slot another validator left must stay out of the sum).
+    assert not any("__LIUM_WARM_POOL__" in c or "docker rename" in c for c in _cmds(ssh))
     svc.create_local_volume.assert_awaited_once()
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
     assert result.volume_name == f"volume_{payload.pod_id}"
@@ -840,6 +838,32 @@ async def test_slot_that_differs_falls_back_to_a_fresh_create(svc, monkeypatch):
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
     assert result.volume_name == f"volume_{payload.pod_id}"
     assert (result.volume_limit_gb, result.storage_limit_gb) == (10, 20)
+
+
+@pytest.mark.asyncio
+async def test_slot_document_the_comparison_cannot_read_falls_back_not_fails(svc, monkeypatch):
+    """A host-authored inspect whose HostConfig.Binds is not a list makes `slot_matches` raise; the
+    rental must fall back to a fresh create (slot removed), never fail (taiberium, #1337)."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload()
+    spec = _spec(svc, payload)
+    image = _image_doc()
+    doc = _slot_doc(spec, image)
+    doc["HostConfig"]["Binds"] = 5
+    slot = warm_pool.slot_from_inspect(doc, image_id=IMAGE_ID, now=NOW, max_age=MAX_AGE)
+    with pytest.raises(TypeError):
+        warm_pool.slot_matches(slot, spec, image)
+    ssh = _host(svc, spec, image, slot_doc=doc)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert not any("docker rename" in c for c in _cmds(ssh))
+    assert any(
+        f"docker rm -f {spec.name}" in c and f"volume rm volume_{SLOT_ID}" in c for c in _cmds(ssh)
+    )
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1064,12 +1088,13 @@ async def test_sizing_leaves_slot_volumes_out_of_the_declared_sum(svc, monkeypat
     ssh.run = AsyncMock(side_effect=_side_every_volume)
     assert await svc._get_existing_vloopback_bytes(ssh) == 30 * 1024**3
 
-    # With the flag off the sizing pays no listing round trip and counts every volume, as before the
-    # pool; a slot left behind by a flag flip is the stale-container sweep's to remove.
+    # With the flag off the listing still runs: a slot left on the host by another validator, or by
+    # this one before a flag flip, would otherwise count and the df_guard would size the rental at
+    # 1.5x the free disk (taiberium, lium-io#1337).
     monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", False)
-    ssh.run = AsyncMock(side_effect=_side_every_volume)
-    assert await svc._get_existing_vloopback_bytes(ssh) == 30 * 1024**3
-    assert not any("lium.warm_pool" in c.args[0] for c in ssh.run.await_args_list)
+    ssh.run = AsyncMock(side_effect=_side)
+    assert await svc._get_existing_vloopback_bytes(ssh) == 10 * 1024**3
+    assert any("lium.warm_pool=1" in c.args[0] for c in ssh.run.await_args_list)
 
 
 # ------------------------------------------------------------------

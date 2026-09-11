@@ -1454,7 +1454,12 @@ class DockerService:
         """rename → cpu/memory → start the slot as `container_name`; False (slot and volume removed)
         when the live slot differs from `run_spec` in any field or the command fails."""
         slot = adoption.slot
-        reason = warm_pool.slot_matches(slot, run_spec, adoption.image_doc)
+        try:
+            reason = warm_pool.slot_matches(slot, run_spec, adoption.image_doc)
+        except Exception as exc:
+            # A document the host authored: anything unreadable in it is a fallback, never a
+            # failed rental (the lookup treats its slot documents the same way).
+            reason = f"slot document unreadable: {exc}"
         if reason is None and run_spec.network:
             # A `docker create` proves the rental network is an ICC-off bridge (DAH-3199); the slot
             # was created hours ago, so its start re-reads the live network the same way.
@@ -1529,7 +1534,7 @@ class DockerService:
                 ssh_client=ssh_client, now=now, max_age=max_age, default_extra=default_extra
             )
             for image in await self._warm_pool_images(ssh_client):
-                image_doc = await self._sweep_slots_of_image(
+                image_doc = await self._sweep_slots_and_image_to_fill(
                     ssh_client=ssh_client, image=image, now=now, max_age=max_age, default_extra=default_extra
                 )
                 if image_doc is None:
@@ -1552,7 +1557,7 @@ class DockerService:
         finally:
             self._warm_pool_maintaining.discard(executor_id)
 
-    async def _sweep_slots_of_image(
+    async def _sweep_slots_and_image_to_fill(
         self,
         *,
         ssh_client: asyncssh.SSHClientConnection,
@@ -1561,10 +1566,10 @@ class DockerService:
         max_age: timedelta,
         default_extra: dict,
     ) -> dict | None:
-        """The sweep half of one image's maintenance: remove its slots that are no longer fresh and
-        all but the newest fresh one. Returns the image's inspect when the image is left with no slot
-        — the create should follow — and None when it has one, is not on the host, or its slot
-        listing could not be read (unknown is not "none": no create)."""
+        """One image's maintenance, both jobs: sweep its slots that are no longer fresh and all but
+        the newest fresh one, then say whether a slot must be created. Returns the image's inspect
+        when the image is left with no slot — the create should follow — and None when it has one,
+        is not on the host, or its slot listing could not be read (unknown is not "none": no create)."""
         probe = await ssh_client.run(
             warm_pool.find_slots_command(image), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
         )
@@ -4312,14 +4317,11 @@ class DockerService:
         vloopback volumes by name must leave these out: `_get_existing_vloopback_bytes` filters
         through this set; the host-probe fast path (lium-io#1332) carries the same listing as the
         `SLOT` section of its one command and filters at parse time (`_parse_volume_host_probe`).
-        With WARM_POOL_ENABLED off there is no listing and no round trip. A slot left behind by a
-        flag flip then counts until the stale-container sweep removes it (`warm_` in
-        RENTAL_CONTAINER_PREFIXES, at WARM_POOL_MAX_AGE_HOURS); the `df_guard` candidate keeps that
-        sizing inside the disk's real free space meanwhile. A listing that fails or times out is an
-        empty set: the sizing then counts every volume, as it did before the pool, rather than
-        falling back to the legacy passthrough."""
-        if not settings.WARM_POOL_ENABLED:
-            return set()
+        The listing is not gated on WARM_POOL_ENABLED: a slot another validator (or this one, before
+        a flag flip) left on the host would otherwise count, and the `df_guard` candidate would size
+        the rental at 1.5x the disk's free space. A listing that fails or times out is an empty
+        set: the sizing then counts every volume, as it did before the pool, rather than falling
+        back to the legacy passthrough."""
         try:
             slot_result = await ssh_client.run(
                 warm_pool.slot_volumes_command(), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
