@@ -12,11 +12,12 @@ falls back to the SSH path and logs the reason. Nothing here can fail a node.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import aiohttp
 from datura.requests.validator_requests import (
@@ -147,6 +148,19 @@ def sign_intent(intent: dict[str, Any], keypair) -> dict[str, Any]:
     return signed
 
 
+@runtime_checkable
+class BackgroundProbe(Protocol):
+    """A backend call one check started for a later check to await (liumd phase 2: the rental
+    probe beside the GPU steps — `checks/rental_verification.RentalProbe`). Declared as a
+    Protocol here because the checks package imports this module, so naming the dataclass
+    itself would be an import cycle; `Pipeline.run` settles whatever is left unconsumed."""
+
+    task: asyncio.Task
+    consumed: bool
+
+    async def cancel_and_await(self) -> str: ...
+
+
 @dataclass
 class LocalVerifyOutcome:
     """What the consuming checks read (`ctx.state.local_verify`). A field is set only when the
@@ -158,6 +172,9 @@ class LocalVerifyOutcome:
     executor_elapsed_ms: int = 0
     executor_version: str = ""
     fallbacks: dict[str, str] = field(default_factory=dict)  # step -> reason
+    # Phase 2: the backend rental probe started beside the GPU steps (LOCAL_VERIFY_RENTAL_PROBE_PARALLEL);
+    # `RentalVerificationCheck` awaits it, `Pipeline.run` settles it on a halt. None = not started.
+    rental_probe: BackgroundProbe | None = None
 
 
 @dataclass
