@@ -5,15 +5,19 @@ pong timeout long enough for the keepalive to survive a scoring-cycle burst.
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import websockets
-from payload_models.payloads import ContainerCreated, DeliveryStamps
-
 from clients.compute_client import WS_PING_INTERVAL, WS_PING_TIMEOUT, ComputeClient
-from protocol.vc_protocol.validator_requests import ExecutorSpecRequest, RentedMachineRequest
+from payload_models.payloads import ContainerCreated, DeliveryStamps
+from protocol.vc_protocol.validator_requests import (
+    ExecutorSpecRequest,
+    RentedMachineRequest,
+    ValidationEvent,
+)
 from services.miner_service import MinerService
 from services.redis_service import MACHINE_SPEC_CHANNEL
 
@@ -96,6 +100,39 @@ async def test_bridge_tolerates_payload_without_stamps(create_job_result, mock_s
     # Assert
     assert spec.sent_at is None
     assert spec.batch_total is None
+
+
+@pytest.mark.asyncio
+async def test_bridge_carries_structured_validation_event(create_job_result, mock_settings) -> None:
+    job = create_job_result(log_text="GPU mismatch >>> legacy JSON")
+    job.validation_event = ValidationEvent(
+        event="GPU mismatch",
+        reason_code="GPU_MISMATCH",
+        severity="critical",
+        impact="Node cannot be listed",
+        remediation="Check the installed GPU",
+        what_we_saw={"expected": "A100", "actual": "T4"},
+        check_id="executor.validate.gpu",
+        when=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    [payload] = await _published_payloads([job])
+    spec = await _bridge_machine_spec(payload)
+
+    assert payload["validation_event"]["reason_code"] == "GPU_MISMATCH"
+    assert isinstance(spec.validation_event, ValidationEvent)
+    assert spec.validation_event.what_we_saw == {"expected": "A100", "actual": "T4"}
+    assert spec.validation_event.when == datetime(2026, 9, 1, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_bridge_tolerates_payload_without_validation_event(create_job_result, mock_settings) -> None:
+    [payload] = await _published_payloads([create_job_result()])
+    del payload["validation_event"]
+
+    spec = await _bridge_machine_spec(payload)
+
+    assert spec.validation_event is None
 
 
 async def _drain_send_loop(client: ComputeClient, expected_sends: int) -> list[dict[str, Any]]:
