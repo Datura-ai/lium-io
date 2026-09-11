@@ -280,9 +280,9 @@ async def test_capability_check_vram_allocation_failure_gets_its_own_reason(cont
         # no uuid, but nothing says the allocation failed
         ("None", "segmentation fault", "UUID mismatch"),
         ("", "", "UUID mismatch"),
-        # cudaMalloc failed for another reason: CUDA error 802, the NVLink fabric not ready on an
-        # HGX board (DAH-3362, a 1x H200 every cycle). Permanent, so it must not be told "retry".
-        ("None", "Failed to allocate d_A: system not yet initialized", "UUID mismatch"),
+        # cudaMalloc failed for another CUDA error the check does not know: not the VRAM story
+        # (the known ones — fabric not ready, no device — have their own codes below, DAH-3362)
+        ("None", "Failed to allocate d_A: unspecified launch failure", "UUID mismatch"),
         # the service rejected a sealed result that failed authentication: the empty uuid is the
         # service's, not the probe's, and stderr is miner-controlled — an OOM line buys nothing
         ("", OOM_STDERR, "Sealed result failed authentication (tampered/forged executor output)"),
@@ -341,3 +341,149 @@ async def test_capability_check_stderr_tail_is_bounded(context_factory):
     assert len(tail) == STDERR_TAIL_CHARS and tail.endswith(OOM_STDERR)
     # the full stderr is still there for anyone who needs it
     assert result.event.what_we_saw["stderr"] == long_stderr
+
+
+# DAH-3362 (ticket-0318): the CUDA failure the probe hit gets its own reason code, as the timeout
+# and the out-of-memory case do; the remediation names the fix. The 1x H200 node in the ticket
+# printed exactly this stderr every cycle while nvidia-smi worked (CUDA error 802).
+NOT_READY_STDERR = "Failed to allocate d_A: system not yet initialized"
+NO_DEVICE_STDERR = "cudaGetDeviceCount returned no CUDA-capable device is detected"
+NO_UUID_STDOUT = 'UUID:  None\nRESULT_JSON: {"uuid": null, "metrics": {}, "sealed": null}'
+NO_UUID_ERROR = "UUID mismatch: expected '<nonce>', got 'None'"  # expected_uuid is a per-call uuid4
+DOCS_TABLE_ANCHOR = "/providers/troubleshooting#6-validator-reason-codes"
+
+
+async def _run_failed_probe(
+    context_factory, *, returned_uuid, stdout, stderr, error_message=NO_UUID_ERROR
+):
+    validation_service = DummyValidationService(
+        success=False,
+        error_message=error_message,
+        returned_uuid=returned_uuid,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    services = build_services(validation=validation_service)
+    ctx = context_factory(services=services, state=build_state(specs={"gpu": {"count": 1}}))
+    return await CapabilityCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_capability_check_cuda_not_ready_names_the_fabric(context_factory):
+    # every failed cudaMalloc prints "Failed to allocate …"; the error after the colon decides
+    result = await _run_failed_probe(
+        context_factory, returned_uuid="None", stdout=NO_UUID_STDOUT, stderr=NOT_READY_STDERR
+    )
+
+    assert result.passed is False
+    assert result.event.reason_code == "GPU_VERIFY_CUDA_NOT_READY"
+    assert "Fabric Manager" in result.event.remediation
+    # the reason-code table is where the per-case steps live
+    assert result.event.help_uri.endswith(DOCS_TABLE_ANCHOR)
+    # the raw stderr the provider can match against the docs table stays in the details
+    assert result.event.what_we_saw["stderr"] == NOT_READY_STDERR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        NO_DEVICE_STDERR,
+        # the same error from a later call
+        "Failed to allocate d_A: no CUDA-capable device is detected",
+        # the statically linked runtime finds no libcuda in the container (toolkit mounted none)
+        "cudaGetDeviceCount returned CUDA driver version is insufficient for CUDA runtime version",
+    ],
+)
+async def test_capability_check_no_cuda_device_points_at_the_container_runtime(
+    context_factory, stderr
+):
+    result = await _run_failed_probe(context_factory, returned_uuid="", stdout="", stderr=stderr)
+
+    assert result.event.reason_code == "GPU_VERIFY_NO_CUDA_DEVICE"
+    assert "docker exec executor-executor-1 nvidia-smi" in result.event.remediation
+    assert result.event.help_uri.endswith(DOCS_TABLE_ANCHOR)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "returned_uuid,stdout,stderr,error_message",
+    [
+        # no uuid and nothing recognisable in the output
+        ("None", NO_UUID_STDOUT, "segmentation fault", NO_UUID_ERROR),
+        # a wrong answer where the nonce should be: the anti-spoof case, whatever stderr says
+        (
+            "wrong-uuid",
+            "UUID: wrong-uuid",
+            NOT_READY_STDERR,
+            "UUID mismatch: expected '<nonce>', got 'wrong-uuid'",
+        ),
+        # a plausible-looking device uuid is still a wrong answer (the expected value is a nonce)
+        (
+            "GPU-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            "UUID: GPU-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            NO_DEVICE_STDERR,
+            "UUID mismatch: expected '<nonce>', got 'GPU-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0'",
+        ),
+        # the service rejected a sealed result: its empty uuid is not the probe's answer
+        (
+            "",
+            "",
+            NOT_READY_STDERR,
+            "Sealed result failed authentication (tampered/forged executor output)",
+        ),
+    ],
+)
+async def test_capability_check_default_text_when_nothing_matches(
+    context_factory, returned_uuid, stdout, stderr, error_message
+):
+    result = await _run_failed_probe(
+        context_factory,
+        returned_uuid=returned_uuid,
+        stdout=stdout,
+        stderr=stderr,
+        error_message=error_message,
+    )
+
+    assert result.event.reason_code == "GPU_VERIFY_FAILED"
+    assert result.event.remediation == Msg.VERIFY_FAILED.remediation
+    assert result.event.help_uri.endswith(DOCS_TABLE_ANCHOR)
+
+
+@pytest.mark.asyncio
+async def test_capability_check_service_exception_keeps_default_text(context_factory):
+    validation_service = DummyValidationService(
+        success=False, should_raise=True, error_message=NOT_READY_STDERR
+    )
+    services = build_services(validation=validation_service)
+    ctx = context_factory(services=services, state=build_state(specs={"gpu": {"count": 1}}))
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.event.reason_code == "GPU_VERIFY_FAILED"
+    assert result.event.what_we_saw == {"error": NOT_READY_STDERR}
+
+
+def test_capability_sub_reason_wording_is_provider_facing():
+    # L-271: no chain/token words in anything a provider reads.
+    banned = (
+        "bittensor",
+        "subnet",
+        "tao",
+        "alpha",
+        "token",
+        "wallet",
+        "hotkey",
+        "mining",
+        "miner",
+        "emission",
+    )
+    for template in (
+        Msg.VERIFY_FAILED,
+        Msg.VERIFY_FAILED_CUDA_NOT_READY,
+        Msg.VERIFY_FAILED_CONTAINER_GPU_ACCESS,
+        Msg.VERIFY_FAILED_VRAM_UNAVAILABLE,
+    ):
+        text = template.remediation.lower()
+        # substring, not token, match: an image or path name carrying the word counts too
+        assert not [w for w in banned if w in text], template.reason
