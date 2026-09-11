@@ -1387,7 +1387,7 @@ async def test_stale_sweep_ages_a_slot_by_the_pools_max_age_whatever_the_flag(
         if cmd.strip() == "date +%s":
             return _ssh_result(stdout=str(AGE_NOW))
         if "docker inspect" in cmd:
-            return _ssh_result(stdout=f"{AGE_NOW - age_hours * 3600}\n{ZERO_TIME_EPOCH}\n0\n")
+            return _ssh_result(stdout=f"{AGE_NOW - age_hours * 3600}\n{ZERO_TIME_EPOCH}\n1\n")
         if "docker rm -f" in cmd or "docker volume rm" in cmd:
             removed.append(cmd)
         return _ssh_result()
