@@ -39,7 +39,9 @@ STEP_NAMES = ("image", "container", "ready")
 EXECUTOR_VERSION_MAX_CHARS = 64
 
 # The executor's `ready` step: how long it waits for State.Running (the SSH path's poll is 10 tries
-# of 1 s). The SSH-banner wait is the caller's choice (`ssh_wait_s`, 0 = none).
+# of 1 s). The SSH-banner wait is the caller's choice (`ssh_wait_s`, 0 = none), capped at what the
+# executor's `ReadyStep.ssh_timeout_s` accepts (`le=60`).
+SSH_WAIT_MAX_S = 60
 RUNNING_TIMEOUT_S = 10
 
 LocalRentUnavailable = LocalVerifyUnavailable
@@ -48,8 +50,10 @@ LocalRentUnavailable = LocalVerifyUnavailable
 # (404), the body was refused before any create — 401 from the route's checks, 422 from an old
 # image's `MinerMiddleware` (no `data_to_sign`) or from the route's own model validation — the
 # executor was busy / had seen the nonce (409), or the connection was never made (aiohttp's
-# connect-phase errors: refused, DNS, connect timeout — the type name `post_signed` puts first in
-# the detail). Every other non-answer — a total timeout, a connection that broke after the send, a
+# `ClientConnector*` errors: refused, DNS, certificate — the type name `post_signed` puts first in
+# the detail; a connect that times out is aiohttp's `ConnectionTimeoutError`, an `asyncio.TimeoutError`,
+# which `post_signed` labels `timeout` — treated as may-have-acted, one harmless force-remove of a
+# name that cannot exist). Every other non-answer — a total timeout, a connection that broke after the send, a
 # 5xx, an answer that could not be read — leaves it open whether a container of the spec's name
 # exists over there, and the SDK fallback frees the name before its own `docker run`
 # (`may_have_acted`).
@@ -108,7 +112,9 @@ def build_intent(
     now = time.time() if now is None else now
     ready: dict[str, Any] = {"running_timeout_s": RUNNING_TIMEOUT_S}
     if ssh_host_port is not None and ssh_wait_s > 0:
-        ready.update({"ssh_host_port": ssh_host_port, "ssh_timeout_s": ssh_wait_s})
+        # the executor's ReadyStep bounds ssh_timeout_s at SSH_WAIT_MAX_S; a larger setting would be
+        # a 422 on every rent (one wasted call each) instead of a longer wait
+        ready.update({"ssh_host_port": ssh_host_port, "ssh_timeout_s": min(ssh_wait_s, SSH_WAIT_MAX_S)})
     return {
         "schema": SCHEMA,
         "nonce": secrets.token_hex(16),

@@ -88,6 +88,85 @@ class ContainerRunSpec:
     network: str | None = None
 
 
+# --- the rental network (DAH-3199) --------------------------------------------------------------
+
+# Every rental on a host shares this user-defined bridge instead of docker0. The daemon's default
+# bridge allows inter-container traffic, and a pod holds NET_ADMIN, so two rentals on a split host
+# could otherwise reach each other's unpublished ports. Docker enforces ICC=false with a FORWARD
+# drop between ports of this bridge; published ports still arrive through the host and NAT egress
+# is untouched. One network per host — nothing to remove at teardown. The validator names it in
+# `ContainerRunSpec.network`; whichever side creates the container makes sure it exists first
+# (`ensure_rental_network`) — the SAME check on both paths, so a locally made rental is never the
+# one on docker0.
+RENTAL_NETWORK_NAME = "lium-rentals"
+RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
+RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
+RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
+
+
+class RentalNetworkError(RuntimeError):
+    """The rental network cannot be used: it could not be created, or a same-named network on the
+    host does not turn inter-container traffic off. The container is NOT created."""
+
+
+def ensure_rental_network(api_client: Any, name: str) -> None:
+    """The container's network exists on the host and has inter-container traffic off.
+
+    Runs before every rental `create_container`, so the isolation holds on a host that has never
+    seen a rental, on one whose network was removed by hand, and for two creates racing on the
+    same host (the loser's `create_network` conflicts and the network is inspected again). A
+    network of that name whose options do not turn ICC off is refused rather than used: running
+    the pod on it would silently restore the docker0 behaviour this network exists to end.
+    Blocking (docker-py); callers run it off the event loop."""
+    network = _inspect_network_or_none(api_client, name)
+    if network is None:
+        try:
+            api_client.create_network(
+                name,
+                driver="bridge",
+                options=dict(RENTAL_NETWORK_OPTIONS),
+                labels=dict(RENTAL_NETWORK_LABELS),
+            )
+        except Exception as exc:
+            network = _inspect_network_or_none(api_client, name)
+            if network is None:
+                detail = str(exc) or exc.__class__.__name__
+                raise RentalNetworkError(f"Docker SDK create network {name} failed: {detail}") from exc
+        else:
+            network = _inspect_network_or_none(api_client, name)
+            if network is None:
+                raise RentalNetworkError(f"Docker network {name} was created but cannot be inspected")
+    require_icc_off(name, network)
+
+
+def require_icc_off(name: str, network: dict) -> None:
+    options = network.get("Options") or {}
+    if network.get("Driver") == "bridge" and options.get(RENTAL_NETWORK_ICC_OPTION) == "false":
+        return
+    raise RentalNetworkError(
+        f"Docker network {name} exists on the executor but is not a bridge with "
+        f"{RENTAL_NETWORK_ICC_OPTION}=false (driver={network.get('Driver')!r}, options={options!r}); "
+        "refusing to run the rental on it. Remove the network once it is empty so the validator "
+        "recreates it with inter-container traffic off."
+    )
+
+
+def _inspect_network_or_none(api_client: Any, name: str) -> dict | None:
+    try:
+        return api_client.inspect_network(name)
+    except Exception as exc:
+        if _is_not_found(exc):
+            return None
+        raise
+
+
+def _is_not_found(exc: Exception) -> bool:
+    # docker-py's NotFound / ImageNotFound, or any APIError whose daemon answer was a 404
+    if exc.__class__.__name__ in {"ImageNotFound", "NotFound"}:
+        return True
+    return getattr(getattr(exc, "response", None), "status_code", None) == 404
+
+
 # --- docker-py arguments (the one HostConfig) ---------------------------------------------------
 
 
@@ -199,7 +278,7 @@ PUBLIC_ENVIRONMENT = {"NVIDIA_DRIVER_CAPABILITIES": "all"}
 WIRE_FIELDS = (
     "image", "name", "command", "environment", "ports", "volumes", "restart_policy", "runtime",
     "cap_add", "sysctls", "ulimits", "devices", "device_requests", "cpu_count", "memory_gb",
-    "storage_limit_gb", "shm_size", "entrypoint",
+    "storage_limit_gb", "shm_size", "entrypoint", "network",
 )  # fmt: skip
 
 # Bounds: what one rental container legitimately has, with room. `spec_from_wire` refuses more.
@@ -272,6 +351,8 @@ def spec_to_wire(spec: ContainerRunSpec) -> dict[str, Any]:
         "storage_limit_gb": spec.storage_limit_gb or None,
         "shm_size": spec.shm_size,
         "entrypoint": spec.entrypoint,
+        # the icc-off rental bridge (DAH-3199); None = the daemon's default bridge
+        "network": spec.network,
     }
 
 
@@ -345,9 +426,12 @@ def spec_from_wire(raw: Any) -> ContainerRunSpec:
         )
         for r in _objects(raw, "device_requests")
     )
-    restart_policy = _str(raw, "restart_policy")
+    restart_policy = _str(raw, "restart_policy", default="unless-stopped")
     if restart_policy is not None and restart_policy not in RESTART_POLICIES:
         raise WireError(f"restart_policy is not one of {list(RESTART_POLICIES)}")
+    network = _str(raw, "network")
+    if network is not None and not NAME_PATTERN.fullmatch(network):
+        raise WireError("network is not a docker network name")
     return ContainerRunSpec(
         image=image,
         name=name,
@@ -367,6 +451,7 @@ def spec_from_wire(raw: Any) -> ContainerRunSpec:
         storage_limit_gb=_int(raw, "storage_limit_gb", lo=1),
         shm_size=_str(raw, "shm_size"),
         entrypoint=_str(raw, "entrypoint"),
+        network=network,
     )
 
 

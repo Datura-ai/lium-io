@@ -15,16 +15,22 @@ from pathlib import Path
 # liumd (DAH-2834): the rental run spec and its HostConfig live in datura — ONE definition for
 # this SSH-tunnelled path and the executor's local `POST /rent`; re-exported here unchanged.
 from datura.rental_spec import (  # noqa: F401 — re-exports
+    RENTAL_NETWORK_ICC_OPTION,
+    RENTAL_NETWORK_LABELS,
+    RENTAL_NETWORK_NAME,
+    RENTAL_NETWORK_OPTIONS,
     ContainerRunSpec,
     ContainerUlimit,
     DeviceMount,
     GpuDeviceRequest,
     PortBinding,
+    RentalNetworkError,
     VolumeMount,
     build_host_config_kwargs,
     container_ports,
     container_volumes,
     create_and_start,
+    ensure_rental_network,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -44,15 +50,8 @@ _DOCKER_EXECUTOR_MAX_WORKERS = 32
 _DOCKER_EXECUTOR = ThreadPoolExecutor(
     max_workers=_DOCKER_EXECUTOR_MAX_WORKERS, thread_name_prefix="docker-sdk"
 )
-# DAH-3199: every rental on a host shares this user-defined bridge instead of docker0. The daemon's
-# default bridge allows inter-container traffic, and a pod holds NET_ADMIN, so two rentals on a split
-# host could otherwise reach each other's unpublished ports. Docker enforces ICC=false with a FORWARD
-# drop between ports of this bridge; published ports still arrive through the host and NAT egress is
-# untouched. One network per host — nothing to remove at teardown.
-RENTAL_NETWORK_NAME = "lium-rentals"
-RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
-RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
-RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
+# DAH-3199: the rental network (`RENTAL_NETWORK_*`, `ensure_rental_network`) is datura's — the
+# executor's local `POST /rent` runs the same check before the same `create_and_start`.
 logger = logging.getLogger(__name__)
 
 
@@ -416,44 +415,12 @@ class RentalDockerSdkClient:
         create_and_start(self._api_client, spec)
 
     def _ensure_rental_network_sync(self, name: str) -> None:
-        """The container's network exists on the host and has inter-container traffic off.
-
-        Runs before every rental `create_container`, so the isolation holds on a host that has never
-        seen a rental, on one whose network was removed by hand, and for two creates racing on the
-        same host (the loser's `create_network` conflicts and the network is inspected again). A
-        network of that name whose options do not turn ICC off is refused rather than used: running
-        the pod on it would silently restore the docker0 behaviour this network exists to end.
-        """
-        network = self._inspect_network_or_none(name)
-        if network is None:
-            try:
-                self._api_client.create_network(
-                    name,
-                    driver="bridge",
-                    options=dict(RENTAL_NETWORK_OPTIONS),
-                    labels=dict(RENTAL_NETWORK_LABELS),
-                )
-            except Exception as exc:
-                network = self._inspect_network_or_none(name)
-                if network is None:
-                    raise RentalDockerOperationError(
-                        _wrap_error_message(f"Docker SDK create network {name} failed", exc)
-                    ) from exc
-            else:
-                network = self._inspect_network_or_none(name)
-                if network is None:
-                    raise RentalDockerOperationError(
-                        f"Docker network {name} was created but cannot be inspected"
-                    )
-        _require_icc_off(name, network)
-
-    def _inspect_network_or_none(self, name: str) -> dict | None:
+        """datura's `ensure_rental_network` (the executor's `/rent` runs the same one): the network
+        exists and has inter-container traffic off, or the rental is not created."""
         try:
-            return self._api_client.inspect_network(name)
-        except Exception as exc:
-            if _is_docker_not_found_error(exc):
-                return None
-            raise
+            ensure_rental_network(self._api_client, name)
+        except RentalNetworkError as exc:
+            raise RentalDockerOperationError(str(exc)) from exc
 
     def _create_volume_sync(
         self,
@@ -845,23 +812,9 @@ def _build_rental_ssh_http_adapter_class(
     return RentalSSHHTTPAdapter
 
 
-def _require_icc_off(name: str, network: dict) -> None:
-    options = network.get("Options") or {}
-    if network.get("Driver") == "bridge" and options.get(RENTAL_NETWORK_ICC_OPTION) == "false":
-        return
-    raise RentalDockerOperationError(
-        f"Docker network {name} exists on the executor but is not a bridge with "
-        f"{RENTAL_NETWORK_ICC_OPTION}=false (driver={network.get('Driver')!r}, options={options!r}); "
-        "refusing to run the rental on it. Remove the network once it is empty so the validator "
-        "recreates it with inter-container traffic off."
-    )
-
-
-# The HostConfig / ports / volumes arguments are datura's (`rental_spec.py`), shared with the
-# executor's local rent path; the private names stay for this module's callers.
+# The HostConfig arguments are datura's (`rental_spec.py`), shared with the executor's local rent
+# path; the private name stays for the tests that import it.
 _build_host_config_kwargs = build_host_config_kwargs
-_container_ports = container_ports
-_container_volumes = container_volumes
 
 
 def _binds(volumes: tuple[VolumeMount, ...]) -> list[str]:
