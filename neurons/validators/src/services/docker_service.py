@@ -115,7 +115,6 @@ from services.rental_docker_sdk import (
     RentalDockerSdkClientFactory,
     VolumeMount,
     build_authorized_keys_and_environment_exec_spec,
-    build_authorized_keys_exec_spec,
     build_container_command_argv,
     build_environment_exec_spec,
     environment_fits_exec_variable,
@@ -3020,19 +3019,14 @@ class DockerService:
     ) -> None:
         """Append the renter's keys to authorized_keys — and, with ``environment`` (DAH-3258), the
         renter's `/etc/environment` lines in the same exec. Raises on a non-zero exit."""
-        if environment:
-            exec_spec = build_authorized_keys_and_environment_exec_spec(
-                container_name=container_name,
-                public_keys=public_keys,
-                environment=environment,
-            )
-        else:
-            exec_spec = build_authorized_keys_exec_spec(
-                container_name=container_name,
-                public_keys=public_keys,
-            )
+        # falls back to the keys-only spec when there are no environment lines
+        exec_spec = build_authorized_keys_and_environment_exec_spec(
+            container_name=container_name,
+            public_keys=public_keys,
+            environment=environment,
+        )
         with_environment = bool(exec_spec.environment)
-        what = "SSH public keys and environment" if with_environment else "SSH public keys"
+        added_items = "SSH public keys and environment" if with_environment else "SSH public keys"
         result = await exec_logged_rental_docker_sdk_operation(
             docker_client=docker_client,
             operation=(
@@ -3043,13 +3037,13 @@ class DockerService:
         )
         if result.exit_status != 0:
             await self.stream_log(
-                result.stderr or result.stdout or f"Failed to add {what}",
+                result.stderr or result.stdout or f"Failed to add {added_items}",
                 "error",
                 log_tag,
             )
             logger.warning(
                 _m(
-                    f"Failed to add {what}",
+                    f"Failed to add {added_items}",
                     extra=get_extra_info({
                         **log_extra,
                         "container_name": container_name,
@@ -3060,7 +3054,7 @@ class DockerService:
                 )
             )
             raise Exception(
-                f"Failed to add {what}: "
+                f"Failed to add {added_items}: "
                 f"exit_status={result.exit_status}; "
                 f"stderr={result.stderr}; stdout={result.stdout}"
             )
