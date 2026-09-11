@@ -140,6 +140,42 @@ class ResetVerifiedJobReason(int, enum.Enum):
     POD_NOT_RUNNING = 1         # container for pod is not running
 
 
+class _AbsentWhenNone(pydantic.BaseModel):
+    """A field the host did not answer stays absent on the wire (as the redis payload had it), instead of a
+    `null` the backend's JSONB row would keep; `None` set on purpose (`container_finished_at: None`) is dropped
+    too — the row reads the same either way."""
+
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    @pydantic.model_serializer(mode="wrap")
+    def _drop_none(self, handler: pydantic.SerializerFunctionWrapHandler) -> dict[str, Any]:
+        return {key: value for key, value in handler(self).items() if value is not None}
+
+
+class ResetVerifiedJobContainerEvidence(_AbsentWhenNone):
+    """What the rented-machine check saw of the pod's container (`docker inspect`, typed and bounded on the
+    validator: rented_machine.py `_penalty_evidence_from_diagnostics`). Every field is optional."""
+
+    container_status: str | None = None
+    container_exit_code: int | None = None
+    container_oom_killed: bool | None = None
+    container_error: str | None = None
+    container_started_at: str | None = None
+    container_finished_at: str | None = None
+    container_missing: bool | None = None
+    diagnostics_capture_error: str | None = None
+
+
+class ResetVerifiedJobEvidence(_AbsentWhenNone):
+    """DAH-3386: what the check that cleared the verified job saw. The backend copies it into the penalty row
+    (lium-platform DAH-3385 `details.evidence.validator`), so the keys are named here and on that side alike;
+    `extra="allow"` keeps a key a newer check adds on the wire instead of dropping the reset."""
+
+    pod_id: str | None = None
+    container_name: str | None = None
+    container: ResetVerifiedJobContainerEvidence | None = None
+
+
 class ResetVerifiedJobRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ResetVerifiedJobRequest
     validator_hotkey: str
@@ -151,7 +187,7 @@ class ResetVerifiedJobRequest(BaseValidatorRequest):
     # into the penalty it raises (lium-platform DAH-3385 details.evidence.validator). Optional both ways.
     reason_code: str | None = None
     check_id: str | None = None
-    evidence: dict | None = None
+    evidence: ResetVerifiedJobEvidence | None = None
 
 
 class DuplicateExecutorsRequest(BaseValidatorRequest):

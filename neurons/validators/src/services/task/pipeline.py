@@ -208,7 +208,7 @@ class LoggerSink:
         getattr(self.logger, level)(_m(event.event, extra=event.model_dump(mode="json")))
 
 
-def clear_evidence_for(res: CheckResult, check_id: str) -> dict[str, Any]:
+def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
     """The check's updates, with ``clear_verified_job_evidence`` filled when the check clears the verified job.
 
     DAH-3386: every check that sets ``clear_verified_job_info`` names itself to the backend — its event's
@@ -287,7 +287,7 @@ class Pipeline:
             events.append(res.event)
 
             if res.updates:
-                current_ctx = current_ctx.model_copy(update=clear_evidence_for(res, chk.check_id))
+                current_ctx = current_ctx.model_copy(update=updates_with_clear_verified_job_evidence(res, chk.check_id))
 
             if failed:
                 return False, events, current_ctx
