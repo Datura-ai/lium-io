@@ -246,6 +246,11 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
+# Where the gocryptfs passphrase and the script that carries it live for the second they exist
+# inside the rental container. /dev/shm is the tmpfs Docker (and sysbox) mount into every
+# container; /tmp is part of the container's writable layer, i.e. a directory on the provider's
+# disk, where an unlinked file stays recoverable until its blocks are reused.
+_VOLUME_SETUP_TMPFS = "/dev/shm"
 # the path comes from a customer-authored template and the backend only requires a leading slash,
 # so anything that is not a plain absolute path is refused here rather than mounted over
 _PLAINTEXT_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
@@ -733,7 +738,8 @@ def _build_gocryptfs_setup_and_mount_script(
         f"awk -v target={plaintext} "
         "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
     )
-    # Random pad XOR'd into the script as hex. Opaque names. No stdin.
+    # Random pad XOR'd into the script as hex. Opaque names. The script itself reads nothing from
+    # its stdin (no `read -r`); the caller delivers it over the SSH channel's stdin onto tmpfs.
     # ${v%${v#??}} / ${v#??} is portable sh for take/drop first two hex chars.
     return f"""set -e
 {pad_var}={pad_hex}
@@ -2560,8 +2566,8 @@ class DockerService:
         passphrase = VolumeKeyDeriver.from_settings(settings).material(pod_id).passphrase
 
         container_q = shlex.quote(container_name)
-        setup_script_path = f"/tmp/.x{uuid4().hex[:8]}"
-        passfile_path = f"/tmp/.x{uuid4().hex[:8]}"
+        setup_script_path = f"{_VOLUME_SETUP_TMPFS}/.x{uuid4().hex[:8]}"
+        passfile_path = f"{_VOLUME_SETUP_TMPFS}/.x{uuid4().hex[:8]}"
         pad_hex, wrapped_hex = _xor_wrap_passphrase(passphrase)
         pad_var = _opaque_shell_name()
         wrapped_var = _opaque_shell_name()
@@ -2629,13 +2635,14 @@ class DockerService:
             passfile_path=passfile_path,
             allow_init=allow_init,
         )
-        setup_heredoc = f"__SETUP_{uuid4().hex}__"
+        # The script goes over the SSH channel's stdin, never in the command string: sshd hands
+        # the command string to `sh -c`, so a heredoc there is the remote shell's argv, readable
+        # by anyone on the host (`/proc/<pid>/cmdline`, execsnoop, auditd) for as long as the
+        # exec runs — pad and wrapped passphrase side by side. `umask 077` makes the file 0600
+        # from its first byte: it carries the same material as the passfile the script chmods 600.
         upload_cmd = (
             f"/usr/bin/docker exec -u 0 -i {container_q} sh -c "
-            f"\"cat > {setup_script_path}\" "
-            f"<< '{setup_heredoc}'\n"
-            f"{setup_script}\n"
-            f"{setup_heredoc}"
+            f"{shlex.quote(f'umask 077 && cat > {setup_script_path}')}"
         )
         logger.info(
             _m(
@@ -2643,7 +2650,7 @@ class DockerService:
                 extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
             )
         )
-        upload_result = await ssh_client.run(upload_cmd)
+        upload_result = await ssh_client.run(upload_cmd, input=setup_script)
         if upload_result.exit_status != 0:
             await wipe_tmp_files()
             await fail_step(
