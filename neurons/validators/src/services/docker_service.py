@@ -4457,16 +4457,19 @@ class DockerService:
         and nothing is leaked, which a bare ``gather`` (one coroutine still connecting while the
         exception propagates) would not guarantee.
         """
-        outcomes = await asyncio.gather(
+        ssh_outcome, docker_outcome = await asyncio.gather(
             connections.enter_async_context(ssh_connect),
             connections.enter_async_context(docker_connect),
             return_exceptions=True,
         )
-        for outcome in outcomes:
-            if isinstance(outcome, BaseException):
-                raise outcome
-        ssh_client, docker_client = outcomes
-        return ssh_client, docker_client
+        if isinstance(ssh_outcome, BaseException):
+            if isinstance(docker_outcome, BaseException):
+                # both sides failed: the SSH error is raised, the Docker one rides along as its cause
+                raise ssh_outcome from docker_outcome
+            raise ssh_outcome
+        if isinstance(docker_outcome, BaseException):
+            raise docker_outcome
+        return ssh_outcome, docker_outcome
 
     async def create_container(
         self,
