@@ -273,7 +273,7 @@ def _observe_local_digest(ctx: Context) -> None:
     consumed — the SSH pre-check and the inspector run below are unchanged; Loki's agreement rate
     is what decides whether the fact may ever stand in for the pre-check (jam6099's call)."""
     facts = ctx.state.local_facts
-    reported = getattr(facts, "inspector_lib_sha256", None) if facts is not None else None
+    reported = facts.inspector_lib_sha256 if facts is not None else None
     if reported is None:
         return
     expected = getattr(ctx.services.inspector, "local_checksum", None)

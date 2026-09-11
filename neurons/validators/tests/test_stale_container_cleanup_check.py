@@ -32,7 +32,7 @@ class RecordingContainerCleanup:
         self.reclaim_calls = []
         self.sweep_calls = []
 
-    async def cleanup(self, ssh_client, rented_data, executor_uuid):
+    async def cleanup(self, ssh_client, rented_data, executor_uuid, host_facts=None):
         self.calls.append(
             {
                 "ssh_client": ssh_client,

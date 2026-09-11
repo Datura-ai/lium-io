@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from services.local_verify_client import StepEvidence
+
 MAX_CONTAINERS = 512
 # The host's clock (`now`, epoch seconds): a positive int below 2**40 (year ≈ 36 800) — outside
 # that the fact cannot age containers; an unbounded int would overflow the float division downstream.
@@ -143,7 +145,7 @@ def parse_inspector_digest(data: Any) -> str | None:
 
 
 def parse_facts(
-    steps: dict[str, Any],
+    steps: dict[str, StepEvidence],
     *,
     capabilities: set[str] | frozenset[str],
     round_trip_ms: int,

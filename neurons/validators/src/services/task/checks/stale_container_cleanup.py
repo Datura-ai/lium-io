@@ -56,7 +56,7 @@ class StaleContainerCleanupCheck:
             ssh_client=ctx.ssh,
             rented_data=ctx.state.rented_data,
             executor_uuid=ctx.executor.uuid,
-            **({"host_facts": ctx.state.local_facts} if ctx.state.local_facts is not None else {}),
+            host_facts=ctx.state.local_facts,
         )
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB

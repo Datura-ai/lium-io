@@ -94,7 +94,7 @@ class ContainerCleanup:
         # Outside the guarded block below: a fact that cannot be aged (a bug, an odd value the parser
         # let through) must land on the SSH listing, not on "removed nothing this cycle".
         try:
-            fact_ages = self._rental_container_ages_from_facts(host_facts)
+            fact_ages = self._rental_container_age_minutes_from_facts(host_facts)
         except Exception as e:  # noqa: BLE001 — the fact is an optimisation; SSH is the source of truth
             logger.warning(
                 _m(
@@ -479,14 +479,14 @@ class ContainerCleanup:
             return 0
 
     @staticmethod
-    def _rental_container_ages_from_facts(
+    def _rental_container_age_minutes_from_facts(
         host_facts: "LocalFacts | None",
-    ) -> dict[str, Optional[float]] | None:
+    ) -> dict[str, float | None] | None:
         """{name: age_minutes | None} for the fact's rental-prefixed containers, in the SSH
         listing's order; None when the fact cannot age containers (no listing, or no host clock)."""
         if host_facts is None or not host_facts.can_age_containers():
             return None
-        ages: dict[str, Optional[float]] = {}
+        ages: dict[str, float | None] = {}
         for container in host_facts.containers:
             if not container.name.startswith(tuple(RENTAL_CONTAINER_PREFIXES)):
                 continue

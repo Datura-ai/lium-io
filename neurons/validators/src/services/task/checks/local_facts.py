@@ -108,6 +108,11 @@ class LocalFactsCheck:
             round_trip_ms=answer.round_trip_ms,
             executor_elapsed_ms=answer.elapsed_ms,
         )
+        return self._report(ctx, facts)
+
+    def _report(self, ctx: Context, facts: LocalFacts) -> CheckResult:
+        """The event and the `[local_verify] outcome` line for a parsed fact table: which facts a
+        later check can use (`usable`) decides OK vs UNAVAILABLE and consumed vs fallback."""
         what = {
             "round_trip_ms": facts.round_trip_ms,
             "executor_elapsed_ms": facts.executor_elapsed_ms,
