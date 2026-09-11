@@ -22,11 +22,11 @@ import services.verifyx_validation_service as vvs
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from datura.requests.miner_requests import ExecutorSSHInfo
+from datura.requests.validator_requests import MatmulStep, VerifyXStep
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.checks.local_verify import (
-    STEP_WALL_CLOCK_CAP_MS,
+    ROUND_TRIP_CAP_MS_BY_STEP,
     LocalVerifyCheck,
-    LocalVerifyOutcome,
 )
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
@@ -41,6 +41,7 @@ from services.local_verify_client import (
     MAX_CAPABILITY_CHARS,
     SCHEMA,
     LocalVerifyClient,
+    LocalVerifyOutcome,
     LocalVerifyUnavailable,
     build_intent,
     canonical_intent_message,
@@ -295,7 +296,7 @@ async def run_local_then_consumers(ctx, check: LocalVerifyCheck):
 def test_intent_is_signed_over_the_canonical_document(keypair):
     intent = build_intent(
         executor_uuid="e",
-        matmul={"dim_n": 1, "dim_k": 2, "seed": 3, "cipher_text": "c"},
+        matmul=MatmulStep(dim_n=1, dim_k=2, seed=3, cipher_text="c"),
         verifyx=None,
         parallel_gpu=True,
         deadline_s=60,
@@ -357,7 +358,7 @@ def test_wire_contract_with_the_executor_side(keypair):
 
     intent = build_intent(
         executor_uuid="e",
-        matmul={"dim_n": 1900, "dim_k": 2_000_000, "seed": 3, "cipher_text": "c0ffee"},
+        matmul=MatmulStep(dim_n=1900, dim_k=2_000_000, seed=3, cipher_text="c0ffee"),
         verifyx=None,
         parallel_gpu=True,
         deadline_s=executor_deadline_s(240),
@@ -434,8 +435,8 @@ async def test_client_against_the_fake_executor(keypair, local_verify_on):
         assert await client.capabilities(executor.executor_info) == {CAPABILITY}
         intent = build_intent(
             executor_uuid=EXECUTOR_UUID,
-            matmul={"dim_n": 1, "dim_k": 2, "seed": 3, "cipher_text": "c"},
-            verifyx={"seed": 1, "cipher_text": "v"},
+            matmul=MatmulStep(dim_n=1, dim_k=2, seed=3, cipher_text="c"),
+            verifyx=VerifyXStep(seed=1, cipher_text="v"),
             parallel_gpu=True,
             deadline_s=5,
         )
@@ -1058,7 +1059,7 @@ async def test_a_pass_slower_than_the_ssh_cap_is_left_to_ssh(
     validation.validate_gpu_model_and_process_job = ssh_matmul
     verifyx_service.validate_verifyx_and_process_job = ssh_verifyx
     # The fake answers in under a millisecond; only the slow step's cap is pulled under that.
-    monkeypatch.setitem(STEP_WALL_CLOCK_CAP_MS, slow_step, -1)
+    monkeypatch.setitem(ROUND_TRIP_CAP_MS_BY_STEP, slow_step, -1)
     other = "verifyx" if slow_step == "matmul" else "matmul"
 
     async with FakeExecutor(keypair) as executor:
@@ -1070,7 +1071,7 @@ async def test_a_pass_slower_than_the_ssh_cap_is_left_to_ssh(
         )
     assert local.event.what_we_saw["fallbacks"] == {slow_step: "step_overtime"}
     assert local.event.what_we_saw["consumed"] == [other]
-    assert local.event.what_we_saw["round_trip_ms"] > STEP_WALL_CLOCK_CAP_MS[slow_step]
+    assert local.event.what_we_saw["round_trip_ms"] > ROUND_TRIP_CAP_MS_BY_STEP[slow_step]
     slow, fast = (capability, verifyx) if slow_step == "matmul" else (verifyx, capability)
     assert slow.event.what_we_saw["transport"] == "ssh"
     assert fast.event.what_we_saw["transport"] == "local_verify"
@@ -1081,7 +1082,7 @@ async def test_a_pass_slower_than_the_ssh_cap_is_left_to_ssh(
 
 def test_the_wall_clock_caps_are_the_ssh_paths_own():
     assert (
-        STEP_WALL_CLOCK_CAP_MS
+        ROUND_TRIP_CAP_MS_BY_STEP
         == {
             "matmul": mvs.MATRIX_VERIFY_TIMEOUT_SECONDS * 1000,
             "verifyx": vvs.VERIFYX_COMMAND_TIMEOUT_SECONDS * 1000,
