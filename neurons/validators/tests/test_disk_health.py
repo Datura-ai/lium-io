@@ -18,13 +18,13 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 from neurons.validators.tests.helpers import build_scrape_namespace, build_state
-
 from services.task.checks.disk_health import DiskHealthCheck, disk_error_summary
 from services.task.messages import DiskHealthMessages as Msg
 
@@ -48,6 +48,9 @@ DISK_HEALTH_HELPERS = {
     "kernel_disk_errors",
     "block_device_io_errors",
     "nvme_controller_states",
+    "SMARTCTL_TIMEOUT_S",
+    "TIMEOUT_EXIT_STATUS",
+    "run_cmd_result",
     "smart_health",
     "get_disk_health",
 }
@@ -289,32 +292,41 @@ def test_smart_is_unavailable_without_smartctl(scrape: dict[str, Any], monkeypat
     assert scrape["smart_health"]() == "unavailable"
 
 
-def test_smart_reads_the_verdict_per_device_and_keeps_going_past_a_failing_call(
+# smartctl -j's message for a device it cannot open (exit status 2, no smart_status block)
+CANNOT_OPEN_MESSAGE = {"string": "Unable to detect device type", "severity": "error"}
+
+
+def test_smart_reads_a_failing_disk_from_the_json_although_smartctl_exits_non_zero(
     scrape: dict[str, Any], monkeypatch
 ) -> None:
-    # Arrange — smartctl -j output for a healthy and a failing disk; the third device makes smartctl exit non-zero
-    reports = {
-        "/dev/nvme0n1": json.dumps({"smart_status": {"passed": True}}),
-        "/dev/sda": json.dumps({"smart_status": {"passed": False}}),
+    # Arrange — what smartctl -H -j really does: exit 0 for a healthy disk, exit 8 (bit 3, DISK FAILING)
+    # for a failing one WITH the verdict in its JSON, exit 2 with no smart_status for a device it
+    # cannot open, and timeout(1)'s 124 for a drive that never answers
+    results = {
+        "/dev/nvme0n1": (0, json.dumps({"smart_status": {"passed": True}})),
+        "/dev/sda": (8, json.dumps({"smart_status": {"passed": False}})),
+        "/dev/sdb": (2, json.dumps({"smartctl": {"messages": [CANNOT_OPEN_MESSAGE]}})),
+        "/dev/sdc": (124, ""),
     }
 
-    def fake_run_cmd(cmd):
-        device = cmd.split()[-1]
-        if device not in reports:
-            raise RuntimeError(f"run_cmd error {cmd!r} returncode=4")
-        return reports[device]
+    def fake_run_cmd_result(cmd):
+        assert cmd.startswith(f"timeout {scrape['SMARTCTL_TIMEOUT_S']} smartctl -H -j /dev/")
+        returncode, stdout = results[cmd.split()[-1]]
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
 
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/smartctl")
-    monkeypatch.setattr(glob, "glob", lambda pattern: {"/dev/sd?": ["/dev/sda", "/dev/sdb"], "/dev/nvme?n1": ["/dev/nvme0n1"]}[pattern])
-    scrape["run_cmd"] = fake_run_cmd
+    devices = {"/dev/sd?": ["/dev/sda", "/dev/sdb", "/dev/sdc"], "/dev/nvme?n1": ["/dev/nvme0n1"]}
+    monkeypatch.setattr(glob, "glob", lambda pattern: devices[pattern])
+    scrape["run_cmd_result"] = fake_run_cmd_result
 
     # Act
     verdicts = scrape["smart_health"]()
 
-    # Assert
+    # Assert — the failing disk is FAILED, not an "error: run_cmd error …" string
     assert verdicts["/dev/nvme0n1"] == "PASSED"
     assert verdicts["/dev/sda"] == "FAILED"
-    assert verdicts["/dev/sdb"].startswith("error: ")
+    assert verdicts["/dev/sdb"] == "error: Unable to detect device type"
+    assert verdicts["/dev/sdc"] == "error: smartctl did not answer within 30s"
 
 
 # --------------------------------------------------------------------------------------------------
