@@ -218,7 +218,7 @@ def test_all_steps_run_and_return_raw_evidence(fake_scripts, fake_docker):
 
     ports = result.steps["ports"].data
     assert isinstance(ports, PortFacts)
-    assert ports.configured == 10 and ports.published_by_docker == [40001] and ports.free == 9
+    assert ports.configured == 10 and ports.published_by_docker == [40001] and ports.free_ports == 9
 
     inspector = result.steps["inspector"].data
     assert isinstance(inspector, InspectorFacts)
@@ -596,6 +596,24 @@ def test_malformed_intent_is_422_before_any_signature_check(client, validator_ke
         )
     with pytest.raises(ValueError):
         DeviceChallenge(index=-1, seed=1, cipher_text="x")
+
+
+def test_unknown_top_level_field_is_422_even_when_signed(client, validator_keypair):
+    """Regression: `extra="ignore"` on the wire models would accept `{"steps": …, "priority": 1}`,
+    run the suite (200) and silently drop the field — while the Rust liumd (`deny_unknown_fields`)
+    refuses the same document. Both sides refuse, so the schema can be pinned."""
+    intent = _body().model_dump(by_alias=True)
+    intent["priority"] = 1
+    intent["signature"] = "0x" + validator_keypair.sign(canonical_intent_message(intent)).hex()
+    response = client.post("/verify", json=intent)
+    assert response.status_code == 422, response.text
+    assert "priority" in response.text
+    # A nested unknown field is refused the same way; the intent's own fields alone are accepted.
+    nested = _signed(_body(), validator_keypair)
+    nested["steps"]["matmul"]["dim_m"] = 4
+    nested["signature"] = "0x" + validator_keypair.sign(canonical_intent_message(nested)).hex()
+    assert client.post("/verify", json=nested).status_code == 422
+    assert client.post("/verify", json=_signed(_body(), validator_keypair)).status_code == 200
 
 
 def test_canonical_message_is_the_shared_datura_definition():

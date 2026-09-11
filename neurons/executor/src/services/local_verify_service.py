@@ -357,7 +357,7 @@ def _port_facts(port_range: str | None, port_mappings: str | None, ssh_port: int
         configured=len(pairs),
         sampled=len(sample),
         published_by_docker=in_use,
-        free=len(sample) - len(in_use),
+        free_ports=len(sample) - len(in_use),
     )
 
 
@@ -439,8 +439,8 @@ class LocalVerifyService:
             )
         if steps.inspector:
             facts["inspector"] = lambda: run_facts("inspector", _inspector_facts)
-        gpu_order = list(gpu)
-        return {**gpu, **facts}, gpu_order
+        gpu_step_names = list(gpu)
+        return {**gpu, **facts}, gpu_step_names
 
     async def run(self, body: VerifyIntentBody) -> VerifyResult:
         if self._busy.locked():
@@ -452,7 +452,7 @@ class LocalVerifyService:
         started_wall = int(time.time())
         started = time.perf_counter()
         deadline = min(body.deadline_s, self.max_deadline_s)
-        runners, gpu_order = self._runners(body)
+        runners, gpu_step_names = self._runners(body)
         results: dict[str, StepResult] = {}
 
         async def step(name: str) -> None:
@@ -463,13 +463,13 @@ class LocalVerifyService:
         async def gpu_group() -> None:
             # VerifyX then matmul, the pipeline's order, unless the validator asked for both at once.
             if body.parallel_gpu:
-                await asyncio.gather(*(step(n) for n in gpu_order))
+                await asyncio.gather(*(step(n) for n in gpu_step_names))
                 return
-            for name in sorted(gpu_order, key=lambda n: 0 if n == "verifyx" else 1):
+            for name in sorted(gpu_step_names, key=lambda n: 0 if n == "verifyx" else 1):
                 await step(name)
 
-        tasks = [asyncio.ensure_future(step(n)) for n in runners if n not in gpu_order]
-        if gpu_order:
+        tasks = [asyncio.ensure_future(step(n)) for n in runners if n not in gpu_step_names]
+        if gpu_step_names:
             tasks.append(asyncio.ensure_future(gpu_group()))
 
         deadline_hit = False

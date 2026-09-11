@@ -24,7 +24,7 @@ from core.config import VALIDATOR_HOTKEY_SS58, settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload, SignaturePayload
-from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent, VerifyIntentBody  # noqa: E501
+from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
 from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature, verify_signature
 from services.local_verify_service import (
     BusyError,
@@ -411,9 +411,8 @@ async def local_verify(request: Request):
     # Signed as sent: the validator signs the document it puts on the wire, so a field it left at
     # its default is not re-serialised here and a field it did send cannot be altered in flight.
     await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))
-    body = VerifyIntentBody.model_validate({k: v for k, v in raw.items() if k != "signature"})
 
-    refused = check_intent_window(body, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS)
+    refused = check_intent_window(intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS)
     if refused:
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
     service = _get_local_verify_service()
@@ -421,16 +420,16 @@ async def local_verify(request: Request):
     # the validator may re-send the same signed intent once the executor is free.
     if service.busy:
         raise HTTPException(status_code=409, detail="a verification is already running")
-    if not _local_verify_nonces.claim(body.nonce, float(body.expires_at)):
+    if not _local_verify_nonces.claim(intent.nonce, float(intent.expires_at)):
         raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
 
     try:
-        result = await service.run(body)
+        result = await service.run(intent)
     except BusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     logger.info(
         "local verify done nonce=%s elapsed_ms=%d deadline_hit=%s steps=%s",
-        body.nonce,
+        intent.nonce,
         result.elapsed_ms,
         result.deadline_hit,
         {name: step.status for name, step in result.steps.items()},
