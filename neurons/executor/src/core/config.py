@@ -1,16 +1,41 @@
+import importlib.util
 from typing import Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from scalecodec.utils.ss58 import is_valid_ss58_address
+
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
+# The validator whose signatures this executor trusts (SSH-key uploads, /ping,
+# /hardware_utilization, container metrics and logs). Deliberately not an
+# environment variable: a host operator must not be able to repoint the executor
+# at another validator at runtime. Non-prod images bake a different anchor in at
+# build time — docker_build.sh writes core/config_override.py.
+_BUILTIN_VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
 
 
-# This hotkey is used to verify the validator signature. 
-# This shouldn't be overridden by the environment variable. 
-VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
-try:
-    from core.config_override import _VALIDATOR_HOTKEY_SS58 
-    VALIDATOR_HOTKEY_SS58 = _VALIDATOR_HOTKEY_SS58
-except Exception:
-    pass
+def _resolve_validator_hotkey() -> str:
+    if importlib.util.find_spec("core.config_override") is None:
+        logger.info("Validator trust anchor: built-in %s", _BUILTIN_VALIDATOR_HOTKEY_SS58)
+        return _BUILTIN_VALIDATOR_HOTKEY_SS58
+    # An override module is present, so this is a non-prod build. Anything wrong
+    # with it (import error, missing name, mistyped address) is a broken build;
+    # failing here beats silently trusting the built-in anchor of another
+    # environment, or rejecting every signature at runtime.
+    from core.config_override import _VALIDATOR_HOTKEY_SS58 as override
+
+    if not is_valid_ss58_address(override):
+        raise RuntimeError(
+            f"core.config_override._VALIDATOR_HOTKEY_SS58 is not an ss58 address: {override!r}"
+        )
+    logger.warning("Validator trust anchor: OVERRIDDEN by core.config_override -> %s", override)
+    return override
+
+
+VALIDATOR_HOTKEY_SS58 = _resolve_validator_hotkey()
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
