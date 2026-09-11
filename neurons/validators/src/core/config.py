@@ -311,6 +311,24 @@ class Settings(BaseSettings):
     # VALIDATOR_LOCAL_VERIFY_ENABLED and LOCAL_VERIFY_FACTS_ENABLED (the facts call's /version answer is
     # what says the executor takes the call — without it nothing starts early).
     LOCAL_VERIFY_GPU_EARLY_START: bool = Field(env="LOCAL_VERIFY_GPU_EARLY_START", default=False)
+    # liumd deploy (DAH-2834, speed/DEPLOY_LOCAL_RENT.md): create the rental container with ONE signed
+    # `POST /rent` on the executor — the validator's own run spec, made with the same docker-py calls on
+    # the host, running-state and sshd-port waits included — instead of the Docker SDK `run` through
+    # the SSH tunnel plus the `docker ps` poll. Only a spec with nothing private (no renter command,
+    # entrypoint or environment: the executor API is plain HTTP) takes it; every refusal, timeout,
+    # 404 or malformed answer falls back to the SDK path unchanged. Off by default.
+    VALIDATOR_LOCAL_RENT_ENABLED: bool = Field(env="VALIDATOR_LOCAL_RENT_ENABLED", default=False)
+    # Whole-call budget for `POST /rent` (seconds); the executor is told to stop EXECUTOR_ROLLBACK_MARGIN_S
+    # (15 s) earlier, floor 5 (services/local_rent_client.py: the margin covers its by-id rollback).
+    LOCAL_RENT_TIMEOUT_SECONDS: int = Field(env="LOCAL_RENT_TIMEOUT_SECONDS", default=45)
+    # > 0: for an image that ships sshd, the call also waits up to this many seconds for the SSH banner
+    # on the published port before answering, so RUNNING means "sshd answers" — at ≈ +0.5 s p50 on the
+    # critical path (measured, speed/DEPLOY_LOCAL_RENT.md), time that today overlaps the key/env execs.
+    # A wait the banner misses is a failed call: the executor rolls the container back and the SDK path
+    # creates it again — set it above the image's sshd start time, or leave it at 0.
+    # 0 (default): no wait; the renter's first connection retries as it does today. Capped at 60 s, the
+    # executor's `ReadyStep.ssh_timeout_s` bound (`local_rent_client.SSH_WAIT_MAX_S`).
+    LOCAL_RENT_SSHD_WAIT_SECONDS: int = Field(env="LOCAL_RENT_SSHD_WAIT_SECONDS", default=0)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both

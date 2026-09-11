@@ -295,13 +295,22 @@ class LocalVerifyClient:
         }
 
     async def verify(self, executor_info, intent: dict[str, Any]) -> LocalVerifyAnswer:
+        raw, round_trip_ms = await self.post_signed(executor_info, "/verify", intent)
+        return parse_answer(raw, intent=intent, round_trip_ms=round_trip_ms)
+
+    async def post_signed(
+        self, executor_info, path: str, intent: dict[str, Any]
+    ) -> tuple[Any, int]:
+        """One signed intent to `path`, the executor's JSON answer back (bounded) with the round
+        trip in ms; every non-200 and every transport error is a `LocalVerifyUnavailable` whose
+        reason names it. `/verify` and the deploy path's `/rent` post the same way."""
         signed = sign_intent(intent, self.keypair)
         timeout = aiohttp.ClientTimeout(total=self.timeout_s, connect=self.connect_timeout_s)
         started = time.perf_counter()
         try:
             async with self._session_factory(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url(executor_info)}/verify", json=signed, allow_redirects=False
+                    f"{self.base_url(executor_info)}{path}", json=signed, allow_redirects=False
                 ) as response:
                     # A redirect would re-send the signed intent to a host of the executor's
                     # choosing: it is an http_error below. The body is bounded before it is parsed.
@@ -332,4 +341,4 @@ class LocalVerifyClient:
             raw = json.loads(text)
         except ValueError:
             raise LocalVerifyUnavailable("malformed", "answer is not JSON")
-        return parse_answer(raw, intent=intent, round_trip_ms=round_trip_ms)
+        return raw, round_trip_ms

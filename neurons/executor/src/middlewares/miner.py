@@ -23,8 +23,8 @@ SELF_AUTHENTICATED_GET_PATTERNS = (
     re.compile(r"^/containers/[^/]+/logs/?$"),  # verify_container_logs_signature
 )
 # POST routes that verify a validator signature themselves instead of the miner's
-# (/verify: the validator's hotkey over the whole intent, nonce'd and time-windowed).
-SELF_AUTHENTICATED_POST_PATHS = frozenset({"/hardware_utilization", "/ping", "/verify"})
+# (/verify and /rent: the validator's hotkey over the whole intent, nonce'd and time-windowed).
+SELF_AUTHENTICATED_POST_PATHS = frozenset({"/hardware_utilization", "/ping", "/verify", "/rent"})
 SELF_AUTHENTICATED_POST_PATTERNS = (
     re.compile(r"^/containers(/[^/]+)?/?$"),  # verify_container_signature
 )

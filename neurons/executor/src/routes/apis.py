@@ -29,6 +29,9 @@ from payloads.verify import (
     DIND_CAPABILITY as LOCAL_VERIFY_DIND_CAPABILITY,
     VerifyIntent,
 )
+from payloads.rent import CAPABILITY as LOCAL_RENT_CAPABILITY, RentIntent, RentIntentBody
+from services.local_rent_service import BusyError as RentBusyError, LocalRentService
+from services.ssh_service import SSHService
 from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature, verify_signature
 from services.local_verify_service import (
     BusyError,
@@ -357,11 +360,13 @@ async def ping(_: None = Depends(verify_ping_signature)):
 def _capabilities() -> list[str]:
     # What a validator may call beyond the routes every executor has. Read per request so a flag
     # flip is visible without a restart of anything but this process.
-    if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
-        return []
-    caps = [LOCAL_VERIFY_CAPABILITY]
-    if settings.EXECUTOR_LOCAL_VERIFY_DIND_ENABLED:
-        caps.append(LOCAL_VERIFY_DIND_CAPABILITY)
+    caps: list[str] = []
+    if settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
+        caps.append(LOCAL_VERIFY_CAPABILITY)
+        if settings.EXECUTOR_LOCAL_VERIFY_DIND_ENABLED:
+            caps.append(LOCAL_VERIFY_DIND_CAPABILITY)
+    if settings.EXECUTOR_LOCAL_RENT_ENABLED:
+        caps.append(LOCAL_RENT_CAPABILITY)
     return caps
 
 
@@ -445,6 +450,75 @@ async def local_verify(request: Request):
         intent.nonce,
         result.elapsed_ms,
         result.deadline_hit,
+        {name: step.status for name, step in result.steps.items()},
+    )
+    return result.model_dump(by_alias=True)
+
+
+_local_rent_service: LocalRentService | None = None
+
+
+def _get_local_rent_service() -> LocalRentService:
+    global _local_rent_service
+    if _local_rent_service is None:
+        _local_rent_service = LocalRentService(
+            executor_version=_get_version(),
+            max_deadline_s=settings.LOCAL_RENT_MAX_DEADLINE_SECONDS,
+            port_range=settings.RENTING_PORT_RANGE,
+            port_mappings=settings.RENTING_PORT_MAPPINGS,
+            ssh_port=settings.SSH_PORT,
+            host_key=SSHService().get_host_public_key,
+        )
+    return _local_rent_service
+
+
+@apis_router.post("/rent")
+async def local_rent(request: Request):
+    """Create the rental container from one validator-signed intent (liumd deploy).
+
+    Auth, nonce and window exactly as `/verify` (the intent is signed as sent, replay refused).
+    Flag off → 404; the validator treats every non-200 as "use SSH". Nonces are shared with
+    `/verify`: one cache, one rule. Busy → 409 before the nonce is claimed, so the same signed
+    intent may be re-sent.
+    """
+    if not settings.EXECUTOR_LOCAL_RENT_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    try:
+        raw = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Body is not JSON")
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=422, detail="Body is not an object")
+    try:
+        intent = RentIntent.model_validate(raw)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors())
+    await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))
+    body = RentIntentBody.model_validate({k: v for k, v in raw.items() if k != "signature"})
+
+    refused = check_intent_window(body, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS)
+    if refused:
+        raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
+    service = _get_local_rent_service()
+    refused = service.refuse_intent(body)
+    if refused:
+        raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
+    if service.busy:
+        raise HTTPException(status_code=409, detail="a rental create is already running")
+    if not _local_verify_nonces.claim(body.nonce, float(body.expires_at)):
+        raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
+
+    try:
+        result = await service.run(body)
+    except RentBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    logger.info(
+        "local rent done nonce=%s elapsed_ms=%d deadline_hit=%s rolled_back=%s steps=%s",
+        body.nonce,
+        result.elapsed_ms,
+        result.deadline_hit,
+        result.rolled_back,
         {name: step.status for name, step in result.steps.items()},
     )
     return result.model_dump(by_alias=True)

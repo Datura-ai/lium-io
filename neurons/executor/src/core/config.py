@@ -103,6 +103,13 @@ class Settings(BaseSettings):
     EXECUTOR_LOCAL_VERIFY_DIND_ENABLED: bool = Field(env="EXECUTOR_LOCAL_VERIFY_DIND_ENABLED", default=False)
     # How far the intent's issued_at may be from this host's clock (seconds, either way).
     LOCAL_VERIFY_INTENT_WINDOW_SECONDS: int = Field(env="LOCAL_VERIFY_INTENT_WINDOW_SECONDS", default=120)
+    # liumd deploy (DAH-2834): `POST /rent` creates the rental container from the validator's
+    # signed run spec with docker-py on this host — the SSH path's `docker run` + running poll in
+    # one call. Off: 404 and not advertised (`local_rent/1`), the validator keeps the SSH path.
+    # Independent of the /verify flag; the same hotkey, nonce and window rules apply.
+    EXECUTOR_LOCAL_RENT_ENABLED: bool = Field(env="EXECUTOR_LOCAL_RENT_ENABLED", default=False)
+    # Longest a single /rent call may run before answering (and rolling back what it made).
+    LOCAL_RENT_MAX_DEADLINE_SECONDS: int = Field(env="LOCAL_RENT_MAX_DEADLINE_SECONDS", default=120)
 
 
 settings = Settings()

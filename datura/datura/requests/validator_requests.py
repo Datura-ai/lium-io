@@ -92,6 +92,13 @@ LOCAL_VERIFY_DIND_NAME_MAX = 128
 LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN = r"^ssh-(ed25519|rsa) [A-Za-z0-9+/=]{1,900}( [A-Za-z0-9@._-]{1,64})?$"
 LOCAL_VERIFY_DIND_PUBLIC_KEY_MAX = 1024
 
+# liumd deploy (DAH-2834, `speed/DEPLOY_LOCAL_RENT.md`): the validator's one-call rental create,
+# `POST /rent` on the executor — the rental container made from the validator's own run spec
+# (`datura.rental_spec`) by the executor's docker-py on the host, instead of over the SSH tunnel.
+# Signed with `local_verify_signing_blob` like `/verify`; advertised as its own capability.
+LOCAL_RENT_SCHEMA = "lium.local_rent/1"
+LOCAL_RENT_CAPABILITY = "local_rent/1"
+
 
 # The largest card count one host can claim; bounds the matmul fan-out an intent can ask for.
 LOCAL_VERIFY_MAX_DEVICES = 64
