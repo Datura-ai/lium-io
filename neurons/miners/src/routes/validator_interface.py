@@ -19,7 +19,12 @@ from datura.requests.miner_requests import (
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from consumers.validator_consumer import ValidatorConsumer
-from dependencies.auth import verify_simple_validator_signature, verify_validator_auth_from_headers
+from dependencies.auth import (
+    authenticated_miner_hotkey,
+    require_request_names_authenticated_miner,
+    verify_simple_validator_signature,
+    verify_validator_auth_from_headers,
+)
 from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
 
@@ -87,6 +92,7 @@ async def get_executors_for_validator(
 async def submit_ssh_pubkey(
     request: SSHPubKeySubmitRequest,
     authenticated_validator: Annotated[str, Depends(verify_validator_auth_from_headers)],
+    authenticated_miner: Annotated[str, Depends(authenticated_miner_hotkey)],
     executor_service: Annotated[ExecutorService, Depends(ExecutorService)],
     ssh_service: Annotated[MinerSSHService, Depends(MinerSSHService)],
 ) -> AcceptSSHKeyRequest | FailedRequest:
@@ -104,6 +110,7 @@ async def submit_ssh_pubkey(
     Returns:
         AcceptSSHKeyRequest with executors or FailedRequest on error
     """
+    require_request_names_authenticated_miner(request.miner_hotkey, authenticated_miner)
     try:
         logger.info("Validator %s sent SSH Pubkey via REST API.", authenticated_validator)
         
@@ -151,6 +158,7 @@ async def submit_ssh_pubkey(
 async def remove_ssh_pubkey(
     request: SSHPubKeyRemoveRequest,
     authenticated_validator: Annotated[str, Depends(verify_validator_auth_from_headers)],
+    authenticated_miner: Annotated[str, Depends(authenticated_miner_hotkey)],
     executor_service: Annotated[ExecutorService, Depends(ExecutorService)],
 ) -> SSHKeyRemoved | FailedRequest:
     """Remove SSH public key from miner (REST API version).
@@ -166,6 +174,7 @@ async def remove_ssh_pubkey(
     Returns:
         SSHKeyRemoved on success or FailedRequest on error
     """
+    require_request_names_authenticated_miner(request.miner_hotkey, authenticated_miner)
     try:
         logger.info("Validator %s sent remove SSH Pubkey via REST API.", authenticated_validator)
         
@@ -187,6 +196,7 @@ async def remove_ssh_pubkey(
 async def get_pod_logs(
     request: GetPodLogsRequest,
     authenticated_validator: Annotated[str, Depends(verify_validator_auth_from_headers)],
+    authenticated_miner: Annotated[str, Depends(authenticated_miner_hotkey)],
     executor_service: Annotated[ExecutorService, Depends(ExecutorService)],
 ) -> PodLogsResponse | FailedRequest:
     """Get pod logs from miner (REST API version).
@@ -202,6 +212,7 @@ async def get_pod_logs(
     Returns:
         PodLogsResponse with logs or FailedRequest on error
     """
+    require_request_names_authenticated_miner(request.miner_hotkey, authenticated_miner)
     try:
         logger.info("Validator %s get pod logs for container %s via REST API.", authenticated_validator, request.container_name)
         

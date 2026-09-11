@@ -8,6 +8,7 @@ import bittensor
 from datura.requests.validator_requests import SimpleValidatorRequest
 from fastapi import Depends, Header, HTTPException, status
 
+from core import config as core_config
 from services.validator_service import ValidatorService
 
 logger = logging.getLogger(__name__)
@@ -72,10 +73,15 @@ async def verify_validator_auth_from_headers(
     must be within AUTH_MESSAGE_MAX_AGE seconds of the current time (symmetric window
     to handle small clock differences between servers). Each request must send a fresh
     timestamp to prevent replay attacks.
+
+    X-Miner-Hotkey is part of the signed blob and names the miner the validator signed in
+    to. Outside CENTRAL_MODE this miner serves one hotkey and answers 403 when the header
+    names another one; the central miner serves many portal hotkeys and accepts any, with
+    `authenticated_miner_hotkey` binding the request body to the same name.
     
     Args:
         x_validator_hotkey: Validator hotkey from header
-        x_miner_hotkey: Miner hotkey from header (must match this miner's hotkey)
+        x_miner_hotkey: Miner hotkey from header (must be this miner's hotkey outside CENTRAL_MODE)
         x_timestamp: Unix timestamp from header (in seconds, or milliseconds if > 1e12)
         x_signature: Signature from header
         validator_service: Service to check validator registration
@@ -128,6 +134,22 @@ async def verify_validator_auth_from_headers(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Validator is not registered",
         )
+
+    # A standard miner serves one hotkey: a sign-in made for another miner is not for us.
+    # settings is read through its module so a test can replace it for one request.
+    if not core_config.settings.CENTRAL_MODE:
+        own_hotkey = core_config.settings.get_bittensor_wallet().get_hotkey().ss58_address
+        if x_miner_hotkey != own_hotkey:
+            logger.warning(
+                "Validator %s signed in for miner %s; this miner is %s",
+                validator_hotkey,
+                x_miner_hotkey,
+                own_hotkey,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Authentication names another miner",
+            )
     
     # Create authentication payload and verify signature
     # Use normalized timestamp in seconds
@@ -161,6 +183,37 @@ async def verify_validator_auth_from_headers(
         )
     
     return validator_hotkey
+
+
+async def authenticated_miner_hotkey(
+    x_miner_hotkey: Annotated[str, Header(alias="X-Miner-Hotkey")],
+    _validator_hotkey: Annotated[str, Depends(verify_validator_auth_from_headers)],
+) -> str:
+    """The miner hotkey the validator's signed headers named (verified by the dependency above)."""
+    return x_miner_hotkey
+
+
+def require_request_names_authenticated_miner(request_miner_hotkey: str, authenticated: str) -> None:
+    """A request body's miner_hotkey must be the one the signed headers named.
+
+    The validator sends the same hotkey in both places (MinerService._generate_auth_headers and
+    every request it builds); a body naming another miner would let signed-in headers act for a
+    miner the signature never named.
+
+    Raises:
+        HTTPException: 403 when the body names another miner
+    """
+    if request_miner_hotkey != authenticated:
+        logger.warning(
+            "Request names miner %s but the signed headers named %s",
+            request_miner_hotkey,
+            authenticated,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Request names a miner the authentication did not",
+        )
+
 
 async def verify_simple_validator_signature(
     request: SimpleValidatorRequest,

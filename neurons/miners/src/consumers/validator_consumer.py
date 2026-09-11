@@ -52,6 +52,8 @@ class ValidatorConsumer(BaseConsumer):
         self.validator_key = validator_key
         self.my_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
         self.validator_authenticated = False
+        # the miner hotkey the validator's signed sign-in named; every later message must name it too
+        self.authenticated_miner_hotkey: str | None = None
         self.msg_queue = []
 
     def accepted_request_type(self):
@@ -60,8 +62,11 @@ class ValidatorConsumer(BaseConsumer):
     def verify_auth_msg(self, msg: AuthenticateRequest) -> tuple[bool, str]:
         if msg.payload.timestamp < time.time() - AUTH_MESSAGE_MAX_AGE:
             return False, "msg too old"
-        # if msg.payload.miner_hotkey != self.my_hotkey:
-        #     return False, f"wrong miner hotkey ({self.my_hotkey}!={msg.payload.miner_hotkey})"
+        # The signed payload names the miner it is for. A standard miner serves one hotkey and
+        # refuses a sign-in made for another; the central miner serves many portal hotkeys and
+        # cannot compare here — its later messages are bound to this name instead (handle_message).
+        if not settings.CENTRAL_MODE and msg.payload.miner_hotkey != self.my_hotkey:
+            return False, f"wrong miner hotkey ({self.my_hotkey}!={msg.payload.miner_hotkey})"
         if msg.payload.validator_hotkey != self.validator_key:
             return (
                 False,
@@ -71,6 +76,7 @@ class ValidatorConsumer(BaseConsumer):
         keypair = bittensor.Keypair(ss58_address=self.validator_key)
         if keypair.verify(msg.blob_for_signing(), msg.signature):
             return True, ""
+        return False, "invalid signature"
 
     async def handle_authentication(self, msg: AuthenticateRequest):
         # check if validator is registered
@@ -88,8 +94,12 @@ class ValidatorConsumer(BaseConsumer):
             return
 
         self.validator_authenticated = True
-        for msg in self.msg_queue:
-            await self.handle_message(msg)
+        self.authenticated_miner_hotkey = msg.payload.miner_hotkey
+        for queued in list(self.msg_queue):
+            await self.handle_message(queued)
+            if not self.validator_authenticated:
+                # a queued message named another miner: the session is over, stop replaying
+                break
 
     async def check_validator_allowance(self, msg: AuthenticateRequest):
         """Check if there's any executors opened for current validator.
@@ -145,6 +155,20 @@ class ValidatorConsumer(BaseConsumer):
         if not self.validator_authenticated:
             if len(self.msg_queue) <= MAX_MESSAGE_COUNT:
                 self.msg_queue.append(msg)
+            return
+
+        # every request after the sign-in carries a miner_hotkey; it must be the one the sign-in named
+        named_miner = getattr(msg, "miner_hotkey", None)
+        if named_miner != self.authenticated_miner_hotkey:
+            details = (
+                f"message names miner {named_miner}, but this session was authenticated "
+                f"for {self.authenticated_miner_hotkey}"
+            )
+            logger.info("Validator %s: %s", self.validator_key, details)
+            # the session is over: nothing queued behind this message is served either
+            self.validator_authenticated = False
+            await self.send_message(UnAuthorizedRequest(details=details))
+            await self.disconnect()
             return
 
         if isinstance(msg, SSHPubKeySubmitRequest):
