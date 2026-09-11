@@ -444,6 +444,14 @@ class ExecutorImageMessages:
         category="policy",
         impact="Score set to 0 until the image is current",
     )
+    # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
+    OUTDATED_WARNING = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="warning",
+        category="policy",
+        impact="Warning only until EXECUTOR_IMAGE_CHECK_ENFORCE is on: score and incentive unchanged",
+    )
 
 
 class SysboxRequiredMessages:

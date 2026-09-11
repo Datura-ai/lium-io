@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from core.config import Settings, settings
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -21,6 +22,16 @@ from tests.helpers import build_context_config, build_state, make_context
 
 EXECUTOR_DIGEST = f"sha256:{'a' * 64}"
 STALE_DIGEST = f"sha256:{'c' * 64}"
+
+
+@pytest.fixture
+def enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
+
+
+@pytest.fixture
+def warn_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
 
 
 def policy() -> ExpectedImageSnapshot:
@@ -94,8 +105,14 @@ def test_observation_returns_none_when_ambiguous():
     )
 
 
+def test_enforcement_is_off_by_default():
+    # Regression: flipping the default back to True zeroes idle pay for every node still on
+    # the old image before DAH-3419 restores auto-update (99 executors on 11 Sep).
+    assert Settings.model_fields["EXECUTOR_IMAGE_CHECK_ENFORCE"].default is False
+
+
 @pytest.mark.asyncio
-async def test_unrented_outdated_executor_fails_validation():
+async def test_unrented_outdated_executor_fails_validation(enforce):
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
         state=build_state(
@@ -109,10 +126,38 @@ async def test_unrented_outdated_executor_fails_validation():
     assert result.passed is False
     assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
     assert "unavailable for rent" in result.event.impact
+    assert result.event.severity == "error"
+    assert result.event.context["executor_image_check_enforced"] is True
+    assert "earns no incentive" in result.event.remediation
 
 
 @pytest.mark.asyncio
-async def test_rented_outdated_executor_passes_validation():
+async def test_warning_only_unrented_outdated_executor_passes_and_logs_digests(warn_only):
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(
+            specs=specs(executor_digest=STALE_DIGEST),
+            rented_data=SimpleNamespace(executors={}),
+        ),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is True
+    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
+    assert result.updates["default_extra"]["executor_image_status"] == "OUTDATED"
+    assert result.event.reason_code == "EXECUTOR_IMAGE_OUTDATED"
+    assert result.event.severity == "warning"
+    assert result.event.what_we_saw["observed_digest"] == STALE_DIGEST
+    assert result.event.what_we_saw["expected_digest"] == EXECUTOR_DIGEST
+    assert "EXECUTOR_IMAGE_CHECK_ENFORCE" in result.event.impact
+    assert "EXECUTOR_IMAGE_CHECK_ENFORCE" in result.event.remediation
+    assert "earns no incentive" not in result.event.remediation
+    assert result.event.context["executor_image_check_enforced"] is False
+
+
+@pytest.mark.asyncio
+async def test_rented_outdated_executor_passes_validation(enforce):
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
         state=build_state(
@@ -144,7 +189,7 @@ async def test_current_executor_passes_validation():
 
 
 @pytest.mark.asyncio
-async def test_unobservable_executor_digest_is_outdated():
+async def test_unobservable_executor_digest_is_outdated(enforce):
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
         state=build_state(
@@ -220,6 +265,7 @@ def test_image_check_precedes_tenant_enforcement_in_both_pipelines():
     [(False, 0.0), (True, 1.0)],
 )
 def test_score_calculator_zeroes_outdated_executor(
+    enforce,
     rented: bool,
     expected_job_score: float,
 ):
@@ -237,6 +283,25 @@ def test_score_calculator_zeroes_outdated_executor(
     assert actual_score == 0.0
     assert job_score == expected_job_score
     assert "Required executor image is outdated" in warning
+
+
+@pytest.mark.parametrize("rented", [False, True])
+def test_warning_only_score_calculator_leaves_outdated_executor_scored(warn_only, rented: bool):
+    report = policy().report(STALE_DIGEST)
+    context = make_context(
+        state=build_state(
+            gpu_model="NVIDIA H200",
+            executor_image_report=report,
+            specs={"network": {"ema_verifyx_download_speed": 100.0}},
+        ),
+        collateral_deposited=True,
+    )
+
+    actual_score, job_score, warning = calculate_scores(context, rented)
+
+    assert actual_score == 1.0
+    assert job_score == 1.0
+    assert "outdated" not in warning
 
 
 @pytest.mark.asyncio

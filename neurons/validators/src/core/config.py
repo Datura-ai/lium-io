@@ -332,6 +332,12 @@ class Settings(BaseSettings):
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
     )
+    # DAH-2701 compares the executor container's image digest with EXECUTOR_IMAGE_REF's.
+    # False (default): an OUTDATED verdict is logged with both digests and the score, the
+    # incentive and the validation result are unchanged. True: an idle OUTDATED executor fails
+    # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
+    # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
+    EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
 
     # DAH-2272: when on, raise the asyncssh logger to DEBUG (debug level 2) so the
     # SSH handshake (banner / key exchange / auth) is logged per connection, and
