@@ -15,6 +15,8 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+
 from .models import JobResult
 from .pipeline import Context
 
@@ -40,6 +42,23 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
         return specs
 
     return {**specs, "gpu": {**gpu, "details": canonical_details}}
+
+
+def _visits_into_own_filler_containers(
+    reported_entries: object, rented_data: RentedExecutorsResponse | None, executor_uuid: str
+) -> list:
+    if not isinstance(reported_entries, list) or rented_data is None:
+        return []
+    own_containers = set(rented_data.get_filler_containers(executor_uuid))
+    # The container name is checked for being a name before the lookup: an unhashable value
+    # (a list, a dict) would raise on the set membership, and this must fail open, not fail.
+    return [
+        entry
+        for entry in reported_entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("container"), str)
+        and entry["container"] in own_containers
+    ]
 
 
 class ResultHandler:
@@ -161,6 +180,15 @@ class ResultHandler:
         # backend types this nested object as MachineSpecs.gpu_metrics.
         if context.state.gpu_metrics is not None:
             specs["gpu_metrics"] = context.state.gpu_metrics
+
+        # DAH-2787: the scrape sees every filler container on the HOST, and a host can carry more
+        # than one executor. Keep only the visits into containers the backend says are THIS
+        # executor's - the same rule DAH-2735 uses to decide whose workload is whose. No backend
+        # snapshot means nothing can be attributed, so nothing is judged.
+        if "filler_entries" in specs:
+            specs["filler_entries"] = _visits_into_own_filler_containers(
+                specs["filler_entries"], context.state.rented_data, executor_info.uuid
+            )
 
         # DAH-2265 Plan 2: advisory cached-template signal — whether this executor has the
         # recommended default image pre-pulled (so DOCKER_PULL is a no-op for default-template
