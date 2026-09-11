@@ -184,6 +184,9 @@ class LocalVerifyOutcome:
     # Phase 2: the backend rental probe started beside the GPU steps (LOCAL_VERIFY_RENTAL_PROBE_PARALLEL);
     # `RentalVerificationCheck` awaits it, `Pipeline.run` settles it on a halt. None = not started.
     rental_probe: BackgroundProbe | None = None
+    # Phase 3: the GPU call started early (LOCAL_VERIFY_GPU_EARLY_START; `checks/local_verify.PendingVerify`);
+    # `LocalVerifyCheck` awaits and judges it, `Pipeline.run` settles it on a halt. None = not started / consumed.
+    pending: BackgroundProbe | None = None
 
 
 @dataclass

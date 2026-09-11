@@ -536,6 +536,23 @@ def _held_vram_without_owner(
     ]
 
 
+def reads_the_live_card(
+    gpu_details: list[dict], gpu_processes: list[dict], workload_containers: set[str]
+) -> bool:
+    """True when this check's verdict for the scrape's snapshot would come from a live `nvidia-smi`
+    read rather than the snapshot alone: the ghost-GPU cure and re-sample (a wedge candidate with
+    no process) or the ownerless-VRAM confirmation. Public for liumd phase 3
+    (`LocalVerifyStartCheck`): the validator's own matmul/VerifyX must not be the compute app on the
+    card when either read is taken — it would read as the wedge cured, or as an owner for the held
+    VRAM — so the early call is not started on a cycle that needs one (the later call runs after
+    this check, as today). A superset of the read conditions is fine here: the cost of a false
+    "yes" is only the lost overlap.
+    """
+    if not gpu_processes and any(_is_wedge_candidate(detail) for detail in gpu_details):
+        return True
+    return bool(_held_vram_without_owner(gpu_details, gpu_processes, workload_containers))
+
+
 def _find_violation(gpu_details: list[dict], gpu_processes: list[dict]) -> dict | None:
     if not gpu_processes:
         return None

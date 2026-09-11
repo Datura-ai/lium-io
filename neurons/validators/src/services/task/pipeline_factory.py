@@ -48,6 +48,7 @@ from .checks import (
     InspectorRentedCheck,
     LocalFactsCheck,
     LocalVerifyCheck,
+    LocalVerifyStartCheck,
     MachineSpecScrapeCheck,
     NvmlDigestCheck,
     PortConnectivityCheck,
@@ -301,6 +302,11 @@ class PipelineFactory:
                 # picks — and is observed by the inspector pre-check. Off by default; every
                 # verdict stays SSH-proven with or without it.
                 LocalFactsCheck(),
+                # liumd phase 3 (DAH-2834): the GPU `/verify` leaves NOW as a background task — the
+                # same intent LocalVerifyCheck below would send, judged there — so the executor's
+                # first-pass GPU work overlaps the port check's remaining round trips instead of
+                # following them. Off by default; a halt before the judge cancels it (Pipeline.run).
+                LocalVerifyStartCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
                 # platform deliberately does not tear down) keeps binding the rental port range.

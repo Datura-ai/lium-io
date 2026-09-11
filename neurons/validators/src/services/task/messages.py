@@ -1427,6 +1427,21 @@ class LocalVerifyMessages:
         category="transport",
         impact="The matmul and VerifyX verdicts below come from the executor's local run, judged by the validator",
     )
+    # Phase 3: the same call, started right after the facts call and judged where it is judged today.
+    EARLY_STARTED = MessageTemplate(
+        event="Local verification started early",
+        reason="LOCAL_VERIFY_EARLY_STARTED",
+        severity="info",
+        category="transport",
+        impact="None yet — the executor's GPU steps run while the checks below take their SSH round trips; the local-verification check judges the answer",
+    )
+    EARLY_SKIPPED = MessageTemplate(
+        event="Local verification not started early",
+        reason="LOCAL_VERIFY_EARLY_SKIPPED",
+        severity="info",
+        category="transport",
+        impact="None — the local-verification check makes its call where it does today",
+    )
 
 
 class LocalFactsMessages:

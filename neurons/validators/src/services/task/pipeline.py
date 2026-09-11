@@ -18,7 +18,7 @@ from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
-from services.local_verify_client import BackgroundProbe, LocalVerifyOutcome
+from services.local_verify_client import LocalVerifyOutcome
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
@@ -330,45 +330,44 @@ class Pipeline:
 
 
 async def _settle_background_work(ctx: Context) -> None:
-    """liumd phase 2: a check may leave work in flight for a later check — the rental probe task in
-    `ctx.state.local_verify` (2b) and the DinD container the executor started for the port check in
-    `ctx.state.local_facts.dind` (2c). A fatal check or a halt in between would leave it pending —
-    a probe pod the backend already rented, a container holding a rental port — so whatever is
-    still unconsumed is settled here, once, whatever ended the pipeline: the probe is cancelled or
-    awaited and its `health_check_*` container force-removed (DAH-1991), the DinD container removed.
-    The outcome objects own the how (`BackgroundProbe.cancel_and_await`)."""
+    """liumd phase 2/3: a check may leave work in flight for a later check — the rental probe task
+    in `ctx.state.local_verify` (2b), the DinD container the executor started for the port check in
+    `ctx.state.local_facts.dind` (2c) and the early GPU call in `ctx.state.local_verify.pending`
+    (phase 3). A fatal check or a halt in between would leave it pending — a probe pod the backend
+    already rented, a container holding a rental port, a GPU answer nobody judges — so whatever is
+    still unconsumed is settled here, once, whatever ended the pipeline: cancelled or awaited
+    (`BackgroundProbe.cancel_and_await`), the probe's `health_check_*` container force-removed
+    (DAH-1991), the DinD container removed. The pipeline's own result is never replaced."""
     await _remove_unconsumed_dind(ctx)
     outcome = ctx.state.local_verify
-    probe: BackgroundProbe | None = outcome.rental_probe if outcome is not None else None
-    if probe is None or probe.consumed:
+    if outcome is None:
         return
-    probe.consumed = True
-    try:
-        reason = await probe.cancel_and_await()
-    except Exception as exc:  # noqa: BLE001 — cleanup must not replace the pipeline's own result
-        reason = f"settle_error: {type(exc).__name__}"
-    removed: int | str
-    try:
-        removed = await ctx.services.container_cleanup.force_remove_health_checks(
-            ctx.ssh, ctx.executor.uuid
-        )
-    except Exception as exc:  # noqa: BLE001 — same: the pipeline's own result stands
-        removed = f"error: {type(exc).__name__}"
-    logger.info(
-        _m(
-            RENTAL_PROBE_OUTCOME_EVENT,
-            extra=get_extra_info(
-                {
-                    **ctx.default_extra,
-                    "outcome": "fallback",
-                    "step": "rental_probe",
-                    "reason": f"unconsumed_{reason}",
-                    "health_checks_removed": removed,
-                    "first_pass": ctx.config.first_pass,
-                }
-            ),
-        )
-    )
+    # Phase 3's early GPU call and phase 2b's rental probe: the same shape, settled the same way.
+    for work, step in ((outcome.pending, "gpu_early"), (outcome.rental_probe, "rental_probe")):
+        if work is None or work.consumed:
+            continue
+        work.consumed = True
+        try:
+            reason = await work.cancel_and_await()
+        except Exception as exc:  # noqa: BLE001 — cleanup must not replace the pipeline's own result
+            reason = f"settle_error: {type(exc).__name__}"
+        extra = {
+            **ctx.default_extra,
+            "outcome": "fallback",
+            "step": step,
+            "reason": f"unconsumed_{reason}",
+            "first_pass": ctx.config.first_pass,
+        }
+        if step == "rental_probe":
+            # the backend spawned a health_check_* pod for the probe; only RentalVerificationCheck
+            # removed it before (DAH-1991), so an unconsumed probe left its pod on the executor
+            try:
+                extra["health_checks_removed"] = await ctx.services.container_cleanup.force_remove_health_checks(
+                    ctx.ssh, ctx.executor.uuid
+                )
+            except Exception as exc:  # noqa: BLE001 — same: the pipeline's own result stands
+                extra["health_checks_removed"] = f"error: {type(exc).__name__}"
+        logger.info(_m(RENTAL_PROBE_OUTCOME_EVENT, extra=get_extra_info(extra)))
 
 
 DIND_SETTLE_TIMEOUT_SECONDS = 15

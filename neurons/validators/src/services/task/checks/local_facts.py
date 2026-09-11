@@ -31,6 +31,7 @@ from services.local_verify_client import (
     CAPABILITY,
     DETAIL_MAX_CHARS,
     DIND_CAPABILITY,
+    EXECUTOR_DEADLINE_MIN_SECONDS,
     LocalVerifyClient,
     LocalVerifyUnavailable,
     build_intent,
@@ -49,7 +50,22 @@ logger = logging.getLogger(__name__)
 
 LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
 # The executor caps each fact collector at 20 s (FAST_STEP_TIMEOUT_SECONDS); ask for no more.
-FACTS_DEADLINE_S = 20
+FACTS_STEP_CAP_S = 20
+# The answer has to travel back inside the client's whole-call timeout; the GPU call's 30 s margin
+# (`executor_deadline_s`) would leave a 25 s facts budget with the 5 s floor, so the facts call has
+# its own, sized for a ≈ 1 s call on a far node.
+FACTS_DEADLINE_MARGIN_S = 5
+
+
+def facts_deadline_s(timeout_s: int) -> int:
+    """The `deadline_s` for the facts-only intent given the client's whole-call timeout
+    (`LOCAL_VERIFY_FACTS_TIMEOUT_SECONDS`): the timeout less the margin, never above the executor's
+    per-collector cap (asking for more buys nothing) and never below the floor the executor accepts
+    (`EXECUTOR_DEADLINE_MIN_SECONDS`, the intent's `ge=5`).
+    Default 25 → 20; an operator who tightens the timeout tightens the executor's stop with it, so a
+    cut answer still arrives before the client gives up."""
+    wanted = int(timeout_s) - FACTS_DEADLINE_MARGIN_S
+    return max(EXECUTOR_DEADLINE_MIN_SECONDS, min(FACTS_STEP_CAP_S, wanted))
 
 
 _DIND_NAME_RE = re.compile(LOCAL_VERIFY_DIND_NAME_PATTERN)
@@ -142,7 +158,7 @@ class LocalFactsCheck:
             matmul=None,
             verifyx=None,
             parallel_gpu=False,
-            deadline_s=FACTS_DEADLINE_S,
+            deadline_s=facts_deadline_s(settings.LOCAL_VERIFY_FACTS_TIMEOUT_SECONDS),
             dind=None
             if prepared is None
             else DindStep(
