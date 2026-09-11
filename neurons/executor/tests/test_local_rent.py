@@ -16,6 +16,8 @@ import bittensor
 import pytest
 import services.local_rent_service as lrs
 from datura.rental_spec import (
+    RENTAL_NETWORK_ICC_OPTION,
+    RENTAL_NETWORK_NAME,
     ContainerRunSpec,
     ContainerUlimit,
     DeviceMount,
@@ -72,11 +74,28 @@ class FakeDockerApi:
         self.create_delay_s = 0.0
         self.exit_after_create = False
         self.remove_error: Exception | None = None
+        self.networks = {}
         self.lock = threading.Lock()
 
     def create_host_config(self, **kwargs):
         self.calls.append(("host_config", kwargs))
         return {"HostConfig": kwargs}
+
+    # the host's docker networks by name (`inspect_network` / `create_network`, as ensure_rental_network uses them)
+    networks: dict[str, dict] = {}
+    create_network_error: Exception | None = None
+
+    def inspect_network(self, name):
+        self.calls.append(("inspect_network", name))
+        if name not in self.networks:
+            raise NotFound(f"network {name} not found")
+        return dict(self.networks[name])
+
+    def create_network(self, name, driver=None, options=None, labels=None):
+        self.calls.append(("create_network", {"name": name, "driver": driver, "options": options, "labels": labels}))
+        if self.create_network_error is not None:
+            raise self.create_network_error
+        self.networks[name] = {"Name": name, "Driver": driver, "Options": dict(options or {}), "Labels": dict(labels or {})}
 
     start_error: Exception | None = None
     _next_id = 0
@@ -170,6 +189,7 @@ def _spec(**overrides) -> ContainerRunSpec:
         ports=(PortBinding(22, 40001), PortBinding(8888, 40002)),
         volumes=(VolumeMount("pod_abc_vol", "/root"),),
         runtime="sysbox-runc",
+        network=RENTAL_NETWORK_NAME,
     )
     fields.update(overrides)
     return ContainerRunSpec(**fields)
@@ -222,7 +242,8 @@ def test_a_good_intent_makes_the_container_with_the_validators_own_calls():
     assert result.steps["container"].data["container_name"] == "pod_abc"
     assert result.steps["ready"].status == "ok" and result.steps["ready"].data["state"]["Running"]
     names = [c[0] for c in api.calls]
-    assert names[:3] == ["inspect_image", "host_config", "create"]
+    # the icc-off rental network is made sure of BEFORE the container is created on it (DAH-3199)
+    assert names[:6] == ["inspect_image", "inspect_network", "create_network", "inspect_network", "host_config", "create"]
     assert "start" in names and "remove" not in names
     create = next(c[1] for c in api.calls if c[0] == "create")
     assert create["name"] == "pod_abc" and create["detach"] is True
@@ -233,6 +254,9 @@ def test_a_good_intent_makes_the_container_with_the_validators_own_calls():
     assert host["runtime"] == "sysbox-runc"
     assert host["port_bindings"] == {"22/tcp": 40001, "8888/tcp": 40002}
     assert host["binds"] == ["pod_abc_vol:/root:rw"]
+    assert host["network_mode"] == RENTAL_NETWORK_NAME
+    created_network = next(c[1] for c in api.calls if c[0] == "create_network")
+    assert created_network["driver"] == "bridge" and created_network["options"] == {RENTAL_NETWORK_ICC_OPTION: "false"}
     assert create["labels"] == {NONCE_LABEL: result.nonce}  # the rollback's handle, the only addition
     assert result.steps["container"].data["container_id"] == api.made["pod_abc"]["Id"]
     assert "pod_abc" in api.made
@@ -250,6 +274,37 @@ def test_the_created_container_is_the_same_the_validator_would_make():
     assert host == build_host_config_kwargs(_spec())
     create = next(c[1] for c in api.calls if c[0] == "create")
     assert set(create) - {"labels"} == {"image", "command", "detach", "ports", "environment", "volumes", "name", "entrypoint", "host_config"}
+
+
+def test_an_existing_icc_off_network_is_reused_and_not_recreated():
+    api = FakeDockerApi()
+    api.networks[RENTAL_NETWORK_NAME] = {"Name": RENTAL_NETWORK_NAME, "Driver": "bridge", "Options": {RENTAL_NETWORK_ICC_OPTION: "false"}}
+    result = asyncio.run(_service(api).run(_body()))
+    assert result.steps["container"].status == "ok"
+    names = [c[0] for c in api.calls]
+    assert "create_network" not in names and names.index("inspect_network") < names.index("create")
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        pytest.param({"Name": RENTAL_NETWORK_NAME, "Driver": "bridge", "Options": {}}, id="icc-left-on"),
+        pytest.param({"Name": RENTAL_NETWORK_NAME, "Driver": "macvlan", "Options": {RENTAL_NETWORK_ICC_OPTION: "false"}}, id="not-a-bridge"),
+    ],
+)
+def test_a_same_named_network_that_does_not_isolate_fails_the_step_and_creates_nothing(existing):
+    """Regression: a host where someone made a `lium-rentals` network with ICC on must not get the
+    pod anyway (the SSH path refuses it; before this round the local path never looked). The
+    executor answers a failed container step with the reason, so the validator's SSH fallback
+    hits the same refusal instead of a rental that can reach its neighbours."""
+    api = FakeDockerApi()
+    api.networks[RENTAL_NETWORK_NAME] = existing
+    result = asyncio.run(_service(api).run(_body()))
+    assert result.steps["container"].status == "failed"
+    assert f"{RENTAL_NETWORK_ICC_OPTION}=false" in result.steps["container"].error
+    assert result.steps["ready"].status == "skipped"
+    assert "create" not in [c[0] for c in api.calls] and api.made == {}
+    assert result.rolled_back is True  # nothing of ours exists — proven by the by-label search
 
 
 def test_a_missing_image_is_a_fact_and_nothing_is_created():
@@ -289,6 +344,10 @@ def test_a_bad_spec_is_refused_before_docker_is_touched():
         (dict(sysctls={"net.ipv4.ip_forward": "1"}), "sysctls"),
         (dict(sysctls={"net.ipv4.conf.all.src_valid_mark": "0"}), "sysctls"),
         (dict(ulimits=(ContainerUlimit("nofile", 1, 1),)), "ulimits"),
+        (dict(network="host"), "network"),  # the host's namespace: every port, every interface
+        (dict(network="none"), "network"),
+        (dict(network="container:pod_other"), "network"),  # another rental's namespace
+        (dict(network="bridge"), "network"),  # docker0 by name: inter-container traffic on
     ],
 )
 def test_a_spec_beyond_a_rentals_is_refused_by_the_executor_whoever_signed_it(overrides, why):
@@ -315,6 +374,7 @@ def test_a_rentals_own_extras_pass_the_executors_policy():
     )
     assert refuse_spec(spec) is None
     assert refuse_spec(_spec(runtime=None)) is None
+    assert refuse_spec(_spec(network=None)) is None  # the daemon's default bridge (the quote broker's spec)
 
 
 @pytest.mark.parametrize(
