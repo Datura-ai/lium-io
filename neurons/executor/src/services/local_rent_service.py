@@ -6,7 +6,8 @@ up — this does in-process against the host's Docker socket from one signed int
 
     image      `docker image inspect`: is the image here, which digest (a fact for the validator)
     container  the validator's own `ContainerRunSpec`, created and started with docker-py exactly
-               as the validator would (`datura.rental_spec.create_and_start`: ONE definition)
+               as the validator would (`datura.rental_spec.create_and_start`: ONE definition) on
+               the icc-off rental network it names (`ensure_rental_network`: the same check)
     ready      poll `inspect` until State.Running; optionally wait for the SSH banner on the
                published sshd port from this host
 
@@ -42,10 +43,12 @@ from typing import Any
 from datura.rental_spec import (
     NAME_PATTERN,
     RENTAL_CONTAINER_NAME_PREFIXES,
+    RENTAL_NETWORK_NAME,
     ContainerRunSpec,
     WireError,
     carries_only_public_fields,
     create_and_start,
+    ensure_rental_network,
     spec_from_wire,
 )
 from payloads.rent import STEP_NAMES, ReadyStep, RentIntentBody, RentResult, RentStepResult
@@ -85,6 +88,10 @@ ALLOWED_SYSCTLS = {"net.ipv4.conf.all.src_valid_mark": "1"}
 ALLOWED_ULIMIT_NAMES = frozenset({"memlock"})
 ALLOWED_DEVICE_PREFIXES = ("/dev/nvidia", "/dev/infiniband/", "/dev/net/tun", "/dev/fuse", "/dev/dri/")
 ALLOWED_HOST_BIND_PREFIXES = ("/var/run/lium-dstack/",)
+# The daemon's default bridge (the CVM quote broker) or the icc-off rental bridge (DAH-3199) —
+# never `host`, `none` or `container:<id>`, which would put the pod in the host's or another
+# container's network namespace.
+ALLOWED_NETWORKS = (None, RENTAL_NETWORK_NAME)
 
 
 def _docker_api():
@@ -147,6 +154,8 @@ def refuse_spec(spec: ContainerRunSpec) -> str | None:
     for device in spec.devices:
         if not device.path_on_host.startswith(ALLOWED_DEVICE_PREFIXES) or ".." in device.path_on_host:
             return f"device {device.path_on_host!r} is not a rental's"
+    if spec.network not in ALLOWED_NETWORKS:
+        return f"network {spec.network!r} is not a rental's"
     return None
 
 
@@ -407,6 +416,16 @@ class _Run:
 
     async def _container(self, spec: ContainerRunSpec) -> RentStepResult:
         started = time.perf_counter()
+        if spec.network:
+            # What the validator's SSH path does before its own create (DAH-3199): the icc-off
+            # rental network exists, or the rental is refused. Before `create_attempted`: a refusal
+            # here made nothing, so the answer's `rolled_back` is True without a search.
+            try:
+                await self._in_thread(lambda: ensure_rental_network(self.api, spec.network), INSPECT_TIMEOUT_SECONDS)
+            except TimeoutError:
+                return RentStepResult(status="timeout", ms=_elapsed_ms(started), error="rental network inspect/create timed out")
+            except Exception as exc:  # noqa: BLE001 — the reason is the evidence; the SSH path meets the same refusal
+                return RentStepResult(status="failed", ms=_elapsed_ms(started), error=f"{type(exc).__name__}: {exc}")
         # Marked before the create is issued: a cancellation mid-flight (the deadline) must still
         # run the rollback, which finds what the daemon may have made by the nonce label.
         self.create_attempted = True

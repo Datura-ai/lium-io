@@ -19,6 +19,7 @@ from aiohttp.test_utils import TestServer
 from datura.rental_spec import (
     PUBLIC_ENVIRONMENT,
     RENTAL_CONTAINER_NAME_PREFIXES,
+    RENTAL_NETWORK_NAME,
     ContainerRunSpec,
     ContainerUlimit,
     DeviceMount,
@@ -77,6 +78,7 @@ def _spec(**overrides) -> ContainerRunSpec:
         memory_gb=32,
         storage_limit_gb=100,
         shm_size="16g",
+        network=RENTAL_NETWORK_NAME,
     )
     fields.update(overrides)
     return ContainerRunSpec(**fields)
@@ -89,6 +91,47 @@ def test_the_spec_round_trips_through_the_wire():
     spec = _spec()
     wire = json.loads(json.dumps(spec_to_wire(spec)))
     assert spec_from_wire(wire) == spec
+
+
+def test_the_spec_the_validator_really_builds_reaches_the_executor_whole(svc):
+    """Regression (fresh review on this PR): `_build_rental_container_run_spec` names the icc-off
+    rental network (DAH-3199) but the wire did not carry `network`, so an executor-made rental
+    landed on docker0 with inter-container traffic on and nothing said so. The real builder's
+    output, not a hand-built spec, must survive the wire field for field — and the executor's
+    HostConfig for it must be the SDK path's, `network_mode` included."""
+    from payload_models.payloads import ContainerCreateRequest, CustomOptions
+    from services.rental_docker_sdk import GpuDockerConfig
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="hk", executor_id=EXECUTOR_UUID, pod_id="abc", docker_image="daturaai/ubuntu:24.04",
+        gpu_uuids=["GPU-1"], is_sysbox=True,
+    )
+    built = svc._build_rental_container_run_spec(
+        payload=payload,
+        container_name="pod_abc",
+        custom_options=CustomOptions(),
+        port_maps=[(22, 40001, 50001)],
+        local_volume="pod_abc_vol",
+        local_volume_path="/root",
+        encrypted_local_volume=False,
+        external_volume_name=None,
+        gpu_devices=GpuDockerConfig(),
+        effective_storage_limit_gb=None,
+        cpu_count=None,
+    )
+    assert built.network == RENTAL_NETWORK_NAME and carries_only_public_fields(built)
+    wire = json.loads(json.dumps(spec_to_wire(built)))
+    assert wire["network"] == RENTAL_NETWORK_NAME
+    parsed = spec_from_wire(wire)
+    assert parsed == built
+    assert build_host_config_kwargs(parsed)["network_mode"] == RENTAL_NETWORK_NAME
+
+
+def test_the_quote_brokers_default_bridge_travels_as_no_network():
+    wire = json.loads(json.dumps(spec_to_wire(_spec(network=None))))
+    assert wire["network"] is None
+    assert spec_from_wire(wire).network is None
+    assert "network_mode" not in build_host_config_kwargs(spec_from_wire(wire))
 
 
 def test_a_zero_limit_travels_as_no_limit_and_builds_the_same_host_config():
@@ -113,6 +156,7 @@ def test_a_zero_limit_travels_as_no_limit_and_builds_the_same_host_config():
         (lambda w: w["ports"].append({"container_port": 22, "host_port": 1, "protocol": "sctp"}), "protocol"),
         (lambda w: w.update(cpu_count=-1), "cpu_count"),
         (lambda w: w.update(restart_policy="forever"), "restart_policy"),
+        (lambda w: w.update(network="lium rentals; rm -rf"), "network"),
         (lambda w: w["volumes"].append({"source": "x", "target": "relative"}), "target"),
         (lambda w: w.update(ports=[{"container_port": 22, "host_port": 40001}] * 600), "ports"),
         (lambda w: w.update(environment={"A" * 5000: "b"}), "environment"),
@@ -131,10 +175,13 @@ def test_a_wire_document_outside_a_rentals_shape_is_refused(mutate, why):
 
 def test_a_missing_optional_field_takes_the_specs_default():
     wire = spec_to_wire(_spec())
-    for key in ("cap_add", "sysctls", "ulimits", "devices", "device_requests", "shm_size", "cpu_count"):
+    for key in ("cap_add", "sysctls", "ulimits", "devices", "device_requests", "shm_size", "cpu_count", "restart_policy", "network"):
         wire.pop(key)
     parsed = spec_from_wire(wire)
     assert parsed.cap_add == () and parsed.shm_size is None and parsed.cpu_count is None
+    # absent = the dataclass default: a rental restarts with the daemon; a spec that wants none says null
+    assert parsed.restart_policy == "unless-stopped" and parsed.network is None
+    assert spec_from_wire({**spec_to_wire(_spec()), "restart_policy": None}).restart_policy is None
     # a device request without the capabilities key is the dataclass default (gpu), not "none"
     wire = spec_to_wire(_spec())
     wire["device_requests"][0].pop("capabilities")
@@ -212,6 +259,9 @@ def test_the_intent_carries_the_spec_and_asks_for_sshd_only_when_the_image_ships
     no_wait = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=40001, ssh_wait_s=0)
     assert no_wait["steps"]["ready"] == {"running_timeout_s": 10}
     assert without["nonce"] != with_sshd["nonce"]
+    # an operator's LOCAL_RENT_SSHD_WAIT_SECONDS=90 is not a 422 from the executor's `le=60` on every rent
+    long_wait = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=40001, ssh_wait_s=90)
+    assert long_wait["steps"]["ready"]["ssh_timeout_s"] == 60
 
 
 def _answer(intent, **overrides) -> dict:
