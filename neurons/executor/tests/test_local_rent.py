@@ -761,7 +761,7 @@ def test_a_nonce_is_one_cache_with_verify(client, validator_keypair, monkeypatch
     verify = {
         "schema": "lium.local_verify/1", "nonce": intent["nonce"], "issued_at": intent["issued_at"],
         "expires_at": intent["expires_at"], "executor_uuid": EXECUTOR_UUID, "deadline_s": 30,
-        "parallel_gpu": False, "steps": {"inspector": True},
+        "miner_hotkey": settings.MINER_HOTKEY_SS58_ADDRESS, "parallel_gpu": False, "steps": {"inspector": True},
     }
     verify["signature"] = "0x" + validator_keypair.sign(canonical_intent_message(verify)).hex()
     crossed = client.post("/verify", json=verify)
