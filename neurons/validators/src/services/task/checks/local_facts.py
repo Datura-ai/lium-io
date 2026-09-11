@@ -64,6 +64,25 @@ class LocalFactsCheck:
         try:
             return await self._run(ctx)
         except Exception as exc:  # noqa: BLE001 — the pipeline has no guard; a bug here must not end the node's cycle
+            # A validator-side bug, not an executor answer: logged as a WARNING with the traceback and
+            # `outcome=error`, so it never hides in the fallback rate (11 Sep: a missing build_intent
+            # kwarg made every facts call a quiet `internal_error` fallback; only the tests noticed).
+            logger.warning(
+                _m(
+                    LOCAL_VERIFY_OUTCOME_EVENT,
+                    extra=get_extra_info(
+                        {
+                            **ctx.default_extra,
+                            "outcome": "error",
+                            "step": "facts",
+                            "reason": "internal_error",
+                            "detail": f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS],
+                            "first_pass": ctx.config.first_pass,
+                        }
+                    ),
+                ),
+                exc_info=exc,
+            )
             return self._unavailable(ctx, "internal_error", f"{type(exc).__name__}: {exc}")
 
     async def _run(self, ctx: Context) -> CheckResult:

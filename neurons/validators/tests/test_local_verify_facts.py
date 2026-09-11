@@ -248,7 +248,7 @@ async def test_the_facts_call_asks_for_no_gpu_step_and_leaves_bounded_facts(keyp
     (intent,) = executor.intents
     assert intent["steps"] == {"matmul": None, "verifyx": None, "docker": True, "ports": True, "inspector": True}
     assert intent["parallel_gpu"] is False and intent["deadline_s"] == 20
-    # addressed like the GPU intent: the executor refuses a facts intent for another miner (401)
+    # addressed like the GPU intent (the real route's check_intent_target refuses another miner's; the fake only echoes)
     assert intent["executor_uuid"] == ctx.executor.uuid and intent["miner_hotkey"] == ctx.miner_hotkey
     assert result.passed and result.event.reason_code == "LOCAL_FACTS_OK"
     facts: LocalFacts = result.updates["state"].local_facts
@@ -306,7 +306,12 @@ async def test_a_refusal_or_a_malformed_answer_leaves_the_ssh_listings_in_place(
 
 
 @pytest.mark.asyncio
-async def test_a_bug_in_the_check_is_a_fallback_not_a_halt(keypair, facts_on):
+async def test_a_bug_in_the_check_is_a_fallback_not_a_halt_but_a_loud_one(keypair, facts_on, metric_log):
+    """Regression: a programming error in the check (a build_intent kwarg missing after a wire
+    change — it happened on 11 Sep) must not be indistinguishable from an executor's 401/timeout.
+    The cycle goes on (fallback), but the line is a WARNING with the traceback and outcome=error,
+    so the Loki fallback rate does not absorb a validator-side bug."""
+
     def broken(ctx):
         raise RuntimeError("factory bug")
 
@@ -315,6 +320,11 @@ async def test_a_bug_in_the_check_is_a_fallback_not_a_halt(keypair, facts_on):
         result = await LocalFactsCheck(broken).run(ctx)
     assert result.passed and result.event.what_we_saw["reason"] == "internal_error"
     assert result.updates == {}
+    (warning,) = metric_log.warning.call_args_list
+    assert str(warning.args[0]) == "[local_verify] outcome"
+    assert warning.args[0].extra["outcome"] == "error" and warning.args[0].extra["reason"] == "internal_error"
+    assert "factory bug" in warning.args[0].extra["detail"]
+    assert isinstance(warning.kwargs["exc_info"], RuntimeError)
 
 
 @pytest.mark.asyncio
@@ -330,7 +340,8 @@ async def test_a_slow_executor_falls_back_inside_the_facts_budget(keypair, facts
         executor.answer_override = lambda intent: facts_answer(intent)
         ctx = facts_context(keypair, executor.executor_info)
         started = time.perf_counter()
-        result = await LocalFactsCheck(client_factory(keypair)).run(ctx)
+        # the production client (`_default_client`): the 1 s budget observed is the one IT read
+        result = await LocalFactsCheck().run(ctx)
     assert time.perf_counter() - started < 2.5
     assert result.event.reason_code == "LOCAL_FACTS_UNAVAILABLE" and result.event.what_we_saw["reason"] == "timeout"
 
