@@ -858,6 +858,34 @@ def test_the_late_removals_target_this_calls_container_only_never_the_name(monke
     assert not any(a[-1] == "container_hotkey_40003" for a in rm)
 
 
+def test_a_failed_dind_run_removes_only_what_this_call_labelled_never_the_name(monkeypatch):
+    """Regression (fresh review, 11 Sep): `docker run` exits 125 with `Conflict. The container name
+    "/container_<hotkey>_<port>" is already in use` when another validator's probe of this miner
+    (or the validator's own SSH-started one) holds the name — the SAME name every validator derives.
+    A removal by bare name here would kill THEIR live container; by this call's label it removes
+    the half-made one (a bind failure after the create) and nothing else."""
+
+    async def fake_run_script(argv, *, timeout, env=None):
+        return StepResult(
+            status="failed", exit_status=125,
+            stderr_tail='docker: Error response from daemon: Conflict. The container name "/container_hotkey_40003" is already in use',
+        )
+
+    removed: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_remove(name, container_id=None, run_token=None):
+        removed.append((name, container_id, run_token))
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    monkeypatch.setattr(lvs, "_remove_dind_orphan", fake_remove)
+    result = asyncio.run(lvs.run_dind(_dind(), lvs.parse_port_range("40000-40009", None), 2200))
+    assert result.status == "failed"
+    (call,) = removed
+    assert call[0] == "container_hotkey_40003" and call[1] is None
+    assert call[2] is not None and len(call[2]) == 16, "keyed by this call's run token, not the shared name"
+    assert "container_hotkey_40003" not in lvs._dind_orphan_timers
+
+
 def test_dind_with_port_mappings_publishes_the_internal_port(monkeypatch):
     async def fake_run_script(argv, *, timeout, env=None):
         return StepResult(status="ok", exit_status=0, stdout="cid\n")

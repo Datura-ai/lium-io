@@ -493,7 +493,10 @@ async def test_a_started_container_no_probe_took_is_removed_when_the_pipeline_en
     # A name the validator asked for is removed when the executor MAY have started it and never
     # confirmed (a lost answer, a mismatched echo, a missing step); only a consumed one, or none,
     # is left alone.
-    for may_have_started in ("timeout", "transport", "http_error", "malformed", "echo_mismatch", "not_answered", ""):
+    for may_have_started in (
+        "timeout", "transport", "http_error", "malformed", "schema_mismatch", "nonce_mismatch",
+        "executor_mismatch", "echo_mismatch", "not_answered", "",
+    ):
         ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=0)))
         unconfirmed = prepared(40001, started=False, reason=may_have_started)
         ctx = make_context(ssh=ssh, state=build_state(local_facts=LocalFacts(dind=unconfirmed)))

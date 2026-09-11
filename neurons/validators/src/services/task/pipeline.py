@@ -385,8 +385,8 @@ DIND_NEVER_STARTED_REASONS = frozenset({"refused", "busy_or_replay", "not_suppor
 async def _remove_unconsumed_dind(ctx: Context) -> None:
     """Remove the DinD container the validator asked the executor to start from the facts intent
     when no probe took it (the port check never ran, ran before the facts arrived, or the answer was
-    lost after the executor may have started it: timeout, transport, http_error, a malformed or
-    mismatched echo, a missing step). The name is the validator's own choice, so a `docker rm -f` of
+    lost after the executor may have started it: timeout, transport, http_error, a malformed answer
+    or a schema/nonce/executor mismatch in it, a mismatched echo, a missing step). The name is the validator's own choice, so a `docker rm -f` of
     it is safe whether or not the container exists; best effort over the pipeline's SSH — the
     executor's TTL and the stale cleanup (`container_` prefix) are the backstops. An outcome under
     which the executor ran nothing of ours (`DIND_NEVER_STARTED_REASONS`) removes nothing: a
