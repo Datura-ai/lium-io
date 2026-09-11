@@ -88,10 +88,12 @@ ALLOWED_SYSCTLS = {"net.ipv4.conf.all.src_valid_mark": "1"}
 ALLOWED_ULIMIT_NAMES = frozenset({"memlock"})
 ALLOWED_DEVICE_PREFIXES = ("/dev/nvidia", "/dev/infiniband/", "/dev/net/tun", "/dev/fuse", "/dev/dri/")
 ALLOWED_HOST_BIND_PREFIXES = ("/var/run/lium-dstack/",)
-# The daemon's default bridge (the CVM quote broker) or the icc-off rental bridge (DAH-3199) —
-# never `host`, `none` or `container:<id>`, which would put the pod in the host's or another
-# container's network namespace.
-ALLOWED_NETWORKS = (None, RENTAL_NETWORK_NAME)
+# A rental joins the icc-off rental bridge (DAH-3199) and nothing else: not the daemon's default
+# bridge (inter-container traffic on — the state that network exists to end; the SSH path never
+# builds a rental without it), not `host`, `none` or `container:<id>` (the host's or another
+# container's namespace). The one spec on the default bridge, the CVM quote broker, is not a
+# rental and never comes through `/rent` (its name fails the prefix rule above).
+ALLOWED_NETWORKS = (RENTAL_NETWORK_NAME,)
 
 
 def _docker_api():
@@ -557,7 +559,7 @@ class _Run:
 
         try:
             ids = await self._in_thread(find, INSPECT_TIMEOUT_SECONDS)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — unknown is not proven clean: answered False, the validator frees the name
             logger.warning("local rent: listing by label failed: %s", exc)
             return False
         if not ids:

@@ -326,7 +326,8 @@ class Settings(BaseSettings):
     # critical path (measured, speed/DEPLOY_LOCAL_RENT.md), time that today overlaps the key/env execs.
     # A wait the banner misses is a failed call: the executor rolls the container back and the SDK path
     # creates it again — set it above the image's sshd start time, or leave it at 0.
-    # 0 (default): no wait; the renter's first connection retries as it does today.
+    # 0 (default): no wait; the renter's first connection retries as it does today. Capped at 60 s, the
+    # executor's `ReadyStep.ssh_timeout_s` bound (`local_rent_client.SSH_WAIT_MAX_S`).
     LOCAL_RENT_SSHD_WAIT_SECONDS: int = Field(env="LOCAL_RENT_SSHD_WAIT_SECONDS", default=0)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
