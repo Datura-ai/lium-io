@@ -302,6 +302,15 @@ class Settings(BaseSettings):
     # removed and the probe runs as today; one no probe took is removed by Pipeline.run's settle step.
     # Off by default; needs LOCAL_VERIFY_FACTS_ENABLED.
     LOCAL_VERIFY_DIND_IN_INTENT: bool = Field(env="LOCAL_VERIFY_DIND_IN_INTENT", default=False)
+    # liumd phase 3 (DAH-2834): start the GPU `POST /verify` (matmul + VerifyX) as a background task right
+    # after the facts call, instead of where `LocalVerifyCheck` runs — so the executor's ≈ 45 s of first-pass
+    # GPU work overlap the port check's connect-back batch, the sysbox proof, the image check and the tenant
+    # check (≈ 10–12 s of SSH round trips) rather than following them. The same intent, judged by the same
+    # check with the same caps; the call is made once per cycle either way. First pass only, never on a node
+    # with a customer pod; a halt in between cancels the task (Pipeline.run). Off by default; needs
+    # VALIDATOR_LOCAL_VERIFY_ENABLED and LOCAL_VERIFY_FACTS_ENABLED (the facts call's /version answer is
+    # what says the executor takes the call — without it nothing starts early).
+    LOCAL_VERIFY_GPU_EARLY_START: bool = Field(env="LOCAL_VERIFY_GPU_EARLY_START", default=False)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both

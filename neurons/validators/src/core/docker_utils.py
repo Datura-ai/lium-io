@@ -64,6 +64,12 @@ class DockerCommand:
         return f"/usr/bin/docker logs {container_id} 2>&1 | head -20"
 
     @staticmethod
+    def inspect_running(name: str) -> str:
+        """Build docker inspect for the running flag: `true` / `false` on stdout, exit 1 when the
+        container does not exist (stderr silenced so the exit status is the answer)."""
+        return f"/usr/bin/docker inspect {shlex.quote(name)} --format '{{{{.State.Running}}}}' 2>/dev/null"
+
+    @staticmethod
     def inspect_exit_code(container_id: str) -> str:
         """Build docker inspect for exit code."""
         return f"/usr/bin/docker inspect {container_id} --format '{{{{.State.ExitCode}}}}' 2>&1"

@@ -418,7 +418,7 @@ def verifier(inner):
     v = DindVerifier(ssh_service=SimpleNamespace(generate_keypair=MagicMock(return_value=("other-private", "ssh-ed25519 OTHER"))))
     connected = []
 
-    async def connect(host, port, pkey, log_ctx):
+    async def connect(host, port, pkey, log_ctx, **_kw):
         connected.append(pkey)
         if isinstance(inner, Exception):
             raise inner
