@@ -17,7 +17,12 @@ drops docker-policy findings whose ancestry reaches sshd or pid 1, so these are 
 not trust); anything from the host, a `NamespaceEnter`, a memory read, an exec the sensor could not attribute is *provider-origin* and is
 what the check, the score gate and the renter event act on when it names a rented pod (or names no
 container at all); a finding on any other container is recorded under `unmatched_containers` and
-acts on nobody. The payloads are too many and too
+acts on nobody. The executor's own backup and restore (`executor/src/storage/restic.py`) never
+reach this module: the sensor classifies the encrypted flow's `nsenter -t <pid> -U` as benign
+(nsenter.rs: a `CLONE_NEWUSER`-only `setns`, judged by nstype, never by a container name) and the
+unencrypted flow's `-v volume_<pod_id>:/workspace` bind as a runtime mount (mount.rs: runc /
+container-stack binaries), so neither is a finding — a name-based exemption here would only let a
+provider's `lium-storage-…`-named container borrow the platform's origin. The payloads are too many and too
 script-shaped for an exact allow-list to be honest, so the platform execs' payloads are recorded
 in the verdict (`platform_exec_commands`) for the daily digest instead of gating anything. What keeps
 the tag trustworthy — a provider `docker exec`-ing into the executor container to borrow its
@@ -112,6 +117,11 @@ class VerdictPayload(BaseModel):
     # no action
     unmatched_containers: list[str]
     unmatched_containers_count: int
+    # provider findings that named no container and no rental volume: each one marks every rented
+    # pod on the host (the fallback the flag decision has to measure)
+    unnamed_findings: int
+    # platform findings by kind, for the shadow numbers
+    platform_kind_counts: dict[str, int]
 
 
 class RenterAccessEvent(BaseModel):
@@ -149,6 +159,8 @@ class InspectorVerdict:
     # no action
     unmatched_containers: list[str] = field(default_factory=list)
     unmatched_containers_count: int = 0
+    # provider findings that named no container and no rental volume (every rented pod is marked)
+    unnamed_findings: int = 0
 
     @property
     def provider_origin(self) -> bool:
@@ -169,7 +181,14 @@ class InspectorVerdict:
             platform_exec_commands=self.platform_exec_commands,
             unmatched_containers=self.unmatched_containers,
             unmatched_containers_count=self.unmatched_containers_count,
+            unnamed_findings=self.unnamed_findings,
+            platform_kind_counts=_kind_counts(self.platform_findings),
         )
+
+    def findings_for_pod(self, pod_id: str) -> list[dict[str, Any]]:
+        """The provider findings that concern this pod: the ones naming its container or its volume,
+        and the ones naming nothing (those mark every rented pod on the host)."""
+        return [f for f in self.provider_findings if _concerns_pod(f, pod_id)]
 
 
 def canonical_sha256(value: Any) -> str:
@@ -241,7 +260,9 @@ def is_platform_origin(finding: dict[str, Any]) -> bool:
     docker-policy findings whose ancestry reaches sshd or the container's pid 1, so every such
     finding is one whose ancestry it could not trust; until DAH-3278 hardens that on the verifier,
     all of them count as the platform's. Everything else — an nsenter, a memory or overlayfs read,
-    anything from the host — is the provider's."""
+    anything from the host — is the provider's. The executor's own backup/restore nsenter and volume
+    bind (restic.py) are benign at the sensor (module docstring) and never arrive here; a
+    `NamespaceEnter` that does arrive is a real pid/mnt/net entry, whatever container it came from."""
     if _kind(finding) not in _DOCKER_CONTROL_PLANE_KINDS:
         return False
     if finding.get("host") is True:
@@ -298,15 +319,30 @@ def _named_resource(finding: dict[str, Any]) -> str | None:
 
 
 def _platform_exec_commands(platform: list[dict[str, Any]]) -> list[str]:
-    seen: list[str] = []
+    commands: list[str] = []
     for finding in platform:
         payload = docker_exec_command(str(finding.get("command") or "")) or "(not a docker exec argv)"
         payload = payload[:_PAYLOAD_PREVIEW_CHARS]
-        if payload not in seen:
-            seen.append(payload)
-        if len(seen) >= _PAYLOAD_PREVIEW_MAX:
+        if payload not in commands:
+            commands.append(payload)
+        if len(commands) >= _PAYLOAD_PREVIEW_MAX:
             break
-    return seen
+    return commands
+
+
+def _kind_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for finding in findings:
+        kind = finding_kind(finding)
+        counts[kind] = counts.get(kind, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _concerns_pod(finding: dict[str, Any], pod_id: str) -> bool:
+    """A finding is about this pod when it names its container or volume, or names nothing at all
+    (those mark every rented pod); a foreign container — even one named like a pod id — is nobody's."""
+    name = _named_resource(finding)
+    return name is None or pod_id_of(name) == pod_id
 
 
 def build_verdict(
@@ -325,19 +361,19 @@ def build_verdict(
     rented = set(rented_pod_ids)
     affected: set[str] = set()
     unmatched: set[str] = set()
-    has_unnamed_finding = False
+    unnamed = 0
     for finding in provider:
         name = _named_resource(finding)
         pod_id = pod_id_of(name) if name else None
         if name is None:
-            has_unnamed_finding = True
+            unnamed += 1
         elif pod_id in rented:
             affected.add(pod_id)
         else:
             # a pod that left or joined since the rented list was fetched, or not a pod at all:
             # recorded, but no renter is told about a container that was not theirs
             unmatched.add(name)
-    if has_unnamed_finding:
+    if unnamed:
         # the sensor named no container at all: every renter on this host is told
         affected |= rented
     # Enforcement acts only for a rented pod: a provider inside their own container (a finding
@@ -357,6 +393,7 @@ def build_verdict(
         platform_exec_commands=_platform_exec_commands(platform),
         unmatched_containers=[name[:_UNMATCHED_NAME_CHARS] for name in names[:_UNMATCHED_MAX]],
         unmatched_containers_count=len(names),
+        unnamed_findings=unnamed,
     )
 
 
@@ -366,8 +403,12 @@ def renter_access_event(
     pod_id: str,
     when: str,
 ) -> RenterAccessEvent:
-    """One pod-log entry the renter sees in their pod's event stream."""
-    kinds = ", ".join(verdict.finding_kinds) or "access"
+    """One pod-log entry the renter sees in their pod's event stream: only the findings about this
+    pod (its container, its volume, or none named), never another renter's."""
+    findings = verdict.findings_for_pod(pod_id)
+    finding_kinds = sorted({finding_kind(f) for f in findings})
+    evidence = [canonical_sha256(f) for f in findings]
+    kinds = ", ".join(finding_kinds) or "access"
     sensor = "attested sensor" if verdict.sensor_attestation == SENSOR_ATTESTED else "unattested sensor"
     # `quarantine` only asks the backend to act; the ban itself is the backend's
     outcome = (
@@ -383,11 +424,11 @@ def renter_access_event(
         event=RENTER_EVENT,
         pod_id=pod_id,
         when=when,
-        finding_kinds=verdict.finding_kinds,
-        provider_findings=len(verdict.provider_findings),
+        finding_kinds=finding_kinds,
+        provider_findings=len(findings),
         report_sha256=verdict.report_sha256,
-        evidence_sha256=verdict.evidence_sha256[:_RENTER_EVIDENCE_MAX],
-        evidence_sha256_truncated=len(verdict.evidence_sha256) > _RENTER_EVIDENCE_MAX,
+        evidence_sha256=evidence[:_RENTER_EVIDENCE_MAX],
+        evidence_sha256_truncated=len(evidence) > _RENTER_EVIDENCE_MAX,
         sensor=verdict.sensor_attestation,
         action=verdict.action,
     )

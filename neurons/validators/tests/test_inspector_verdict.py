@@ -236,6 +236,27 @@ def test_platform_origin_is_the_executor_ancestry_not_the_payload():
     assert not is_platform_origin(_finding(f"/var/lib/docker/volumes/volume_{POD}/_data", kind="DockerVolumeMount"))
 
 
+def test_a_container_named_like_the_storage_helper_cannot_borrow_the_platforms_origin():
+    # taiberium (11 Sep) asked to exempt the encrypted backup's nsenter (restic.py runs it from a
+    # `lium-storage-<id>` helper). The sensor already judges that `nsenter -t <pid> -U` benign by
+    # nstype (CLONE_NEWUSER only, nsenter.rs) and the unencrypted flow's volume bind as a runtime
+    # mount (mount.rs), so neither reaches the verdict; a NamespaceEnter or DockerVolumeMount that
+    # does arrive is real and a helper-shaped container name must not turn it into the platform's
+    nsenter = "nsenter -t 4242 -m -p -- /bin/sh"
+    mount = f"/var/lib/docker/volumes/volume_{POD}/_data"
+    for kind, command in (("NamespaceEnter", nsenter), ("DockerVolumeMount", mount)):
+        assert not is_platform_origin(_finding(command, kind=kind, nested_from="lium-storage-0123456789ab"))
+        assert not is_platform_origin(_finding(command, kind=kind))  # the executor container itself
+        assert not is_platform_origin(_finding(command, kind=kind, nested=False))
+    # the shadow digest still sees what the platform did produce, by kind
+    verdict = build_verdict(
+        {}, [_finding(VALIDATOR_LIVENESS), _finding(f"docker rm -f pod_{POD}", kind="DockerRm"), _finding(VALIDATOR_LIVENESS)],
+        rented_pod_ids=[POD], sensor_attested=False, enforce=False,
+    )
+    assert verdict.provider_findings == []
+    assert verdict.as_payload().platform_kind_counts == {"DockerExec": 2, "DockerRm": 1}
+
+
 def test_verdict_records_the_platform_exec_commands_for_the_digest():
     execs = _platform_execs()
     findings = [_finding(c) for c in execs.values()] + [_finding(HUMAN_SHELL, host=True, nested=False)]
@@ -387,6 +408,37 @@ def test_verdict_without_a_named_pod_tells_every_renter_on_the_host():
     assert verdict.sensor_attestation == SENSOR_ATTESTED
     assert verdict.action == ACTION_QUARANTINE
     assert verdict.as_payload().ban_source == "inspector_auto"
+    # the fallback is counted so the shadow digest can say how often it fires (an overlay2 path has
+    # no `volumes/` segment, so this may be common — taiberium, 11 Sep)
+    assert verdict.unnamed_findings == 1 and verdict.as_payload().unnamed_findings == 1
+    named = build_verdict({}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=True, enforce=True)
+    assert named.unnamed_findings == 0
+
+
+def test_the_renter_event_carries_only_that_pods_findings():
+    # two renters on one host: A's event must not show B's kinds or evidence; a finding that names
+    # no container is about every pod and appears in both
+    on_a = _finding(HUMAN_KEY_READ, host=True, nested=False)
+    on_b = _finding("/proc/4242/mem", kind="ProcessMemoryRead", host=True, nested=False)
+    on_b["container"] = "pod_b"
+    # a provider container named exactly like a pod id is unmatched, never a pod's
+    foreign = _finding("docker exec b sh", host=True, nested=False)
+    foreign["container"] = "b"
+    unnamed = _finding("chroot /var/lib/docker/overlay2/abc/merged", kind="ContainerChroot", host=True, nested=False)
+    unnamed["container"] = None
+    verdict = build_verdict({}, [on_a, on_b, unnamed, foreign], rented_pod_ids=[POD, "b"], sensor_attested=True, enforce=True)
+    # host-wide, in the inspector event
+    assert verdict.finding_kinds == ["ContainerChroot", "DockerExec", "ProcessMemoryRead"]
+    assert verdict.unmatched_containers == ["b"]
+
+    event_a = renter_access_event(verdict, pod_id=POD, when="2026-09-11T00:00:00Z")
+    event_b = renter_access_event(verdict, pod_id="b", when="2026-09-11T00:00:00Z")
+    assert event_a.finding_kinds == ["ContainerChroot", "DockerExec"] and event_a.provider_findings == 2
+    assert event_a.evidence_sha256 == [canonical_sha256(on_a), canonical_sha256(unnamed)]
+    assert "ProcessMemoryRead" not in event_a.log_text
+    assert event_b.finding_kinds == ["ContainerChroot", "ProcessMemoryRead"] and event_b.provider_findings == 2
+    assert event_b.evidence_sha256 == [canonical_sha256(on_b), canonical_sha256(unnamed)]
+    assert "DockerExec" not in event_b.log_text
 
 
 # --- the check -----------------------------------------------------------------------------
@@ -547,6 +599,24 @@ async def test_finding_on_a_non_rented_container_under_enforcement_is_recorded_a
     assert verdict["affected_pod_ids"] == []
     assert verdict["unmatched_containers"] == ["my-own-jupyter"]
     redis.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finding_on_a_non_rented_container_in_shadow_is_not_called_access_to_a_rented_pod(context_factory):
+    """Shadow mode, the provider in their own container: the impact text names what happened — a
+    container that is not a rented pod — so the shadow counts read from it are not wrong in the
+    enforcement direction (taiberium, 11 Sep). The flag is off here."""
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = "my-own-jupyter"
+    ctx, _ = _ctx(context_factory, [finding])
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is True
+    assert "not a rented pod" in result.event.impact
+    assert "access to a rented pod" not in result.event.impact
+    verdict = result.updates["state"].inspector_event["context"]["verdict"]
+    assert verdict["enforce"] is False and verdict["affected_pod_ids"] == []
 
 
 @pytest.mark.asyncio

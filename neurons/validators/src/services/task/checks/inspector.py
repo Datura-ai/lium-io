@@ -224,7 +224,7 @@ class InspectorRentedCheck:
         acts = verdict.action == ACTION_QUARANTINE
         if acts:
             impact = "Provider-origin access to a rented pod: score zeroed, quarantine requested"
-        elif verdict.enforce:
+        elif not verdict.affected_pod_ids:
             impact = "Provider-origin finding on a container that is not a rented pod recorded; score unchanged"
         else:
             impact = "Provider-origin access to a rented pod recorded; score unchanged (INSPECTOR_ENFORCE_ENABLED off)"
