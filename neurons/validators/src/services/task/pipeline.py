@@ -365,7 +365,18 @@ class Pipeline:
 
             return True, events, current_ctx
         finally:
-            await _cancel_unconsumed_probe(current_ctx)
+            await _settle_background_work(current_ctx)
+
+
+async def _settle_background_work(ctx: Context) -> None:
+    """liumd phase 2: a check may leave work in flight for a later check — the health-check probe
+    task in `ctx.state.local_verify` (2b) and the DinD container the executor started for the port
+    check in `ctx.state.local_facts.dind` (2c). A fatal check or a halt in between would leave it
+    pending — a probe pod the backend already rented, a container holding a rental port — so
+    whatever is still unconsumed is settled here, once, whatever ended the pipeline. Each step owns
+    its own how."""
+    await _remove_unconsumed_dind(ctx)
+    await _cancel_unconsumed_probe(ctx)
 
 
 async def _cancel_unconsumed_probe(ctx: Context) -> None:
@@ -410,5 +421,44 @@ async def _cancel_unconsumed_probe(ctx: Context) -> None:
                     "first_pass": ctx.config.first_pass,
                 }
             ),
+        )
+    )
+
+
+DIND_SETTLE_TIMEOUT_SECONDS = 15
+
+
+async def _remove_unconsumed_dind(ctx: Context) -> None:
+    """Remove the DinD container the validator asked the executor to start from the facts intent
+    when no probe took it (the port check never ran, ran before the facts arrived, or the answer was
+    lost after the executor may have started it). The name is the validator's own choice, so a
+    `docker rm -f` of it is safe whether or not the container exists; best effort over the
+    pipeline's SSH — the executor's TTL and the stale cleanup (`container_` prefix) are the backstops."""
+    facts = ctx.state.local_facts
+    dind = facts.dind if facts is not None else None
+    if dind is None or dind.consumed:
+        return
+    dind.consumed = True
+    reason = "removed"
+    if ctx.ssh is None:
+        reason = "no_ssh"
+    else:
+        try:
+            await asyncio.wait_for(
+                ctx.ssh.run(f"/usr/bin/docker rm -fv {dind.name}"), timeout=DIND_SETTLE_TIMEOUT_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 — cleanup must not replace the pipeline's own result
+            reason = f"rm_error: {type(exc).__name__}"
+    logger.info(
+        _m(
+            LOCAL_VERIFY_OUTCOME_EVENT,
+            extra={
+                **ctx.default_extra,
+                "outcome": "fallback",
+                "step": "dind",
+                "reason": f"unconsumed_{reason}",
+                "started": dind.started,
+                "first_pass": ctx.config.first_pass,
+            },
         )
     )

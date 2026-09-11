@@ -24,7 +24,11 @@ from core.config import settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload, SignaturePayload
-from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
+from payloads.verify import (
+    CAPABILITY as LOCAL_VERIFY_CAPABILITY,
+    DIND_CAPABILITY as LOCAL_VERIFY_DIND_CAPABILITY,
+    VerifyIntent,
+)
 from dependencies.auth import (
     match_validator_hotkey,
     verify_allowed_hotkey_signature,
@@ -372,7 +376,12 @@ async def ping(_: None = Depends(verify_ping_signature)):
 def _capabilities() -> list[str]:
     # What a validator may call beyond the routes every executor has. Read per request so a flag
     # flip is visible without a restart of anything but this process.
-    return [LOCAL_VERIFY_CAPABILITY] if settings.EXECUTOR_LOCAL_VERIFY_ENABLED else []
+    if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
+        return []
+    caps = [LOCAL_VERIFY_CAPABILITY]
+    if settings.EXECUTOR_LOCAL_VERIFY_DIND_ENABLED:
+        caps.append(LOCAL_VERIFY_DIND_CAPABILITY)
+    return caps
 
 
 @apis_router.get("/version")
@@ -419,6 +428,7 @@ def _get_local_verify_service() -> LocalVerifyService:
             port_range=settings.RENTING_PORT_RANGE,
             port_mappings=settings.RENTING_PORT_MAPPINGS,
             ssh_port=settings.SSH_PORT,
+            dind_enabled=settings.EXECUTOR_LOCAL_VERIFY_DIND_ENABLED,
         )
     return _local_verify_service
 

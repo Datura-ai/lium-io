@@ -16,18 +16,29 @@ default (`LOCAL_VERIFY_FACTS_ENABLED`, under `VALIDATOR_LOCAL_VERIFY_ENABLED`).
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import replace
 
+from datura.requests.validator_requests import (
+    LOCAL_VERIFY_DIND_NAME_MAX,
+    LOCAL_VERIFY_DIND_NAME_PATTERN,
+    LOCAL_VERIFY_DIND_PUBLIC_KEY_MAX,
+    LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN,
+    DindStep,
+)
+from services.executor_connectivity.models import PortPair
 from services.local_verify_client import (
     CAPABILITY,
     DETAIL_MAX_CHARS,
+    DIND_CAPABILITY,
     LocalVerifyClient,
     LocalVerifyUnavailable,
     build_intent,
     executor_deadline_s,
 )
-from services.local_verify_facts import LocalFacts, parse_facts
+from services.local_verify_facts import LocalFacts, PreparedDind, judge_dind_step, parse_facts
+from services.port_utils import get_all_ports
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -47,6 +58,21 @@ def facts_deadline_s() -> int:
     budget minus the transport margin (`executor_deadline_s`), capped at the executor's collector
     timeout. With the default 25 s budget that is 5 s, enough for the ~1 s the facts take."""
     return min(FACTS_DEADLINE_CAP_S, executor_deadline_s(settings.LOCAL_VERIFY_FACTS_TIMEOUT_SECONDS))
+
+
+_DIND_NAME_RE = re.compile(LOCAL_VERIFY_DIND_NAME_PATTERN)
+_DIND_KEY_RE = re.compile(LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN)
+
+
+def dind_step_fits_the_wire_bounds(name: str, public_key: str) -> bool:
+    """The executor's `DindStep` bounds (datura), applied here first so the two ends cannot drift
+    apart silently: a step this returns False for would be a 422 on the whole intent."""
+    return (
+        len(name) <= LOCAL_VERIFY_DIND_NAME_MAX
+        and _DIND_NAME_RE.fullmatch(name) is not None
+        and len(public_key) <= LOCAL_VERIFY_DIND_PUBLIC_KEY_MAX
+        and _DIND_KEY_RE.fullmatch(public_key) is not None
+    )
 
 
 class LocalFactsCheck:
@@ -119,6 +145,7 @@ class LocalFactsCheck:
                 },
             )
 
+        prepared = self._choose_dind_identity(ctx, capabilities)
         intent = build_intent(
             executor_uuid=ctx.executor.uuid,
             miner_hotkey=ctx.miner_hotkey,
@@ -126,6 +153,14 @@ class LocalFactsCheck:
             verifyx=None,
             parallel_gpu=False,
             deadline_s=facts_deadline_s(),
+            dind=None
+            if prepared is None
+            else DindStep(
+                name=prepared.name,
+                port=prepared.port.external,
+                public_key=prepared.public_key,
+                sysbox=prepared.sysbox,
+            ),
         )
         if port is None:
             # The capability without the loopback port: `/verify` cannot be reached from the
@@ -136,8 +171,20 @@ class LocalFactsCheck:
         try:
             answer = await client.verify(ctx.ssh, port, intent)
         except LocalVerifyUnavailable as exc:
+            # The executor may have started the container before the answer was lost, so the name
+            # the validator asked for stays in the state (`started` False, reason = the loss):
+            # ProviderSideLoadCheck excuses that name instead of billing its cores to the provider,
+            # and the settle step removes the container if it exists. PortConnectivityCheck runs
+            # as today (it takes only a `started` container).
+            if prepared is not None:
+                prepared.reason = exc.reason
             return self._unavailable(
-                ctx, exc.reason, exc.detail, capabilities=capabilities, local_verify_port=port
+                ctx,
+                exc.reason,
+                exc.detail,
+                capabilities=capabilities,
+                local_verify_port=port,
+                dind=prepared,
             )
 
         facts = parse_facts(
@@ -147,6 +194,15 @@ class LocalFactsCheck:
             round_trip_ms=answer.round_trip_ms,
             executor_elapsed_ms=answer.elapsed_ms,
         )
+        if prepared is not None:
+            facts = replace(facts, dind=judge_dind_step(prepared, answer.steps))
+            self._metric(
+                ctx,
+                "consumed" if facts.dind.started else "fallback",
+                "ok" if facts.dind.started else facts.dind.reason,
+                step_name="dind",
+                port=prepared.port.external,
+            )
         return self._report(ctx, facts)
 
     def _report(self, ctx: Context, facts: LocalFacts) -> CheckResult:
@@ -169,6 +225,7 @@ class LocalFactsCheck:
                 ("containers", facts.has_container_ages()),
                 ("ports", facts.published_ports is not None),
                 ("inspector", facts.inspector_lib_sha256 is not None),
+                ("dind", facts.dind is not None and facts.dind.started),
             )
             if present
         ]
@@ -191,6 +248,51 @@ class LocalFactsCheck:
             updates={"state": replace(ctx.state, local_facts=facts)},
         )
 
+    def _choose_dind_identity(self, ctx: Context, capabilities: set[str]) -> PreparedDind | None:
+        """Phase 2c: the name, port and key pair the DinD probe would create over SSH, chosen now so
+        the executor can start the container beside the other steps. The port is the first one the
+        selector would offer (configured range minus rented and filler ports — the validator's own
+        set, no fact involved); the name is the probe's own `container_<hotkey>_<port>`."""
+        if not settings.LOCAL_VERIFY_DIND_IN_INTENT or DIND_CAPABILITY not in capabilities:
+            return None
+        if not ctx.config.job_batch_id or ctx.services.ssh is None:
+            return None  # PortConnectivityCheck would not probe, or nothing can mint a key
+        rented_data = ctx.state.rented_data
+        rented = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        taken = set(rented.get_rented_ports() if rented else [])
+        taken |= set(rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else [])
+        try:
+            pairs = get_all_ports(
+                ctx.executor.port_range, ctx.executor.port_mappings, ctx.executor.ssh_port
+            )
+        except (ValueError, TypeError):
+            return None
+        pair = next(((i, e) for i, e in pairs if e not in taken), None)
+        if pair is None:
+            return None
+        private_key, public_key = ctx.services.ssh.generate_keypair()
+        port = PortPair(*pair)
+        name, public_key = f"container_{ctx.miner_hotkey}_{port.external}", public_key.strip()
+        if not dind_step_fits_the_wire_bounds(name, public_key):
+            # The executor's DindStep would reject it with a 422 on the WHOLE intent — every fact
+            # lost for a step that is an optimisation. Leave the step out; the probe runs as today.
+            logger.warning(
+                _m(
+                    "[local_facts] dind step outside the shared bounds; not asking",
+                    extra=get_extra_info(
+                        {**ctx.default_extra, "name_len": len(name), "key_len": len(public_key)}
+                    ),
+                )
+            )
+            return None
+        return PreparedDind(
+            name=name,
+            port=port,
+            private_key=private_key,
+            public_key=public_key,
+            sysbox=ctx.state.sysbox_runtime,
+        )
+
     def _unavailable(
         self,
         ctx: Context,
@@ -198,6 +300,7 @@ class LocalFactsCheck:
         detail: str,
         capabilities: set[str] | None = None,
         local_verify_port: int | None = None,
+        dind: PreparedDind | None = None,
     ) -> CheckResult:
         detail = detail[:DETAIL_MAX_CHARS]
         self._metric(ctx, "fallback", reason, detail=detail)
@@ -206,7 +309,9 @@ class LocalFactsCheck:
                 "state": replace(
                     ctx.state,
                     local_facts=LocalFacts(
-                        capabilities=frozenset(capabilities), local_verify_port=local_verify_port
+                        capabilities=frozenset(capabilities),
+                        local_verify_port=local_verify_port,
+                        dind=dind,
                     ),
                 )
             }
@@ -225,7 +330,9 @@ class LocalFactsCheck:
         )
 
     @staticmethod
-    def _metric(ctx: Context, outcome: str, reason: str, detail: str = "", **fields) -> None:
+    def _metric(
+        ctx: Context, outcome: str, reason: str, detail: str = "", step_name: str = "facts", **fields
+    ) -> None:
         logger.info(
             _m(
                 LOCAL_VERIFY_OUTCOME_EVENT,
@@ -233,7 +340,7 @@ class LocalFactsCheck:
                     {
                         **ctx.default_extra,
                         "outcome": outcome,
-                        "step": "facts",
+                        "step": step_name,
                         "reason": reason,
                         "detail": detail[:DETAIL_MAX_CHARS],
                         "first_pass": ctx.config.first_pass,
