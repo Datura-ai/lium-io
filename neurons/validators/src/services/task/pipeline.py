@@ -203,12 +203,6 @@ class LoggerSink:
         getattr(self.logger, level)(_m(event.event, extra=event.model_dump(mode="json")))
 
 
-# DAH-3012: steps shorter than this are left out of the final event's summary — they are the
-# ~25 sub-second bookkeeping checks; the 6–8 that carry the run's time are what a provider (and a
-# Loki query) needs to see, in ~300 bytes.
-STEP_SUMMARY_MIN_MS = 1000
-
-
 def summarize_steps(
     steps: list[tuple[str, int]], elapsed_time_ms: int, failed_check_id: str | None = None
 ) -> dict[str, Any]:
@@ -218,9 +212,14 @@ def summarize_steps(
     as `last_validation`, so this is how per-step durations reach the provider without a new
     field anywhere downstream.
     """
+    # DAH-3019: every step the run executed, not only the slow ones. The provider's node page lists
+    # this summary, and a list that silently drops the quick checks reads as "only 3 checks ran".
     summary: dict[str, Any] = {
+        # a tenth of a second for the steps that carry the run's time, three decimals below a
+        # second so a 4 ms check does not read as 0.0
         "steps": {
-            check_id: round(ms / 1000, 1) for check_id, ms in steps if ms >= STEP_SUMMARY_MIN_MS
+            check_id: round(ms / 1000, 1) if ms >= 1000 else round(ms / 1000, 3)
+            for check_id, ms in steps
         },
         "steps_total_s": round(elapsed_time_ms / 1000, 1),
     }
