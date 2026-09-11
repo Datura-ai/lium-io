@@ -92,13 +92,23 @@ class VerifyXCheck:
             if ctx.config.first_pass
             else {}
         )
-        result = await verifyx_service.validate_verifyx_and_process_job(
-            shell=ctx.services.shell,
-            executor_info=ctx.executor,
-            default_extra=ctx.default_extra,
-            machine_spec=specs,
-            **sizing,
-        )
+        # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
+        # judged it with evaluate_verifyx_capture — the same function the SSH path ends in. Only a
+        # PASSING local result is consumed; anything else (and the cold-sample retry below) runs
+        # over SSH exactly as before.
+        local = getattr(ctx.state, "local_verify", None)
+        transport = "ssh"
+        if local is not None and local.verifyx is not None:
+            result = local.verifyx
+            transport = "local_verify"
+        else:
+            result = await verifyx_service.validate_verifyx_and_process_job(
+                shell=ctx.services.shell,
+                executor_info=ctx.executor,
+                default_extra=ctx.default_extra,
+                machine_spec=specs,
+                **sizing,
+            )
 
         prev_ema = (
             ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
@@ -197,6 +207,7 @@ class VerifyXCheck:
                     "verifyx_success": True,
                     "verifyx_network_success": verifyx_network.get("success"),
                     "network": speedtest_network,
+                    "transport": transport,
                 },
             )
             if errors:

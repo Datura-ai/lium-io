@@ -419,6 +419,216 @@ class ValidationService:
         # CUDA_VISIBLE_DEVICES, so per-card crypto cannot gate today.
         return {"card_index": index, "ok": True, "reason": ""}
 
+    def prepare_matmul_challenge(
+        self,
+        machine_spec: dict,
+        default_extra: dict,
+        vram_budget_mb: int | None = None,
+    ) -> "MatmulChallenge":
+        """Size and encrypt one capability challenge; the caller decides how it reaches the executor.
+
+        The SSH path runs `decrypt_challenge.py {challenge.params}` over the shell; the local path
+        (liumd phase 1, `POST /verify`) sends the same four arguments in the intent. Either way
+        the output comes back to `evaluate_matmul_output`, which holds the only pass/fail logic, so
+        both transports are judged by one function. The returned object owns the generate-side
+        seal key (`gen_ptr`): call `close()` once the output has been evaluated.
+        """
+        # vram_budget_mb (DAH-3011): size the matmul from min(card VRAM, budget) instead of the whole
+        # card. Same challenge, seal and UUID check — a wrong/absent GPU or a spoofed UUID still
+        # fails; only the "fill the card" capacity proof is deferred. None = today's full-card size.
+        gpu_model = ""
+        if machine_spec.get("gpu", {}).get("count", 0) > 0:
+            details = machine_spec["gpu"].get("details", [])
+            if len(details) > 0:
+                gpu_model = details[0].get("name", "")
+
+        gpu_details = machine_spec.get("gpu", {}).get("details", [])
+        gpu_count = machine_spec.get("gpu", {}).get("count", 0)
+        gpu_uuids = ','.join([detail.get('uuid', '') for detail in gpu_details])
+
+        # NOTE: machine_info MUST exactly match what the executor's libdmcompverify
+        # reconstructs locally via getGPUInfo() — otherwise the hash-derived AES key
+        # will not match and the executor's decrypt will fail. Adding any new field
+        # to this JSON (e.g. gpu_capacity_mb) requires a corresponding change in the
+        # .so's getGPUInfo(). The Python-side pre-check below uses gpu_capacity_mb
+        # as a separate local variable; it is NEVER embedded into machine_info.
+        gpu_info = {
+            "uuids": gpu_uuids,
+            "gpu_count": gpu_count,
+            "gpu_model": gpu_model,
+        }
+        machine_info = json.dumps(gpu_info, sort_keys=True)
+
+        # GPU model<->VRAM consistency is gated earlier in the pipeline by
+        # GpuVramPrecheck (before the rented short-circuit), so it is NOT
+        # repeated here. gpu_capacity_mb is still needed to size the matmul.
+        gpu_capacity_mb = self.get_gpu_memory(machine_spec)
+        if vram_budget_mb and gpu_capacity_mb:
+            gpu_capacity_mb = min(gpu_capacity_mb, vram_budget_mb)
+
+        verifier_params = VerifierParams()
+        verifier_params.generate()
+        verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_capacity_mb, verifier_params.dim_n))
+
+        # Generate the challenge on a dedicated per-call object (mirrors the legacy
+        # encrypt_challenge flow, but its key is retained for the post-transport unseal).
+        gen_ptr = None
+        try:
+            gen_ptr = self.wrapper.DMCompVerify_new(10, 10)
+            self.wrapper.setDimension(gen_ptr, verifier_params.dim_n, verifier_params.dim_k)
+            self.wrapper.generateChallenge(
+                gen_ptr, verifier_params.seed, machine_info, verifier_params.uuid
+            )
+            verifier_params.cipher_text = self.wrapper.getCipherText(gen_ptr) or ""
+        except Exception as e:
+            logger.error("Failed encrypt challenge request: %s", str(e))
+            verifier_params.cipher_text = ""
+
+        log_extra = {
+            **default_extra,
+            "dim_n": verifier_params.dim_n,
+            "dim_k": verifier_params.dim_k,
+            "sized_vram_mb": gpu_capacity_mb,
+            "seed": verifier_params.seed,
+            "uuid": verifier_params.uuid,
+            "cipher_text": verifier_params.cipher_text,
+            "machine_info": machine_info,
+        }
+        return MatmulChallenge(
+            params=verifier_params, gen_ptr=gen_ptr, machine_info=machine_info, log_extra=log_extra, service=self
+        )
+
+    def evaluate_matmul_output(
+        self,
+        challenge: "MatmulChallenge",
+        *,
+        stdout: str,
+        stderr: str = "",
+    ) -> ValidationResult:
+        """Judge the executor's `decrypt_challenge.py` output — the one place that decides.
+
+        `stdout`/`stderr` are the process's, however they travelled (SSH capture or the `/verify`
+        result document). The sealed blob is authoritative and is unsealed with THIS challenge's
+        generate-side key, so a transport cannot change the verdict.
+        """
+        verifier_params = challenge.params
+        gen_ptr = challenge.gen_ptr
+        log_extra = challenge.log_extra
+        stdout = stdout.strip()
+        stderr = stderr.strip() if stderr else ""
+
+        # Extract the result from stdout. Prefer the combined RESULT_JSON marker
+        # (carries uuid + TFLOPS metrics); fall back to the legacy "UUID:" line for
+        # backward compatibility with older executors. A malformed RESULT_JSON also
+        # falls back to the legacy line rather than failing the check. The library
+        # prints many debug lines, so we take the LAST RESULT_JSON match.
+        metrics = None
+        sealed_blob = ""
+        try:
+            lines = stdout.splitlines()
+            result_json_line = next(
+                (line for line in reversed(lines) if line.startswith("RESULT_JSON:")),
+                None,
+            )
+            uuid = ""
+            if result_json_line is not None:
+                try:
+                    parsed = json.loads(result_json_line[len("RESULT_JSON:"):].strip())
+                except (ValueError, TypeError):
+                    parsed = None
+                # Only trust a well-formed object carrying a *string* uuid. Stdout is
+                # miner-controlled, so a crafted uuid of list/int/dict type must fall
+                # back to the legacy UUID: line rather than erroring out the whole
+                # check. (UUID comparison stays fail-closed regardless.)
+                if isinstance(parsed, dict) and isinstance(parsed.get("uuid"), str):
+                    uuid = parsed["uuid"].strip()
+                    metrics = parsed.get("metrics")
+                    # The sealed blob (when present) is authoritative; verified below.
+                    if isinstance(parsed.get("sealed"), str):
+                        sealed_blob = parsed["sealed"]
+                else:
+                    result_json_line = None  # malformed/unusable → fall through to legacy parse
+            if result_json_line is None:
+                uuid_line = next((line for line in lines if line.startswith("UUID:")), None)
+                uuid = uuid_line.split("UUID:")[1].strip() if uuid_line else ""
+        except Exception as e:
+            error_msg = f"Failed to extract UUID from stdout: {str(e)}"
+            logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
+            return ValidationResult(
+                success=False,
+                expected_uuid=verifier_params.uuid,
+                returned_uuid="",
+                stdout=stdout,
+                stderr=stderr,
+                error_message=error_msg
+            )
+
+        # Anti-spoof gate: when the executor returns a sealed (authenticated-encrypted)
+        # blob, it is AUTHORITATIVE. We decrypt it with OUR generate-side key and take
+        # uuid+metrics from inside, so a miner who only edits the (untrusted) Python
+        # wrapper cannot forge or inflate the result. If a sealed blob is present but
+        # fails authentication, we REJECT — we do not fall back to the miner-controlled
+        # plaintext line. Executors that predate sealing send no blob and keep the
+        # legacy behavior, so independent validator/executor upgrades stay compatible.
+        if getattr(self.wrapper, "_has_sealed", False) and sealed_blob:
+            inner = self.wrapper.unsealResult(gen_ptr, sealed_blob)
+            inner_obj = None
+            if inner:
+                try:
+                    inner_obj = json.loads(inner)
+                except (ValueError, TypeError):
+                    inner_obj = None
+            if not isinstance(inner_obj, dict) or not isinstance(inner_obj.get("uuid"), str):
+                error_msg = "Sealed result failed authentication (tampered/forged executor output)"
+                logger.error(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "error": error_msg})))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    returned_uuid="",
+                    stdout=stdout,
+                    stderr=stderr,
+                    error_message=error_msg,
+                )
+            # Authenticated: these override anything in the plaintext line.
+            uuid = inner_obj["uuid"].strip()
+            metrics = inner_obj.get("metrics")
+
+        try:
+            uuid_array = verifier_params.uuid.split(",")
+            if uuid in uuid_array:
+                logger.info(_m("Matrix Multiplication Verification Succeed", extra=get_extra_info(log_extra)))
+                return ValidationResult(
+                    success=True,
+                    expected_uuid=verifier_params.uuid,
+                    returned_uuid=uuid,
+                    stdout=stdout,
+                    stderr=stderr,
+                    metrics=metrics
+                )
+            else:
+                error_msg = f"UUID mismatch: expected '{verifier_params.uuid}', got '{uuid}'"
+                logger.error(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "returned_uuid": uuid, "error": error_msg})))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    returned_uuid=uuid,
+                    stdout=stdout,
+                    stderr=stderr,
+                    error_message=error_msg,
+                    metrics=metrics
+                )
+        except Exception as e:
+            error_msg = f"Error during UUID verification: {str(e)}"
+            logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
+            return ValidationResult(
+                success=False,
+                expected_uuid=verifier_params.uuid,
+                returned_uuid=uuid if 'uuid' in locals() else "",
+                stdout=stdout,
+                stderr=stderr,
+                error_message=error_msg
+            )
+
     async def validate_gpu_model_and_process_job(
         self,
         ssh_client,
@@ -427,9 +637,9 @@ class ValidationService:
         machine_spec: dict,
         vram_budget_mb: int | None = None,
     ) -> ValidationResult:
-        # vram_budget_mb (DAH-3011): size the matmul from min(card VRAM, budget) instead of the whole
-        # card. Same challenge, seal and UUID check — a wrong/absent GPU or a spoofed UUID still
-        # fails; only the "fill the card" capacity proof is deferred. None = today's full-card size.
+        # The SSH transport of the capability matmul: prepare_matmul_challenge → one remote
+        # `decrypt_challenge.py` run → evaluate_matmul_output. The local transport (checks/
+        # local_verify.py) calls the same two functions around `POST /verify`.
         # DAH-2671 item 3: all-claimed-cards work-proof. Shadow (MATMUL_ALLCARDS_CHECK_ENABLED
         # without enforcement) logs timing + per-card outcome and NEVER changes the returned result;
         # enforcement fails a count lie (device-selection error / OOM / serialised aggregate
@@ -452,67 +662,12 @@ class ValidationService:
         # Per-call verifier object: its key MUST survive the SSH round-trip so we can
         # unseal the executor's authenticated response. A shared object would be clobbered
         # by concurrent validations across the `await` below. Freed in `finally`.
-        gen_ptr = None
+        challenge = None
         try:
             script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
-
-            gpu_model = ""
-            if machine_spec.get("gpu", {}).get("count", 0) > 0:
-                details = machine_spec["gpu"].get("details", [])
-                if len(details) > 0:
-                    gpu_model = details[0].get("name", "")
-
-            gpu_details = machine_spec.get("gpu", {}).get("details", [])
-            gpu_count = machine_spec.get("gpu", {}).get("count", 0)
-            gpu_uuids = ','.join([detail.get('uuid', '') for detail in gpu_details])
-
-            # NOTE: machine_info MUST exactly match what the executor's libdmcompverify
-            # reconstructs locally via getGPUInfo() — otherwise the hash-derived AES key
-            # will not match and the executor's decrypt will fail. Adding any new field
-            # to this JSON (e.g. gpu_capacity_mb) requires a corresponding change in the
-            # .so's getGPUInfo(). The Python-side pre-check below uses gpu_capacity_mb
-            # as a separate local variable; it is NEVER embedded into machine_info.
-            gpu_info = {
-                "uuids": gpu_uuids,
-                "gpu_count": gpu_count,
-                "gpu_model": gpu_model,
-            }
-            machine_info = json.dumps(gpu_info, sort_keys=True)
-
-            # GPU model<->VRAM consistency is gated earlier in the pipeline by
-            # GpuVramPrecheck (before the rented short-circuit), so it is NOT
-            # repeated here. gpu_capacity_mb is still needed to size the matmul.
-            gpu_capacity_mb = self.get_gpu_memory(machine_spec)
-            if vram_budget_mb and gpu_capacity_mb:
-                gpu_capacity_mb = min(gpu_capacity_mb, vram_budget_mb)
-
-            verifier_params = VerifierParams()
-            verifier_params.generate()
-            verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_capacity_mb, verifier_params.dim_n))
-
-            # Generate the challenge on a dedicated per-call object (mirrors the legacy
-            # encrypt_challenge flow, but its key is retained for the post-SSH unseal).
-            try:
-                gen_ptr = self.wrapper.DMCompVerify_new(10, 10)
-                self.wrapper.setDimension(gen_ptr, verifier_params.dim_n, verifier_params.dim_k)
-                self.wrapper.generateChallenge(
-                    gen_ptr, verifier_params.seed, machine_info, verifier_params.uuid
-                )
-                verifier_params.cipher_text = self.wrapper.getCipherText(gen_ptr) or ""
-            except Exception as e:
-                logger.error("Failed encrypt challenge request: %s", str(e))
-                verifier_params.cipher_text = ""
-
-            log_extra = {
-                **default_extra,
-                "dim_n": verifier_params.dim_n,
-                "dim_k": verifier_params.dim_k,
-                "sized_vram_mb": gpu_capacity_mb,
-                "seed": verifier_params.seed,
-                "uuid": verifier_params.uuid,
-                "cipher_text": verifier_params.cipher_text,
-                "machine_info": machine_info,
-            }
+            challenge = self.prepare_matmul_challenge(machine_spec, default_extra, vram_budget_mb)
+            verifier_params = challenge.params
+            log_extra = challenge.log_extra
 
             # Short-circuit if encrypt_challenge returned empty. This happens when
             # the native call raised. No point SSHing an empty cipher to the
@@ -579,117 +734,7 @@ class ValidationService:
                     error_message=error_msg
                 )
 
-            # Extract the result from stdout. Prefer the combined RESULT_JSON marker
-            # (carries uuid + TFLOPS metrics); fall back to the legacy "UUID:" line for
-            # backward compatibility with older executors. A malformed RESULT_JSON also
-            # falls back to the legacy line rather than failing the check. The library
-            # prints many debug lines, so we take the LAST RESULT_JSON match.
-            metrics = None
-            sealed_blob = ""
-            try:
-                lines = stdout.splitlines()
-                result_json_line = next(
-                    (line for line in reversed(lines) if line.startswith("RESULT_JSON:")),
-                    None,
-                )
-                uuid = ""
-                if result_json_line is not None:
-                    try:
-                        parsed = json.loads(result_json_line[len("RESULT_JSON:"):].strip())
-                    except (ValueError, TypeError):
-                        parsed = None
-                    # Only trust a well-formed object carrying a *string* uuid. Stdout is
-                    # miner-controlled, so a crafted uuid of list/int/dict type must fall
-                    # back to the legacy UUID: line rather than erroring out the whole
-                    # check. (UUID comparison stays fail-closed regardless.)
-                    if isinstance(parsed, dict) and isinstance(parsed.get("uuid"), str):
-                        uuid = parsed["uuid"].strip()
-                        metrics = parsed.get("metrics")
-                        # The sealed blob (when present) is authoritative; verified below.
-                        if isinstance(parsed.get("sealed"), str):
-                            sealed_blob = parsed["sealed"]
-                    else:
-                        result_json_line = None  # malformed/unusable → fall through to legacy parse
-                if result_json_line is None:
-                    uuid_line = next((line for line in lines if line.startswith("UUID:")), None)
-                    uuid = uuid_line.split("UUID:")[1].strip() if uuid_line else ""
-            except Exception as e:
-                error_msg = f"Failed to extract UUID from stdout: {str(e)}"
-                logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
-                return ValidationResult(
-                    success=False,
-                    expected_uuid=verifier_params.uuid,
-                    returned_uuid="",
-                    stdout=stdout,
-                    stderr=stderr,
-                    error_message=error_msg
-                )
-
-            # Anti-spoof gate: when the executor returns a sealed (authenticated-encrypted)
-            # blob, it is AUTHORITATIVE. We decrypt it with OUR generate-side key and take
-            # uuid+metrics from inside, so a miner who only edits the (untrusted) Python
-            # wrapper cannot forge or inflate the result. If a sealed blob is present but
-            # fails authentication, we REJECT — we do not fall back to the miner-controlled
-            # plaintext line. Executors that predate sealing send no blob and keep the
-            # legacy behavior, so independent validator/executor upgrades stay compatible.
-            if getattr(self.wrapper, "_has_sealed", False) and sealed_blob:
-                inner = self.wrapper.unsealResult(gen_ptr, sealed_blob)
-                inner_obj = None
-                if inner:
-                    try:
-                        inner_obj = json.loads(inner)
-                    except (ValueError, TypeError):
-                        inner_obj = None
-                if not isinstance(inner_obj, dict) or not isinstance(inner_obj.get("uuid"), str):
-                    error_msg = "Sealed result failed authentication (tampered/forged executor output)"
-                    logger.error(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "error": error_msg})))
-                    return ValidationResult(
-                        success=False,
-                        expected_uuid=verifier_params.uuid,
-                        returned_uuid="",
-                        stdout=stdout,
-                        stderr=stderr,
-                        error_message=error_msg,
-                    )
-                # Authenticated: these override anything in the plaintext line.
-                uuid = inner_obj["uuid"].strip()
-                metrics = inner_obj.get("metrics")
-
-            try:
-                uuid_array = verifier_params.uuid.split(",")
-                if uuid in uuid_array:
-                    logger.info(_m("Matrix Multiplication Verification Succeed", extra=get_extra_info(log_extra)))
-                    return ValidationResult(
-                        success=True,
-                        expected_uuid=verifier_params.uuid,
-                        returned_uuid=uuid,
-                        stdout=stdout,
-                        stderr=stderr,
-                        metrics=metrics
-                    )
-                else:
-                    error_msg = f"UUID mismatch: expected '{verifier_params.uuid}', got '{uuid}'"
-                    logger.error(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "returned_uuid": uuid, "error": error_msg})))
-                    return ValidationResult(
-                        success=False,
-                        expected_uuid=verifier_params.uuid,
-                        returned_uuid=uuid,
-                        stdout=stdout,
-                        stderr=stderr,
-                        error_message=error_msg,
-                        metrics=metrics
-                    )
-            except Exception as e:
-                error_msg = f"Error during UUID verification: {str(e)}"
-                logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
-                return ValidationResult(
-                    success=False,
-                    expected_uuid=verifier_params.uuid,
-                    returned_uuid=uuid if 'uuid' in locals() else "",
-                    stdout=stdout,
-                    stderr=stderr,
-                    error_message=error_msg
-                )
+            return self.evaluate_matmul_output(challenge, stdout=stdout, stderr=stderr)
 
         except Exception as e:
             error_msg = f"Unexpected error in validate_gpu_model_and_process_job: {str(e)}"
@@ -700,8 +745,31 @@ class ValidationService:
             )
         finally:
             # Always release the per-call verifier object (it held the seal key).
-            if gen_ptr is not None:
-                try:
-                    self.wrapper.free(gen_ptr)
-                except Exception:
-                    pass
+            if challenge is not None:
+                challenge.close()
+
+
+@dataclass
+class MatmulChallenge:
+    """One prepared capability challenge and the key that judges its answer (see
+    `ValidationService.prepare_matmul_challenge`)."""
+
+    params: VerifierParams
+    gen_ptr: object
+    machine_info: str
+    log_extra: dict
+    service: ValidationService
+
+    def close(self) -> None:
+        if self.gen_ptr is not None:
+            try:
+                self.service.wrapper.free(self.gen_ptr)
+            except Exception as exc:
+                # The native free failing leaks one generator; nothing to roll back, the verdict stands.
+                logger.warning(
+                    _m(
+                        "Matmul challenge generator free failed",
+                        extra=get_extra_info({**self.log_extra, "error": str(exc)}),
+                    )
+                )
+            self.gen_ptr = None

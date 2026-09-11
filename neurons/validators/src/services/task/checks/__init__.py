@@ -16,6 +16,7 @@ from .gpu_power_limit import GpuPowerLimitCheck
 from .gpu_usage import GpuUsageCheck
 from .gpu_vram_precheck import GpuVramPrecheck
 from .inspector import InspectorRentedCheck
+from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
@@ -51,6 +52,7 @@ __all__ = [
     "GpuUsageCheck",
     "GpuVramPrecheck",
     "InspectorRentedCheck",
+    "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
     "NvmlDigestCheck",
     "PortConnectivityCheck",

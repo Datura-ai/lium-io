@@ -79,6 +79,63 @@ LOCAL_VERIFY_SCHEMA = "lium.local_verify/1"
 LOCAL_VERIFY_CAPABILITY = "local_verify/1"
 
 
+# The largest card count one host can claim; bounds the matmul fan-out an intent can ask for.
+LOCAL_VERIFY_MAX_DEVICES = 64
+
+
+class LocalVerifyWireModel(pydantic.BaseModel):
+    """Every document on the `/verify` wire, both sides. `extra="forbid"`: a field this schema does
+    not name is a 422, never silently dropped — the Rust liumd (`deny_unknown_fields`) refuses it
+    too, and a schema both sides refuse identically is one that can be pinned (LIUMD_RUST_PLAN
+    §2.3.6). The intent's step challenges live here so the validator builds what the executor
+    parses from ONE definition; the executor's `payloads/verify.py` imports them."""
+
+    model_config = pydantic.ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class DeviceChallenge(LocalVerifyWireModel):
+    """One card's own challenge for the all-cards work-proof: a run pinned to `index`
+    (`CUDA_VISIBLE_DEVICES`) with a cipher text sealed for that card alone (seeds may repeat, as
+    on the SSH path). The validator derives the cipher text per device (domain-separated from the
+    intent's nonce), so the output of one real run unseals for one card only — a host with fewer
+    cards than it claims cannot answer for all of them with a single computation."""
+
+    index: int = pydantic.Field(ge=0)
+    seed: int
+    cipher_text: str = pydantic.Field(min_length=1, max_length=4096)
+
+
+class MatmulStep(LocalVerifyWireModel):
+    """The capability matmul challenge, exactly the arguments `decrypt_challenge.py` takes."""
+
+    dim_n: int
+    dim_k: int
+    seed: int
+    cipher_text: str = pydantic.Field(min_length=1, max_length=4096)
+    # The all-cards work-proof: one pinned run per card, each with its own challenge; None = one
+    # unpinned run with the challenge above.
+    devices: list[DeviceChallenge] | None = pydantic.Field(default=None, max_length=LOCAL_VERIFY_MAX_DEVICES)
+
+    @pydantic.model_validator(mode="after")
+    def _one_challenge_per_card(self) -> "MatmulStep":
+        if not self.devices:
+            return self
+        indexes = [d.index for d in self.devices]
+        if len(set(indexes)) != len(indexes):
+            raise ValueError("devices: the same card index twice")
+        ciphers = {d.cipher_text for d in self.devices} | {self.cipher_text}
+        if len(ciphers) != len(self.devices) + 1:
+            raise ValueError("devices: every card needs its own cipher_text")
+        return self
+
+
+class VerifyXStep(LocalVerifyWireModel):
+    """The VerifyX challenge, exactly the arguments `verifyx_executor.py` takes."""
+
+    seed: int
+    cipher_text: str = pydantic.Field(min_length=1, max_length=65536)
+
+
 def local_verify_signing_blob(intent: dict) -> str:
     """Canonical message the validator signs over a `/verify` intent.
 

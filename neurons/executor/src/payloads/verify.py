@@ -9,67 +9,25 @@ challenge are judged by the same function.
 
 from typing import Literal
 
-from datura.requests.validator_requests import LOCAL_VERIFY_CAPABILITY, LOCAL_VERIFY_SCHEMA
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from datura.requests.validator_requests import (
+    LOCAL_VERIFY_CAPABILITY,
+    LOCAL_VERIFY_SCHEMA,
+    DeviceChallenge,  # noqa: F401 — re-exported for the service and the tests
+    LocalVerifyWireModel,
+    MatmulStep,
+    VerifyXStep,
+)
+from pydantic import Field
 
 # One definition for both sides (datura): the validator client imports the same names.
 SCHEMA = LOCAL_VERIFY_SCHEMA
 CAPABILITY = LOCAL_VERIFY_CAPABILITY
+# The intent's step challenges (`DeviceChallenge`, `MatmulStep`, `VerifyXStep`) and the
+# `extra="forbid"` base are datura's — the validator builds the intent from the very models the
+# executor parses. Re-exported here for the service and the tests.
+WireModel = LocalVerifyWireModel
 
 STEP_NAMES = ("matmul", "verifyx", "docker", "ports", "inspector")
-# The largest card count one host can claim; bounds the matmul fan-out an intent can ask for.
-MAX_DEVICES = 64
-
-
-class WireModel(BaseModel):
-    """Every document on the `/verify` wire. `extra="forbid"`: a field this schema does not name is
-    a 422, never silently dropped — the Rust liumd (`deny_unknown_fields`) refuses it too, and a
-    schema that both sides refuse identically is one that can be pinned (LIUMD_RUST_PLAN §2.3.6)."""
-
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-
-class DeviceChallenge(WireModel):
-    """One card's own challenge for the all-cards work-proof: a run pinned to `index`
-    (`CUDA_VISIBLE_DEVICES`) with a cipher text sealed for that card alone (seeds may repeat, as
-    on the SSH path). The validator derives the cipher text per device (domain-separated from the
-    intent's nonce), so the output of one real run unseals for one card only — a host with fewer
-    cards than it claims cannot answer for all of them with a single computation."""
-
-    index: int = Field(ge=0)
-    seed: int
-    cipher_text: str = Field(min_length=1, max_length=4096)
-
-
-class MatmulStep(WireModel):
-    """The capability matmul challenge, exactly the arguments `decrypt_challenge.py` takes."""
-
-    dim_n: int
-    dim_k: int
-    seed: int
-    cipher_text: str = Field(min_length=1, max_length=4096)
-    # The all-cards work-proof: one pinned run per card, each with its own challenge; None = one
-    # unpinned run with the challenge above.
-    devices: list[DeviceChallenge] | None = Field(default=None, max_length=MAX_DEVICES)
-
-    @model_validator(mode="after")
-    def _one_challenge_per_card(self) -> "MatmulStep":
-        if not self.devices:
-            return self
-        indexes = [d.index for d in self.devices]
-        if len(set(indexes)) != len(indexes):
-            raise ValueError("devices: the same card index twice")
-        ciphers = {d.cipher_text for d in self.devices} | {self.cipher_text}
-        if len(ciphers) != len(self.devices) + 1:
-            raise ValueError("devices: every card needs its own cipher_text")
-        return self
-
-
-class VerifyXStep(WireModel):
-    """The VerifyX challenge, exactly the arguments `verifyx_executor.py` takes."""
-
-    seed: int
-    cipher_text: str = Field(min_length=1, max_length=65536)
 
 
 class VerifySteps(WireModel):
