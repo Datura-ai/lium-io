@@ -630,12 +630,18 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         raise NVMLError(ret)
 
 
-def run_cmd(cmd):
+def run_cmd_result(cmd) -> subprocess.CompletedProcess:
+    """`run_cmd` without the raise: the caller reads returncode / stdout / stderr itself (smartctl
+    reports a failing disk through its exit status AND its JSON, DAH-2928)."""
     # Strip LD_LIBRARY_PATH so PyInstaller's bundled libs don't leak into subprocesses
     # and conflict with system-linked shared libs (e.g. libssl vs libcrypto version mismatch).
     env = {**os.environ}
     env.pop("LD_LIBRARY_PATH", None)
-    proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
+    return subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
+
+
+def run_cmd(cmd):
+    proc = run_cmd_result(cmd)
     if proc.returncode != 0:
         raise RuntimeError(
             f"run_cmd error {cmd=!r} {proc.returncode=} {proc.stdout=!r} {proc.stderr=!r}"
@@ -1482,6 +1488,230 @@ def get_gpu_interconnect():
     except Exception as exc:
         return GpuInterconnectObservation(None, f"parse: {exc!r}"[:400])
     return GpuInterconnectObservation(payload, "; ".join(errors))
+# DAH-2928: the host's own view of its disks. The scrape shares the host PID namespace (see the
+# /proc/1/root walks above), so /proc/1/mounts is the host mount table and /sys is the host sysfs.
+HOST_MOUNTS_PATH = "/proc/1/mounts"
+HOST_ROOT_PREFIX = "/proc/1/root"
+BLOCK_SYSFS_PATH = "/sys/block"
+NVME_SYSFS_PATH = "/sys/class/nvme"
+KERNEL_ERRORS_CMD = "dmesg --level=emerg,alert,crit,err"
+KERNEL_ERROR_LINES_KEPT = 8
+KERNEL_ERROR_LINE_CHARS = 200
+# Messages the block layer, the filesystems and the disk drivers print when a disk misbehaves.
+# What they have in common is that the data was not read or written as asked.
+KERNEL_DISK_ERROR_PATTERN = re.compile(
+    r"I/O error|Buffer I/O error|print_req_error|EXT4-fs error|EXT4-fs \([^)]*\): [^\n]*(error|corrupt)"
+    r"|XFS \([^)]*\): [^\n]*(error|corrupt|shutdown)|Remounting filesystem read-only|critical medium error"
+    r"|Medium Error|Unrecovered read error|BTRFS[^\n]*(csum failed|corrupt)"
+    r"|nvme[^\n]*(timeout|reset controller|failed|Removing after probe failure|I/O Cmd)"
+    r"|ata\d+(\.\d+)?: (exception Emask|failed command|status: \{ DRDY ERR)",
+    re.IGNORECASE,
+)
+# errno values, spelled out because the packaged scrape cannot import errno (obfuscator allowlist)
+ERRNO_EIO = 5
+ERRNO_EROFS = 30
+
+
+class DiskHealthObservation:
+    def __init__(
+        self,
+        docker_root_dir: str,
+        read_only_mounts: list[str],
+        write_probe: str,
+        write_probe_error: str,
+        kernel_io_errors: int,
+        kernel_io_error_lines: list[str],
+        kernel_log_error: str,
+        block_io_errors: dict[str, int],
+        nvme_states: dict[str, str],
+        smart: dict[str, str] | str,
+    ) -> None:
+        self.docker_root_dir = docker_root_dir
+        self.read_only_mounts = read_only_mounts
+        self.write_probe = write_probe
+        self.write_probe_error = write_probe_error
+        self.kernel_io_errors = kernel_io_errors
+        self.kernel_io_error_lines = kernel_io_error_lines
+        self.kernel_log_error = kernel_log_error
+        self.block_io_errors = block_io_errors
+        self.nvme_states = nvme_states
+        self.smart = smart
+
+    def as_payload(self) -> dict:
+        return {
+            "dh_docker_root_dir": self.docker_root_dir,
+            "dh_read_only_mounts": self.read_only_mounts,
+            "dh_write_probe_error": self.write_probe_error,
+            "dh_write_probe": self.write_probe,
+            "dh_kernel_io_error_lines": self.kernel_io_error_lines,
+            "dh_kernel_io_errors": self.kernel_io_errors,
+            "dh_kernel_log_error": self.kernel_log_error,
+            "dh_block_io_errors": self.block_io_errors,
+            "dh_nvme_states": self.nvme_states,
+            "dh_smart": self.smart,
+        }
+
+
+def mounts_holding(mounts_text: str, path: str) -> list[str]:
+    """The mount point a write to `path` lands on, when that filesystem is mounted read-only.
+
+    `mounts_text` is /proc/<pid>/mounts. Only the covering mount counts - the longest mount point
+    that is `path` or a parent of it, the last line winning when a point is mounted over - because
+    a mount above it says nothing about writes below: `ro /` with `rw /var/lib/docker` is a docker
+    root that takes writes, and returns []. One element or none; a list so the payload shape
+    holds."""
+    covering: tuple[str, list[str]] | None = None
+    for line in mounts_text.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        mount_point, options = fields[1], fields[3].split(",")
+        if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
+            continue
+        if covering is None or len(mount_point) >= len(covering[0]):
+            covering = (mount_point, options)
+    if covering is None or "ro" not in covering[1]:
+        return []
+    return [covering[0]]
+
+
+def probe_write(directory: str) -> tuple[str, str]:
+    """('ok', '') when a file can be created, written, fsynced and removed under `directory`;
+    ('failed', reason) when the kernel refused with EROFS/EIO - the disk itself is refusing writes;
+    ('skipped', reason) for anything else (no such directory, no permission from where the scrape runs)."""
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=".lium-disk-probe-", dir=directory) as probe:
+            probe.write(b"lium disk probe\n")
+            probe.flush()
+            os.fsync(probe.fileno())
+        return "ok", ""
+    except OSError as e:
+        if e.errno in (ERRNO_EIO, ERRNO_EROFS):
+            return "failed", f"{e.__class__.__name__}: {e}"
+        return "skipped", f"{e.__class__.__name__}: {e}"
+    except Exception as e:
+        return "skipped", f"{e.__class__.__name__}: {e}"
+
+
+def kernel_disk_errors(log_text: str) -> tuple[int, list[str]]:
+    """How many kernel error lines describe a disk fault, and the last few of them."""
+    matching = [line.strip() for line in log_text.splitlines() if KERNEL_DISK_ERROR_PATTERN.search(line)]
+    kept = [line[:KERNEL_ERROR_LINE_CHARS] for line in matching[-KERNEL_ERROR_LINES_KEPT:]]
+    return len(matching), kept
+
+
+def block_device_io_errors() -> dict[str, int]:
+    """SCSI/SATA devices with a non-zero ioerr_cnt (hex in sysfs); NVMe has no such counter."""
+    errors = {}
+    for counter_path in sorted(glob.glob(f"{BLOCK_SYSFS_PATH}/*/device/ioerr_cnt")):
+        device = counter_path.split("/")[-3]
+        try:
+            count = int(read_sysfs_value(counter_path) or "0", 16)
+        except ValueError:
+            continue
+        if count:
+            errors[device] = count
+    return errors
+
+
+def nvme_controller_states() -> dict[str, str]:
+    """NVMe controllers whose state is anything but 'live' (resetting, connecting, dead, deleting)."""
+    states = {}
+    for state_path in sorted(glob.glob(f"{NVME_SYSFS_PATH}/*/state")):
+        state = read_sysfs_value(state_path)
+        if state and state != "live":
+            states[state_path.split("/")[-2]] = state
+    return states
+
+
+# A drive that is dying is exactly the one that may not answer a SMART query; `timeout(1)` bounds it
+# so the fatal machine scrape is not held past its own budget (the docker daemon gets the same 30 s).
+SMARTCTL_TIMEOUT_S = 30
+TIMEOUT_EXIT_STATUS = 124
+
+
+def smart_health() -> dict[str, str] | str:
+    """smartctl's overall health verdict per disk, or 'unavailable' where smartctl is not installed.
+
+    `smartctl -H` exits non-zero when the disk is FAILING (bit 3) and when the device has no SMART or
+    cannot be opened (bits 1/2) — the verdict is in the JSON on stdout either way, so the exit status
+    alone is never the error; only a timeout or unreadable output is.
+    """
+    if not shutil.which("smartctl"):
+        return "unavailable"
+    verdicts = {}
+    for device in sorted(glob.glob("/dev/sd?") + glob.glob("/dev/nvme?n1")):
+        try:
+            proc = run_cmd_result(f"timeout {SMARTCTL_TIMEOUT_S} smartctl -H -j {device}")
+            if proc.returncode == TIMEOUT_EXIT_STATUS:
+                verdicts[device] = f"error: smartctl did not answer within {SMARTCTL_TIMEOUT_S}s"
+                continue
+            report = json.loads(proc.stdout)
+            passed = (report.get("smart_status") or {}).get("passed")
+            if passed is None:
+                messages = (report.get("smartctl") or {}).get("messages") or []
+                first = next(
+                    (m.get("string") for m in messages if isinstance(m, dict) and m.get("string")),
+                    "",
+                )
+                verdicts[device] = (
+                    f"error: {first[:KERNEL_ERROR_LINE_CHARS]}" if first else "unknown"
+                )
+            else:
+                verdicts[device] = "PASSED" if passed else "FAILED"
+        except Exception as e:
+            verdicts[device] = f"error: {str(e)[:KERNEL_ERROR_LINE_CHARS]}"
+    return verdicts
+
+
+def get_disk_health() -> DiskHealthObservation:
+    """Whether the disk that holds the containers is still taking writes, and what the kernel and
+    the drives say about it (DAH-2928).
+
+    A renter's file on a pod changed on disk after it was written, with no error reaching the
+    container. The scrape reported capacity and usage and nothing about health, so the node kept
+    being listed. Four independent readings are taken and reported side by side; deciding what to
+    do with an error count is the backend's job. A docker root that refuses writes is a node that
+    cannot start a container; DiskHealthCheck reports it as a warning (no score change) until the
+    reading is proven on live executors.
+    """
+    try:
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+
+    try:
+        with open(HOST_MOUNTS_PATH) as mounts_file:
+            mounts_text = mounts_file.read()
+    except Exception:
+        mounts_text = ""
+    read_only_mounts = mounts_holding(mounts_text, docker_root_dir)
+
+    host_docker_root = f"{HOST_ROOT_PREFIX}{docker_root_dir}"
+    write_probe, write_probe_error = probe_write(
+        host_docker_root if os.path.isdir(host_docker_root) else docker_root_dir
+    )
+
+    kernel_log_error = ""
+    try:
+        kernel_io_errors, kernel_io_error_lines = kernel_disk_errors(run_cmd(KERNEL_ERRORS_CMD))
+    except Exception as e:
+        # dmesg needs CAP_SYSLOG or kernel.dmesg_restrict=0; without it the count is unknown, not 0
+        kernel_io_errors, kernel_io_error_lines = 0, []
+        kernel_log_error = str(e)[:KERNEL_ERROR_LINE_CHARS]
+
+    return DiskHealthObservation(
+        docker_root_dir,
+        read_only_mounts,
+        write_probe,
+        write_probe_error,
+        kernel_io_errors,
+        kernel_io_error_lines,
+        kernel_log_error,
+        block_device_io_errors(),
+        nvme_controller_states(),
+        smart_health(),
+    )
 
 
 def get_machine_specs():
@@ -1675,6 +1905,11 @@ def get_machine_specs():
         # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
         # node that loses only the breakdown must keep reporting total/used/free.
         data["hard_disk_docker_scrape_error"] = repr(exc)
+
+    try:
+        data["data_disk_health"] = get_disk_health().as_payload()
+    except Exception as exc:
+        data["data_disk_health_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:
