@@ -5,6 +5,7 @@ import logging
 from preflight.base import PreflightCheck, CheckResult, CheckStatus
 from preflight.utils import get_gpu_info
 from preflight.constants import GPU_MODEL_RATES
+from services.gpu_spec_table import normalize_gpu_model
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +45,23 @@ class GPUCheck(PreflightCheck):
                     message="No GPUs detected. Ensure NVIDIA GPUs are installed and drivers are properly configured"
                 )
 
-            gpu_model = gpu_info["gpu_model"]
+            raw_gpu_model = gpu_info["gpu_model"]
+            # Same canonical name the validator gives the scraped specs (machine_spec_scrape),
+            # so a host the validator would accept is not refused here by its NVML spelling
+            # ("NVIDIA A10G", "Tesla T4", ...).
+            gpu_model = normalize_gpu_model(raw_gpu_model)
             gpu_count = gpu_info["gpu_count"]
             gpu_details = gpu_info["gpu_details"]
             gpu_uuids = gpu_info["gpu_uuids"]
 
-            logger.debug(f"GPU model: {gpu_model}, count: {gpu_count}")
+            logger.debug(f"GPU model: {gpu_model} (NVML: {raw_gpu_model}), count: {gpu_count}")
 
             # Check 1: GPU model support
             if gpu_model not in GPU_MODEL_RATES:
                 return CheckResult(
                     name=self.name,
                     status=CheckStatus.FAILED,
-                    message=f"GPU model '{gpu_model}' is not supported. Supported models: {', '.join(list(GPU_MODEL_RATES.keys())[:5])}..."
+                    message=f"GPU model '{raw_gpu_model}' is not supported. Supported models: {', '.join(list(GPU_MODEL_RATES.keys())[:5])}..."
                 )
 
             # Check 2: GPU count

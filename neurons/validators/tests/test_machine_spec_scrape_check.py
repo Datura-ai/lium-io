@@ -111,9 +111,10 @@ class DummySSHService:
         return json.dumps(self.decrypted_data)
 
 
-def test_normalize_gpu_details_canonicalizes_a10_alias():
+@pytest.mark.parametrize("nvml_name", ["NVIDIA A10", "NVIDIA A10G"])
+def test_normalize_gpu_details_canonicalizes_a10_alias(nvml_name):
     assert _normalize_gpu_details(
-        [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]
+        [{"name": nvml_name, "uuid": "GPU-abc123"}]
     ) == [
         {"name": "NVIDIA A10 Tensor Core GPU", "uuid": "GPU-abc123"}
     ]

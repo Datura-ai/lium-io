@@ -93,6 +93,7 @@ def test_known_unranged_passthrough(monkeypatch):
     ("Tesla H100 80GB HBM3", "NVIDIA H100 80GB HBM3"),
     ("NVIDIA T4", "NVIDIA T4 Tensor Core GPU"),
     ("NVIDIA A10", "NVIDIA A10 Tensor Core GPU"),
+    ("NVIDIA A10G", "NVIDIA A10 Tensor Core GPU"),  # AWS g5 SKU of the A10
 ])
 def test_normalization_lookup(raw, expected):
     assert gpu_spec_table.normalize_gpu_model(raw) == expected
