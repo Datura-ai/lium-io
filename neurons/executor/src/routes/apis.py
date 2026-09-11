@@ -261,10 +261,32 @@ async def remove_ssh_key(
     return response
 
 
+def _validate_pod_logs_consistency(payload: GetPodLogsPaylod) -> None:
+    """Require the signed string to be the container name the request reads.
+
+    MinerMiddleware verifies the miner's signature over `data_to_sign` and nothing
+    else, so without this check any string the miner ever signed (an SSH public key
+    sent to /upload_ssh_key, another container's name) authenticates a read of any
+    container's events. The miner signs the container name itself
+    (ExecutorService.get_pod_logs), same shape as `_validate_ssh_key_consistency`.
+
+    Raises:
+        HTTPException: 400 when data_to_sign is not the requested container name
+    """
+    if payload.container_name.strip() != payload.data_to_sign.strip():
+        logger.warning(
+            "pod_logs request signed over a different string: "
+            f"container_name length={len(payload.container_name.strip())}, "
+            f"data_to_sign length={len(payload.data_to_sign.strip())}"
+        )
+        raise HTTPException(status_code=400, detail="Container name mismatch")
+
+
 @apis_router.post("/pod_logs")
 async def get_pod_logs(
     payload: GetPodLogsPaylod, pod_log_service: Annotated[PodLogService, Depends(PodLogService)]
 ):
+    _validate_pod_logs_consistency(payload)
     return await pod_log_service.find_by_continer_name(payload.container_name)
 
 
