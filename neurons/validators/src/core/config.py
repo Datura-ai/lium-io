@@ -274,6 +274,11 @@ class Settings(BaseSettings):
     # away, and refuse the spoofable nvidia-smi XML fallback when it disagrees with the kernel map.
     KERNEL_GPU_VERDICT_CHECK_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_CHECK_ENABLED", default=True)
     KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2662 — match provider/GPU bans against the kernel's GPU UUIDs (/proc/driver/nvidia) as well
+    # as the host-reported ones. Shadow by default: the kernel list is read, recorded on specs and
+    # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
+    # matched on the reported list until this is flipped from a week of clean fleet data.
+    KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
     # Item 2a — corroborate the advertised CPU(s) count against sources the lscpu wrapper does not
     # author (/proc/cpuinfo, /sys present population, docker NCPU).
     CPU_TRUTH_CHECK_ENABLED: bool = Field(env="CPU_TRUTH_CHECK_ENABLED", default=True)

@@ -43,7 +43,7 @@ async def test_hotkey_match_fails(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.PROVIDER_BANNED.reason
-    assert result.updates == {"is_provider_banned": True}
+    assert result.updates["is_provider_banned"] is True
 
 
 @pytest.mark.asyncio
@@ -64,7 +64,7 @@ async def test_coldkey_match_fails(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.PROVIDER_BANNED.reason
-    assert result.updates == {"is_provider_banned": True}
+    assert result.updates["is_provider_banned"] is True
 
 
 @pytest.mark.asyncio
@@ -83,7 +83,7 @@ async def test_gpu_uuid_match_fails(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.PROVIDER_BANNED.reason
-    assert result.updates == {"is_provider_banned": True}
+    assert result.updates["is_provider_banned"] is True
 
 
 @pytest.mark.asyncio
@@ -108,7 +108,10 @@ async def test_clean_provider_passes(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.PROVIDER_ALLOWED.reason
-    assert result.updates == {}
+    assert "is_provider_banned" not in result.updates
+    # DAH-2662: no ssh here, so the kernel read is skipped — and remembered as attempted
+    assert result.updates["state"].kernel_gpu_uuids_read is True
+    assert result.updates["state"].kernel_gpu_uuids is None
 
 
 @pytest.mark.asyncio
