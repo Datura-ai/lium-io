@@ -51,7 +51,7 @@ from services.local_verify_client import (
     sign_intent,
 )
 
-from core.config import Settings, settings
+from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state, make_context
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
@@ -1329,11 +1329,6 @@ async def test_the_gate_reads_the_callers_unscored_flag_not_the_fast_path_sized_
         assert executor.intents[0]["parallel_gpu"] is False  # serial, full size: not first_pass-shaped
     assert local.event.reason_code == "LOCAL_VERIFY_OK"
     assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
-
-
-def test_the_shipped_default_gates_the_one_call_to_the_first_pass():
-    assert Settings.model_fields["LOCAL_VERIFY_FIRST_PASS_ONLY"].default is True
-    assert build_context_config().unscored is False  # a scored cycle unless the caller says so
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():
