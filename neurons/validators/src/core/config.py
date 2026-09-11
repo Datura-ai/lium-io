@@ -226,6 +226,11 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # DAH-3258: after `docker run`, start the inspector collector concurrently with the encrypted
+    # volume mount (a host-side process, independent of the container's filesystem) and write
+    # authorized_keys and /etc/environment in ONE `docker exec` after the mount. Every step still
+    # completes before ContainerCreated is returned. Off: the serial order as before.
+    RENTAL_POSTRUN_CONCURRENT_ENABLED: bool = Field(env="RENTAL_POSTRUN_CONCURRENT_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a

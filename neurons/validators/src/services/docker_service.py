@@ -115,9 +115,10 @@ from services.rental_docker_sdk import (
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
-    build_authorized_keys_exec_spec,
+    build_authorized_keys_and_environment_exec_spec,
     build_container_command_argv,
     build_environment_exec_spec,
+    environment_fits_exec_variable,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
 )
@@ -851,6 +852,39 @@ class DockerService:
     ) -> bool:
         rented_machine = await self.redis_service.get_rented_machine(executor_info)
         return bool(rented_machine and rented_machine.get("containers"))
+
+    async def _settle_inspector_after_failed_create(
+        self,
+        inspector_task: asyncio.Task,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        default_extra: dict,
+    ) -> None:
+        """DAH-3258: the collector was started alongside the mount and the create then failed.
+
+        Let the start finish (it never raises), then leave the host as a delete would: stop the
+        collector when no other rented container keeps it needed. Best-effort — the create's
+        own failure is what gets reported.
+        """
+        try:
+            await inspector_task
+            if not await self._has_rented_containers(executor_info):
+                await self._run_inspector_collector_lifecycle(
+                    ssh_client=ssh_client,
+                    executor_info=executor_info,
+                    action="stop",
+                    default_extra=default_extra,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Inspector collector could not be settled after a failed create",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+            )
 
     def _ssh_bootstrap_script_path(self) -> Path:
         return Path(__file__).resolve().parent / "assets" / "sshd_bootstrap.sh"
@@ -3007,26 +3041,35 @@ class DockerService:
         public_keys: list[str] | tuple[str, ...],
         log_tag: str,
         log_extra: dict,
+        environment: dict[str, str] | None = None,
     ) -> None:
-        exec_spec = build_authorized_keys_exec_spec(
+        """Append the renter's keys to authorized_keys — and, with ``environment`` (DAH-3258), the
+        renter's `/etc/environment` lines in the same exec. Raises on a non-zero exit."""
+        # falls back to the keys-only spec when there are no environment lines
+        exec_spec = build_authorized_keys_and_environment_exec_spec(
             container_name=container_name,
             public_keys=public_keys,
+            environment=environment,
         )
+        with_environment = bool(exec_spec.environment)
+        added_items = "SSH public keys and environment" if with_environment else "SSH public keys"
         result = await exec_logged_rental_docker_sdk_operation(
             docker_client=docker_client,
-            operation="exec_add_authorized_keys",
+            operation=(
+                "exec_add_authorized_keys_and_environment" if with_environment else "exec_add_authorized_keys"
+            ),
             exec_spec=exec_spec,
             log_extra=log_extra,
         )
         if result.exit_status != 0:
             await self.stream_log(
-                result.stderr or result.stdout or "Failed to add SSH public keys",
+                result.stderr or result.stdout or f"Failed to add {added_items}",
                 "error",
                 log_tag,
             )
             logger.warning(
                 _m(
-                    "Failed to add SSH public keys",
+                    f"Failed to add {added_items}",
                     extra=get_extra_info({
                         **log_extra,
                         "container_name": container_name,
@@ -3037,7 +3080,7 @@ class DockerService:
                 )
             )
             raise Exception(
-                "Failed to add SSH public keys: "
+                f"Failed to add {added_items}: "
                 f"exit_status={result.exit_status}; "
                 f"stderr={result.stderr}; stdout={result.stdout}"
             )
@@ -5267,6 +5310,24 @@ class DockerService:
 
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
+                # DAH-3258: the inspector collector is a host-side process that reads the container
+                # from outside; it needs neither the encrypted mount nor the keys, so with the flag on
+                # it starts now and runs alongside them. It is awaited before ContainerCreated is
+                # returned (nothing here moves past RUNNING), and a create that fails after this
+                # point settles it the way a delete does (_settle_inspector_after_failed_create).
+                postrun_concurrent = settings.RENTAL_POSTRUN_CONCURRENT_ENABLED
+                inspector_extra = {**default_extra, "container_name": container_name}
+                inspector_task: asyncio.Task | None = None
+                if postrun_concurrent and settings.ENABLE_INSPECTOR:
+                    inspector_task = asyncio.create_task(
+                        self._run_inspector_collector_lifecycle(
+                            ssh_client=ssh_client,
+                            executor_info=executor_info,
+                            action="start",
+                            default_extra=inspector_extra,
+                        )
+                    )
+
                 try:
                     if use_encrypted_volume:
                         current_step = "encrypted_volume_setup"
@@ -5289,12 +5350,25 @@ class DockerService:
                     # a grace period waiting for an image-provided sshd — whichever
                     # sshd comes up first must already find the keys in place.
                     current_step = "add_public_keys"
+                    # DAH-3258: with the flag on the renter's /etc/environment lines ride in this
+                    # exec (one exec instead of two); they are plain data with no dependency on the
+                    # bootstrap, and the file is read at login, so writing them before sshd is up
+                    # changes nothing for the renter. An environment too large for one exec
+                    # variable keeps its own stdin exec below.
+                    environment_in_keys_exec = postrun_concurrent and environment_fits_exec_variable(
+                        custom_options.environment if custom_options else None
+                    )
                     await self.add_ssh_public_keys_with_rental_docker(
                         docker_client=docker_client,
                         container_name=container_name,
                         public_keys=payload.user_public_keys,
                         log_tag=log_tag,
                         log_extra=default_extra,
+                        environment=(
+                            custom_options.environment
+                            if environment_in_keys_exec and custom_options
+                            else None
+                        ),
                     )
 
                     current_step = "ssh_bootstrap"
@@ -5352,21 +5426,28 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.SSH_SERVICE_INSTALLATION, prev_timestamp))
                     prev_timestamp = now_ms()
 
-                    # add environment variables
+                    # add environment variables (already written by the keys exec with DAH-3258 on)
                     current_step = "set_environment"
-                    environment_error = await self.add_environment_variables_with_rental_docker(
-                        docker_client=docker_client,
-                        container_name=container_name,
-                        environment=custom_options.environment if custom_options else None,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                    )
-                    if environment_error:
-                        raise RuntimeError(f"Failed to set environment variables: {environment_error}")
+                    if not environment_in_keys_exec:
+                        environment_error = await self.add_environment_variables_with_rental_docker(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            environment=custom_options.environment if custom_options else None,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                        if environment_error:
+                            raise RuntimeError(f"Failed to set environment variables: {environment_error}")
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
-                    profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
+                    profilers.append(
+                        ProfilerStep.since(
+                            ProfilerStepName.ADDING_PUBLIC_KEYS,
+                            prev_timestamp,
+                            skipped=environment_in_keys_exec,
+                        )
+                    )
                     prev_timestamp = now_ms()
 
                     await self.finish_stream_logs()
@@ -5382,15 +5463,15 @@ class DockerService:
                         container_name=container_name,
                         default_extra=default_extra,
                     )
-                    if settings.ENABLE_INSPECTOR:
+                    if inspector_task is not None:
+                        # started alongside the mount above; this step times only what is left of it
+                        await inspector_task
+                    elif settings.ENABLE_INSPECTOR:
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,
                             executor_info=executor_info,
                             action="start",
-                            default_extra={
-                                **default_extra,
-                                "container_name": container_name,
-                            },
+                            default_extra=inspector_extra,
                         )
                     profilers.append(
                         ProfilerStep.since(
@@ -5401,6 +5482,13 @@ class DockerService:
                     )
                     prev_timestamp = now_ms()
                 except Exception:
+                    if inspector_task is not None:
+                        await self._settle_inspector_after_failed_create(
+                            inspector_task,
+                            ssh_client=ssh_client,
+                            executor_info=executor_info,
+                            default_extra=inspector_extra,
+                        )
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
