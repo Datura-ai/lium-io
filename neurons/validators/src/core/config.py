@@ -338,6 +338,16 @@ class Settings(BaseSettings):
     # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
     # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
     EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
+    # DAH-3405: for this many validation cycles, counting the one in which the registry digest of
+    # EXECUTOR_IMAGE_REF was seen to change, an executor that fails the way a watchtower restart
+    # makes it fail (SSH gone, scrape failed, ports missing, image not yet the new one) gets no
+    # verdict instead of a 0. 2 = the cycle the push landed in and the next (watchtower polls
+    # every 60 s; a node that has not pulled and restarted 15 minutes later is a node whose
+    # watchtower is not working). Cycles are counted as the validator runs them, never by the
+    # clock. Capped at MAX_ROLLOUT_GRACE_CYCLES (2, services/executor_rollout.py): a withheld
+    # executor publishes nothing, and the backend marks an executor inactive (with the
+    # EXECUTOR_INACTIVE_MID_RENTAL penalty) when its row is not updated for 1 h. 0 turns it off.
+    EXECUTOR_ROLLOUT_GRACE_CYCLES: int = Field(env="EXECUTOR_ROLLOUT_GRACE_CYCLES", default=2)
 
     # DAH-2272: when on, raise the asyncssh logger to DEBUG (debug level 2) so the
     # SSH handshake (banner / key exchange / auth) is logged per connection, and

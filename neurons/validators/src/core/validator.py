@@ -18,6 +18,12 @@ from services.default_docker_image_digest_service import (
 )
 from services.docker_service import DockerService
 from services.executor_image_policy import build_expected_image_snapshot
+from services.executor_rollout import (
+    ROLLOUT_GRACE,
+    ExecutorRolloutTracker,
+    RolloutWindow,
+    withhold_rollout_verdicts,
+)
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
@@ -87,6 +93,8 @@ class Validator:
         self.verifyx_validation_service = VerifyXValidationService()
         self.collateral_contract_service = CollateralContractService()
         self.attestation_service = AttestationService(redis_service=self.redis_service)
+        # DAH-3405: remembers the authorized executor digest and when it last changed.
+        self.rollout_tracker = ExecutorRolloutTracker(redis_service=self.redis_service)
 
         # Backend client for API requests
         keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -315,17 +323,7 @@ class Validator:
                         ),
                     )
 
-                try:
-                    executor_digest = await fetch_executor_image_digest()
-                except Exception as exc:
-                    executor_digest = None
-                    logger.error(
-                        _m(
-                            "[sync] executor image digest fetch failed; image check skips this cycle",
-                            extra=get_extra_info({**self.default_extra, "error": str(exc)}),
-                        ),
-                    )
-
+                executor_digest = await self.fetch_executor_digest_or_none()
                 executor_image_snapshot = build_expected_image_snapshot(executor_digest)
 
                 # Fetch all rented executors from backend API
@@ -338,6 +336,11 @@ class Validator:
                         ),
                     )
                     return
+
+                # DAH-3405: a push between two cycles opens the grace window here, after the last
+                # early return and before the first job of this cycle runs against the new digest,
+                # so an aborted iteration does not count as a cycle of the window.
+                rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
 
                 logger.info(
                     _m(
@@ -522,13 +525,19 @@ class Validator:
                         ),
                     )
 
+                    all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
+                        all_job_results, job_block, job_batch_id, rollout_window
+                    )
+
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
-                    # when it earned nothing this cycle. Overwrite, never accumulate.
+                    # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
+                    # withheld result (DAH-3405) got no verdict on that executor this cycle, so it
+                    # is treated as active as well.
                     self.active_hotkeys = {
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
                         if any(result.is_successful for result in results)
-                    }
+                    } | {result_miner_hotkey for result_miner_hotkey, _ in withheld_results}
 
                     incentive = IncentiveFactory.create(
                         config=self.incentive,
@@ -639,6 +648,12 @@ class Validator:
                                 if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
                             )
 
+                    # DAH-3405: a withheld executor was handled by this cycle too — the express
+                    # lane must not treat it as never validated and run a first pass on it.
+                    published_executor_ids.extend(
+                        result.executor_info.uuid for _, result in withheld_results
+                    )
+
                     if settings.EXPRESS_LANE_ENABLED:
                         # DAH-2958: everything published by a cycle is "validated" for the
                         # express lane; only what the portal lists beyond this set is new.
@@ -670,6 +685,7 @@ class Validator:
                                     "total_executors": incentive.total_executors,
                                     "successful_executors": incentive.successful_executors,
                                     "failed_executors": incentive.failed_executors,
+                                    "withheld_executors": len(withheld_results),
                                     "completed_cycles_since_start": self.completed_cycles_since_start,
                                 }
                             ),
@@ -738,6 +754,115 @@ class Validator:
                         ),
                     ),
                 )
+
+    async def fetch_executor_digest_or_none(self) -> str | None:
+        """The registry digest of EXECUTOR_IMAGE_REF, or None when it cannot be read.
+
+        None makes the image check skip this cycle and (DAH-3405) leaves the rollout window as it
+        was. Called at cycle start and, since DAH-3405, once more at cycle end; each call is a
+        token GET and a manifest HEAD against Docker Hub, each with a 30-s timeout.
+        """
+        try:
+            return await fetch_executor_image_digest()
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[sync] executor image digest fetch failed; image check skips this cycle and "
+                    "the rollout window is left as it was",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+            return None
+
+    async def observe_executor_rollout(
+        self,
+        executor_digest: str | None,
+        job_block: int,
+        fallback: RolloutWindow | None = None,
+    ) -> RolloutWindow:
+        """DAH-3405: tell the tracker what the registry says now, in cycle `job_block`.
+
+        Called at cycle start (a push between cycles) and again at cycle end (a push during the
+        cycle — the 11 Sep case) with the start's window as `fallback`. When Redis fails the
+        cycle keeps what it already knew; without that, it behaves as before this change: every
+        failure is a verdict.
+        """
+        try:
+            return await self.rollout_tracker.observe(executor_digest, job_block)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[rollout-grace] rollout state unreadable; "
+                    + ("the window seen at cycle start stands" if fallback else "every verdict stands this cycle"),
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+            if fallback is not None:
+                return fallback
+            return RolloutWindow(
+                digest=executor_digest,
+                previous_digest=None,
+                started_at=None,
+                opened_job_block=None,
+                cycles_seen=0,
+                grace_cycles=0,
+            )
+
+    async def withhold_verdicts_for_rollout(
+        self,
+        all_job_results: dict[str, list[JobResult]],
+        job_block: int,
+        job_batch_id: str,
+        window_at_cycle_start: RolloutWindow,
+    ) -> tuple[dict[str, list[JobResult]], list[tuple[str, JobResult]]]:
+        """DAH-3405: at cycle end, take the results the rollout explains out of the cycle.
+
+        The push that recreates the fleet's containers can land in the middle of a cycle (11 Sep
+        07:50Z did), so the registry is read once more here and the window opens on THIS cycle's
+        results, before scoring and publishing see them.
+        """
+        window = await self.observe_executor_rollout(
+            await self.fetch_executor_digest_or_none(), job_block, fallback=window_at_cycle_start
+        )
+        kept, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
+        await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
+        return kept, withheld_results
+
+    async def record_withheld_verdicts(
+        self,
+        window: RolloutWindow,
+        withheld_results: list[tuple[str, JobResult]],
+        job_batch_id: str,
+        job_block: int,
+    ) -> None:
+        """DAH-3405: one line per cycle inside the window, and the window's running total."""
+        if not window.covers(job_block):
+            return
+        withheld_count = len(withheld_results)
+        logger.warning(
+            _m(
+                "[rollout-grace] cycle inside the executor image rollout window",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "outcome": ROLLOUT_GRACE,
+                        "job_batch_id": job_batch_id,
+                        "job_block": job_block,
+                        "withheld_executors": withheld_count,
+                        **window.as_extra(),
+                    }
+                ),
+            ),
+        )
+        try:
+            await self.rollout_tracker.record_withheld(withheld_count)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[rollout-grace] could not record the withheld count",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
 
     async def start(self):
         logger.info(
