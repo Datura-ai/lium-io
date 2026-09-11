@@ -102,7 +102,7 @@ RENTING_PORT_RANGE="19001,19002,19003"
 
 # Identity
 MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here   # your provider hotkey (SS58)
-VALIDATOR_HOTKEY_SS58_ADDRESS=...            # measured into the CVM attestation (RTMR) by app/init_script.sh; the executor's trusted validator is fixed in src/core/config.py
+VALIDATOR_HOTKEY_SS58_ADDRESS=...            # measured into the CVM attestation (RTMR) by app/init_script.sh; the executor's trusted validator is fixed per image: docker_build.sh writes src/core/config_override.py from VALIDATOR_HOTKEY_SS58 at build time (src/core/config.py holds the default)
 ENABLE_TDX_ATTESTATION=true
 ENABLE_GPU_ATTESTATION=false                 # optional; GPU_ATTESTATION_ARCH=HOPPER | BLACKWELL when on
 

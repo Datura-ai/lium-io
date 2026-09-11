@@ -158,7 +158,9 @@ Go to `/etc/docker/daemon.json` and add `"exec-opts": ["native.cgroupdriver=cgro
 | OS          | Version |
 |-------------|---------|
 | Ubuntu      | 22.04+  |
-| Kernel      | 5.19+ (6.x recommended) — overlayfs on ID-mapped mounts, which Sysbox needs for GPUs, landed in 5.19; `nvidia_docker_sysbox_setup.sh` checks it |
+| Kernel      | 5.19+ (6.x recommended) |
+
+Why 5.19: overlayfs on ID-mapped mounts, which Sysbox needs for GPUs, landed in 5.19; `nvidia_docker_sysbox_setup.sh` checks it.
 
 Checking OS and Kernel version
 ```shell

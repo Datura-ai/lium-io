@@ -91,7 +91,16 @@ Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm proj
 (cd neurons/miners && pdm install && pdm run pytest tests/ -v --tb=short)
 ```
 
-These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter: a `route` job reads the changed files and each neuron's job runs only when that neuron, `datura/` or `.github/` changed; `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`; `lint` (`ruff format --check`, report-only, not required) runs per changed neuron; `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `datura/`, `.github/` or `e2e/` changed; `tests-ok` is the one status check to require and reports on every PR. Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
+These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter; its jobs decide for themselves:
+
+- `route` reads the changed files (`.github/actions/changed-packages`), after dropping `*.md`, `.gitignore` and the root `docs/` tree — a README-only PR runs no neuron job.
+- Each neuron's test job runs only when that neuron, `datura/` or `.github/` changed.
+- `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`.
+- `lint` (`ruff format --check`, report-only, not required) runs per changed neuron.
+- `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `datura/`, `.github/` or `e2e/` changed.
+- `tests-ok` is the one status check to require; it reports on every PR.
+
+Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
 
 ## Releases
 
