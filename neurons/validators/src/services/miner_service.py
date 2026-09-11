@@ -447,6 +447,8 @@ class MinerService:
                         if executor_id is None
                         else self._only_requested(msg.executors, executor_id, default_extra)
                     )
+                    # DAH-3019: one start report for the whole miner, as its executors are launched.
+                    self.task_service.report_verification_started(payload, executors)
                     try:
                         tasks = [
                             asyncio.create_task(
@@ -2060,6 +2062,8 @@ class MinerService:
                     if executor_id is None
                     else self._only_requested(msg.executors, executor_id, default_extra)
                 )
+                # DAH-3019: one start report for the whole miner, as its executors are launched.
+                self.task_service.report_verification_started(payload, executors)
                 try:
                     tasks = [
                         asyncio.create_task(

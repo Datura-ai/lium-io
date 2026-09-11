@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Annotated
 
 import asyncssh
@@ -54,7 +56,10 @@ class TaskService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
+        self.backend_client = backend_client
         self.wallet = settings.get_bittensor_wallet()
+        # DAH-3019: the start reports run in the background; the set keeps them referenced until done.
+        self._start_reports: set[asyncio.Task] = set()
 
         # Initialize pipeline factory with all required services
         self.pipeline_factory = PipelineFactory(
@@ -67,6 +72,29 @@ class TaskService:
             backend_client=backend_client,
             pod_recovery=pod_recovery,
         )
+
+    def report_verification_started(
+        self,
+        miner_info: MinerJobRequestPayload,
+        executors: list[ExecutorSSHInfo],
+    ) -> None:
+        """Tell the backend this miner's executors are starting their pipelines (DAH-3019), off the hot path.
+
+        Called once per miner by MinerService, right where it launches one `create_task` per executor,
+        so the whole batch shares one start time and one request. Scheduled, not awaited: the report
+        must not add its round trip (or a slow backend's 10-s timeout) to the miner's pipelines. The
+        client method swallows every error.
+        """
+        task = asyncio.create_task(
+            self.backend_client.report_verification_started(
+                job_batch_id=miner_info.job_batch_id,
+                miner_hotkey=miner_info.miner_hotkey,
+                executor_uuids=[executor.uuid for executor in executors],
+                started_at=datetime.now(UTC),
+            )
+        )
+        self._start_reports.add(task)
+        task.add_done_callback(self._start_reports.discard)
 
     async def create_task(
         self,

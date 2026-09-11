@@ -211,6 +211,14 @@ class PodHostRebootRecoveredResponse(BaseModel):
     recorded: bool
 
 
+class VerificationStartedResponse(BaseModel):
+    """Ack for DAH-3019 `verification-started` (one request per miner): how many of the batch's
+    executors the backend stored the run start for, so the provider portal can show which step
+    is running and how long is left. Fewer than sent means nodes this validator does not own."""
+
+    recorded: int
+
+
 class FillerRunActiveResponse(BaseModel):
     active: bool
     executor_id: str | None = None  # DAH-2757: the executor the run belongs to, as for the pod above
