@@ -5170,6 +5170,16 @@ class DockerService:
                             "executor image cannot restore into an encrypted volume at create time "
                             "(no workspace.bootstrap); the provider must update the executor image"
                         )
+                    # Same reason, same place: the runner and its engine binary are checked
+                    # again inside _run_bootstrap_restore, but by then the pod is built.
+                    if not await supports_storage_operation(
+                        ssh_client, payload.bootstrap_restore.backup_engine
+                    ):
+                        raise RuntimeError(
+                            "executor does not support bootstrap restore engine "
+                            f"{payload.bootstrap_restore.backup_engine}; the provider must update "
+                            "the executor image"
+                        )
                 if not local_volume:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (flag off → None → the per-command path below, unchanged).

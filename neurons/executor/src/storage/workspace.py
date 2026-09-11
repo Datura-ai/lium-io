@@ -184,9 +184,11 @@ class WorkspaceResolver:
             error = f"backup source is not a directory: {requested_path}"
         elif overwrite_fresh_target:
             # Create-time restore into the pod's fresh mount (DAH-3274): the entrypoint may have
-            # dropped `.jupyter`, `.bashrc` or a shell history there since `docker run`; the
-            # backup wins, as it did when the restore preceded the entrypoint. Only the shape is
-            # checked — the target must be absent or a directory, never a file.
+            # dropped `.jupyter`, `.bashrc` or a shell history there since `docker run`. The
+            # backup wins. That flips the old order, where the restore ran first and the
+            # entrypoint wrote last; at create time nothing in the mount is the customer's, so the
+            # backup is the right winner. Only the shape is checked — the target must be absent
+            # or a directory, never a file.
             check_script = 'target="$1"; if [ ! -e "$target" ]; then exit 0; fi; if [ ! -d "$target" ]; then exit 20; fi'
             error = f"restore target is not a directory: {requested_path}"
         else:

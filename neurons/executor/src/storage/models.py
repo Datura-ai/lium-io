@@ -190,6 +190,8 @@ class StorageOperationSpec:
         snapshot_id = _optional_nullable_string(value, "snapshot_id")
         legacy_object_key = _optional_nullable_string(value, "legacy_object_key")
         legacy_object_size_bytes = _optional_nullable_nonnegative_integer(value, "legacy_object_size_bytes")
+        if workspace.bootstrap and action is not StorageAction.RESTORE:
+            raise OperationSpecError("workspace.bootstrap is only meaningful for restore")
         if engine is StorageEngine.RESTIC and not repository.password:
             raise OperationSpecError("repository.password is required for restic")
         if action is StorageAction.RESTORE and engine is StorageEngine.RESTIC and not snapshot_id:

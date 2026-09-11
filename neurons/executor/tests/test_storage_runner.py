@@ -521,8 +521,15 @@ def test_bootstrap_encrypted_restore_skips_the_emptiness_preflight(
 
 
 def test_bootstrap_flag_is_refused_outside_encrypted_running() -> None:
-    with pytest.raises(OperationSpecError, match="bootstrap is only meaningful"):
+    with pytest.raises(
+        OperationSpecError, match="bootstrap is only meaningful for encrypted_running"
+    ):
         StorageOperationSpec.from_mapping(_operation_payload(action="restore", bootstrap=True))
+    # a backup carrying the flag would parse and silently ignore it (review, taiberium)
+    with pytest.raises(OperationSpecError, match="bootstrap is only meaningful for restore"):
+        StorageOperationSpec.from_mapping(
+            _operation_payload(action="backup", mode="encrypted_running", bootstrap=True)
+        )
     with pytest.raises(OperationSpecError, match="must be a boolean"):
         StorageOperationSpec.from_mapping(
             _operation_payload(action="restore", mode="encrypted_running", bootstrap="yes")  # type: ignore[arg-type]
