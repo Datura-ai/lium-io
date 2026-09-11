@@ -9,7 +9,7 @@ challenges the SSH-driven checks would (`ValidationService.prepare_matmul_challe
 
 Everything else — flag off, capability absent, refusal, timeout, a mismatched answer, a step that
 did not run, a step that ran and FAILED the judgement, or a pass that arrived later than the SSH
-path's own cap for that step (`STEP_WALL_CLOCK_CAP_MS`, measured on the validator's clock) — leaves
+path's own cap for that step (`ROUND_TRIP_CAP_MS_BY_STEP`, measured on the validator's clock) — leaves
 that step to the SSH path, so the new transport can only save time, never change a verdict on its
 own. The matmul is not asked for
 at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on: the all-cards work-proof runs inside the SSH
@@ -21,14 +21,16 @@ outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric). 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from typing import Any
 
+from datura.requests.validator_requests import MatmulStep, VerifyXStep
 from services.local_verify_client import (
     CAPABILITY,
     DETAIL_MAX_CHARS,
     LocalVerifyAnswer,
     LocalVerifyClient,
+    LocalVerifyOutcome,
     LocalVerifyUnavailable,
     build_intent,
     executor_deadline_s,
@@ -36,13 +38,11 @@ from services.local_verify_client import (
 from services.matrix_validation_service import (
     MATRIX_VERIFY_TIMEOUT_SECONDS,
     MatmulChallenge,
-    ValidationResult,
 )
 from services.verifyx_validation_service import (
     VERIFYX_COMMAND_TIMEOUT_SECONDS,
     SSHCapture,
     VerifyXChallenge,
-    VerifyXResponse,
 )
 
 from core.config import settings
@@ -70,14 +70,14 @@ def _step_reason(step) -> str:
 # VERIFYX_COMMAND_TIMEOUT_SECONDS. The executor's own per-step caps and `step.ms` are its word, so
 # the same bound is applied to the one clock the validator holds: the whole call's round trip,
 # which is an upper bound on any step's wall-clock (serial or side by side).
-STEP_WALL_CLOCK_CAP_MS = {
+ROUND_TRIP_CAP_MS_BY_STEP = {
     "matmul": MATRIX_VERIFY_TIMEOUT_SECONDS * 1000,
     "verifyx": VERIFYX_COMMAND_TIMEOUT_SECONDS * 1000,
 }
 
 
 def _over_time(name: str, answer: LocalVerifyAnswer) -> bool:
-    return answer.round_trip_ms > STEP_WALL_CLOCK_CAP_MS[name]
+    return answer.round_trip_ms > ROUND_TRIP_CAP_MS_BY_STEP[name]
 
 
 class _NothingToSend(Exception):
@@ -87,19 +87,6 @@ class _NothingToSend(Exception):
         super().__init__(detail)
         self.reason = reason
         self.detail = detail
-
-
-@dataclass
-class LocalVerifyOutcome:
-    """What the consuming checks read. A field is set only when the local step ran AND passed the
-    validator's judgement; None means "run it over SSH"."""
-
-    matmul: ValidationResult | None = None
-    verifyx: VerifyXResponse | None = None
-    round_trip_ms: int = 0
-    executor_elapsed_ms: int = 0
-    executor_version: str = ""
-    fallbacks: dict[str, str] = field(default_factory=dict)  # step -> reason
 
 
 class LocalVerifyCheck:
@@ -220,17 +207,17 @@ class LocalVerifyCheck:
         matmul_step = None
         if matmul_challenge is not None:
             params = matmul_challenge.params
-            matmul_step = {
-                "dim_n": params.dim_n,
-                "dim_k": params.dim_k,
-                "seed": params.seed,
-                "cipher_text": params.cipher_text,
-            }
+            matmul_step = MatmulStep(
+                dim_n=params.dim_n,
+                dim_k=params.dim_k,
+                seed=params.seed,
+                cipher_text=params.cipher_text,
+            )
         intent = build_intent(
             executor_uuid=ctx.executor.uuid,
             matmul=matmul_step,
             verifyx=(
-                {"seed": verifyx_challenge.seed, "cipher_text": verifyx_challenge.cipher_text}
+                VerifyXStep(seed=verifyx_challenge.seed, cipher_text=verifyx_challenge.cipher_text)
                 if verifyx_challenge is not None
                 else None
             ),

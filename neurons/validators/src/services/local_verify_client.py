@@ -22,8 +22,17 @@ import aiohttp
 from datura.requests.validator_requests import (
     LOCAL_VERIFY_CAPABILITY,
     LOCAL_VERIFY_SCHEMA,
+    MatmulStep,
+    VerifyXStep,
     local_verify_signing_blob,
 )
+
+# The judged results are the SSH path's own types. Imported at runtime, not under TYPE_CHECKING:
+# `Context` (pipeline.py) is a pydantic model and resolves `LocalVerifyOutcome`'s annotations
+# when it is built — a name only the type checker sees leaves every cycle unbuildable
+# (test_rented_machine_check.test_context_annotations_resolve_at_runtime).
+from services.matrix_validation_service import ValidationResult
+from services.verifyx_validation_service import VerifyXResponse
 
 # One definition for both sides (datura, #1339): the executor's payloads/verify.py and
 # local_verify_service.py import the same names, so the two ends cannot drift apart.
@@ -99,12 +108,16 @@ canonical_intent_message = local_verify_signing_blob
 def build_intent(
     *,
     executor_uuid: str,
-    matmul: dict[str, Any] | None,
-    verifyx: dict[str, Any] | None,
+    matmul: MatmulStep | None,
+    verifyx: VerifyXStep | None,
     parallel_gpu: bool,
     deadline_s: int,
     now: float | None = None,
 ) -> dict[str, Any]:
+    """The intent document as signed and sent. The step challenges are the datura models the
+    executor parses (`MatmulStep`, `VerifyXStep`), so a field the executor's `extra="forbid"`
+    schema does not know cannot be built here; `docker`, `ports` and `inspector` are asked for so
+    the facts the phase-2 checks read (#1345) come with the same call."""
     now = time.time() if now is None else now
     return {
         "schema": SCHEMA,
@@ -115,8 +128,8 @@ def build_intent(
         "deadline_s": deadline_s,
         "parallel_gpu": parallel_gpu,
         "steps": {
-            "matmul": matmul,
-            "verifyx": verifyx,
+            "matmul": matmul.model_dump(exclude_none=True) if matmul is not None else None,
+            "verifyx": verifyx.model_dump() if verifyx is not None else None,
             "docker": True,
             "ports": True,
             "inspector": True,
@@ -128,6 +141,19 @@ def sign_intent(intent: dict[str, Any], keypair) -> dict[str, Any]:
     signed = dict(intent)
     signed["signature"] = "0x" + keypair.sign(canonical_intent_message(intent)).hex()
     return signed
+
+
+@dataclass
+class LocalVerifyOutcome:
+    """What the consuming checks read (`ctx.state.local_verify`). A field is set only when the
+    local step ran AND passed the validator's judgement; None means "run it over SSH"."""
+
+    matmul: ValidationResult | None = None
+    verifyx: VerifyXResponse | None = None
+    round_trip_ms: int = 0
+    executor_elapsed_ms: int = 0
+    executor_version: str = ""
+    fallbacks: dict[str, str] = field(default_factory=dict)  # step -> reason
 
 
 @dataclass

@@ -17,6 +17,7 @@ from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
+from services.local_verify_client import LocalVerifyOutcome
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
@@ -125,10 +126,10 @@ class ContextState:
     # (not cached / no backend digest / unreadable RepoDigest — strict fail-open).
     recommended_image_digest_match: bool | None = None
     executor_image_report: ExecutorImageReport | None = None
-    # liumd phase 1 (DAH-2834): what `POST /verify` answered this cycle, already judged
-    # (checks/local_verify.LocalVerifyOutcome). None = not attempted or fell back entirely; the
-    # capability and VerifyX checks consume a judged step when present and run over SSH otherwise.
-    local_verify: Any | None = None
+    # liumd phase 1 (DAH-2834): what `POST /verify` answered this cycle, already judged. None =
+    # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
+    # step when present and run over SSH otherwise.
+    local_verify: LocalVerifyOutcome | None = None
 
 
 class CheckResult(BaseModel):
