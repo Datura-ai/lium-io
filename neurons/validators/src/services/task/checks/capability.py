@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from core.config import settings
+from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
@@ -112,9 +113,11 @@ STDERR_TAIL_CHARS = 300
 # "Failed to allocate d_B: out of memory"). The executor then answers no uuid at all, which the
 # service reports as "UUID mismatch: expected '<uuid>', got 'None'" — the wrong story for the
 # provider (DAH-3264: 49 such verdicts on 31 executors in 26 h, every one an allocation failure).
+# Only the out-of-memory text counts: the verifier prints "Failed to allocate d_X: <error string>"
+# for every failed cudaMalloc, including "system not yet initialized" (CUDA error 802, the NVLink
+# fabric not ready on an HGX board — permanent, so "retry next cycle" would be the wrong advice).
 _VRAM_UNAVAILABLE_MARKERS = (
     "out of memory",
-    "failed to allocate",
     "cudaErrorMemoryAllocation",
 )
 _NO_UUID = {"", "none", "null"}
@@ -129,13 +132,20 @@ def _failure_template(result: ValidationResult | None) -> MessageTemplate:
     """Pick the reason for a failed capability probe.
 
     A timeout keeps its own reason. An answer with no uuid whose stderr/stdout carries a CUDA
-    allocation failure is `VERIFY_FAILED_VRAM_UNAVAILABLE`. A returned uuid that does not match —
-    the anti-spoof case — stays `VERIFY_FAILED`, whatever stderr says.
+    out-of-memory line is `VERIFY_FAILED_VRAM_UNAVAILABLE`. A returned uuid that does not match —
+    the anti-spoof case — stays `VERIFY_FAILED`, whatever stderr says; so does any other failed
+    allocation (a CUDA error other than out-of-memory) and any failure the service reported for a
+    reason other than the missing uuid (a sealed result that failed authentication).
     """
     if result is None:
         return Msg.VERIFY_FAILED
     if result.timed_out:
         return Msg.VERIFY_TIMEOUT
+    # Only the service's "UUID mismatch" failure is the probe's own answer. Its other empty-uuid
+    # results (a sealed blob that failed authentication, a stdout that could not be parsed) are
+    # not allocation failures, and stderr is miner-controlled: they keep the generic reason.
+    if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
+        return Msg.VERIFY_FAILED
     returned = (result.returned_uuid or "").strip().lower()
     output = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
     if returned in _NO_UUID and any(m.lower() in output for m in _VRAM_UNAVAILABLE_MARKERS):

@@ -1,6 +1,9 @@
 import pytest
 
-from neurons.validators.src.services.task.checks.capability import CapabilityCheck
+from neurons.validators.src.services.task.checks.capability import (
+    STDERR_TAIL_CHARS,
+    CapabilityCheck,
+)
 from neurons.validators.src.services.task.messages import CapabilityMessages as Msg
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
@@ -270,21 +273,27 @@ async def test_capability_check_vram_allocation_failure_gets_its_own_reason(cont
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "returned_uuid,stderr",
+    "returned_uuid,stderr,error_message",
     [
         # a real wrong answer with an OOM line in stderr is still a mismatch (anti-spoof stays fail-closed)
-        ("wrong-uuid", OOM_STDERR),
+        ("wrong-uuid", OOM_STDERR, "UUID mismatch"),
         # no uuid, but nothing says the allocation failed
-        ("None", "segmentation fault"),
-        ("", ""),
+        ("None", "segmentation fault", "UUID mismatch"),
+        ("", "", "UUID mismatch"),
+        # cudaMalloc failed for another reason: CUDA error 802, the NVLink fabric not ready on an
+        # HGX board (DAH-3362, a 1x H200 every cycle). Permanent, so it must not be told "retry".
+        ("None", "Failed to allocate d_A: system not yet initialized", "UUID mismatch"),
+        # the service rejected a sealed result that failed authentication: the empty uuid is the
+        # service's, not the probe's, and stderr is miner-controlled — an OOM line buys nothing
+        ("", OOM_STDERR, "Sealed result failed authentication (tampered/forged executor output)"),
     ],
 )
 async def test_capability_check_keeps_generic_failure_without_allocation_evidence(
-    context_factory, returned_uuid, stderr
+    context_factory, returned_uuid, stderr, error_message
 ):
     validation_service = DummyValidationService(
         success=False,
-        error_message="UUID mismatch",
+        error_message=error_message,
         returned_uuid=returned_uuid,
         stdout="UUID:  " + returned_uuid,
         stderr=stderr,
@@ -329,6 +338,6 @@ async def test_capability_check_stderr_tail_is_bounded(context_factory):
 
     assert result.event.reason_code == Msg.VERIFY_FAILED_VRAM_UNAVAILABLE.reason
     tail = result.event.what_we_saw["stderr_tail"]
-    assert len(tail) == 300 and tail.endswith(OOM_STDERR)
+    assert len(tail) == STDERR_TAIL_CHARS and tail.endswith(OOM_STDERR)
     # the full stderr is still there for anyone who needs it
     assert result.event.what_we_saw["stderr"] == long_stderr
