@@ -126,6 +126,15 @@ def test_gpu_model_rates_parity():
     )
 
 
+def test_normalization_map_targets_are_rate_keys_and_aliases_are_not():
+    """Every alias resolves to a name GPU_MODEL_RATES knows, and no alias is itself such a name:
+    aliasing a model that already validates would change `gpu_model_count` for live nodes and
+    trip SpecChangeCheck, clearing their verification (review, taiberium)."""
+    rates_keys = {k for k in GPU_MODEL_RATES.keys() if k is not None}
+    assert set(gpu_spec_table.NORMALIZATION_MAP.values()) <= rates_keys
+    assert not set(gpu_spec_table.NORMALIZATION_MAP) & rates_keys
+
+
 def test_gpu_vram_sizes_well_formed():
     """Every model maps to a non-empty list of positive, strictly-increasing
     nominal MB sizes (one per real SKU)."""
