@@ -248,6 +248,8 @@ async def test_the_facts_call_asks_for_no_gpu_step_and_leaves_bounded_facts(keyp
     (intent,) = executor.intents
     assert intent["steps"] == {"matmul": None, "verifyx": None, "docker": True, "ports": True, "inspector": True}
     assert intent["parallel_gpu"] is False and intent["deadline_s"] == 20
+    # addressed like the GPU intent: the executor refuses a facts intent for another miner (401)
+    assert intent["executor_uuid"] == ctx.executor.uuid and intent["miner_hotkey"] == ctx.miner_hotkey
     assert result.passed and result.event.reason_code == "LOCAL_FACTS_OK"
     facts: LocalFacts = result.updates["state"].local_facts
     assert facts.can_age_containers() and len(facts.containers) == 3 and facts.host_now == HOST_NOW

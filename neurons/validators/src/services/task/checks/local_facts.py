@@ -92,6 +92,7 @@ class LocalFactsCheck:
 
         intent = build_intent(
             executor_uuid=ctx.executor.uuid,
+            miner_hotkey=ctx.miner_hotkey,
             matmul=None,
             verifyx=None,
             parallel_gpu=False,
