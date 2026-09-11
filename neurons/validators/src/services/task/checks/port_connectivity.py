@@ -49,6 +49,14 @@ class PortConnectivityCheck:
             else None
         )
 
+        # Phase 2c: the DinD container the early call had the executor start (checks/local_facts);
+        # the verifier connects to it instead of running `docker run` first. Its port is held by
+        # that container, so it is not in the batch probe; a container that does not answer the
+        # validator's key is removed and the probe runs as today.
+        prestarted = facts.dind if facts is not None else None
+        if prestarted is not None and not (prestarted.started and not prestarted.consumed):
+            prestarted = None
+
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
@@ -66,6 +74,7 @@ class PortConnectivityCheck:
                 "executor_ip": ctx.executor.address,
             },
             published_ports=published_ports,
+            prestarted_dind=prestarted,
         )
         verified_port_count = len(result.successful_ports)
         extra_info = {

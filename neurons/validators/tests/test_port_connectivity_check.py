@@ -63,6 +63,7 @@ class DummyConnectivityService:
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
         published_ports: list[int] | None = None,
+        prestarted_dind=None,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
         # Track what parameters we were called with

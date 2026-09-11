@@ -22,7 +22,9 @@ from typing import Any, Protocol, runtime_checkable
 import aiohttp
 from datura.requests.validator_requests import (
     LOCAL_VERIFY_CAPABILITY,
+    LOCAL_VERIFY_DIND_CAPABILITY,
     LOCAL_VERIFY_SCHEMA,
+    DindStep,
     MatmulStep,
     VerifyXStep,
     local_verify_signing_blob,
@@ -39,6 +41,7 @@ from services.verifyx_validation_service import VerifyXResponse
 # local_verify_service.py import the same names, so the two ends cannot drift apart.
 SCHEMA = LOCAL_VERIFY_SCHEMA
 CAPABILITY = LOCAL_VERIFY_CAPABILITY
+DIND_CAPABILITY = LOCAL_VERIFY_DIND_CAPABILITY  # phase 2c: the intent may carry `steps.dind`
 # The executor refuses an intent whose issued_at is more than its window (120 s default) from its
 # clock and whose expiry is further than about two windows out; stay inside both.
 INTENT_TTL_SECONDS = 120
@@ -65,7 +68,7 @@ def _wire_int(value: Any) -> int:
 
 
 # The step names the intent can ask for; anything else in an answer is dropped, not echoed.
-STEP_NAMES = ("matmul", "verifyx", "docker", "ports", "inspector")
+STEP_NAMES = ("matmul", "verifyx", "docker", "ports", "inspector", "dind")
 # The statuses the executor's `StepResult` emits. Any other string is `malformed` here, so every
 # `reason` label and event field built from a status comes from this closed set (PR_PROCESS §5:
 # peer-controlled strings never reach a log label uncapped).
@@ -115,12 +118,24 @@ def build_intent(
     parallel_gpu: bool,
     deadline_s: int,
     now: float | None = None,
+    dind: DindStep | None = None,
 ) -> dict[str, Any]:
     """The intent document as signed and sent. The step challenges are the datura models the
-    executor parses (`MatmulStep`, `VerifyXStep`), so a field the executor's `extra="forbid"`
-    schema does not know cannot be built here; `docker`, `ports` and `inspector` are asked for so
-    the facts the phase-2 checks read (#1345) come with the same call."""
+    executor parses (`MatmulStep`, `VerifyXStep`, `DindStep`), so a field the executor's
+    `extra="forbid"` schema does not know cannot be built here; `docker`, `ports` and `inspector`
+    are asked for so the facts the phase-2 checks read (#1345) come with the same call."""
     now = time.time() if now is None else now
+    steps: dict[str, Any] = {
+        "matmul": matmul.model_dump(exclude_none=True) if matmul is not None else None,
+        "verifyx": verifyx.model_dump() if verifyx is not None else None,
+        "docker": True,
+        "ports": True,
+        "inspector": True,
+    }
+    if dind is not None:
+        # Phase 2c, only for an executor advertising DIND_CAPABILITY: the wire stays the phase-1
+        # document otherwise (an older executor would refuse the unknown key with 422).
+        steps["dind"] = dind.model_dump()
     return {
         "schema": SCHEMA,
         "nonce": secrets.token_hex(16),
@@ -132,13 +147,7 @@ def build_intent(
         "miner_hotkey": miner_hotkey,
         "deadline_s": deadline_s,
         "parallel_gpu": parallel_gpu,
-        "steps": {
-            "matmul": matmul.model_dump(exclude_none=True) if matmul is not None else None,
-            "verifyx": verifyx.model_dump() if verifyx is not None else None,
-            "docker": True,
-            "ports": True,
-            "inspector": True,
-        },
+        "steps": steps,
     }
 
 

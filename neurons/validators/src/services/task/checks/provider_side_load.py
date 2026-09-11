@@ -31,6 +31,9 @@ PROVIDER_SIDE_DISK_LIMIT_KB = 100 * 1024 * 1024  # 100 GB outside docker
 # the gate's own floor: names can never excuse enough load to hide a violation. The executor's
 # own stack is matched by image digest instead and stays uncapped - the scrape itself runs in
 # that container and can hold several cores, and zeroing an honest node is the worse error.
+# The validator's OWN container of this cycle (liumd phase 2c's port-check DinD, absent from the
+# scrape) is excused by name too, and shares this one cap with the infra names: two forgeable
+# tiers with separate caps would let names hide 4.0 cores against a 2.0 floor.
 CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
@@ -102,19 +105,39 @@ class ContainerRow:
 
 
 def provider_cores_outside_lium(
-    host_cores: float, rows: list[ContainerRow], lium_container_keys: set[str]
+    host_cores: float,
+    rows: list[ContainerRow],
+    lium_container_keys: set[str],
+    names_excused_under_the_cap: frozenset[str] = frozenset(),
 ) -> float:
     """The host's cores minus the containers Lium itself put there.
 
     Matching by both id and name, because the scrape reports full ids and `docker stats`
-    reports the first 12 characters.
+    reports the first 12 characters. `names_excused_under_the_cap` are the forgeable names —
+    the infra tier and the validator's own containers of this cycle, which the scrape never
+    listed — excused TOGETHER up to ONE cap (`CLAIMED_EXCUSE_CORES`), whether or not a name is
+    also in `lium_container_keys`: a name anyone may wear must not excuse a miner.
     """
     lium_short_ids: set[str] = {key[:12] for key in lium_container_keys}
+
+    def matched_by_id(row: ContainerRow) -> bool:
+        return row.container_id[:12] in lium_short_ids
+
     lium_percent: float = sum(
         row.measured_cpu_percent
         for row in rows
-        if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
+        if matched_by_id(row)
+        or (row.name in lium_container_keys and row.name not in names_excused_under_the_cap)
     )
+    if names_excused_under_the_cap:
+        lium_percent += min(
+            sum(
+                row.measured_cpu_percent
+                for row in rows
+                if row.name in names_excused_under_the_cap and not matched_by_id(row)
+            ),
+            CLAIMED_EXCUSE_CORES * 100,
+        )
     # Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
     # inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5.
     provider_cores = max(0.0, host_cores - lium_percent / 100)
@@ -199,6 +222,35 @@ def infra_container_names(specs: dict[str, Any], excused_by_digest: set[str]) ->
     if sum(row.cpu_percent or 0.0 for row in infra_rows) > CLAIMED_EXCUSE_CORES * 100:
         return set()
     return {row.name for row in infra_rows}
+
+
+def validators_own_containers_this_cycle(ctx: Context) -> frozenset[str]:
+    """Names of the containers the VALIDATOR asked this host to start this cycle, after the scrape.
+
+    liumd phase 2c: the port-check DinD container (`container_<hotkey>_<port>`) boots — inner
+    dockerd, sshd, sysbox setup, 1–3 core-seconds — while this check's confirming read runs, and
+    the scrape's listing, taken before the facts call, does not carry it, so the by-name tier
+    cannot see it. The name is the validator's own choice, not the executor's claim; still, a
+    name is free to wear, so the caller excuses it under the same cap as the infra names.
+    """
+    facts = ctx.state.local_facts
+    dind = facts.dind if facts is not None else None
+    if dind is None or not dind.name:
+        return frozenset()
+    # Excused as soon as the validator ASKED for the name, not only once the executor confirmed
+    # the start: a lost answer (`started` False) may still have left the container running, and
+    # its boot would otherwise be billed to the provider as side load.
+    return frozenset({dind.name})
+
+
+def names_excused_under_the_cap_this_cycle(ctx: Context) -> frozenset[str]:
+    """Every name the confirming read excuses under the one shared cap: the infra tier as the
+    scrape saw it (already gated all-or-nothing at `CLAIMED_EXCUSE_CORES` there) plus the
+    validator's own containers of this cycle."""
+    specs = ctx.state.specs or {}
+    return frozenset(
+        infra_container_names(specs, executor_stack_container_ids(specs))
+    ) | validators_own_containers_this_cycle(ctx)
 
 
 async def late_started_containers_the_backend_owns(
@@ -347,6 +399,7 @@ def parse_resampled_cpu_cores(
     container_rows: str,
     sample_after: str,
     lium_container_keys: set[str],
+    names_excused_under_the_cap: frozenset[str] = frozenset(),
 ) -> float | None:
     """Provider-side cores from the second reading, or None if it is not readable.
 
@@ -384,7 +437,10 @@ def parse_resampled_cpu_cores(
     excused_dockerd_cores = min(max(0.0, dockerd_cores), CLAIMED_EXCUSE_CORES)
     host_cores = (total_delta - (last_idle - first_idle)) / total_delta * kernel_cores
     return provider_cores_outside_lium(
-        host_cores - excused_dockerd_cores, stats_rows, lium_container_keys
+        host_cores - excused_dockerd_cores,
+        stats_rows,
+        lium_container_keys,
+        names_excused_under_the_cap,
     )
 
 
@@ -429,7 +485,11 @@ class ProviderSideLoadCheck:
             return None
         jiffies_before, container_rows, jiffies_after = sections
         return parse_resampled_cpu_cores(
-            jiffies_before, container_rows, jiffies_after, lium_container_keys
+            jiffies_before,
+            container_rows,
+            jiffies_after,
+            lium_container_keys,
+            names_excused_under_the_cap=names_excused_under_the_cap_this_cycle(ctx),
         )
 
     def _what_we_saw(

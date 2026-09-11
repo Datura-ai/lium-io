@@ -294,6 +294,14 @@ class Settings(BaseSettings):
     LOCAL_VERIFY_FACTS_ENABLED: bool = Field(env="LOCAL_VERIFY_FACTS_ENABLED", default=False)
     # Whole-call budget for the facts-only call; the executor caps each collector at 20 s.
     LOCAL_VERIFY_FACTS_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_FACTS_TIMEOUT_SECONDS", default=25)
+    # liumd phase 2c (DAH-2834): the facts intent also asks an executor advertising `local_verify/dind`
+    # to start the port check's DinD container (the validator's own name, port and key pair), so it
+    # boots while the stale cleanup and the provider-load check run; DindVerifier then connects with the
+    # validator's private key and runs the sysbox proof and the removal as today — only the `docker run`
+    # round trip and the boot wait leave the critical path. A container that does not answer the key is
+    # removed and the probe runs as today; one no probe took is removed by Pipeline.run's settle step.
+    # Off by default; needs LOCAL_VERIFY_FACTS_ENABLED.
+    LOCAL_VERIFY_DIND_IN_INTENT: bool = Field(env="LOCAL_VERIFY_DIND_IN_INTENT", default=False)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
