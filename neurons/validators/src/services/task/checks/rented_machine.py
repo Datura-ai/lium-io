@@ -347,6 +347,15 @@ class TenantEnforcementCheck:
                     "default_extra": extra,
                     "clear_verified_job_info": True,
                     "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
+                    # DAH-3386: the backend's penalty row shows why the container was not running — a renter's
+                    # entrypoint exiting with its own code and a host that lost the container look different here.
+                    "clear_verified_job_evidence": {
+                        "reason_code": event.reason_code,
+                        "check_id": self.check_id,
+                        "pod_id": pod_id,
+                        "container_name": container_name,
+                        "container": _penalty_evidence_from_diagnostics(diagnostics),
+                    },
                 },
             ),
             ssh_pub_keys=[],
@@ -473,6 +482,50 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
         ssh_keys = []
 
     return pod_running, ssh_keys
+
+
+# The diagnostics fields that decide whether a not-running container is the provider's fault (host lost the
+# container or it never came back after a reboot) or the workload's own exit (the renter's entrypoint returned,
+# the process was OOM-killed inside the tenant's ceiling). Logs and host context stay in Loki.
+_PENALTY_EVIDENCE_FIELDS = (
+    "container_status",
+    "container_exit_code",
+    "container_oom_killed",
+    "container_error",
+    "container_started_at",
+    "container_finished_at",
+    "container_missing",
+    "diagnostics_capture_error",
+)
+
+
+# Every value came from the provider's host (`docker inspect` stdout/stderr); the backend writes the dict into a
+# JSONB row and a log line, so each one is typed and bounded here (PR_PROCESS §5 bounded input).
+_PENALTY_EVIDENCE_STR_MAX = 256
+
+
+def _penalty_evidence_from_diagnostics(diagnostics: dict[str, object]) -> dict[str, object]:
+    """The subset of a pod's death diagnostics that travels with the reset to the backend (DAH-3386).
+
+    Strings are cut to _PENALTY_EVIDENCE_STR_MAX, `container_exit_code` is kept only as an int, the two flags only
+    as bools; anything else the host answered is dropped rather than forwarded.
+    """
+    evidence: dict[str, object] = {}
+    for key in _PENALTY_EVIDENCE_FIELDS:
+        if key not in diagnostics:
+            continue
+        value = diagnostics[key]
+        if key == "container_exit_code":
+            if isinstance(value, int) and not isinstance(value, bool):
+                evidence[key] = value
+        elif key in ("container_oom_killed", "container_missing"):
+            if isinstance(value, bool):
+                evidence[key] = value
+        elif isinstance(value, str):
+            evidence[key] = value[:_PENALTY_EVIDENCE_STR_MAX]
+        elif value is None:
+            evidence[key] = None
+    return evidence
 
 
 async def _collect_pod_diagnostics(

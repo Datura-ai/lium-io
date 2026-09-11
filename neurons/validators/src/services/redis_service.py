@@ -419,7 +419,8 @@ class RedisService:
         miner_hotkey: str,
         executor_id,
         prev_info: dict = {},
-        reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
+        reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
+        evidence: dict | None = None,
     ):
         spec = prev_info.get('spec', '')
         uuids = prev_info.get('uuids', '')
@@ -432,12 +433,20 @@ class RedisService:
         }
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
+        # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the
+        # penalty row (lium-platform DAH-3385). Optional on the wire: an older backend ignores the keys.
+        evidence = dict(evidence or {})
+        reason_code = evidence.pop("reason_code", None)
+        check_id = evidence.pop("check_id", None)
         await self.publish(
             RESET_VERIFIED_JOB_CHANNEL,
             {
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_id,
                 "reason": reason.value,
+                "reason_code": reason_code,
+                "check_id": check_id,
+                "evidence": evidence or None,
             },
         )
 

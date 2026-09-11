@@ -156,6 +156,11 @@ class Context(BaseModel):
     state: ContextState = Field(default_factory=ContextState)
     clear_verified_job_info: bool = False
     clear_verified_job_reason: str | None = None
+    # DAH-3386: what the check that cleared the verified job saw — reason_code, check_id and, for a pod found not
+    # running, the container's death diagnostics. Sent to the backend with the reset so the penalty it raises
+    # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
+    # the check did not set it itself.
+    clear_verified_job_evidence: dict[str, Any] | None = None
     collateral_deposited: bool = False
     collateral_error_message: str | None = None
     contract_version: str | None = None
@@ -204,6 +209,24 @@ class LoggerSink:
     async def emit(self, event: ValidationEvent) -> None:
         level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
         getattr(self.logger, level)(_m(event.event, extra=event.model_dump(mode="json")))
+
+
+def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
+    """The check's updates, with ``clear_verified_job_evidence`` filled when the check clears the verified job.
+
+    DAH-3386: every check that sets ``clear_verified_job_info`` names itself to the backend — its event's
+    reason_code and its check_id — so an EXECUTOR_INACTIVE_MID_RENTAL raised from the reset says which check
+    fired instead of the bare DEFAULT/POD_NOT_RUNNING enum. A check that already attached richer evidence (the
+    rented-machine check adds the container's death diagnostics) keeps it; only the two names are filled in.
+    """
+    updates = dict(res.updates)
+    if not updates.get("clear_verified_job_info"):
+        return updates
+    evidence = dict(updates.get("clear_verified_job_evidence") or {})
+    evidence.setdefault("reason_code", res.event.reason_code)
+    evidence.setdefault("check_id", res.event.check_id or check_id)
+    updates["clear_verified_job_evidence"] = evidence
+    return updates
 
 
 def summarize_steps(
@@ -267,7 +290,7 @@ class Pipeline:
             events.append(res.event)
 
             if res.updates:
-                current_ctx = current_ctx.model_copy(update=res.updates)
+                current_ctx = current_ctx.model_copy(update=updates_with_clear_verified_job_evidence(res, chk.check_id))
 
             if failed:
                 return False, events, current_ctx

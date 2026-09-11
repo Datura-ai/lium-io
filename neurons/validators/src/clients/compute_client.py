@@ -389,7 +389,10 @@ class ComputeClient:
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
-                            reason=data["reason"]
+                            reason=data["reason"],
+                            reason_code=data.get("reason_code"),
+                            check_id=data.get("check_id"),
+                            evidence=data.get("evidence"),
                         )
 
                         async with self.lock:
