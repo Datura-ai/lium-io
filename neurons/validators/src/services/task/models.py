@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING, Any
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import IncentiveReason
-from protocol.vc_protocol.validator_requests import AVAILABILITY_CATEGORY, ValidationEvent
+from protocol.vc_protocol.validator_requests import (
+    AVAILABILITY_CATEGORY as AVAILABILITY_CATEGORY,
+    ValidationEvent,
+)
 from pydantic import BaseModel, Field, PrivateAttr
 
 if TYPE_CHECKING:
