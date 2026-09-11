@@ -58,7 +58,7 @@ def client_factory(keypair):
     )
 
 
-def prepared(port=40000, started=True, consumed=False, name=None) -> PreparedDind:
+def prepared(port=40000, started=True, consumed=False, name=None, reason="") -> PreparedDind:
     return PreparedDind(
         name=name or f"container_miner-hotkey_{port}",
         port=PortPair(port, port),
@@ -67,6 +67,7 @@ def prepared(port=40000, started=True, consumed=False, name=None) -> PreparedDin
         sysbox=True,
         started=started,
         consumed=consumed,
+        reason=reason,
     )
 
 
@@ -489,19 +490,37 @@ async def test_a_started_container_no_probe_took_is_removed_when_the_pipeline_en
     assert p.consumed
     ssh.run.assert_awaited_once_with("/usr/bin/docker rm -fv container_miner-hotkey_40000")
 
-    # A name the validator asked for is removed whether or not the executor confirmed the start
-    # (a lost answer may have left it running); only a consumed one, or none, is left alone.
-    ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=0)))
-    unconfirmed = prepared(40001, started=False)
-    ctx = make_context(ssh=ssh, state=build_state(local_facts=LocalFacts(dind=unconfirmed)))
-    await _settle_background_work(ctx)
-    assert unconfirmed.consumed
-    ssh.run.assert_awaited_once_with("/usr/bin/docker rm -fv container_miner-hotkey_40001")
+    # A name the validator asked for is removed when the executor MAY have started it and never
+    # confirmed (a lost answer, a mismatched echo, a missing step); only a consumed one, or none,
+    # is left alone.
+    for may_have_started in ("timeout", "transport", "http_error", "malformed", "echo_mismatch", "not_answered", ""):
+        ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=0)))
+        unconfirmed = prepared(40001, started=False, reason=may_have_started)
+        ctx = make_context(ssh=ssh, state=build_state(local_facts=LocalFacts(dind=unconfirmed)))
+        await _settle_background_work(ctx)
+        assert unconfirmed.consumed, may_have_started
+        ssh.run.assert_awaited_once_with("/usr/bin/docker rm -fv container_miner-hotkey_40001")
 
     for untouched in (prepared(consumed=True), None):
         ssh = SimpleNamespace(run=AsyncMock())
         ctx = make_context(ssh=ssh, state=build_state(local_facts=LocalFacts(dind=untouched)))
         await _settle_background_work(ctx)
+        ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_container_the_executor_provably_never_started_is_not_removed_by_name():
+    """Regression (fresh review, 11 Sep): the name is `container_<miner hotkey>_<port>` — the same
+    for every validator probing that miner. When the executor refused the intent (401/409), never
+    understood the step, or answered `failed`/`skipped` for it (its by-label cleanup took its own
+    half-made one), nothing of ours exists, and a same-named container that IS there is another
+    validator's probe: a `docker rm -fv <name>` here would kill their check."""
+    for never_started in ("refused", "busy_or_replay", "not_supported", "skipped", "failed"):
+        ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=0)))
+        theirs = prepared(40001, started=False, reason=never_started)
+        ctx = make_context(ssh=ssh, state=build_state(local_facts=LocalFacts(dind=theirs)))
+        await _settle_background_work(ctx)
+        assert theirs.consumed, never_started  # settled: nothing else comes for it
         ssh.run.assert_not_awaited()
 
 

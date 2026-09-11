@@ -374,19 +374,32 @@ async def _settle_background_work(ctx: Context) -> None:
 DIND_SETTLE_TIMEOUT_SECONDS = 15
 
 
+# Facts-call outcomes under which the executor provably ran nothing of ours: the intent was refused
+# before any step (401 / 409), never understood (no capability), or the executor's own `dind` step
+# answered `skipped` / `failed` (its by-label cleanup took its half-made container). Nothing to remove —
+# and the name is derived from the miner hotkey and the port, the same for every validator probing
+# that miner, so a container that IS there under it is another validator's probe, never ours.
+DIND_NEVER_STARTED_REASONS = frozenset({"refused", "busy_or_replay", "not_supported", "skipped", "failed"})
+
+
 async def _remove_unconsumed_dind(ctx: Context) -> None:
     """Remove the DinD container the validator asked the executor to start from the facts intent
     when no probe took it (the port check never ran, ran before the facts arrived, or the answer was
-    lost after the executor may have started it). The name is the validator's own choice, so a
-    `docker rm -f` of it is safe whether or not the container exists; best effort over the
-    pipeline's SSH — the executor's TTL and the stale cleanup (`container_` prefix) are the backstops."""
+    lost after the executor may have started it: timeout, transport, http_error, a malformed or
+    mismatched echo, a missing step). The name is the validator's own choice, so a `docker rm -f` of
+    it is safe whether or not the container exists; best effort over the pipeline's SSH — the
+    executor's TTL and the stale cleanup (`container_` prefix) are the backstops. An outcome under
+    which the executor ran nothing of ours (`DIND_NEVER_STARTED_REASONS`) removes nothing: a
+    same-named container then is another validator's."""
     facts = ctx.state.local_facts
     dind = facts.dind if facts is not None else None
     if dind is None or dind.consumed:
         return
     dind.consumed = True
     reason = "removed"
-    if ctx.ssh is None:
+    if not dind.started and dind.reason in DIND_NEVER_STARTED_REASONS:
+        reason = f"never_started_{dind.reason}"
+    elif ctx.ssh is None:
         reason = "no_ssh"
     else:
         try:
