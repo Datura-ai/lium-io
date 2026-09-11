@@ -275,6 +275,15 @@ class Settings(BaseSettings):
     # It DOES need EXPRESS_LANE_ENABLED: the express lane (`core/express_lane.py`) is the only caller
     # that passes `first_pass=True`; with it off and this flag on, `/verify` is never called.
     LOCAL_VERIFY_FIRST_PASS_ONLY: bool = Field(env="LOCAL_VERIFY_FIRST_PASS_ONLY", default=True)
+    # liumd phase 2 (DAH-2834): on the first pass, start the backend rental probe (RentalVerificationCheck's
+    # `check_executor_health`, ≈ 25 s: rent a probe pod, wait for sshd + nvidia-smi inside) right before the
+    # one `/verify` call, so it overlaps the executor's GPU steps instead of following them (−≈ 25 s node work
+    # at first-pass sizes: this base already runs VerifyX beside the matmul). RentalVerificationCheck awaits the very same request and judges it as today; a
+    # halt in between cancels the task (Pipeline.run). Off by default; needs VALIDATOR_LOCAL_VERIFY_ENABLED
+    # AND FIRST_PASS_FAST_PATH_ENABLED: the probe pod takes the GPUs while the GPU steps run, which is
+    # safe only beside the right-sized first-pass steps (`ContextConfig.first_pass`, the `parallel_gpu`
+    # rule) — with the fast path off no cycle starts a probe, the express lane's included.
+    LOCAL_VERIFY_RENTAL_PROBE_PARALLEL: bool = Field(env="LOCAL_VERIFY_RENTAL_PROBE_PARALLEL", default=False)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both

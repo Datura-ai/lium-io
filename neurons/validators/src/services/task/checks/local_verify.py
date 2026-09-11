@@ -22,8 +22,9 @@ cycle's serial full-size run can push a passing matmul past its cap and re-run i
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
@@ -54,6 +55,7 @@ from ..messages import LocalVerifyMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .capability import _get_filler_only_container
+from .rental_verification import RentalProbe, rental_probe_request
 from .verifyx import _first_pass_challenge_config
 
 logger = logging.getLogger(__name__)
@@ -112,12 +114,48 @@ class LocalVerifyCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
             )
+        started: list[RentalProbe] = []  # the probe, if _run started one before it raised
         try:
-            return await self._run(ctx)
+            return await self._run(ctx, started)
         except Exception as exc:  # noqa: BLE001 — the pipeline has no guard; a bug here must not end the node's cycle
-            return self._fallback(ctx, "call", "internal_error", f"{type(exc).__name__}: {exc}")
+            return self._fallback(
+                ctx,
+                "call",
+                "internal_error",
+                f"{type(exc).__name__}: {exc}",
+                probe=started[0] if started else None,
+            )
+        except BaseException:
+            # A cancellation (the per-executor wait_for in miner_service) or an exit while
+            # `client.verify` is awaited: nothing returns, so the pipeline's `finally` never sees
+            # the probe. Cancel it here — a probe pod nobody will read is not rented on.
+            for probe in started:
+                if not probe.task.done():
+                    probe.task.cancel()
+                elif not probe.task.cancelled():
+                    # nothing to cancel; read the exception so asyncio does not report it unretrieved
+                    probe.task.exception()
+            raise
 
-    async def _run(self, ctx: Context) -> CheckResult:
+    def _start_rental_probe(self, ctx: Context) -> RentalProbe | None:
+        """Phase 2 (LOCAL_VERIFY_RENTAL_PROBE_PARALLEL): start the backend rental probe now, so
+        its ≈ 25 s (rent a probe pod, wait for sshd + nvidia-smi inside) overlap the executor's
+        GPU steps instead of following them. First pass only — the probe pod takes the GPUs by
+        UUID while the first-pass matmul (8 GB VRAM) and VerifyX run; full-size cycles keep the
+        serial order (the `parallel_gpu` rule). The request is the one `RentalVerificationCheck`
+        would build (`rental_probe_request`), and that check consumes the task only if its own
+        request is identical."""
+        if not settings.LOCAL_VERIFY_RENTAL_PROBE_PARALLEL or not ctx.config.first_pass:
+            return None
+        request = rental_probe_request(ctx)
+        if request is None:
+            return None
+        task = asyncio.create_task(
+            ctx.services.backend.check_executor_health(**asdict(request)), name="local_verify.rental_probe"
+        )
+        return RentalProbe(task=task, request=request)
+
+    async def _run(self, ctx: Context, started: list[RentalProbe]) -> CheckResult:
         specs = ctx.state.specs
         if not specs:
             return self._skipped(ctx, "no specs")
@@ -166,7 +204,9 @@ class LocalVerifyCheck:
         except _NothingToSend as exc:
             return self._fallback(ctx, "call", exc.reason, exc.detail)
         try:
-            return await self._call_and_judge(ctx, client, matmul_challenge, verifyx_challenge)
+            return await self._call_and_judge(
+                ctx, client, matmul_challenge, verifyx_challenge, started
+            )
         finally:
             if matmul_challenge is not None:
                 matmul_challenge.close()
@@ -210,6 +250,7 @@ class LocalVerifyCheck:
         client: LocalVerifyClient,
         matmul_challenge: MatmulChallenge | None,
         verifyx_challenge: VerifyXChallenge | None,
+        started: list[RentalProbe],
     ) -> CheckResult:
         first_pass = ctx.config.first_pass
         matmul_step = None
@@ -239,12 +280,19 @@ class LocalVerifyCheck:
             deadline_s=executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS),
         )
 
+        # Started right before the call so it overlaps the executor's GPU steps; every return
+        # from here on carries it in `ctx.state.local_verify` for RentalVerificationCheck.
+        probe = self._start_rental_probe(ctx)
+        if probe is not None:
+            started.append(probe)
+
         try:
             answer = await client.verify(ctx.executor, intent)
         except LocalVerifyUnavailable as exc:
-            return self._fallback(ctx, "call", exc.reason, exc.detail)
+            return self._fallback(ctx, "call", exc.reason, exc.detail, probe=probe)
 
         outcome = self._judge(ctx, answer, matmul_challenge, verifyx_challenge)
+        outcome.rental_probe = probe
         what = {
             "round_trip_ms": outcome.round_trip_ms,
             "executor_elapsed_ms": outcome.executor_elapsed_ms,
@@ -255,6 +303,7 @@ class LocalVerifyCheck:
             ],
             "fallbacks": outcome.fallbacks,
             "deadline_hit": answer.deadline_hit,
+            "rental_probe_started": probe is not None,
         }
         template = Msg.CONSUMED if what["consumed"] else Msg.FALLBACK
         return CheckResult(
@@ -344,9 +393,23 @@ class LocalVerifyCheck:
             event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what={"why": why}),
         )
 
-    def _fallback(self, ctx: Context, step: str, reason: str, detail: str) -> CheckResult:
+    def _fallback(
+        self,
+        ctx: Context,
+        step: str,
+        reason: str,
+        detail: str,
+        probe: RentalProbe | None = None,
+    ) -> CheckResult:
         detail = detail[:DETAIL_MAX_CHARS]  # executor-derived text: same cap as the metric line
         self._metric(ctx, "fallback", step, reason, detail=detail)
+        # A started rental probe rides along even when the call itself fell back: the state
+        # carries no consumed step (both consumers take SSH), only the task for the rental check.
+        updates = (
+            {"state": replace(ctx.state, local_verify=LocalVerifyOutcome(rental_probe=probe))}
+            if probe is not None
+            else {}
+        )
         return CheckResult(
             passed=True,
             event=render_message(
@@ -355,6 +418,7 @@ class LocalVerifyCheck:
                 check_id=self.check_id,
                 what={"step": step, "reason": reason, "detail": detail},
             ),
+            updates=updates,
         )
 
     @staticmethod

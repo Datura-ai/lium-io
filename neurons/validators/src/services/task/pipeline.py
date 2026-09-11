@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from core.utils import _m
+from core.utils import _m, get_extra_info
 from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
 from services.redis_service import RedisService
@@ -17,13 +17,20 @@ from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
-from services.local_verify_client import LocalVerifyOutcome
+from services.local_verify_client import BackgroundProbe, LocalVerifyOutcome
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
+
+logger = logging.getLogger(__name__)
+
+# The one `[local_verify] outcome` line every phase-2 probe reading writes (`step=rental_probe`);
+# Loki counts by (outcome, reason). The checks import it from here.
+RENTAL_PROBE_OUTCOME_EVENT = "[local_verify] outcome"
+
 
 @runtime_checkable
 class PodRecoverer(Protocol):
@@ -276,36 +283,82 @@ class Pipeline:
         steps: list[tuple[str, int]] = []
         last_index = len(self.checks) - 1
 
-        for index, chk in enumerate(self.checks):
-            check_start_time = time.perf_counter()
-            res = await chk.run(current_ctx)
-            check_end_time = time.perf_counter()
+        try:
+            for index, chk in enumerate(self.checks):
+                check_start_time = time.perf_counter()
+                res = await chk.run(current_ctx)
+                check_end_time = time.perf_counter()
 
-            execution_time_ms = int((check_end_time - check_start_time) * 1000)
-            elapsed_time_ms = int((check_end_time - pipeline_start_time) * 1000)
+                execution_time_ms = int((check_end_time - check_start_time) * 1000)
+                elapsed_time_ms = int((check_end_time - pipeline_start_time) * 1000)
 
-            res.event.context["execution_time_ms"] = execution_time_ms
-            res.event.context["elapsed_time_ms"] = elapsed_time_ms
-            steps.append((chk.check_id, execution_time_ms))
+                res.event.context["execution_time_ms"] = execution_time_ms
+                res.event.context["elapsed_time_ms"] = elapsed_time_ms
+                steps.append((chk.check_id, execution_time_ms))
 
-            failed = not res.passed and getattr(chk, "fatal", False)
-            if failed or res.halt or index == last_index:
-                res.event.what_we_saw.update(
-                    summarize_steps(
-                        steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                failed = not res.passed and getattr(chk, "fatal", False)
+                if failed or res.halt or index == last_index:
+                    res.event.what_we_saw.update(
+                        summarize_steps(
+                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                        )
                     )
-                )
 
-            await self.sink.emit(res.event)
-            events.append(res.event)
+                await self.sink.emit(res.event)
+                events.append(res.event)
 
-            if res.updates:
-                current_ctx = current_ctx.model_copy(update=updates_with_clear_verified_job_evidence(res, chk.check_id))
+                if res.updates:
+                    current_ctx = current_ctx.model_copy(
+                        update=updates_with_clear_verified_job_evidence(res, chk.check_id)
+                    )
 
-            if failed:
-                return False, events, current_ctx
+                if failed:
+                    return False, events, current_ctx
 
-            if res.halt:
-                return True, events, current_ctx
+                if res.halt:
+                    return True, events, current_ctx
 
-        return True, events, current_ctx
+            return True, events, current_ctx
+        finally:
+            await _settle_background_work(current_ctx)
+
+
+async def _settle_background_work(ctx: Context) -> None:
+    """liumd phase 2: a check may leave an `asyncio.Task` in `ctx.state.local_verify` for a later
+    check to await (the rental probe started beside the GPU steps). A fatal check or a halt in
+    between would leave it pending — the backend already rented a probe pod for it — so whatever
+    is still unconsumed is cancelled and awaited here, once, whatever ended the pipeline, and the
+    `health_check_*` container the backend spawned for it is force-removed (DAH-1991: only
+    `RentalVerificationCheck` did that, so a probe nobody consumed left its pod on the executor).
+    The probe owns the how (`BackgroundProbe.cancel_and_await`)."""
+    outcome = ctx.state.local_verify
+    probe: BackgroundProbe | None = outcome.rental_probe if outcome is not None else None
+    if probe is None or probe.consumed:
+        return
+    probe.consumed = True
+    try:
+        reason = await probe.cancel_and_await()
+    except Exception as exc:  # noqa: BLE001 — cleanup must not replace the pipeline's own result
+        reason = f"settle_error: {type(exc).__name__}"
+    removed: int | str
+    try:
+        removed = await ctx.services.container_cleanup.force_remove_health_checks(
+            ctx.ssh, ctx.executor.uuid
+        )
+    except Exception as exc:  # noqa: BLE001 — same: the pipeline's own result stands
+        removed = f"error: {type(exc).__name__}"
+    logger.info(
+        _m(
+            RENTAL_PROBE_OUTCOME_EVENT,
+            extra=get_extra_info(
+                {
+                    **ctx.default_extra,
+                    "outcome": "fallback",
+                    "step": "rental_probe",
+                    "reason": f"unconsumed_{reason}",
+                    "health_checks_removed": removed,
+                    "first_pass": ctx.config.first_pass,
+                }
+            ),
+        )
+    )
