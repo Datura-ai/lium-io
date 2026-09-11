@@ -5360,6 +5360,50 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_
 
 
 @pytest.mark.asyncio
+async def test_create_container_encrypted_restore_stops_before_docker_run_without_the_engine(
+    docker_service,
+    monkeypatch,
+):
+    # DAH-3274 (review): new models but no restic binary used to fail inside _run_bootstrap_restore,
+    # with the pod already built; the engine check now runs next to the models probe.
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        docker_service_module, "supports_bootstrap_restore", AsyncMock(return_value=True)
+    )
+    engine_probe = AsyncMock(return_value=False)
+    monkeypatch.setattr(docker_service_module, "supports_storage_operation", engine_probe)
+    docker_run = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", docker_run)
+    restore_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_bootstrap_restore", restore_spy)
+    volume_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "create_local_volume", volume_spy)
+
+    payload = _create_payload(str(uuid4()), encrypted=True)
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest), result
+    assert result.failure_step == "bootstrap_restore_probe"
+    assert payload.bootstrap_restore.backup_engine in result.detail
+    engine_probe.assert_awaited_once()
+    volume_spy.assert_not_awaited()
+    docker_run.assert_not_awaited()
+    restore_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_container_encrypted_local_volume_docker_run_flags(
     docker_service,
     monkeypatch,
