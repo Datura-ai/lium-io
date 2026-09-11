@@ -10,7 +10,7 @@ challenge are judged by the same function.
 from typing import Literal
 
 from datura.requests.validator_requests import LOCAL_VERIFY_CAPABILITY, LOCAL_VERIFY_SCHEMA
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # One definition for both sides (datura): the validator client imports the same names.
 SCHEMA = LOCAL_VERIFY_SCHEMA
@@ -21,7 +21,15 @@ STEP_NAMES = ("matmul", "verifyx", "docker", "ports", "inspector")
 MAX_DEVICES = 64
 
 
-class DeviceChallenge(BaseModel):
+class WireModel(BaseModel):
+    """Every document on the `/verify` wire. `extra="forbid"`: a field this schema does not name is
+    a 422, never silently dropped — the Rust liumd (`deny_unknown_fields`) refuses it too, and a
+    schema that both sides refuse identically is one that can be pinned (LIUMD_RUST_PLAN §2.3.6)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class DeviceChallenge(WireModel):
     """One card's own challenge for the all-cards work-proof: a run pinned to `index`
     (`CUDA_VISIBLE_DEVICES`) with a cipher text sealed for that card alone (seeds may repeat, as
     on the SSH path). The validator derives the cipher text per device (domain-separated from the
@@ -33,7 +41,7 @@ class DeviceChallenge(BaseModel):
     cipher_text: str = Field(min_length=1, max_length=4096)
 
 
-class MatmulStep(BaseModel):
+class MatmulStep(WireModel):
     """The capability matmul challenge, exactly the arguments `decrypt_challenge.py` takes."""
 
     dim_n: int
@@ -57,14 +65,14 @@ class MatmulStep(BaseModel):
         return self
 
 
-class VerifyXStep(BaseModel):
+class VerifyXStep(WireModel):
     """The VerifyX challenge, exactly the arguments `verifyx_executor.py` takes."""
 
     seed: int
     cipher_text: str = Field(min_length=1, max_length=65536)
 
 
-class VerifySteps(BaseModel):
+class VerifySteps(WireModel):
     matmul: MatmulStep | None = None
     verifyx: VerifyXStep | None = None
     docker: bool = False
@@ -72,7 +80,7 @@ class VerifySteps(BaseModel):
     inspector: bool = False
 
 
-class VerifyIntentBody(BaseModel):
+class VerifyIntentBody(WireModel):
     """What the validator signs. `signature` covers the canonical JSON of these fields."""
 
     # Only this schema is understood: another version is refused (422) rather than run as v1.
@@ -88,17 +96,15 @@ class VerifyIntentBody(BaseModel):
     parallel_gpu: bool = False
     steps: VerifySteps = Field(default_factory=VerifySteps)
 
-    model_config = {"populate_by_name": True}
-
 
 class VerifyIntent(VerifyIntentBody):
     signature: str = Field(min_length=1, max_length=1024)
 
 
-class ScriptRun(BaseModel):
+class ScriptRun(WireModel):
     """What one script run produced: exit status, capped stdout, the stderr tail."""
 
-    status: str  # ok | failed | timeout | skipped
+    status: Literal["ok", "failed", "timeout", "skipped"]
     ms: int = 0
     exit_status: int | None = None
     stdout: str | None = None
@@ -116,29 +122,29 @@ class CardRun(ScriptRun):
     card_index: int
 
 
-class MatmulData(BaseModel):
+class MatmulData(WireModel):
     per_card: list[CardRun]
 
 
-class VerifyXData(BaseModel):
+class VerifyXData(WireModel):
     # The validator compares the library digest before it trusts a response (core/checksums).
     lib_sha256: str | None
 
 
-class ContainerFact(BaseModel):
+class ContainerFact(WireModel):
     name: str
     status: str
     image: str | None
     created: str | None
 
 
-class DiskFact(BaseModel):
+class DiskFact(WireModel):
     total_bytes: int
     free_bytes: int
     used_bytes: int
 
 
-class DockerFacts(BaseModel):
+class DockerFacts(WireModel):
     server_version: str | None
     root_dir: str | None
     runtimes: list[str]
@@ -148,16 +154,16 @@ class DockerFacts(BaseModel):
     containers: list[ContainerFact]
 
 
-class PortFacts(BaseModel):
+class PortFacts(WireModel):
     port_range: str | None
     port_mappings: str | None
     configured: int
     sampled: int
     published_by_docker: list[int]
-    free: int
+    free_ports: int
 
 
-class InspectorFacts(BaseModel):
+class InspectorFacts(WireModel):
     lib_present: bool
     lib_sha256: str | None
     script_present: bool
@@ -173,7 +179,7 @@ class StepResult(ScriptRun):
     data: StepData | None = None
 
 
-class VerifyResult(BaseModel):
+class VerifyResult(WireModel):
     schema_id: str = Field(alias="schema", default=SCHEMA)
     nonce: str
     executor_uuid: str
@@ -186,5 +192,3 @@ class VerifyResult(BaseModel):
     # that the adversary's host signed). The field is here so a future key can fill it.
     signer: str = "none"
     signature: str | None = None
-
-    model_config = {"populate_by_name": True}
