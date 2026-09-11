@@ -1,6 +1,6 @@
 # lium.io
 
-**[Lium Subnet Documentation](https://docs.lium.io/bittensor-subnet/overview)**
+**[Lium Documentation](https://docs.lium.io)** — providers: <https://docs.lium.io/providers>, validators: <https://docs.lium.io/validators>
 
 <img width="469" height="468" alt="image" src="https://github.com/user-attachments/assets/69550b83-91a9-492a-bd7a-09d35c6106d3" />
 
@@ -16,6 +16,7 @@ Welcome to **Lium.io powered by Bittensor Subnet 51**! This project enables a de
   - [For Validators](#for-validators)
 - [Repository Layout](#repository-layout)
 - [Running the Tests](#running-the-tests)
+- [Releases](#releases)
 - [Contact and Support](#contact-and-support)
 
 ## Introduction
@@ -64,13 +65,15 @@ For more details, visit the [Validator Setup Guide](neurons/validators/README.md
 
 ## Repository Layout
 
-Three neurons, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files; `watchtower/`, its own pdm project with a Dockerfile; and one shared pdm package (`datura/`, a `pyproject.toml` only):
+Three neurons, each with its own `pyproject.toml` / `pdm.lock`, Dockerfile and compose files; `watchtower/`, its own pdm project with a Dockerfile; one shared pdm package (`datura/`, a `pyproject.toml` only); and `packages/lium-core/`, the library published to PyPI. The root `pyproject.toml` (`compute-subnet`, Python 3.11) holds the shared `[tool.ruff]` config and the repo-wide dev tools (`ruff`, `pre-commit`), plus one declared runtime dependency (`aiohttp`):
 
 - `neurons/validators/` — the validator: scores miners, verifies executors over SSH, creates and manages rental containers on them (`src/services/docker_service.py`), sets weights. `src/miner_jobs/` holds the scripts the validator uploads to an executor and runs there (`machine_scrape.py` hardware scrape, `backup_storage.py` / `restore_storage.py`, `workspace_mount.py`); `machine_scrape.py` is obfuscated per job by `src/services/file_encrypt_service.py` before upload, so its key order is load-bearing (see the comment at the top of that file).
 - `neurons/miners/` — the miner: registers executors with the network and answers validator requests; its database schema is Alembic migrations under `migrations/`.
 - `neurons/executor/` — the agent installed on a GPU machine: exposes the machine to its miner's validators, runs the containers. `dstacktee/` runs it inside an Intel TDX confidential VM with attestation (its own README).
 - `datura/` — the protocol shared by the three: request/response models (`datura/requests`), consumers, errors.
+- `packages/lium-core/` — `lium_core.shared_config`, the shared-config client the validator and the miner install from PyPI as `lium-core` (its own README; CI `lium-core-ci.yml`, release by hand through `lium-core-release.yml`).
 - `watchtower/` — pulls validator-signed image updates and restarts containers (its own README).
+- `e2e/` — the whole loop on one machine without the chain: a real executor on its own dockerd, a real miner, the validator's services as the tester (`e2e/README.md`; `./gate.sh` is what CI runs).
 - `scripts/` — the `install_*_on_ubuntu.sh` installers referenced by the setup guides; `docs/` — operator notes; `contrib/` — contribution and style guides.
 
 ## Running the Tests
@@ -88,7 +91,28 @@ Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm proj
 (cd neurons/miners && pdm install && pdm run pytest tests/ -v --tb=short)
 ```
 
-These are the commands `.github/workflows/test.yml` runs on every pull request against `main` or `dev`. Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
+These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter; its jobs decide for themselves:
+
+- `route` reads the changed files (`.github/actions/changed-packages`), after dropping `*.md`, `.gitignore` and the root `docs/` tree — a README-only PR runs no neuron job.
+- Each neuron's test job runs only when that neuron, `datura/` or `.github/` changed.
+- `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`.
+- `lint` (`ruff format --check`, report-only, not required) runs per changed neuron.
+- `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `datura/`, `.github/` or `e2e/` changed.
+- `tests-ok` is the one status check to require; it reports on every PR.
+
+Tests follow Arrange-Act-Assert, one behaviour per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`) is the formatter.
+
+## Releases
+
+Images are built and pushed to Docker Hub by the `*_cd_prod` and `*_cd_dev` workflows from each neuron's `docker_build.sh` / `docker_publish.sh` (and the `*_runner_*` pair for the auto-updating runner image):
+
+| Tag pushed | Workflow | Images |
+|---|---|---|
+| `executor-v*` | `executor_cd_prod.yml` | `daturaai/compute-subnet-executor`, `daturaai/compute-subnet-executor-runner` |
+| `validator-v*` | `validator_cd_prod.yml` | `daturaai/compute-subnet-validator`, `daturaai/compute-subnet-validator-runner` |
+| `miner-v*` | `miner_cd_prod.yml` | `daturaai/compute-subnet-miner`, `daturaai/compute-subnet-miner-runner` |
+
+The `*_cd_dev.yml` and `*_cd_staging.yml` workflows are started by hand (`workflow_dispatch`); the two `*_cd_staging.yml` use `docker/build-push-action` to publish `ghcr.io/datura-ai/lium-validator:staging` and `ghcr.io/datura-ai/lium-miner:staging`. The deploy of the validator and central miner lives in the private `lium-io-deployment` repository.
 
 ## Contact and Support
 

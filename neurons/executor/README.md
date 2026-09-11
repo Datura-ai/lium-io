@@ -9,7 +9,7 @@ Before the first command, the machine needs:
 - **Ubuntu 22.04 on x86_64**, kernel 5.19 or newer (6.x recommended; `hostnamectl` shows both), and root or passwordless `sudo`;
 - **the NVIDIA driver loaded** — `nvidia-smi` lists the GPUs;
 - **Docker Engine installed and running** — `docker ps` works. The Sysbox installer below refuses to run without it (`lium mine` runs the Docker install script too, but only after this step, and it is a no-op on a machine that already has Docker);
-- **a public IP** with the service port (`8080`) and the node SSH port (`2200`) reachable, and the SS58 hotkey of a provider registered on subnet 51.
+- **a public IP** with the service port (`8080`) and the node SSH port (`2200`) reachable, and the hotkey (SS58 address) of your registered provider account — see the [Provider Quickstart](https://docs.lium.io/providers/quickstart).
 
 RAM, disk (including the 1.5× VRAM rule for the idle incentive) and the recommended XFS storage setup are in the [Node Quickstart requirements](https://docs.lium.io/providers/nodes/quickstart#requirements).
 
@@ -19,10 +19,10 @@ Install [Sysbox](https://docs.lium.io/providers/nodes/sysbox) first — validato
 curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 ```
 
-Then run the node in one command, with your miner hotkey:
+Then run the node in one command, with your provider hotkey:
 
 ```shell
-curl -fsSL https://lium.io/mine.sh | bash -s -- -k <your_miner_hotkey_ss58>
+curl -fsSL https://lium.io/mine.sh | bash -s -- -k <your_provider_hotkey_ss58>
 ```
 
 The script installs the [`lium`](https://github.com/Datura-ai/lium) CLI and runs `lium mine`, which:
@@ -80,27 +80,34 @@ cd neurons/executor
 cp .env.template .env
 ```
 
-* Install Required Tools 
+* Install Sysbox and the NVIDIA Container Toolkit (root is required)
 ```shell
-./nvidia_docker_sysbox_setup.sh
+sudo ./nvidia_docker_sysbox_setup.sh
 ```
 
-Add the correct miner wallet hotkey for `MINER_HOTKEY_SS58_ADDRESS`.
-You can change the ports for `INTERNAL_PORT`, `EXTERNAL_PORT`, `SSH_PORT` based on your need.
+Put your provider hotkey (SS58 address) in `MINER_HOTKEY_SS58_ADDRESS` — the variable keeps its historical name.
+You can change the ports for `INTERNAL_PORT`, `EXTERNAL_PORT`, `SSH_PORT` based on your need; the template's
+defaults are `8001` / `8001` / `2200` (`lium mine` proposes `8080` for the service port instead).
 
 - **INTERNAL_PORT**: internal port of your executor docker container
 - **EXTERNAL_PORT**: external expose port of your executor docker container
 - **SSH_PORT**: ssh port map into 22 of your executor docker container
 - **SSH_PUBLIC_PORT**: [Optional] ssh public access port of your executor docker container. If `SSH_PUBLIC_PORT` is equal to `SSH_PORT` then you don't have to specify this port.
-- **MINER_HOTKEY_SS58_ADDRESS**: the miner hotkey address
+- **MINER_HOTKEY_SS58_ADDRESS**: your provider hotkey (SS58 address)
 - **RENTING_PORT_RANGE**: The port range that are publicly accessible. This can be empty if all ports are open. Available formats are: 
-  - Range Specification(`from-to`): Miners can specify a range of ports, such as 2000-2005. This means ports from 2000 to 2005 will be open for the validator to select.
-  - Specific Ports(`port1,port2,port3`): Miners can specify individual ports, such as 2000,2001,2002. This means only ports 2000, 2001, and 2002 will be available for the validator.
+  - Range Specification(`from-to`): a range of ports, such as 2000-2005. This means ports from 2000 to 2005 will be open for the validator to select.
+  - Specific Ports(`port1,port2,port3`): individual ports, such as 2000,2001,2002. This means only ports 2000, 2001, and 2002 will be available for the validator.
   - Default Behavior: If no ports are specified, the validator will assume that all ports on the executor are available.
 - **RENTING_PORT_MAPPINGS**: Internal, external port mappings. Use this env when you are using proxy in front of your executors and the internal port and external port can't be the same. You can ignore this env, if all ports are open or the internal and external ports are the same. example:
   - if internal port 46681 is mapped to 56681 external port and internal port 46682 is mapped to 56682 external port, then RENTING_PORT_MAPPINGS="[[46681, 56681], [46682, 56682]]"
 
 Note: Please use either **RENTING_PORT_RANGE** or **RENTING_PORT_MAPPINGS** and DO NOT use both of them if you have specific ports are available.
+
+Optional, commented out in the template (`src/core/config.py` has the defaults):
+
+- **COMPUTE_REST_API_URL**: the Lium backend the executor pre-pulls its GPU's cache template image from (default `https://lium.io/api`; empty disables the pre-pull)
+- **CACHE_TEMPLATE_REFRESH_SECONDS**: how often the template digest is re-checked (default `900`)
+- **CONTAINER_SIGNATURE_MAX_AGE_SECONDS**: maximum clock skew accepted on signed pod-metrics and pod-log requests (default `300`; keep the host on NTP rather than widening this)
 
 
 * Run project
@@ -150,24 +157,26 @@ Go to `/etc/docker/daemon.json` and add `"exec-opts": ["native.cgroupdriver=cgro
 #### System Requirments
 | OS          | Version |
 |-------------|---------|
-| Ubuntu      | 22+     |
-| Kernel      | 6.5+    |
+| Ubuntu      | 22.04+  |
+| Kernel      | 5.19+ (6.x recommended) |
+
+Why 5.19: overlayfs on ID-mapped mounts, which Sysbox needs for GPUs, landed in 5.19; `nvidia_docker_sysbox_setup.sh` checks it.
 
 Checking OS and Kernel version
 ```shell
 hostnamectl
 ```
 
-Get the latest kernel version on ubuntu 22.04 if the kernel version is less than 6.5
+Get the HWE kernel on Ubuntu 22.04 if the kernel version is older than 5.19
 ```shell
 sudo apt update
 sudo apt install --install-recommends linux-generic-hwe-22.04
 sudo reboot
 ```
 
-Installation of sysbox
+Installation of sysbox (as root; `sudo ./nvidia_docker_sysbox_setup.sh --check` only runs the host checks)
 ```shell
-./nvidia_docker_sysbox_setup.sh
+sudo ./nvidia_docker_sysbox_setup.sh
 ```
 
 Verify sysbox is working correctly with gpu
