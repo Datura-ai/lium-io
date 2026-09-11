@@ -122,6 +122,10 @@ class RentedExecutorsResponse(BaseModel):
     # FillerRunDao.CREATE_KILL_*). Such a run never reaches RUNNING, so the ISSUE-050 liveness
     # probe has nothing to check. Additive with an empty default: an older backend penalizes nobody.
     filler_create_kill_executor_ids: list[str] = []
+    # DAH-3436: executor_ids the backend wants rental-probed this cycle regardless of the probe
+    # interval (a renter pod on the node went BROKEN since the last probe). Additive with an empty
+    # default: a backend that does not set it leaves the probe on its interval alone.
+    rental_probe_requested_executor_ids: list[str] = []
     provider_discord_connected_executor_ids: list[str] | None = None  # executor_ids whose provider has connected Discord
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).

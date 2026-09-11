@@ -1238,6 +1238,47 @@ class RentalVerificationMessages:
     )
 
 
+class RentalProbeMessages:
+    """DAH-3436: the synthetic rental probe. A failed step zeroes the score and clears the verified job for
+    the cycle (RENTAL_PROBE_FAILED); an idle node with the image pulled is probed again next cycle."""
+
+    DISABLED = MessageTemplate(
+        event="Rental probe disabled",
+        reason="RENTAL_PROBE_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Rental probe skipped",
+        reason="RENTAL_PROBE_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed; the probe runs on an idle node once per interval",
+    )
+    PROBE_OK = MessageTemplate(
+        event="Rental probe passed: a renter container started, sshd listened and the GPUs were visible",
+        reason="RENTAL_PROBE_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    PROBE_FAILED = MessageTemplate(
+        event="Rental probe failed: a renter could not use this node",
+        reason="RENTAL_PROBE_FAILED",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0 and the verified job cleared for this cycle; the node is probed again next cycle while it stays idle",
+    )
+    INCONCLUSIVE = MessageTemplate(
+        event="Rental probe could not reach a verdict",
+        reason="RENTAL_PROBE_INCONCLUSIVE",
+        severity="warning",
+        category="runtime",
+        impact="Proceed without penalty; the probe runs again next cycle",
+    )
+
+
 class CpuTruthMessages:
     """DAH-2671 item 2a — corroborate advertised CPU(s) against sources the lscpu wrapper does not
     author. Shadow (CPU_TRUTH_CHECK_ENABLED without enforcement) emits CPU_MISMATCH as a warning and

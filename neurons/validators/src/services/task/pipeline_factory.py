@@ -51,6 +51,7 @@ from .checks import (
     PortConnectivityCheck,
     PortCountCheck,
     ProviderSideLoadCheck,
+    RentalProbeCheck,
     RentalVerificationCheck,
     ScoreCheck,
     SpecChangeCheck,
@@ -145,6 +146,7 @@ class PipelineFactory:
         tdx_attestation_passed: bool = False,
         gpu_attestation_passed: bool | None = None,
         first_pass: bool = False,
+        encrypted_private_key: str | None = None,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -155,6 +157,8 @@ class PipelineFactory:
             keypair: Validator's bittensor keypair
             private_key: Decrypted private key for SSH
             public_key: Public key for SSH
+            encrypted_private_key: the same key as the backend sent it, for the rental probe's
+                create_container / delete_container calls (DAH-3436); None disables the probe
             encrypted_files: Encrypted validation files
             tdx_attestation_passed: Whether TDX attestation passed
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
@@ -201,6 +205,7 @@ class PipelineFactory:
             settings={"version": settings.VERSION},
             encrypt_key=encrypted_files.encrypt_key,
             executor_ssh_private_key=private_key,
+            executor_ssh_private_key_encrypted=encrypted_private_key,
             default_extra=default_extra,
             services=ContextServices(
                 ssh=self.ssh_service,
@@ -331,6 +336,11 @@ class PipelineFactory:
                 # idle valid-executor population. No scoring impact; fails open on any error.
                 CachedTemplateVerificationCheck(),
                 RentalVerificationCheck(),
+                # DAH-3436: rent the idle node from the validator once per interval, the way a renter
+                # would (default image, probe key, verified ports), and prove sshd, the login and
+                # `nvidia-smi -L`. Last before scoring: it needs the verified ports, the GPU list and
+                # the rented/filler state every check above settled. Flag-gated, off by default.
+                RentalProbeCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -391,6 +401,7 @@ class PipelineFactory:
                 CapabilityCheck(),
                 GpuFaultProbeCheck(),
                 RentalVerificationCheck(),
+                # RentalProbeCheck(),  # SKIP: creates and removes a container on the executor
                 ScoreCheck(),
                 FinalizeCheck(),
             ],

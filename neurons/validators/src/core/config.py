@@ -324,6 +324,19 @@ class Settings(BaseSettings):
     # default off: the probe is new GPU work on every idle node per cycle, so it starts as an opt-in shadow.
     GPU_FAULT_PROBE_CHECK_ENABLED: bool = Field(env="GPU_FAULT_PROBE_CHECK_ENABLED", default=False)
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
+    # DAH-3436: the synthetic rental probe. On an idle node (no renter pod, no filler) the validator
+    # rents the node from itself once per RENTAL_PROBE_INTERVAL_HOURS: it starts the default renter
+    # image through the same create_container path a renter's pod takes, with a probe-owned SSH key
+    # and the node's verified ports, waits RENTAL_PROBE_SSH_DEADLINE_SECONDS for sshd on the mapped
+    # port, logs in, runs `nvidia-smi -L`, and tears the container down through delete_container.
+    # A failed step zeroes the score and clears the verified job for the cycle (RENTAL_PROBE_FAILED),
+    # like the GPU runtime quarantine; the failure is not carried forward, so a node the next cycle
+    # skips (filler running, image gone) or reads inconclusively is verified again by that cycle,
+    # and an idle node with the image pulled is probed again every cycle until it passes. Off by default:
+    # it rents a container on every idle node every 6 h, so the team turns it on after staging.
+    RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
+    RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
+    RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
