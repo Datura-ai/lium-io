@@ -9,7 +9,6 @@ import pytest
 from neurons.validators.src.services.task import pipeline as pipeline_module
 from neurons.validators.src.services.task.models import ValidationEvent
 from neurons.validators.src.services.task.pipeline import (
-    STEP_SUMMARY_MIN_MS,
     CheckResult,
     Pipeline,
     summarize_steps,
@@ -64,7 +63,7 @@ def clock(monkeypatch) -> _Clock:
 
 
 @pytest.mark.asyncio
-async def test_passing_run_lists_the_slow_steps_and_the_total_on_the_last_event(clock, context_factory):
+async def test_passing_run_lists_every_step_and_the_total_on_the_last_event(clock, context_factory):
     checks = [
         _TimedCheck("prep.start_gpu_monitor", 0.2, clock),
         _TimedCheck("gpu.scrape.machine_spec", 21.04, clock),
@@ -80,9 +79,12 @@ async def test_passing_run_lists_the_slow_steps_and_the_total_on_the_last_event(
     assert ok is True
     last = events[-1].what_we_saw
     assert last["steps"] == {
+        "prep.start_gpu_monitor": 0.2,
         "gpu.scrape.machine_spec": 21.0,
+        "gpu.validate.count": 0.0,
         "gpu.validate.verifyx": 78.5,
         "gpu.validate.capability": 26.2,
+        "pipeline.finalize": 0.0,
     }
     assert last["steps_total_s"] == pytest.approx(125.9, abs=0.11)
     assert "steps_failed" not in last
@@ -130,7 +132,7 @@ async def test_non_fatal_failure_does_not_stop_and_is_not_named(clock, context_f
 
     assert ok is True
     assert "steps_failed" not in events[-1].what_we_saw
-    assert events[-1].what_we_saw["steps"] == {"host.validate.cpu_truth": 1.5}
+    assert events[-1].what_we_saw["steps"] == {"host.validate.cpu_truth": 1.5, "pipeline.finalize": 0.0}
 
 
 @pytest.mark.asyncio
@@ -152,10 +154,10 @@ async def test_halt_is_a_final_event_too(clock, context_factory):
     assert "steps_failed" not in events[-1].what_we_saw
 
 
-def test_summary_omits_sub_second_steps_and_rounds_to_a_tenth():
-    steps = [("a", STEP_SUMMARY_MIN_MS - 1), ("b", STEP_SUMMARY_MIN_MS), ("c", 73_090)]
+def test_summary_keeps_every_step_and_rounds_to_a_tenth():
+    steps = [("a", 999), ("b", 1000), ("c", 73_090)]
 
     summary = summarize_steps(steps, elapsed_time_ms=152_345)
 
-    assert summary == {"steps": {"b": 1.0, "c": 73.1}, "steps_total_s": 152.3}
+    assert summary == {"steps": {"a": 0.999, "b": 1.0, "c": 73.1}, "steps_total_s": 152.3}
     assert summarize_steps(steps, 1, failed_check_id="c")["steps_failed"] == "c"
