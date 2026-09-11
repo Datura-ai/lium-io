@@ -77,6 +77,20 @@ def ssh_pubkey_signing_blob(public_key: str, nonce: str | None = None) -> str:
 # executor. Schema id of the wire documents and the capability string `GET /version` advertises.
 LOCAL_VERIFY_SCHEMA = "lium.local_verify/1"
 LOCAL_VERIFY_CAPABILITY = "local_verify/1"
+# liumd phase 2c: the intent may carry `steps.dind` — the executor starts the port-check DinD
+# container locally, beside the other steps, for the validator to connect to as today. Advertised
+# separately so a validator never sends the step to an image that would silently ignore it.
+LOCAL_VERIFY_DIND_CAPABILITY = "local_verify/dind"
+# The port-check DinD image both sides start (`DockerCommand.run_dind` on the validator, `run_dind`
+# on the executor): one definition so the two cannot drift apart.
+LOCAL_VERIFY_DIND_IMAGE = "daturaai/dind:0.0.1"
+# The `steps.dind` document, bounded on BOTH ends from one place: the executor's `DindStep` rejects
+# a field outside these (a 422 on the whole intent), so the validator checks its own document
+# against the same patterns before it sends and leaves the step out rather than lose every fact.
+LOCAL_VERIFY_DIND_NAME_PATTERN = r"^container_[A-Za-z0-9_.-]{1,100}$"
+LOCAL_VERIFY_DIND_NAME_MAX = 128
+LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN = r"^ssh-(ed25519|rsa) [A-Za-z0-9+/=]{1,900}( [A-Za-z0-9@._-]{1,64})?$"
+LOCAL_VERIFY_DIND_PUBLIC_KEY_MAX = 1024
 
 
 # The largest card count one host can claim; bounds the matmul fan-out an intent can ask for.
@@ -134,6 +148,25 @@ class VerifyXStep(LocalVerifyWireModel):
 
     seed: int
     cipher_text: str = pydantic.Field(min_length=1, max_length=65536)
+
+
+class DindStep(LocalVerifyWireModel):
+    """liumd phase 2c: start the port-check DinD container the validator would otherwise start
+    over SSH (`DockerCommand.run_dind` on the validator, byte-for-byte), so it boots beside the
+    other steps and sshd inside is ready by the time PortConnectivityCheck connects. The validator
+    still connects, runs the sysbox proof and removes the container itself; this only moves the
+    `docker run`. Every field is bounded and rebuilt into an argv on the executor — no command
+    string crosses the wire."""
+
+    # `container_<miner hotkey>_<port>`: the validator's own naming, which the stale cleanup reaps.
+    name: str = pydantic.Field(pattern=LOCAL_VERIFY_DIND_NAME_PATTERN, max_length=LOCAL_VERIFY_DIND_NAME_MAX)
+    # The host port to publish sshd on; must be one of this executor's own configured ports.
+    port: int = pydantic.Field(ge=1, le=65535)
+    # One OpenSSH public key line for the container's root; the validator holds the private half.
+    public_key: str = pydantic.Field(
+        pattern=LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN, max_length=LOCAL_VERIFY_DIND_PUBLIC_KEY_MAX
+    )
+    sysbox: bool = False
 
 
 def local_verify_signing_blob(intent: dict) -> str:

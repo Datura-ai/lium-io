@@ -34,6 +34,7 @@ class ExecutorConnectivityService:
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
         published_ports: list[int] | None = None,
+        prestarted_dind=None,
     ) -> PortVerificationResult:
         """Verify executor port connectivity and DinD capability.
 
@@ -43,6 +44,10 @@ class ExecutorConnectivityService:
         from the batch the validator would probe today, never moves the batch; which of the
         remaining ports work is still proven by the connect-back, and none of this changes
         `rented_ports`' meaning for the sysbox fallback below.
+
+        `prestarted_dind` (phase 2c, `local_verify_facts.PreparedDind`): the DinD container the
+        executor already started from the validator's signed intent — same name, port and key the
+        probe would have used. The verifier skips only the `docker run`.
         """
         log_ctx = log_ctx or {}
         t1 = time.monotonic()
@@ -58,6 +63,7 @@ class ExecutorConnectivityService:
                 unavailable_ports=(rented_ports or []) + (filler_ports or []),
                 log_ctx=log_ctx,
                 published_ports=published_ports,
+                prestarted_dind=prestarted_dind,
             )
             sysbox_result = verification.sysbox_runtime
             if not sysbox_result and rented_ports and sysbox_runtime:

@@ -11,8 +11,10 @@ from typing import Literal
 
 from datura.requests.validator_requests import (
     LOCAL_VERIFY_CAPABILITY,
+    LOCAL_VERIFY_DIND_CAPABILITY,
     LOCAL_VERIFY_SCHEMA,
     DeviceChallenge,  # noqa: F401 — re-exported for the service and the tests
+    DindStep,
     LocalVerifyWireModel,
     MatmulStep,
     VerifyXStep,
@@ -22,11 +24,13 @@ from pydantic import Field
 # One definition for both sides (datura): the validator client imports the same names.
 SCHEMA = LOCAL_VERIFY_SCHEMA
 CAPABILITY = LOCAL_VERIFY_CAPABILITY
-# The intent's step challenges (`DeviceChallenge`, `MatmulStep`, `VerifyXStep`) and the
+DIND_CAPABILITY = LOCAL_VERIFY_DIND_CAPABILITY
+# The intent's step challenges (`DeviceChallenge`, `MatmulStep`, `VerifyXStep`, `DindStep`) and the
 # `extra="forbid"` base are datura's — the validator builds the intent from the very models the
 # executor parses. Re-exported here for the service and the tests.
 WireModel = LocalVerifyWireModel
 
+# Always answered (skipped when not asked); `dind` (phase 2c) is answered only when the intent carries it.
 STEP_NAMES = ("matmul", "verifyx", "docker", "ports", "inspector")
 
 
@@ -36,6 +40,7 @@ class VerifySteps(WireModel):
     docker: bool = False
     ports: bool = False
     inspector: bool = False
+    dind: DindStep | None = None
 
 
 class VerifyIntentBody(WireModel):
@@ -134,7 +139,15 @@ class InspectorFacts(WireModel):
     script_present: bool
 
 
-StepData = MatmulData | VerifyXData | DockerFacts | PortFacts | InspectorFacts
+class DindData(WireModel):
+    """The DinD step's answer (phase 2c): the container the validator will connect to."""
+
+    container_name: str
+    port: int
+    publish_port: int
+
+
+StepData = MatmulData | VerifyXData | DockerFacts | PortFacts | InspectorFacts | DindData
 
 
 class StepResult(ScriptRun):

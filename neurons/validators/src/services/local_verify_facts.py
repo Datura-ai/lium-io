@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from services.executor_connectivity.models import PortPair
 from services.local_verify_client import StepEvidence
 
 MAX_CONTAINERS = 512
@@ -64,6 +65,29 @@ class HostContainer:
     created_at: int | None  # epoch seconds, None when the executor's string did not parse
 
 
+@dataclass
+class PreparedDind:
+    """Phase 2c: the port-check DinD container the early call asked the executor to start.
+
+    The validator chose the name, the port and the key pair BEFORE the call and keeps the private
+    half; `started` is the executor's word that `docker run` succeeded, and the only thing that word
+    buys is that `DindVerifier` skips its own `docker run` and connects straight away. Everything
+    that decides — sshd answering the validator's key, the sysbox proof inside, the removal — is the
+    validator's own doing, exactly as when it started the container over SSH. A container the
+    validator never comes for is removed by `Pipeline.run`'s settle step (and by the executor's own
+    TTL, and by the stale cleanup: it carries the `container_` prefix).
+    """
+
+    name: str
+    port: PortPair
+    private_key: str = field(repr=False)  # never in a log line
+    public_key: str
+    sysbox: bool
+    started: bool = False
+    consumed: bool = False  # DindVerifier took it (and owns the removal from then on)
+    reason: str = ""  # why not started: step status / mismatch, for the outcome metric
+
+
 @dataclass(frozen=True)
 class LocalFacts:
     """What the early facts call learnt; every field is optional evidence, never a verdict."""
@@ -76,9 +100,29 @@ class LocalFacts:
     round_trip_ms: int = 0
     executor_elapsed_ms: int = 0
     step_statuses: dict[str, str] = field(default_factory=dict)  # step -> status as answered
+    dind: PreparedDind | None = None  # phase 2c; None = not asked
 
     def can_age_containers(self) -> bool:
         return self.containers is not None and self.host_now is not None
+
+
+def judge_dind_step(prepared: PreparedDind, steps: dict[str, Any]) -> PreparedDind:
+    """Mark the prepared container started only when the executor's `dind` step is `ok` AND
+    echoes the very name and port the validator asked for; anything else is a reason to start it
+    over SSH as today."""
+    step = steps.get("dind")
+    if step is None:
+        prepared.reason = "not_answered"
+        return prepared
+    if step.status != "ok":
+        prepared.reason = step.status
+        return prepared
+    data = step.data if isinstance(step.data, dict) else {}
+    if data.get("container_name") != prepared.name or data.get("port") != prepared.port.external:
+        prepared.reason = "echo_mismatch"
+        return prepared
+    prepared.started = True
+    return prepared
 
 
 def parse_created(value: Any) -> int | None:

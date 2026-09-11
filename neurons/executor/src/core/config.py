@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     EXECUTOR_LOCAL_VERIFY_ENABLED: bool = Field(env="EXECUTOR_LOCAL_VERIFY_ENABLED", default=False)
     # Longest a single /verify call may run before answering with what finished (seconds).
     LOCAL_VERIFY_MAX_DEADLINE_SECONDS: int = Field(env="LOCAL_VERIFY_MAX_DEADLINE_SECONDS", default=600)
+    # liumd phase 2c: also start the validator's port-check DinD container from the intent (`steps.dind`),
+    # so it boots beside the other steps; advertised as `local_verify/dind`. Needs the flag above.
+    EXECUTOR_LOCAL_VERIFY_DIND_ENABLED: bool = Field(env="EXECUTOR_LOCAL_VERIFY_DIND_ENABLED", default=False)
     # How far the intent's issued_at may be from this host's clock (seconds, either way).
     LOCAL_VERIFY_INTENT_WINDOW_SECONDS: int = Field(env="LOCAL_VERIFY_INTENT_WINDOW_SECONDS", default=120)
 
