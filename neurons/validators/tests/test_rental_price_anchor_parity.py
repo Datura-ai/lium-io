@@ -16,9 +16,13 @@ WORKSTATION = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
 
 
 def test_incentive_config_anchors_server_edition_at_workstation_price():
+    """Fails when the parity override is dropped or mistyped: the Server entry then falls back to the
+    installed lium-core value (0.86 in 0.1.8) and no longer equals the Workstation entry."""
     prices = IncentiveConfig().rental_prices_per_hour
+    upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
-    assert prices[SERVER] == prices[WORKSTATION] == 1.0
+    assert prices[SERVER] == prices[WORKSTATION]
+    assert prices[SERVER] == upstream[WORKSTATION]
 
 
 def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
