@@ -26,10 +26,30 @@ from .runner import SSHCommandRunner
 
 @runtime_checkable
 class PodRecoverer(Protocol):
-    # The slice of DockerService the rented-machine check needs. Declared here because
-    # docker_service imports this package, so naming the class itself would be an import
+    # The slice of DockerService the rented-machine check and the rental probe need. Declared here
+    # because docker_service imports this package, so naming the class itself would be an import
     # cycle — and Context is a pydantic model, so a TYPE_CHECKING-only name would leave it
     # unbuildable and every validation cycle would raise instead of running.
+
+    # DAH-3436: the rental probe rents the node through the same two entry points a renter's pod
+    # takes (miner_service hands the backend's requests to these), so there is one start path and
+    # one teardown path to keep correct. `private_key` is the Fernet-encrypted key as the backend
+    # sends it; both decrypt it themselves.
+    async def create_container(
+        self,
+        payload: Any,
+        executor_info: ExecutorSSHInfo,
+        keypair: Any,
+        private_key: str,
+    ) -> Any: ...
+
+    async def delete_container(
+        self,
+        payload: Any,
+        executor_info: ExecutorSSHInfo,
+        keypair: Any,
+        private_key: str,
+    ) -> Any: ...
 
     async def recover_pod_after_stale_vloopback_mount(
         self,
@@ -112,6 +132,10 @@ class ContextState:
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
     verified_port_count: int = 0
+    # DAH-3436: the (internal, external) pairs PortConnectivityCheck proved reachable this cycle.
+    # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
+    # needs both to hand create_container the ports as the backend would.
+    verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None
@@ -150,6 +174,10 @@ class Context(BaseModel):
     # Already decrypted: pod recovery re-runs the rental start path, which opens its own
     # connection to the host rather than reusing `ssh`.
     executor_ssh_private_key: str | None = None
+    # DAH-3436: the same key as the backend sent it (Fernet-encrypted with the validator's hotkey).
+    # create_container and delete_container decrypt it themselves, so the rental probe hands them
+    # this one and never re-encrypts.
+    executor_ssh_private_key_encrypted: str | None = None
     default_extra: dict[str, Any] = {}
     services: ContextServices
     config: ContextConfig

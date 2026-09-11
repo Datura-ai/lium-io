@@ -126,7 +126,9 @@ class TaskService:
         has_reached_the_node = False
 
         try:
-            # Decrypt private key
+            # Decrypt private key. The encrypted form is kept for the rental probe (DAH-3436), whose
+            # create_container / delete_container calls decrypt it themselves like a backend request.
+            encrypted_private_key = private_key
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
 
             # Prepare attestation host policy before SSH connection
@@ -180,6 +182,7 @@ class TaskService:
                     tdx_attestation_passed=attestation_passed,
                     gpu_attestation_passed=gpu_attestation_passed,
                     first_pass=first_pass,
+                    encrypted_private_key=encrypted_private_key,
                 )
 
                 # Build and run validation pipeline

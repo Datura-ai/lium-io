@@ -20,6 +20,7 @@ from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
 from .provider_side_load import ProviderSideLoadCheck
+from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_machine import TenantEnforcementCheck
@@ -56,6 +57,7 @@ __all__ = [
     "PortConnectivityCheck",
     "PortCountCheck",
     "ProviderSideLoadCheck",
+    "RentalProbeCheck",
     "RentalVerificationCheck",
     "TdxHostCheck",
     "TenantEnforcementCheck",
