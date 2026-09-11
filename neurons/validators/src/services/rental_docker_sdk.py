@@ -12,9 +12,23 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
-from core.utils import _m, get_extra_info
+# liumd (DAH-2834): the rental run spec and its HostConfig live in datura — ONE definition for
+# this SSH-tunnelled path and the executor's local `POST /rent`; re-exported here unchanged.
+from datura.rental_spec import (  # noqa: F401 — re-exports
+    ContainerRunSpec,
+    ContainerUlimit,
+    DeviceMount,
+    GpuDeviceRequest,
+    PortBinding,
+    VolumeMount,
+    build_host_config_kwargs,
+    container_ports,
+    container_volumes,
+    create_and_start,
+)
 from datura.requests.miner_requests import ExecutorSSHInfo
 
+from core.utils import _m, get_extra_info
 
 DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
 _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
@@ -69,68 +83,9 @@ def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
 
 
 @dataclass(slots=True)
-class PortBinding:
-    container_port: int
-    host_port: int
-    protocol: str = "tcp"
-
-
-@dataclass(slots=True)
-class VolumeMount:
-    source: str
-    target: str
-    read_only: bool = False
-
-
-@dataclass(slots=True)
-class DeviceMount:
-    path_on_host: str
-    path_in_container: str | None = None
-    permissions: str = "rwm"
-
-
-@dataclass(slots=True)
-class GpuDeviceRequest:
-    count: int | None = None
-    device_ids: tuple[str, ...] = ()
-    capabilities: tuple[tuple[str, ...], ...] = (("gpu",),)
-
-
-@dataclass(slots=True)
 class GpuDockerConfig:
     device_requests: tuple[GpuDeviceRequest, ...] = ()
     device_mounts: tuple[DeviceMount, ...] = ()
-
-
-@dataclass(slots=True)
-class ContainerUlimit:
-    name: str
-    soft: int
-    hard: int
-
-
-@dataclass(slots=True)
-class ContainerRunSpec:
-    image: str
-    name: str
-    command: tuple[str, ...] = ()
-    environment: dict[str, str] = field(default_factory=dict)
-    ports: tuple[PortBinding, ...] = ()
-    volumes: tuple[VolumeMount, ...] = ()
-    restart_policy: str | None = "unless-stopped"
-    runtime: str | None = None
-    cap_add: tuple[str, ...] = ()
-    sysctls: dict[str, str] = field(default_factory=dict)
-    ulimits: tuple[ContainerUlimit, ...] = ()
-    devices: tuple[DeviceMount, ...] = ()
-    device_requests: tuple[GpuDeviceRequest, ...] = ()
-    cpu_count: int | None = None
-    memory_gb: int | None = None
-    storage_limit_gb: int | None = None
-    shm_size: str | None = None
-    entrypoint: str | None = None
-    # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
-    network: str | None = None
 
 
 @dataclass(slots=True)
@@ -458,21 +413,7 @@ class RentalDockerSdkClient:
     def _run_container_sync(self, spec: ContainerRunSpec) -> None:
         if spec.network:
             self._ensure_rental_network_sync(spec.network)
-        host_config = self._api_client.create_host_config(
-            **_build_host_config_kwargs(spec)
-        )
-        self._api_client.create_container(
-            image=spec.image,
-            command=list(spec.command) or None,
-            detach=True,
-            ports=_container_ports(spec.ports) or None,
-            environment=spec.environment or None,
-            volumes=_container_volumes(spec.volumes) or None,
-            name=spec.name,
-            entrypoint=spec.entrypoint or None,
-            host_config=host_config,
-        )
-        self._api_client.start(spec.name)
+        create_and_start(self._api_client, spec)
 
     def _ensure_rental_network_sync(self, name: str) -> None:
         """The container's network exists on the host and has inter-container traffic off.
@@ -904,30 +845,6 @@ def _build_rental_ssh_http_adapter_class(
     return RentalSSHHTTPAdapter
 
 
-def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
-    kwargs = {
-        "port_bindings": _port_bindings(spec.ports),
-        "binds": _binds(spec.volumes),
-        "restart_policy": _restart_policy(spec.restart_policy),
-        "runtime": spec.runtime,
-        "cap_add": list(spec.cap_add) or None,
-        "sysctls": spec.sysctls or None,
-        "ulimits": _ulimits(spec.ulimits),
-        "devices": _devices(spec.devices),
-        "device_requests": _device_requests(spec.device_requests),
-        "nano_cpus": spec.cpu_count * 1_000_000_000 if spec.cpu_count else None,
-        "mem_limit": f"{spec.memory_gb}g" if spec.memory_gb else None,
-        "storage_opt": (
-            {"size": f"{spec.storage_limit_gb}g"}
-            if spec.storage_limit_gb
-            else None
-        ),
-        "shm_size": spec.shm_size,
-        "network_mode": spec.network,
-    }
-    return {key: value for key, value in kwargs.items() if value is not None}
-
-
 def _require_icc_off(name: str, network: dict) -> None:
     options = network.get("Options") or {}
     if network.get("Driver") == "bridge" and options.get(RENTAL_NETWORK_ICC_OPTION) == "false":
@@ -940,66 +857,15 @@ def _require_icc_off(name: str, network: dict) -> None:
     )
 
 
-def _ulimits(ulimits: tuple[ContainerUlimit, ...]) -> list | None:
-    if not ulimits:
-        return None
-    from docker.types import Ulimit
-
-    return [Ulimit(name=ulimit.name, soft=ulimit.soft, hard=ulimit.hard) for ulimit in ulimits]
-
-
-def _container_ports(ports: tuple[PortBinding, ...]) -> list[tuple[int, str]]:
-    return [(port.container_port, port.protocol) for port in ports]
-
-
-def _port_bindings(ports: tuple[PortBinding, ...]) -> dict[str, int]:
-    return {_port_key(port): port.host_port for port in ports}
-
-
-def _port_key(port: PortBinding) -> str:
-    return f"{port.container_port}/{port.protocol}"
-
-
-def _container_volumes(volumes: tuple[VolumeMount, ...]) -> list[str]:
-    return [volume.target for volume in volumes]
+# The HostConfig / ports / volumes arguments are datura's (`rental_spec.py`), shared with the
+# executor's local rent path; the private names stay for this module's callers.
+_build_host_config_kwargs = build_host_config_kwargs
+_container_ports = container_ports
+_container_volumes = container_volumes
 
 
 def _binds(volumes: tuple[VolumeMount, ...]) -> list[str]:
-    return [
-        f"{volume.source}:{volume.target}:{'ro' if volume.read_only else 'rw'}"
-        for volume in volumes
-    ]
-
-
-def _restart_policy(policy: str | None) -> dict[str, str] | None:
-    if not policy:
-        return None
-    return {"Name": policy}
-
-
-def _devices(devices: tuple[DeviceMount, ...]) -> list[str]:
-    return [_device_arg(device) for device in devices]
-
-
-def _device_arg(device: DeviceMount) -> str:
-    target = device.path_in_container or device.path_on_host
-    return f"{device.path_on_host}:{target}:{device.permissions}"
-
-
-def _device_requests(device_requests: tuple[GpuDeviceRequest, ...]) -> list:
-    if not device_requests:
-        return []
-
-    from docker.types import DeviceRequest
-
-    return [
-        DeviceRequest(
-            count=device_request.count,
-            device_ids=list(device_request.device_ids) or None,
-            capabilities=[list(capability) for capability in device_request.capabilities],
-        )
-        for device_request in device_requests
-    ]
+    return build_host_config_kwargs(ContainerRunSpec(image="-", name="-", volumes=volumes))["binds"]
 
 
 def _encode_exec_stdin(value: str | bytes | None) -> bytes | None:

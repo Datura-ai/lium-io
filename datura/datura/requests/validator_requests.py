@@ -78,6 +78,13 @@ def ssh_pubkey_signing_blob(public_key: str, nonce: str | None = None) -> str:
 LOCAL_VERIFY_SCHEMA = "lium.local_verify/1"
 LOCAL_VERIFY_CAPABILITY = "local_verify/1"
 
+# liumd deploy (DAH-2834, `speed/DEPLOY_LOCAL_RENT.md`): the validator's one-call rental create,
+# `POST /rent` on the executor — the rental container made from the validator's own run spec
+# (`datura.rental_spec`) by the executor's docker-py on the host, instead of over the SSH tunnel.
+# Signed with `local_verify_signing_blob` like `/verify`; advertised as its own capability.
+LOCAL_RENT_SCHEMA = "lium.local_rent/1"
+LOCAL_RENT_CAPABILITY = "local_rent/1"
+
 
 # The largest card count one host can claim; bounds the matmul fan-out an intent can ask for.
 LOCAL_VERIFY_MAX_DEVICES = 64

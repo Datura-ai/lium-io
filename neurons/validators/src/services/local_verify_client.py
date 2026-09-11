@@ -312,18 +312,35 @@ class LocalVerifyClient:
         self, ssh: asyncssh.SSHClientConnection, local_verify_port: int, intent: dict[str, Any]
     ) -> LocalVerifyAnswer:
         """Sign the intent and POST it through `ssh` to `127.0.0.1:<local_verify_port>` on the
-        executor. The listener this binds lives for this one call; sshd opens the direct-tcpip
-        channel when aiohttp connects to it. A channel sshd cannot open (nothing on that loopback
-        port, or forwarding disabled) closes the local end without a byte: `refused`, like a 403.
+        executor (`post_signed`); the answer must be to this intent (`parse_answer`)."""
+        raw, round_trip_ms = await self.post_signed(ssh, local_verify_port, "/verify", intent)
+        return parse_answer(raw, intent=intent, round_trip_ms=round_trip_ms)
+
+    async def post_signed(
+        self,
+        ssh: asyncssh.SSHClientConnection,
+        local_port: int,
+        path: str,
+        intent: dict[str, Any],
+    ) -> tuple[Any, int]:
+        """One signed intent to `path` through `ssh` to `127.0.0.1:<local_port>` on the executor;
+        the executor's JSON answer back (bounded) with the round trip in ms. `/verify` and the
+        deploy path's `/rent` post the same way: both answers are unsigned, so both travel only
+        inside the authenticated SSH session (the executor serves them to loopback peers only).
+
+        The listener this binds lives for this one call; sshd opens the direct-tcpip channel when
+        aiohttp connects to it. A channel sshd cannot open (nothing on that loopback port, or
+        forwarding disabled) closes the local end without a byte: `refused`, like a 403.
         `connect_timeout_s` bounds the local bind and connect only; the channel open on the
-        executor's side is inside the whole-call `timeout_s`."""
+        executor's side is inside the whole-call `timeout_s`. Every non-200 and every transport
+        error is a `LocalVerifyUnavailable` whose reason names it."""
         signed = sign_intent(intent, self.keypair)
         timeout = aiohttp.ClientTimeout(total=self.timeout_s, connect=self.connect_timeout_s)
         started = time.perf_counter()
         try:
             listener = await asyncio.wait_for(
                 ssh.forward_local_port(
-                    TUNNEL_LISTEN_HOST, 0, EXECUTOR_LOOPBACK, local_verify_port
+                    TUNNEL_LISTEN_HOST, 0, EXECUTOR_LOOPBACK, local_port
                 ),
                 self.connect_timeout_s,
             )
@@ -336,7 +353,7 @@ class LocalVerifyClient:
         try:
             async with self._session_factory(timeout=timeout) as session:
                 async with session.post(
-                    f"http://{TUNNEL_LISTEN_HOST}:{listener.get_port()}/verify",
+                    f"http://{TUNNEL_LISTEN_HOST}:{listener.get_port()}{path}",
                     json=signed,
                     allow_redirects=False,
                 ) as response:
@@ -352,7 +369,7 @@ class LocalVerifyClient:
             # disconnect before any status line.
             raise LocalVerifyUnavailable(
                 "refused",
-                f"tunnel to {EXECUTOR_LOOPBACK}:{local_verify_port} closed without an answer: "
+                f"tunnel to {EXECUTOR_LOOPBACK}:{local_port} closed without an answer: "
                 f"{type(exc).__name__}",
             )
         except Exception as exc:  # other aiohttp client errors
@@ -386,4 +403,4 @@ class LocalVerifyClient:
             raw = json.loads(text)
         except ValueError:
             raise LocalVerifyUnavailable("malformed", "answer is not JSON")
-        return parse_answer(raw, intent=intent, round_trip_ms=round_trip_ms)
+        return raw, round_trip_ms
