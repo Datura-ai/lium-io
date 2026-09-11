@@ -216,6 +216,11 @@ class Settings(BaseSettings):
         env="INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK",
         default=True,
     )
+    # DAH-3275: a provider-origin Inspector finding on a rented pod fails the check, zeroes the
+    # score and asks the backend for an inspector_auto quarantine (off the marketplace + renters
+    # told; nothing deleted). Off = shadow: the verdict and the evidence hashes are recorded in
+    # the inspector event, no renter is told, the score is untouched.
+    INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
     # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
     # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the

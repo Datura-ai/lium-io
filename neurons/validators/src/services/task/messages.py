@@ -598,8 +598,15 @@ class InspectorMessages:
         reason="INSPECTOR_MALICIOUS_FINDINGS",
         severity="warning",
         category="runtime",
-        impact="Findings logged; score unchanged",
-        remediation="Review the libinspector report and tenant workload before taking action.",
+        impact="Provider-origin findings recorded; score unchanged",
+        remediation="Review the verdict's evidence; when the verdict's action is quarantine (INSPECTOR_ENFORCE_ENABLED and a rented pod affected) the renters were told and the backend acts on it.",
+    )
+    PLATFORM_ORIGIN_ONLY = MessageTemplate(
+        event="Inspector findings were the platform's own execs",
+        reason="INSPECTOR_PLATFORM_ORIGIN_ONLY",
+        severity="info",
+        category="runtime",
+        impact="Only validator/executor execs seen (sshd ancestry lost on this host); nothing provider-side",
     )
     VALIDATION_ERROR = MessageTemplate(
         event="Inspector validation error",

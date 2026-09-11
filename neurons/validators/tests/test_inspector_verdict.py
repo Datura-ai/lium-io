@@ -1,0 +1,705 @@
+from __future__ import annotations
+
+import shlex
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from helpers import build_context_config, build_services, build_state
+from neurons.validators.src.services.inspector_validation_service import (
+    InspectorValidationResponse,
+)
+from neurons.validators.src.services.redis_service import STREAMING_LOG_CHANNEL
+from neurons.validators.src.services.task.checks.inspector import InspectorRentedCheck
+from neurons.validators.src.services.task.inspector_verdict import (
+    ACTION_NONE,
+    ACTION_QUARANTINE,
+    SENSOR_ATTESTED,
+    SENSOR_UNATTESTED,
+    build_verdict,
+    canonical_sha256,
+    KNOWN_FINDING_KINDS,
+    docker_exec_command,
+    is_platform_origin,
+    renter_access_event,
+)
+from neurons.validators.src.services.task.messages import InspectorMessages as Msg
+from neurons.validators.src.services.task.score_calculator import calculate_scores
+from protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedPod,
+)
+
+from core.config import settings
+
+POD = "0f6a1c2e-1111-4222-8333-444455556666"
+
+
+def _finding(
+    command: str, *, host: bool = False, kind: str = "DockerExec", nested: bool = True, nested_from: str = "executor-executor-1"
+) -> dict:
+    return {
+        "category": "runtime_interference",
+        "kind": kind,
+        "severity": "high",
+        "time": "2026-09-08T00:11:00Z",
+        "command": command,
+        "binary": "/usr/bin/docker",
+        "pid": 4242,
+        "cwd": "/root",
+        "container": f"pod_{POD}",
+        "parent": {"pid": 4000, "binary": "/bin/bash"},
+        "host": host,
+        "policy": "tamper-docker-cli",
+        "tags": ["tamper:docker-cli", "severity:high"] + ([f"nested_from:{nested_from}"] if nested else []),
+        "details": {},
+    }
+
+
+VALIDATOR_LIVENESS = f'/usr/bin/docker exec -u 0 -i pod_{POD} sh -c "cat /root/.ssh/authorized_keys"'
+HUMAN_SHELL = f"/usr/bin/docker exec -it pod_{POD} bash"
+HUMAN_KEY_READ = f"/usr/bin/docker exec -u 0 -i pod_{POD} sh -c 'cat /root/.ssh/id_ed25519'"
+CHAINED = f"/usr/bin/docker exec -u 0 -i pod_{POD} sh -c 'cat /root/.ssh/authorized_keys; cat /root/.ssh/id_rsa'"
+
+
+def _platform_execs() -> dict[str, str]:
+    """The argv the platform really runs against a pod, built by the code that runs it."""
+    import sys
+
+    miner_jobs = str(Path(__file__).resolve().parents[1] / "src" / "miner_jobs")
+    if miner_jobs not in sys.path:
+        sys.path.insert(0, miner_jobs)
+    import backup_storage
+    import restore_storage
+    from workspace_mount import VolumeAccess
+
+    access = VolumeAccess(volume_name="v", volume_path="/root", encrypted=True, container_name=f"pod_{POD}")
+    return {
+        "liveness": VALIDATOR_LIVENESS,
+        # executor hardware_service._get_filesystem_usage: `docker exec -u root <pod> df -k <Destination>`
+        "df_root": f"/usr/bin/docker exec -u root pod_{POD} df -k /root",
+        "df_cipher": f"/usr/bin/docker exec -u root pod_{POD} df -k /lium-cipher",
+        "restore_mkdir": shlex.join(restore_storage.workspace_command(None, access, "mkdir") + ["-p", "/root/restored"]),
+        "restore_chown": shlex.join(restore_storage.workspace_command(None, access, "chown") + ["1000", "/root/restored"]),
+        "restore_tar": shlex.join(
+            restore_storage.workspace_command(None, access, "tar", interactive=True)
+            + ["--xattrs", "--acls", "-xzpf", "-", "-C", "/root/restored", "--strip-components=1"]
+        ),
+        "backup_du": shlex.join(backup_storage.workspace_command(None, access, "du") + ["-sb", "/root/data"]),
+        "backup_tar": shlex.join(
+            backup_storage.workspace_command(None, access, "tar") + ["--xattrs", "--acls", "-C", "/root", "-czf", "-", "data"]
+        ),
+        "gocryptfs_setup": f"/usr/bin/docker exec -u 0 pod_{POD} sh /dev/shm/.s-abc",
+        "sshd_probe": f"/usr/bin/docker exec -u 0 pod_{POD} sh -lc 'test -S /run/sshd.sock && echo ok'",
+    }
+
+
+@pytest.mark.parametrize(
+    ("command", "payload"),
+    [
+        (VALIDATOR_LIVENESS, "cat /root/.ssh/authorized_keys"),
+        (f"/usr/bin/docker exec -u 0 -i pod_{POD} sh -c cat /root/.ssh/authorized_keys", "cat /root/.ssh/authorized_keys"),
+        (f"/usr/bin/docker exec -u root pod_{POD} df -k /root", "df -k /root"),
+        (HUMAN_SHELL, "bash"),
+        (f"/usr/bin/docker exec --user=root pod_{POD} df -k /", "df -k /"),
+        (f"/usr/bin/docker exec -u 0 pod_{POD} sh -lc 'test -S /run/sshd.sock'", "test -S /run/sshd.sock"),
+        ("/usr/bin/docker ps", None),
+        ("/usr/bin/docker exec -u 0 -i executor-executor-1 sh -c 'cat x'", None),
+    ],
+)
+def test_docker_exec_command_strips_options_and_shell_wrapper(command, payload):
+    assert docker_exec_command(command) == payload
+
+
+def test_the_real_platform_execs_are_recognised_from_the_executor_container():
+    execs = _platform_execs()
+    assert execs["restore_tar"].endswith("--strip-components=1")
+    for name, command in execs.items():
+        assert is_platform_origin(_finding(command)), name
+        # the digest depends on the argv parsing as a docker exec — the drift the builders could cause
+        assert docker_exec_command(command) is not None, name
+    # the very same commands from the host are a human at the keyboard
+    for name, command in execs.items():
+        assert not is_platform_origin(_finding(command, host=True, nested=False)), name
+
+
+@pytest.mark.parametrize(
+    ("container", "platform"),
+    [
+        ("executor", True),
+        ("executor-executor-1", True),
+        ("lium-executor-executor-1", True),   # a compose project not literally `executor`
+        ("pod_other", False),
+        ("nginx", False),
+        ("myexecutor", False),
+    ],
+)
+def test_the_executor_stack_rule_matches_the_sensors(container, platform):
+    assert is_platform_origin(_finding(VALIDATOR_LIVENESS, nested_from=container)) is platform
+
+
+def test_known_finding_kinds_are_the_sensors_runtime_interference_kinds():
+    # celium-gpu-verifier inspector/src/collector/analysis/types.rs, RuntimeInterferenceKind (PascalCase)
+    expected = {
+        "DockerExec", "DockerAttach", "DockerCp", "DockerRun", "DockerCreate", "DockerStart", "DockerStop",
+        "DockerKill", "DockerPause", "DockerRm", "DockerRestart", "DockerRename", "DockerUpdate", "DockerCommit",
+        "DockerExport", "DockerPrune", "DockerInspect", "DockerPull", "DockerPush", "DockerBuild", "DockerLoad",
+        "DockerImport", "DockerRmi", "DockerNetworkConnect", "DockerNetworkDisconnect", "DockerNetworkRm",
+        "DockerVolumeRm", "DockerSave", "NamespaceEnter", "DockerSocketWrite", "OverlayFsRead", "OverlayFsWrite",
+        "ProcFsRead", "ProcFsWrite", "ContainerChroot", "ProcessAttach", "ProcessMemoryRead", "ProcessMemoryWrite",
+        "DockerVolumeMount",
+    }
+    assert KNOWN_FINDING_KINDS == frozenset(expected)
+    assert len(expected) == 39
+
+
+def _path_finding(kind: str, path: str) -> dict:
+    """The shape fs.rs / mount.rs emit: no container, the path in `command`, tag `rental_volume`."""
+    return {
+        "category": "runtime_interference",
+        "kind": kind,
+        "severity": "high",
+        "time": "2026-09-08T00:11:00Z",
+        "command": path,
+        "binary": "/usr/bin/cat",
+        "pid": 4242,
+        "cwd": "/root",
+        "container": None,
+        "docker": None,
+        "parent": {"pid": 4000, "binary": "/bin/bash"},
+        "host": True,
+        "policy": "tamper-fs",
+        "tags": ["tamper:fs", "rental_volume", "severity:high"],
+        "details": {},
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "path"),
+    [
+        ("OverlayFsRead", f"/var/lib/docker/volumes/volume_{POD}/_data/.ssh/id_ed25519"),
+        ("OverlayFsWrite", f"/var/lib/docker/volumes/volume_{POD}/_data/.bashrc"),
+        ("DockerVolumeMount", f"/var/lib/docker/plugins/<eight hex characters>/propagated-mount/volume_{POD}"),
+    ],
+)
+def test_a_read_of_the_pods_volume_names_the_pod_and_only_that_pod(kind, path):
+    # the 8 Sep class-D shape: tamper-fs on the pod's volume data, container unset
+    verdict = build_verdict({}, [_path_finding(kind, path)], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
+
+    assert verdict.affected_pod_ids == [POD]
+    assert verdict.finding_kinds == [kind]
+    assert verdict.as_payload().unmatched_containers == []
+
+
+def test_a_volume_named_in_the_container_field_names_the_pod_too():
+    # DockerVolumeRm carries the volume as the container name
+    finding = _finding("/usr/bin/docker volume rm volume_x", host=True, nested=False, kind="DockerVolumeRm")
+    finding["container"] = f"volume_{POD}"
+    verdict = build_verdict({}, [finding], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
+
+    assert verdict.affected_pod_ids == [POD]
+
+
+def test_the_renter_event_caps_the_evidence_list():
+    findings = [_finding(f"/usr/bin/docker exec -it pod_{POD} cat /root/f{i}", host=True, nested=False) for i in range(60)]
+    verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+    event = renter_access_event(verdict, pod_id=POD, when="2026-09-09T00:00:00Z")
+
+    assert len(verdict.evidence_sha256) == 60
+    assert len(event.evidence_sha256) == 20
+    assert event.evidence_sha256_truncated is True
+    assert event.provider_findings == 60
+    assert event.report_sha256 == verdict.report_sha256
+
+
+def test_platform_origin_is_the_executor_ancestry_not_the_payload():
+    # the classifier does not judge the payload: what the platform runs changes too often for an
+    # exact list (DAH-3278 hardens the tag on the verifier); a chained read from the executor
+    # container is recorded as a platform payload, not as a provider
+    assert is_platform_origin(_finding(CHAINED))
+    assert is_platform_origin(_finding(HUMAN_KEY_READ))
+    # …but without the executor tag, or from the host, it is the provider's
+    assert not is_platform_origin(_finding(HUMAN_KEY_READ, nested=False))
+    assert not is_platform_origin(_finding(HUMAN_SHELL, host=True))
+    # the executor runs a pod's whole life through the Docker API: a `docker cp` for a restore or the
+    # `docker rm` at the rental's end from inside its container is ours too — taiberium, 9 Sep
+    assert is_platform_origin(_finding(f"docker cp /tmp/restore.tar pod_{POD}:/root", kind="DockerCp"))
+    assert is_platform_origin(_finding(f"docker rm -f pod_{POD}", kind="DockerRm"))
+    assert is_platform_origin(_finding(f"docker stop pod_{POD}", kind="DockerStop"))
+    assert not is_platform_origin(_finding(f"docker rm -f pod_{POD}", kind="DockerRm", host=True))
+    # only Docker control-plane actions can be ours; an nsenter, a memory or overlayfs read never is
+    assert not is_platform_origin(_finding(VALIDATOR_LIVENESS, kind="NamespaceEnter"))
+    assert not is_platform_origin(_finding("/proc/4242/mem", kind="ProcessMemoryRead"))
+    assert not is_platform_origin(_finding(f"/var/lib/docker/volumes/volume_{POD}/_data/x", kind="OverlayFsRead"))
+    assert not is_platform_origin(_finding(f"/var/lib/docker/volumes/volume_{POD}/_data", kind="DockerVolumeMount"))
+
+
+def test_a_container_named_like_the_storage_helper_cannot_borrow_the_platforms_origin():
+    # taiberium (11 Sep) asked to exempt the encrypted backup's nsenter (restic.py runs it from a
+    # `lium-storage-<id>` helper). The sensor already judges that `nsenter -t <pid> -U` benign by
+    # nstype (CLONE_NEWUSER only, nsenter.rs) and the unencrypted flow's volume bind as a runtime
+    # mount (mount.rs), so neither reaches the verdict; a NamespaceEnter or DockerVolumeMount that
+    # does arrive is real and a helper-shaped container name must not turn it into the platform's
+    nsenter = "nsenter -t 4242 -m -p -- /bin/sh"
+    mount = f"/var/lib/docker/volumes/volume_{POD}/_data"
+    for kind, command in (("NamespaceEnter", nsenter), ("DockerVolumeMount", mount)):
+        assert not is_platform_origin(_finding(command, kind=kind, nested_from="lium-storage-0123456789ab"))
+        assert not is_platform_origin(_finding(command, kind=kind))  # the executor container itself
+        assert not is_platform_origin(_finding(command, kind=kind, nested=False))
+    # the shadow digest still sees what the platform did produce, by kind
+    verdict = build_verdict(
+        {}, [_finding(VALIDATOR_LIVENESS), _finding(f"docker rm -f pod_{POD}", kind="DockerRm"), _finding(VALIDATOR_LIVENESS)],
+        rented_pod_ids=[POD], sensor_attested=False, enforce=False,
+    )
+    assert verdict.provider_findings == []
+    assert verdict.as_payload().platform_kind_counts == {"DockerExec": 2, "DockerRm": 1}
+
+
+def test_verdict_records_the_platform_exec_commands_for_the_digest():
+    execs = _platform_execs()
+    findings = [_finding(c) for c in execs.values()] + [_finding(HUMAN_SHELL, host=True, nested=False)]
+    verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+
+    payloads = verdict.as_payload().platform_exec_commands
+    assert payloads == verdict.platform_exec_commands
+    assert "cat /root/.ssh/authorized_keys" in payloads
+    assert "df -k /root" in payloads
+    assert "tar --xattrs --acls -xzpf - -C /root/restored --strip-components=1" in payloads
+    assert len(verdict.provider_findings) == 1
+    assert len(payloads) == len(set(payloads)) <= 20
+
+
+def test_a_pod_outside_the_rented_list_is_recorded_but_no_renter_is_told():
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = "pod_gone-since-the-list-was-fetched"
+    verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+
+    assert verdict.affected_pod_ids == []
+    assert verdict.unmatched_containers == ["pod_gone-since-the-list-was-fetched"]
+    assert verdict.unmatched_containers_count == 1
+    assert verdict.as_payload().unmatched_containers == ["pod_gone-since-the-list-was-fetched"]
+    assert len(verdict.provider_findings) == 1
+
+
+@pytest.mark.parametrize("container", ["my-own-jupyter", "pod_gone-since-the-list-was-fetched"])
+def test_a_finding_on_a_container_that_is_not_a_rented_pod_takes_no_action(container):
+    """A provider inside their own container is provider-origin but harms no renter: under
+    enforcement the verdict still says `none` (taiberium, #1342)."""
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = container
+    verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=True, enforce=True)
+
+    assert verdict.provider_origin is True
+    assert verdict.affected_pod_ids == []
+    assert verdict.action == ACTION_NONE
+    assert verdict.as_payload().ban_source is None
+    assert verdict.unmatched_containers == [container]
+
+
+def test_a_rented_pod_named_under_enforcement_is_quarantined():
+    verdict = build_verdict(
+        {}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=True, enforce=True
+    )
+    assert verdict.affected_pod_ids == [POD]
+    assert verdict.action == ACTION_QUARANTINE
+
+
+def test_a_verdict_with_every_pod_matched_carries_empty_unmatched_fields():
+    verdict = build_verdict({}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+
+    assert verdict.unmatched_containers == [] and verdict.unmatched_containers_count == 0
+    payload = verdict.as_payload().model_dump()
+    assert payload["unmatched_containers"] == [] and payload["unmatched_containers_count"] == 0
+
+
+@pytest.mark.parametrize("kind", [["DockerExec"], {"k": 1}, 7, None])
+def test_any_json_type_in_kind_classifies_without_raising(kind):
+    finding = _finding(VALIDATOR_LIVENESS)
+    finding["kind"] = kind
+    verdict = build_verdict({}, [finding], rented_pod_ids=[POD], sensor_attested=False, enforce=True)
+
+    assert is_platform_origin(finding) is False    # not a string kind → not an exec we can vouch for
+    assert verdict.finding_kinds == ["unknown"]
+    assert verdict.affected_pod_ids == [POD]       # `container` still names the pod
+
+
+@pytest.mark.parametrize(
+    ("tags", "platform"),
+    [
+        (7, False),
+        ("nested_from:executor-executor-1", False),      # a string is not a list of tags
+        ({"a": 1}, False),
+        (None, False),
+        ([1, None, "nested_from:executor-executor-1"], True),   # non-string entries are skipped
+    ],
+)
+def test_any_json_type_in_tags_reaches_the_ancestry_guard_without_raising(tags, platform):
+    finding = _finding(VALIDATOR_LIVENESS)      # kind DockerExec, host False: the tag decides
+    finding["tags"] = tags
+    assert is_platform_origin(finding) is platform
+
+    # the path-shaped branch reads tags too: no container, a rental-volume path, odd tags
+    path_finding = _path_finding("OverlayFsRead", f"/var/lib/docker/volumes/volume_{POD}/_data/x")
+    path_finding["tags"] = tags
+    verdict = build_verdict({}, [path_finding], rented_pod_ids=[POD, "other"], sensor_attested=False, enforce=False)
+    assert verdict.affected_pod_ids == [POD]    # the kind alone routes it to the path rule
+
+
+def test_unmatched_containers_are_capped_in_the_verdict():
+    findings = []
+    for i in range(30):
+        f = _finding(HUMAN_SHELL, host=True, nested=False)
+        f["container"] = f"pod_gone-{i:02d}-" + "x" * 300
+        findings.append(f)
+    verdict = build_verdict({}, findings, rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+    payload = verdict.as_payload().model_dump()
+
+    assert len(payload["unmatched_containers"]) == 20
+    assert all(len(name) <= 128 for name in payload["unmatched_containers"])
+    assert payload["unmatched_containers_count"] == 30
+    assert verdict.affected_pod_ids == []
+
+
+def test_renter_visible_finding_kinds_come_from_a_fixed_vocabulary():
+    odd = _finding(HUMAN_SHELL, host=True, nested=False, kind="<script>alert(1)</script>" + "x" * 500)
+    verdict = build_verdict({}, [odd, _finding(HUMAN_SHELL, host=True, nested=False, kind="NamespaceEnter")],
+                            rented_pod_ids=[POD], sensor_attested=False, enforce=False)
+
+    assert verdict.finding_kinds == ["NamespaceEnter", "unknown"]
+    event = renter_access_event(verdict, pod_id=POD, when="2026-09-09T00:00:00Z").model_dump()
+    assert "<script>" not in event["log_text"]
+    assert event["finding_kinds"] == ["NamespaceEnter", "unknown"]
+    assert "classes" not in event
+    # the raw kind survives only in the evidence
+    assert verdict.evidence_sha256[0] == canonical_sha256(odd)
+
+
+def test_verdict_hashes_only_the_provider_findings_and_names_the_pod():
+    report = {"findings": [_finding(VALIDATOR_LIVENESS), _finding(HUMAN_KEY_READ, host=True, nested=False)]}
+    verdict = build_verdict(
+        report,
+        report["findings"],
+        rented_pod_ids=[POD, "other-pod"],
+        sensor_attested=False,
+        enforce=False,
+    )
+
+    assert len(verdict.platform_findings) == 1
+    assert len(verdict.provider_findings) == 1
+    assert verdict.evidence_sha256 == [canonical_sha256(report["findings"][1])]
+    assert verdict.report_sha256 == canonical_sha256(report)
+    assert verdict.affected_pod_ids == [POD]
+    assert verdict.finding_kinds == ["DockerExec"]
+    assert verdict.sensor_attestation == SENSOR_UNATTESTED
+    assert verdict.action == ACTION_NONE
+    payload = verdict.as_payload().model_dump()
+    assert payload["ban_source"] is None
+    assert payload["sensor"] == SENSOR_UNATTESTED and payload["finding_kinds"] == ["DockerExec"]
+
+
+def test_verdict_without_a_named_pod_tells_every_renter_on_the_host():
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = None
+    verdict = build_verdict({}, [finding], rented_pod_ids=["b", "a"], sensor_attested=True, enforce=True)
+
+    assert verdict.affected_pod_ids == ["a", "b"]
+    assert verdict.sensor_attestation == SENSOR_ATTESTED
+    assert verdict.action == ACTION_QUARANTINE
+    assert verdict.as_payload().ban_source == "inspector_auto"
+    # the fallback is counted so the shadow digest can say how often it fires (an overlay2 path has
+    # no `volumes/` segment, so this may be common — taiberium, 11 Sep)
+    assert verdict.unnamed_findings == 1 and verdict.as_payload().unnamed_findings == 1
+    named = build_verdict({}, [_finding(HUMAN_SHELL, host=True, nested=False)], rented_pod_ids=[POD], sensor_attested=True, enforce=True)
+    assert named.unnamed_findings == 0
+
+
+def test_the_renter_event_carries_only_that_pods_findings():
+    # two renters on one host: A's event must not show B's kinds or evidence; a finding that names
+    # no container is about every pod and appears in both
+    on_a = _finding(HUMAN_KEY_READ, host=True, nested=False)
+    on_b = _finding("/proc/4242/mem", kind="ProcessMemoryRead", host=True, nested=False)
+    on_b["container"] = "pod_b"
+    # a provider container named exactly like a pod id is unmatched, never a pod's
+    foreign = _finding("docker exec b sh", host=True, nested=False)
+    foreign["container"] = "b"
+    unnamed = _finding("chroot /var/lib/docker/overlay2/abc/merged", kind="ContainerChroot", host=True, nested=False)
+    unnamed["container"] = None
+    verdict = build_verdict({}, [on_a, on_b, unnamed, foreign], rented_pod_ids=[POD, "b"], sensor_attested=True, enforce=True)
+    # host-wide, in the inspector event
+    assert verdict.finding_kinds == ["ContainerChroot", "DockerExec", "ProcessMemoryRead"]
+    assert verdict.unmatched_containers == ["b"]
+
+    event_a = renter_access_event(verdict, pod_id=POD, when="2026-09-11T00:00:00Z")
+    event_b = renter_access_event(verdict, pod_id="b", when="2026-09-11T00:00:00Z")
+    assert event_a.finding_kinds == ["ContainerChroot", "DockerExec"] and event_a.provider_findings == 2
+    assert event_a.evidence_sha256 == [canonical_sha256(on_a), canonical_sha256(unnamed)]
+    assert "ProcessMemoryRead" not in event_a.log_text
+    assert event_b.finding_kinds == ["ContainerChroot", "ProcessMemoryRead"] and event_b.provider_findings == 2
+    assert event_b.evidence_sha256 == [canonical_sha256(on_b), canonical_sha256(unnamed)]
+    assert "DockerExec" not in event_b.log_text
+
+
+# --- the check -----------------------------------------------------------------------------
+
+
+class DummyInspectorService:
+    def __init__(self, response: InspectorValidationResponse) -> None:
+        self.response = response
+        self.sensor_attested = None
+
+    async def validate_rented_executor(self, shell, ssh, executor, default_extra, *, sensor_attested=False):
+        self.sensor_attested = sensor_attested
+        return self.response
+
+
+def _rented(executor_uuid: str) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            executor_uuid: RentedExecutor(
+                miner_hotkey="miner",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=[RentedPod(pod_id=POD, container_name=f"pod_{POD}")],
+            )
+        },
+        banned_guids=[],
+    )
+
+
+def _ctx(context_factory, findings: list[dict], *, redis=None, **overrides):
+    service = DummyInspectorService(
+        InspectorValidationResponse(
+            report={
+                "canary_ok": True,
+                "health": {"collector_started_unix": 1},
+                "findings": findings,
+                "summary": {"findings": len(findings) if isinstance(findings, list) else 0},
+            },
+            diagnostics={"sensor_integrity": "shell_sha256_unattested"},
+        )
+    )
+    ctx = context_factory(
+        config=build_context_config(inspector_enabled=True),
+        services=build_services(inspector=service, redis=redis),
+        state=build_state(rented_data=_rented("executor-123")),
+        **overrides,
+    )
+    return ctx, service
+
+
+@pytest.mark.asyncio
+async def test_platform_only_findings_are_clean_and_no_renter_is_told(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)
+    redis = AsyncMock()
+    ctx, _ = _ctx(context_factory, [_finding(VALIDATOR_LIVENESS), _finding(_platform_execs()["df_root"])], redis=redis)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.PLATFORM_ORIGIN_ONLY.reason
+    assert result.event.severity == "info"
+    # the event carries the count; the findings themselves are in the report
+    assert result.event.what_we_saw["platform_findings"] == 2
+    event = result.updates["state"].inspector_event
+    assert event["outcome"] == "CLEAN"
+    assert event["context"]["verdict"]["platform_findings"] == 2
+    assert event["context"]["verdict"]["finding_kinds"] == []
+    assert event["context"]["verdict"]["provider_findings"] == 0
+    assert "inspector_passed" not in result.updates
+    redis.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_finding_in_shadow_records_the_verdict_and_does_not_tell_the_renter(
+    context_factory, monkeypatch
+):
+    """Shadow mode measures the classifier; the renter is told only when enforcement acts on it."""
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", False)
+    redis = AsyncMock()
+    provider = _finding(HUMAN_KEY_READ, host=True, nested=False)
+    ctx, _ = _ctx(context_factory, [_finding(VALIDATOR_LIVENESS), provider], redis=redis)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.MALICIOUS_FINDINGS.reason
+    assert result.event.severity == "warning"
+    assert result.event.what_we_saw["findings"] == [provider]
+    assert result.event.what_we_saw["platform_findings"] == 1
+    assert "inspector_passed" not in result.updates
+    verdict = result.updates["state"].inspector_event["context"]["verdict"]
+    assert verdict["evidence_sha256"] == [canonical_sha256(provider)]
+    assert verdict["action"] == ACTION_NONE
+    assert verdict["enforce"] is False
+    assert verdict["sensor"] == SENSOR_UNATTESTED
+    assert verdict["affected_pod_ids"] == [POD]
+    # the sensor's own diagnostics stay next to the verdict
+    assert result.updates["state"].inspector_event["context"]["sensor_integrity"] == "shell_sha256_unattested"
+
+    redis.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_finding_under_enforcement_fails_the_check_and_requests_quarantine(
+    context_factory, monkeypatch
+):
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)
+    redis = AsyncMock()
+    ctx, _ = _ctx(context_factory, [_finding(HUMAN_SHELL, host=True, nested=False)], redis=redis)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.halt is False  # non-fatal: the cycle finishes, the score gate does the rest
+    assert result.event.severity == "error"
+    assert result.updates["inspector_passed"] is False
+    verdict = result.updates["state"].inspector_event["context"]["verdict"]
+    assert verdict["action"] == ACTION_QUARANTINE
+    assert verdict["ban_source"] == "inspector_auto"
+    redis.publish.assert_awaited_once()
+    channel, message = redis.publish.await_args.args
+    assert channel == STREAMING_LOG_CHANNEL
+    assert message["pod_id"] == POD
+    assert message["executor_uuid"] == ctx.executor.uuid
+    (log,) = message["logs"]
+    assert log["log_tag"] == "provider_access_detected"
+    assert log["log_status"] == "error"
+    assert log["evidence_sha256"] == verdict["evidence_sha256"]
+    assert log["finding_kinds"] == ["DockerExec"]
+    assert "asked to take the host off the marketplace" in log["log_text"]
+
+
+@pytest.mark.asyncio
+async def test_finding_on_a_non_rented_container_under_enforcement_is_recorded_and_acts_on_nobody(
+    context_factory, monkeypatch
+):
+    """The provider entered their own container: MALICIOUS is recorded with the container under
+    `unmatched_containers`, but the check passes, the score gate is not set and no renter is told."""
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)
+    redis = AsyncMock()
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = "my-own-jupyter"
+    ctx, _ = _ctx(context_factory, [finding], redis=redis)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.MALICIOUS_FINDINGS.reason
+    assert result.event.severity == "warning"
+    assert "not a rented pod" in result.event.impact
+    assert "inspector_passed" not in result.updates
+    event = result.updates["state"].inspector_event
+    assert event["outcome"] == "MALICIOUS"
+    verdict = event["context"]["verdict"]
+    assert verdict["enforce"] is True
+    assert verdict["action"] == ACTION_NONE
+    assert verdict["ban_source"] is None
+    assert verdict["affected_pod_ids"] == []
+    assert verdict["unmatched_containers"] == ["my-own-jupyter"]
+    redis.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finding_on_a_non_rented_container_in_shadow_is_not_called_access_to_a_rented_pod(context_factory):
+    """Shadow mode, the provider in their own container: the impact text names what happened — a
+    container that is not a rented pod — so the shadow counts read from it are not wrong in the
+    enforcement direction (taiberium, 11 Sep). The flag is off here."""
+    finding = _finding(HUMAN_SHELL, host=True, nested=False)
+    finding["container"] = "my-own-jupyter"
+    ctx, _ = _ctx(context_factory, [finding])
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is True
+    assert "not a rented pod" in result.event.impact
+    assert "access to a rented pod" not in result.event.impact
+    verdict = result.updates["state"].inspector_event["context"]["verdict"]
+    assert verdict["enforce"] is False and verdict["affected_pod_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_report_is_a_sensor_error_not_a_provider_finding(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)
+    redis = AsyncMock()
+    ctx, _ = _ctx(context_factory, ["not-a-finding", 42], redis=redis)  # type: ignore[list-item]
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VALIDATION_ERROR.reason
+    assert "inspector_passed" not in result.updates
+    assert result.updates["state"].inspector_event["outcome"] == "ERROR"
+    redis.publish.assert_not_awaited()
+
+
+@pytest.mark.parametrize("findings", [{}, "", 0])
+@pytest.mark.asyncio
+async def test_a_falsy_non_list_findings_is_still_a_sensor_error(context_factory, findings):
+    ctx, _ = _ctx(context_factory, findings)  # type: ignore[arg-type]
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.VALIDATION_ERROR.reason
+
+
+@pytest.mark.asyncio
+async def test_tdx_attested_host_marks_the_sensor_attested_and_skips_the_shell_checksum(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", True)  # the image was compared to TDX_WHITELIST
+    ctx, service = _ctx(context_factory, [], tdx_attestation_passed=True)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert service.sensor_attested is True
+    assert result.updates["state"].inspector_event["context"]["verdict"]["sensor"] == SENSOR_ATTESTED
+
+
+@pytest.mark.asyncio
+async def test_a_passed_attestation_without_the_whitelist_leaves_the_sensor_unattested(context_factory, monkeypatch):
+    # prod runs ENABLE_ATTESTATION_WHITELIST=false: the quote is genuine but nothing compared the image
+    # against TDX_WHITELIST, so the sensor binary is not measured and the shell checksum must stay — taiberium, 9 Sep
+    monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", False)
+    ctx, service = _ctx(context_factory, [], tdx_attestation_passed=True)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    assert service.sensor_attested is False
+    assert result.updates["state"].inspector_event["context"]["verdict"]["sensor"] == SENSOR_UNATTESTED
+
+
+@pytest.mark.asyncio
+async def test_renter_event_failure_does_not_lose_the_verdict(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "INSPECTOR_ENFORCE_ENABLED", True)  # the only mode that publishes
+    redis = AsyncMock()
+    redis.publish.side_effect = ConnectionError("redis down")
+    ctx, _ = _ctx(context_factory, [_finding(HUMAN_SHELL, host=True, nested=False)], redis=redis)
+
+    result = await InspectorRentedCheck().run(ctx)
+
+    redis.publish.assert_awaited_once()
+    assert result.event.reason_code == Msg.MALICIOUS_FINDINGS.reason
+    assert result.updates["inspector_passed"] is False
+    assert result.updates["state"].inspector_event["context"]["verdict"]["provider_findings"] == 1
+
+
+def test_score_gate_zeroes_on_a_failed_inspector_verdict():
+    def ctx(inspector_passed: bool):
+        return SimpleNamespace(
+            state=SimpleNamespace(gpu_model="", specs={"network": {"ema_verifyx_download_speed": 500.0}}),
+            collateral_deposited=True,
+            collateral_error_message=None,
+            contract_version=None,
+            executor=SimpleNamespace(price_per_gpu=None, tdx_quote=None),
+            tdx_attestation_passed=False,
+            cpu_truth_passed=True,
+            provider_side_load_passed=True,
+            inspector_passed=inspector_passed,
+        )
+
+    actual, job, warning = calculate_scores(ctx(False), rented=False)
+    assert (actual, job) == (0.0, 0.0)
+    assert "Inspector" in warning
+
+    actual, _, _ = calculate_scores(ctx(True), rented=False)
+    assert actual > 0.0

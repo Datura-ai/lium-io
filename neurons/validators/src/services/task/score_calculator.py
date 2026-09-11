@@ -85,6 +85,14 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Provider-side workload consumes the machine's CPU or disk")
 
+    # Inspector gate (DAH-3275): the host reached into a renter's pod (exec / nsenter / memory
+    # read not attributable to the platform). Non-fatal check, same mechanics as the two above;
+    # INSPECTOR_ENFORCE_ENABLED off leaves the flag True.
+    if not ctx.inspector_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Provider-side access to a rented pod detected by the Inspector")
+
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"
