@@ -20,6 +20,9 @@ jobs:
     # the marker keeps this feature's own comments (they quote `/temp-dev`) from starting a run
     if: github.event.issue.pull_request && contains(github.event.comment.body, '/temp-dev') && !contains(github.event.comment.body, '<!-- temp-dev-bot -->')
     runs-on: ubuntu-latest
+    # the token lives in this environment, whose branch rule is `main` only: a workflow on a branch
+    # of this public repository must not be able to read a token that can start a run in lium-infra
+    environment: temp-dev
     steps:
       - name: Hand the comment to lium-infra
         uses: actions/github-script@v7
