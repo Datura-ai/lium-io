@@ -443,8 +443,9 @@ async def _remove_dind_orphan(
 ) -> None:
     """`docker rm -fv` of the container this call made — by the id `docker run` printed when there
     is one (a timer must only ever remove the container it was armed for), by this call's label
-    token when the CLI was killed before it printed one (`run_token`: only what this call created,
-    never a same-named container the validator started itself), by name for a half-made one."""
+    token when the CLI was killed before it printed one or exited non-zero (`run_token`: only what
+    this call created, never a same-named container another validator or the validator's own SSH
+    path started); by bare name only from the orphan timer armed without an id."""
     _dind_orphan_timers.pop(name, None)
     try:
         if run_token is not None:
@@ -517,8 +518,11 @@ async def run_dind(step: DindStep, port_pairs: list[tuple[int, int]], ssh_port: 
         asyncio.get_running_loop().create_task(_remove_dind_orphan_twice(step.name, run_token))
         return result
     if result.status != "ok":
-        # A half-created container (name taken, bind failed) must not hold the port or the name.
-        await _remove_dind_orphan(step.name)
+        # A half-created container (bind failed after the create) must not hold the port or the
+        # name — removed by THIS call's label, never by the name: a `Conflict … name is already in
+        # use` means the live container is someone else's (another validator's probe of this miner,
+        # or the validator's own SSH-started one), and this call created nothing.
+        await _remove_dind_orphan(step.name, run_token=run_token)
         return result
     printed = (result.stdout or "").strip()
     container_id = printed if _DOCKER_ID_RE.fullmatch(printed) else None
