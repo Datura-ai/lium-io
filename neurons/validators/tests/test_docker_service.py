@@ -5817,7 +5817,8 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     assert len(stdin_calls) == 1
     upload_call = stdin_calls[0]
     upload_cmd = upload_call.args[0]
-    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c 'cat > ")
+    # 0600 from the first byte: the script holds the same material as the passfile it writes
+    assert upload_cmd.startswith("/usr/bin/docker exec -u 0 -i pod_test sh -c 'umask 077 && cat > ")
     assert f"{docker_service_module._VOLUME_SETUP_TMPFS}/.x" in upload_cmd
     assert "<<" not in upload_cmd
     setup_script = upload_call.kwargs["input"]

@@ -2557,10 +2557,11 @@ class DockerService:
         # The script goes over the SSH channel's stdin, never in the command string: sshd hands
         # the command string to `sh -c`, so a heredoc there is the remote shell's argv, readable
         # by anyone on the host (`/proc/<pid>/cmdline`, execsnoop, auditd) for as long as the
-        # exec runs — pad and wrapped passphrase side by side.
+        # exec runs — pad and wrapped passphrase side by side. `umask 077` makes the file 0600
+        # from its first byte: it carries the same material as the passfile the script chmods 600.
         upload_cmd = (
             f"/usr/bin/docker exec -u 0 -i {container_q} sh -c "
-            f"{shlex.quote(f'cat > {setup_script_path}')}"
+            f"{shlex.quote(f'umask 077 && cat > {setup_script_path}')}"
         )
         logger.info(
             _m(
