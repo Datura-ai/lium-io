@@ -1,0 +1,66 @@
+{
+  "direction": "socket_replies",
+  "about": "The backend's typeless replies on the validator's WebSocket, as compute_app_requests.py serialises them: Response answers AuthenticateRequest, RentedMachineResponse answers RentedMachineRequest, RevenuePerGpuTypeResponse answers RevenuePerGpuTypeRequest. The validator validates each against the one it is waiting for (compute_client.py); test_protocol_compat.py does the same. Addresses are TEST-NET.",
+  "messages": [
+    {
+      "expect": "Response",
+      "message": {
+        "status": "success",
+        "errors": []
+      }
+    },
+    {
+      "expect": "Response",
+      "message": {
+        "status": "error",
+        "errors": [
+          {
+            "msg": "signature invalid",
+            "type": "auth",
+            "help": ""
+          }
+        ]
+      }
+    },
+    {
+      "expect": "RentedMachineResponse",
+      "message": {
+        "machines": [
+          {
+            "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+            "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+            "executor_ip_address": "203.0.113.10",
+            "executor_ip_port": "8001",
+            "containers": [
+              {
+                "name": "container_0b1c2d3e",
+                "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+                "rented_ports": [
+                  40001,
+                  40002
+                ]
+              }
+            ],
+            "owner_flag": false,
+            "rented_ports": [
+              40001,
+              40002
+            ]
+          }
+        ],
+        "banned_guids": [],
+        "banned_hotkeys": [],
+        "banned_coldkeys": [],
+        "banned_provider_guids": []
+      }
+    },
+    {
+      "expect": "RevenuePerGpuTypeResponse",
+      "message": {
+        "revenues": {
+          "NVIDIA H100 80GB HBM3": 1234.5
+        }
+      }
+    }
+  ]
+}

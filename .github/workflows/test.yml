@@ -4,7 +4,7 @@ on:
   # no `paths:` filter on the workflow: a required status check that never reports blocks the
   # merge button and stalls a merge queue. The filtering happens inside — the `route` job reads
   # the PR's (or merge-group entry's) file list and each package job runs only when its package,
-  # datura/ or .github/ changed. tests-ok reports on every PR either way. No `branches:` filter
+  # datura/ or .github/ changed (lium_protocol/ also selects validators). tests-ok reports on every PR either way. No `branches:` filter
   # either: a PR stacked on another PR's branch (the loop's and the team's dependent PRs) used
   # to get no run at all until its base merged and GitHub retargeted it to main.
   pull_request:
@@ -34,6 +34,7 @@ jobs:
       validators: ${{ steps.pkgs.outputs.validators }}
       executor: ${{ steps.pkgs.outputs.executor }}
       miners: ${{ steps.pkgs.outputs.miners }}
+      protocol: ${{ steps.pkgs.outputs.protocol }}
       e2e: ${{ steps.pkgs.outputs.e2e }}
     steps:
       - uses: actions/checkout@v4
@@ -145,6 +146,41 @@ jobs:
       - name: Run tests
         run: pdm run pytest tests/ -v --tb=short
 
+  protocol:
+    # DAH-3247: the validator↔backend wire protocol package (lium_protocol/) — its tests, and the
+    # committed JSON-schema snapshot must equal the models: a model change without a regenerated,
+    # reviewed snapshot fails here (`python -m lium_protocol.schema --write` regenerates it).
+    # Routed like the neurons; a lium_protocol/ change also selects `validators` (the compat test).
+    name: Protocol package (tests + schema snapshot)
+    needs: route
+    if: needs.route.outputs.protocol == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    defaults:
+      run:
+        working-directory: lium_protocol
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        # the renderer is pinned: the snapshot is pydantic's JSON Schema, and a pydantic release can change it
+        # (2.10 → 2.12 did); 2.13 wrote the committed snapshot and is the validator's lock (neurons/validators/pdm.lock)
+        run: pip install -q . pytest "pydantic==2.13.*"
+
+      - name: Schema snapshot matches the models
+        run: python -m lium_protocol.schema --check
+
+      - name: Run tests
+        run: python -m pytest tests -v --tb=short
+
   lint:
     # ruff format is the repo's pre-commit hook (.pre-commit-config.yaml, same version pin)
     # and CI never ran it. REPORT-ONLY: on 6 Sep 2026 main had 207/301 validators, 30/51
@@ -195,7 +231,7 @@ jobs:
     # (a PR that touches no neuron); a failed or cancelled one fails this. `lint` joins
     # once the packages are formatted (see above).
     name: tests-ok
-    needs: [route, validators, executor, miners, ruff-check, e2e]
+    needs: [route, validators, executor, miners, ruff-check, protocol, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
