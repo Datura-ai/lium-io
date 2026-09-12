@@ -1,0 +1,3 @@
+#!/bin/bash
+# kaalia calls dmidecode inside the container; feed it the host's dumped DMI table
+exec /usr/sbin/dmidecode.real --from-dump /var/lib/dmi.bin "$@"

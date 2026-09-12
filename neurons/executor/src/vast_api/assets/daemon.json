@@ -1,0 +1,17 @@
+{
+  "data-root": "/var/lib/docker",
+  "storage-driver": "overlay2",
+  "features": {
+    "containerd-snapshotter": false
+  },
+  "default-runtime": "nvidia",
+  "runtimes": {
+    "nvidia": {
+      "path": "/var/lib/vastai_kaalia/latest/kaalia_docker_shim",
+      "args": []
+    }
+  },
+  "exec-opts": [
+    "native.cgroupdriver=cgroupfs"
+  ]
+}

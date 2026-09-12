@@ -1,0 +1,12 @@
+FROM aglover1221/systemd-dind:v1.0.0
+
+# Do NOT clean /var/lib/apt/lists here: kaalia's installer apt-installs
+# logrotate/libvirt-dev/bubblewrap/rclone/cron and rolls the whole install
+# back when the lists are empty.
+RUN apt-get update \
+ && apt-get install -y python3-requests lshw dmidecode wget curl iproute2 kmod xfsprogs pciutils
+
+# Host DMI dump is mounted at run time (-v .../dmi.bin:/var/lib/dmi.bin:ro);
+# the shim feeds it to kaalia so inventory sees the machine, not the container.
+COPY dmidecode-shim /usr/local/bin/dmidecode
+RUN mv /usr/sbin/dmidecode /usr/sbin/dmidecode.real && chmod +x /usr/local/bin/dmidecode
