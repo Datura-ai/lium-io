@@ -87,13 +87,26 @@ EOF
 
     log_info "config_override.py written to $CONFIG_OVERRIDE"
 else
-    log_info "Skipping config_override.py for prod (configuration supplied at runtime)."
+    log_info "Skipping config_override.py for prod (the prod values in src/config.py apply)."
 fi
 
 # ── Docker build ──────────────────────────────────────────────────────────────
 IMAGE_NAME="daturaai/lium-watchtower:$IMAGE_TAG"
 
-log_step "Building Docker image: ${BOLD}$IMAGE_NAME${NC}"
-docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+# The executor compose files (neurons/executor/docker-compose*.yml) pull the updater by
+# this version tag, never by a moving tag: `1.1.0` for prod, `1.1.0-staging` for the dev stack.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/pyproject.toml")"
+if [ -z "$VERSION" ]; then
+    log_error "No version in $SCRIPT_DIR/pyproject.toml"
+    exit 1
+fi
+if [ "$DEPLOY_ENV" = "prod" ]; then
+    VERSION_IMAGE_NAME="daturaai/lium-watchtower:$VERSION"
+else
+    VERSION_IMAGE_NAME="daturaai/lium-watchtower:$VERSION-$IMAGE_TAG"
+fi
 
-log_info "Build complete: ${BOLD}$IMAGE_NAME${NC}"
+log_step "Building Docker image: ${BOLD}$IMAGE_NAME${NC} (also tagged ${BOLD}$VERSION_IMAGE_NAME${NC})"
+docker build -t "$IMAGE_NAME" -t "$VERSION_IMAGE_NAME" "$SCRIPT_DIR"
+
+log_info "Build complete: ${BOLD}$IMAGE_NAME${NC} ${BOLD}$VERSION_IMAGE_NAME${NC}"

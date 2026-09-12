@@ -115,6 +115,8 @@ Optional, commented out in the template (`src/core/config.py` has the defaults):
 docker compose up -d
 ```
 
+The stack then updates itself. How that works, how to make sure that a node is current, and the one-time restart for a node that stopped updating: [EXECUTOR_UPDATE.md](EXECUTOR_UPDATE.md).
+
 ## Recommended Setup For GPUs and Docker
 
 ### Step 1: Ensure `nvidia-container-toolkit` is installed. 
