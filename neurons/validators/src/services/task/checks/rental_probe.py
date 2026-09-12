@@ -39,7 +39,8 @@ STEP_TEARDOWN = "teardown"
 
 # create_container's failure_step values that fail before the validator has talked to the host over
 # SSH. A failure there is the validator's (its Redis, its key, the attestation verifier), so the probe
-# reaches no verdict about the node instead of penalising it.
+# reaches no verdict about the node instead of penalising it. `cancelled_by_delete` is not positional:
+# a delete_container for the same pod id cut the create short and removed the container itself.
 _CREATE_STEPS_BEFORE_THE_HOST = frozenset(
     {
         "start",
@@ -63,14 +64,16 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
         "default renter image is present, and that the executor's port range is free."
     ),
     STEP_SSHD_LISTEN: (
-        "The container started but sshd never listened on port {port} within {deadline} s. "
-        "Check the host firewall and Docker port publishing: the container's port 22 must be "
-        "reachable from the internet on the mapped port."
+        "The container started but sshd did not answer on port {port} within {deadline} s. "
+        "Check that sshd starts inside the container (`docker logs <container>`), then the host "
+        "firewall and Docker port publishing: the container's port 22 must be reachable from the "
+        "internet on the mapped port."
     ),
     STEP_SSH_LOGIN: (
-        "sshd answered on port {port} but the SSH login with the injected key was refused. "
-        "Check that the container's /root/.ssh/authorized_keys is written and that sshd inside the "
-        "container allows public-key login as root."
+        "sshd answered on port {port} but the SSH login with the injected key was refused, or the "
+        "connection kept dropping until the {deadline} s deadline. Check that the container's "
+        "/root/.ssh/authorized_keys is written and that sshd inside the container allows public-key "
+        "login as root."
     ),
     STEP_GPU_COUNT: (
         "The renter container started and SSH worked, but `nvidia-smi -L` inside it did not list "
@@ -80,14 +83,18 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
 }
 
 _SSHD_POLL_SECONDS = 2.0
+# the identification string sshd sends first on every connection (RFC 4253 §4.2)
+_SSH_BANNER_PREFIX = b"SSH-2.0"
+_SSHD_CONNECT_TIMEOUT_SECONDS = 5
+_SSHD_BANNER_TIMEOUT_SECONDS = 5
 _SSH_LOGIN_TIMEOUT_SECONDS = 30
+# waits between login attempts; the last value repeats until the deadline
+_SSH_LOGIN_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
 _NVIDIA_SMI_TIMEOUT_SECONDS = 30
 # create_container has its own bounded retries (a 90 s port-retry budget, SSH timeouts) but no overall
 # deadline; the image is already on the host, so a create still running after this is a stuck host, and
 # the run's outer timeout (JOB_TIME_OUT) must not be what ends it.
 _CREATE_DEADLINE_SECONDS = 300
-# create_step values for a create that never returned: its container may be half-made on the host
-_CREATE_CUT_SHORT = frozenset({"deadline", "cancelled"})
 _TEARDOWN_DEADLINE_SECONDS = 120
 # one shell command over the validation connection (the image check, the by-name removals)
 _SHELL_COMMAND_TIMEOUT_SECONDS = 60
@@ -131,9 +138,10 @@ class RentalProbeCheck:
     executor then reported offline) while every 15-minute check scored it 1.0: the checks prove the
     GPUs, the bandwidth and the filler, not the one thing a renter needs. This check starts the
     default renter image through `DockerService.create_container`, the path a renter's pod takes,
-    with a probe-owned SSH key and the ports PortConnectivityCheck verified; waits for sshd on the
-    mapped port; logs in; runs `nvidia-smi -L`; and tears the container down through
-    `delete_container`. Each step is timed and lands in `what_we_saw["probe_steps"]`.
+    with a probe-owned SSH key and the ports PortConnectivityCheck verified; waits for sshd's banner
+    on the mapped port; logs in, retrying until the same RENTAL_PROBE_SSH_DEADLINE_SECONDS deadline;
+    runs `nvidia-smi -L`; and tears the container down through `delete_container`. Each step is
+    timed and lands in `what_we_saw["probe_steps"]`.
 
     A failed step zeroes the score and clears the verified job with reason code RENTAL_PROBE_FAILED
     and the step's name, the same mechanics as the GPU runtime quarantine in rental_verification.py.
@@ -497,7 +505,8 @@ async def _probe(ctx: Context, image_ref: str) -> _ProbeOutcome:
 
     The container's name and volume follow from the pod id (`pod_<id>`, `volume_<id>`), so the
     cleanup in `finally` can remove them by name over the validation shell even when
-    create_container was cut short: by its own deadline here, or by the run's outer timeout
+    create_container returned no ContainerCreated: it failed on the host after `docker_run`, was cut
+    short by its own deadline here, raised, or was cancelled by the run's outer timeout
     (JOB_TIME_OUT), which arrives as CancelledError and passes every `except Exception`. The
     cleanup is shielded so a cancelled task still runs it; the cancellation itself propagates.
     """
@@ -573,9 +582,16 @@ async def _probe(ctx: Context, image_ref: str) -> _ProbeOutcome:
             outcome.inconclusive_reason = "create returned no mapping for container port 22"
             return outcome
 
-        deadline = settings.RENTAL_PROBE_SSH_DEADLINE_SECONDS
+        # one deadline for the renter's first minute: sshd's banner, then the login retries
+        deadline_seconds = settings.RENTAL_PROBE_SSH_DEADLINE_SECONDS
+        deadline_at = time.monotonic() + deadline_seconds
         started = time.perf_counter()
-        listen_error = await _wait_for_sshd(ctx.executor.address, ssh_port, deadline)
+        listen_error = await _wait_for_sshd(
+            ctx.executor.address,
+            ssh_port,
+            deadline_at=deadline_at,
+            deadline_seconds=deadline_seconds,
+        )
         outcome.steps.append(
             _Step(
                 STEP_SSHD_LISTEN, time.perf_counter() - started, listen_error is None, listen_error
@@ -585,9 +601,13 @@ async def _probe(ctx: Context, image_ref: str) -> _ProbeOutcome:
             outcome.failed_step = STEP_SSHD_LISTEN
             return outcome
 
-        login = await _login_and_list_gpus(ctx.executor.address, ssh_port, private_key)
+        login = await _login_and_list_gpus(
+            ctx.executor.address, ssh_port, private_key, deadline_at=deadline_at
+        )
         outcome.steps.append(
-            _Step(STEP_SSH_LOGIN, login.login_seconds, login.login_error is None, login.login_error)
+            _Step(
+                STEP_SSH_LOGIN, login.login_seconds, login.login_error is None, login.login_detail()
+            )
         )
         if login.login_error is not None:
             outcome.failed_step = STEP_SSH_LOGIN
@@ -638,22 +658,28 @@ async def _settle(
 ) -> None:
     """Leave the node and Redis as found.
 
-    A created container goes through delete_container, the renter's unrent path. When that fails, or
-    when the create was cut short by its deadline or by the run's cancellation (it may have left `pod_<id>` behind), the container
-    and its volume are removed by name over the validation shell. The pending-pod mark is cleared in
-    every case. A teardown that needed the fallback is recorded as a failed step: the node served the
-    renter but its unrent path did not finish, so a clean run is INCONCLUSIVE (no stamp, probed again
-    next cycle) rather than a pass.
+    A created container goes through delete_container, the renter's unrent path. In every other case
+    where the create reached the host (it failed after `ssh_connect`, ran into its deadline, was
+    cancelled, or raised), and when the unrent path fails, the container and its volume are removed by
+    name over the validation shell. create_container does run `docker rm -fv` itself when a step after
+    `docker_run` fails (`cleanup_failed_container_creation`), but that cleanup is best effort: its own
+    failure is logged and swallowed, and a cancel or the deadline here skips it. A `pod_<id>` left
+    behind holds the GPUs and the verified ports until the stale sweep, so the by-name removal runs
+    as the backstop in every path; a name that is already gone costs one shell command. Only a create
+    that failed before the host (`_CREATE_STEPS_BEFORE_THE_HOST`) removes nothing. The pending-pod
+    mark is cleared in every case. An unrent path that needed the fallback is recorded as a failed
+    step: the node served the renter but its unrent path did not finish, so a clean run is
+    INCONCLUSIVE (no stamp, probed again next cycle) rather than a pass.
     """
     try:
-        if created is None and outcome.create_step not in _CREATE_CUT_SHORT:
-            return  # nothing reached the host
+        if created is None and outcome.create_step in _CREATE_STEPS_BEFORE_THE_HOST:
+            return  # the create failed before the validator's SSH session to the host
         started = time.perf_counter()
-        teardown_error = (
-            await _teardown(ctx, created, pod_id) if created is not None else "create cut short"
-        )
+        teardown_error: str | None = None
         leftover: str | None = None
-        if teardown_error is not None:
+        if created is not None:
+            teardown_error = await _teardown(ctx, created, pod_id)
+        if created is None or teardown_error is not None:
             # the names the create used when it returned them; the names it would have used otherwise
             container_name = (
                 created.container_name if created is not None else f"{POD_CONTAINER_PREFIX}{pod_id}"
@@ -662,15 +688,25 @@ async def _settle(
             leftover = await _remove_over_shell(
                 ctx, container_name=container_name, volume_name=volume_name
             )
-            detail = (
-                f"{teardown_error}; removed by name over the validation shell"
-                if leftover is None
-                else f"{teardown_error}; shell removal failed too: {leftover}"
-            )
+        if created is None:
+            why = f"create ended at {outcome.create_step or 'an unknown step'}"
         else:
+            why = teardown_error
+        if why is None:
             detail = None
+        elif leftover is None:
+            # `docker rm -fv` by name exits 0 for a container it removed and 1 "No such container" for
+            # one that was already gone; both leave nothing on the node
+            detail = f"{why}; docker rm by name over the validation shell left nothing"
+        else:
+            detail = f"{why}; shell removal failed too: {leftover}"
         outcome.steps.append(
-            _Step(STEP_TEARDOWN, time.perf_counter() - started, teardown_error is None, detail)
+            _Step(
+                STEP_TEARDOWN,
+                time.perf_counter() - started,
+                teardown_error is None and leftover is None,
+                detail,
+            )
         )
         if leftover is not None:
             logger.warning(
@@ -735,55 +771,106 @@ def _mapped_ssh_port(created: ContainerCreated) -> int | None:
     return None
 
 
-async def _wait_for_sshd(host: str, port: int, deadline_seconds: float) -> str | None:
-    """None once a TCP connection to the mapped port opens, else the last error at the deadline."""
+async def _wait_for_sshd(
+    host: str, port: int, *, deadline_at: float, deadline_seconds: float
+) -> str | None:
+    """None once the mapped port answers with sshd's `SSH-2.0` banner, else the last error at the deadline.
+
+    A TCP accept alone proves nothing: docker-proxy accepts on a published port as soon as the
+    container exists, before sshd inside it listens (the default image's start.sh runs `service ssh
+    start` after its own setup), and closes the connection at once. The banner is sshd's first
+    write on every connection, so it is what a renter's client waits for too.
+    """
     last_error = "never tried"
-    deadline = time.monotonic() + deadline_seconds
     while True:
         try:
-            _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=5)
-            writer.close()
-            return None
-        except (TimeoutError, OSError) as exc:
-            last_error = repr(exc)
-        if time.monotonic() >= deadline:
-            return (
-                f"port {port} did not accept a connection within {deadline_seconds} s: {last_error}"
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=_SSHD_CONNECT_TIMEOUT_SECONDS
             )
+            try:
+                banner = await asyncio.wait_for(
+                    reader.readline(), timeout=_SSHD_BANNER_TIMEOUT_SECONDS
+                )
+            finally:
+                writer.close()
+            if banner.startswith(_SSH_BANNER_PREFIX):
+                return None
+            last_error = (
+                f"port {port} accepted the connection but sent no SSH banner "
+                f"({banner[:40]!r}; docker-proxy answers before sshd listens)"
+            )
+        except (TimeoutError, OSError, ValueError) as exc:
+            # ValueError: readline's line limit, a server that talks but not SSH
+            last_error = repr(exc)
+        if time.monotonic() >= deadline_at:
+            return f"sshd did not answer on port {port} within {deadline_seconds} s: {last_error}"
         await asyncio.sleep(_SSHD_POLL_SECONDS)
 
 
 @dataclass
 class _Login:
     login_error: str | None = None
+    login_attempts: int = 0
     command_error: str | None = None
     result: Any = None
     login_seconds: float = 0.0
     command_seconds: float = 0.0
 
+    def login_detail(self) -> str | None:
+        if self.login_error is not None:
+            return f"{self.login_error} (attempt {self.login_attempts})"
+        if self.login_attempts > 1:
+            return f"connected on attempt {self.login_attempts}"
+        return None
 
-async def _login_and_list_gpus(host: str, port: int, private_key: str) -> _Login:
+
+async def _login_and_list_gpus(
+    host: str, port: int, private_key: str, *, deadline_at: float
+) -> _Login:
     """Log in with the probe key the way a renter does and run `nvidia-smi -L` inside the container.
 
-    The two phases are reported apart: a refused or timed-out connection is the login step's failure,
-    a session that opened but could not run the command is the GPU step's.
+    The connect is retried with backoff until `deadline_at` (the sshd step's deadline, shared): a
+    freshly started sshd drops the first connections while it is still forking or under MaxStartups,
+    and a renter's client retries too. A refused key (PermissionDenied) is final: the create wrote
+    authorized_keys before sshd started, so it will not change. The two phases are reported apart: a
+    connection that never opened is the login step's failure, a session that opened but could not run
+    the command is the GPU step's.
     """
     login = _Login()
     started = time.perf_counter()
     try:
         pkey = asyncssh.import_private_key(private_key)
-        conn = await asyncssh.connect(
-            host=host,
-            port=port,
-            username="root",
-            client_keys=[pkey],
-            known_hosts=None,
-            connect_timeout=_SSH_LOGIN_TIMEOUT_SECONDS,
-        )
-    except (TimeoutError, asyncssh.Error, OSError) as exc:
+    except (ValueError, asyncssh.Error) as exc:  # KeyImportError is a ValueError
         login.login_error = repr(exc)
+        login.login_attempts = 1
         login.login_seconds = time.perf_counter() - started
         return login
+    while True:
+        login.login_attempts += 1
+        try:
+            conn = await asyncssh.connect(
+                host=host,
+                port=port,
+                username="root",
+                client_keys=[pkey],
+                known_hosts=None,
+                connect_timeout=_SSH_LOGIN_TIMEOUT_SECONDS,
+            )
+            break
+        except asyncssh.PermissionDenied as exc:
+            login.login_error = repr(exc)
+            login.login_seconds = time.perf_counter() - started
+            return login
+        except (TimeoutError, asyncssh.Error, OSError) as exc:
+            login.login_error = repr(exc)
+        backoff = _SSH_LOGIN_BACKOFF_SECONDS[
+            min(login.login_attempts, len(_SSH_LOGIN_BACKOFF_SECONDS)) - 1
+        ]
+        if time.monotonic() + backoff >= deadline_at:
+            login.login_seconds = time.perf_counter() - started
+            return login
+        await asyncio.sleep(backoff)
+    login.login_error = None
     login.login_seconds = time.perf_counter() - started
     command_started = time.perf_counter()
     try:

@@ -327,8 +327,9 @@ class Settings(BaseSettings):
     # DAH-3436: the synthetic rental probe. On an idle node (no renter pod, no filler) the validator
     # rents the node from itself once per RENTAL_PROBE_INTERVAL_HOURS: it starts the default renter
     # image through the same create_container path a renter's pod takes, with a probe-owned SSH key
-    # and the node's verified ports, waits RENTAL_PROBE_SSH_DEADLINE_SECONDS for sshd on the mapped
-    # port, logs in, runs `nvidia-smi -L`, and tears the container down through delete_container.
+    # and the node's verified ports, waits up to RENTAL_PROBE_SSH_DEADLINE_SECONDS for sshd's banner
+    # on the mapped port and a login (retried until that deadline), runs `nvidia-smi -L`, and tears
+    # the container down through delete_container.
     # A failed step zeroes the score and clears the verified job for the cycle (RENTAL_PROBE_FAILED),
     # like the GPU runtime quarantine; the failure is not carried forward, so a node the next cycle
     # skips (filler running, image gone) or reads inconclusively is verified again by that cycle,

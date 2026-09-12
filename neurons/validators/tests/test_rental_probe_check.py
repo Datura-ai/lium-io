@@ -254,35 +254,66 @@ class FakeSSHConnection:
         return MagicMock(stdout=self.stdout, stderr="", exit_status=self.exit_status)
 
 
+SSH_BANNER = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n"
+
+
+class FakeReader:
+    def __init__(self, first_line: bytes):
+        self.first_line = first_line
+
+    async def readline(self):
+        return self.first_line
+
+
 @contextmanager
 def renter_path(
     *,
     sshd_listens: bool = True,
-    login_error: Exception | None = None,
+    sshd_up_after: int | None = 0,
+    login_error: Exception | list | None = None,
     command_error: Exception | None = None,
     smi_stdout: str = SMI_TWO_GPUS,
     smi_exit: int = 0,
 ):
-    """What the probe sees from the validator's side of the network: the TCP port and the login."""
-    seen: dict = {}
+    """What the probe sees from the validator's side of the network: the TCP port and the login.
+
+    `sshd_listens=False` refuses the TCP connection (no docker-proxy, no container port published).
+    `sshd_up_after=N` is a published port whose container has not started sshd yet: docker-proxy
+    accepts the first N connections and closes them with no banner, and an SSH login in that window is
+    dropped; from connection N+1 sshd answers with its banner. None: sshd never comes up.
+    `login_error` is one exception for every attempt, or a list with one entry per attempt (None = success).
+    """
+    seen: dict = {"tcp_connects": 0, "ssh_attempts": 0}
+    login_errors = list(login_error) if isinstance(login_error, list) else None
+
+    def sshd_up() -> bool:
+        return sshd_up_after is not None and seen["tcp_connects"] > sshd_up_after
 
     async def open_connection(host, port):
         seen["tcp"] = (host, port)
         if not sshd_listens:
             raise ConnectionRefusedError(111, "Connection refused")
-        writer = MagicMock()
-        return MagicMock(), writer
+        seen["tcp_connects"] += 1
+        return FakeReader(SSH_BANNER if sshd_up() else b""), MagicMock()
 
     async def connect(**kwargs):
         seen["ssh"] = kwargs
-        if login_error is not None:
-            raise login_error
+        seen["ssh_attempts"] += 1
+        if not sshd_up():
+            raise asyncssh.ConnectionLost("Connection lost")
+        if login_errors is not None:
+            error = login_errors.pop(0) if login_errors else None
+        else:
+            error = login_error
+        if error is not None:
+            raise error
         return FakeSSHConnection(smi_stdout, smi_exit, command_error)
 
     with (
         patch.object(module.asyncio, "open_connection", open_connection),
         patch.object(module.asyncssh, "connect", connect),
         patch.object(module, "_SSHD_POLL_SECONDS", 0.0),
+        patch.object(module, "_SSH_LOGIN_BACKOFF_SECONDS", (0.01,)),
     ):
         yield seen
 
@@ -458,9 +489,62 @@ async def test_container_start_failure_on_the_host_zeroes_the_score_and_clears_v
 
 
 @pytest.mark.asyncio
+async def test_a_create_that_fails_after_docker_run_still_removes_the_container_by_name():
+    """Regression: create_container fails at add_public_keys, set_environment or finalize; its own
+    `cleanup_failed_container_creation` is best effort (a failed `docker rm` is logged and swallowed), and
+    the settle sees no ContainerCreated and returns early, so a `pod_<id>` that cleanup missed keeps running
+    on the node with the GPUs and the verified ports until the stale sweep."""
+    for step in ("add_public_keys", "set_environment", "finalize"):
+        ctx, docker, redis = make_probe_context(
+            docker=FakeDocker(create_result=create_failed(step))
+        )
+        with probe_settings(), renter_path():
+            result = await RentalProbeCheck().run(ctx)
+
+        assert result.passed is False, step
+        assert result.event.what_we_saw["failed_step"] == STEP_CONTAINER_START
+        assert result.event.what_we_saw["create_step"] == step
+        probe_pod_id = docker.create_calls[0][0].pod_id
+        shell_commands = [call.args[0] for call in ctx.ssh.run.call_args_list]
+        assert any(f"docker rm -fv pod_{probe_pod_id}" in cmd for cmd in shell_commands), step
+        assert any(f"volume_{probe_pod_id}" in cmd for cmd in shell_commands), step
+        assert docker.delete_calls == []
+        assert redis.removed_rented == [f"pod_{probe_pod_id}"]
+        teardown = next(
+            s for s in result.event.what_we_saw["probe_steps"] if s["step"] == STEP_TEARDOWN
+        )
+        assert teardown["ok"] is True
+        assert (
+            teardown["detail"]
+            == f"create ended at {step}; docker rm by name over the validation shell left nothing"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_create_that_raises_still_removes_the_container_by_name():
+    """Regression: create_container ends in a raise instead of a FailedContainerRequest (a BaseException that
+    is not a cancel, a bug in its handler) after it may have started `pod_<id>`; the probe reaches no verdict
+    and nothing removes the container."""
+    ctx, docker, redis = make_probe_context(
+        docker=FakeDocker(create_result=RuntimeError("unexpected"))
+    )
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.event.what_we_saw["reason"] == "create_container raised"
+    probe_pod_id = docker.create_calls[0][0].pod_id
+    shell_commands = [call.args[0] for call in ctx.ssh.run.call_args_list]
+    assert any(f"docker rm -fv pod_{probe_pod_id}" in cmd for cmd in shell_commands)
+    assert any(f"volume_{probe_pod_id}" in cmd for cmd in shell_commands)
+    assert redis.removed_rented == [f"pod_{probe_pod_id}"]
+    assert redis.removed_pending == [(MINER, EXECUTOR.uuid, probe_pod_id)]
+
+
+@pytest.mark.asyncio
 async def test_create_failure_before_the_host_is_not_the_nodes_fault():
     """Regression: a validator-side failure (its Redis lock, its key, the attestation verifier) zeroes an
-    honest node's score."""
+    honest node's score; or the settle runs `docker rm` on a node the create never reached and reports a
+    teardown step for it."""
     ctx, docker, redis = make_probe_context(
         docker=FakeDocker(create_result=create_failed("attestation"))
     )
@@ -470,6 +554,10 @@ async def test_create_failure_before_the_host_is_not_the_nodes_fault():
     assert result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert result.updates == {}
     assert not redis.stamped()
+    # the only shell command was the image check before the create; nothing was removed by name
+    shell_commands = [call.args[0] for call in ctx.ssh.run.call_args_list]
+    assert not any("docker rm" in cmd for cmd in shell_commands)
+    assert [s["step"] for s in result.event.what_we_saw["probe_steps"]] == [STEP_CONTAINER_START]
 
     ctx, docker, redis = make_probe_context(
         docker=FakeDocker(create_result=RuntimeError("redis down"))
@@ -502,15 +590,88 @@ async def test_sshd_never_listening_fails_at_sshd_listen_and_names_the_port():
 @pytest.mark.asyncio
 async def test_login_refused_fails_at_ssh_login():
     """Regression: sshd answers but the injected key is not honoured, and the probe reports the node healthy
-    because it only checked the TCP port."""
+    because it only checked the TCP port. Also: a refused key is retried until the deadline, which adds
+    the whole deadline to every cycle on a node that cannot pass (authorized_keys is written before sshd
+    starts, so a PermissionDenied does not clear itself)."""
     ctx, docker, _ = make_probe_context()
-    with probe_settings(), renter_path(login_error=asyncssh.PermissionDenied("Permission denied")):
+    with (
+        probe_settings(deadline=5),
+        renter_path(login_error=asyncssh.PermissionDenied("Permission denied")) as seen,
+    ):
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False
     assert result.event.what_we_saw["failed_step"] == STEP_SSH_LOGIN
     assert (
         "port 30002" in result.event.remediation and "authorized_keys" in result.event.remediation
     )
+    assert seen["ssh_attempts"] == 1
+    assert len(docker.delete_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_slow_starting_sshd_behind_docker_proxy_passes():
+    """Regression: docker-proxy accepts on the published port as soon as the container exists, seconds
+    before the image's start.sh runs `service ssh start`. A bare TCP accept ends the sshd_listen wait at
+    once, the single login is dropped, and a healthy node scores 0 with failed_step=ssh_login."""
+    ctx, docker, redis = make_probe_context()
+    with probe_settings(deadline=5), renter_path(sshd_up_after=3) as seen:
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    steps = {step["step"]: step for step in result.event.what_we_saw["probe_steps"]}
+    assert steps[STEP_SSHD_LISTEN]["ok"] is True and steps[STEP_SSH_LOGIN]["ok"] is True
+    # the banner was waited for: three accepted-then-closed connections, then the fourth answered
+    assert seen["tcp_connects"] == 4
+    assert seen["ssh_attempts"] == 1
+    assert redis.stamped() and len(docker.delete_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_port_that_accepts_but_never_sends_a_banner_fails_at_sshd_listen():
+    """Regression: the container runs but sshd inside it never starts. docker-proxy keeps accepting, so the
+    probe blames ssh_login and the provider is told to check authorized_keys instead of sshd."""
+    ctx, docker, _ = make_probe_context()
+    with probe_settings(deadline=1), renter_path(sshd_up_after=None) as seen:
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is False and result.event.reason_code == Msg.PROBE_FAILED.reason
+    what = result.event.what_we_saw
+    assert what["failed_step"] == STEP_SSHD_LISTEN
+    listen = next(step for step in what["probe_steps"] if step["step"] == STEP_SSHD_LISTEN)
+    assert listen["ok"] is False and "no SSH banner" in listen["detail"]
+    assert listen["seconds"] >= 1.0 and seen["tcp_connects"] > 1
+    assert seen["ssh_attempts"] == 0
+    assert "sshd did not answer on port 30002" in result.event.remediation
+    assert len(docker.delete_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_first_login_is_retried_until_the_deadline():
+    """Regression: sshd's banner is up but the first connection is dropped (sshd still forking, MaxStartups)
+    and a single connect attempt zeroes the node; or the retries never stop and the probe outlives the
+    deadline it told the provider about."""
+    ctx, docker, _ = make_probe_context()
+    dropped = asyncssh.ConnectionLost("Connection lost")
+    with probe_settings(deadline=5), renter_path(login_error=[dropped, dropped, None]) as seen:
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    assert seen["ssh_attempts"] == 3
+    login = next(
+        step for step in result.event.what_we_saw["probe_steps"] if step["step"] == STEP_SSH_LOGIN
+    )
+    assert login["ok"] is True and login["detail"] == "connected on attempt 3"
+
+    ctx, docker, _ = make_probe_context()
+    with probe_settings(deadline=1), renter_path(login_error=dropped) as seen:
+        started = time.perf_counter()
+        result = await RentalProbeCheck().run(ctx)
+        elapsed = time.perf_counter() - started
+    assert result.passed is False and result.event.what_we_saw["failed_step"] == STEP_SSH_LOGIN
+    assert seen["ssh_attempts"] > 1 and elapsed < 3
+    login = next(
+        step for step in result.event.what_we_saw["probe_steps"] if step["step"] == STEP_SSH_LOGIN
+    )
+    assert login["ok"] is False and f"(attempt {seen['ssh_attempts']})" in login["detail"]
     assert len(docker.delete_calls) == 1
 
 
@@ -767,7 +928,7 @@ async def test_teardown_failure_after_a_clean_run_neither_penalises_nor_stamps()
     )
     assert teardown["ok"] is False and "delete_container" in teardown["detail"]
     # the leftover is removed by name over the validation shell, so no port stays bound until the sweep
-    assert "removed by name over the validation shell" in teardown["detail"]
+    assert "docker rm by name over the validation shell left nothing" in teardown["detail"]
     shell_commands = [call.args[0] for call in ctx.ssh.run.call_args_list]
     assert any("docker rm -fv pod_pod" in cmd for cmd in shell_commands)
     assert redis.removed_rented == ["pod_pod"]
