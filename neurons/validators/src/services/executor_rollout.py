@@ -52,8 +52,9 @@ ROLLOUT_GRACE = "ROLLOUT_GRACE"
 # an executor's publishes is three cycle periods plus the duration of the next scored cycle minus
 # the duration of the last one: about 2700 + 850 s (JOB_TIME_OUT − 50) = 3550 s while cycles keep
 # their 15-minute cadence (job blocks 75 × 12 s apart) — a lower bound, since a cycle that runs
-# past 900 s delays the next start. A third withheld cycle puts the gap past the hour in every
-# case, and the hourly sweep catches it whenever it runs inside the excess. A new window may open
+# past 900 s delays the next start. A third withheld cycle puts the gap past the hour whenever
+# the next scored cycle is not shorter than the last (3600 s + d_next − d_last), and the hourly
+# sweep catches it whenever it runs inside the excess, so the cap stays at 2. A new window may open
 # only once one uncovered cycle has published (`cycles_seen >= grace_cycles + 2`), so two pushes
 # back to back cannot chain windows either.
 MAX_ROLLOUT_GRACE_CYCLES = 2
@@ -368,7 +369,10 @@ def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: in
     it ended without failing — the rented halt or finalize — with score 0 and the image check had
     read OUTDATED: a rented executor's image check passes, so the run halts as RENTED instead of
     failing), and, for every reason but OUTDATED, the executor's observed image is not the new
-    digest. An executor that already runs
+    digest. The OUTDATED-without-failing case counts only while `EXECUTOR_IMAGE_CHECK_ENFORCE` is
+    on: off (the default since DAH-3439), the image check passes an OUTDATED node and leaves its
+    score alone, so a score of 0 under an OUTDATED report came from another gate (price cap, TDX,
+    collateral) and stands. An executor that already runs
     the new image failed for a reason of its own; a rented executor that failed a later check of
     its own (pod not running, filler killed) failed for that reason, OUTDATED or not; and a result
     with a score is never touched.
@@ -378,7 +382,10 @@ def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: in
     reason = result.failure_reason_code
     if reason not in ROLLOUT_FAILURE_REASONS:
         ended_without_failing = reason in _RUN_ENDED_WITHOUT_FAILING
-        outdated = (result.executor_image_report or {}).get("status") == ImageVerdict.OUTDATED.value
+        outdated = (
+            settings.EXECUTOR_IMAGE_CHECK_ENFORCE
+            and (result.executor_image_report or {}).get("status") == ImageVerdict.OUTDATED.value
+        )
         if not (ended_without_failing and outdated):
             return None
         reason = _OUTDATED

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import asyncssh
 import pytest
+from core.config import settings
 from core.validator import Validator
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
@@ -370,11 +371,13 @@ def test_a_failure_on_an_executor_already_running_the_new_image_is_a_real_failur
     assert rollout_grace_reason(still_on_old, window, J1) == reason
 
 
-def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not() -> None:
-    """The 70 EXECUTOR_IMAGE_OUTDATED rows of 11 Sep. Unrented, the fatal check ends the run with
-    that reason; rented, the run completes with score 0 and only the report says OUTDATED. Both
-    are the fleet not having pulled yet (or the validator's snapshot predating the push, in which
-    case the observed digest is already the new one)."""
+def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monkeypatch) -> None:
+    """The 70 EXECUTOR_IMAGE_OUTDATED rows of 11 Sep, with the image check enforced as it was that
+    day. Unrented, the fatal check ends the run with that reason; rented, the run completes with
+    score 0 and only the report says OUTDATED. Both are the fleet not having pulled yet (or the
+    validator's snapshot predating the push, in which case the observed digest is already the new
+    one)."""
+    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
     window = _open_window()
     unrented = _failed("node-1", "EXECUTOR_IMAGE_OUTDATED", observed_digest=OLD, image_status="OUTDATED")
     rented = _failed("node-2", "RENTED", observed_digest=OLD, image_status="OUTDATED")
@@ -385,6 +388,18 @@ def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not() -> 
     assert rollout_grace_reason(unrented, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
     assert rollout_grace_reason(rented, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
     assert rollout_grace_reason(validator_snapshot_was_stale, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
+
+
+def test_a_rented_zero_under_an_unenforced_outdated_report_stands(monkeypatch) -> None:
+    """Regression: with EXECUTOR_IMAGE_CHECK_ENFORCE off (the default since DAH-3439) the image
+    check passes an OUTDATED node and leaves its score alone, so a rented run at score 0 owes its
+    0 to another gate (price cap, TDX, collateral). Reading the OUTDATED report as the cause would
+    withhold that verdict for two cycles and keep the executor's previous scored row."""
+    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
+    window = _open_window()
+    rented_zero_from_another_gate = _failed("node-2", "RENTED", observed_digest=OLD, image_status="OUTDATED")
+
+    assert rollout_grace_reason(rented_zero_from_another_gate, window, J0) is None
 
 
 def test_a_rented_executor_failing_a_later_check_of_its_own_stands_even_when_outdated() -> None:
@@ -557,6 +572,7 @@ async def test_a_rented_outdated_run_carries_the_rented_halt_as_its_reason(monke
     """A rented executor's image check passes and TenantEnforcementCheck halts the run with
     success=True and score 0. Regression: recording a reason only for failed runs leaves this
     result with none, and the classifier publishes the rented fleet's OUTDATED zeros as today."""
+    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
     monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _ShellThatOpens())
     service = _task_service_that_reaches_the_ssh_connect()
     service.redis_service = AsyncMock()
