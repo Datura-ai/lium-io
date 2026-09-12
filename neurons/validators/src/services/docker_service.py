@@ -264,6 +264,10 @@ class _VolumeEncryptionState(enum.Enum):
 
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
+# DAH-2991: dockerd sent SIGKILL but containerd never reported the task gone — the process is wedged
+# (uninterruptible I/O). `docker rm -f` fails the same way on every retry; only a direct kill of the
+# init and its shim over SSH gets past it (ticket-0287: 4 backend deletes, 5 h at score 0).
+_DOCKER_COULD_NOT_KILL_PHRASES = ("could not kill", "did not receive an exit event")
 HOST_KEY_REQUIRED_EXTRA = {
     "ssh_host_key_missing": True,
     "docker_sdk_host_key_required": True,
@@ -574,6 +578,13 @@ def _is_missing_docker_container_error(exc: Exception) -> bool:
 def _is_docker_container_removal_in_progress_error(exc: Exception) -> bool:
     return any(
         all(phrase in text.lower() for phrase in _DOCKER_REMOVAL_IN_PROGRESS_PHRASES)
+        for text in _exception_texts(exc)
+    )
+
+
+def _is_docker_could_not_kill_error(exc: Exception) -> bool:
+    return any(
+        all(phrase in text.lower() for phrase in _DOCKER_COULD_NOT_KILL_PHRASES)
         for text in _exception_texts(exc)
     )
 
@@ -6346,6 +6357,33 @@ class DockerService:
             )
         return None
 
+    async def _force_remove_or_kill(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        ssh_client: asyncssh.SSHClientConnection,
+        log: _BoundLog,
+    ) -> FailedContainerRequest | None:
+        """_force_remove_container, escalating once when dockerd cannot kill the process (DAH-2991).
+
+        Retrying the same `rm -f` every 10 min failed 4 times in ticket-0287 and left the orphan
+        holding the rental ports. Kill its init + shim over SSH (the executor runs pid: host,
+        privileged), then remove once more; a second failure propagates as before.
+        """
+        try:
+            return await self._force_remove_container(docker_client, payload, log)
+        except Exception as exc:
+            if not _is_docker_could_not_kill_error(exc):
+                raise
+            log.warning(
+                "dockerd could not kill the container; killing its processes directly",
+                container_name=payload.container_name,
+                error=str(exc),
+            )
+        killed = await ssh_client.run(DockerCommand.kill_container_processes(payload.container_name))
+        log.info("Killed the container's processes", result=(killed.stdout or "").strip())
+        return await self._force_remove_container(docker_client, payload, log)
+
     async def delete_container(
         self,
         payload: ContainerDeleteRequest,
@@ -6425,7 +6463,7 @@ class DockerService:
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.
                 try:
-                    removal_failure = await self._force_remove_container(docker_client, payload, log)
+                    removal_failure = await self._force_remove_or_kill(docker_client, payload, ssh_client, log)
                     if removal_failure is not None:
                         return removal_failure
                 except Exception:

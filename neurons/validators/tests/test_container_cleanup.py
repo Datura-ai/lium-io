@@ -82,7 +82,7 @@ async def test_cleanup_removes_stale_running_health_check():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
         rented_data=None,
         executor_uuid=EXECUTOR_UUID,
@@ -108,7 +108,7 @@ async def test_cleanup_removes_stale_exited_health_check():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
         rented_data=None,
         executor_uuid=EXECUTOR_UUID,
@@ -128,7 +128,7 @@ async def test_cleanup_preserves_young_health_check():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
         rented_data=None,
         executor_uuid=EXECUTOR_UUID,
@@ -149,7 +149,7 @@ async def test_cleanup_preserves_rented_health_check():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
         rented_data=_rented_data(EXECUTOR_UUID, [name]),
         executor_uuid=EXECUTOR_UUID,
@@ -200,7 +200,7 @@ async def test_cleanup_preserves_active_filler_container():
     rented_data = _rented_data(EXECUTOR_UUID, [])
     rented_data.filler_containers_by_executor = {EXECUTOR_UUID: [name]}
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
         rented_data=rented_data,
         executor_uuid=EXECUTOR_UUID,
@@ -220,7 +220,7 @@ async def test_cleanup_preserves_young_unknown_filler_container():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
         rented_data=None,
         executor_uuid=EXECUTOR_UUID,
@@ -240,7 +240,7 @@ async def test_cleanup_removes_stale_unknown_filler_container():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
         rented_data=None,
         executor_uuid=EXECUTOR_UUID,
@@ -422,7 +422,7 @@ async def test_cleanup_invokes_volume_prune():
     ssh, rm_calls = _volume_ssh_mock(dangling=[ANON_VOLUME_A])
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh,
         rented_data=None,
         executor_uuid=EXECUTOR_UUID,
@@ -447,10 +447,77 @@ async def test_cleanup_preserves_every_filler_bundle_on_split_node():
     rented_data = _rented_data(EXECUTOR_UUID, [])
     rented_data.filler_containers_by_executor = {EXECUTOR_UUID: [bundle_a, bundle_b]}
 
-    removed_count, removed_names = await cleanup.cleanup(
+    removed_count, removed_names, _ = await cleanup.cleanup(
         ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
     )
 
     assert removed_count == 0
     assert removed_names == []
     assert not any("docker rm -f" in c for c in rm_calls)
+
+
+# ---------------------------------------------------------------------------
+# DAH-2991: an orphan dockerd cannot kill (ticket-0287)
+# ---------------------------------------------------------------------------
+
+COULD_NOT_KILL = (
+    'Error response from daemon: cannot remove container "/pod_x": could not kill: '
+    "tried to kill container, but did not receive an exit event"
+)
+
+
+def _make_unkillable_ssh_mock(name: str, rm_failures: int, current_ts: int = 1_000_000_000):
+    """docker rm -fv fails `rm_failures` times with dockerd's could-not-kill error, then succeeds."""
+    calls: list[str] = []
+    state = {"rm_left": rm_failures}
+
+    async def handler(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if "docker ps -a" in cmd:
+            return MagicMock(exit_status=0, stdout=name, stderr="")
+        if cmd.strip() == "date +%s":
+            return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
+        if "docker inspect" in cmd and "Created" in cmd:
+            return MagicMock(exit_status=0, stdout=str(current_ts - 120 * 60), stderr="")
+        if "docker rm -f" in cmd:
+            if state["rm_left"] > 0:
+                state["rm_left"] -= 1
+                return MagicMock(exit_status=1, stdout="", stderr=COULD_NOT_KILL)
+            return MagicMock(exit_status=0, stdout="", stderr="")
+        if ".State.Pid" in cmd:
+            return MagicMock(exit_status=0, stdout="killed pid=4242 shim=4141", stderr="")
+        return MagicMock(exit_status=0, stdout="", stderr="")
+
+    return _ssh_mock_from_calls(handler), calls
+
+
+@pytest.mark.asyncio
+async def test_cleanup_kills_processes_directly_when_docker_rm_cannot_kill():
+    """rm -f fails with 'did not receive an exit event' -> kill init+shim over ssh -> rm -f again succeeds."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, calls = _make_unkillable_ssh_mock(name, rm_failures=1)
+
+    removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [name] and unremovable == []
+    rm_idx = [i for i, c in enumerate(calls) if "docker rm -f" in c and name in c]
+    kill_idx = [i for i, c in enumerate(calls) if ".State.Pid" in c and "kill -9" in c and name in c]
+    assert len(rm_idx) == 2 and len(kill_idx) == 1
+    assert rm_idx[0] < kill_idx[0] < rm_idx[1]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_container_that_survives_the_direct_kill():
+    """Still not removable after the escalation -> reported as unremovable, not silently dropped."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, calls = _make_unkillable_ssh_mock(name, rm_failures=2)
+
+    removed_count, removed_names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_count == 0 and removed_names == []
+    assert unremovable == [name]
+    assert sum(1 for c in calls if "docker rm -f" in c and name in c) == 2  # one retry, no loop
