@@ -37,6 +37,7 @@ executor-side issues.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 import xml.etree.ElementTree as ET
@@ -147,6 +148,10 @@ def _emit_kernel_xml_disagreement(
         },
     )
 
+
+# Bound on the per-cycle procfs read in read_kernel_gpu_uuids (DAH-2662): reading a few procfs files
+# is instant on a live host; the same bound CpuTruthCheck puts on its sysfs read.
+KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS = 15
 
 PROC_GPU_INFO_CMD = (
     "for f in /proc/driver/nvidia/gpus/*/information; do "
@@ -367,6 +372,34 @@ async def _query_gpu_nodes_for_uuids(
 
 def _missing_gpu_uuids(gpu_uuids: Sequence[str], uuid_to_minor: dict[str, int]) -> list[str]:
     return [uuid for uuid in gpu_uuids if uuid not in uuid_to_minor]
+
+
+async def read_kernel_gpu_uuids(ssh: asyncssh.SSHClientConnection) -> list[str] | None:
+    """GPU UUIDs as the kernel driver reports them in /proc/driver/nvidia/gpus/*/information.
+
+    DAH-2662: the ban list is matched against the UUIDs the host *reports* (NVML, which an
+    `ld.so.preload` shim rewrites — the 2026-08-10 case incremented the last hex digit). procfs is
+    the one inventory that shim does not author, so bans are matched against it too. None when the
+    read fails or procfs is empty/unreadable: the caller falls back to the reported list (fail-open,
+    as before), never treats "unreadable" as a spoof.
+
+    The read is bounded: it runs on the fatal-check path of every executor every cycle, and a
+    wedged host would otherwise hold the check open for the executor's whole validation budget.
+    A timeout is one more "unreadable" (None), never a failure of the host.
+    """
+    try:
+        uuids = list(
+            await asyncio.wait_for(
+                _query_gpu_minor_map_from_proc(ssh), timeout=KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS
+            )
+        )
+    except Exception as exc:
+        # fail-open by design; the line is what tells ops the kernel view was missing on this host
+        logger.warning(
+            "kernel GPU UUID read failed, bans matched on the reported list only: %r", exc
+        )
+        return None
+    return uuids or None
 
 
 async def _query_gpu_minor_map_from_proc(

@@ -111,6 +111,11 @@ class ContextState:
     gpu_splitting_min_count: int | None = None
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
+    # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
+    # None = unreadable or not read; `kernel_gpu_uuids_read` tells the two apart so a failed read is
+    # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    kernel_gpu_uuids: list[str] | None = None
+    kernel_gpu_uuids_read: bool = False
     verified_port_count: int = 0
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
