@@ -73,7 +73,7 @@ def client(validator_keypair, miner_keypair, monkeypatch):
       - settings.MINER_HOTKEY_SS58_ADDRESS → test miner's ss58 address
       - settings.DEFAULT_MINER_HOTKEY      → same (prevents accidental match
                                              via the fallback hotkey)
-      - routes.apis.VALIDATOR_HOTKEY_SS58  → test validator's ss58 address
+      - dependencies.auth.VALIDATOR_HOTKEYS_SS58 → {"current": test validator's ss58 address}
 
     MinerService is overridden so no real SSH or TDX operations occur.
     """
@@ -84,7 +84,9 @@ def client(validator_keypair, miner_keypair, monkeypatch):
     monkeypatch.setattr(settings, "DEFAULT_MINER_HOTKEY", miner_keypair.ss58_address)
 
     # --- patch validator auth ---
-    monkeypatch.setattr("routes.apis.VALIDATOR_HOTKEY_SS58", validator_keypair.ss58_address)
+    monkeypatch.setattr(
+        "dependencies.auth.VALIDATOR_HOTKEYS_SS58", {"current": validator_keypair.ss58_address}
+    )
 
     # --- build minimal app ---
     app = FastAPI()
