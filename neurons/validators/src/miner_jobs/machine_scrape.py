@@ -841,6 +841,22 @@ def get_container_log_bytes(docker_root_dir: str) -> int:
     return total
 
 
+def get_host_disk_usage():
+    # total/used/free of the filesystem that holds docker's data root — where rented containers,
+    # images and volumes land — read through PID 1's root like the walks above. `/` is this
+    # container's own overlay: on a host with /var/lib/docker on its own partition it reported the
+    # root partition, so a 5 TB docker volume listed as 1.8 TB (ticket-0286, DAH-2771). Without a
+    # docker answer, or outside the executor container, `/` stays the measurement.
+    try:
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+    host_docker_root = f"/proc/1/root{docker_root_dir}"
+    if os.path.isdir(host_docker_root):
+        return shutil.disk_usage(host_docker_root)
+    return shutil.disk_usage("/")
+
+
 def get_docker_disk_usage():
     # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
     df = docker_api_get("/system/df")
@@ -1495,7 +1511,7 @@ def get_machine_specs():
 
     data["data_hard_disk"] = {}
     try:
-        disk_usage = shutil.disk_usage("/")
+        disk_usage = get_host_disk_usage()
         data["data_hard_disk"] = {
             "hard_disk_total": disk_usage.total // 1024,  # in kB
             "hard_disk_used": disk_usage.used // 1024,
