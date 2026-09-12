@@ -287,6 +287,25 @@ class Settings(BaseSettings):
     # from a real 8-GPU box show what that costs an honest miner.
     MATMUL_ALLCARDS_CHECK_ENABLED: bool = Field(env="MATMUL_ALLCARDS_CHECK_ENABLED", default=False)
     MATMUL_ALLCARDS_ENFORCEMENT_ENABLED: bool = Field(env="MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", default=False)
+    # DAH-3137 — on-host GPU hardware-signature challenge (a building block for liumd/DAH-2834).
+    # The prober ships pre-built in the executor image (at GPU_SIGNATURE_BINARY_RELATIVE under the
+    # executor root — NOT uploaded per check) and is driven with a fresh per-card nonce; each result
+    # is authenticated by libgpusig.so (the verifier binary, source in the private celium-gpu-verifier
+    # repo). CHECK_ENABLED runs it per claimed card and OBSERVES (verdict logged, score untouched);
+    # ENFORCEMENT is reserved for after the per-class envelope is calibrated on real hardware and the
+    # score gate is wired — until then it only raises the failing event from warning to error. Default
+    # False: absence of the binary or the verifier skips the check.
+    ENABLE_GPU_SIGNATURE_CHECK: bool = Field(env="ENABLE_GPU_SIGNATURE_CHECK", default=False)
+    GPU_SIGNATURE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_SIGNATURE_ENFORCEMENT_ENABLED", default=False)
+    # Must match the key baked into (or injected into) the executor image; provisioned via env /
+    # shared config in prod and rotated per release. The dev default matches the prober's compiled
+    # default. Passed opaquely to libgpusig.so — never used to compute a seal here.
+    GPU_SIGNATURE_KEY: str = Field(
+        env="GPU_SIGNATURE_KEY", default="lium-gpu-sig-dev-key-do-not-use-in-prod"
+    )
+    GPU_SIGNATURE_BINARY_RELATIVE: str = Field(env="GPU_SIGNATURE_BINARY_RELATIVE", default="bin/gpu_sig")
+    GPU_SIGNATURE_MAX_CONCURRENT: int = Field(env="GPU_SIGNATURE_MAX_CONCURRENT", default=8)
+    GPU_SIGNATURE_TIMEOUT_SECONDS: int = Field(env="GPU_SIGNATURE_TIMEOUT_SECONDS", default=120)
     # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
     # host's Docker daemon creates the probe with `--cpus=<advertised>` and rejects a count that
     # exceeds the machine's physical cores (a signal the lscpu wrapper cannot forge, since dockerd
