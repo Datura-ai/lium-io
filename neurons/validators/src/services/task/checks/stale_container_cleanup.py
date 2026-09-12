@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import logging
 import time
+
+from core.utils import _m
+from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+logger = logging.getLogger(__name__)
 
 
 # DAH-2805: how often the download-temporary sweep may run per executor. The check itself runs every
@@ -50,11 +56,24 @@ class StaleContainerCleanupCheck:
         self._last_sweep_at: dict[str, float] = {}
 
     async def run(self, ctx: Context) -> CheckResult:
-        removed_count, removed_names = await ctx.services.container_cleanup.cleanup(
-            ssh_client=ctx.ssh,
-            rented_data=ctx.state.rented_data,
-            executor_uuid=ctx.executor.uuid,
-        )
+        # DAH-1932: when a miner re-adds an executor it gets a new subnet UUID for the same
+        # IP:port. `rented_data` is keyed by UUID, so the tenant that is still running on the
+        # box is listed under the OLD uuid and this executor looks unrented. Removing "orphans"
+        # now would kill a paying customer's pod. A UUID this validator has never run the cleanup
+        # for gets one cycle of grace; the set lives in Redis so a validator restart does not
+        # reopen the race. The grace is a bridge, not the fix: the backend remaps the row to the
+        # new UUID only on a publish with a positive score, and a first cycle that fails
+        # PortCountCheck publishes 0 — closing that (in the validator by address, or in the
+        # backend's zero-score publish) is the open question on the PR.
+        first_sight = await self._first_sight(ctx)
+        if first_sight:
+            removed_count, removed_names = 0, []
+        else:
+            removed_count, removed_names = await ctx.services.container_cleanup.cleanup(
+                ssh_client=ctx.ssh,
+                rented_data=ctx.state.rented_data,
+                executor_uuid=ctx.executor.uuid,
+            )
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
         # on one prod node. Swept from here because this check reaches every node, whatever image it
@@ -88,8 +107,26 @@ class StaleContainerCleanupCheck:
             what={
                 "removed_count": removed_count,
                 "removed_containers": removed_names,
+                "first_sight_grace": first_sight,
                 "reclaimed_cache_volumes": reclaimed_cache_volumes,
                 "swept_download_temporaries": swept_download_temporaries,
             },
         )
         return CheckResult(passed=True, event=event)
+
+    async def _first_sight(self, ctx: Context) -> bool:
+        """Record the executor UUID; True the first time this validator meets it.
+
+        Redis trouble counts as first sight: skipping one cycle of garbage collection
+        costs one cycle of delayed GC, removing a live tenant's container cannot be undone.
+        """
+        try:
+            return bool(await ctx.services.redis.sadd(CLEANUP_SEEN_EXECUTORS_SET, ctx.executor.uuid))
+        except Exception as e:  # noqa: BLE001 - best-effort check, never fatal
+            logger.warning(
+                _m(
+                    "Could not record executor as seen; skipping stale container cleanup this cycle",
+                    extra={"executor_uuid": ctx.executor.uuid, "error": str(e)},
+                )
+            )
+            return True

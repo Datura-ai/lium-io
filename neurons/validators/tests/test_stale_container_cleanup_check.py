@@ -6,7 +6,11 @@ platform does not tear down) cannot keep binding the rental port range and deadl
 port verification.
 """
 
+import asyncio
+
 import pytest
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeRedis
 from helpers import build_services, build_state, default_executor, make_context
 from neurons.validators.src.services.task.checks import StaleContainerCleanupCheck
 from neurons.validators.src.services.task.checks.stale_container_cleanup import (
@@ -51,8 +55,31 @@ class RecordingContainerCleanup:
         return self._swept
 
 
-def _make_ctx(cleanup, rented_data=None):
-    services = build_services(container_cleanup=cleanup)
+class SeenExecutorsRedis:
+    """The one Redis call the check makes: SADD on the seen-executors set (DAH-1932).
+
+    Starts with every UUID already seen, so the existing tests exercise a node the
+    validator knows; ``seen=set()`` makes the next visit a first sight.
+    """
+
+    def __init__(self, seen=None, error=None):
+        self.seen = set(seen) if seen is not None else None  # None = knows everyone
+        self.error = error
+        self.calls = []
+
+    async def sadd(self, key, elem):
+        self.calls.append((key, elem))
+        if self.error:
+            raise self.error
+        if self.seen is None:
+            return 0
+        added = 0 if elem in self.seen else 1
+        self.seen.add(elem)
+        return added
+
+
+def _make_ctx(cleanup, rented_data=None, redis=None):
+    services = build_services(container_cleanup=cleanup, redis=redis or SeenExecutorsRedis())
     state = build_state(rented_data=rented_data)
     return make_context(services=services, state=state, ssh="ssh-conn-sentinel")
 
@@ -87,7 +114,7 @@ async def test_passes_cleanup_args_through():
         },
         banned_guids=[],
     )
-    services = build_services(container_cleanup=cleanup)
+    services = build_services(container_cleanup=cleanup, redis=SeenExecutorsRedis())
     state = build_state(rented_data=rented_data)
     ctx = make_context(executor=executor, services=services, state=state, ssh="ssh-conn-sentinel")
 
@@ -171,3 +198,78 @@ async def test_the_sweep_is_throttled_per_executor():
 
     assert len(cleanup.sweep_calls) == 1
     assert second_result.event.what_we_saw["swept_download_temporaries"] is None
+
+
+# DAH-1932: a re-registered executor (new subnet UUID, same box) shows up with empty rented_data
+# because the tenant is still filed under the old UUID; the backend remaps only after this
+# cycle's spec publish. Killing "orphans" on that first visit killed paying customers' pods.
+
+
+@pytest.mark.asyncio
+async def test_first_sight_of_an_executor_uuid_skips_container_removal():
+    cleanup = RecordingContainerCleanup(result=(1, ["pod_tenant"]))
+    redis = SeenExecutorsRedis(seen=set())
+    ctx = _make_ctx(cleanup, redis=redis)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert cleanup.calls == []
+    assert result.passed is True
+    assert result.event.what_we_saw["removed_count"] == 0
+    assert result.event.what_we_saw["first_sight_grace"] is True
+    assert redis.calls == [("cleanup_seen_executors", ctx.executor.uuid)]
+    # The disk sweeps do not depend on rented state and still run.
+    assert len(cleanup.sweep_calls) == 1 and len(cleanup.reclaim_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_sight_of_the_same_uuid_cleans_up():
+    cleanup = RecordingContainerCleanup(result=(1, ["pod_orphan"]))
+    redis = SeenExecutorsRedis(seen=set())
+    check = StaleContainerCleanupCheck()
+
+    await check.run(_make_ctx(cleanup, redis=redis))
+    second = await check.run(_make_ctx(cleanup, redis=redis))
+
+    assert len(cleanup.calls) == 1
+    assert second.event.what_we_saw["removed_count"] == 1
+    assert second.event.what_we_saw["first_sight_grace"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_known_uuid_is_cleaned_on_its_first_visit_after_a_validator_restart():
+    """The set lives in Redis, not on the check instance: a fresh check object must not
+    hand every executor another grace cycle."""
+    cleanup = RecordingContainerCleanup(result=(1, ["pod_orphan"]))
+    redis = SeenExecutorsRedis(seen=set())
+
+    await StaleContainerCleanupCheck().run(_make_ctx(cleanup, redis=redis))
+    await StaleContainerCleanupCheck().run(_make_ctx(cleanup, redis=redis))
+
+    assert len(cleanup.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_redis_trouble_skips_removal_and_stays_non_fatal():
+    cleanup = RecordingContainerCleanup(result=(1, ["pod_tenant"]))
+    ctx = _make_ctx(cleanup, redis=SeenExecutorsRedis(error=ConnectionError("redis down")))
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert cleanup.calls == []
+    assert result.passed is True
+    assert result.event.what_we_saw["first_sight_grace"] is True
+
+
+@pytest.mark.asyncio
+async def test_redis_service_sadd_returns_one_only_for_a_new_member():
+    # the grace rests on `RedisService.sadd` returning what Redis returns: 1 the first time, 0 after
+    from neurons.validators.src.services.redis_service import CLEANUP_SEEN_EXECUTORS_SET, RedisService
+
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeRedis(server=FakeServer())
+    service.lock = asyncio.Lock()
+
+    assert await service.sadd(CLEANUP_SEEN_EXECUTORS_SET, "uuid-b") == 1
+    assert await service.sadd(CLEANUP_SEEN_EXECUTORS_SET, "uuid-b") == 0
+    assert await service.sadd(CLEANUP_SEEN_EXECUTORS_SET, "uuid-c") == 1
