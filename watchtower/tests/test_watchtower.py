@@ -13,96 +13,20 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
 from watchtower import (
-    get_current_image_digest,
+    CANONICAL_REGISTRY_HOST,
+    DigestMismatchError,
+    RunnerLookupError,
+    container_create_kwargs,
+    find_runner_container,
     fetch_verified_digest,
     verify_watchtower_signature,
     find_container_by_name,
     pull_and_restart_containers,
+    pull_image_by_digest,
+    recreate_container,
     check_and_update,
 )
 from models import WatchtowerDigestResponse
-
-
-# ── get_current_image_digest ──────────────────────────────────────────────────
-
-def test_get_current_image_digest_returns_digest_from_container():
-    """Should resolve the image digest via the running container."""
-    # Arrange
-    mock_client = Mock()
-    mock_container = Mock()
-    mock_container.attrs = {"Image": "sha256:imageid123"}
-    mock_client.containers.get.return_value = mock_container
-    mock_image = Mock()
-    mock_image.attrs = {"RepoDigests": ["daturaai/compute-subnet-executor-runner@sha256:abc123def456"]}
-    mock_client.images.get.return_value = mock_image
-
-    # Act
-    digest = get_current_image_digest(mock_client, "executor-runner")
-
-    # Assert — digest is extracted from the part after '@' in RepoDigests
-    assert digest == "sha256:abc123def456"
-    mock_client.containers.get.assert_called_once_with("executor-runner")
-    mock_client.images.get.assert_called_once_with("sha256:imageid123")
-
-
-def test_get_current_image_digest_returns_none_when_container_not_found():
-    """Should return None when the named container does not exist."""
-    # Arrange
-    mock_client = Mock()
-    mock_client.containers.get.side_effect = docker.errors.NotFound("not found")
-
-    # Act
-    digest = get_current_image_digest(mock_client, "executor-runner")
-
-    # Assert — NotFound is handled gracefully without raising
-    assert digest is None
-
-
-def test_get_current_image_digest_returns_none_when_container_has_no_image_id():
-    """Should return None without querying images when Image attr is absent."""
-    # Arrange
-    mock_client = Mock()
-    mock_container = Mock()
-    mock_container.attrs = {"Image": None}
-    mock_client.containers.get.return_value = mock_container
-
-    # Act
-    digest = get_current_image_digest(mock_client, "executor-runner")
-
-    # Assert — missing image ID short-circuits before calling images.get
-    assert digest is None
-    mock_client.images.get.assert_not_called()
-
-
-def test_get_current_image_digest_returns_none_when_repo_digests_empty():
-    """Should return None when the image has no RepoDigests."""
-    # Arrange
-    mock_client = Mock()
-    mock_container = Mock()
-    mock_container.attrs = {"Image": "sha256:imageid"}
-    mock_client.containers.get.return_value = mock_container
-    mock_image = Mock()
-    mock_image.attrs = {"RepoDigests": []}
-    mock_client.images.get.return_value = mock_image
-
-    # Act
-    digest = get_current_image_digest(mock_client, "executor-runner")
-
-    # Assert — empty RepoDigests means the digest is unavailable
-    assert digest is None
-
-
-def test_get_current_image_digest_returns_none_on_unexpected_exception():
-    """Should return None and not propagate unexpected errors."""
-    # Arrange
-    mock_client = Mock()
-    mock_client.containers.get.side_effect = Exception("Unexpected error")
-
-    # Act
-    digest = get_current_image_digest(mock_client, "executor-runner")
-
-    # Assert — unexpected exceptions are swallowed and None returned
-    assert digest is None
 
 
 # ── verify_watchtower_signature ───────────────────────────────────────────────
@@ -344,86 +268,350 @@ def test_find_container_by_name_returns_none_on_exception():
     assert result is None
 
 
+# ── fixtures: a runner container as `docker inspect` reports it ──────────────
+
+OLD_DIGEST = "sha256:" + "8c" * 32
+NEW_DIGEST = "sha256:" + "d1" * 32
+IMAGE = "daturaai/compute-subnet-executor-runner"
+COMPOSE_LABELS = {
+    "com.docker.compose.project": "executor",
+    "com.docker.compose.service": "executor-runner",
+    "com.docker.compose.config-hash": "abc",
+}
+
+
+def _fake_image(digest: str, cmd=None, entrypoint=None):
+    image = Mock()
+    image.attrs = {
+        "RepoDigests": [f"{IMAGE}@{digest}"],
+        "Config": {"Cmd": cmd, "Entrypoint": entrypoint or ["/entrypoint.sh"]},
+    }
+    return image
+
+
+def _fake_container(name="executor-executor-runner-1", cmd=None, entrypoint=None):
+    """The standard stack's runner: compose labels, `.env` bind, `unless-stopped`, one network."""
+    container = Mock()
+    container.name = name
+    container.id = "0123456789abcdef" * 4
+    container.short_id = container.id[:12]
+    container.attrs = {
+        "Id": container.id,
+        "Name": f"/{name}",
+        "Image": "sha256:oldimageid",
+        "Config": {
+            "Cmd": cmd,
+            "Entrypoint": entrypoint or ["/entrypoint.sh"],
+            "Env": ["PATH=/usr/local/bin:/usr/bin"],
+            "Labels": COMPOSE_LABELS,
+            "WorkingDir": "/root/executor",
+            "User": "",
+        },
+        "HostConfig": {
+            "Binds": [
+                "/var/run/docker.sock:/var/run/docker.sock:rw",
+                "/home/lium/compute-subnet/neurons/executor/.env:/root/executor/.env:rw",
+            ],
+            "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+            "NetworkMode": "executor_default",
+        },
+        "NetworkSettings": {
+            "Networks": {"executor_default": {"Aliases": ["executor-runner", container.id[:12]]}},
+        },
+    }
+    return container
+
+
+def _client_with(container, old_image=None, pulled_image=None):
+    client = Mock()
+    client.images.get.return_value = old_image or _fake_image(OLD_DIGEST)
+    client.images.pull.return_value = pulled_image or _fake_image(NEW_DIGEST)
+    created = Mock()
+    created.name, created.short_id = "executor-executor-runner-1", "newid"
+
+    def containers_get(reference):
+        if reference == "executor-runner":
+            raise docker.errors.NotFound("no CVM-named runner")
+        return created
+
+    client.containers.get.side_effect = containers_get
+    client.containers.list.return_value = [container] if container else []
+    client.api.create_container.return_value = {"Id": "newid"}
+    client.api.create_endpoint_config.side_effect = lambda aliases=None: {"Aliases": aliases}
+    client.api.create_networking_config.side_effect = lambda endpoints: {"EndpointsConfig": endpoints}
+    return client
+
+
+# ── pull_image_by_digest ─────────────────────────────────────────────────────
+
+def test_pull_image_by_digest_pulls_the_digest_reference_not_the_tag():
+    """Regression: a pull by tag lets a registry mirror answer with an old image (P119,
+    DAH-3419). The daemon is asked for `image@digest`, and the returned reference is
+    the one the container is created from."""
+    client = _client_with(None)
+
+    reference = pull_image_by_digest(client, IMAGE, NEW_DIGEST)
+
+    assert reference == f"{IMAGE}@{NEW_DIGEST}"
+    client.images.pull.assert_called_once_with(f"{IMAGE}@{NEW_DIGEST}")
+
+
+def test_pull_image_by_digest_falls_back_to_docker_hub_when_the_daemon_path_fails():
+    """Regression: the mirror answers 404 (or a proxy times out) for a digest it has not
+    cached, and the update stalls. The second pull names `registry-1.docker.io`, which the
+    daemon's `registry-mirrors` do not apply to."""
+    client = _client_with(None)
+    client.images.pull.side_effect = [docker.errors.NotFound("manifest unknown"), _fake_image(NEW_DIGEST)]
+
+    reference = pull_image_by_digest(client, IMAGE, NEW_DIGEST)
+
+    assert reference == f"{CANONICAL_REGISTRY_HOST}/{IMAGE}@{NEW_DIGEST}"
+    assert [c.args[0] for c in client.images.pull.call_args_list] == [
+        f"{IMAGE}@{NEW_DIGEST}",
+        f"{CANONICAL_REGISTRY_HOST}/{IMAGE}@{NEW_DIGEST}",
+    ]
+
+
+def test_pull_image_by_digest_rejects_an_image_without_the_requested_digest():
+    """Regression: the daemon resolves the reference to a cached image whose RepoDigests
+    do not carry the digest. Both attempts return such an image; the pull fails instead
+    of restarting the runner on the wrong image."""
+    client = _client_with(None)
+    client.images.pull.return_value = _fake_image(OLD_DIGEST)
+
+    with pytest.raises(DigestMismatchError):
+        pull_image_by_digest(client, IMAGE, NEW_DIGEST)
+
+    assert client.images.pull.call_count == 2
+
+
+# ── find_runner_container ────────────────────────────────────────────────────
+
+def test_find_runner_container_prefers_the_cvm_name():
+    """The CVM stack names the container `executor-runner`; that lookup wins and no label query runs."""
+    client = Mock()
+    cvm = _fake_container(name="executor-runner")
+    client.containers.get.return_value = cvm
+
+    assert find_runner_container(client) is cvm
+    client.containers.list.assert_not_called()
+
+
+def test_find_runner_container_finds_the_compose_service_by_label():
+    """Regression: the standard stack's container is `executor-executor-runner-1`, so a
+    lookup by the CVM name finds nothing and the node is never updated. The compose
+    service label identifies it whatever the project name is."""
+    runner = _fake_container()
+    client = _client_with(runner)
+
+    assert find_runner_container(client) is runner
+    client.containers.list.assert_called_once_with(
+        all=True, filters={"label": "com.docker.compose.service=executor-runner"}
+    )
+
+
+def test_find_runner_container_raises_when_the_label_is_ambiguous():
+    """Regression: two containers carry the service label (while `docker compose up -d`
+    renames the old runner and creates the new one, or a second project on the host) and
+    the lookup answered None, which reads as "no runner" and leads to a pull and a
+    CVM-shaped `executor-runner` created beside the real ones. The lookup now raises."""
+    client = _client_with(None)
+    client.containers.list.return_value = [_fake_container(), _fake_container(name="other-executor-runner-1")]
+
+    with pytest.raises(RunnerLookupError):
+        find_runner_container(client)
+
+
+def test_find_runner_container_raises_when_listing_fails():
+    """A docker error while listing is not "no runner": it raises, so nothing is created."""
+    client = _client_with(None)
+    client.containers.list.side_effect = docker.errors.APIError("daemon busy")
+
+    with pytest.raises(RunnerLookupError):
+        find_runner_container(client)
+
+
+# ── container_create_kwargs / recreate_container ─────────────────────────────
+
+def test_container_create_kwargs_copies_the_compose_configuration():
+    """Regression: the recreated runner used to get two hard-coded binds and no labels, so
+    compose no longer recognised it and the `.env` bind pointed at `~/.env`. The old
+    container's name, labels, binds, restart policy and network are what the new one gets."""
+    runner = _fake_container()
+    client = _client_with(runner)
+
+    kwargs = container_create_kwargs(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+    assert kwargs["image"] == f"{IMAGE}@{NEW_DIGEST}"
+    assert kwargs["name"] == "executor-executor-runner-1"
+    assert kwargs["labels"] == COMPOSE_LABELS
+    assert kwargs["host_config"] is runner.attrs["HostConfig"]
+    assert kwargs["environment"] == ["PATH=/usr/local/bin:/usr/bin"]
+    assert kwargs["working_dir"] == "/root/executor"
+    assert kwargs["user"] is None
+    assert kwargs["networking_config"] == {
+        "EndpointsConfig": {"executor_default": {"Aliases": ["executor-runner"]}}
+    }
+
+
+def test_container_create_kwargs_leaves_inherited_cmd_and_entrypoint_to_the_new_image():
+    """Regression: copying the Cmd/Entrypoint the old container took from its image pins
+    the new container to the old image's entrypoint. Values equal to the old image's are
+    dropped; a value set on the container itself is kept."""
+    runner = _fake_container(cmd=["--interval", "60"], entrypoint=["/entrypoint.sh"])
+    client = _client_with(runner, old_image=_fake_image(OLD_DIGEST, cmd=None, entrypoint=["/entrypoint.sh"]))
+
+    kwargs = container_create_kwargs(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+    assert kwargs["entrypoint"] is None
+    assert kwargs["command"] == ["--interval", "60"]
+
+
+def test_recreate_container_keeps_a_runner_on_the_host_at_every_step():
+    """Regression: stop and remove the old container, then fail to create the new one, and
+    the host has no runner until the next cycle creates a CVM-shaped one. The order is:
+    rename the old aside, create the new under the old name, stop the old, start the new,
+    remove the old. The old container is removed only after the new one runs."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    order = []
+    runner.rename.side_effect = lambda name: order.append(("rename", name))
+    runner.stop.side_effect = lambda timeout: order.append("stop")
+    runner.remove.side_effect = lambda force: order.append("remove")
+    client.api.create_container.side_effect = lambda **kwargs: order.append(("create", kwargs["name"])) or {"Id": "newid"}
+    client.api.start.side_effect = lambda cid: order.append(("start", cid))
+
+    recreate_container(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+    assert order == [
+        ("rename", f"executor-executor-runner-1-previous-{runner.short_id}"),
+        ("create", "executor-executor-runner-1"),
+        "stop",
+        ("start", "newid"),
+        "remove",
+    ]
+    runner.stop.assert_called_once_with(timeout=10)
+
+
+def test_recreate_container_puts_the_old_name_back_when_create_fails():
+    """The daemon refuses the create (bad HostConfig, disk full): the old container gets its
+    name back, is never stopped, and the error propagates."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    client.api.create_container.side_effect = docker.errors.APIError("no space left")
+
+    with pytest.raises(docker.errors.APIError):
+        recreate_container(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+    assert [c.args[0] for c in runner.rename.call_args_list] == [
+        f"executor-executor-runner-1-previous-{runner.short_id}",
+        "executor-executor-runner-1",
+    ]
+    runner.stop.assert_not_called()
+    runner.remove.assert_not_called()
+
+
+def test_recreate_container_restores_the_old_runner_when_the_old_one_does_not_stop():
+    """Regression: `stop` fails (daemon timeout) after the new container was created under
+    the real name, and the host keeps both: a running renamed old runner and a created,
+    never started new one. The new container is removed and the old one gets its name back."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    runner.stop.side_effect = docker.errors.APIError("stop timed out")
+
+    with pytest.raises(docker.errors.APIError):
+        recreate_container(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+    client.api.remove_container.assert_called_once_with("newid", force=True)
+    client.api.start.assert_not_called()
+    assert runner.rename.call_args_list[-1].args[0] == "executor-executor-runner-1"
+    runner.remove.assert_not_called()
+
+
+def test_recreate_container_restores_the_old_runner_when_the_new_one_does_not_start():
+    """Regression: the new container is created but does not start, and the host is left
+    with a stopped runner on the new digest that reads "up to date" forever. The new
+    container is removed, the old one gets its name back and is started again."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    client.api.start.side_effect = docker.errors.APIError("cannot start")
+
+    with pytest.raises(docker.errors.APIError):
+        recreate_container(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+    client.api.remove_container.assert_called_once_with("newid", force=True)
+    assert runner.rename.call_args_list[-1].args[0] == "executor-executor-runner-1"
+    runner.start.assert_called_once()
+    runner.remove.assert_not_called()
+
+
 # ── pull_and_restart_containers ───────────────────────────────────────────────
 
-@patch('watchtower.find_container_by_name')
-def test_pull_and_restart_containers_stops_old_and_creates_new(mock_find):
-    """Should pull the new image, stop/remove the old container, then create a fresh one."""
-    # Arrange
-    mock_client = Mock()
-    mock_container = Mock()
-    mock_container.short_id = "old123"
-    mock_find.return_value = mock_container
+def test_pull_and_restart_containers_rebuilds_the_compose_runner_from_the_digest():
+    """The standard stack: pull `image@digest`, then recreate `executor-executor-runner-1`
+    with its own configuration. The CVM-style `containers.run` fallback is not used."""
+    runner = _fake_container()
+    client = _client_with(runner)
 
-    # Act
-    result = pull_and_restart_containers(mock_client, "test-image", "sha256:newdigest")
+    result = pull_and_restart_containers(client, IMAGE, NEW_DIGEST)
 
-    # Assert — full lifecycle: pull → stop → remove → create
     assert result is True
-    mock_client.images.pull.assert_called_once_with("test-image@sha256:newdigest")
-    mock_container.stop.assert_called_once_with(timeout=10)
-    mock_container.remove.assert_called_once()
-    mock_client.containers.run.assert_called_once()
+    client.images.pull.assert_called_once_with(f"{IMAGE}@{NEW_DIGEST}")
+    runner.stop.assert_called_once_with(timeout=10)
+    runner.remove.assert_called_once_with(force=True)
+    assert client.api.create_container.call_args.kwargs["image"] == f"{IMAGE}@{NEW_DIGEST}"
+    assert client.api.create_container.call_args.kwargs["name"] == "executor-executor-runner-1"
+    client.containers.run.assert_not_called()
 
 
-@patch('watchtower.find_container_by_name')
-def test_pull_and_restart_containers_creates_container_when_none_exists(mock_find):
-    """Should still create a new container even when no prior container is found."""
-    # Arrange
-    mock_client = Mock()
-    mock_find.return_value = None
+def test_pull_and_restart_containers_creates_container_when_none_exists():
+    """No runner on the host (first CVM boot): one is created from the digest reference with
+    the CVM configuration."""
+    client = _client_with(None)
 
-    # Act
-    result = pull_and_restart_containers(mock_client, "test-image", "sha256:newdigest")
+    result = pull_and_restart_containers(client, IMAGE, NEW_DIGEST)
 
-    # Assert — no stop/remove attempted, but new container is still created
     assert result is True
-    mock_client.images.pull.assert_called_once_with("test-image@sha256:newdigest")
-    mock_client.containers.run.assert_called_once()
+    client.api.create_container.assert_not_called()
+    assert client.containers.run.call_args.args[0] == f"{IMAGE}@{NEW_DIGEST}"
+    assert client.containers.run.call_args.kwargs["name"] == "executor-runner"
 
 
-@patch('watchtower.find_container_by_name')
-def test_pull_and_restart_containers_creates_container_with_digest_image(mock_find):
-    """New container should be launched from the exact digest-pinned image reference."""
-    # Arrange
-    mock_client = Mock()
-    mock_find.return_value = None
+def test_pull_and_restart_containers_returns_false_and_keeps_the_runner_when_both_pulls_fail():
+    """Both pull attempts fail (mirror and Docker Hub): the result is False and the
+    runner is not stopped."""
+    runner = _fake_container()
+    client = _client_with(runner)
+    client.images.pull.side_effect = docker.errors.APIError("Pull failed")
 
-    # Act
-    pull_and_restart_containers(mock_client, "daturaai/executor", "sha256:abc123")
+    result = pull_and_restart_containers(client, IMAGE, NEW_DIGEST)
 
-    # Assert — containers.run receives the fully-qualified image@digest reference
-    call_kwargs = mock_client.containers.run.call_args
-    image_arg = call_kwargs[0][0]
-    assert image_arg == "daturaai/executor@sha256:abc123"
-
-
-@patch('watchtower.find_container_by_name')
-def test_pull_and_restart_containers_returns_false_on_docker_api_error(mock_find):
-    """Should return False when Docker raises an APIError during pull."""
-    # Arrange
-    mock_client = Mock()
-    mock_find.return_value = Mock()
-    mock_client.images.pull.side_effect = docker.errors.APIError("Pull failed")
-
-    # Act
-    result = pull_and_restart_containers(mock_client, "test-image", "sha256:digest")
-
-    # Assert — Docker API errors are caught and failure is reported
     assert result is False
+    assert client.images.pull.call_count == 2
+    runner.stop.assert_not_called()
 
 
-@patch('watchtower.find_container_by_name')
-def test_pull_and_restart_containers_returns_false_on_unexpected_error(mock_find):
+def test_pull_and_restart_containers_returns_false_when_the_runner_cannot_be_identified():
+    """Regression: an ambiguous lookup after the pull led to a CVM-shaped `executor-runner`
+    beside the real one. Nothing is created; the result is False."""
+    client = _client_with(None)
+    client.containers.list.return_value = [_fake_container(), _fake_container(name="other-executor-runner-1")]
+
+    result = pull_and_restart_containers(client, IMAGE, NEW_DIGEST)
+
+    assert result is False
+    client.containers.run.assert_not_called()
+    client.api.create_container.assert_not_called()
+
+
+def test_pull_and_restart_containers_returns_false_on_unexpected_error():
     """Should return False on any unexpected exception."""
-    # Arrange
-    mock_client = Mock()
-    mock_find.side_effect = Exception("Unexpected error")
+    client = _client_with(None)
+    client.images.pull.return_value = _fake_image(NEW_DIGEST)
+    client.containers.run.side_effect = Exception("boom")
 
-    # Act
-    result = pull_and_restart_containers(mock_client, "test-image", "sha256:digest")
+    result = pull_and_restart_containers(client, IMAGE, NEW_DIGEST)
 
-    # Assert — unexpected errors are caught and failure is reported
     assert result is False
 
 
@@ -431,40 +619,55 @@ def test_pull_and_restart_containers_returns_false_on_unexpected_error(mock_find
 
 @patch('watchtower.pull_and_restart_containers')
 @patch('watchtower.fetch_verified_digest')
-@patch('watchtower.get_current_image_digest')
 @patch('watchtower.docker.from_env')
 @patch('watchtower.settings')
-def test_check_and_update_pulls_when_digests_differ(
-    mock_settings, mock_docker, mock_get_digest, mock_fetch, mock_pull
-):
-    """Should trigger pull_and_restart when current and remote digests differ."""
-    # Arrange
-    mock_settings.WATCHTOWER_IMAGE = "test-image"
-    mock_client = Mock()
-    mock_docker.return_value = mock_client
-    mock_get_digest.return_value = "sha256:old"
-    mock_fetch.return_value = "sha256:new"
+def test_check_and_update_pulls_when_digests_differ(mock_settings, mock_docker, mock_fetch, mock_pull):
+    """The running runner's digest is read from the container found by label; it differs
+    from the signed digest, so the update runs with that digest."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    client = _client_with(_fake_container())
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
     mock_pull.return_value = True
 
-    # Act
     check_and_update()
 
-    # Assert — pull triggered with the client, image name, and the new remote digest
-    mock_pull.assert_called_once_with(mock_client, "test-image", "sha256:new")
+    mock_pull.assert_called_once_with(client, IMAGE, NEW_DIGEST)
 
 
 @patch('watchtower.pull_and_restart_containers')
 @patch('watchtower.fetch_verified_digest')
-@patch('watchtower.get_current_image_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_pulls_nothing_when_the_runner_is_not_identified(mock_settings, mock_docker, mock_fetch, mock_pull):
+    """Regression: two labelled containers (mid `docker compose up -d`) read as "no runner",
+    the signed digest was fetched and a runner was pulled and created. The cycle ends
+    before the endpoint is called."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    client = _client_with(None)
+    client.containers.list.return_value = [_fake_container(), _fake_container(name="other-executor-runner-1")]
+    mock_docker.return_value = client
+
+    check_and_update()
+
+    mock_fetch.assert_not_called()
+    mock_pull.assert_not_called()
+
+
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.container_image_digest')
+@patch('watchtower.find_runner_container')
 @patch('watchtower.docker.from_env')
 @patch('watchtower.settings')
 def test_check_and_update_skips_pull_when_digests_match(
-    mock_settings, mock_docker, mock_get_digest, mock_fetch, mock_pull
+    mock_settings, mock_docker, mock_find, mock_get_digest, mock_fetch, mock_pull
 ):
     """Should not pull when the current digest already matches the remote one."""
     # Arrange
     mock_settings.WATCHTOWER_IMAGE = "test-image"
     mock_docker.return_value = Mock()
+    mock_find.return_value = _fake_container()
     mock_get_digest.return_value = "sha256:same"
     mock_fetch.return_value = "sha256:same"
 
@@ -476,16 +679,18 @@ def test_check_and_update_skips_pull_when_digests_match(
 
 
 @patch('watchtower.fetch_verified_digest')
-@patch('watchtower.get_current_image_digest')
+@patch('watchtower.container_image_digest')
+@patch('watchtower.find_runner_container')
 @patch('watchtower.docker.from_env')
 @patch('watchtower.settings')
 def test_check_and_update_skips_when_remote_fetch_fails(
-    mock_settings, mock_docker, mock_get_digest, mock_fetch
+    mock_settings, mock_docker, mock_find, mock_get_digest, mock_fetch
 ):
     """Should return early without error when the remote digest cannot be fetched."""
     # Arrange
     mock_settings.WATCHTOWER_IMAGE = "test-image"
     mock_docker.return_value = Mock()
+    mock_find.return_value = _fake_container()
     mock_get_digest.return_value = "sha256:current"
     mock_fetch.return_value = None
 

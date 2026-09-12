@@ -8,12 +8,14 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
       - ./.env:/root/executor/.env
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
 
+  # The updater (source: ../../watchtower in this repository). Every WATCHTOWER_INTERVAL
+  # seconds it reads the runner digest the validator signed, checks the signature, and
+  # pulls the runner by that digest. It never pulls by tag: a Docker Hub mirror in the
+  # host's /etc/docker/daemon.json can keep serving an old `latest`, which left 99 of 493
+  # nodes on an old runner (DAH-3419). The tag is the version in ../../watchtower/pyproject.toml.
   watchtower:
-    image: nickfedor/watchtower
+    image: daturaai/lium-watchtower:1.1.0
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 60 --cleanup --label-enable
