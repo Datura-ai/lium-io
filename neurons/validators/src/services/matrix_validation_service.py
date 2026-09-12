@@ -159,6 +159,12 @@ class VerifierParams:
         return f"--dim_n {self.dim_n} --dim_k {self.dim_k} --seed {self.seed} --cipher_text {self.cipher_text}"
 
 
+# The error a probe that ran and answered no (or a wrong) uuid gets. CapabilityCheck classifies
+# only this failure by the probe's stderr: the other empty-uuid results (a sealed blob that failed
+# authentication, a stdout that could not be parsed) are not the probe's answer.
+UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
+
+
 @dataclass
 class ValidationResult:
     """Result of GPU validation with detailed debugging information."""
@@ -668,7 +674,10 @@ class ValidationService:
                         metrics=metrics
                     )
                 else:
-                    error_msg = f"UUID mismatch: expected '{verifier_params.uuid}', got '{uuid}'"
+                    error_msg = (
+                        f"{UUID_MISMATCH_ERROR_PREFIX}: "
+                        f"expected '{verifier_params.uuid}', got '{uuid}'"
+                    )
                     logger.error(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "returned_uuid": uuid, "error": error_msg})))
                     return ValidationResult(
                         success=False,
