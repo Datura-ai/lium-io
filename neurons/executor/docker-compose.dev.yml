@@ -8,12 +8,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
       - ./.env:/root/executor/.env
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
 
+  # Same updater as docker-compose.yml (DAH-3419); see the comment there. The `-staging`
+  # build has the staging digest endpoint baked in, which signs the `dev` runner.
   watchtower:
-    image: nickfedor/watchtower
+    image: daturaai/lium-watchtower:1.1.0-staging
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 60 --cleanup --label-enable

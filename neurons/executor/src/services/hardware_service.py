@@ -15,7 +15,7 @@ _docker_client = None
 _docker_client_lock = threading.Lock()
 
 
-def _get_docker_client() -> docker.DockerClient:
+def get_docker_client() -> docker.DockerClient:
     # one shared client with a bounded API timeout, so a wedged docker daemon cannot hold a call forever
     global _docker_client
     with _docker_client_lock:
@@ -216,7 +216,7 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
     """
     try:
         # Get Docker client
-        client = _get_docker_client()
+        client = get_docker_client()
         container = client.containers.get(container_name)
 
         # Get container stats (non-streaming, single sample)
