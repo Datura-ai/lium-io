@@ -4631,28 +4631,44 @@ class DockerService:
                 # Docker daemon and the credential stays in this validator's client, so nothing is
                 # written to the executor's ~/.docker/config.json for a `docker logout` to clear.
                 #
-                # The default cache-template images are public Docker Hub refs, so a
-                # registry login buys nothing for them — the pull needs no auth and is
-                # itself almost always skipped (the image is pre-cached on the executor).
-                # The backend still attaches credentials whenever the renter has any
-                # saved, which costs a round-trip to auth.docker.io on every such deploy
-                # (~1.1s median in prod). Skip the login on that path.
-                #
-                # `ships_sshd` IS the "renter selected a default image" signal — the
-                # backend sets it from the same check that resolves the recommended image
-                # for this executor's GPU+driver (executor.py: `ships_sshd=is_cached`,
-                # with `is_cached=False` forced for custom builds, so they keep this login
-                # path as-is; the DinD `docker build` never sees this SDK login, and
-                # passing credentials into it is a separate task). Don't re-derive it here:
-                # a second, validator-side notion of "is this a default image?" could
-                # disagree with the backend's and skip a login that was actually needed.
+                # DAH-3246: the login exists for one thing — the pull. When the image is already on
+                # the host there is no pull, and the login was a round trip to auth.docker.io for
+                # nothing (~1.1 s median in prod, 3.9 s on a far node). So the image probe comes
+                # first and the login runs only when a pull will follow and the backend attached
+                # credentials — whatever the image. Before this, the skip was keyed on
+                # `ships_sshd` (the backend's "default image" signal), which also skipped the login
+                # for a default image that still had to be pulled: that pull went anonymous, into
+                # Docker Hub's unauthenticated rate limit, while the credentials sat unused. A custom
+                # build has no image to probe and keeps the login it always had.
                 has_credentials = bool(payload.docker_username and payload.docker_password)
-                skip_login = not has_credentials or bool(payload.ships_sshd)
+                image_present = False
+                if not is_custom_build:
+                    current_step = "docker_image_inspect"
+                    try:
+                        image_present = await run_logged_rental_docker_sdk_operation(
+                            operation="inspect_image",
+                            log_extra=default_extra,
+                            call=lambda: docker_client.image_exists(
+                                image=payload.docker_image
+                            ),
+                            image=payload.docker_image,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            _m(
+                                "Docker SDK image inspect probe failed; falling back to pull",
+                                extra=get_extra_info({**default_extra, "error": str(exc)}),
+                            )
+                        )
+                    profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_IMAGE_INSPECT, prev_timestamp))
+                    prev_timestamp = now_ms()
+
+                skip_login = not has_credentials or image_present
                 if skip_login:
                     if has_credentials:
                         logger.info(
                             _m(
-                                "Skipping docker login for default cache-template image",
+                                "Skipping docker login; image already present, nothing to pull",
                                 extra=get_extra_info(default_extra),
                             )
                         )
@@ -4722,25 +4738,6 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.CUSTOM_DOCKER_BUILD, prev_timestamp))
                     prev_timestamp = now_ms()
                 else:
-                    current_step = "docker_image_inspect"
-                    image_present = False
-                    try:
-                        image_present = await run_logged_rental_docker_sdk_operation(
-                            operation="inspect_image",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.image_exists(
-                                image=payload.docker_image
-                            ),
-                            image=payload.docker_image,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            _m(
-                                "Docker SDK image inspect probe failed; falling back to pull",
-                                extra=get_extra_info({**default_extra, "error": str(exc)}),
-                            )
-                        )
-
                     current_step = "docker_pull"
                     if image_present:
                         logger.info(
