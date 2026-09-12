@@ -223,6 +223,15 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK run container failed", exc)
             ) from exc
 
+    async def create_container(self, spec: ContainerRunSpec, *, labels: dict[str, str] | None = None) -> None:
+        """`docker create` only — the container is left in the `created` state (warm pool slots)."""
+        try:
+            await _in_docker_thread(self._create_container_sync, spec, labels)
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK create container failed", exc)
+            ) from exc
+
     async def exec_in_container(self, spec: ContainerExecSpec) -> ContainerExecResult:
         last_restart_error: Exception | None = None
         for attempt in range(len(_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS) + 1):
@@ -456,6 +465,12 @@ class RentalDockerSdkClient:
         return None
 
     def _run_container_sync(self, spec: ContainerRunSpec) -> None:
+        self._create_container_sync(spec, None)
+        self._api_client.start(spec.name)
+
+    def _create_container_sync(self, spec: ContainerRunSpec, labels: dict[str, str] | None) -> None:
+        # the rental network (DAH-3199) must exist before any `docker create` that names it — a rental's
+        # and a warm-pool slot's alike (DAH-3265): the slot is created on the same spec, started later
         if spec.network:
             self._ensure_rental_network_sync(spec.network)
         host_config = self._api_client.create_host_config(
@@ -470,9 +485,9 @@ class RentalDockerSdkClient:
             volumes=_container_volumes(spec.volumes) or None,
             name=spec.name,
             entrypoint=spec.entrypoint or None,
+            labels=labels or None,
             host_config=host_config,
         )
-        self._api_client.start(spec.name)
 
     def _ensure_rental_network_sync(self, name: str) -> None:
         """The container's network exists on the host and has inter-container traffic off.

@@ -6,6 +6,7 @@ from typing import Optional
 import asyncssh
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
 from core.utils import _m
 from services.const import (
@@ -17,6 +18,7 @@ from services.const import (
     FILLER_CONTAINER_PREFIX,
     POD_CONTAINER_PREFIX,
     RENTAL_CONTAINER_PREFIXES,
+    WARM_CONTAINER_PREFIX,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,8 +96,17 @@ class ContainerCleanup:
                 if stripped_name in rented_containers:
                     continue
 
+                threshold_minutes = self.stale_threshold_minutes
+                if stripped_name.startswith(WARM_CONTAINER_PREFIX):
+                    # A warm-pool slot (services/warm_pool.py) lives WARM_POOL_MAX_AGE_HOURS by
+                    # design: every validator sweeps every executor, so the slot's own age — not the
+                    # rental grace, and not this validator's WARM_POOL_ENABLED — decides, or a peer
+                    # with the flag off would remove another validator's slots 15 min after each
+                    # filler start. A slot left behind by a flag flip goes at that age too.
+                    threshold_minutes = settings.WARM_POOL_MAX_AGE_HOURS * 60
+
                 age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
-                if age_minutes and age_minutes > self.stale_threshold_minutes:
+                if age_minutes and age_minutes > threshold_minutes:
                     if self.dry_run:
                         logger.info(
                             _m(
@@ -499,7 +510,7 @@ class ContainerCleanup:
             )
             if created_result.exit_status != 0:
                 return None
-            created_timestamp = int(created_result.stdout.strip())
+            created_timestamp = self._container_age_start(created_result.stdout)
 
             # Get current time on the machine
             current_result = await ssh_client.run("date +%s")
@@ -520,6 +531,27 @@ class ContainerCleanup:
             )
             return None
 
+    @staticmethod
+    def _container_age_start(inspect_output: str) -> int:
+        """The epoch second a container's age counts from: `Created`, `StartedAt` and the
+        `lium.warm_pool` label as `inspect_created_timestamp` prints them.
+
+        A pod adopted from a warm-pool slot was created hours before the rental started it and keeps
+        the slot's label through the rename, so a labelled container's age counts from its last
+        start — a restart-policy restart minutes into the rental must not make it read 24 h old
+        (taiberium, #1337). Every other container counts from `Created`, as before the pool: a
+        `pod_*` stopped and started again does not become young, so the 15-minute sweep still
+        reaches it. Not gated on WARM_POOL_ENABLED: every validator sweeps every executor, and one
+        reading `Created` alone would remove another validator's adopted pod inside its
+        rented-snapshot window."""
+        parts = inspect_output.split()
+        if len(parts) not in (2, 3):
+            # an absent label prints an empty line (two tokens); anything else is an error text
+            raise ValueError(f"age inspect printed {len(parts)} tokens")
+        created, started = int(parts[0]), int(parts[1])
+        adopted_slot = len(parts) == 3 and parts[2] == "1"
+        return max(created, started) if adopted_slot else created
+
     async def _remove_container(self, ssh_client, container_name: str) -> bool:
         """Remove a container and its associated resources."""
         try:
@@ -528,10 +560,12 @@ class ContainerCleanup:
             if result.exit_status != 0:
                 return False
 
-            # Remove associated volume if it's a pod container
-            if container_name.startswith(POD_CONTAINER_PREFIX):
-                pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
-                await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
+            # Remove the associated volume of a pod container — or of a warm-pool slot, whose
+            # never-used `volume_<slot id>` is named the same way
+            for prefix in (POD_CONTAINER_PREFIX, WARM_CONTAINER_PREFIX):
+                if container_name.startswith(prefix):
+                    owner_id = container_name.removeprefix(prefix)
+                    await ssh_client.run(DockerCommand.volume_remove(f"volume_{owner_id}"))
 
             return True
 

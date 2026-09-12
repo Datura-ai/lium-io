@@ -17,7 +17,9 @@ the plugin is already enabled. Covered here:
 - `create_local_volume` with an enabled plugin runs no SSH command and creates the identical volume;
   with the plugin absent it still installs (negative control);
 - `create_container` never probes with the flag off, probes once with it on and hands the probe to
-  both the sizing and the create.
+  both the sizing and the create;
+- DAH-3265: the warm-pool slot volumes are one more section of the same command (no second probe),
+  and the parser leaves them out of the names the sizing inspects.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import pytest
 from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE, df_command
 from payload_models.payloads import ContainerCreateRequest
+from services import warm_pool
 from services.docker_service import (
     DockerService,
     VolumeHostProbe,
@@ -62,6 +65,7 @@ def _probe_stdout(
     df: str | None = _DF_STDOUT,
     volumes: str = "",
     volume_ls_status: str | None = "0",
+    slot_volumes: tuple[str, ...] = (),
     plugin: str = "true",
 ) -> str:
     lines = [f"ROOT\t{root}"]
@@ -70,6 +74,7 @@ def _probe_stdout(
     lines.extend(volumes.splitlines())
     if volume_ls_status is not None:
         lines.append(f"VOLS\t{volume_ls_status}")
+    lines.extend(f"SLOT\t{name}" for name in slot_volumes)
     lines.append(f"PLUGIN\t{plugin}")
     return "\n".join(lines) + "\n"
 
@@ -104,6 +109,9 @@ def test_probe_command_is_one_line_with_every_section():
     )
     assert "/usr/bin/docker plugin inspect --format '{{.Enabled}}' vloopback" in command
     assert "plugin install" not in command
+    # DAH-3265: the warm-pool slot volumes ride in the same command, tagged for the parser
+    assert warm_pool.slot_volumes_command(tag="SLOT") + "; " in command
+    assert command.count("docker ps") == 1
 
 
 def test_probe_command_without_df_skips_the_helper_container():
@@ -133,7 +141,26 @@ def test_parse_probe_reads_root_df_vloopback_names_and_plugin():
     assert probe.docker_root_dir == "/var/lib/docker"
     assert probe.df_avail_bytes == 966367641600
     assert probe.vloopback_volume_names == ["volume_abc", "volume_def"]
+    assert probe.warm_slot_volume_names == []
     assert probe.loopback_plugin_enabled is True
+
+
+def test_parse_probe_leaves_warm_pool_slot_volumes_out_of_the_vloopback_names():
+    # DAH-3265: a slot's sparse volume declares a whole-host size and holds no bytes; the sizing
+    # must not sum it. The probe's SLOT section names it and the parser drops it from the names
+    # the inspect will size — the same filter `_warm_slot_volume_names` applies per command.
+    stdout = _probe_stdout(
+        volumes=(
+            "VOL\tvolume_pod1\tvloopback:latest\n"
+            "VOL\tvolume_slot9\tvloopback:latest\n"
+        ),
+        slot_volumes=("volume_slot9", "volume_gone"),  # a slot whose volume `volume ls` no longer lists
+    )
+
+    probe = _parse_volume_host_probe(stdout, with_df=True)
+
+    assert probe.vloopback_volume_names == ["volume_pod1"]
+    assert probe.warm_slot_volume_names == ["volume_slot9"]
 
 
 @pytest.mark.parametrize("plugin_state", ["false", "absent", ""])
@@ -190,7 +217,7 @@ def test_parse_probe_error_message_caps_the_echoed_host_output(stdout):
 # ---------------------------------------------------------------------------
 
 _DOCKER_STUB = """#!/bin/sh
-# stands in for /usr/bin/docker: answers the four sub-commands the probe issues
+# stands in for /usr/bin/docker: answers the six sub-commands the probe issues
 mode="$(cat "$STUB_MODE_FILE")"
 case "$1 $2" in
   "info --format") echo /var/lib/docker ;;
@@ -198,9 +225,12 @@ case "$1 $2" in
   "volume ls")
     case "$mode" in
       volumes) printf 'VOL\\tvolume_abc\\tvloopback:latest\\nVOL\\tother\\tlocal\\n' ;;
+      slot) printf 'VOL\\tvolume_abc\\tvloopback:latest\\nVOL\\tvolume_slot9\\tvloopback:latest\\n' ;;
       empty) ;;
       ls-fails) echo "Cannot connect to the Docker daemon" >&2; exit 1 ;;
     esac ;;
+  "ps -aq") [ "$mode" = slot ] && echo 0f0f0f0f0f0f ;;  # the warm-pool slot listing: one created slot, or none
+  "inspect --format") printf 'SLOT\\tvolume_slot9\\n' ;;  # what the SLOT template renders for that slot
   "plugin inspect") [ "$mode" = plugin-absent ] && { echo; exit 1; }; echo true ;;  # real docker: blank stdout line, then exit 1
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -233,6 +263,17 @@ def test_probe_command_through_a_shell_parses_volumes(tmp_path):
     assert probe.df_avail_bytes == 42
     assert probe.vloopback_volume_names == ["volume_abc"]
     assert probe.loopback_plugin_enabled is True
+
+
+def test_probe_command_through_a_shell_leaves_the_slot_volume_out(tmp_path):
+    # DAH-3265: the slot listing is a section of the one probe command (`docker ps -aq … | xargs
+    # docker inspect`), and the slot's volume never reaches the names the sizing will inspect.
+    stdout = _run_probe_command_with_stub(tmp_path, "slot")
+
+    assert "SLOT\tvolume_slot9\n" in stdout
+    probe = _parse_volume_host_probe(stdout, with_df=True)
+    assert probe.vloopback_volume_names == ["volume_abc"]
+    assert probe.warm_slot_volume_names == ["volume_slot9"]
 
 
 def test_probe_command_through_a_shell_empty_volume_list_is_zero_volumes(tmp_path):
@@ -349,7 +390,9 @@ async def test_resolve_volume_sizing_with_probe_matches_per_command_result(docke
     # Assert: identical sizing, and the probe path ran exactly the inspect command.
     assert with_probe == per_command
     assert with_probe.path == "fresh" and with_probe.volume_limit_gb == 393
-    assert per_command_ssh.run.await_count == 4  # info, df, volume ls, volume inspect
+    # info, df, volume ls, the warm-pool slot listing (DAH-3265, not gated on its flag: a slot
+    # another validator left must stay out of the sum), volume inspect
+    assert per_command_ssh.run.await_count == 5
     assert probe_ssh.run.await_count == 1
     assert probe_ssh.run.await_args.args[0].startswith("/usr/bin/docker volume inspect volume_abc ")
 
@@ -397,8 +440,8 @@ async def test_resolve_volume_sizing_probe_without_df_falls_back_to_per_command_
 
     assert result.path == "fresh"
     assert (
-        ssh_client.run.await_count == 3
-    )  # info, df, volume ls (no vloopback volumes → no inspect)
+        ssh_client.run.await_count == 4
+    )  # info, df, volume ls, slot listing (no vloopback volumes → no inspect)
 
 
 # ---------------------------------------------------------------------------

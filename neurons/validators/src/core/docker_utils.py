@@ -81,11 +81,21 @@ class DockerCommand:
 
     @staticmethod
     def inspect_created_timestamp(container_id: str) -> str:
-        """Build docker inspect command to get creation timestamp in seconds."""
+        """Build docker inspect command printing, one per line, the creation and last-start timestamps
+        in seconds and the container's `lium.warm_pool` label (empty when absent).
+
+        A never-started container prints docker's zero time (year 1) for the second line. A warm-pool
+        slot (services/warm_pool.py) is created long before the rental that adopts it starts it and
+        keeps its label through the adopting rename, so `ContainerCleanup` ages a labelled container
+        from its start; every other container ages from `Created`, as before the pool. Not gated on
+        WARM_POOL_ENABLED: an adopted pod is swept by every validator's cleanup, whatever that
+        validator's flag says."""
+        quoted = shlex.quote(container_id)
         return (
-            f"/usr/bin/docker inspect {shlex.quote(container_id)} "
-            "--format '{{json .Created}}' | "
-            "xargs -I {} date -d {} +%s"
+            f"/usr/bin/docker inspect {quoted} "
+            "--format '{{.Created}}{{\"\\n\"}}{{.State.StartedAt}}' | "
+            "xargs -I {} date -d {} +%s; "
+            f"/usr/bin/docker inspect {quoted} --format '{{{{index .Config.Labels \"lium.warm_pool\"}}}}'"
         )
 
     @staticmethod
