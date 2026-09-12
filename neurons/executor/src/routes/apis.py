@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import json
 import logging
 import os
 import threading
@@ -13,16 +14,26 @@ from typing import Annotated, Any, Optional
 import bittensor
 import docker
 from datura.requests.validator_requests import ssh_pubkey_signing_blob
-from fastapi import APIRouter, Depends, Query, Header, HTTPException
+from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics, get_container_metrics
 from core.config import VALIDATOR_HOTKEY_SS58, settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
-from payloads.backend import ContainerUtilizationPayload
-from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature
+from payloads.backend import ContainerUtilizationPayload, SignaturePayload
+from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
+from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature, verify_signature
+from services.local_verify_service import (
+    BusyError,
+    LocalVerifyService,
+    NonceCache,
+    canonical_intent_message,
+    check_intent_target,
+    check_intent_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -339,15 +350,94 @@ async def ping(_: None = Depends(verify_ping_signature)):
     return {"status": "pong"}
 
 
+def _capabilities() -> list[str]:
+    # What a validator may call beyond the routes every executor has. Read per request so a flag
+    # flip is visible without a restart of anything but this process.
+    return [LOCAL_VERIFY_CAPABILITY] if settings.EXECUTOR_LOCAL_VERIFY_ENABLED else []
+
+
 @apis_router.get("/version")
 async def get_version():
     """
     Get the executor version information.
 
     Returns:
-        dict: {"version": "x.y.z"}
+        dict: {"version": "x.y.z", "capabilities": [...]}
     """
-    return {"version": _get_version()}
+    return {"version": _get_version(), "capabilities": _capabilities()}
+
+
+_local_verify_nonces = NonceCache()
+_local_verify_service: LocalVerifyService | None = None
+
+
+def _get_local_verify_service() -> LocalVerifyService:
+    global _local_verify_service
+    if _local_verify_service is None:
+        _local_verify_service = LocalVerifyService(
+            executor_version=_get_version(),
+            max_deadline_s=settings.LOCAL_VERIFY_MAX_DEADLINE_SECONDS,
+            port_range=settings.RENTING_PORT_RANGE,
+            port_mappings=settings.RENTING_PORT_MAPPINGS,
+            ssh_port=settings.SSH_PORT,
+        )
+    return _local_verify_service
+
+
+@apis_router.post("/verify")
+async def local_verify(request: Request):
+    """Run the verification suite locally from one validator-signed intent (liumd phase 1).
+
+    Auth is the validator hotkey signature every validator-facing route here uses
+    (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
+    (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
+    window. Flag off → 404. (An image without the route answers 422 from MinerMiddleware instead;
+    the validator treats every non-200 as "use SSH".)
+    """
+    if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    try:
+        raw = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Body is not JSON")
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=422, detail="Body is not an object")
+    try:
+        intent = VerifyIntent.model_validate(raw)
+    except ValidationError as exc:
+        # `exc.errors()` carries the raising ValueError object in `ctx` for a model_validator
+        # refusal (a shared card challenge): serialised here, or the 422 would be a 500.
+        raise HTTPException(status_code=422, detail=json.loads(exc.json()))
+    # Signed as sent: the validator signs the document it puts on the wire, so a field it left at
+    # its default is not re-serialised here and a field it did send cannot be altered in flight.
+    await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))
+
+    refused = check_intent_window(
+        intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
+    ) or check_intent_target(intent, settings.MINER_HOTKEY_SS58_ADDRESS)
+    if refused:
+        raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
+    service = _get_local_verify_service()
+    # Busy is answered before the nonce is claimed, so a refused-because-busy intent is not burnt:
+    # the validator may re-send the same signed intent once the executor is free.
+    if service.busy:
+        raise HTTPException(status_code=409, detail="a verification is already running")
+    if not _local_verify_nonces.claim(intent.nonce, float(intent.expires_at)):
+        raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
+
+    try:
+        result = await service.run(intent)
+    except BusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    logger.info(
+        "local verify done nonce=%s elapsed_ms=%d deadline_hit=%s steps=%s",
+        intent.nonce,
+        result.elapsed_ms,
+        result.deadline_hit,
+        {name: step.status for name, step in result.steps.items()},
+    )
+    return result.model_dump(by_alias=True)
 
 
 @apis_router.get("/containers/{container_name}/logs")

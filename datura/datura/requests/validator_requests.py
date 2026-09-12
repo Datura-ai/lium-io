@@ -73,6 +73,25 @@ def ssh_pubkey_signing_blob(public_key: str, nonce: str | None = None) -> str:
     return f"{public_key}\nnonce:{nonce}"
 
 
+# liumd phase 1 (DAH-2834): the validator's one-call verification intent, `POST /verify` on the
+# executor. Schema id of the wire documents and the capability string `GET /version` advertises.
+LOCAL_VERIFY_SCHEMA = "lium.local_verify/1"
+LOCAL_VERIFY_CAPABILITY = "local_verify/1"
+
+
+def local_verify_signing_blob(intent: dict) -> str:
+    """Canonical message the validator signs over a `/verify` intent.
+
+    CRITICAL: the single source of truth for the intent signature, shared by the validator
+    (signer, `neurons/validators/src/services/local_verify_client.py`) and the executor (verifier,
+    `neurons/executor/src/services/local_verify_service.py`). The executor rebuilds it from the
+    request body it received, so both sides must serialise the same way: every key but `signature`,
+    sorted keys, no whitespace, ASCII-escaped. Any change here breaks every /verify fleet-wide.
+    """
+    unsigned = {k: v for k, v in intent.items() if k != "signature"}
+    return json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
 class SSHPubKeySubmitRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeySubmitRequest
     public_key: bytes
