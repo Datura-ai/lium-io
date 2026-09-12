@@ -100,6 +100,11 @@ class AttestationService:
         self.enabled: bool = bool(
             settings.ENABLE_TDX_ATTESTATION and settings.TDX_VERIFIER_URL)
         self.verifier_url: str | None = settings.TDX_VERIFIER_URL
+        # A verifier image embeds exactly one QEMU version's ACPI oracle; this
+        # optional second verifier carries the QEMU 10.x oracle. When configured,
+        # quotes from QEMU >= 10 hosts route here (see _select_verifier_url). It
+        # never widens `enabled`, which stays keyed on the primary verifier only.
+        self.verifier_qemu10_url: str | None = settings.TDX_VERIFIER_QEMU10_URL
         self.quote_timeout: int = 60
         # Injected by FastAPI DI or passed explicitly (ioc / validator core).
         # Used for the minimal-G5 CVM ratchet and the re-attest cadence; both
@@ -152,15 +157,71 @@ class AttestationService:
                                 host_key.encode("utf-8")).hexdigest()
         return f"0x{digest}"
 
+    @staticmethod
+    def _parse_qemu_version(quote_json: str) -> str | None:
+        """Best-effort extraction of vm_config.qemu_version from a verifier quote.
+
+        vm_config rides in the quote either as a JSON string (the verifier's wire
+        format) or as an already-decoded object; both are handled. Returns None on
+        any parse failure so callers can fall back to the default verifier — this
+        must never raise (it runs on every prod attestation).
+        """
+        try:
+            payload = json.loads(quote_json) if isinstance(quote_json, str) else quote_json
+            if not isinstance(payload, dict):
+                return None
+            vm_config = payload.get("vm_config")
+            if isinstance(vm_config, str):
+                vm_config = json.loads(vm_config)
+            if not isinstance(vm_config, dict):
+                return None
+            version = vm_config.get("qemu_version")
+            return version if isinstance(version, str) and version.strip() else None
+        except Exception:
+            return None
+
+    def _select_verifier_url(self, quote_json: str) -> str:
+        """Pick the verifier whose embedded QEMU ACPI oracle matches the quote.
+
+        One verifier image embeds exactly one QEMU version's ACPI oracle, so a
+        quote produced on a QEMU >= 10 host must be routed to the qemu10 verifier
+        when one is configured. Everything else — no qemu10 verifier configured, a
+        QEMU 9.x host (the entire prod fleet stamps 9.2.1), or an absent/unparseable
+        version — routes to the default verifier.
+
+        Runs on every attestation, so it is ultra-defensive: any exception, missing
+        field, or unparseable version falls back to the default verifier and can
+        never break the existing 9.x path.
+        """
+        try:
+            if not self.verifier_qemu10_url:
+                return self.verifier_url
+            version = self._parse_qemu_version(quote_json)
+            if version is None:
+                return self.verifier_url
+            major = int(version.strip().split(".")[0])
+            if major >= 10:
+                return self.verifier_qemu10_url
+        except Exception:
+            return self.verifier_url
+        return self.verifier_url
+
     async def _call_verifier(self, quote_json: str, executor: ExecutorSSHInfo) -> dict:
         if not self.verifier_url:
             raise AttestationError("TDX verifier URL is not configured")
 
-        url = self.verifier_url.rstrip("/")
+        base_url = self._select_verifier_url(quote_json)
+        url = base_url.rstrip("/")
         if not url.endswith("/verify"):
             url = f"{url}/verify"
 
-        logger.info(f"[VERIFIER REQUEST] Posting to {url} for {executor.address}:{executor.port}")
+        selected_qemu10 = bool(self.verifier_qemu10_url and base_url == self.verifier_qemu10_url)
+        verifier = "qemu10" if selected_qemu10 else "default"
+        qemu_version = self._parse_qemu_version(quote_json)
+        logger.info(
+            f"[VERIFIER REQUEST] Posting to {url} (verifier={verifier}, qemu_version={qemu_version}) "
+            f"for {executor.address}:{executor.port}"
+        )
 
         timeout = aiohttp.ClientTimeout(total=self.quote_timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
