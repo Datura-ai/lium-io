@@ -105,10 +105,30 @@ def test_observation_returns_none_when_ambiguous():
     )
 
 
-def test_enforcement_is_off_by_default():
-    # Regression: flipping the default back to True zeroes idle pay for every node still on
-    # the old image before DAH-3419 restores auto-update (99 executors on 11 Sep).
-    assert Settings.model_fields["EXECUTOR_IMAGE_CHECK_ENFORCE"].default is False
+@pytest.mark.asyncio
+async def test_shipped_default_keeps_an_idle_outdated_executor_validated(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Regression: the default flips back to True before DAH-3419 restores auto-update, and every
+    # idle node on the old image fails validation again (99 executors earned 0 in one hour, 11 Sep).
+    monkeypatch.delenv("EXECUTOR_IMAGE_CHECK_ENFORCE", raising=False)
+    shipped = Settings(_env_file=None)  # no developer .env: the class default only
+    monkeypatch.setattr(
+        settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", shipped.EXECUTOR_IMAGE_CHECK_ENFORCE
+    )
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(
+            specs=specs(executor_digest=STALE_DIGEST),
+            rented_data=SimpleNamespace(executors={}),
+        ),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is True
+    assert result.event.severity == "warning"
+    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
 
 
 @pytest.mark.asyncio
