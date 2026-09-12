@@ -125,6 +125,7 @@ from services.rental_docker_sdk import (
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     start_storage_operation,
+    supports_bootstrap_restore,
     supports_storage_operation,
     wait_for_storage_operation,
 )
@@ -4946,6 +4947,65 @@ class DockerService:
                 effective_volume_limit_gb = payload.volume_limit_gb
                 effective_storage_limit_gb = payload.storage_limit_gb
 
+                # Decided before the volume exists so a refusal below leaves nothing behind.
+                use_encrypted_volume = _should_encrypt_local_volume(
+                    local_volume or f"volume_{payload.pod_id}",
+                    payload.workload_kind,
+                    payload.is_sysbox,
+                    payload.enable_volume_encryption,
+                )
+                if use_encrypted_volume:
+                    current_step = "encrypted_volume_image_inspect"
+                    if not await self._image_has_encrypted_volume_label(
+                        ssh_client,
+                        payload.docker_image,
+                        host_probe=host_probe,
+                    ):
+                        use_encrypted_volume = False
+                        volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
+                        await self.stream_log(
+                            "Image missing lium.volume_encryption.enable=1; using plain local volume",
+                            "warning",
+                            log_tag,
+                        )
+                        logger.warning(
+                            _m(
+                                "Image missing volume-encryption label; falling back to plain volume",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "container_name": container_name,
+                                    "docker_image": payload.docker_image,
+                                    "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
+                                }),
+                            ),
+                        )
+
+                if payload.bootstrap_restore and use_encrypted_volume:
+                    # The encrypted restore after `docker run` sends `workspace.bootstrap`; an
+                    # executor image from before DAH-3274 ignores the key and refuses the target
+                    # the entrypoint has already written to, so the create would fail with the
+                    # pod half-built. Stop here, before the volume and the pod exist. This is a
+                    # hard failure on purpose, unlike the label check above: that one downgrades
+                    # because the renter's own image can never encrypt (and the status says so),
+                    # while an old executor is the provider's to update — a plain-volume restore
+                    # would put the backup's plaintext on a disk the renter asked to encrypt, and
+                    # the old encrypted mode would hand the executor the passphrase.
+                    current_step = "bootstrap_restore_probe"
+                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
+                        raise RuntimeError(
+                            "executor image cannot restore into an encrypted volume at create time "
+                            "(no workspace.bootstrap); the provider must update the executor image"
+                        )
+                    # Same reason, same place: the runner and its engine binary are checked
+                    # again inside _run_bootstrap_restore, but by then the pod is built.
+                    if not await supports_storage_operation(
+                        ssh_client, payload.bootstrap_restore.backup_engine
+                    ):
+                        raise RuntimeError(
+                            "executor does not support bootstrap restore engine "
+                            f"{payload.bootstrap_restore.backup_engine}; the provider must update "
+                            "the executor image"
+                        )
                 if not local_volume:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (flag off → None → the per-command path below, unchanged).
@@ -5004,39 +5064,12 @@ class DockerService:
                     prev_timestamp = now_ms()
 
                 external_volume_name = None
-                use_encrypted_volume = _should_encrypt_local_volume(
-                    local_volume,
-                    payload.workload_kind,
-                    payload.is_sysbox,
-                    payload.enable_volume_encryption,
-                )
-                if use_encrypted_volume:
-                    current_step = "encrypted_volume_image_inspect"
-                    if not await self._image_has_encrypted_volume_label(
-                        ssh_client,
-                        payload.docker_image,
-                        host_probe=host_probe,
-                    ):
-                        use_encrypted_volume = False
-                        volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
-                        await self.stream_log(
-                            "Image missing lium.volume_encryption.enable=1; using plain local volume",
-                            "warning",
-                            log_tag,
-                        )
-                        logger.warning(
-                            _m(
-                                "Image missing volume-encryption label; falling back to plain volume",
-                                extra=get_extra_info({
-                                    **default_extra,
-                                    "container_name": container_name,
-                                    "docker_image": payload.docker_image,
-                                    "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
-                                }),
-                            ),
-                        )
-
-                if payload.bootstrap_restore:
+                if payload.bootstrap_restore and not use_encrypted_volume:
+                    # A plain volume is restored before the container exists: the data is in
+                    # place when the image's entrypoint starts. An encrypted volume cannot be:
+                    # its plaintext exists only behind the gocryptfs mount inside the running
+                    # pod, so that restore runs after setup_encrypted_local_volume below —
+                    # through the pod's own mount, never with the passphrase (DAH-3274).
                     current_step = "bootstrap_restore"
                     await self._run_bootstrap_restore(
                         ssh_client=ssh_client,
@@ -5045,7 +5078,7 @@ class DockerService:
                         restore=payload.bootstrap_restore,
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
-                        encrypted=use_encrypted_volume,
+                        encrypted=False,
                     )
                 if external_volume_info:
                     current_step = "external_volume_creation"
@@ -5351,6 +5384,26 @@ class DockerService:
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                         prev_timestamp = now_ms()
 
+                        if payload.bootstrap_restore:
+                            # DAH-3274: restore into the mounted plaintext through the pod's own
+                            # gocryptfs (the executor nsenters the pod's user namespace, as the
+                            # online `lium restore` does). The passphrase stays in the
+                            # validator→pod channel; the executor never sees it. Runs before the
+                            # key injection below: the entrypoint may already have written to the
+                            # fresh mount, but the restore comes first, so it cannot erase the
+                            # keys the injection puts under /root.
+                            current_step = "bootstrap_restore"
+                            await self._run_bootstrap_restore(
+                                ssh_client=ssh_client,
+                                executor_info=executor_info,
+                                payload=payload,
+                                restore=payload.bootstrap_restore,
+                                local_volume=local_volume,
+                                local_volume_path=local_volume_path,
+                                encrypted=True,
+                                container_name=container_name,
+                            )
+
                     # DAH-2341: inject the customer's public keys before the sshd
                     # bootstrap. The keys are plain data (mkdir + append) with no
                     # dependency on a running sshd, and the bootstrap may now spend
@@ -5648,7 +5701,15 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
         encrypted: bool,
+        container_name: str | None = None,
     ) -> None:
+        if encrypted and not container_name:
+            # No mode exists that restores into an encrypted volume without the pod: the
+            # only other way is to hand the executor the passphrase, which is the leak this
+            # method must never reopen (DAH-3274).
+            raise RuntimeError(
+                "encrypted bootstrap restore needs the running rental container"
+            )
         if not await supports_storage_operation(ssh_client, restore.backup_engine):
             # Legacy archives must remain restorable while executor-image adoption
             # is gradual. Restic has no safe fallback without its pinned binary.
@@ -5665,16 +5726,24 @@ class DockerService:
                 f"executor does not support bootstrap restore engine {restore.backup_engine}"
             )
         operation_id = UUID(restore.restore_log_id)
+        # The spec is SFTP'd into the executor container — a file on the provider's disk — so
+        # it carries what the executor needs to reach the data and nothing that unlocks it.
+        # `encrypted_running` restores through the pod's live gocryptfs mount; the passphrase
+        # never appears here (DAH-3274 — the former `encrypted_bootstrap` mode put it in the
+        # helper's `docker run -e`, i.e. in `docker inspect` for the life of the pod).
         workspace: dict[str, object] = {
-            "mode": "encrypted_bootstrap" if encrypted else "plain_volume",
+            "mode": "encrypted_running" if encrypted else "plain_volume",
             "volume_name": local_volume,
             "volume_path": local_volume_path,
             "requested_path": restore.restore_path or local_volume_path,
         }
         if encrypted:
-            workspace["volume_passphrase"] = VolumeKeyDeriver.from_settings(settings).material(
-                payload.pod_id
-            ).passphrase
+            workspace["container_name"] = container_name
+            # The pod has been running since `docker run`; its entrypoint may already have
+            # written under the fresh mount (`.jupyter`, `.bashrc`). At create time nothing
+            # there is the customer's, so the executor lets the backup write over it instead
+            # of refusing a non-empty target as an online restore would.
+            workspace["bootstrap"] = True
 
         repository: dict[str, object] = {
             "bucket": restore.backup_volume_info.name,
