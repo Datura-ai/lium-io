@@ -1,5 +1,6 @@
 version: '3.7'
 
+# Same host docker-config mounts as docker-compose.yml (DAH-3376); see the comment there.
 services:
   executor-runner:
     image: daturaai/compute-subnet-executor-runner:dev
@@ -7,7 +8,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
+      - "$HOME/.docker:/root/.docker:ro"
       - ./.env:/root/executor/.env
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
@@ -16,4 +20,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - "$HOME/.docker:/config:ro"
+    environment:
+      - DOCKER_CONFIG=/config
     command: --interval 60 --cleanup --label-enable

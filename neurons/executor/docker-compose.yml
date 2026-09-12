@@ -1,5 +1,17 @@
 version: '3.7'
 
+# The host's Docker config directory ($HOME/.docker, written by `docker login`) is mounted
+# read-only into both containers so the update chain can authenticate against Docker Hub:
+# anonymous pulls are counted per source IP, and hosts behind a shared egress exhaust that
+# quota together (DAH-3376). An empty directory changes nothing — the pulls stay anonymous.
+# Create it as the user who runs the stack (`mkdir -p ~/.docker`; the installer does) before
+# the first `docker compose up`, or the daemon creates it as root and a later `docker login`
+# by that user cannot write config.json. The runner pins DOCKER_HOST so a `currentContext`
+# in the host's config.json cannot redirect its docker CLI. The credentials must be inline
+# (`auths`): Watchtower has no credential helper, and a `credsStore` in config.json makes it
+# skip every container, public images included. The login must sit in `auths`, not in a
+# helper: `grep -E 'credsStore|credHelpers' ~/.docker/config.json` should print nothing;
+# remove the key and log in again otherwise.
 services:
   executor-runner:
     image: daturaai/compute-subnet-executor-runner:latest
@@ -7,7 +19,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
+      - "$HOME/.docker:/root/.docker:ro"
       - ./.env:/root/executor/.env
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
@@ -16,4 +31,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - "$HOME/.docker:/config:ro"
+    environment:
+      - DOCKER_CONFIG=/config
     command: --interval 60 --cleanup --label-enable
