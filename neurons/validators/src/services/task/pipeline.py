@@ -161,6 +161,10 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
+    # DAH-3457: set by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED when the scrape shows a GPU outside the
+    # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
+    # node scores 0 on every later cycle under this executor id and is never re-anchored.
+    gpu_anchor_broken: bool = False
     collateral_deposited: bool = False
     collateral_error_message: str | None = None
     contract_version: str | None = None

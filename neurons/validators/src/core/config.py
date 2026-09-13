@@ -308,6 +308,15 @@ class Settings(BaseSettings):
     # a foreign GPU workload takes the card. CHECK observes and logs; ENFORCEMENT zeroes the
     # score. Enforcement defaults off: a provider's own nginx also burns CPU, so the floors
     # need a shadow week over the live fleet before the first payout is cut.
+    # DAH-3457 (owner, 13 Sep 2026): a listed node keeps one fixed set of GPU UUIDs (the anchor). Off = a changed
+    # set is GPU_UUID_CHANGED (verification reset, the anchor is kept) and the event's what_we_saw carries the
+    # would-be hard decision; a missing or added card is GPU_UUID_CHANGED too now that the fingerprint check
+    # runs before the spec check (the count change made it SPEC_CHANGED). On = a strict subset of the anchor is GPU_MISSING (score 0
+    # this cycle, the node returns when the full set is back); any UUID outside the anchor marks the node
+    # "anchor broken": score 0 on every later cycle under this executor id, no re-verification; the provider
+    # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
+    # Flip after reading a week of the warn-mode rows.
+    GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_CHECK_ENABLED: bool = Field(env="PROVIDER_SIDE_LOAD_CHECK_ENABLED", default=True)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False

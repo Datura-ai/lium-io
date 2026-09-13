@@ -361,6 +361,8 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
+    # Warn mode (GPU_ANCHOR_HARD_ENABLED off): the legacy verdict. Its what_we_saw carries `anchor_hard_would_be`
+    # (GPU_MISSING or ANCHOR_BROKEN) so the hard rule can be read from a week of rows before it is switched on.
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
@@ -368,6 +370,32 @@ class GpuFingerprintMessages:
         category="env",
         impact="Verification reset; score set to 0",
         remediation="Ensure the same physical GPUs remain attached and stable.",
+    )
+    # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
+    # scores again on the first cycle that shows the full set.
+    GPU_MISSING = MessageTemplate(
+        event="GPU missing from the listed set",
+        reason="GPU_MISSING",
+        severity="warning",
+        category="env",
+        impact="Verification reset; score set to 0 until every listed GPU is visible again",
+        remediation=(
+            "One or more GPUs this node listed are not visible. Check `nvidia-smi -L` and `dmesg` on the host. "
+            "The node scores again when the full set is back."
+        ),
+    )
+    # Hard mode: the scrape shows a GPU that is not in the anchored set (swap, added card, or a set
+    # replaced by a different one). Permanent for this executor id; re-registering the node is the only way out.
+    ANCHOR_BROKEN = MessageTemplate(
+        event="GPU set differs from the listed set",
+        reason="GPU_UUID_CHANGED",
+        severity="error",
+        category="env",
+        impact="Score 0 on every cycle for this node id; verification does not restart",
+        remediation=(
+            "A listed node keeps one fixed set of GPUs. To list a different set, re-register the node. "
+            "Uptime starts over; penalties stay."
+        ),
     )
     UUID_OK = MessageTemplate(
         event="GPU fingerprints stable",

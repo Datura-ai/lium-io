@@ -284,8 +284,10 @@ class PipelineFactory:
                 CpuTruthCheck(),
                 GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
-                SpecChangeCheck(),
+                # DAH-3457: the UUID set is the node's identity and model:count is derived from it, so the
+                # fingerprint check runs first; a missing card is then GPU_MISSING, not SPEC_CHANGED.
                 GpuFingerprintCheck(),
+                SpecChangeCheck(),
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
@@ -366,8 +368,10 @@ class PipelineFactory:
                 # consume the shared gpu_power_restore:* records the production pipeline relies on.
                 GpuPowerLimitCheck(restore_stale_caps=False),
                 NvmlDigestCheck(),
-                SpecChangeCheck(),
+                # DAH-3457: the UUID set is the node's identity and model:count is derived from it, so the
+                # fingerprint check runs first; a missing card is then GPU_MISSING, not SPEC_CHANGED.
                 GpuFingerprintCheck(),
+                SpecChangeCheck(),
                 BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
