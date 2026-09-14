@@ -397,13 +397,16 @@ async def get_version():
     Returns:
         dict: {"version": "x.y.z", "capabilities": [...]} plus, while `local_verify/1` is
         advertised, `local_verify_port`: the loopback port the validator's SSH tunnel targets for
-        `POST /verify` (this process's own INTERNAL_PORT; the miner's EXTERNAL_PORT may differ).
-        Read over plain HTTP, so a proxy can change it: a wrong port only fails the tunnel's
-        connect, and the validator then runs its SSH checks as before.
+        `POST /verify` (this process's own INTERNAL_PORT; the miner's EXTERNAL_PORT may differ),
+        and, while `local_rent/1` is advertised, `local_rent_port`: the same port for `POST /rent`
+        (each behind its own flag). Read over plain HTTP, so a proxy can change them: a wrong
+        port only fails the tunnel's connect, and the validator then takes the SSH path as before.
     """
     version = {"version": _get_version(), "capabilities": _capabilities()}
     if settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
         version["local_verify_port"] = settings.INTERNAL_PORT
+    if settings.EXECUTOR_LOCAL_RENT_ENABLED:
+        version["local_rent_port"] = settings.INTERNAL_PORT
     return version
 
 
@@ -542,6 +545,11 @@ def _get_local_rent_service() -> LocalRentService:
 async def local_rent(request: Request):
     """Create the rental container from one validator-signed intent (liumd deploy).
 
+    Reached through the validator's SSH session only, like `/verify`: the answer is unsigned, so
+    a request whose TCP peer is not this host's loopback is refused 403 before the body is read
+    (`_is_loopback_client`), and the miner's port-forward from the network can neither read the
+    spec nor rewrite what was made. `/version` names the port as `local_rent_port`.
+
     Auth, nonce and window exactly as `/verify` (the intent is signed as sent, replay refused).
     Flag off → 404; the validator treats every non-200 as "use SSH". Nonces are shared with
     `/verify`: one cache, one rule. Busy → 409 before the nonce is claimed, so the same signed
@@ -549,6 +557,14 @@ async def local_rent(request: Request):
     """
     if not settings.EXECUTOR_LOCAL_RENT_ENABLED:
         raise HTTPException(status_code=404, detail="Not Found")
+    if not _is_loopback_client(request):
+        logger.warning(
+            "local rent refused: not a loopback peer host=%s",
+            request.client.host if request.client else None,
+        )
+        raise HTTPException(
+            status_code=403, detail="/rent is served on the loopback only (the validator's SSH tunnel)"
+        )
 
     try:
         raw = await request.json()

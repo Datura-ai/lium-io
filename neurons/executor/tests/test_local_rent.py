@@ -698,7 +698,12 @@ def validator_keypair():
 @pytest.fixture()
 def client(validator_keypair, monkeypatch):
     api = FakeDockerApi()
-    monkeypatch.setattr("dependencies.auth.VALIDATOR_HOTKEY_SS58", validator_keypair.ss58_address)
+    # main's #1357 (DAH-3394) turned the one hotkey into the `VALIDATOR_HOTKEYS_SS58` map; both
+    # names are patched so the fixture holds on either side of that rebase.
+    monkeypatch.setattr("dependencies.auth.VALIDATOR_HOTKEY_SS58", validator_keypair.ss58_address, raising=False)
+    monkeypatch.setattr(
+        "dependencies.auth.VALIDATOR_HOTKEYS_SS58", {"validator": validator_keypair.ss58_address}, raising=False
+    )
     monkeypatch.setattr(settings, "EXECUTOR_LOCAL_RENT_ENABLED", True)
     monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_ENABLED", False)
     monkeypatch.setattr(settings, "RENTING_PORT_RANGE", "40000-40009")
@@ -709,9 +714,22 @@ def client(validator_keypair, monkeypatch):
     app = FastAPI()
     app.add_middleware(MinerMiddleware)
     app.include_router(apis_router)
-    test_client = TestClient(app)
+    # The peer the validator's SSH tunnel presents: sshd's direct-tcpip channel lands on loopback.
+    test_client = TestClient(_from_peer(app, "127.0.0.1"))
     test_client.fake_api = api
+    test_client.app_under_test = app
     return test_client
+
+
+def _from_peer(app, host: str, port: int = 51234):
+    """The app as seen from a TCP peer at `host` (starlette 0.37's TestClient cannot set one)."""
+
+    async def wrapped(scope, receive, send):
+        if scope["type"] == "http":
+            scope = {**scope, "client": (host, port)}
+        await app(scope, receive, send)
+
+    return wrapped
 
 
 def _signed(body: RentIntentBody, keypair) -> dict:
@@ -720,12 +738,37 @@ def _signed(body: RentIntentBody, keypair) -> dict:
     return wire
 
 
-def test_version_advertises_rent_with_its_own_flag(client, monkeypatch):
-    assert client.get("/version").json()["capabilities"] == [CAPABILITY]
+def test_version_advertises_rent_and_its_tunnel_port_with_its_own_flag(client, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_PORT", 8123)
+    version = client.get("/version").json()
+    assert version["capabilities"] == [CAPABILITY] and version["local_rent_port"] == 8123
+    assert "local_verify_port" not in version
     monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_ENABLED", True)
-    assert client.get("/version").json()["capabilities"] == [VERIFY_CAPABILITY, CAPABILITY]
+    version = client.get("/version").json()
+    assert version["capabilities"] == [VERIFY_CAPABILITY, CAPABILITY]
+    assert version["local_verify_port"] == version["local_rent_port"] == 8123
     monkeypatch.setattr(settings, "EXECUTOR_LOCAL_RENT_ENABLED", False)
-    assert client.get("/version").json()["capabilities"] == [VERIFY_CAPABILITY]
+    version = client.get("/version").json()
+    assert version["capabilities"] == [VERIFY_CAPABILITY] and "local_rent_port" not in version
+
+
+def test_a_network_peer_is_403_before_the_body_is_read_and_makes_nothing(client, validator_keypair):
+    """The answer is unsigned, so it must travel inside the validator's pinned SSH channel: the
+    miner's port-forward (a network peer, here the docker gateway) is refused, a valid intent
+    included; nothing is created and its nonce stays unclaimed for the tunnel to use."""
+    app = client.app_under_test
+    intent = _signed(_body(), validator_keypair)
+    from_network = TestClient(_from_peer(app, "172.18.0.1"))
+    refused = from_network.post("/rent", json=intent)
+    assert refused.status_code == 403 and "loopback" in refused.text
+    assert from_network.post("/rent", data=b"not even json").status_code == 403
+    # The QEMU slirp gateway a CVM sees every outside connection from, and starlette's own default.
+    assert TestClient(_from_peer(app, "10.0.2.2")).post("/rent", json=intent).status_code == 403
+    assert TestClient(_from_peer(app, "testclient")).post("/rent", json=intent).status_code == 403
+    assert client.fake_api.calls == []
+    # IPv6 loopback is the tunnel too; the nonce is still unclaimed after every refusal above.
+    assert TestClient(_from_peer(app, "::1")).post("/rent", json=intent).status_code == 200
+    assert "pod_abc" in client.fake_api.made
 
 
 def test_flag_off_is_404(client, validator_keypair, monkeypatch):

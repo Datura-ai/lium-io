@@ -2,17 +2,25 @@
 
 The SSH path's create is four dependent round trips through the miner hop and the SSH tunnel —
 the Docker SDK `create` + `start`, the `docker ps` running poll, the first exec. An executor with
-the route on (it advertises `local_rent/1` on `/version`; the rent path does not spend a round trip
-reading it — it posts, and a 404/422 is the "not here" answer) accepts the validator's own run spec
-(`datura.rental_spec`, the very dataclass the SDK path hands to docker-py) and makes the container
-with the same docker-py calls on the host, waits for it to run and for the published sshd port to
-answer, and reports what it made. What it reports is evidence, not the proof: the SSH execs that follow (keys, sshd
-bootstrap, environment) are unchanged and are what prove the container reachable.
+the route on advertises `local_rent/1` and `local_rent_port` on `/version` (one plain GET over
+the executor's API port; no port → the SDK path, `no_tunnel_port`). It accepts the validator's own
+run spec (`datura.rental_spec`, the very dataclass the SDK path hands to docker-py) and makes the
+container with the same docker-py calls on the host, waits for it to run and for the published
+sshd port to answer, and reports what it made. What it reports is evidence, not the proof: the SSH
+execs that follow (keys, sshd bootstrap, environment) are unchanged and are what prove the
+container reachable.
+
+The answer is unsigned, like `/verify`'s, so the executor serves `/rent` to loopback peers only
+and the intent rides the rental's own SSH session (`LocalVerifyClient.post_signed`: a
+direct-tcpip channel of the `asyncssh` connection the SDK path already holds, host key pinned).
+A proxy on the miner's port-forward can neither read the spec nor rewrite the answer — the same
+trust root as the SSH path (taiberium on #1339).
 
 Only a spec that carries nothing private takes this path (`carries_only_public_fields`): the
-executor's API port is plain HTTP, so a renter's startup command, entrypoint or environment
-never travels on it — such a rental keeps the SSH tunnel. Any refusal, timeout or malformed
-answer → the SDK path as today (`LocalRentUnavailable.reason` is the log label).
+executor's API is plain HTTP and the spec is logged there, so a renter's startup command,
+entrypoint or environment never travels on it — such a rental keeps the SDK path. Any refusal,
+timeout or malformed answer → the SDK path as today (`LocalRentUnavailable.reason` is the log
+label).
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import asyncssh
 from datura.rental_spec import ContainerRunSpec, carries_only_public_fields, spec_to_wire
 from datura.requests.validator_requests import LOCAL_RENT_CAPABILITY, LOCAL_RENT_SCHEMA
 from services.local_verify_client import (
@@ -47,25 +56,32 @@ RUNNING_TIMEOUT_S = 10
 LocalRentUnavailable = LocalVerifyUnavailable
 
 # Non-answers after which the executor cannot have acted on the intent: the route is absent or off
-# (404), the body was refused before any create — 401 from the route's checks, 422 from an old
-# image's `MinerMiddleware` (no `data_to_sign`) or from the route's own model validation — the
-# executor was busy / had seen the nonce (409), or the connection was never made (aiohttp's
-# `ClientConnector*` errors: refused, DNS, certificate — the type name `post_signed` puts first in
-# the detail; a connect that times out is aiohttp's `ConnectionTimeoutError`, an `asyncio.TimeoutError`,
-# which `post_signed` labels `timeout` — treated as may-have-acted, one harmless force-remove of a
-# name that cannot exist). Every other non-answer — a total timeout, a connection that broke after the send, a
-# 5xx, an answer that could not be read — leaves it open whether a container of the spec's name
-# exists over there, and the SDK fallback frees the name before its own `docker run`
-# (`may_have_acted`).
-NEVER_ACTED_REASONS = frozenset({"not_supported", "refused", "busy_or_replay"})
+# (404), the body was refused before any create — 401 from the route's checks, 403 from a peer
+# that was not its loopback, 422 from an old image's `MinerMiddleware` (no `data_to_sign`) or from
+# the route's own model validation — the executor was busy / had seen the nonce (409), the tunnel
+# listener was never bound (`post_signed`'s `tunnel: …` transport error or `tunnel listener not
+# bound` timeout: nothing was sent), or the local connect to that listener failed (aiohttp's
+# `ClientConnector*` errors — the type name `post_signed` puts first in the detail). Every other
+# non-answer — a total timeout, a tunnel that closed without a status line (sshd could not open
+# the channel, OR the session broke after the send: aiohttp sees the same disconnect), a 5xx, an
+# answer that could not be read — leaves it open whether a container of the spec's name exists
+# over there, and the SDK fallback frees the name before its own `docker run` (`may_have_acted`).
+NEVER_ACTED_REASONS = frozenset({"not_supported", "busy_or_replay"})
 NEVER_CONNECTED_PREFIX = "ClientConnector"  # ClientConnectorError and its DNS/SSL/cert subclasses
-NEVER_ACTED_STATUS_PREFIX = "status 422"  # `post_signed` labels any non-200/401/404/409 `http_error: status <n>`
+NEVER_BOUND_PREFIXES = ("tunnel: ", "tunnel listener not bound")  # `post_signed` before any send
+TUNNEL_CLOSED_PREFIX = "tunnel to "  # `post_signed`'s `refused` for a channel that closed unanswered
+NEVER_ACTED_STATUS_PREFIX = "status 422"  # `post_signed` labels any non-200/401/403/404/409 `http_error: status <n>`
 
 
 def may_have_acted(reason: str, detail: str = "") -> bool:
     if reason in NEVER_ACTED_REASONS:
         return False
+    if reason == "refused":
+        # 401/403 text is the executor's refusal (never acted); a closed tunnel is not an answer.
+        return detail.startswith(TUNNEL_CLOSED_PREFIX)
     if reason == "http_error" and detail.startswith(NEVER_ACTED_STATUS_PREFIX):
+        return False
+    if reason in ("transport", "timeout") and detail.startswith(NEVER_BOUND_PREFIXES):
         return False
     return not (reason == "transport" and detail.startswith(NEVER_CONNECTED_PREFIX))
 
@@ -186,9 +202,13 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
 
 
 class LocalRentClient(LocalVerifyClient):
-    """The verify client's transport (same base URL, signing, bounds and error labels), one more
-    route."""
+    """The verify client's transport (`/version` read, signing, the SSH tunnel, bounds and error
+    labels), one more route."""
 
-    async def rent(self, executor_info, intent: dict[str, Any]) -> LocalRentAnswer:
-        raw, round_trip_ms = await self.post_signed(executor_info, "/rent", intent)
+    async def rent(
+        self, ssh: asyncssh.SSHClientConnection, local_rent_port: int, intent: dict[str, Any]
+    ) -> LocalRentAnswer:
+        """The signed intent through `ssh` to `127.0.0.1:<local_rent_port>/rent` on the executor
+        (`post_signed`); the answer must be to this intent (`parse_answer`)."""
+        raw, round_trip_ms = await self.post_signed(ssh, local_rent_port, "/rent", intent)
         return parse_answer(raw, intent=intent, round_trip_ms=round_trip_ms)

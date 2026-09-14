@@ -111,6 +111,8 @@ Optional, commented out in the template (`src/core/config.py` has the defaults):
 - **EXECUTOR_LOCAL_VERIFY_ENABLED**: answer the validator's one-call `POST /verify` (the verification suite from one signed intent, posted through the validator's SSH connection to the executor's loopback port; a request from the network is refused, and so is an intent that does not name this host's `MINER_HOTKEY_SS58_ADDRESS`) instead of 404 (default `false`; the validator falls back to its SSH checks either way)
 - **LOCAL_VERIFY_MAX_DEADLINE_SECONDS**: the longest a `/verify` intent may keep the GPU before the executor answers with what finished (default `600`)
 - **LOCAL_VERIFY_INTENT_WINDOW_SECONDS**: how far a `/verify` intent's `issued_at` may be from this host's clock (default `120`; NTP, as above)
+- **EXECUTOR_LOCAL_RENT_ENABLED**: answer the validator's one-call `POST /rent` (the rental container from one signed run spec, posted through the validator's SSH connection to the executor's loopback port; a request from the network is refused) instead of 404 (default `false`; the validator falls back to its Docker SDK path either way)
+- **LOCAL_RENT_MAX_DEADLINE_SECONDS**: the longest a `/rent` intent may run before the executor answers with what finished (default `120`)
 
 
 * Run project

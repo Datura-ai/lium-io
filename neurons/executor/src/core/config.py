@@ -154,7 +154,9 @@ class Settings(BaseSettings):
     # liumd deploy (DAH-2834): `POST /rent` creates the rental container from the validator's
     # signed run spec with docker-py on this host — the SSH path's `docker run` + running poll in
     # one call. Off: 404 and not advertised (`local_rent/1`), the validator keeps the SSH path.
-    # Independent of the /verify flag; the same hotkey, nonce and window rules apply.
+    # On: served to loopback peers only (the validator's SSH tunnel; `/version` names the port as
+    # `local_rent_port`), like /verify. Independent of the /verify flag; the same hotkey, nonce
+    # and window rules apply. On a CVM the two settings need dstacktee/app/init_script.sh's whitelist.
     EXECUTOR_LOCAL_RENT_ENABLED: bool = Field(env="EXECUTOR_LOCAL_RENT_ENABLED", default=False)
     # Longest a single /rent call may run before answering (and rolling back what it made).
     LOCAL_RENT_MAX_DEADLINE_SECONDS: int = Field(env="LOCAL_RENT_MAX_DEADLINE_SECONDS", default=120)
