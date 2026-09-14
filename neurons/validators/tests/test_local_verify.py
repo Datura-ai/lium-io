@@ -2,9 +2,12 @@
 same functions the SSH path uses, with the SSH path as the fallback for every other outcome.
 
 Fake executor: an in-process aiohttp server that checks the intent signature the way the executor
-does (canonical JSON, validator hotkey), refuses a replayed nonce, and answers with stub script
-output after a configurable per-step sleep. Fake SSH: an `ssh_client.run` that sleeps one RTT per
-command. The timing test at the end is the e2e-stack measurement quoted in the PR body.
+does (canonical JSON, validator hotkey), refuses a replayed nonce, refuses 403 a `/verify` whose
+peer did not come through the tunnel (the real route admits loopback peers only), and answers with
+stub script output after a configurable per-step sleep. Fake tunnel (`FakeSSH`): the one asyncssh
+call the client makes, `forward_local_port`, as a loopback listener piped to the destination the
+way sshd's direct-tcpip channel is. Fake SSH command path: an `ssh_client.run` that sleeps one RTT
+per command. The timing test at the end is the e2e-stack measurement quoted in the PR body.
 """
 
 from __future__ import annotations
@@ -15,6 +18,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
+import asyncssh
 import bittensor
 import pytest
 import services.matrix_validation_service as mvs
@@ -35,11 +40,13 @@ from services.local_verify_client import (
     CAPABILITY,
     EXECUTOR_DEADLINE_MARGIN_SECONDS,
     EXECUTOR_DEADLINE_MAX_SECONDS,
+    EXECUTOR_LOOPBACK,
     EXECUTOR_VERSION_MAX_CHARS,
     MAX_ANSWER_BYTES,
     MAX_CAPABILITIES,
     MAX_CAPABILITY_CHARS,
     SCHEMA,
+    Advertised,
     LocalVerifyClient,
     LocalVerifyOutcome,
     LocalVerifyUnavailable,
@@ -137,9 +144,76 @@ def matmul_stdout(proven_uuid: str) -> str:
     )
 
 
+# The source ports of the connections FakeSSH tunnels are open right now. FakeExecutor's `/verify`
+# admits a peer only from this set: on one host, sshd's direct-tcpip channel is the only way a
+# request reaches the loopback-bound route, and the fake keeps that property.
+_TUNNELLED_SOURCE_PORTS: set[int] = set()
+
+
+class _FakeListener:
+    """`asyncssh.SSHListener` as the client uses it: `get_port`, `close`, `wait_closed`."""
+
+    def __init__(self, ssh: FakeSSH, server: asyncio.Server):
+        self._ssh = ssh
+        self._server = server
+
+    def get_port(self) -> int:
+        return self._server.sockets[0].getsockname()[1]
+
+    def close(self) -> None:
+        self._server.close()
+        self._ssh.open_listeners -= 1
+
+    async def wait_closed(self) -> None:
+        await self._server.wait_closed()
+
+
+class FakeSSH:
+    """`asyncssh.SSHClientConnection.forward_local_port` as the pipeline's session provides it: a
+    listener bound here, each accepted connection piped to `dest_host:dest_port` like the
+    direct-tcpip channel sshd opens. A destination nobody listens on closes the local end without a
+    byte — what asyncssh's `SSHLocalForwarder` does on `ChannelOpenError`."""
+
+    def __init__(self):
+        self.forwards: list[tuple[str, int]] = []  # every (dest_host, dest_port) asked for
+        self.open_listeners = 0
+
+    async def forward_local_port(self, listen_host, listen_port, dest_host, dest_port):
+        self.forwards.append((dest_host, dest_port))
+
+        async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
+            try:
+                while chunk := await src.read(65536):
+                    dst.write(chunk)
+                    await dst.drain()
+            finally:
+                dst.close()
+
+        async def accepted(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            try:
+                up_reader, up_writer = await asyncio.open_connection(dest_host, dest_port)
+            except OSError:
+                writer.close()
+                return
+            source_port = up_writer.get_extra_info("sockname")[1]
+            _TUNNELLED_SOURCE_PORTS.add(source_port)
+            try:
+                await asyncio.gather(
+                    pipe(reader, up_writer), pipe(up_reader, writer), return_exceptions=True
+                )
+            finally:
+                _TUNNELLED_SOURCE_PORTS.discard(source_port)
+
+        server = await asyncio.start_server(accepted, listen_host, listen_port)
+        self.open_listeners += 1
+        return _FakeListener(self, server)
+
+
 class FakeExecutor:
-    """The executor's `/verify` as a fake: signature and replay checks as the real route, then a
-    stub GPU whose scripts take `step_sleep` seconds each and run side by side when asked."""
+    """The executor's `/verify` as a fake: the loopback-peer, signature and replay checks as the
+    real route, then a stub GPU whose scripts take `step_sleep` seconds each and run side by side
+    when asked. `/version` names this server's own port as `local_verify_port` (the real executor
+    names its INTERNAL_PORT), so a tunnel that targets it lands here."""
 
     def __init__(
         self,
@@ -159,6 +233,7 @@ class FakeExecutor:
         self.verifyx_ok = verifyx_ok  # False: a full-length response libverifyx rejects
         self.seen_nonces: set[str] = set()
         self.intents: list[dict] = []
+        self.refused_peers: list[str] = []  # `/verify` requests that did not come through a tunnel
         self.answer_override = None  # callable(intent) -> dict | (status, body)
         self.version_override = None  # dict served by /version instead of the default
         self.app = web.Application()
@@ -167,6 +242,10 @@ class FakeExecutor:
         self.server = TestServer(self.app)
 
     async def __aenter__(self):
+        # A tunnel handler left pending when an earlier test's loop closed never ran its
+        # `finally`; start every executor with no admitted peers, so a reused ephemeral port
+        # cannot admit a direct POST.
+        _TUNNELLED_SOURCE_PORTS.clear()
         await self.server.start_server()
         return self
 
@@ -188,11 +267,19 @@ class FakeExecutor:
     async def version(self, request):
         if self.version_override is not None:
             return web.json_response(self.version_override)
-        return web.json_response(
-            {"version": "4.1.0", "capabilities": [CAPABILITY] if self.advertise else []}
-        )
+        version = {"version": "4.1.0", "capabilities": [CAPABILITY] if self.advertise else []}
+        if self.advertise:
+            version["local_verify_port"] = self.server.port
+        return web.json_response(version)
 
     async def verify(self, request):
+        peer = request.transport.get_extra_info("peername")
+        if peer is None or peer[1] not in _TUNNELLED_SOURCE_PORTS:
+            self.refused_peers.append(f"{peer[0]}:{peer[1]}" if peer else "?")
+            return web.json_response(
+                {"detail": "/verify is served on the loopback only (the validator's SSH tunnel)"},
+                status=403,
+            )
         raw = await request.json()
         if not self.keypair.verify(canonical_intent_message(raw), raw["signature"]):
             return web.json_response({"detail": "Invalid signature"}, status=401)
@@ -258,9 +345,11 @@ def context(
     first_pass=True,
     verifyx_enabled=True,
     state=None,
+    ssh=None,
 ):
     return make_context(
         executor=executor_info,
+        ssh=ssh or FakeSSH(),
         services=build_services(
             validation=validation,
             verifyx=verifyx,
@@ -436,11 +525,24 @@ async def test_the_intent_the_check_sends_is_what_the_executor_accepts(
     assert parsed.deadline_s == executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS)
 
 
+def empty_intent() -> dict:
+    return build_intent(
+        executor_uuid=EXECUTOR_UUID,
+        miner_hotkey=MINER_HOTKEY,
+        matmul=None,
+        verifyx=None,
+        parallel_gpu=False,
+        deadline_s=5,
+    )
+
+
 @pytest.mark.asyncio
 async def test_client_against_the_fake_executor(keypair, local_verify_on):
     async with FakeExecutor(keypair) as executor:
         client = client_factory(keypair)(None)
-        assert await client.capabilities(executor.executor_info) == {CAPABILITY}
+        ssh = FakeSSH()
+        advertised = await client.advertised(executor.executor_info)
+        assert advertised == Advertised({CAPABILITY}, executor.server.port)
         intent = build_intent(
             executor_uuid=EXECUTOR_UUID,
             miner_hotkey=MINER_HOTKEY,
@@ -449,51 +551,75 @@ async def test_client_against_the_fake_executor(keypair, local_verify_on):
             parallel_gpu=True,
             deadline_s=5,
         )
-        answer = await client.verify(executor.executor_info, intent)
+        answer = await client.verify(ssh, advertised.local_verify_port, intent)
         assert answer.nonce == intent["nonce"] and answer.step("matmul").status == "ok"
         # A replay of the same intent is refused by the executor (409, like a busy executor).
         with pytest.raises(LocalVerifyUnavailable) as exc:
-            await client.verify(executor.executor_info, intent)
+            await client.verify(ssh, advertised.local_verify_port, intent)
         assert exc.value.reason == "busy_or_replay"
 
         stranger = LocalVerifyClient(
             bittensor.Keypair.create_from_uri("//Stranger"), timeout_s=5, connect_timeout_s=2
         )
         with pytest.raises(LocalVerifyUnavailable) as exc:
-            await stranger.verify(
-                executor.executor_info,
-                build_intent(
-                    executor_uuid=EXECUTOR_UUID,
-                    miner_hotkey=MINER_HOTKEY,
-                    matmul=None,
-                    verifyx=None,
-                    parallel_gpu=False,
-                    deadline_s=5,
-                ),
-            )
+            await stranger.verify(ssh, advertised.local_verify_port, empty_intent())
         assert exc.value.reason == "refused"
+        # Every call opened its own tunnel listener and closed it again.
+        assert ssh.forwards == [(EXECUTOR_LOOPBACK, executor.server.port)] * 3
+        assert ssh.open_listeners == 0
 
 
 @pytest.mark.asyncio
-async def test_client_reports_absent_route_and_dead_host_as_fallback_reasons(
+async def test_the_post_rides_the_ssh_session_and_the_network_path_is_refused(
+    keypair, local_verify_on
+):
+    """The regression: the client posted to `http://<address>:<port>/verify` and the executor
+    (loopback peers only since #1339 f366ef5) answered 403 every time. Through the tunnel the
+    executor sees a loopback peer and answers. The second half posts straight at the fake's API
+    port and checks the fake's own 403: it shows the tunnelled answer is not vacuous, and is not a
+    product assertion."""
+    async with FakeExecutor(keypair) as executor:
+        client = client_factory(keypair)(None)
+        answer = await client.verify(FakeSSH(), executor.server.port, empty_intent())
+        assert answer.nonce and executor.refused_peers == []
+
+        session_factory = client._session_factory
+        async with session_factory(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.post(
+                f"{client.base_url(executor.executor_info)}/verify",
+                json=sign_intent(empty_intent(), keypair),
+            ) as response:
+                assert response.status == 403
+        assert len(executor.refused_peers) == 1
+
+
+@pytest.mark.asyncio
+async def test_client_reports_absent_route_dead_tunnel_and_dead_host_as_fallback_reasons(
     keypair, local_verify_on
 ):
     async with FakeExecutor(keypair) as executor:
         executor.answer_override = lambda raw: (404, {"detail": "Not Found"})
         client = client_factory(keypair)(None)
         with pytest.raises(LocalVerifyUnavailable) as exc:
-            await client.verify(
-                executor.executor_info,
-                build_intent(
-                    executor_uuid=EXECUTOR_UUID,
-                    miner_hotkey=MINER_HOTKEY,
-                    matmul=None,
-                    verifyx=None,
-                    parallel_gpu=False,
-                    deadline_s=5,
-                ),
-            )
+            await client.verify(FakeSSH(), executor.server.port, empty_intent())
         assert exc.value.reason == "not_supported"
+
+    # Nothing listens on the loopback port the tunnel targets: sshd cannot open the channel and
+    # the local end closes without a byte — `refused`, and the listener is gone.
+    ssh = FakeSSH()
+    with pytest.raises(LocalVerifyUnavailable) as exc:
+        await client.verify(ssh, 9, empty_intent())
+    assert exc.value.reason == "refused" and "closed without an answer" in exc.value.detail
+    assert ssh.forwards == [(EXECUTOR_LOOPBACK, 9)] and ssh.open_listeners == 0
+
+    # The session itself cannot forward (closed, or forwarding refused by asyncssh): `transport`.
+    gone = SimpleNamespace(
+        forward_local_port=AsyncMock(side_effect=asyncssh.ChannelOpenError(1, "closed"))
+    )
+    with pytest.raises(LocalVerifyUnavailable) as exc:
+        await client.verify(gone, executor.server.port, empty_intent())
+    assert exc.value.reason == "transport" and exc.value.detail.startswith("tunnel: ")
+
     dead = ExecutorSSHInfo(
         uuid=EXECUTOR_UUID,
         address="127.0.0.1",
@@ -503,20 +629,7 @@ async def test_client_reports_absent_route_and_dead_host_as_fallback_reasons(
         python_path="p",
         root_dir="/r",
     )
-    assert await client.capabilities(dead) == set()
-    with pytest.raises(LocalVerifyUnavailable) as exc:
-        await client.verify(
-            dead,
-            build_intent(
-                executor_uuid=EXECUTOR_UUID,
-                miner_hotkey=MINER_HOTKEY,
-                matmul=None,
-                verifyx=None,
-                parallel_gpu=False,
-                deadline_s=5,
-            ),
-        )
-    assert exc.value.reason == "transport"
+    assert await client.advertised(dead) == Advertised(set(), None)
 
 
 # --- the check and its consumers ------------------------------------------------------------------
@@ -560,8 +673,9 @@ async def test_advertised_executor_is_verified_in_one_call_and_ssh_is_not_used(
     verifyx_service.validate_verifyx_and_process_job = ssh_verifyx
 
     async with FakeExecutor(keypair) as executor:
+        ssh = FakeSSH()
         ctx = context(
-            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service, ssh=ssh
         )
         local, verifyx, capability = await run_local_then_consumers(
             ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
@@ -582,6 +696,11 @@ async def test_advertised_executor_is_verified_in_one_call_and_ssh_is_not_used(
         assert verifyx.updates["state"].specs["network"]["verifyx_download_speed"] == 900.0
         ssh_matmul.assert_not_awaited()
         ssh_verifyx.assert_not_awaited()
+
+        # The POST went through the pipeline's SSH session to the port `/version` named, and the
+        # tunnel listener did not outlive the call.
+        assert ssh.forwards == [(EXECUTOR_LOOPBACK, executor.server.port)]
+        assert ssh.open_listeners == 0 and executor.refused_peers == []
 
         # What went over the wire: the challenge as the SSH command would carry it, first-pass sized.
         sent = executor.intents[0]
@@ -620,9 +739,83 @@ async def test_not_advertised_falls_back_before_any_challenge_is_built(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("port", [None, "8001", 0, 65536, True])
+async def test_an_image_that_names_no_tunnel_port_leaves_everything_to_ssh(
+    keypair, monkeypatch, local_verify_on, verifyx_service, port
+):
+    """An executor that advertises `local_verify/1` without a usable `local_verify_port` (the
+    #1339 image before f366ef5, or a proxy that rewrote the field): nothing to tunnel to, so no
+    challenge is built, no listener opened, and both consumers run over SSH."""
+    validation = matmul_service(monkeypatch)
+    validation.validate_gpu_model_and_process_job = AsyncMock(
+        return_value=mvs.ValidationResult(success=True)
+    )
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
+    async with FakeExecutor(keypair) as executor:
+        executor.version_override = {"version": "4.1.0", "capabilities": [CAPABILITY]}
+        if port is not None:
+            executor.version_override["local_verify_port"] = port
+        ssh = FakeSSH()
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service, ssh=ssh
+        )
+        local, verifyx, capability = await run_local_then_consumers(
+            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+        )
+    assert local.passed and local.event.reason_code == "LOCAL_VERIFY_FALLBACK"
+    assert local.event.what_we_saw["reason"] == "no_tunnel_port"
+    assert ssh.forwards == [] and executor.intents == []
+    assert validation.wrapper.generateChallenge.call_count == 0
+    assert (
+        capability.event.what_we_saw["transport"] == "ssh"
+        and verifyx.event.what_we_saw["transport"] == "ssh"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_tunnel_nobody_answers_leaves_everything_to_ssh(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """`/version` names a loopback port nothing listens on (a proxy rewrote it, or the executor
+    process moved): the channel cannot open, the call is `refused`, SSH decides as before."""
+    validation = matmul_service(monkeypatch)
+    validation.validate_gpu_model_and_process_job = AsyncMock(
+        return_value=mvs.ValidationResult(success=True)
+    )
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
+    async with FakeExecutor(keypair) as executor:
+        executor.version_override = {
+            "version": "4.1.0",
+            "capabilities": [CAPABILITY],
+            "local_verify_port": 9,
+        }
+        ssh = FakeSSH()
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service, ssh=ssh
+        )
+        local, verifyx, capability = await run_local_then_consumers(
+            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+        )
+    assert local.event.reason_code == "LOCAL_VERIFY_FALLBACK"
+    assert local.event.what_we_saw["reason"] == "refused"
+    assert ssh.forwards == [(EXECUTOR_LOOPBACK, 9)] and ssh.open_listeners == 0
+    assert executor.intents == []
+    assert (
+        capability.event.what_we_saw["transport"] == "ssh"
+        and verifyx.event.what_we_saw["transport"] == "ssh"
+    )
+    validation.wrapper.free.assert_called_with("ptr")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "override,reason",
     [
+        (lambda raw: (403, {"detail": "not a loopback peer"}), "refused"),
         (lambda raw: (404, {"detail": "Not Found"}), "not_supported"),
         (lambda raw: (409, {"detail": "busy"}), "busy_or_replay"),
         (lambda raw: (500, {"detail": "boom"}), "http_error"),

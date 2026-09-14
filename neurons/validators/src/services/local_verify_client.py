@@ -6,12 +6,23 @@ side by side at first-pass sizes, returning their raw output in one document. Th
 sends, and checks that what came back is the answer to what was asked (schema, nonce, executor);
 judging the steps is the checks' job, with the same functions the SSH path uses.
 
+The executor serves `/verify` to loopback peers only (#1339, taiberium: the answer is not signed,
+so it must not cross a port-forward a proxy could rewrite). The intent therefore rides the SSH
+session the pipeline already holds to the executor (`Context.ssh`, host key pinned to the TDX
+quote on a CVM): `SSHClientConnection.forward_local_port` binds an ephemeral listener on this
+process's loopback and sshd opens a direct-tcpip channel to `127.0.0.1:<local_verify_port>` on the
+executor for every connection it accepts; the HTTP request is a plain aiohttp POST to that
+listener. `/version`, read over the executor's API port as before, names the loopback port. The
+transport is the same trust root as the SSH checks: whoever could read or change the answer could
+already run the SSH commands.
+
 Anything that is not a well-formed answer raises `LocalVerifyUnavailable(reason)`; the caller
 falls back to the SSH path and logs the reason. Nothing here can fail a node.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
@@ -19,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
+import asyncssh
 from datura.requests.validator_requests import (
     LOCAL_VERIFY_CAPABILITY,
     LOCAL_VERIFY_SCHEMA,
@@ -76,6 +88,10 @@ MAX_ANSWER_BYTES = 2 * 1024 * 1024
 MAX_CAPABILITIES = 32
 MAX_CAPABILITY_CHARS = 64
 DETAIL_MAX_CHARS = 300
+# Both ends of the tunnel: the listener this process binds (port 0 = ephemeral) and the address
+# sshd connects to inside the executor's container, where uvicorn listens on 0.0.0.0.
+TUNNEL_LISTEN_HOST = "127.0.0.1"
+EXECUTOR_LOOPBACK = "127.0.0.1"
 
 
 async def _read_bounded(response, limit: int) -> bytes:
@@ -226,9 +242,27 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
     )
 
 
+@dataclass(frozen=True)
+class Advertised:
+    """What the executor's `/version` says about the local path: the capability list and, while
+    `local_verify/1` is served, the loopback port the tunnel targets (None on an image that does
+    not name one — its `/verify` cannot be reached from the network, so it is left to SSH)."""
+
+    capabilities: set[str]
+    local_verify_port: int | None
+
+
+def _wire_port(value: Any) -> int | None:
+    """A TCP port the executor reported, or None for anything that is not one."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 65535 else None
+
+
 class LocalVerifyClient:
-    """HTTP to the executor's own API port (`executor_info.port`, where the miner and the backend
-    already talk to it) — no SSH session, no miner hop."""
+    """`GET /version` over the executor's API port (`executor_info.port`, where the miner and the
+    backend already talk to it), then `POST /verify` through a direct-tcpip channel of the
+    pipeline's SSH session to the executor's loopback port (`verify`)."""
 
     def __init__(self, keypair, *, timeout_s: int, connect_timeout_s: int, session_factory=None):
         self.keypair = keypair
@@ -240,8 +274,13 @@ class LocalVerifyClient:
     def base_url(executor_info) -> str:
         return f"http://{executor_info.address}:{executor_info.port}"
 
-    async def capabilities(self, executor_info) -> set[str]:
-        """What the executor's `/version` advertises; empty on any error (an old image has none)."""
+    async def advertised(self, executor_info) -> Advertised:
+        """What the executor's `/version` advertises; nothing on any error (an old image has none).
+        Read over plain HTTP: a proxy that changes the port can only point the tunnel at another
+        loopback port of the executor's container, a peer the miner already controls; whatever
+        answers there is judged as the executor's own answer would be (nonce echo, unseal) or
+        falls back to SSH."""
+        nothing = Advertised(capabilities=set(), local_verify_port=None)
         timeout = aiohttp.ClientTimeout(
             total=self.connect_timeout_s * 2, connect=self.connect_timeout_s
         )
@@ -251,28 +290,54 @@ class LocalVerifyClient:
                     f"{self.base_url(executor_info)}/version", allow_redirects=False
                 ) as response:
                     if response.status != 200:
-                        return set()
+                        return nothing
                     body = json.loads(await _read_bounded(response, MAX_ANSWER_BYTES))
         except Exception:
-            return set()
+            return nothing
         caps = body.get("capabilities") if isinstance(body, dict) else None
         if not isinstance(caps, list):
-            return set()
+            return nothing
         # A closed-size set: the event that lists them is a log sink, not a place for a novel.
-        return {
-            c
-            for c in caps[:MAX_CAPABILITIES]
-            if isinstance(c, str) and len(c) <= MAX_CAPABILITY_CHARS
-        }
+        return Advertised(
+            capabilities={
+                c
+                for c in caps[:MAX_CAPABILITIES]
+                if isinstance(c, str) and len(c) <= MAX_CAPABILITY_CHARS
+            },
+            local_verify_port=_wire_port(body.get("local_verify_port")),
+        )
 
-    async def verify(self, executor_info, intent: dict[str, Any]) -> LocalVerifyAnswer:
+    async def verify(
+        self, ssh: asyncssh.SSHClientConnection, local_verify_port: int, intent: dict[str, Any]
+    ) -> LocalVerifyAnswer:
+        """Sign the intent and POST it through `ssh` to `127.0.0.1:<local_verify_port>` on the
+        executor. The listener this binds lives for this one call; sshd opens the direct-tcpip
+        channel when aiohttp connects to it. A channel sshd cannot open (nothing on that loopback
+        port, or forwarding disabled) closes the local end without a byte: `refused`, like a 403.
+        `connect_timeout_s` bounds the local bind and connect only; the channel open on the
+        executor's side is inside the whole-call `timeout_s`."""
         signed = sign_intent(intent, self.keypair)
         timeout = aiohttp.ClientTimeout(total=self.timeout_s, connect=self.connect_timeout_s)
         started = time.perf_counter()
         try:
+            listener = await asyncio.wait_for(
+                ssh.forward_local_port(
+                    TUNNEL_LISTEN_HOST, 0, EXECUTOR_LOOPBACK, local_verify_port
+                ),
+                self.connect_timeout_s,
+            )
+        except TimeoutError:
+            raise LocalVerifyUnavailable(
+                "timeout", f"tunnel listener not bound within {self.connect_timeout_s}s"
+            )
+        except Exception as exc:  # asyncssh errors (session gone), a loopback bind failure
+            raise LocalVerifyUnavailable("transport", f"tunnel: {type(exc).__name__}: {exc}")
+        try:
             async with self._session_factory(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url(executor_info)}/verify", json=signed, allow_redirects=False
+                    f"http://{TUNNEL_LISTEN_HOST}:{listener.get_port()}/verify",
+                    json=signed,
+                    allow_redirects=False,
                 ) as response:
                     # A redirect would re-send the signed intent to a host of the executor's
                     # choosing: it is an http_error below. The body is bounded before it is parsed.
@@ -280,8 +345,20 @@ class LocalVerifyClient:
                     status = response.status
         except TimeoutError:
             raise LocalVerifyUnavailable("timeout", f"no answer within {self.timeout_s}s")
-        except Exception as exc:  # aiohttp client errors, DNS, refused connections
+        except aiohttp.ClientConnectionError as exc:
+            # asyncssh closes the accepted connection when the channel open fails
+            # (SSHLocalForwarder: ChannelOpenError → connection_lost), so aiohttp sees a
+            # disconnect before any status line.
+            raise LocalVerifyUnavailable(
+                "refused",
+                f"tunnel to {EXECUTOR_LOOPBACK}:{local_verify_port} closed without an answer: "
+                f"{type(exc).__name__}",
+            )
+        except Exception as exc:  # other aiohttp client errors
             raise LocalVerifyUnavailable("transport", f"{type(exc).__name__}: {exc}")
+        finally:
+            listener.close()
+            await listener.wait_closed()
         round_trip_ms = int((time.perf_counter() - started) * 1000)
         text = body[:MAX_ANSWER_BYTES].decode("utf-8", errors="replace")
         if status == 404:
@@ -291,7 +368,9 @@ class LocalVerifyClient:
         if status == 409:
             # The executor runs one suite at a time and refuses a nonce it has seen.
             raise LocalVerifyUnavailable("busy_or_replay", text[:200])
-        if status == 401:
+        if status in (401, 403):
+            # 401: signature, window or miner refused. 403: the peer the executor saw was not its
+            # loopback — the request did not arrive through the tunnel.
             raise LocalVerifyUnavailable("refused", text[:200])
         if status != 200:
             raise LocalVerifyUnavailable("http_error", f"status {status}: {text[:200]}")

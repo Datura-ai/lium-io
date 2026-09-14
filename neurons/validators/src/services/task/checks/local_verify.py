@@ -1,14 +1,17 @@
 """liumd phase 1 (DAH-2834): the matmul and VerifyX from one signed call instead of the SSH sequence.
 
-For an executor whose `/version` advertises `local_verify/1`, this check prepares the same two
-challenges the SSH-driven checks would (`ValidationService.prepare_matmul_challenge`,
-`VerifyXValidationService.prepare_verifyx_challenge`), sends them in one validator-signed intent to
-`POST /verify`, and judges the answer with the same two functions those checks use on SSH output
-(`evaluate_matmul_output`, `evaluate_verifyx_capture`). A judged, passing step is left in
-`ctx.state.local_verify`; `CapabilityCheck` and `VerifyXCheck` consume it and skip their SSH run.
+For an executor whose `/version` advertises `local_verify/1` and names its `local_verify_port`,
+this check prepares the same two challenges the SSH-driven checks would
+(`ValidationService.prepare_matmul_challenge`, `VerifyXValidationService.prepare_verifyx_challenge`),
+sends them in one validator-signed intent to `POST /verify` through a direct-tcpip channel of the
+pipeline's SSH session (`ctx.ssh`; the executor serves the route to loopback peers only), and judges
+the answer with the same two functions those checks use on SSH output (`evaluate_matmul_output`,
+`evaluate_verifyx_capture`). A judged, passing step is left in `ctx.state.local_verify`;
+`CapabilityCheck` and `VerifyXCheck` consume it and skip their SSH run.
 
-Everything else — flag off, capability absent, refusal, timeout, a mismatched answer, a step that
-did not run, a step that ran and FAILED the judgement, or a pass that arrived later than the SSH
+Everything else — flag off, capability or port absent, refusal, a tunnel nobody answers, timeout, a
+mismatched answer, a step that did not run, a step that ran and FAILED the judgement, or a pass
+that arrived later than the SSH
 path's own cap for that step (`ROUND_TRIP_CAP_MS_BY_STEP`, measured on the validator's clock) — leaves
 that step to the SSH path, so the new transport can only save time, never change a verdict on its
 own. The matmul is not asked for
@@ -138,8 +141,8 @@ class LocalVerifyCheck:
             )
 
         client = self._client_factory(ctx)
-        capabilities = await client.capabilities(ctx.executor)
-        if CAPABILITY not in capabilities:
+        advertised = await client.advertised(ctx.executor)
+        if CAPABILITY not in advertised.capabilities:
             self._metric(ctx, "fallback", "call", "not_advertised")
             return CheckResult(
                 passed=True,
@@ -147,8 +150,14 @@ class LocalVerifyCheck:
                     Msg.NOT_ADVERTISED,
                     ctx=ctx,
                     check_id=self.check_id,
-                    what={"capabilities": sorted(capabilities)},
+                    what={"capabilities": sorted(advertised.capabilities)},
                 ),
+            )
+        if advertised.local_verify_port is None:
+            # An image that advertises the capability but not the port serves `/verify` on the
+            # loopback with no way to name it; nothing to tunnel to.
+            return self._fallback(
+                ctx, "call", "no_tunnel_port", "/version names no local_verify_port"
             )
 
         try:
@@ -158,7 +167,9 @@ class LocalVerifyCheck:
         except _NothingToSend as exc:
             return self._fallback(ctx, "call", exc.reason, exc.detail)
         try:
-            return await self._call_and_judge(ctx, client, matmul_challenge, verifyx_challenge)
+            return await self._call_and_judge(
+                ctx, client, advertised.local_verify_port, matmul_challenge, verifyx_challenge
+            )
         finally:
             if matmul_challenge is not None:
                 matmul_challenge.close()
@@ -200,6 +211,7 @@ class LocalVerifyCheck:
         self,
         ctx: Context,
         client: LocalVerifyClient,
+        local_verify_port: int,
         matmul_challenge: MatmulChallenge | None,
         verifyx_challenge: VerifyXChallenge | None,
     ) -> CheckResult:
@@ -232,7 +244,8 @@ class LocalVerifyCheck:
         )
 
         try:
-            answer = await client.verify(ctx.executor, intent)
+            # Through the session the SSH checks run on: the executor answers loopback peers only.
+            answer = await client.verify(ctx.ssh, local_verify_port, intent)
         except LocalVerifyUnavailable as exc:
             return self._fallback(ctx, "call", exc.reason, exc.detail)
 
