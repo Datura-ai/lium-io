@@ -24,11 +24,12 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
+from protocol.vc_protocol.compute_requests import RentedPod
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedPod
 
 from ..pipeline import Context
 
@@ -89,7 +90,7 @@ async def tcp_connect_fault(host: str, port: int, timeout: float) -> str | None:
     """None when the port accepts a TCP connection; else the fault name."""
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return FAULT_TCP_TIMEOUT
     except OSError:
         return FAULT_TCP_REFUSED
@@ -127,7 +128,7 @@ async def probe_rented_pod_ssh(
         faults.append(FAULT_AUTHORIZED_KEYS_UNREADABLE)
 
     boot_id_now = (ctx.state.specs or {}).get("boot_id")
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
 
     if not faults:
         await redis.set(_ok_key(pod.pod_id), json.dumps({"at": now_iso, "boot_id": boot_id_now}))
@@ -160,9 +161,7 @@ async def probe_rented_pod_ssh(
     )
 
     boot_id_at_ok = ok_mark.get("boot_id")
-    boot_id_changed = (
-        boot_id_at_ok != boot_id_now if boot_id_at_ok and boot_id_now else None
-    )
+    boot_id_changed = boot_id_at_ok != boot_id_now if boot_id_at_ok and boot_id_now else None
     threshold = settings.RENTED_POD_SSH_PROBE_CYCLES
     verdict = RentedPodSshVerdict(
         pod_id=pod.pod_id,

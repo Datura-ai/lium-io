@@ -23,14 +23,13 @@ from neurons.validators.src.services.task.checks.rented_pod_ssh import (
     tcp_connect_fault,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
-from test_rented_machine_check import DummyScoreCalculator, DummySSHClient, MockContainerCleanup
-
 from protocol.vc_protocol.compute_requests import (
     PodSshUnreachableResponse,
     RentedExecutor,
     RentedExecutorsResponse,
     RentedPod,
 )
+from test_rented_machine_check import DummyScoreCalculator, DummySSHClient, MockContainerCleanup
 
 EXECUTOR_UUID = "executor-123"
 POD_ID = "pod-1"
@@ -59,7 +58,9 @@ class Harness:
         self.context_factory = context_factory
         self.redis = FakeRedis()
         self.backend = AsyncMock()
-        self.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(recorded=True)
+        self.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(
+            recorded=True
+        )
         self.ssh_port = ssh_port
         self.score_calculator = DummyScoreCalculator(actual_score=0.9, job_score=0.9)
 
@@ -103,7 +104,9 @@ async def test_one_refused_cycle_after_a_healthy_one_counts_but_stays_quiet(cont
 
 
 @pytest.mark.asyncio
-async def test_second_consecutive_refused_cycle_raises_the_event_and_tells_the_backend_once(context_factory):
+async def test_second_consecutive_refused_cycle_raises_the_event_and_tells_the_backend_once(
+    context_factory,
+):
     # ticket-0326: host rebooted (boot_id changed), container back, port 40199 refuses, pod RUNNING.
     h = Harness(context_factory)
     await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="boot-a")
@@ -138,7 +141,9 @@ async def test_second_consecutive_refused_cycle_raises_the_event_and_tells_the_b
 
 
 @pytest.mark.asyncio
-async def test_third_cycle_of_the_same_outage_keeps_the_event_but_does_not_post_again(context_factory):
+async def test_third_cycle_of_the_same_outage_keeps_the_event_but_does_not_post_again(
+    context_factory,
+):
     # One POST per outage: the backend dedupes too, but the validator must not spam it every 15 min.
     h = Harness(context_factory)
     await h.cycle(tcp_fault=None, ssh_keys=KEYS)
@@ -190,18 +195,27 @@ async def test_open_port_with_unreadable_authorized_keys_is_the_ticket_0247_faul
     [pod] = result.event.what_we_saw["unreachable_pods"]
     assert pod["faults"] == [FAULT_AUTHORIZED_KEYS_UNREADABLE]
     assert pod["boot_id_changed"] is False
-    assert h.backend.report_pod_ssh_unreachable.await_args.kwargs["faults"] == [FAULT_AUTHORIZED_KEYS_UNREADABLE]
+    assert h.backend.report_pod_ssh_unreachable.await_args.kwargs["faults"] == [
+        FAULT_AUTHORIZED_KEYS_UNREADABLE
+    ]
 
 
 @pytest.mark.asyncio
-async def test_backend_without_the_field_sends_no_ssh_port_and_the_keys_alone_decide(context_factory):
+async def test_backend_without_the_field_sends_no_ssh_port_and_the_keys_alone_decide(
+    context_factory,
+):
     # An older backend omits ssh_port: no TCP connect is attempted, authorized_keys still judged.
     h = Harness(context_factory, ssh_port=None)
     result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
 
     assert h.tcp_calls == []
     assert result.event.reason_code == Msg.ALREADY_RENTED.reason
-    assert json.loads(h.redis.store[f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"])["boot_id"] == "boot-a"
+    assert (
+        json.loads(h.redis.store[f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"])[
+            "boot_id"
+        ]
+        == "boot-a"
+    )
 
 
 @pytest.mark.asyncio
