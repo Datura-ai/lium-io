@@ -6522,12 +6522,14 @@ class DockerService:
         Polls ``inspect`` by name for up to REMOVE_CONFIRM_TIMEOUT_SECONDS. Returns None once dockerd
         answers 404 (gone), ``"removing"`` when it is still tearing the container down at the end of
         the window, any other ``State.Status`` as soon as it is seen (the container is not being
-        removed), or ``"unknown"`` when the inspect itself fails or times out. Only None lets the
-        delete report success.
+        removed), or ``"unknown"`` when the inspect itself fails, times out or carries no state.
+        Only None lets the delete report success.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + REMOVE_CONFIRM_TIMEOUT_SECONDS
         while True:
+            # the window is checked between inspects, so the last inspect may run past the
+            # deadline by up to REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS (worst case ~75 s in all)
             try:
                 status = await asyncio.wait_for(
                     docker_client.container_status(container_name=payload.container_name),
@@ -6540,6 +6542,14 @@ class DockerService:
                     "Could not inspect the container after the remove timed out",
                     container_name=payload.container_name,
                     error=str(exc),
+                )
+                return "unknown"
+            if status == "":
+                # an inspect body without State.Status: dockerd knows the name but says nothing
+                # usable about it — not proof of anything, the delete fails as before
+                log.warning(
+                    "Inspect after the remove timed out carried no container state",
+                    container_name=payload.container_name,
                 )
                 return "unknown"
             if status is None or status != _DOCKER_REMOVING_STATUS:
