@@ -58,10 +58,11 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
-from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
+from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
 from incentive.config import BASE_GPU_MAP
@@ -933,11 +934,9 @@ class MinerService:
                         "batch_total": batch_total,
                         "availability_errors": result.availability_errors,
                         # DAH-3338: None when the cycle observed no rented pod and reaped nothing.
-                        "pod_states": (
-                            [state.model_dump(mode="json") for state in result.pod_states]
-                            if result.pod_states is not None
-                            else None
-                        ),
+                        # The spec carries at most the backend's bound; the rest of the list goes
+                        # in PodStatesReport chunks below, or waits for the next cycle.
+                        "pod_states": self._spec_pod_states(result, default_extra),
                     },
                 )
             except Exception as e:
@@ -945,6 +944,76 @@ class MinerService:
                     _m(
                         f"Error publishing machine specs of {miner_hotkey} to compute app connector process",
                         extra=get_extra_info({**default_extra, "error": str(e)}),
+                    ),
+                    exc_info=True,
+                )
+                continue
+            if settings.POD_STATES_REPORT_ENABLED:
+                await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
+
+    @staticmethod
+    def _spec_pod_states(result: JobResult, default_extra: dict) -> list[dict] | None:
+        if result.pod_states is None:
+            return None
+        bounded = bound_pod_states(result.pod_states)
+        if len(bounded) < len(result.pod_states):
+            logger.warning(
+                _m(
+                    "pod_states over the spec's bound"
+                    + (
+                        "; every state goes in the PodStatesReport chunks"
+                        if settings.POD_STATES_REPORT_ENABLED
+                        else "; the observed states past it are cut until the reaped queue drains"
+                    ),
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "executor_uuid": result.executor_info.uuid,
+                            "pod_states": len(result.pod_states),
+                            "in_spec": len(bounded),
+                        }
+                    ),
+                )
+            )
+        return [state.model_dump(mode="json") for state in bounded]
+
+    async def _publish_pod_states_report(self, result: JobResult, *, miner_hotkey: str, default_extra: dict) -> None:
+        """DAH-3338: every state of the cycle, in chunks of POD_STATES_MAX_ITEMS, right after the spec.
+
+        The chunks carry what the spec carries and what did not fit it; the backend's write is
+        idempotent, so the overlap changes nothing. A publish that fails loses that chunk for this
+        cycle only: a reaped id is re-sent from its queue, an observed state is observed again.
+        """
+        if not result.pod_states:
+            return
+        chunks = chunk_pod_states(result.pod_states)
+        for index, chunk in enumerate(chunks):
+            try:
+                await self.redis_service.publish(
+                    POD_STATES_CHANNEL,
+                    {
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": result.executor_info.uuid,
+                        "job_batch_id": result.job_batch_id,
+                        "chunk_index": index,
+                        "chunk_total": len(chunks),
+                        "pod_states": [state.model_dump(mode="json") for state in chunk],
+                        "sent_at": time.time(),
+                    },
+                )
+            except Exception as e:
+                logger.error(
+                    _m(
+                        "Error publishing pod states report chunk to compute app connector process",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "executor_uuid": result.executor_info.uuid,
+                                "chunk_index": index,
+                                "chunk_total": len(chunks),
+                                "error": str(e),
+                            }
+                        ),
                     ),
                     exc_info=True,
                 )

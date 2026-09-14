@@ -11,6 +11,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from core.config import settings
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis as FakeRedisClient
 from helpers import build_services, build_state, default_executor, make_context
@@ -18,6 +19,7 @@ from neurons.validators.src.services.task.checks import StaleContainerCleanupChe
 from neurons.validators.src.services.task.checks.stale_container_cleanup import (
     POD_STATES_MAX_ITEMS,
     REAPED_POD_STATE_RETENTION_SECONDS,
+    REAPED_POD_STATES_FLOOR,
     REAPED_POD_STATES_KEY_PREFIX,
     StaleContainerCleanupCheck as DirectImport,
 )
@@ -560,6 +562,47 @@ async def test_a_queue_within_its_share_is_sent_whole_every_cycle():
 
     assert set(await _cycle(executor, redis, rented_data)) == set(ids)
     assert set(await _cycle(executor, redis, rented_data)) == set(ids)
+
+
+@pytest.mark.asyncio
+async def test_a_node_with_256_rented_pods_still_moves_its_reaped_queue(monkeypatch):
+    """Regression (review): the share was 256 minus the rented count, so a node with 256 rented
+    pods gave the queue zero slots and every queued id expired unsent. Without the report the
+    queue now gets a floor; the reaped ids sit first in the list, so the spec's cut takes observed
+    states (observed again next cycle), never a reaped id."""
+    monkeypatch.setattr(settings, "POD_STATES_REPORT_ENABLED", False)
+    executor = default_executor()
+    key = f"{REAPED_POD_STATES_KEY_PREFIX}{executor.uuid}"
+    an_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    ids = _queued_ids(40)
+    redis = FakeRedis({key: {pod_id: an_hour_ago for pod_id in ids}})
+    rented_data = _rented(executor, pod_count=POD_STATES_MAX_ITEMS)
+
+    first = await _cycle(executor, redis, rented_data)
+    second = await _cycle(executor, redis, rented_data)
+
+    assert len(first) == REAPED_POD_STATES_FLOOR == 32
+    assert set(first) | set(second) == set(ids)
+    assert len(redis.hashes[key]) == 40  # nothing dropped, nothing expired
+
+
+@pytest.mark.asyncio
+async def test_with_the_report_on_every_queued_id_goes_out_each_cycle(monkeypatch):
+    """With PodStatesReport the states leave in chunks after the spec, so there is no share: a node
+    with 256 rented pods and 300 queued reaped ids sends all 300 in one cycle."""
+    monkeypatch.setattr(settings, "POD_STATES_REPORT_ENABLED", True)
+    executor = default_executor()
+    key = f"{REAPED_POD_STATES_KEY_PREFIX}{executor.uuid}"
+    an_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    ids = _queued_ids(300)
+    redis = FakeRedis({key: {pod_id: an_hour_ago for pod_id in ids}})
+    rented_data = _rented(executor, pod_count=POD_STATES_MAX_ITEMS)
+
+    sent = await _cycle(executor, redis, rented_data)
+
+    assert set(sent) == set(ids) and len(sent) == 300
+    # and every one is stamped as sent, so the next cycle's order is by last report again
+    assert all("sent_at" in json.loads(redis.hashes[key][pod_id]) for pod_id in ids)
 
 
 @pytest.mark.asyncio
