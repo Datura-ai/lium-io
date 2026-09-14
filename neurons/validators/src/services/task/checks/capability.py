@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 from core.config import settings
 
 from ..messages import CapabilityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+
+if TYPE_CHECKING:
+    from services.matrix_validation_service import ValidationResult
+
+logger = logging.getLogger(__name__)
 
 
 class CapabilityCheck:
@@ -91,6 +98,17 @@ class CapabilityCheck:
         elif failure_reason:
             failure_details = {"error": failure_reason}
 
+        if _probe_gave_no_answer(result):
+            lium_workload = await _lium_workload_live_now(ctx)
+            if lium_workload is not None:
+                event = render_message(
+                    Msg.RENTED_SKIPPED,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={**lium_workload, "probe": failure_details},
+                )
+                return CheckResult(passed=True, event=event)
+
         template = Msg.VERIFY_TIMEOUT if result is not None and result.timed_out else Msg.VERIFY_FAILED
         event = render_message(
             template,
@@ -99,6 +117,65 @@ class CapabilityCheck:
             what=failure_details,
         )
         return CheckResult(passed=False, event=event)
+
+
+# What the probe answers when it never reached the UUID step: the wrapper prints "UUID:  None"
+# after a failed cudaMalloc, and the service reports that as a mismatch against 'None'.
+_NO_UUID = frozenset({"", "none", "null"})
+_UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
+
+
+def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
+    """True when the probe timed out or came back without any UUID.
+
+    A returned UUID that does not match is the anti-spoof case and is never waived: the expected
+    UUID is a per-call nonce, so a genuine executor never answers a wrong one. An exception on
+    the validator's side (result None) is not the card's doing either.
+    """
+    if result is None:
+        return False
+    if result.timed_out:
+        return True
+    if not (result.error_message or "").startswith(_UUID_MISMATCH_ERROR_PREFIX):
+        return False
+    return (result.returned_uuid or "").strip().lower() in _NO_UUID
+
+
+async def _lium_workload_live_now(ctx: Context) -> dict[str, Any] | None:
+    """Ask the backend whether a workload it started holds this node's cards right now.
+
+    `rented_data` is read once, at cycle start. A filler the backend starts right after a rental
+    closes, or a pod created during the cycle, is absent from that snapshot, so the probe runs
+    against a busy card and cannot allocate (DAH-3480: 60 of 267 `GPU_VERIFY_FAILED` "Failed to
+    allocate" rows in 48 h had a filler created after the snapshot and live at probe time; 0 fell
+    inside a rental the snapshot knew about). DAH-2757 closed the same race for the GPU usage
+    gate. Asked only after a failed probe, never on the healthy path; one call, 30 s timeout, no
+    retry, and a backend that does not answer keeps the failure (fail closed).
+
+    What counts is the backend's list, never the node's: a filler container it runs on the node
+    (a default job, Lium's or the miner's own, both already exempt from the probe when the
+    snapshot knows them), or a pod it lists (BROKEN and DELETING pods are not listed). The same
+    two lists are what `TenantEnforcementCheck` and the filler skip above trust at cycle start,
+    so this grants at most the one cycle the snapshot missed.
+    """
+    try:
+        fresh = await ctx.services.backend.get_rented_executors_now()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Rented-executors re-read failed; the probe verdict stands: %s", exc)
+        return None
+    if fresh is None:
+        return None
+    executor_uuid = ctx.executor.uuid
+    filler_containers = fresh.get_filler_containers(executor_uuid)
+    if filler_containers:
+        return {"workload": "filler", "containers": sorted(filler_containers)}
+    rented_executor = fresh.executors.get(executor_uuid)
+    if rented_executor and rented_executor.pods:
+        return {
+            "workload": "pod",
+            "containers": sorted(pod.container_name for pod in rented_executor.pods),
+        }
+    return None
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:

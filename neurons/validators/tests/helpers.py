@@ -152,6 +152,8 @@ def build_services(**overrides) -> ContextServices:
     # A bare AsyncMock would confirm every Lium-named container as ours (DAH-2757); opt in per test.
     backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False)
     backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=False)
+    # A bare AsyncMock would report a live Lium workload on every node (DAH-3480); opt in per test.
+    backend.get_rented_executors_now.return_value = None
     base = dict(
         ssh=None,
         redis=None,
