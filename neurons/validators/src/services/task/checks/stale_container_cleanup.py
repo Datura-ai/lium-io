@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import replace
@@ -7,7 +8,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from core.utils import _m
-from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
+from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
 from ...const import POD_CONTAINER_PREFIX
@@ -31,6 +32,9 @@ DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS = 60 * 60
 # container is gone (the next cycle finds nothing to reap). So every reaped pod id is queued in
 # redis BEFORE its container is removed and re-sent with every cycle's pod_states until it is this
 # old; the backend's write is idempotent (a repeat changes nothing), so a re-send costs nothing.
+# One message carries at most POD_STATES_MAX_ITEMS states (the backend's bound). The rented pods'
+# observed states have first claim on those slots; the queued ids take turns for the rest, least
+# recently sent first, so a queue longer than its share still goes out whole over a few cycles.
 REAPED_POD_STATE_RETENTION_SECONDS = 24 * 60 * 60
 REAPED_POD_STATES_KEY_PREFIX = "reaped_pod_states:"
 
@@ -143,7 +147,7 @@ class StaleContainerCleanupCheck:
         for name in unremovable_names:
             # queued before the attempt (the hook runs first), still on the host: not reaped
             await queue.drop(name)
-        reaped = await queue.states()
+        reaped = await queue.states(limit=self._reaped_share(ctx))
         if not unremovable_names and not reaped:
             return CheckResult(passed=True, event=event)
         state = replace(
@@ -152,6 +156,21 @@ class StaleContainerCleanupCheck:
             pod_states=[*ctx.state.pod_states, *reaped],
         )
         return CheckResult(passed=True, event=event, updates={"state": state})
+
+    @staticmethod
+    def _reaped_share(ctx: Context) -> int:
+        """How many queued reaped ids fit in this cycle's message next to the observed states.
+
+        `ExecutorSpecRequest.pod_states` holds at most POD_STATES_MAX_ITEMS (the backend drops a
+        longer spec whole, node listing included, and a second spec per cycle would write a second
+        cycle row and validation report). TenantEnforcementCheck adds one observed state per rented
+        pod later in the cycle; those slots are reserved here, the reaped ids share what is left.
+        The rented list is the backend's own, so it never approaches the bound on one node.
+        """
+        rented_data = ctx.state.rented_data
+        rented = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_pod_count = len(rented.pods) if rented else 0
+        return max(0, POD_STATES_MAX_ITEMS - rented_pod_count)
 
     async def _first_sight(self, ctx: Context) -> bool:
         """Record the executor UUID; True the first time this validator meets it.
@@ -189,8 +208,45 @@ def pod_id_of_container(name: str) -> str | None:
     return pod_id
 
 
+class _QueuedReap:
+    """One hash entry: when the container was reaped, and when its report last went out (None: never)."""
+
+    __slots__ = ("observed_at", "sent_at")
+
+    def __init__(self, observed_at: datetime, sent_at: datetime | None = None) -> None:
+        self.observed_at = observed_at
+        self.sent_at = sent_at
+
+    def encode(self) -> str:
+        value = {"observed_at": self.observed_at.isoformat()}
+        if self.sent_at is not None:
+            value["sent_at"] = self.sent_at.isoformat()
+        return json.dumps(value)
+
+    @classmethod
+    def decode(cls, raw: str) -> _QueuedReap:
+        """Raises ValueError on a value this code did not write."""
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = None
+        if not isinstance(value, dict):
+            # a bare timestamp, as the first cut of this queue wrote it: reaped then, never sent
+            return cls(datetime.fromisoformat(raw))
+        sent_at = value.get("sent_at")
+        return cls(
+            datetime.fromisoformat(str(value["observed_at"])),
+            datetime.fromisoformat(str(sent_at)) if sent_at else None,
+        )
+
+    def send_order(self) -> tuple[int, datetime]:
+        # never sent first, then the one whose last report is oldest
+        return (0, self.observed_at) if self.sent_at is None else (1, self.sent_at)
+
+
 class _ReapedPodStateQueue:
-    """Per-executor redis hash ``pod_id -> observed_at`` of reaped rental containers (DAH-3338).
+    """Per-executor redis hash ``pod_id -> {observed_at, sent_at}`` of reaped rental containers
+    (DAH-3338).
 
     Every method swallows a redis error: the queue is delivery insurance, and a redis hiccup must
     neither stop the removal nor change the executor's verdict. Without a redis service (tests,
@@ -201,18 +257,18 @@ class _ReapedPodStateQueue:
         self._redis = ctx.services.redis
         self._key = f"{REAPED_POD_STATES_KEY_PREFIX}{ctx.executor.uuid}"
         self._extra = {"executor_uuid": ctx.executor.uuid}
-        self._this_cycle: dict[str, datetime] = {}
+        self._this_cycle: dict[str, _QueuedReap] = {}
 
     async def add(self, container_name: str) -> None:
         pod_id = pod_id_of_container(container_name)
         if pod_id is None or pod_id in self._this_cycle:
             return
-        observed_at = datetime.now(UTC)
-        self._this_cycle[pod_id] = observed_at
+        entry = _QueuedReap(datetime.now(UTC))
+        self._this_cycle[pod_id] = entry
         if self._redis is None:
             return
         try:
-            await self._redis.hset(self._key, pod_id, observed_at.isoformat())
+            await self._redis.hset(self._key, pod_id, entry.encode())
             # the hash of a node that leaves the fleet is not read again; the TTL is what removes it
             await self._redis.expire(self._key, REAPED_POD_STATE_RETENTION_SECONDS)
         except Exception as e:
@@ -230,8 +286,14 @@ class _ReapedPodStateQueue:
         except Exception as e:
             logger.warning(_m("reaped pod state not dropped", extra={**self._extra, "pod_id": pod_id, "error": str(e)}))
 
-    async def states(self) -> list[PodContainerState]:
-        queued: dict[str, datetime] = dict(self._this_cycle)
+    async def states(self, limit: int) -> list[PodContainerState]:
+        """Up to ``limit`` queued reaps for this cycle's message, and record that they went out.
+
+        Never-sent ids first, then the ones whose last report is oldest; what does not fit keeps
+        its place and goes next cycle, so a queue longer than the message's share is sent whole
+        over ceil(queue / share) cycles instead of the same head every time.
+        """
+        queued: dict[str, _QueuedReap] = dict(self._this_cycle)
         if self._redis is not None:
             try:
                 stored = await self._redis.hgetall(self._key)
@@ -240,26 +302,44 @@ class _ReapedPodStateQueue:
                 stored = {}
             cutoff = datetime.now(UTC).timestamp() - REAPED_POD_STATE_RETENTION_SECONDS
             expired: list[str] = []
-            for raw_pod_id, raw_observed_at in (stored or {}).items():
+            for raw_pod_id, raw_entry in (stored or {}).items():
                 pod_id = raw_pod_id.decode() if isinstance(raw_pod_id, bytes) else str(raw_pod_id)
-                raw_observed_at = (
-                    raw_observed_at.decode() if isinstance(raw_observed_at, bytes) else str(raw_observed_at)
-                )
+                raw_entry = raw_entry.decode() if isinstance(raw_entry, bytes) else str(raw_entry)
                 try:
-                    observed_at = datetime.fromisoformat(raw_observed_at)
-                except ValueError:
+                    entry = _QueuedReap.decode(raw_entry)
+                except (ValueError, KeyError, TypeError):
                     expired.append(pod_id)
                     continue
-                if observed_at.timestamp() < cutoff:
+                if entry.observed_at.timestamp() < cutoff:
                     expired.append(pod_id)
                     continue
-                queued.setdefault(pod_id, observed_at)
+                queued.setdefault(pod_id, entry)
             if expired:
                 try:
                     await self._redis.hdel(self._key, *expired)
                 except Exception as e:
                     logger.warning(_m("expired reaped pod states not dropped", extra={**self._extra, "error": str(e)}))
+
+        in_send_order = sorted(queued.items(), key=lambda item: item[1].send_order())
+        sending = in_send_order[: max(0, limit)]
+        if len(sending) < len(in_send_order):
+            logger.info(
+                _m(
+                    "reaped pod states over this cycle's share of the message; the rest go next cycle",
+                    extra={**self._extra, "queued": len(in_send_order), "sent": len(sending), "share": limit},
+                )
+            )
+        sent_at = datetime.now(UTC)
+        for pod_id, entry in sending:
+            entry.sent_at = sent_at
+        if self._redis is not None and sending:
+            try:
+                for pod_id, entry in sending:
+                    await self._redis.hset(self._key, pod_id, entry.encode())
+            except Exception as e:
+                # the ids go out anyway; an unrecorded send only puts them first in line again
+                logger.warning(_m("reaped pod state send not recorded", extra={**self._extra, "error": str(e)}))
         return [
-            PodContainerState(pod_id=pod_id, container_state=ContainerState.REAPED, observed_at=observed_at)
-            for pod_id, observed_at in sorted(queued.items(), key=lambda item: item[1])
+            PodContainerState(pod_id=pod_id, container_state=ContainerState.REAPED, observed_at=entry.observed_at)
+            for pod_id, entry in sorted(sending, key=lambda item: item[1].observed_at)
         ]
