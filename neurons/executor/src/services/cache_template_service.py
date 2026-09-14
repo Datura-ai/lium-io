@@ -18,6 +18,7 @@ decision: state failures are swallowed inside ``cache_prefetch_state``.
 """
 
 import asyncio
+import time
 
 import aiohttp
 import docker
@@ -293,6 +294,10 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
         while True:
             try:
                 state.begin_sweep()
+                # When the next mandatory refresh is due. With the pre-pull on, the sweep is
+                # capped at it and the sleep below runs only up to it, so the default image is
+                # re-checked every refresh_interval whatever the sweep did (review, DAH-2977).
+                refresh_deadline = time.monotonic() + refresh_interval
                 # Resolve GPU info off-thread, and keep retrying while it is still
                 # unknown: at early boot the NVIDIA driver may not be ready yet,
                 # and caching "unknown" once would wedge the loop forever.
@@ -357,6 +362,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                         await pre_puller.sweep(
                             pre_pull,
                             protected=frozenset(f"{repo}:{tag}" for repo, tag in mandatory_refs if repo and tag),
+                            deadline=refresh_deadline,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -368,8 +374,14 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                 # Publish before sleeping, so the document is never a full refresh
                 # interval behind what the loop actually knows.
                 state.flush()
-                # Sleep once per full sweep, after all templates are processed.
-                await asyncio.sleep(refresh_interval)
+                # Sleep once per full sweep. With the pre-pull on, only until the refresh
+                # deadline: the time the sweep took comes out of the sleep, not on top, so the
+                # default image is re-checked every refresh_interval. Flag off, the sleep is
+                # today's full interval after the work, unchanged.
+                if pre_puller:
+                    await asyncio.sleep(max(0.0, refresh_deadline - time.monotonic()))
+                else:
+                    await asyncio.sleep(refresh_interval)
             except asyncio.CancelledError:
                 logger.info("Cache template pre-pull cancelled")
                 raise

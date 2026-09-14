@@ -14,12 +14,16 @@ digest-pinned, and only if
   a pull already running is cancelled the moment either appears;
 * the docker root keeps ``PRE_PULL_MIN_FREE_GB`` free afterwards — least-recently-used
   pre-pulled images are evicted first to make room, nothing else is ever removed;
-* it finishes within ``PRE_PULL_TIMEOUT_SECONDS``.
+* it finishes within ``PRE_PULL_TIMEOUT_SECONDS`` and before the next mandatory refresh
+  is due: the sweep runs inside the cache-template loop, so the start delay and the pull
+  are both capped at the refresh deadline the loop hands in, and a pull that would not
+  fit waits for the next sweep. The default image's refresh is never postponed by it.
 
 One pull per sweep per node plus a random start delay keeps a fleet-wide enable from
 stampeding the registry. Every pull attempt ends in exactly one log line
 ``pre_pull image=… seconds=… outcome=…``. Bookkeeping (what we pulled, when it was last
-used by a rental) lives in a small JSON file so eviction order survives restarts.
+used by a rental) lives in a small JSON file on the ``reserve_data`` volume so eviction
+order survives restarts and a force-recreate of the executor container.
 """
 
 import asyncio
@@ -31,6 +35,8 @@ from pathlib import Path
 
 import docker
 import psutil
+import requests
+import urllib3
 
 from core.config import settings
 from core.logger import get_logger
@@ -38,7 +44,14 @@ from services.pull_lock import cache_pull_lock
 
 logger = get_logger(__name__)
 
-STATE_PATH = "/var/lib/lium/pre_pull_state.json"
+# On the `reserve_data` named volume (compose mounts it at /var/lium-reserve), which outlives a
+# force-recreate of the executor container. /var/lib/lium is the container's writable layer:
+# a state file there is gone after a recreate and every image it tracked would stay on the
+# host outside the eviction inventory.
+STATE_PATH = "/var/lium-reserve/pre_pull_state.json"
+# A pull with less than this left before the refresh deadline is not started; it waits for
+# the next sweep instead of being cut off by the deadline a few seconds in.
+MIN_PULL_BUDGET_SECONDS = 60
 # Same prefix monitor.py watches: every rental container the validator creates.
 RENTAL_CONTAINER_PREFIX = "pod_"
 # The validator drives rental docker operations through docker-py over SSH, which runs
@@ -49,6 +62,11 @@ ON_DISK_MULTIPLIER = 3.0
 DISK_PATH = "/"
 # How often a running pull re-checks that the node is still idle.
 ACTIVITY_CHECK_SECONDS = 10
+# Socket timeouts of the pull stream: connect, and the longest silence between two progress
+# events before the pull counts as stalled. Docker streams progress many times a second while
+# a layer downloads or extracts, so a minute of silence is a stuck registry, not a slow one.
+CONNECT_TIMEOUT_SECONDS = 30
+STREAM_READ_TIMEOUT_SECONDS = 60
 GIB = 1024**3
 
 
@@ -148,12 +166,15 @@ def _pull_pinned(
     headers = {"X-Registry-Auth": auth_header} if auth_header else {}
     deadline = time.monotonic() + timeout_seconds
     next_check = time.monotonic() + ACTIVITY_CHECK_SECONDS
+    # The deadline and the idle check run per stream event, so the read timeout is what
+    # bounds a stream that goes silent: without it a stalled registry would hold this thread
+    # (and the pull lock) for the whole budget past the caller's refresh deadline.
     response = api._post(
         api._url("/images/create"),
         params={"fromImage": repo, "tag": digest},
         headers=headers,
         stream=True,
-        timeout=timeout_seconds,
+        timeout=(CONNECT_TIMEOUT_SECONDS, STREAM_READ_TIMEOUT_SECONDS),
     )
     try:
         api._raise_for_status(response)
@@ -168,6 +189,10 @@ def _pull_pinned(
                 busy = rental_activity(client)
                 if busy:
                     return "preempted", busy
+    except (requests.exceptions.Timeout, urllib3.exceptions.TimeoutError):
+        # docker-py reads the chunked stream off `response.raw`, so a silent stream surfaces as
+        # urllib3's ReadTimeoutError, not requests' (requests only remaps inside iter_content).
+        return "timeout", f"no stream event for {STREAM_READ_TIMEOUT_SECONDS}s"
     finally:
         response.close()
     # A digest pull leaves the tag untouched; rentals look the image up by repo:tag.
@@ -181,12 +206,24 @@ class PrePuller:
         self.state = PrePullState(state_path)
         self._first_sweep = True
 
-    async def sweep(self, entries: list[dict], protected: frozenset[str] = frozenset()) -> None:
+    async def sweep(
+        self,
+        entries: list[dict],
+        protected: frozenset[str] = frozenset(),
+        deadline: float | None = None,
+    ) -> None:
         """Pull at most one missing ``pre_pull`` entry, if the node is idle and has room.
 
         ``protected`` are the mandatory refs (``repo:tag``) the default-image path owns this
         sweep: a ref pre-pulled earlier that has since become this node's default is untracked
-        here so the disk guard never evicts it."""
+        here so the disk guard never evicts it.
+
+        ``deadline`` is the ``time.monotonic()`` instant the caller's next mandatory refresh is
+        due. The start jitter and the pull budget are both cut at it, so this sweep holds the
+        default image's refresh by at most one stream read timeout plus a retag (a 15-minute
+        jitter plus a 30-minute pull would otherwise hold the loop for 45 minutes while the
+        validator checks the default digest).
+        ``None`` means no cap, which only the tests use."""
         for image_ref in protected & self.state.images.keys():
             self.state.forget(image_ref)
             logger.info(f"pre-pull: {image_ref} is now a mandatory image; no longer tracked for eviction")
@@ -194,8 +231,14 @@ class PrePuller:
             self.state.flush()
             return
         if self._first_sweep:
-            self._first_sweep = False
             delay = random.uniform(0, settings.PRE_PULL_START_JITTER_SECONDS)
+            if deadline is not None and delay > deadline - time.monotonic():
+                # The drawn delay does not fit before the refresh deadline: sleep what is
+                # left and draw again next sweep, so this node keeps its share of the
+                # fleet-wide spread instead of starting early.
+                delay = max(0.0, deadline - time.monotonic())
+            else:
+                self._first_sweep = False
             logger.info(f"pre-pull: first sweep in {delay:.0f}s (start jitter)")
             await asyncio.sleep(delay)
 
@@ -224,8 +267,29 @@ class PrePuller:
                 logger.info(f"pre-pull: node busy ({busy}); {image_ref} waits for the next sweep")
                 break
 
+            if deadline is not None and deadline - time.monotonic() < MIN_PULL_BUDGET_SECONDS:
+                # Checked before eviction, so nothing is removed for a pull that will not run.
+                logger.info(
+                    f"pre-pull: {max(0.0, deadline - time.monotonic()):.0f}s left before the "
+                    f"refresh deadline; {image_ref} waits for the next sweep"
+                )
+                break
+
             started = time.monotonic()
             room, detail = await self._make_room(image_ref, int(size * ON_DISK_MULTIPLIER))
+            # The budget is measured after eviction, which takes time of its own: the pull's
+            # clock starts below, so this is what cuts it at the deadline.
+            budget = float(settings.PRE_PULL_TIMEOUT_SECONDS)
+            if deadline is not None:
+                budget = max(0.0, min(budget, deadline - time.monotonic()))
+                if budget < MIN_PULL_BUDGET_SECONDS:
+                    # A slow eviction ate the budget; a pull that must end in under a minute
+                    # would only be logged as a timeout. The room it made stays for next sweep.
+                    logger.info(
+                        f"pre-pull: eviction left {budget:.0f}s before the refresh deadline; "
+                        f"{image_ref} waits for the next sweep"
+                    )
+                    break
             if not room:
                 outcome = "insufficient_disk"
             else:
@@ -235,7 +299,7 @@ class PrePuller:
                     else:
                         try:
                             outcome, detail = await asyncio.to_thread(
-                                _pull_pinned, self.client, repo, tag, digest, settings.PRE_PULL_TIMEOUT_SECONDS
+                                _pull_pinned, self.client, repo, tag, digest, budget
                             )
                         except Exception as e:
                             outcome, detail = "pull_failed", str(e)
