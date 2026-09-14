@@ -48,6 +48,27 @@ class DockerCommand:
         return f"/usr/bin/docker rm -fv {name}"
 
     @staticmethod
+    def kill_container_processes(name: str) -> str:
+        """SIGKILL a container's init and its containerd shim directly (DAH-2991).
+
+        For a container dockerd cannot kill ("tried to kill container, but did not receive an exit
+        event": the process is wedged, typically in uninterruptible I/O on a dead mount), `docker rm -f`
+        fails forever and the container keeps its published ports. The executor runs `pid: host` and
+        privileged, so the host pids are visible: killing the shim makes containerd report the task
+        as exited and dockerd then lets `docker rm -f` through. Prints what was killed; exit 0 always.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"pid=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {quoted} 2>/dev/null); "
+            "if [ -n \"$pid\" ] && [ \"$pid\" != 0 ]; then "
+            "shim=$(awk '/^PPid:/{print $2}' /proc/$pid/status 2>/dev/null); "
+            "kill -9 $pid 2>/dev/null; "
+            "if [ -n \"$shim\" ] && grep -qa containerd-shim /proc/$shim/cmdline 2>/dev/null; "
+            "then kill -9 $shim 2>/dev/null; else shim=; fi; "
+            "sleep 3; echo \"killed pid=$pid shim=${shim:-none}\"; fi; true"
+        )
+
+    @staticmethod
     def ps_filter(*name_patterns: str) -> str:
         """Build docker ps command with one or more filters."""
         filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)

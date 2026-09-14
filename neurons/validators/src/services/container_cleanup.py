@@ -67,13 +67,15 @@ class ContainerCleanup:
         ssh_client,
         rented_data: Optional[RentedExecutorsResponse],
         executor_uuid: str,
-    ) -> tuple[int, list[str]]:
+    ) -> tuple[int, list[str], list[str]]:
         """Remove containers that are not in rented data and are older than threshold.
 
         Returns:
-            Tuple of (number_removed, list_of_removed_container_names)
+            Tuple of (number_removed, removed container names, orphaned containers that survived
+            removal — they still hold their ports, so the port check names them).
         """
         removed_names = []
+        unremovable_names: list[str] = []
         extra = {
             "executor_uuid": executor_uuid,
             "threshold_minutes": self.stale_threshold_minutes,
@@ -122,6 +124,8 @@ class ContainerCleanup:
                                 }
                             )
                         )
+                    else:
+                        unremovable_names.append(stripped_name)
 
         except Exception as e:
             logger.warning(
@@ -147,7 +151,7 @@ class ContainerCleanup:
         # without -v. Best-effort — never raises, never changes this return.
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
 
-        return len(removed_names), removed_names
+        return len(removed_names), removed_names, unremovable_names
 
     async def prune_dangling_anonymous_volumes(
         self,
@@ -526,7 +530,31 @@ class ContainerCleanup:
             # Remove stale containers together with anonymous Docker volumes.
             result = await ssh_client.run(DockerCommand.remove_with_volumes(container_name))
             if result.exit_status != 0:
-                return False
+                # DAH-2991: dockerd could not kill the container (ticket-0287: "tried to kill
+                # container, but did not receive an exit event", 4 backend deletes failed the same
+                # way and the orphan held 8 of 10 rental ports for 5 h). Used to return False here in
+                # silence, every cycle. Kill its init and shim directly and try once more.
+                error = (result.stderr or result.stdout or "").strip()
+                logger.warning(
+                    _m(
+                        f"docker rm -f failed for {container_name}; killing its processes directly",
+                        extra={"container_name": container_name, "error": error},
+                    )
+                )
+                killed = await ssh_client.run(DockerCommand.kill_container_processes(container_name))
+                result = await ssh_client.run(DockerCommand.remove_with_volumes(container_name))
+                if result.exit_status != 0:
+                    logger.error(
+                        _m(
+                            f"Container {container_name} survives docker rm -f and a direct kill",
+                            extra={
+                                "container_name": container_name,
+                                "error": (result.stderr or result.stdout or "").strip(),
+                                "killed": (getattr(killed, "stdout", "") or "").strip(),
+                            },
+                        )
+                    )
+                    return False
 
             # Remove associated volume if it's a pod container
             if container_name.startswith(POD_CONTAINER_PREFIX):

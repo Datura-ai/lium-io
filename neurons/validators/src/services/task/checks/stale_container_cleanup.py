@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
@@ -50,7 +51,7 @@ class StaleContainerCleanupCheck:
         self._last_sweep_at: dict[str, float] = {}
 
     async def run(self, ctx: Context) -> CheckResult:
-        removed_count, removed_names = await ctx.services.container_cleanup.cleanup(
+        removed_count, removed_names, unremovable_names = await ctx.services.container_cleanup.cleanup(
             ssh_client=ctx.ssh,
             rented_data=ctx.state.rented_data,
             executor_uuid=ctx.executor.uuid,
@@ -88,8 +89,12 @@ class StaleContainerCleanupCheck:
             what={
                 "removed_count": removed_count,
                 "removed_containers": removed_names,
+                "unremovable_containers": unremovable_names,
                 "reclaimed_cache_volumes": reclaimed_cache_volumes,
                 "swept_download_temporaries": swept_download_temporaries,
             },
         )
-        return CheckResult(passed=True, event=event)
+        # DAH-2991: an orphan that survived removal still holds its ports; PortCountCheck names it
+        # instead of reporting a bare count the provider has to diagnose by hand.
+        updates = {"state": replace(ctx.state, orphaned_containers=unremovable_names)} if unremovable_names else {}
+        return CheckResult(passed=True, event=event, updates=updates)

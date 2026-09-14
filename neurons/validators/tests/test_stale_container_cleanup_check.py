@@ -24,7 +24,7 @@ from protocol.vc_protocol.compute_requests import (
 class RecordingContainerCleanup:
     """Records cleanup() calls and returns a configurable (count, names) result."""
 
-    def __init__(self, result=(0, []), reclaimed=0, swept=0):
+    def __init__(self, result=(0, [], []), reclaimed=0, swept=0):
         self._result = result
         self._reclaimed = reclaimed
         self._swept = swept
@@ -59,7 +59,7 @@ def _make_ctx(cleanup, rented_data=None):
 
 @pytest.mark.asyncio
 async def test_runs_cleanup_and_passes():
-    cleanup = RecordingContainerCleanup(result=(2, ["pod_orphan", "filler_old"]))
+    cleanup = RecordingContainerCleanup(result=(2, ["pod_orphan", "filler_old"], []))
     ctx = _make_ctx(cleanup)
 
     result = await StaleContainerCleanupCheck().run(ctx)
@@ -102,7 +102,7 @@ async def test_passes_cleanup_args_through():
 
 @pytest.mark.asyncio
 async def test_noop_cleanup_still_passes():
-    cleanup = RecordingContainerCleanup(result=(0, []))
+    cleanup = RecordingContainerCleanup(result=(0, [], []))
     ctx = _make_ctx(cleanup)
 
     result = await StaleContainerCleanupCheck().run(ctx)
@@ -135,7 +135,7 @@ def test_cleanup_runs_before_port_checks_in_production_pipeline():
 async def test_also_reclaims_the_dphn_cache_when_disk_is_tight():
     # DAH-2475: this check is the ONLY caller of the reclaim backstop — the create-time sweep
     # deliberately never reclaims, so a node stranded under the listing floor is rescued here.
-    cleanup = RecordingContainerCleanup(result=(0, []), reclaimed=2)
+    cleanup = RecordingContainerCleanup(result=(0, [], []), reclaimed=2)
     ctx = _make_ctx(cleanup)
 
     result = await StaleContainerCleanupCheck().run(ctx)
@@ -171,3 +171,16 @@ async def test_the_sweep_is_throttled_per_executor():
 
     assert len(cleanup.sweep_calls) == 1
     assert second_result.event.what_we_saw["swept_download_temporaries"] is None
+
+
+@pytest.mark.asyncio
+async def test_unremovable_orphan_is_recorded_in_state_for_the_port_check():
+    """DAH-2991: an orphan that survives removal is named in the event and handed to PortCountCheck."""
+    cleanup = RecordingContainerCleanup(result=(0, [], ["pod_orphan"]))
+    ctx = _make_ctx(cleanup)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["unremovable_containers"] == ["pod_orphan"]
+    assert result.updates["state"].orphaned_containers == ["pod_orphan"]
