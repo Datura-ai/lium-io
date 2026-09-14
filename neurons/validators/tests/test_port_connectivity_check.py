@@ -326,6 +326,41 @@ async def test_port_connectivity_publishes_the_runtime_probe_reason_when_dind_fa
 
 
 @pytest.mark.asyncio
+async def test_port_connectivity_publishes_no_runtime_probe_when_the_downgrade_is_tolerated(context_factory):
+    """DAH-2272 x B-176: the rental that force-removed the DinD container also made the probe
+    fail. The tolerate branch keeps the known sysbox value; it must not publish that failure as a
+    GPU-runtime problem on a healthy, just-rented host — specs carry no `runtime_probe` and the
+    event carries no `runtime_probe_reason` this cycle."""
+    connectivity_service = DummyConnectivityService(
+        success=True,
+        sysbox_runtime=False,
+        verified_port_count=100,
+        dind_ok=False,
+        dind_reason_code="DIND_PROBE_FAILED",
+        dind_error="Error response from daemon: No such container",
+    )
+    services = build_services(
+        redis=DummyRedis(renting_in_progress=True),
+        backend=DummyBackendService(),
+        connectivity=connectivity_service,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(sysbox_runtime=True),
+        rented=False,
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates["default_extra"]["sysbox_downgrade_tolerated"] is True
+    assert "runtime_probe" not in result.updates["state"].specs
+    assert "runtime_probe_reason" not in result.updates["default_extra"]
+    assert "runtime_probe" not in result.event.what
+
+
+@pytest.mark.asyncio
 async def test_port_connectivity_publishes_a_passing_runtime_probe(context_factory):
     """Control: a probe that passed publishes `{"ok": true}` and no reason, so the portal can
     clear the warning the cycle after the host is fixed."""
