@@ -354,6 +354,23 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
 
+    async def container_status(self, *, container_name: str) -> str | None:
+        """Return the container's ``State.Status`` (``running``, ``exited``, ``removing``, …), or
+        None when dockerd no longer knows the name (404)."""
+        try:
+            inspect_result = await _in_docker_thread(
+                self._api_client.inspect_container, container_name
+            )
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+        state = inspect_result.get("State") if isinstance(inspect_result, dict) else None
+        status = state.get("Status") if isinstance(state, dict) else None
+        return str(status).lower() if status else ""
+
     async def mount_source_for_destination(
         self,
         *,

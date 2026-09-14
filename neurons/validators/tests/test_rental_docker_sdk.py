@@ -97,6 +97,7 @@ class FakeApiClient:
         self.exec_inspected = []
         self.containers_inspected = []
         self.container_states = None
+        self.inspect_container_error = None
         self.events = []
         self.pruned_images = False
         self.created_volumes = []
@@ -170,6 +171,8 @@ class FakeApiClient:
     def inspect_container(self, container_name):
         self.events.append("inspect_container")
         self.containers_inspected.append(container_name)
+        if self.inspect_container_error is not None:
+            raise self.inspect_container_error
         if self.container_states is not None:
             if len(self.container_states) > 1:
                 return self.container_states.pop(0)
@@ -1488,3 +1491,37 @@ def test_rental_ssh_adapter_connect_without_transport_does_not_fail(monkeypatch,
     adapter._create_paramiko_client("ssh://root@127.0.0.1:2222")
 
     adapter._connect()
+
+
+# DAH-3467: container_status is what the delete path asks after a remove read timeout. A 404 is the
+# only answer that may report the container gone; every other failure has to surface as an error.
+@pytest.mark.asyncio
+async def test_container_status_returns_none_when_dockerd_no_longer_knows_the_name():
+    api_client = FakeApiClient()
+    api_client.inspect_container_error = NotFound(
+        '404 Client Error for http+docker://ssh/v1.52/containers/pod_gone/json: '
+        'Not Found ("No such container: pod_gone")'
+    )
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_status(container_name="pod_gone") is None
+    assert api_client.containers_inspected == ["pod_gone"]
+
+
+@pytest.mark.asyncio
+async def test_container_status_returns_the_lowercased_state_status():
+    api_client = FakeApiClient()
+    api_client.container_states = [_container_state(status="Removing", running=False)]
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_status(container_name="pod_slow") == "removing"
+
+
+@pytest.mark.asyncio
+async def test_container_status_raises_on_any_other_inspect_failure():
+    api_client = FakeApiClient()
+    api_client.inspect_container_error = APIError("500 Server Error: daemon exploded")
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="inspect container failed.*daemon exploded"):
+        await client.container_status(container_name="pod_slow")
