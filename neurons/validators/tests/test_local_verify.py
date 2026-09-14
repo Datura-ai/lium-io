@@ -1243,6 +1243,42 @@ def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_con
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_download", "used", "transport"),
+    [(760.0, "retry", "ssh"), (30.0, "first", "local_verify")],
+)
+async def test_transport_names_the_sample_the_cold_retry_kept(
+    monkeypatch, retry_download, used, transport
+):
+    """DAH-2959's cold-sample retry always runs over SSH. When it wins, the event's `transport`
+    must say so; a consumed local answer that lost to it is not what the event describes.
+    First pass, so the kept-first case ends in the DAH-3011 deferred-gate success event too."""
+    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
+    local_answer = vvs.VerifyXResponse(
+        data={"success": True, "network": {"download_speed": 59.9, "upload_speed": 20.0}}
+    )
+    ssh_answer = vvs.VerifyXResponse(
+        data={"success": True, "network": {"download_speed": retry_download, "upload_speed": 1.0}}
+    )
+    ssh = SimpleNamespace(validate_verifyx_and_process_job=AsyncMock(return_value=ssh_answer))
+    ctx = make_context(
+        services=build_services(verifyx=ssh),
+        config=build_context_config(verifyx_enabled=True, first_pass=True),
+        state=build_state(
+            specs=SPECS,
+            rented_data=RentedExecutorsResponse(executors={}, banned_guids=[], network_ema={}),
+            local_verify=LocalVerifyOutcome(verifyx=local_answer),
+        ),
+    )
+
+    result = await VerifyXCheck().run(ctx)
+
+    ssh.validate_verifyx_and_process_job.assert_awaited_once()
+    assert result.event.what_we_saw["cold_sample_retry"]["used"] == used
+    assert result.event.what_we_saw["transport"] == transport
+
+
 # --- equivalence: one judge for both transports ------------------------------------------------
 
 

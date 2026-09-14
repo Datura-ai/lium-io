@@ -152,7 +152,10 @@ class VerifyXCheck:
                 )
             )
             if use_retry:
+                # The retry always runs over SSH, so a consumed local answer that loses to it is
+                # no longer what the event describes.
                 result = retry
+                transport = "ssh"
 
         # Extract errors with clear priority: data.errors > result.error
         errors = self._extract_errors(result)
