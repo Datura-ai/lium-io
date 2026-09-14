@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID
 
+from core.config import settings
 from core.utils import _m
 from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
@@ -32,11 +33,14 @@ DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS = 60 * 60
 # container is gone (the next cycle finds nothing to reap). So every reaped pod id is queued in
 # redis BEFORE its container is removed and re-sent with every cycle's pod_states until it is this
 # old; the backend's write is idempotent (a repeat changes nothing), so a re-send costs nothing.
-# One message carries at most POD_STATES_MAX_ITEMS states (the backend's bound). The rented pods'
-# observed states have first claim on those slots; the queued ids take turns for the rest, least
-# recently sent first, so a queue longer than its share still goes out whole over a few cycles.
+# With settings.POD_STATES_REPORT_ENABLED the cycle's states go out in PodStatesReport chunks, so
+# every queued id is sent every cycle. Without it the spec is the only carrier and holds at most
+# POD_STATES_MAX_ITEMS states (the backend's bound): the rented pods' observed states have first
+# claim on those slots, the queued ids take turns for the rest (least recently sent first) and never
+# fewer than REAPED_POD_STATES_FLOOR of them, so a node with 256 rented pods still moves its queue.
 REAPED_POD_STATE_RETENTION_SECONDS = 24 * 60 * 60
 REAPED_POD_STATES_KEY_PREFIX = "reaped_pod_states:"
+REAPED_POD_STATES_FLOOR = 32
 
 
 class StaleContainerCleanupCheck:
@@ -158,19 +162,29 @@ class StaleContainerCleanupCheck:
         return CheckResult(passed=True, event=event, updates={"state": state})
 
     @staticmethod
-    def _reaped_share(ctx: Context) -> int:
-        """How many queued reaped ids fit in this cycle's message next to the observed states.
+    def _reaped_share(ctx: Context) -> int | None:
+        """How many queued reaped ids go into this cycle's message; None for all of them.
 
-        `ExecutorSpecRequest.pod_states` holds at most POD_STATES_MAX_ITEMS (the backend drops a
-        longer spec whole, node listing included, and a second spec per cycle would write a second
-        cycle row and validation report). TenantEnforcementCheck adds one observed state per rented
-        pod later in the cycle; those slots are reserved here, the reaped ids share what is left.
-        The rented list is the backend's own, so it never approaches the bound on one node.
+        With POD_STATES_REPORT_ENABLED the states travel as PodStatesReport chunks after the spec
+        (256 per chunk, as many chunks as it takes), so there is no share to divide. Without it the
+        spec is the only carrier and holds at most POD_STATES_MAX_ITEMS (the backend drops a longer
+        spec whole, node listing included, and a second spec per cycle would write a second cycle
+        row and validation report). TenantEnforcementCheck adds one observed state per rented pod
+        later in the cycle; those slots are reserved here and the reaped ids share what is left,
+        but never fewer than REAPED_POD_STATES_FLOOR: the reaped ids sit first in the list, so the
+        wire's cut takes observed states instead, and a reaped id that misses its 24 h window is
+        lost for good. The cost falls on a node with more than 256 - REAPED_POD_STATES_FLOOR rented
+        pods: the last rented pods in the backend's list have their states cut every cycle until the
+        queue drains (at most its 24 h retention). The backend writes only the states it receives
+        and never reads a pod missing from a list as absent, so those rows keep their last state.
+        The flag is the fix; this floor only stops the queue from expiring unsent.
         """
+        if settings.POD_STATES_REPORT_ENABLED:
+            return None
         rented_data = ctx.state.rented_data
         rented = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         rented_pod_count = len(rented.pods) if rented else 0
-        return max(0, POD_STATES_MAX_ITEMS - rented_pod_count)
+        return max(REAPED_POD_STATES_FLOOR, POD_STATES_MAX_ITEMS - rented_pod_count)
 
     async def _first_sight(self, ctx: Context) -> bool:
         """Record the executor UUID; True the first time this validator meets it.
@@ -286,8 +300,9 @@ class _ReapedPodStateQueue:
         except Exception as e:
             logger.warning(_m("reaped pod state not dropped", extra={**self._extra, "pod_id": pod_id, "error": str(e)}))
 
-    async def states(self, limit: int) -> list[PodContainerState]:
-        """Up to ``limit`` queued reaps for this cycle's message, and record that they went out.
+    async def states(self, limit: int | None) -> list[PodContainerState]:
+        """Up to ``limit`` queued reaps for this cycle's message (all of them for None), and record
+        that they went out.
 
         Never-sent ids first, then the ones whose last report is oldest; what does not fit keeps
         its place and goes next cycle, so a queue longer than the message's share is sent whole
@@ -321,7 +336,7 @@ class _ReapedPodStateQueue:
                     logger.warning(_m("expired reaped pod states not dropped", extra={**self._extra, "error": str(e)}))
 
         in_send_order = sorted(queued.items(), key=lambda item: item[1].send_order())
-        sending = in_send_order[: max(0, limit)]
+        sending = in_send_order if limit is None else in_send_order[: max(0, limit)]
         if len(sending) < len(in_send_order):
             logger.info(
                 _m(

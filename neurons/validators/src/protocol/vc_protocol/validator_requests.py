@@ -26,6 +26,7 @@ class RequestType(enum.Enum):
     ScorePortionPerGpuTypeRequest = "ScorePortionPerGpuTypeRequest"
     GpuEstimatesRequest = "GpuEstimatesRequest"
     EstimateResponse = "EstimateResponse"
+    PodStatesReport = "PodStatesReport"
 
 
 class BaseValidatorRequest(BaseRequest, DeliveryStamps):
@@ -106,15 +107,47 @@ class PodContainerState(pydantic.BaseModel):
 
 # The backend bounds ExecutorSpecRequest.pod_states at 256 entries (lium-platform#312,
 # `Field(max_length=256)`); a longer list fails its validation and the WHOLE spec is dropped, node
-# listing included. The list is shared out BEFORE it gets here: the rented pods' observed states
-# have their slots, and StaleContainerCleanupCheck hands out the rest to its queued `reaped` ids in
-# turns (`_ReapedPodStateQueue.states`), so a queue longer than its share still goes out whole over
-# a few cycles. This cut is the last guard for the wire and cuts nothing while that holds.
+# listing included. One PodStatesReport chunk holds the same number. With
+# settings.POD_STATES_REPORT_ENABLED every state of the cycle goes out in report chunks after the
+# spec, and the spec keeps this bounded head as a copy for a backend that does not read the report
+# yet (a copy that is reaped ids only when 256 or more are queued). With the flag off the spec is
+# the only carrier: StaleContainerCleanupCheck hands its queued `reaped` ids at least
+# REAPED_POD_STATES_FLOOR slots (they sit first in the list, so this cut never reaches them) and
+# the last rented pods' observed states are cut every cycle until the queue drains.
 POD_STATES_MAX_ITEMS = 256
 
 
 def bound_pod_states(states: list[PodContainerState]) -> list[PodContainerState]:
     return states[:POD_STATES_MAX_ITEMS]
+
+
+def chunk_pod_states(states: list[PodContainerState]) -> list[list[PodContainerState]]:
+    """The cycle's states cut into PodStatesReport chunks of at most POD_STATES_MAX_ITEMS, in order.
+
+    An empty list gives no chunk: a cycle that observed nothing sends no report.
+    """
+    return [states[start : start + POD_STATES_MAX_ITEMS] for start in range(0, len(states), POD_STATES_MAX_ITEMS)]
+
+
+class PodStatesReport(BaseValidatorRequest):
+    """DAH-3338: one chunk of the container states one cycle saw on one node.
+
+    Sent after the cycle's ExecutorSpecRequest, one message per chunk, so a node whose states do not
+    fit the spec's bound (256 rented pods plus queued reaped ids) still reports every one of them in
+    the same cycle. The backend (lium-platform#312) writes the states onto the rental rows and
+    nothing else: no cycle row, no validation report, so a second message per cycle changes no
+    accounting. The write is idempotent, so a chunk delivered twice leaves the rows as they were.
+    ``job_batch_id`` is the cycle; ``chunk_index`` counts from 0 up to ``chunk_total - 1``.
+    """
+
+    message_type: RequestType = RequestType.PodStatesReport
+    validator_hotkey: str
+    miner_hotkey: str
+    executor_uuid: str
+    job_batch_id: str
+    chunk_index: int = pydantic.Field(ge=0)
+    chunk_total: int = pydantic.Field(ge=1)
+    pod_states: list[PodContainerState] = pydantic.Field(min_length=1, max_length=POD_STATES_MAX_ITEMS)
 
 
 class ExecutorSpecRequest(BaseValidatorRequest):
