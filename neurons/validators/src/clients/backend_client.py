@@ -317,6 +317,7 @@ class BackendClient:
                 "boot_id_now": boot_id_now,
             },
             timeout=10,
+            non_200_log_level=logging.WARNING,
         )
 
     async def get_filler_run_active(

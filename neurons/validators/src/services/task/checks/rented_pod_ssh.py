@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from protocol.vc_protocol.compute_requests import RentedPod
@@ -153,7 +153,8 @@ async def probe_rented_pod_ssh(
         )
 
     streak = _decode(await redis.get(_fail_key(pod.pod_id))) or {}
-    consecutive = int(streak.get("count", 0)) + 1
+    previous = streak.get("count", 0)
+    consecutive = (previous if isinstance(previous, int) and previous >= 0 else 0) + 1
     first_failed_at = streak.get("first_failed_at") or now_iso
     await redis.set(
         _fail_key(pod.pod_id),
@@ -174,13 +175,12 @@ async def probe_rented_pod_ssh(
         boot_id_changed=boot_id_changed,
         report=consecutive >= threshold,
     )
-    if consecutive != threshold:
+    if consecutive != threshold or settings.DRY_RUN:
+        # DRY_RUN validates without publishing: the event is logged, the backend is not told.
         return verdict
 
     recorded = await _report_to_backend(ctx, verdict, boot_id_at_ok, boot_id_now)
-    return RentedPodSshVerdict(
-        **{**verdict.__dict__, "reported_to_backend": True, "backend_recorded": recorded}
-    )
+    return replace(verdict, reported_to_backend=True, backend_recorded=recorded)
 
 
 async def _report_to_backend(

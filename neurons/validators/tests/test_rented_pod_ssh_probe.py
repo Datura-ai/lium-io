@@ -246,6 +246,62 @@ async def test_probe_disabled_leaves_the_check_as_before(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_a_pod_the_recovery_path_just_restarted_is_not_probed_that_cycle(context_factory):
+    # The container was down, _recover_downed_pod brought it back: judged from the renter's side
+    # next cycle, not on the way up. A probe here would count a fail against a pod still starting.
+    from test_rented_machine_check import DummyBackendClient
+
+    ssh = DummySSHClient(pod_running=False, ssh_keys=[])
+    docker = AsyncMock()
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.pod_running = True
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    redis = FakeRedis()
+    redis.store[f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"] = json.dumps(
+        {"at": "2026-09-14T11:00:00+00:00", "boot_id": "boot-a"}
+    )
+    services = build_services(
+        redis=redis,
+        backend=DummyBackendClient(active=True),
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0),
+        container_cleanup=MockContainerCleanup(),
+        pod_recovery=docker,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(rented_data=rented_data(), specs={"boot_id": "boot-b"}),
+        ssh=ssh,
+        executor_ssh_private_key="ssh-key",
+        collateral_deposited=True,
+        is_rental_succeed=True,
+    )
+    with patch(TCP_PATH, new=AsyncMock(return_value=FAULT_TCP_REFUSED)) as tcp:
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert result.updates["default_extra"]["recovered_pods"] == ["pod_1"]
+    assert tcp.await_args_list == []
+    assert f"{rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX}:{POD_ID}" not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_dry_run_logs_the_event_but_does_not_tell_the_backend(context_factory):
+    # DRY_RUN validates without publishing: a dry-run validator must not make the backend mail a renter.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    with patch.object(rented_pod_ssh.settings, "DRY_RUN", True):
+        result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
     # A bound-then-closed local port refuses; a listening one accepts; a hang is a timeout.
     probe = socket.socket()
