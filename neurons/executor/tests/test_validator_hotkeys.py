@@ -5,10 +5,10 @@ drops `current`. Every test names the regression it guards; signatures are real 
 shaped exactly as the miner relays them, and go through the routes, not the helper.
 """
 
+import importlib.machinery
 import importlib.util
 import os
 import sys
-import types
 from unittest.mock import AsyncMock, MagicMock
 
 import bittensor
@@ -160,14 +160,18 @@ def test_ping_signed_by_a_third_hotkey_is_rejected_with_two_configured(
 
 def _load_config_with_override(monkeypatch, next_hotkey: str | None):
     # a fresh module object from core/config.py with `core.config_override` standing in as
-    # docker_build.sh would have written it (next only; `current` keeps the code default). Reloading
+    # docker_build.sh writes it for a rotation build (both hotkeys; see below). Reloading
     # sys.modules["core.config"] instead would hand every other test a second `settings` object.
     if next_hotkey is None:
         monkeypatch.delitem(sys.modules, "core.config_override", raising=False)
     else:
-        monkeypatch.setitem(
-            sys.modules, "core.config_override", types.SimpleNamespace(_VALIDATOR_NEXT_HOTKEY_SS58=next_hotkey)
-        )
+        # what docker_build.sh writes for a rotation build: both hotkeys (config.py since
+        # DAH-3114 reads `_VALIDATOR_HOTKEY_SS58` from any override it finds). A real module with
+        # a __spec__, because `importlib.util.find_spec` raises on a bare namespace in sys.modules.
+        override = importlib.util.module_from_spec(importlib.machinery.ModuleSpec("core.config_override", None))
+        override._VALIDATOR_HOTKEY_SS58 = _load_config_with_override(monkeypatch, next_hotkey=None).VALIDATOR_HOTKEY_SS58
+        override._VALIDATOR_NEXT_HOTKEY_SS58 = next_hotkey
+        monkeypatch.setitem(sys.modules, "core.config_override", override)
     # the executor must never take a hotkey from its environment; set it to prove it is ignored
     monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY_SS58", bittensor.Keypair.create_from_uri("//FromEnv").ss58_address)
     path = os.path.join(os.path.dirname(__file__), "..", "src", "core", "config.py")

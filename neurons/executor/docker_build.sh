@@ -77,7 +77,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     echo -e "    ${RED}•  ${var}${RESET}" >&2
   done
   echo -e "\n${YELLOW}  Usage example:${RESET}"
-  echo -e "  ${DIM}TAG=latest [VALIDATOR_HOTKEY_SS58=<hotkey>] [VALIDATOR_NEXT_HOTKEY_SS58=<hotkey>] bash docker_build.sh${RESET}\n"
+  echo -e "  ${DIM}TAG=latest [VALIDATOR_HOTKEY_SS58=<hotkey> [VALIDATOR_NEXT_HOTKEY_SS58=<hotkey>]] bash docker_build.sh${RESET}\n"
   exit 1
 fi
 
@@ -90,8 +90,13 @@ IMAGE_NAME="daturaai/compute-subnet-executor:${TAG}"
 log_step "Validator hotkey configuration"
 
 # DAH-3394: VALIDATOR_NEXT_HOTKEY_SS58 is the hotkey the validator rotates to; the image accepts
-# both while it is set. Either variable alone is enough to write the override (the unset one keeps
-# the default from config.py).
+# both while it is set. An override always names `current`: config.py (DAH-3114) reads
+# `_VALIDATOR_HOTKEY_SS58` from any override module it finds and treats its absence as a broken
+# build, so a rotation build passes both variables.
+if [[ -n "${VALIDATOR_NEXT_HOTKEY_SS58:-}" && -z "${VALIDATOR_HOTKEY_SS58:-}" ]]; then
+  log_error "VALIDATOR_NEXT_HOTKEY_SS58 is set but VALIDATOR_HOTKEY_SS58 is not; a rotation build names both hotkeys"
+  exit 1
+fi
 if [[ -n "${VALIDATOR_HOTKEY_SS58:-}" || -n "${VALIDATOR_NEXT_HOTKEY_SS58:-}" ]]; then
   log_info "VALIDATOR_HOTKEY_SS58 / VALIDATOR_NEXT_HOTKEY_SS58 set — generating config_override.py"
   : > "${CONFIG_OVERRIDE_FILE}"
