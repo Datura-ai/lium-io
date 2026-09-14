@@ -28,7 +28,11 @@ import pynvml
 from core.config import settings
 from core.logger import get_logger
 from services.cache_prefetch_state import STATE_PATH, CachePrefetchState, Outcome
-from services.pre_pull_service import STREAM_READ_TIMEOUT_SECONDS, PrePuller
+from services.pre_pull_service import (
+    MIN_PULL_BUDGET_SECONDS,
+    STREAM_READ_TIMEOUT_SECONDS,
+    PrePuller,
+)
 from services.pull_lock import cache_pull_lock
 
 logger = get_logger(__name__)
@@ -43,6 +47,33 @@ ERROR_INTERVAL_SECONDS = 5 * 60
 SWEEP_DEADLINE_MARGIN_SECONDS = STREAM_READ_TIMEOUT_SECONDS + 30
 
 DEFAULT_DOCKER_IMAGE_PATH = "/executors/default-docker-image"
+
+
+def pre_pull_timeout_for(refresh_interval: float, configured: float) -> tuple[float, str | None]:
+    """The pull budget one sweep can honour, and the warning to log once when it is not the setting.
+
+    A sweep's budget ends ``SWEEP_DEADLINE_MARGIN_SECONDS`` before the next refresh, so a
+    ``PRE_PULL_TIMEOUT_SECONDS`` (``configured``) above ``refresh_interval`` minus that margin
+    never applies: the default 1800 s under the default 900 s refresh is really 810 s. Saying
+    so at startup beats reading it off ``outcome=timeout`` lines. A refresh interval that
+    leaves less than ``MIN_PULL_BUDGET_SECONDS`` per sweep defers every pull forever; that is
+    the other warning.
+    """
+    cap = max(float(refresh_interval - SWEEP_DEADLINE_MARGIN_SECONDS), 0.0)
+    configured = float(configured)
+    if cap < MIN_PULL_BUDGET_SECONDS:
+        return cap, (
+            f"pre-pull can never run: CACHE_TEMPLATE_REFRESH_SECONDS={refresh_interval:.0f} leaves "
+            f"{cap:.0f}s per sweep after the {SWEEP_DEADLINE_MARGIN_SECONDS}s margin, under the "
+            f"{MIN_PULL_BUDGET_SECONDS}s minimum a pull needs; raise CACHE_TEMPLATE_REFRESH_SECONDS"
+        )
+    if configured > cap:
+        return cap, (
+            f"PRE_PULL_TIMEOUT_SECONDS={configured:.0f} does not fit one refresh interval; a pre-pull "
+            f"gets {cap:.0f}s (CACHE_TEMPLATE_REFRESH_SECONDS={refresh_interval:.0f} minus the "
+            f"{SWEEP_DEADLINE_MARGIN_SECONDS}s margin)"
+        )
+    return configured, None
 
 
 def _get_gpu_info() -> tuple[str, str, str | None]:
@@ -276,9 +307,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
     )
 
     if not base_url:
-        logger.warning(
-            "COMPUTE_REST_API_URL not set; cache template pre-pull disabled"
-        )
+        logger.warning("COMPUTE_REST_API_URL not set; cache template pre-pull disabled")
         state.record_loop_outcome(Outcome.PREFETCH_DISABLED_NO_BACKEND_URL)
         state.flush()
         return
@@ -300,7 +329,14 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
 
     # DAH-2977: off by default. When on, the backend is asked for the top-N official
     # templates too (`pre_pull: true` entries) and PrePuller warms one per sweep while idle.
-    pre_puller = PrePuller(client) if settings.PRE_PULL_TEMPLATES_ENABLED else None
+    pre_puller: PrePuller | None = None
+    if settings.PRE_PULL_TEMPLATES_ENABLED:
+        pull_timeout, timeout_warning = pre_pull_timeout_for(
+            refresh_interval, settings.PRE_PULL_TIMEOUT_SECONDS
+        )
+        if timeout_warning:
+            logger.warning(timeout_warning)  # once, here; the sweeps stay quiet about it
+        pre_puller = PrePuller(client, pull_timeout_seconds=pull_timeout)
     # The sweep in flight, if any. The loop starts it and never awaits it (review, DAH-2977):
     # a pull stream that goes silent holds the sweep for the read timeout past its deadline
     # and eviction has no deadline at all, so awaiting it would move the default image's
@@ -314,123 +350,134 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
     # timeouts surface as exceptions and route through the existing error backoff.
     session_timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=session_timeout) as session:
-        while True:
-            try:
-                state.begin_sweep()
-                # When the next mandatory refresh is due. With the pre-pull on, the sleep below
-                # runs only up to it, so the default image is re-checked every refresh_interval
-                # whatever the sweep did (review, DAH-2977).
-                refresh_deadline = time.monotonic() + refresh_interval
-                # Resolve GPU info off-thread, and keep retrying while it is still
-                # unknown: at early boot the NVIDIA driver may not be ready yet,
-                # and caching "unknown" once would wedge the loop forever.
-                if gpu_model == "unknown":
-                    gpu_model, driver_version, gpu_error = await asyncio.to_thread(_get_gpu_info)
-                    state.note_gpu(gpu_model, driver_version, error=gpu_error)
+        try:
+            while True:
+                try:
+                    state.begin_sweep()
+                    # When the next mandatory refresh is due. With the pre-pull on, the sleep below
+                    # runs only up to it, so the default image is re-checked every refresh_interval
+                    # whatever the sweep did (review, DAH-2977).
+                    refresh_deadline = time.monotonic() + refresh_interval
+                    # Resolve GPU info off-thread, and keep retrying while it is still
+                    # unknown: at early boot the NVIDIA driver may not be ready yet,
+                    # and caching "unknown" once would wedge the loop forever.
                     if gpu_model == "unknown":
-                        logger.warning("GPU not detected yet; retrying cache pre-pull shortly")
-                        state.record_loop_outcome(Outcome.GPU_UNKNOWN, error=gpu_error)
+                        gpu_model, driver_version, gpu_error = await asyncio.to_thread(
+                            _get_gpu_info
+                        )
+                        state.note_gpu(gpu_model, driver_version, error=gpu_error)
+                        if gpu_model == "unknown":
+                            logger.warning("GPU not detected yet; retrying cache pre-pull shortly")
+                            state.record_loop_outcome(Outcome.GPU_UNKNOWN, error=gpu_error)
+                            state.flush()
+                            await asyncio.sleep(error_interval)
+                            continue
+                        logger.info(
+                            f"Cache pre-pull resolved gpu_model={gpu_model} "
+                            f"driver_version={driver_version}"
+                        )
+
+                    params = {"gpu_model": gpu_model, "driver_version": driver_version}
+                    if pre_puller:
+                        params["include_pre_pull"] = "true"
+                    templates, status, backend_error = await _fetch_templates(session, url, params)
+                    state.note_backend(
+                        status=status, template_count=len(templates), error=backend_error
+                    )
+                    if not templates:
+                        state.record_loop_outcome(Outcome.BACKEND_NO_TEMPLATES, error=backend_error)
                         state.flush()
                         await asyncio.sleep(error_interval)
                         continue
-                    logger.info(
-                        f"Cache pre-pull resolved gpu_model={gpu_model} "
-                        f"driver_version={driver_version}"
-                    )
 
-                params = {"gpu_model": gpu_model, "driver_version": driver_version}
-                if pre_puller:
-                    params["include_pre_pull"] = "true"
-                templates, status, backend_error = await _fetch_templates(session, url, params)
-                state.note_backend(
-                    status=status, template_count=len(templates), error=backend_error
-                )
-                if not templates:
-                    state.record_loop_outcome(Outcome.BACKEND_NO_TEMPLATES, error=backend_error)
+                    # Pre-pull entries are opportunistic and idle-only, so they never go
+                    # through the mandatory default-image path below; their tags are only
+                    # shielded from its old-tag cleanup (same repository). An entry the backend
+                    # marks pre_pull that is also this node's default image stays out of the
+                    # pre-pull set, and the puller is told the mandatory refs so one it tracked
+                    # from an earlier sweep stops being an eviction candidate: the default image
+                    # is never removed (the backend's top-N is global, the default is per
+                    # gpu_model, so the overlap is decided here).
+                    mandatory_refs = {
+                        (data.get("docker_image"), data.get("docker_image_tag"))
+                        for data in templates
+                        if not data.get("pre_pull")
+                    }
+                    pre_pull = [
+                        data
+                        for data in templates
+                        if data.get("pre_pull")
+                        and (data.get("docker_image"), data.get("docker_image_tag"))
+                        not in mandatory_refs
+                    ]
+                    keep_tags = frozenset(
+                        data["docker_image_tag"]
+                        for data in pre_pull
+                        if data.get("docker_image_tag")
+                    )
+                    if pre_puller:
+                        # Published before the mandatory pass, every refresh, so a sweep still
+                        # running from the previous one cannot evict a ref that became this node's
+                        # default since it started, not even while that ref is being checked below.
+                        pre_puller.protected = frozenset(
+                            f"{repo}:{tag}" for repo, tag in mandatory_refs if repo and tag
+                        )
+                    for data in templates:
+                        if not data.get("pre_pull"):
+                            await _ensure_template(client, data, state, keep_tags)
+                    if pre_puller:
+                        # The default image's outcome is what the validator reads (DAH-2470): publish
+                        # it now, not after a sweep that can wait out the start jitter and one pull.
+                        state.flush()
+                        if sweep_task is not None and not sweep_task.done():
+                            logger.info(
+                                "pre-pull: the previous sweep is still running; no new sweep this refresh"
+                            )
+                        else:
+                            # Started, not awaited. Its budget ends a read timeout (plus slack) before
+                            # the refresh, so the pull lock is free again when the default image is
+                            # re-checked, even when the stream went silent at the very end.
+                            sweep_task = asyncio.create_task(
+                                _run_pre_pull_sweep(
+                                    pre_puller,
+                                    pre_pull,
+                                    pre_puller.protected,
+                                    refresh_deadline - SWEEP_DEADLINE_MARGIN_SECONDS,
+                                )
+                            )
+
+                    state.record_loop_outcome(Outcome.SWEEP_OK)
+                    # Publish before sleeping, so the document is never a full refresh
+                    # interval behind what the loop actually knows.
+                    state.flush()
+                    # Sleep once per full sweep. With the pre-pull on, only until the refresh
+                    # deadline, so the default image is re-checked every refresh_interval whether
+                    # or not the sweep task has finished. Flag off, the sleep is today's full
+                    # interval after the work, unchanged.
+                    if pre_puller:
+                        await asyncio.sleep(max(0.0, refresh_deadline - time.monotonic()))
+                    else:
+                        await asyncio.sleep(refresh_interval)
+                except asyncio.CancelledError:
+                    logger.info("Cache template pre-pull cancelled")
+                    raise
+                except aiohttp.ClientError as e:
+                    logger.error(f"Network error during cache pre-pull: {e}")
+                    state.note_loop_error(e)
+                    state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                     state.flush()
                     await asyncio.sleep(error_interval)
-                    continue
-
-                # Pre-pull entries are opportunistic and idle-only, so they never go
-                # through the mandatory default-image path below; their tags are only
-                # shielded from its old-tag cleanup (same repository). An entry the backend
-                # marks pre_pull that is also this node's default image stays out of the
-                # pre-pull set, and the puller is told the mandatory refs so one it tracked
-                # from an earlier sweep stops being an eviction candidate: the default image
-                # is never removed (the backend's top-N is global, the default is per
-                # gpu_model, so the overlap is decided here).
-                mandatory_refs = {
-                    (data.get("docker_image"), data.get("docker_image_tag"))
-                    for data in templates
-                    if not data.get("pre_pull")
-                }
-                pre_pull = [
-                    data
-                    for data in templates
-                    if data.get("pre_pull")
-                    and (data.get("docker_image"), data.get("docker_image_tag"))
-                    not in mandatory_refs
-                ]
-                keep_tags = frozenset(
-                    data["docker_image_tag"] for data in pre_pull if data.get("docker_image_tag")
-                )
-                if pre_puller:
-                    # Published before the mandatory pass, every refresh, so a sweep still
-                    # running from the previous one cannot evict a ref that became this node's
-                    # default since it started, not even while that ref is being checked below.
-                    pre_puller.protected = frozenset(
-                        f"{repo}:{tag}" for repo, tag in mandatory_refs if repo and tag
-                    )
-                for data in templates:
-                    if not data.get("pre_pull"):
-                        await _ensure_template(client, data, state, keep_tags)
-                if pre_puller:
-                    # The default image's outcome is what the validator reads (DAH-2470): publish
-                    # it now, not after a sweep that can wait out the start jitter and one pull.
+                except Exception as e:
+                    logger.error(f"Unexpected error during cache pre-pull: {e}")
+                    state.note_loop_error(e)
+                    state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
                     state.flush()
-                    if sweep_task is not None and not sweep_task.done():
-                        logger.info(
-                            "pre-pull: the previous sweep is still running; no new sweep this refresh"
-                        )
-                    else:
-                        # Started, not awaited. Its budget ends a read timeout (plus slack) before
-                        # the refresh, so the pull lock is free again when the default image is
-                        # re-checked, even when the stream went silent at the very end.
-                        sweep_task = asyncio.create_task(
-                            _run_pre_pull_sweep(
-                                pre_puller,
-                                pre_pull,
-                                pre_puller.protected,
-                                refresh_deadline - SWEEP_DEADLINE_MARGIN_SECONDS,
-                            )
-                        )
-
-                state.record_loop_outcome(Outcome.SWEEP_OK)
-                # Publish before sleeping, so the document is never a full refresh
-                # interval behind what the loop actually knows.
-                state.flush()
-                # Sleep once per full sweep. With the pre-pull on, only until the refresh
-                # deadline, so the default image is re-checked every refresh_interval whether
-                # or not the sweep task has finished. Flag off, the sleep is today's full
-                # interval after the work, unchanged.
-                if pre_puller:
-                    await asyncio.sleep(max(0.0, refresh_deadline - time.monotonic()))
-                else:
-                    await asyncio.sleep(refresh_interval)
-            except asyncio.CancelledError:
-                logger.info("Cache template pre-pull cancelled")
-                if sweep_task is not None:
-                    sweep_task.cancel()
-                raise
-            except aiohttp.ClientError as e:
-                logger.error(f"Network error during cache pre-pull: {e}")
-                state.note_loop_error(e)
-                state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
-                state.flush()
-                await asyncio.sleep(error_interval)
-            except Exception as e:
-                logger.error(f"Unexpected error during cache pre-pull: {e}")
-                state.note_loop_error(e)
-                state.record_loop_outcome(Outcome.LOOP_ERROR, error=e)
-                state.flush()
-                await asyncio.sleep(error_interval)
+                    await asyncio.sleep(error_interval)
+        finally:
+            # However the loop ends (cancelled at shutdown, or a BaseException the handlers
+            # above let through), the sweep it started does not outlive it: an orphan sweep
+            # would keep pulling and holding the pull lock with nothing left to read its
+            # outcome. Cancelled, not awaited: a pull already in its thread runs to its
+            # budget or read timeout either way, and awaiting it would hold shutdown that long.
+            if sweep_task is not None and not sweep_task.done():
+                sweep_task.cancel()
