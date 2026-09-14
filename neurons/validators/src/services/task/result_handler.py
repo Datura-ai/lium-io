@@ -10,7 +10,12 @@ from typing import Optional
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
-from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
+from protocol.vc_protocol.validator_requests import (
+    PodContainerState,
+    ResetVerifiedJobReason,
+    ValidationEvent,
+    bound_pod_states,
+)
 from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
@@ -227,8 +232,28 @@ class ResultHandler:
             gpu_attestation_passed=context.gpu_attestation_passed,
             executor_image_report=executor_image_report,
             inspector_outcome=inspector_outcome,
-            pod_states=list(context.state.pod_states) or None,
+            pod_states=self._bounded_pod_states(context),
         )
+
+    @staticmethod
+    def _bounded_pod_states(context: Context) -> list[PodContainerState] | None:
+        # DAH-3338: never more than the backend accepts; over the bound the whole spec is rejected.
+        states = list(context.state.pod_states)
+        if not states:
+            return None
+        bounded = bound_pod_states(states)
+        if len(bounded) < len(states):
+            logger.warning(
+                _m(
+                    "pod_states over the backend bound; the rest is re-sent next cycle",
+                    extra={
+                        "executor_uuid": context.executor.uuid,
+                        "pod_states": len(states),
+                        "sent": len(bounded),
+                    },
+                )
+            )
+        return bounded
 
     @staticmethod
     def _get_rented_gpu_count(context: Context) -> int | None:
