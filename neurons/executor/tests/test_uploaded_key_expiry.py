@@ -4,7 +4,8 @@ The validator uploads a fresh keypair per job and removes it afterwards; a key t
 executor's authorized_keys after EXECUTOR_UPLOADED_KEY_TTL_S is a leak (I-78: keys planted through a
 validator-hotkey-signed upload stayed for months). The executor now appends every upload with a marker
 carrying the upload time and purges marked lines past the TTL. Everything else in the file — a template's
-key, a key the provider added by hand, comments, blank lines — is never touched.
+key, a key the provider added by hand, comments, blank lines — the purge never touches (the one-time
+startup stamp of lines the previous release wrote is test_legacy_uploaded_key_stamp.py).
 """
 
 import asyncio
@@ -129,7 +130,7 @@ def test_purge_and_removal_survive_a_non_utf8_byte_elsewhere_in_the_file(authori
     assert authorized_keys.read_bytes() == FOREIGN_BYTES
 
 
-def test_the_purge_loop_survives_one_failing_tick_and_logs_what_it_removed(monkeypatch, caplog):
+def test_the_purge_loop_survives_one_failing_tick_and_logs_what_it_removed(authorized_keys, monkeypatch, caplog):
     # regression: a narrowed `except`, or none, ends the loop on its first transient error (a
     # read-only filesystem moment, a permissions blip) and nothing expires until the next restart
     ticks = []
