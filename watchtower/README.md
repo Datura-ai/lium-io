@@ -7,7 +7,7 @@ Monitors a Docker image for validator-signed updates and automatically pulls and
 1. Finds the runner container: `executor-runner` (the CVM stack), else the one container with the compose label `com.docker.compose.service=executor-runner` (the standard stack, `executor-executor-runner-1`)
 2. Reads the digest of the image that container runs
 3. Fetches the latest authorized digest from the validator-signed endpoint
-4. Verifies the signature using the validator's public key (hotkey)
+4. Verifies the signature using the validator's public key (hotkey); during a hotkey rotation, either of two hotkeys (see "Rotating the validator hotkey")
 5. If digests differ, pulls `image@digest` (never a tag), then recreates the container from it (10 s stop timeout)
 
 ### Pull by digest, and the mirror bypass
@@ -51,20 +51,25 @@ The validator endpoint must return:
 }
 ```
 
-The signature is produced by signing the string `<digest>:<timestamp>` (for example `sha256:abc123...:1234567890`) with the validator's hotkey. `verify_watchtower_signature` checks it with `WATCHTOWER_VALIDATOR_HOTKEY` and refuses a timestamp more than 10 minutes from now.
+The signature is produced by signing the string `<digest>:<timestamp>` (for example `sha256:abc123...:1234567890`) with the validator's hotkey. `verify_watchtower_signature` tries each configured hotkey in order (`WATCHTOWER_VALIDATOR_HOTKEYS` in `src/config.py`: `current`, then `next` when one is set), logs `Digest signature verified >>> {"validator_hotkey": "current"}` (or `"next"`) for the one that matched, refuses a response signed by neither, and refuses a timestamp more than 10 minutes from now.
 
 ## Build & Deploy
 
-`WATCHTOWER_ENDPOINT_URL` and `WATCHTOWER_VALIDATOR_HOTKEY` are **baked into the image at build time** for non-prod environments. They are written into `src/config_override.py` by `docker_build.sh` and cannot be overridden at runtime.
+`WATCHTOWER_ENDPOINT_URL`, `WATCHTOWER_VALIDATOR_HOTKEY` and, for a rotation build, `WATCHTOWER_VALIDATOR_HOTKEY_NEXT` are **baked into the image at build time** for non-prod environments. They are written into `src/config_override.py` by `docker_build.sh` and cannot be overridden at runtime; none of them is read from `.env`. `WATCHTOWER_VALIDATOR_HOTKEY_NEXT` is optional: left unset, the image trusts the current hotkey only.
 
 ```bash
 DEPLOY_ENV=staging \
 WATCHTOWER_ENDPOINT_URL=https://staging.lium.io/api/watchtower/digest \
 WATCHTOWER_VALIDATOR_HOTKEY=<ss58-address> \
+WATCHTOWER_VALIDATOR_HOTKEY_NEXT=<ss58-address of the hotkey being rotated to, or omit> \
 ./docker_build.sh
 ```
 
-For `DEPLOY_ENV=prod`, the script writes no override and the prod values in `src/config.py` (`https://lium.io/api/watchtower/digest`, the Lium validator hotkey) apply.
+For `DEPLOY_ENV=prod`, the script writes no override and the prod values in `src/config.py` (`https://lium.io/api/watchtower/digest`, the Lium validator hotkey, `WATCHTOWER_VALIDATOR_HOTKEY_NEXT = ""`) apply; a prod rotation build sets `WATCHTOWER_VALIDATOR_HOTKEY_NEXT` in `src/config.py`, and the script exits 1 when the variable is set in the environment of a prod build instead. A hotkey that is not a valid ss58 address stops the updater at import (`config.py:validator_hotkeys`), so a typo stops the container at its first start (and `pytest` at import), not the fleet's first update after the swap.
+
+### Rotating the validator hotkey
+
+The same procedure as the executor's (`neurons/executor/README.md`, "Validator hotkeys and uploaded ssh keys"; lium-io#1357), so one rotation covers both images. 1. Set `WATCHTOWER_VALIDATOR_HOTKEY_NEXT` to the new hotkey's ss58 (`src/config.py` for prod; `STAGING_VALIDATOR_HOTKEY_NEXT` in `.github/workflows/watchtower_image.yml`, or the build variable, for staging), bump the version, publish the image and let the fleet's updaters restart onto it: from then on they accept a digest signed by either hotkey, and the log names which one (`"validator_hotkey": "next"` once the validator signs with the new one). 2. Roll the validator to the new hotkey; the updaters keep following releases. 3. In the next version, promote `next` to current: put the new ss58 in `WATCHTOWER_VALIDATOR_HOTKEY` (`STAGING_VALIDATOR_HOTKEY` for staging) and clear `WATCHTOWER_VALIDATOR_HOTKEY_NEXT` (`STAGING_VALIDATOR_HOTKEY_NEXT`) back to `""`. Rollback at any point before step 3 is rolling the validator back to the old hotkey; the updaters accept both.
 
 Every build is tagged twice: `daturaai/lium-watchtower:<env tag>` (`latest`, `staging`, `local`) and `daturaai/lium-watchtower:<version>` for prod or `<version>-<env tag>` for the others, where `<version>` is `project.version` in `pyproject.toml`. The executor compose files pull the version tag (`1.1.0` in `docker-compose.yml`, `1.1.0-staging` in `docker-compose.dev.yml`), and `neurons/executor/tests/test_stack_updater_by_digest.py` fails when the two drift.
 

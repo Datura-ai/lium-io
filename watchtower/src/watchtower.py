@@ -6,7 +6,7 @@ from datetime import datetime, UTC
 from typing import Optional
 from docker.models.containers import Container
 
-from config import settings, WATCHTOWER_ENDPOINT_URL, WATCHTOWER_VALIDATOR_HOTKEY
+from config import settings, WATCHTOWER_ENDPOINT_URL, WATCHTOWER_VALIDATOR_HOTKEYS
 from logger import get_logger, _m
 from models import WatchtowerDigestResponse
 
@@ -116,17 +116,32 @@ def container_image_digest(client: docker.DockerClient, container: Container) ->
         return None
 
 
-def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
+def match_validator_hotkey(signing_data: str, signature: str) -> Optional[str]:
+    """The id (`current` / `next`) of the configured validator hotkey that signed `signing_data`, or None.
+
+    The one place a validator signature is checked in the updater, so the hotkey rotation is
+    one list: WATCHTOWER_VALIDATOR_HOTKEYS, tried in order. A malformed signature raises as
+    it did before; the caller decides what to do with it.
+    """
+    for key_id, ss58 in WATCHTOWER_VALIDATOR_HOTKEYS.items():
+        if bittensor.Keypair(ss58_address=ss58).verify(signing_data, signature):
+            return key_id
+    return None
+
+
+def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> str:
     """
     Verify the signature of the watchtower digest response.
+
+    Returns:
+        The id of the hotkey that signed it: `current`, or `next` during a rotation.
 
     Raises:
         Exception: If signature verification fails
     """
     try:
-        keypair = bittensor.Keypair(ss58_address=WATCHTOWER_VALIDATOR_HOTKEY)
         signing_data = f"{payload.digest}:{payload.timestamp}"
-        is_valid = keypair.verify(signing_data, payload.signature)
+        signed_by = match_validator_hotkey(signing_data, payload.signature)
 
         # Verify that the timestamp is not too far in the future or past (e.g., within 5 minutes)
         now = int(datetime.now(UTC).timestamp())
@@ -136,10 +151,15 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
                 f"Digest response timestamp out of allowed range (now={now}, ts={payload.timestamp})"
             )
 
-        if not is_valid:
+        if signed_by is None:
             raise Exception(
-                f"Invalid signature from validator {WATCHTOWER_VALIDATOR_HOTKEY}"
+                "Invalid signature: not signed by a configured validator hotkey "
+                f"({', '.join(WATCHTOWER_VALIDATOR_HOTKEYS.values())})"
             )
+
+        # the id only: which hotkey is in use is what an operator needs to see during a rotation
+        logger.info(_m("Digest signature verified", {"validator_hotkey": signed_by}))
+        return signed_by
 
     except Exception as e:
         logger.error(_m("Signature verification failed", {"error": str(e)}))
@@ -164,11 +184,12 @@ def fetch_verified_digest() -> Optional[str]:
         data = response.json()
         payload = WatchtowerDigestResponse(**data)
 
-        verify_watchtower_signature(payload)
+        signed_by = verify_watchtower_signature(payload)
 
         logger.info(_m("Successfully fetched and verified digest", {
             "digest": payload.digest,
-            "timestamp": payload.timestamp
+            "timestamp": payload.timestamp,
+            "validator_hotkey": signed_by,
         }))
 
         return payload.digest
@@ -436,7 +457,7 @@ def main():
         "image": settings.WATCHTOWER_IMAGE,
         "interval": settings.WATCHTOWER_INTERVAL,
         "endpoint": WATCHTOWER_ENDPOINT_URL,
-        "validator_hotkey": WATCHTOWER_VALIDATOR_HOTKEY
+        "validator_hotkeys": WATCHTOWER_VALIDATOR_HOTKEYS,
     }))
 
     while True:

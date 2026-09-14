@@ -43,6 +43,9 @@ jobs:
       # the hotkey the dev executor build trusts too (executor_cd_dev.yml).
       STAGING_ENDPOINT_URL: https://staging.lium.io/api/watchtower/digest
       STAGING_VALIDATOR_HOTKEY: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
+      # The hotkey the staging validator rotates to; empty until a rotation (watchtower/README.md,
+      # "Rotating the validator hotkey"). The staging image accepts a digest signed by either while set.
+      STAGING_VALIDATOR_HOTKEY_NEXT: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -113,6 +116,7 @@ jobs:
           DEPLOY_ENV: staging
           WATCHTOWER_ENDPOINT_URL: ${{ env.STAGING_ENDPOINT_URL }}
           WATCHTOWER_VALIDATOR_HOTKEY: ${{ env.STAGING_VALIDATOR_HOTKEY }}
+          WATCHTOWER_VALIDATOR_HOTKEY_NEXT: ${{ env.STAGING_VALIDATOR_HOTKEY_NEXT }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           cd watchtower

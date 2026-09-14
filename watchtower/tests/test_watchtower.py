@@ -5,6 +5,7 @@ Tests for watchtower.py - Docker image monitoring and update service.
 import time
 import pytest
 from unittest.mock import Mock, patch
+import bittensor
 import docker
 import requests
 
@@ -12,6 +13,7 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
+from config import validator_hotkeys
 from watchtower import (
     CANONICAL_REGISTRY_HOST,
     DigestMismatchError,
@@ -91,8 +93,8 @@ def test_verify_watchtower_signature_uses_digest_colon_timestamp_format(mock_key
 
 
 @patch('watchtower.bittensor.Keypair')
-def test_verify_watchtower_signature_uses_watchtower_validator_hotkey(mock_keypair_class):
-    """Keypair should be constructed with the WATCHTOWER_VALIDATOR_HOTKEY constant."""
+def test_verify_watchtower_signature_uses_the_configured_validator_hotkeys(mock_keypair_class):
+    """Keypair should be constructed with the configured hotkey (the order of two is covered by the rotation tests below)."""
     # Arrange
     mock_keypair = Mock()
     mock_keypair.verify.return_value = True
@@ -105,11 +107,74 @@ def test_verify_watchtower_signature_uses_watchtower_validator_hotkey(mock_keypa
     )
 
     # Act
-    with patch('watchtower.WATCHTOWER_VALIDATOR_HOTKEY', test_hotkey):
+    with patch('watchtower.WATCHTOWER_VALIDATOR_HOTKEYS', {"current": test_hotkey}):
         verify_watchtower_signature(payload)
 
-    # Assert — hotkey constant is passed to the Keypair constructor
+    # Assert — the configured hotkey is passed to the Keypair constructor
     mock_keypair_class.assert_called_once_with(ss58_address=test_hotkey)
+
+
+# ── validator hotkey rotation: current / next (real sr25519 signatures) ───────
+
+CURRENT_KEYPAIR = bittensor.Keypair.create_from_uri("//WatchtowerCurrentValidator")
+NEXT_KEYPAIR = bittensor.Keypair.create_from_uri("//WatchtowerNextValidator")
+THIRD_KEYPAIR = bittensor.Keypair.create_from_uri("//SomebodyElse")
+BOTH_HOTKEYS = {"current": CURRENT_KEYPAIR.ss58_address, "next": NEXT_KEYPAIR.ss58_address}
+CURRENT_ONLY = {"current": CURRENT_KEYPAIR.ss58_address}
+
+
+def _signed_digest(keypair: bittensor.Keypair, digest: str = "sha256:" + "ab" * 32) -> WatchtowerDigestResponse:
+    """A digest response signed the way the validator signs it: `<digest>:<timestamp>`."""
+    timestamp = int(time.time())
+    signature = keypair.sign(f"{digest}:{timestamp}").hex()
+    return WatchtowerDigestResponse(digest=digest, timestamp=timestamp, signature=f"0x{signature}")
+
+
+def test_digest_signed_by_the_current_hotkey_is_accepted_while_next_is_configured():
+    """Regression: a rotation that replaces `current` with `next` instead of adding it."""
+    with patch('watchtower.WATCHTOWER_VALIDATOR_HOTKEYS', BOTH_HOTKEYS):
+        assert verify_watchtower_signature(_signed_digest(CURRENT_KEYPAIR)) == "current"
+
+
+def test_digest_signed_by_the_next_hotkey_is_accepted_and_logged_as_next():
+    """Regression: the verifier reads only the first configured hotkey (the watchtower logger does not propagate, so the logger is patched, not caplog)."""
+    with patch('watchtower.WATCHTOWER_VALIDATOR_HOTKEYS', BOTH_HOTKEYS), patch('watchtower.logger') as mock_logger:
+        assert verify_watchtower_signature(_signed_digest(NEXT_KEYPAIR)) == "next"
+    verified = [str(c.args[0]) for c in mock_logger.info.call_args_list if str(c.args[0]).startswith("Digest signature verified")]
+    assert verified == ['Digest signature verified >>> {"validator_hotkey": "next"}']
+
+
+def test_digest_signed_by_neither_hotkey_is_refused_with_both_configured():
+    """Regression: a loop that reports 'verified' when no hotkey matched (falls through to the last comparison)."""
+    with patch('watchtower.WATCHTOWER_VALIDATOR_HOTKEYS', BOTH_HOTKEYS):
+        with pytest.raises(Exception, match="not signed by a configured validator hotkey"):
+            verify_watchtower_signature(_signed_digest(THIRD_KEYPAIR))
+
+
+def test_digest_signed_by_the_next_hotkey_is_refused_while_only_current_is_configured():
+    """Regression: `next` unset being read as 'any hotkey'; with it empty the updater behaves as before."""
+    with patch('watchtower.WATCHTOWER_VALIDATOR_HOTKEYS', CURRENT_ONLY):
+        assert verify_watchtower_signature(_signed_digest(CURRENT_KEYPAIR)) == "current"
+        with pytest.raises(Exception, match="not signed by a configured validator hotkey"):
+            verify_watchtower_signature(_signed_digest(NEXT_KEYPAIR))
+
+
+def test_validator_hotkeys_without_next_lists_the_current_hotkey_only():
+    """Regression: an empty or whitespace-only `next` becoming a bogus second entry."""
+    assert validator_hotkeys(CURRENT_KEYPAIR.ss58_address, "") == CURRENT_ONLY
+    assert validator_hotkeys(CURRENT_KEYPAIR.ss58_address, "  ") == CURRENT_ONLY
+
+
+def test_validator_hotkeys_lists_next_after_current_and_a_repeat_once():
+    """Regression: `next == current` listed twice (two identical verifications per digest)."""
+    assert list(validator_hotkeys(CURRENT_KEYPAIR.ss58_address, f" {NEXT_KEYPAIR.ss58_address} ").items()) == list(BOTH_HOTKEYS.items())
+    assert validator_hotkeys(CURRENT_KEYPAIR.ss58_address, CURRENT_KEYPAIR.ss58_address) == CURRENT_ONLY
+
+
+def test_validator_hotkeys_refuses_a_next_that_is_not_an_ss58_address():
+    """Regression: a mistyped `next` surfacing as the fleet's first refused digest after the swap, not at start."""
+    with pytest.raises(ValueError, match="the next validator hotkey is not a valid ss58 address"):
+        validator_hotkeys(CURRENT_KEYPAIR.ss58_address, "5NotAnAddress")
 
 
 @patch('watchtower.bittensor.Keypair')
@@ -137,6 +202,7 @@ def test_verify_watchtower_signature_raises_on_stale_timestamp(mock_keypair_clas
 def test_fetch_verified_digest_returns_digest_on_success(mock_get, mock_verify):
     """Should return the digest when the endpoint responds and signature verifies."""
     # Arrange
+    mock_verify.return_value = "current"  # the id verify_watchtower_signature returns; it is logged
     mock_response = Mock()
     mock_response.json.return_value = {
         "digest": "sha256:newdigest",

@@ -85,8 +85,19 @@ WATCHTOWER_ENDPOINT_URL = "$WATCHTOWER_ENDPOINT_URL"
 WATCHTOWER_VALIDATOR_HOTKEY = "$WATCHTOWER_VALIDATOR_HOTKEY"
 EOF
 
+    # The hotkey the validator rotates to (optional). Set it for the rotation build only; the
+    # image then accepts a digest signed by either hotkey (src/config.py, WATCHTOWER_VALIDATOR_HOTKEY_NEXT).
+    if [ -n "$WATCHTOWER_VALIDATOR_HOTKEY_NEXT" ]; then
+        log_info "WATCHTOWER_VALIDATOR_HOTKEY_NEXT: $WATCHTOWER_VALIDATOR_HOTKEY_NEXT"
+        echo "WATCHTOWER_VALIDATOR_HOTKEY_NEXT = \"$WATCHTOWER_VALIDATOR_HOTKEY_NEXT\"" >> "$CONFIG_OVERRIDE"
+    fi
+
     log_info "config_override.py written to $CONFIG_OVERRIDE"
 else
+    if [ -n "$WATCHTOWER_VALIDATOR_HOTKEY_NEXT" ]; then
+        log_error "WATCHTOWER_VALIDATOR_HOTKEY_NEXT is set but DEPLOY_ENV=prod writes no override; a prod rotation build sets WATCHTOWER_VALIDATOR_HOTKEY_NEXT in src/config.py."
+        exit 1
+    fi
     log_info "Skipping config_override.py for prod (the prod values in src/config.py apply)."
 fi
 
