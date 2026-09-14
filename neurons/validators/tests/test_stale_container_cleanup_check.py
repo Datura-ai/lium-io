@@ -7,6 +7,7 @@ port verification.
 """
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -15,6 +16,7 @@ from fakeredis.aioredis import FakeRedis as FakeRedisClient
 from helpers import build_services, build_state, default_executor, make_context
 from neurons.validators.src.services.task.checks import StaleContainerCleanupCheck
 from neurons.validators.src.services.task.checks.stale_container_cleanup import (
+    POD_STATES_MAX_ITEMS,
     REAPED_POD_STATE_RETENTION_SECONDS,
     REAPED_POD_STATES_KEY_PREFIX,
     StaleContainerCleanupCheck as DirectImport,
@@ -369,9 +371,12 @@ async def test_reaped_pod_is_queued_in_redis_before_the_container_is_removed():
     result = await StaleContainerCleanupCheck().run(ctx)
 
     key = f"{REAPED_POD_STATES_KEY_PREFIX}{ctx.executor.uuid}"
-    # queued by the hook the cleanup awaits before the `docker rm`, once — the post-removal add
-    # is the same id in the same cycle and writes nothing new
-    assert [call[:2] for call in redis.hset_calls] == [(key, REAPED_POD_ID)]
+    # two writes of the one id: queued by the hook the cleanup awaits before the `docker rm`
+    # (nothing else writes the hash during the removal), then the send recorded on the way out
+    assert [call[:2] for call in redis.hset_calls] == [(key, REAPED_POD_ID)] * 2
+    queued, sent = (json.loads(call[2]) for call in redis.hset_calls)
+    assert "sent_at" not in queued and "observed_at" in queued
+    assert sent["observed_at"] == queued["observed_at"] and "sent_at" in sent
     # the hash of a node that leaves the fleet is never read again: the TTL is what removes it
     assert redis.expire_calls == [(key, REAPED_POD_STATE_RETENTION_SECONDS)]
     assert [s.pod_id for s in result.updates["state"].pod_states] == [REAPED_POD_ID]
@@ -396,6 +401,10 @@ async def test_a_reaped_pod_from_an_earlier_cycle_is_sent_again():
         (EARLIER_POD_ID, "reaped", an_hour_ago)
     ]
     assert redis.hdel_calls == []
+    # the bare timestamp the first cut of the queue wrote is read, and rewritten with the send
+    stored = json.loads(redis.hashes[key][EARLIER_POD_ID])
+    assert datetime.fromisoformat(stored["observed_at"]) == an_hour_ago
+    assert datetime.fromisoformat(stored["sent_at"]) > an_hour_ago
 
 
 @pytest.mark.asyncio
@@ -481,3 +490,96 @@ async def test_a_redis_error_does_not_stop_the_report_of_this_cycle():
 
     assert result.passed is True
     assert [s.pod_id for s in result.updates["state"].pod_states] == [REAPED_POD_ID]
+
+
+# ---------------------------------------------------------------------------
+# DAH-3338 (review): the message holds POD_STATES_MAX_ITEMS states. The rented pods' observed
+# states have their slots; the queued reaps take turns for the rest instead of being cut.
+# ---------------------------------------------------------------------------
+
+
+def _rented(executor, pod_count: int) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            executor.uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8080",
+                pods=[RentedPod(pod_id=f"p{i}", container_name=f"pod_p{i}") for i in range(pod_count)],
+            )
+        },
+        banned_guids=[],
+    )
+
+
+def _queued_ids(n: int) -> list[str]:
+    return [f"3c3c3c3c-0000-4000-8000-{i:012d}" for i in range(n)]
+
+
+async def _cycle(executor, redis, rented_data) -> list[str]:
+    services = build_services(container_cleanup=RecordingContainerCleanup(result=(0, [], [])), redis=redis)
+    ctx = make_context(
+        executor=executor, services=services, state=build_state(rented_data=rented_data), ssh="ssh-conn-sentinel"
+    )
+    result = await StaleContainerCleanupCheck().run(ctx)
+    return [s.pod_id for s in result.updates["state"].pod_states] if result.updates else []
+
+
+@pytest.mark.asyncio
+async def test_a_queue_longer_than_its_share_of_the_message_goes_out_whole_over_cycles():
+    """Regression: the list was cut at 256 with observed states first, so on a node with a long
+    queue the same head went every cycle and the tail never left until its retention expired.
+    Now the rented pods' slots are reserved and the reaped ids take turns for the rest."""
+    executor = default_executor()
+    key = f"{REAPED_POD_STATES_KEY_PREFIX}{executor.uuid}"
+    an_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    ids = _queued_ids(300)
+    redis = FakeRedis({key: {pod_id: an_hour_ago for pod_id in ids}})
+    rented_data = _rented(executor, pod_count=10)
+
+    first = await _cycle(executor, redis, rented_data)
+    second = await _cycle(executor, redis, rented_data)
+
+    assert len(first) == POD_STATES_MAX_ITEMS - 10 == 246
+    # the 54 never sent go first in the second cycle, then the oldest of the first cycle's
+    assert set(ids) - set(first) <= set(second)
+    assert set(first) | set(second) == set(ids)
+    assert len(set(second)) == 246
+    assert redis.hdel_calls == [] and len(redis.hashes[key]) == 300
+
+
+@pytest.mark.asyncio
+async def test_a_queue_within_its_share_is_sent_whole_every_cycle():
+    """Control: below the share nothing changes — every queued id goes out each cycle."""
+    executor = default_executor()
+    key = f"{REAPED_POD_STATES_KEY_PREFIX}{executor.uuid}"
+    an_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    ids = _queued_ids(20)
+    redis = FakeRedis({key: {pod_id: an_hour_ago for pod_id in ids}})
+    rented_data = _rented(executor, pod_count=8)
+
+    assert set(await _cycle(executor, redis, rented_data)) == set(ids)
+    assert set(await _cycle(executor, redis, rented_data)) == set(ids)
+
+
+@pytest.mark.asyncio
+async def test_this_cycles_reaps_go_out_before_ids_already_sent_once():
+    executor = default_executor()
+    key = f"{REAPED_POD_STATES_KEY_PREFIX}{executor.uuid}"
+    sent_ids = _queued_ids(POD_STATES_MAX_ITEMS)
+    sent_earlier = json.dumps(
+        {
+            "observed_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+            "sent_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+        }
+    )
+    redis = FakeRedis({key: {pod_id: sent_earlier for pod_id in sent_ids}})
+    cleanup = RecordingContainerCleanup(result=(1, [f"pod_{REAPED_POD_ID}"], []))
+    services = build_services(container_cleanup=cleanup, redis=redis)
+    ctx = make_context(executor=executor, services=services, state=build_state(), ssh="ssh-conn-sentinel")
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    sent = [s.pod_id for s in result.updates["state"].pod_states]
+    assert len(sent) == POD_STATES_MAX_ITEMS
+    assert REAPED_POD_ID in sent

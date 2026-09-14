@@ -238,6 +238,9 @@ class ResultHandler:
     @staticmethod
     def _bounded_pod_states(context: Context) -> list[PodContainerState] | None:
         # DAH-3338: never more than the backend accepts; over the bound the whole spec is rejected.
+        # The checks already share the list out under the bound (the rented pods' slots, then the
+        # reaped queue's turn), so this cut fires only on a rented list the backend itself would
+        # not produce. A cut reaped id is sent again from its queue; an observed one is re-observed.
         states = list(context.state.pod_states)
         if not states:
             return None

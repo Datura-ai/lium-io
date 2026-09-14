@@ -536,7 +536,13 @@ class ContainerCleanup:
             return None
 
     async def _remove_container(self, ssh_client, container_name: str) -> bool:
-        """Remove a container and its associated resources."""
+        """Remove a container and its associated resources.
+
+        True once the container itself is gone. The pod volume removal after it is best-effort:
+        an error there is logged and does not turn a removed container into an unremovable one —
+        the caller reads False as "still on the host" (the port check names it, DAH-3338 drops its
+        reaped report), and both would be wrong about a container `docker rm` already took.
+        """
         try:
             # Remove stale containers together with anonymous Docker volumes.
             result = await ssh_client.run(DockerCommand.remove_with_volumes(container_name))
@@ -566,14 +572,6 @@ class ContainerCleanup:
                         )
                     )
                     return False
-
-            # Remove associated volume if it's a pod container
-            if container_name.startswith(POD_CONTAINER_PREFIX):
-                pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
-                await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
-
-            return True
-
         except Exception as e:
             logger.warning(
                 _m(
@@ -582,3 +580,18 @@ class ContainerCleanup:
                 )
             )
             return False
+
+        # Remove associated volume if it's a pod container
+        if container_name.startswith(POD_CONTAINER_PREFIX):
+            pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
+            try:
+                await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
+            except Exception as e:
+                logger.warning(
+                    _m(
+                        f"Removed container {container_name} but not its volume",
+                        extra={"container_name": container_name, "volume": f"volume_{pod_id}", "error": str(e)},
+                    )
+                )
+
+        return True
