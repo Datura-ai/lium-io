@@ -357,7 +357,7 @@ async def test_port_connectivity_publishes_no_runtime_probe_when_the_downgrade_i
     assert result.updates["default_extra"]["sysbox_downgrade_tolerated"] is True
     assert "runtime_probe" not in result.updates["state"].specs
     assert "runtime_probe_reason" not in result.updates["default_extra"]
-    assert "runtime_probe" not in result.event.what
+    assert "runtime_probe" not in result.event.what_we_saw
 
 
 @pytest.mark.asyncio
