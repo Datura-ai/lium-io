@@ -263,6 +263,59 @@ def test_created_but_never_run_cvm_does_not_block(host: Host):
     assert "no data disk yet" in r.stdout
 
 
+def test_swept_disk_without_manifest_is_an_orphan_and_refuses(host: Host):
+    # Regression: the sweep skipped any hda.img with no vm-manifest.json beside
+    # it, so a disk whose manifest was deleted did not block the upgrade.
+    vm = host.sweep / "srv" / "old-cvms" / "lost-manifest"
+    vm.mkdir(parents=True)
+    (vm / "hda.img").write_bytes(b"\0")
+    host.pin(OLD_ID)
+    host.set_image(KP_IMAGE, OLD_ID)
+
+    r = host.guard("inventory")
+    assert r.returncode == 3, r.stdout + r.stderr
+    listed = [ln.split() for ln in r.stdout.splitlines() if ln.startswith("  ") and "hda.img" in ln]
+    assert listed == [["orphan", str(vm / "hda.img")]]
+    assert "orphan = hda.img with no vm-manifest.json" in r.stdout
+    assert f"sudo rm -rf {vm}" in r.stdout
+
+    r = host.guard("upgrade")
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert not _built(host.calls()), host.calls()
+
+
+def test_registered_disk_without_manifest_is_an_orphan(host: Host, tmp_path: Path):
+    # The registry walk and the sweep share one predicate: hda.img present.
+    vms_dir = tmp_path / "elsewhere" / "neurons" / "executor" / "dstacktee" / "run" / "vms"
+    vm = vms_dir / "manifest-gone"
+    vm.mkdir(parents=True)
+    (vm / "hda.img").write_bytes(b"\0")
+    host.register(vms_dir)
+
+    r = host.guard("inventory")
+
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert f"  orphan   {vm / 'hda.img'}" in r.stdout
+    assert f"sudo rm -rf {vm}" in r.stdout
+
+
+def test_running_disk_without_manifest_is_running_and_keeps_the_stop_line(host: Host):
+    # runtime.json says QEMU runs; `lium-cvm.sh stop` reads it, not the
+    # manifest, so the stop line stays.
+    vm = host.checkout / "run" / "vms" / "live-no-manifest"
+    vm.mkdir(parents=True)
+    (vm / "hda.img").write_bytes(b"\0")
+    (vm / "runtime.json").write_text('{"cid": 7, "pid": 1}')
+
+    r = host.guard("inventory")
+
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert f"  running  {vm / 'hda.img'}" in r.stdout
+    assert "orphan" not in r.stdout
+    assert f"sudo {host.checkout}/lium-cvm.sh stop live-no-manifest" in r.stdout
+    assert f"sudo rm -rf {vm}" in r.stdout
+
+
 def test_empty_host_upgrade_keeps_old_image_and_pins_new(host: Host):
     host.pin(OLD_ID)
     host.set_image(KP_IMAGE, OLD_ID)

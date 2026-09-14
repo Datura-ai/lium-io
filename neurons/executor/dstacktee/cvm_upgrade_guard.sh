@@ -8,8 +8,8 @@
 # next boot. This script makes that rebuild impossible while any CVM disk exists:
 #
 #   inventory   list every CVM disk on the host (all checkouts, all VM
-#               directories, stopped CVMs included) and say whether an upgrade
-#               is allowed
+#               directories, stopped CVMs and disks whose manifest is gone
+#               included) and say whether an upgrade is allowed
 #   start       start the key provider with the exact pinned image; never builds
 #               while a CVM disk exists; builds only on a host with no disks
 #   upgrade     rebuild the key provider; refused while any CVM disk exists or
@@ -132,15 +132,25 @@ cvm_guard_register_vms_dir() {
 
 # --- inventory ---------------------------------------------------------------
 
-# A CVM disk is a directory holding hda.img next to vm-manifest.json (the layout
-# scripts/dstack.py writes). runtime.json marks a running CVM.
+# The one predicate for a CVM disk, used by the registry walk and the sweep
+# alike: a directory holding hda.img. runtime.json (written while QEMU runs)
+# and the manifest (vm-manifest.json, the layout scripts/dstack.py writes) only
+# refine the state: running, stopped, or orphan when the CVM is not running and
+# its manifest is gone (state unknown; the disk still holds sealed data and
+# still blocks an upgrade).
 cvm_guard_classify_dir() {
     local dir="$1" state
     [ -f "$dir/hda.img" ] || {
         [ -f "$dir/vm-manifest.json" ] && CVM_GUARD_NO_DISK_YET+=("$dir")
         return 0
     }
-    if [ -f "$dir/runtime.json" ]; then state=running; else state=stopped; fi
+    if [ -f "$dir/runtime.json" ]; then
+        state=running
+    elif [ ! -f "$dir/vm-manifest.json" ]; then
+        state=orphan
+    else
+        state=stopped
+    fi
     CVM_GUARD_DISKS+=("$state	$dir")
 }
 
@@ -220,7 +230,6 @@ cvm_guard_inventory() {
             dir="$(dirname "$line")"
             [ -n "${seen[$dir]:-}" ] && continue
             seen[$dir]=1
-            [ -f "$dir/vm-manifest.json" ] || continue
             cvm_guard_classify_dir "$dir"
         done <<<"$found"
     done
@@ -245,6 +254,10 @@ cvm_guard_report() {
             dir="${entry#*	}"
             printf '  %-8s %s\n' "$state" "$dir/hda.img"
         done
+        case " ${CVM_GUARD_DISKS[*]%%	*} " in *" orphan "*)
+            cvm_guard_say "orphan = hda.img with no vm-manifest.json beside it and not running (state unknown; the disk still blocks)"
+            ;;
+        esac
     fi
     if [ ${#CVM_GUARD_NO_DISK_YET[@]} -gt 0 ]; then
         cvm_guard_say "created, no data disk yet (does not block): ${CVM_GUARD_NO_DISK_YET[*]}"
