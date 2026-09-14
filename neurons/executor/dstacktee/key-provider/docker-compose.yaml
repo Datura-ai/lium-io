@@ -10,6 +10,7 @@ services:
   aesmd:
     <<: *common-config
     container_name: dstack-aesmd
+    image: lium-aesmd:local
     build:
       context: .
       dockerfile: Dockerfile.aesmd
@@ -25,6 +26,9 @@ services:
   gramine-sealing-key-provider:
     <<: *common-config
     container_name: dstack-key-provider
+    # Fixed name so cvm_upgrade_guard.sh can pin the exact image id and
+    # restart from it; `docker compose up` alone would rebuild on a missing image.
+    image: lium-key-provider:local
     build:
       context: .
       dockerfile: Dockerfile.key-provider
