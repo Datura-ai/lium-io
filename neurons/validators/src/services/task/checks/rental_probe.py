@@ -105,10 +105,13 @@ _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 _TAIL_CHARS = 600
 _REDIS_LAST_OK_PREFIX = "rental_probe_ok"
 # the failed step of the last probe, standing until a probe passes (review: a skipped or inconclusive
-# next cycle must not relist the node without a clean probe)
+# next cycle must not relist the node without a clean probe). The key has NO lifetime: only a passed
+# probe deletes it (review: with a lifetime, a node skipped or inconclusive for longer than it was
+# relisted without a clean probe). The key is one short string per executor that failed and never
+# passed again, deregistered ones included.
 _REDIS_FAILED_PREFIX = "rental_probe_failed"
-# both stamps expire, so a deregistered executor's keys age out; a failure is re-written on every failed
-# verdict and an expired OK stamp only makes the probe run again
+# the OK stamp expires: a deregistered executor's stamp ages out, and an expired stamp only makes the
+# probe run again on the next idle cycle
 _REDIS_STAMP_TTL_SECONDS = 30 * 24 * 3600
 
 
@@ -576,11 +579,12 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
 
 
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
+    # no lifetime: the failure stands until _clear_failure, however long the node is skipped or
+    # inconclusive in between (see _REDIS_FAILED_PREFIX)
     try:
         await ctx.services.redis.set(
             f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}",
             f"{failure.step}:{failure.create_step or ''}",
-            ex=_REDIS_STAMP_TTL_SECONDS,
         )
     except Exception:
         logger.warning(

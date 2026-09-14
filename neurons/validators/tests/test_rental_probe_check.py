@@ -190,12 +190,20 @@ class FakeRedis:
         self.removed_rented.append(container_name)
 
     async def set(self, key: str, value: str, ex: int | None = None):
-        # the real RedisService.set signature; the probe's stamps pass `ex` (30-day lifetime)
+        # the real RedisService.set signature; the OK stamp passes `ex` (30-day lifetime), the failure none
         self.store[key] = value
         self.expiries[key] = ex
 
     async def delete(self, key):
         self.store.pop(key, None)
+        self.expiries.pop(key, None)
+
+    def age_past_every_lifetime(self) -> None:
+        # what Redis does once every `ex` has run out: a key written with a lifetime is gone
+        for key, ex in list(self.expiries.items()):
+            if ex is not None:
+                self.store.pop(key, None)
+                self.expiries.pop(key, None)
 
     async def remove_pending_pod(self, miner_hotkey, executor_id, pod_id):
         self.removed_pending.append((miner_hotkey, executor_id, pod_id))
@@ -420,8 +428,8 @@ async def test_a_failed_probe_clears_an_earlier_pass_stamp_and_records_the_faile
     assert result.passed is False and result.event.reason_code == Msg.PROBE_FAILED.reason
     assert not redis.stamped()
     assert redis.standing_failure() == STEP_SSHD_LISTEN
-    # self-review: both stamps carry a lifetime, so a deregistered executor's keys age out
-    assert redis.expiries[f"rental_probe_failed:{EXECUTOR.uuid}"] == module._REDIS_STAMP_TTL_SECONDS
+    # review: the failure has no lifetime; only a passed probe clears it
+    assert redis.expiries[f"rental_probe_failed:{EXECUTOR.uuid}"] is None
 
     # next cycle: the node is probed again, not skipped
     ctx, docker, _ = make_probe_context(redis=redis)
@@ -527,6 +535,35 @@ async def test_a_standing_failure_ends_with_a_passed_probe():
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
     assert redis.standing_failure() is None and redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_standing_failure_outlives_every_stamp_lifetime_until_a_probe_passes():
+    """Regression (review): the failure was written with the OK stamp's 30-day lifetime, so a node skipped
+    or inconclusive for longer than that (image never pulled, a filler always on it) was relisted without a
+    clean probe once the key expired. The failure now has no lifetime; only a passed probe clears it."""
+    redis = FakeRedis()
+    ctx, docker, _ = make_probe_context(redis=redis)
+    with probe_settings(deadline=1), renter_path(sshd_listens=False):
+        assert (await RentalProbeCheck().run(ctx)).passed is False
+    assert redis.standing_failure() == STEP_SSHD_LISTEN
+
+    # 31 days of cycles that reach no verdict: Redis drops every key that had a lifetime, the failure stays
+    redis.age_past_every_lifetime()
+    for _ in range(3):
+        ctx, docker, _ = make_probe_context(redis=redis, image_present=False)
+        with probe_settings(deadline=1):
+            result = await RentalProbeCheck().run(ctx)
+        assert result.passed is False and result.event.reason_code == Msg.PROBE_FAILED.reason
+        assert result.event.what_we_saw["standing_failure"] is True
+        assert redis.standing_failure() == STEP_SSHD_LISTEN
+
+    # the first probe that passes clears it
+    ctx, docker, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    assert redis.standing_failure() is None
 
 
 @pytest.mark.asyncio
