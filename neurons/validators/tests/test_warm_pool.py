@@ -1203,6 +1203,33 @@ async def test_filler_start_leaves_one_slot_per_prepulled_image(svc, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_prefetch_state_naming_many_images_bounds_the_maintenance_to_the_newest_pulls(svc):
+    """The state document is the executor's to write and the maintenance runs one host command per
+    ref it names; a document naming far more images than the prefetch loop ever keeps must not put
+    that many commands on the filler's response path — the newest pulls, capped, are all it reads."""
+    cap = ds_module._WARM_POOL_MAX_IMAGES
+    state = {
+        "images": {
+            f"daturaai/image-{n:03d}:1": {"last_pull_ok_at": f"2026-09-{1 + n % 28:02d}T{n // 28:02d}:00:00Z"}
+            for n in range(cap * 4)
+        }
+    }
+    state["images"]["daturaai/never:1"] = {"last_pull_ok_at": None}
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(return_value=_ssh_result(stdout=json.dumps(state)))
+
+    images = await svc._warm_pool_images(ssh)
+
+    assert len(images) == cap
+    newest = sorted(
+        ((rec["last_pull_ok_at"], ref) for ref, rec in state["images"].items() if rec["last_pull_ok_at"]),
+        reverse=True,
+    )[:cap]
+    assert images == [ref for _, ref in newest]
+    assert "daturaai/never:1" not in images
+
+
+@pytest.mark.asyncio
 async def test_filler_start_skips_images_that_already_have_a_slot_and_drops_stale_ones(
     svc, monkeypatch
 ):
@@ -1394,10 +1421,11 @@ async def test_stale_sweep_ages_a_slot_by_the_pools_max_age_whatever_the_flag(
 
     ssh = AsyncMock()
     ssh.run = AsyncMock(side_effect=_side)
-    count, names = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+    # DAH-2991 (#1302): the third member names the orphans that survived removal — none here
+    count, names, unremovable = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
         ssh_client=ssh, rented_data=None, executor_uuid="exec-1"
     )
-    assert (count, names) == (len(removed_names), removed_names)
+    assert (count, names, unremovable) == (len(removed_names), removed_names, [])
     if removed_names:
         assert any("docker rm -fv warm_left" in c for c in removed)
         assert any("docker volume rm volume_left" in c for c in removed)

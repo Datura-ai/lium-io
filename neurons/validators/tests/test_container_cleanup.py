@@ -480,7 +480,10 @@ def _make_unkillable_ssh_mock(name: str, rm_failures: int, current_ts: int = 1_0
         if cmd.strip() == "date +%s":
             return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
         if "docker inspect" in cmd and "Created" in cmd:
-            return MagicMock(exit_status=0, stdout=str(current_ts - 120 * 60), stderr="")
+            # Created / StartedAt / lium.warm_pool label, as inspect_created_timestamp prints them
+            # (DAH-3265): an orphan pod started once and was never a slot
+            created_ts = current_ts - 120 * 60
+            return MagicMock(exit_status=0, stdout=f"{created_ts}\n{created_ts + 5}\n\n", stderr="")
         if "docker rm -f" in cmd:
             if state["rm_left"] > 0:
                 state["rm_left"] -= 1

@@ -254,6 +254,10 @@ _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 # Warm pool: the executor's prefetch-state document (DAH-2470) names the images it keeps pulled.
 _WARM_POOL_STATE_READ_BYTES = 64 * 1024
+# The document is the executor's to write. Its writer keeps a handful of template images, so a
+# maintenance that considers more than this many refs (newest pull first) is reading something else —
+# the byte cap bounds the read, this bounds the one host command the maintenance runs per ref.
+_WARM_POOL_MAX_IMAGES = 16
 # Every warm-pool host command is bounded: nvidia-smi hangs on a wedged card (gpu_wedge, gpu_power_limit
 # bound it the same way) and the maintenance runs on a filler's response path.
 _WARM_POOL_COMMAND_TIMEOUT_SEC = 30
@@ -1811,7 +1815,22 @@ class DockerService:
         images = state.get("images") if isinstance(state, dict) else None
         if not isinstance(images, dict):
             return []
-        return [ref for ref, record in images.items() if isinstance(record, dict) and record.get("last_pull_ok_at")]
+        pulled = [
+            (ref, record["last_pull_ok_at"])
+            for ref, record in images.items()
+            if isinstance(record, dict) and record.get("last_pull_ok_at")
+        ]
+        if len(pulled) > _WARM_POOL_MAX_IMAGES:
+            # newest pull first; ISO-8601 UTC strings order as text
+            pulled.sort(key=lambda item: str(item[1]), reverse=True)
+            logger.info(
+                _m(
+                    "warm_pool maintain=trim reason=too many images",
+                    extra={"images": len(pulled), "kept": _WARM_POOL_MAX_IMAGES},
+                )
+            )
+            pulled = pulled[:_WARM_POOL_MAX_IMAGES]
+        return [ref for ref, _ in pulled]
 
     async def _plan_warm_slot(
         self,
