@@ -213,7 +213,7 @@ def test_parse_facts_reads_ok_steps_only_and_needs_the_host_clock_to_age():
     for bad_now in (0, -1, HOST_NOW_MAX, 10**300, True):
         facts = parse_facts(
             {"docker": StepEvidence(status="ok", data={"containers": [], "now": bad_now})},
-            capabilities=set(), round_trip_ms=0, executor_elapsed_ms=0,
+            capabilities=set(), local_verify_port=None, round_trip_ms=0, executor_elapsed_ms=0,
         )
         assert facts.host_now is None and not facts.can_age_containers(), bad_now
 
