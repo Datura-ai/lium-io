@@ -17,6 +17,7 @@ import yaml
 EXECUTOR_DIR = Path(__file__).resolve().parents[1]
 COMPOSE_PATHS = [EXECUTOR_DIR / "docker-compose.yml", EXECUTOR_DIR / "docker-compose.dev.yml"]
 WATCHTOWER_PYPROJECT = EXECUTOR_DIR.parents[1] / "watchtower" / "pyproject.toml"
+PUBLISH_WORKFLOW = EXECUTOR_DIR.parents[1] / ".github" / "workflows" / "watchtower_image.yml"
 UPDATER_REPOSITORY = "daturaai/lium-watchtower"
 # Updaters that resolve a tag through the host's Docker daemon, mirrors included.
 TAG_BASED_UPDATERS = ("nickfedor/watchtower", "containrrr/watchtower")
@@ -81,3 +82,23 @@ def test_runner_is_named_by_tag_so_the_updater_decides_the_digest(compose_path):
     image = _services(compose_path)["executor-runner"]["image"]
     assert "@sha256:" not in image, f"runner pinned in compose: {image!r}"
     assert re.fullmatch(r"daturaai/compute-subnet-executor-runner:(latest|dev)", image), image
+
+
+def test_publish_workflow_pushes_the_version_the_compose_files_pull():
+    """Regression: the version is bumped in ``pyproject.toml`` and both compose files, and
+    the publish workflow still offers the old tag by default, or its release trigger is
+    gone, so the tag the compose files pull is never pushed and every fresh install fails
+    to pull. The workflow builds with ``watchtower/docker_build.sh`` and pushes with the
+    Docker Hub secrets the executor CD uses."""
+    workflow = yaml.safe_load(PUBLISH_WORKFLOW.read_text())
+    triggers = workflow.get("on", workflow.get(True))  # PyYAML reads the bare key ``on`` as True
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert inputs["tag"]["default"] == _watchtower_version(), (
+        f"the workflow's default tag is {inputs['tag']['default']!r}; pyproject.toml is {_watchtower_version()!r}"
+    )
+    assert inputs["push_staging"]["type"] == "boolean"
+    assert triggers["push"]["tags"] == ["watchtower-v*"]
+    text = PUBLISH_WORKFLOW.read_text()
+    assert f"IMAGE_REPOSITORY: {UPDATER_REPOSITORY}" in text
+    assert "secrets.DOCKERHUB_USERNAME" in text and "secrets.DOCKERHUB_PAT" in text
+    assert "bash ./docker_build.sh" in text
