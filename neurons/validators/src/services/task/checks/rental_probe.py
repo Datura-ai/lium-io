@@ -143,6 +143,17 @@ class _ProbeOutcome:
     inconclusive_reason: str | None = None
 
 
+@dataclass
+class _ProbeGate:
+    """What `RentalProbeCheck._may_probe` hands the probe once every may-we-probe condition holds."""
+
+    image_ref: str
+    # held; `run` releases it after the probe (the probe itself releases it as soon as its create returns)
+    create_lock: _CreateLock
+    # the last probe's failed step, standing until a probe passes; None when there is none
+    standing: _Failure | None
+
+
 class RentalProbeCheck:
     """Rent the idle node from the validator and prove a renter could use it (DAH-3436).
 
@@ -181,6 +192,79 @@ class RentalProbeCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
+        gate = await self._may_probe(ctx)
+        if isinstance(gate, CheckResult):
+            return gate
+        standing = gate.standing
+        image_ref = gate.image_ref
+        try:
+            outcome = await _probe(ctx, image_ref, gate.create_lock)
+        finally:
+            await gate.create_lock.release(ctx)
+        # `steps` is the pipeline's own per-check duration summary on the run's last event
+        # (summarize_steps); the probe's records need their own key to survive it.
+        what = {
+            "executor_uuid": ctx.executor.uuid,
+            "image": image_ref,
+            "ssh_port": outcome.ssh_port,
+            "probe_steps": [step.as_record() for step in outcome.steps],
+            "probe_seconds_total": round(sum(step.seconds for step in outcome.steps), 2),
+        }
+
+        if outcome.inconclusive_reason:
+            return self._inconclusive(
+                ctx, outcome.inconclusive_reason, steps=outcome.steps, what=what, standing=standing
+            )
+
+        if outcome.failed_step is None:
+            await _stamp_last_ok(ctx)
+            await _clear_failure(ctx)
+            return CheckResult(
+                passed=True,
+                event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
+            )
+
+        # A renter may have taken the node while the probe ran: their create sweeps our container
+        # away and a real rental is proof the node works. Never punish that race, and never
+        # punish when the race cannot be ruled out.
+        rented_meanwhile = await _rented_meanwhile(ctx)
+        if rented_meanwhile is None:
+            return self._inconclusive(
+                ctx,
+                "could not rule out a rental during the probe",
+                steps=outcome.steps,
+                what=what,
+                standing=standing,
+            )
+        if rented_meanwhile:
+            # rented: the standing failure is neither applied nor cleared (class docstring); a filler
+            # that started during the probe is not a renter and carries it, as _busy_now's filler does
+            return self._inconclusive(
+                ctx,
+                f"node was {rented_meanwhile} during the probe",
+                steps=outcome.steps,
+                what=what,
+                standing=standing if rented_meanwhile == "given a filler" else None,
+            )
+
+        # a pass stamped earlier in the interval must not shield this failure, and the failure stands
+        # until a probe passes (see _standing_failure)
+        await _clear_last_ok(ctx)
+        failure = _Failure(outcome.failed_step, outcome.create_step)
+        await _stamp_failure(ctx, failure)
+        what["failed_step"] = outcome.failed_step
+        if outcome.create_step:
+            what["create_step"] = outcome.create_step
+        return self._failed(ctx, failure, what=what, ssh_port=outcome.ssh_port)
+
+    async def _may_probe(self, ctx: Context) -> _ProbeGate | CheckResult:
+        """May the probe run on this node now? The gate, or the verdict-less result that stops the cycle.
+
+        In order: the feature flag, the standing failure, the cycle's skip reasons (rented, filler,
+        interval), the validator's inputs, the default renter image and its presence on the node, the
+        per-executor create lock, and the node's idleness re-read under that lock. A gate is returned
+        with the lock held; every refusal after the lock was taken releases it first.
+        """
         if not settings.RENTAL_PROBE_ENABLED:
             return CheckResult(
                 passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
@@ -239,84 +323,39 @@ class RentalProbeCheck:
             return self._skipped(ctx, _RENT_IN_PROGRESS)
 
         try:
-            # ctx.state.rented_data is the snapshot the cycle started from, minutes ago for the last
-            # check in the pipeline. create_container sweeps every pod_* container it is not told
-            # about, so the node must be idle NOW: a fresh backend read plus this validator's own
-            # pending-pod mark (a rent it is creating this moment). Unknown counts as busy.
-            reread_started = time.monotonic()
-            busy_now = await _busy_now(ctx)
-            if busy_now is None:
-                return self._inconclusive(
-                    ctx, "could not confirm the node is idle", steps=[], standing=standing
-                )
-            if busy_now:
-                return self._skipped(
-                    ctx, busy_now, standing=None if busy_now in _RENTED_NOW else standing
-                )
-            if time.monotonic() - reread_started > _IDLENESS_REREAD_BUDGET_SECONDS:
-                # the lock's TTL would run out under the create; give it back rather than sweep late
-                return self._inconclusive(
-                    ctx, "the idleness re-read overran its budget", steps=[], standing=standing
-                )
-
-            outcome = await _probe(ctx, image_ref, create_lock)
-        finally:
+            refusal = await self._idle_under_lock(ctx, standing)
+        except BaseException:
             await create_lock.release(ctx)
-        # `steps` is the pipeline's own per-check duration summary on the run's last event
-        # (summarize_steps); the probe's records need their own key to survive it.
-        what = {
-            "executor_uuid": ctx.executor.uuid,
-            "image": image_ref,
-            "ssh_port": outcome.ssh_port,
-            "probe_steps": [step.as_record() for step in outcome.steps],
-            "probe_seconds_total": round(sum(step.seconds for step in outcome.steps), 2),
-        }
+            raise
+        if refusal is not None:
+            await create_lock.release(ctx)
+            return refusal
+        return _ProbeGate(image_ref=image_ref, create_lock=create_lock, standing=standing)
 
-        if outcome.inconclusive_reason:
+    async def _idle_under_lock(self, ctx: Context, standing: _Failure | None) -> CheckResult | None:
+        """Re-read the node's idleness under the create lock; the result that stops the cycle, or None.
+
+        ctx.state.rented_data is the snapshot the cycle started from, minutes ago for the last check
+        in the pipeline. create_container sweeps every pod_* container it is not told about, so the
+        node must be idle NOW: a fresh backend read plus this validator's own pending-pod mark (a rent
+        it is creating this moment). Unknown counts as busy.
+        """
+        reread_started = time.monotonic()
+        busy_now = await _busy_now(ctx)
+        if busy_now is None:
             return self._inconclusive(
-                ctx, outcome.inconclusive_reason, steps=outcome.steps, what=what, standing=standing
+                ctx, "could not confirm the node is idle", steps=[], standing=standing
             )
-
-        if outcome.failed_step is None:
-            await _stamp_last_ok(ctx)
-            await _clear_failure(ctx)
-            return CheckResult(
-                passed=True,
-                event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
+        if busy_now:
+            return self._skipped(
+                ctx, busy_now, standing=None if busy_now in _RENTED_NOW else standing
             )
-
-        # A renter may have taken the node while the probe ran: their create sweeps our container
-        # away and a real rental is proof the node works. Never punish that race, and never
-        # punish when the race cannot be ruled out.
-        rented_meanwhile = await _rented_meanwhile(ctx)
-        if rented_meanwhile is None:
+        if time.monotonic() - reread_started > _IDLENESS_REREAD_BUDGET_SECONDS:
+            # the lock's TTL would run out under the create; give it back rather than sweep late
             return self._inconclusive(
-                ctx,
-                "could not rule out a rental during the probe",
-                steps=outcome.steps,
-                what=what,
-                standing=standing,
+                ctx, "the idleness re-read overran its budget", steps=[], standing=standing
             )
-        if rented_meanwhile:
-            # rented: the standing failure is neither applied nor cleared (class docstring); a filler
-            # that started during the probe is not a renter and carries it, as _busy_now's filler does
-            return self._inconclusive(
-                ctx,
-                f"node was {rented_meanwhile} during the probe",
-                steps=outcome.steps,
-                what=what,
-                standing=standing if rented_meanwhile == "given a filler" else None,
-            )
-
-        # a pass stamped earlier in the interval must not shield this failure, and the failure stands
-        # until a probe passes (see _standing_failure)
-        await _clear_last_ok(ctx)
-        failure = _Failure(outcome.failed_step, outcome.create_step)
-        await _stamp_failure(ctx, failure)
-        what["failed_step"] = outcome.failed_step
-        if outcome.create_step:
-            what["create_step"] = outcome.create_step
-        return self._failed(ctx, failure, what=what, ssh_port=outcome.ssh_port)
+        return None
 
     def _failed(
         self, ctx: Context, failure: _Failure, *, what: dict[str, Any], ssh_port: int | None
@@ -703,155 +742,224 @@ def _probe_payload(
 
 
 async def _probe(ctx: Context, image_ref: str, create_lock: _CreateLock) -> _ProbeOutcome:
-    """Run the five steps; whatever happens, the node and this validator's Redis are left as found.
+    """Run the five steps in order; whatever happens, the node and this validator's Redis are left as found.
 
-    The container's name and volume follow from the pod id (`pod_<id>`, `volume_<id>`), so the
-    cleanup in `finally` can remove them by name over the validation shell even when
-    create_container returned no ContainerCreated: it failed on the host after `docker_run`, was cut
-    short by its own deadline here, raised, or was cancelled by the run's outer timeout
-    (JOB_TIME_OUT), which arrives as CancelledError and passes every `except Exception`. The
-    cleanup is shielded so a cancelled task still runs it; the cancellation itself propagates. The
-    create lock is released as soon as create_container returns, raises or is cut short: a renter must
-    wait behind the probe's sweep of `pod_*` containers, not behind its sshd wait or teardown.
+    1. `_step_container_start`: create the container the way a renter's create does.
+    2. `_step_sshd_listen`: wait for sshd's banner on the mapped port.
+    3. `_step_ssh_login`: log in with the probe's key, retrying until the deadline, and run `nvidia-smi -L`.
+    4. `_step_gpu_count`: compare the listed GPUs with what the node advertises.
+    5. `_step_teardown`: remove the container and the pending-pod mark, whichever step ended the probe.
+
+    A step that ends the probe returns None and says why in `outcome` (a failed step, or an inconclusive
+    reason). The teardown runs in `finally`, so it also runs after a raise or a cancel.
     """
     outcome = _ProbeOutcome()
     pod_id = str(uuid.uuid4())
     private_key, public_key = ctx.services.ssh.generate_keypair()
-    docker = ctx.services.pod_recovery
     log_extra = {**ctx.default_extra, "probe_pod_id": pod_id, "image": image_ref}
     created: ContainerCreated | None = None
 
     try:
-        started = time.perf_counter()
-        try:
-            result = await asyncio.wait_for(
-                docker.create_container(
-                    _probe_payload(ctx, pod_id=pod_id, image_ref=image_ref, public_key=public_key),
-                    ctx.executor,
-                    ctx.config.validator_keypair,
-                    ctx.executor_ssh_private_key_encrypted,
-                ),
-                timeout=_CREATE_DEADLINE_SECONDS,
-            )
-        except TimeoutError:
-            outcome.steps.append(
-                _Step(
-                    STEP_CONTAINER_START,
-                    time.perf_counter() - started,
-                    False,
-                    f"create_container did not finish in {_CREATE_DEADLINE_SECONDS} s",
-                )
-            )
-            outcome.failed_step = STEP_CONTAINER_START
-            outcome.create_step = "deadline"
-            return outcome
-        except asyncio.CancelledError:
-            # the run's outer timeout: create_container may have left `pod_<id>` half-made; _settle removes it by name
-            outcome.create_step = "cancelled"
-            raise
-        except (
-            Exception
-        ) as exc:  # create_container reports its failures; a raise is the validator's own
-            outcome.steps.append(
-                _Step(STEP_CONTAINER_START, time.perf_counter() - started, False, repr(exc))
-            )
-            outcome.inconclusive_reason = "create_container raised"
-            return outcome
-        finally:
-            await asyncio.shield(create_lock.release(ctx))
-
-        if not isinstance(result, ContainerCreated):
-            detail, create_step = _failure_detail(result)
-            outcome.steps.append(
-                _Step(STEP_CONTAINER_START, time.perf_counter() - started, False, detail)
-            )
-            outcome.create_step = create_step
-            if create_step is None:
-                outcome.inconclusive_reason = "create returned a result without a failure step"
-            elif create_step in _CREATE_STEPS_BEFORE_THE_HOST:
-                outcome.inconclusive_reason = (
-                    f"create failed on the validator's side at {create_step}"
-                )
-            else:
-                outcome.failed_step = STEP_CONTAINER_START
-            return outcome
-        created = result
-        outcome.steps.append(_Step(STEP_CONTAINER_START, time.perf_counter() - started, True))
-
-        ssh_port = _mapped_ssh_port(created)
-        outcome.ssh_port = ssh_port
-        if ssh_port is None:
-            # generate_portMappings always maps 22 first; a create without it is the validator's mapping
-            outcome.steps.append(
-                _Step(STEP_SSHD_LISTEN, 0.0, False, "no port mapping for container port 22")
-            )
-            outcome.inconclusive_reason = "create returned no mapping for container port 22"
-            return outcome
-
-        # one deadline for the renter's first minute: sshd's banner, then the login retries
-        deadline_seconds = settings.RENTAL_PROBE_SSH_DEADLINE_SECONDS
-        deadline_at = time.monotonic() + deadline_seconds
-        started = time.perf_counter()
-        listen_error = await _wait_for_sshd(
-            ctx.executor.address,
-            ssh_port,
-            deadline_at=deadline_at,
-            deadline_seconds=deadline_seconds,
+        created = await _step_container_start(
+            ctx,
+            outcome,
+            pod_id=pod_id,
+            image_ref=image_ref,
+            public_key=public_key,
+            create_lock=create_lock,
         )
-        outcome.steps.append(
-            _Step(
-                STEP_SSHD_LISTEN, time.perf_counter() - started, listen_error is None, listen_error
-            )
-        )
-        if listen_error is not None:
-            outcome.failed_step = STEP_SSHD_LISTEN
+        if created is None:
             return outcome
-
-        login = await _login_and_list_gpus(
-            ctx.executor.address, ssh_port, private_key, deadline_at=deadline_at
-        )
-        outcome.steps.append(
-            _Step(
-                STEP_SSH_LOGIN, login.login_seconds, login.login_error is None, login.login_detail()
-            )
-        )
-        if login.login_error is not None:
-            outcome.failed_step = STEP_SSH_LOGIN
+        listening = await _step_sshd_listen(ctx, outcome, created)
+        if listening is None:
             return outcome
-
-        expected = _expected_gpu_count(ctx)
-        if login.command_error is not None:
-            gpu_ok = False
-            detail = f"nvidia-smi -L did not run over the SSH session: {login.command_error}"
-        else:
-            smi = login.result
-            seen = _count_gpus(smi.stdout or "")
-            gpu_ok = smi.exit_status == 0 and seen == expected
-            detail = (
-                None
-                if gpu_ok
-                else f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status}): "
-                f"{(smi.stderr or smi.stdout or '')[-_TAIL_CHARS:]}"
-            )
-        outcome.steps.append(_Step(STEP_GPU_COUNT, login.command_seconds, gpu_ok, detail))
-        if not gpu_ok:
-            outcome.failed_step = STEP_GPU_COUNT
+        ssh_port, deadline_at = listening
+        login = await _step_ssh_login(ctx, outcome, private_key, ssh_port, deadline_at=deadline_at)
+        if login is None:
+            return outcome
+        _step_gpu_count(ctx, outcome, login)
         return outcome
     finally:
-        # the settle runs as its own task and is awaited to the end: a cancel that lands while it runs
-        # (the first one, or a second) interrupts only this wait, never the settle, and is re-raised
-        # once the settle is done so the run still ends as cancelled
-        settle = asyncio.ensure_future(
-            _settle(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
+        await _step_teardown(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
+
+
+async def _step_container_start(
+    ctx: Context,
+    outcome: _ProbeOutcome,
+    *,
+    pod_id: str,
+    image_ref: str,
+    public_key: str,
+    create_lock: _CreateLock,
+) -> ContainerCreated | None:
+    """Step 1: start the container through create_container, the path a renter's pod takes.
+
+    The container's name and volume follow from the pod id (`pod_<id>`, `volume_<id>`), so the
+    teardown can remove them by name over the validation shell even when create_container returned
+    no ContainerCreated: it failed on the host after `docker_run`, was cut short by its own deadline
+    here, raised, or was cancelled by the run's outer timeout (JOB_TIME_OUT), which arrives as
+    CancelledError and passes every `except Exception`. The create lock is released as soon as
+    create_container returns, raises or is cut short: a renter must wait behind the probe's sweep of
+    `pod_*` containers, not behind its sshd wait or teardown. Returns the created container, or None
+    when the probe ends here.
+    """
+    docker = ctx.services.pod_recovery
+    started = time.perf_counter()
+    try:
+        result = await asyncio.wait_for(
+            docker.create_container(
+                _probe_payload(ctx, pod_id=pod_id, image_ref=image_ref, public_key=public_key),
+                ctx.executor,
+                ctx.config.validator_keypair,
+                ctx.executor_ssh_private_key_encrypted,
+            ),
+            timeout=_CREATE_DEADLINE_SECONDS,
         )
-        cancelled = False
-        while not settle.done():
-            try:
-                await asyncio.shield(settle)
-            except asyncio.CancelledError:
-                cancelled = True
-        if cancelled:
-            raise asyncio.CancelledError()
+    except TimeoutError:
+        outcome.steps.append(
+            _Step(
+                STEP_CONTAINER_START,
+                time.perf_counter() - started,
+                False,
+                f"create_container did not finish in {_CREATE_DEADLINE_SECONDS} s",
+            )
+        )
+        outcome.failed_step = STEP_CONTAINER_START
+        outcome.create_step = "deadline"
+        return None
+    except asyncio.CancelledError:
+        # the run's outer timeout: create_container may have left `pod_<id>` half-made; _settle removes it by name
+        outcome.create_step = "cancelled"
+        raise
+    except (
+        Exception
+    ) as exc:  # create_container reports its failures; a raise is the validator's own
+        outcome.steps.append(
+            _Step(STEP_CONTAINER_START, time.perf_counter() - started, False, repr(exc))
+        )
+        outcome.inconclusive_reason = "create_container raised"
+        return None
+    finally:
+        await asyncio.shield(create_lock.release(ctx))
+
+    if not isinstance(result, ContainerCreated):
+        detail, create_step = _failure_detail(result)
+        outcome.steps.append(
+            _Step(STEP_CONTAINER_START, time.perf_counter() - started, False, detail)
+        )
+        outcome.create_step = create_step
+        if create_step is None:
+            outcome.inconclusive_reason = "create returned a result without a failure step"
+        elif create_step in _CREATE_STEPS_BEFORE_THE_HOST:
+            outcome.inconclusive_reason = f"create failed on the validator's side at {create_step}"
+        else:
+            outcome.failed_step = STEP_CONTAINER_START
+        return None
+    outcome.steps.append(_Step(STEP_CONTAINER_START, time.perf_counter() - started, True))
+    return result
+
+
+async def _step_sshd_listen(
+    ctx: Context, outcome: _ProbeOutcome, created: ContainerCreated
+) -> tuple[int, float] | None:
+    """Step 2: wait for sshd's banner on the mapped port.
+
+    Returns the mapped port and the deadline (a `time.monotonic()` instant) the login retries share
+    with this wait: one deadline for the renter's first minute. None when the probe ends here.
+    """
+    ssh_port = _mapped_ssh_port(created)
+    outcome.ssh_port = ssh_port
+    if ssh_port is None:
+        # generate_portMappings always maps 22 first; a create without it is the validator's mapping
+        outcome.steps.append(
+            _Step(STEP_SSHD_LISTEN, 0.0, False, "no port mapping for container port 22")
+        )
+        outcome.inconclusive_reason = "create returned no mapping for container port 22"
+        return None
+
+    deadline_seconds = settings.RENTAL_PROBE_SSH_DEADLINE_SECONDS
+    deadline_at = time.monotonic() + deadline_seconds
+    started = time.perf_counter()
+    listen_error = await _wait_for_sshd(
+        ctx.executor.address,
+        ssh_port,
+        deadline_at=deadline_at,
+        deadline_seconds=deadline_seconds,
+    )
+    outcome.steps.append(
+        _Step(STEP_SSHD_LISTEN, time.perf_counter() - started, listen_error is None, listen_error)
+    )
+    if listen_error is not None:
+        outcome.failed_step = STEP_SSHD_LISTEN
+        return None
+    return ssh_port, deadline_at
+
+
+async def _step_ssh_login(
+    ctx: Context, outcome: _ProbeOutcome, private_key: str, ssh_port: int, *, deadline_at: float
+) -> _Login | None:
+    """Step 3: log in with the probe's key, retrying until the deadline, and run `nvidia-smi -L`.
+
+    Returns the login (with the command's result) for the GPU count, or None when the probe ends here.
+    """
+    login = await _login_and_list_gpus(
+        ctx.executor.address, ssh_port, private_key, deadline_at=deadline_at
+    )
+    outcome.steps.append(
+        _Step(STEP_SSH_LOGIN, login.login_seconds, login.login_error is None, login.login_detail())
+    )
+    if login.login_error is not None:
+        outcome.failed_step = STEP_SSH_LOGIN
+        return None
+    return login
+
+
+def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
+    """Step 4: `nvidia-smi -L` inside the container must list the GPUs this node advertises."""
+    expected = _expected_gpu_count(ctx)
+    if login.command_error is not None:
+        gpu_ok = False
+        detail = f"nvidia-smi -L did not run over the SSH session: {login.command_error}"
+    else:
+        smi = login.result
+        seen = _count_gpus(smi.stdout or "")
+        gpu_ok = smi.exit_status == 0 and seen == expected
+        detail = (
+            None
+            if gpu_ok
+            else f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status}): "
+            f"{(smi.stderr or smi.stdout or '')[-_TAIL_CHARS:]}"
+        )
+    outcome.steps.append(_Step(STEP_GPU_COUNT, login.command_seconds, gpu_ok, detail))
+    if not gpu_ok:
+        outcome.failed_step = STEP_GPU_COUNT
+
+
+async def _step_teardown(
+    ctx: Context,
+    outcome: _ProbeOutcome,
+    *,
+    created: ContainerCreated | None,
+    pod_id: str,
+    log_extra: dict[str, Any],
+) -> None:
+    """Step 5: `_settle`, run to the end even when the probe's task is cancelled.
+
+    The settle runs as its own task and is awaited to the end: a cancel that lands while it runs
+    (the first one, or a second) interrupts only this wait, never the settle, and is re-raised once
+    the settle is done so the run still ends as cancelled.
+    """
+    settle = asyncio.ensure_future(
+        _settle(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
+    )
+    cancelled = False
+    while not settle.done():
+        try:
+            await asyncio.shield(settle)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()
 
 
 async def _settle(

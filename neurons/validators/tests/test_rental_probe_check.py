@@ -1350,6 +1350,18 @@ def test_count_gpus_reads_real_nvidia_smi_output():
     assert module._count_gpus("Failed to initialize NVML: Unknown Error") == 0
 
 
+def test_gpu_count_step_fails_a_listing_with_the_right_count_but_a_non_zero_exit():
+    """Regression: nvidia-smi lists every advertised GPU and still exits non-zero (a driver error after
+    the listing) and the gpu_count step counts it as a pass."""
+    ctx, _, _ = make_probe_context()
+    two_gpus = "GPU 0: NVIDIA RTX (UUID: GPU-aaaa)\nGPU 1: NVIDIA RTX (UUID: GPU-bbbb)\n"
+    smi = MagicMock(stdout=two_gpus, stderr="", exit_status=1)
+    outcome = module._ProbeOutcome()
+    module._step_gpu_count(ctx, outcome, module._Login(result=smi, command_seconds=0.5))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert outcome.steps[-1].ok is False and "listed 2 (exit 1)" in outcome.steps[-1].detail
+
+
 def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     """Regression: the probe is placed before the port or rented checks it depends on, or the dry-run
     pipeline (staging, DRY_RUN=true) starts creating containers on providers' nodes."""
