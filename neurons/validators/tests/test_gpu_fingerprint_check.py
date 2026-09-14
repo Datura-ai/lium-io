@@ -5,6 +5,7 @@ the event; hard mode splits a changed set into GPU_MISSING (subset) and a broken
 and a broken anchor stays broken under the same executor id.
 """
 
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -110,7 +111,6 @@ async def test_hard_mode_subset_is_gpu_missing_and_does_not_break_the_anchor(con
         "gpu-003",  # the one card replaced (5GeGsD2M, 184 events in 7 d)
         "gpu-001,gpu-003",  # one of two cards replaced
         "gpu-001,gpu-002,gpu-003",  # a card added
-        "gpu-001,gpu-001,gpu-002",  # every anchored card present, one listed twice: not the anchored set either
     ],
 )
 @pytest.mark.asyncio
@@ -123,8 +123,51 @@ async def test_hard_mode_any_uuid_outside_the_anchor_breaks_it(current_uuids, co
     assert result.event.reason_code == Msg.ANCHOR_BROKEN.reason == "GPU_UUID_CHANGED"
     assert result.event.event == Msg.ANCHOR_BROKEN.event
     assert result.event.what_we_saw["anchor_broken"] is True
-    assert result.event.what_we_saw.get("duplicate_uuid", False) is (current_uuids == "gpu-001,gpu-001,gpu-002")
+    assert "duplicate_uuid" not in result.event.what_we_saw
     assert result.updates == {"clear_verified_job_info": True, "gpu_anchor_broken": True}
+
+
+@pytest.mark.parametrize("hard", [False, True])
+@pytest.mark.asyncio
+async def test_a_scrape_that_lists_an_anchored_card_twice_matches_the_anchor(hard, context_factory, caplog):
+    """Regression (#1363 review): the sorted lists differ with `missing` and `unexpected` both empty. One
+    duplicated scrape is then filed as a broken anchor and the node never scores again under this executor id."""
+    with caplog.at_level(logging.WARNING):
+        result = await _run(
+            context_factory, hard=hard, prev_uuids="gpu-001,gpu-002", current_uuids="gpu-001,gpu-001,gpu-002"
+        )
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UUID_OK.reason
+    assert result.event.what_we_saw["duplicate_uuid"] is True
+    assert result.updates == {}  # no reset, no broken mark: the stored anchor is untouched
+    assert sum("listed twice" in record.message for record in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_hard_mode_a_duplicated_scrape_missing_a_card_is_gpu_missing_not_broken(context_factory):
+    """Regression: the duplicate is counted as the second card, so `gpu-001,gpu-001` passes for the anchor
+    `gpu-001,gpu-002`; or the event stops recording `duplicate_uuid` on a failing cycle."""
+    result = await _run(context_factory, hard=True, prev_uuids="gpu-001,gpu-002", current_uuids="gpu-001,gpu-001")
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_MISSING.reason
+    assert result.event.what_we_saw["missing"] == ["gpu-002"]
+    assert result.event.what_we_saw["duplicate_uuid"] is True
+    assert result.updates == {"clear_verified_job_info": True}
+
+
+@pytest.mark.parametrize("hard", [False, True])
+@pytest.mark.asyncio
+async def test_a_scrape_with_zero_cards_leaves_the_anchor_alone(hard, context_factory):
+    """Regression: an empty scrape is compared as a strict subset (GPU_MISSING) or as a changed set and
+    resets or breaks the anchor, when the GPU count check is the one that owns an empty scrape."""
+    result = await _run(context_factory, hard=hard, prev_uuids="gpu-001,gpu-002", current_uuids="")
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.UUID_OK.reason
+    assert "duplicate_uuid" not in result.event.what_we_saw
+    assert result.updates == {}
 
 
 @pytest.mark.parametrize("current_uuids", ["gpu-001,gpu-002", "gpu-003", ""])
