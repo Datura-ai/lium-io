@@ -271,6 +271,11 @@ class PipelineFactory:
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
+                # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
+                # the published specs had no tdx_host_supported key and the backend stored false,
+                # so every rented TDX-capable host read as not capable.
+                TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 # Pure-data model<->VRAM gate. No SSH/GPU dependency, so it runs
@@ -322,7 +327,6 @@ class PipelineFactory:
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 VerifyXCheck(),
-                TdxHostCheck(),
                 CapabilityCheck(),
                 # DAH-3035: the kernel-fault probe right after the matmul it complements — same idle,
                 # capability-verified population, same filler skip. Flag-gated, shadow-first, off by default.
@@ -357,6 +361,8 @@ class PipelineFactory:
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-3484: before the rented halt, same as build_checks().
+                TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
@@ -391,7 +397,6 @@ class PipelineFactory:
                 # executor and leaves the shared wedge timers the production pipeline relies on.
                 GpuUsageCheck(dry_run=True),
                 # VerifyXCheck(),
-                TdxHostCheck(),
                 CapabilityCheck(),
                 GpuFaultProbeCheck(),
                 RentalVerificationCheck(),
