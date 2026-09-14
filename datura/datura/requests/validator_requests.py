@@ -79,7 +79,7 @@ LOCAL_VERIFY_SCHEMA = "lium.local_verify/1"
 LOCAL_VERIFY_CAPABILITY = "local_verify/1"
 
 
-def local_verify_signing_blob(intent: dict) -> str:
+def local_verify_signing_blob(intent: dict[str, object]) -> str:
     """Canonical message the validator signs over a `/verify` intent.
 
     CRITICAL: the single source of truth for the intent signature, shared by the validator

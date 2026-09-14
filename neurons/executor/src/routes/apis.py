@@ -423,23 +423,11 @@ def _get_local_verify_service() -> LocalVerifyService:
     return _local_verify_service
 
 
-@apis_router.post("/verify")
-async def local_verify(request: Request):
-    """Run the verification suite locally from one validator-signed intent (liumd phase 1).
-
-    Reached through the validator's SSH connection only: the validator opens a direct-tcpip
-    channel on the session it already holds (host key pinned to the TDX quote on a CVM) to this
-    process's loopback port and posts the intent through it. The answer is not signed (no
-    executor key exists, `payloads/verify.py`), so it must travel inside that channel: a request
-    whose TCP peer is not loopback is refused 403 before the body is read, and the miner's
-    port-forward from the network can neither read nor rewrite a result.
-
-    Auth is the validator hotkey signature every validator-facing route here uses
-    (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
-    (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
-    window. Flag off → 404. (An image without the route answers 422 from MinerMiddleware instead;
-    the validator treats every non-200 as "use SSH".)
-    """
+async def _admit_verify_intent(request: Request) -> VerifyIntent:
+    """The guards a `/verify` intent passes before anything runs: the flag, the loopback peer, the
+    body, the validator signature, the time window and the miner it names. Returns the admitted
+    intent; raises the HTTP refusal otherwise. Claims no nonce, so a refusal here leaves the signed
+    intent usable."""
     if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
         raise HTTPException(status_code=404, detail="Not Found")
     if not _is_loopback_client(request):
@@ -475,6 +463,27 @@ async def local_verify(request: Request):
     if refused:
         logger.warning("local verify refused: %s nonce=%s", refused, intent.nonce)
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
+    return intent
+
+
+@apis_router.post("/verify")
+async def local_verify(request: Request):
+    """Run the verification suite locally from one validator-signed intent (liumd phase 1).
+
+    Reached through the validator's SSH connection only: the validator opens a direct-tcpip
+    channel on the session it already holds (host key pinned to the TDX quote on a CVM) to this
+    process's loopback port and posts the intent through it. The answer is not signed (no
+    executor key exists, `payloads/verify.py`), so it must travel inside that channel: a request
+    whose TCP peer is not loopback is refused 403 before the body is read, and the miner's
+    port-forward from the network can neither read nor rewrite a result.
+
+    Auth is the validator hotkey signature every validator-facing route here uses
+    (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
+    (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
+    window. Flag off → 404. (An image without the route answers 422 from MinerMiddleware instead;
+    the validator treats every non-200 as "use SSH".)
+    """
+    intent = await _admit_verify_intent(request)
     service = _get_local_verify_service()
     # Busy is answered before the nonce is claimed, so a refused-because-busy intent is not burnt:
     # the validator may re-send the same signed intent once the executor is free.
