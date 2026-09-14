@@ -36,6 +36,9 @@ class DummyConnectivityService:
         sysbox_runtime: bool = False,
         verified_port_count: int = 0,
         status: str | None = None,
+        dind_ok: bool | None = None,
+        dind_reason_code: str | None = None,
+        dind_error: str | None = None,
     ):
         """
         Args:
@@ -44,12 +47,17 @@ class DummyConnectivityService:
             sysbox_runtime: The sysbox runtime state to return
             verified_port_count: Number of verified working ports
             status: Override the status field (e.g., "skipped_rental_active")
+            dind_ok: Override the DinD probe outcome (defaults to `success`); with
+                dind_reason_code/dind_error this is the "ports ok, GPU runtime broken" case (B-176)
         """
         self.success = success
         self.log_text = log_text
         self.sysbox_runtime = sysbox_runtime
         self.verified_port_count = verified_port_count
         self.status = status
+        self.dind_ok = success if dind_ok is None else dind_ok
+        self.dind_reason_code = dind_reason_code
+        self.dind_error = dind_error
         self.called_with: dict | None = None
 
     async def verify_ports(
@@ -94,11 +102,13 @@ class DummyConnectivityService:
             successful_ports=successful_ports,
             failed_ports=failed_ports,
             dind_port=successful_ports[0] if successful_ports else None,
-            dind_ok=self.success,
+            dind_ok=self.dind_ok,
             sysbox_runtime=self.sysbox_runtime,
             status=status,
             error=error,
             elapsed_sec=1.0,
+            dind_reason_code=self.dind_reason_code,
+            dind_error=self.dind_error,
         )
 
 
@@ -279,3 +289,56 @@ async def test_port_connectivity_records_sysbox_downgrade_when_not_renting(conte
     # Downgrade recorded — nothing to tolerate without a rental in progress.
     assert result.updates["state"].sysbox_runtime is False
     assert result.updates["default_extra"].get("sysbox_downgrade_tolerated") is None
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_publishes_the_runtime_probe_reason_when_dind_fails(context_factory):
+    """Regression (ticket-0325, B-176): 99 TCP ports verified, the DinD probe failed with the NVML
+    mismatch, the check said PORT_VERIFY_OK and specs carried only `sysbox_runtime: false`. The
+    provider had no way to see why. The check still passes (the ports work) but specs now carry
+    `runtime_probe` with the reason code and plain words, and the event names the reason."""
+    connectivity_service = DummyConnectivityService(
+        success=True,
+        sysbox_runtime=False,
+        verified_port_count=99,
+        dind_ok=False,
+        dind_reason_code="NVIDIA_RUNTIME_MISMATCH",
+        dind_error="nvidia-container-cli: initialization error: nvml error: driver/library version mismatch",
+    )
+    services = build_services(redis=DummyRedis(), backend=DummyBackendService(), connectivity=connectivity_service)
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(sysbox_runtime=False),
+        rented=True,
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFY_OK.reason
+    probe = result.updates["state"].specs["runtime_probe"]
+    assert probe["ok"] is False
+    assert probe["reason_code"] == "NVIDIA_RUNTIME_MISMATCH"
+    assert "driver and its libraries do not match" in probe["message"]
+    assert "driver/library version mismatch" in probe["error"]
+    assert result.updates["default_extra"]["runtime_probe_reason"] == "NVIDIA_RUNTIME_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_publishes_a_passing_runtime_probe(context_factory):
+    """Control: a probe that passed publishes `{"ok": true}` and no reason, so the portal can
+    clear the warning the cycle after the host is fixed."""
+    connectivity_service = DummyConnectivityService(success=True, sysbox_runtime=True, verified_port_count=100)
+    services = build_services(redis=DummyRedis(), backend=DummyBackendService(), connectivity=connectivity_service)
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(sysbox_runtime=True),
+        rented=False,
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].specs["runtime_probe"] == {"ok": True}
+    assert "runtime_probe_reason" not in result.updates["default_extra"]

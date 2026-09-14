@@ -2,9 +2,43 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from services.executor_connectivity.dind_probe import (
+    DIND_PROBE_FAILED,
+    RUNTIME_PROBE_NVIDIA_MISMATCH,
+)
+from services.executor_connectivity.models import PortVerificationResult
+
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+# B-176: plain words for the provider, shown on the portal node page next to the reason code.
+RUNTIME_PROBE_MESSAGES: dict[str, str] = {
+    RUNTIME_PROBE_NVIDIA_MISMATCH: (
+        "The host NVIDIA driver and its libraries do not match. Reboot the host or reload the "
+        "driver, then run `docker compose up -d` in the executor folder."
+    ),
+    DIND_PROBE_FAILED: (
+        "The validator could not start its GPU test container (sysbox runtime, all GPUs) on this "
+        "host. The daemon's message is in the error field; `docker run --rm --runtime=sysbox-runc "
+        "--gpus all daturaai/dind:0.0.1 true` on the host shows the same."
+    ),
+}
+
+
+def runtime_probe_report(result: PortVerificationResult) -> dict[str, object] | None:
+    """`specs.runtime_probe` for the backend: None when the DinD probe did not run this cycle."""
+    if result.dind_port is None:
+        return None
+    if result.dind_ok:
+        return {"ok": True}
+    reason_code = result.dind_reason_code or DIND_PROBE_FAILED
+    return {
+        "ok": False,
+        "reason_code": reason_code,
+        "message": RUNTIME_PROBE_MESSAGES.get(reason_code, RUNTIME_PROBE_MESSAGES[DIND_PROBE_FAILED]),
+        "error": result.dind_error,
+    }
 
 
 class PortConnectivityCheck:
@@ -59,13 +93,22 @@ class PortConnectivityCheck:
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
         }
+        # B-176: the DinD probe's outcome rides executor.specs to the backend so the portal can
+        # show the provider why (a failed probe zeroes the sysbox multiplier while this check
+        # still reports PORT_VERIFY_OK; before this it was one ERROR log line on the validator).
+        runtime_probe = runtime_probe_report(result)
+        specs = {
+            **ctx.state.specs,
+            "sysbox_runtime": result.sysbox_runtime,
+            "verified_ports": [p.external for p in result.successful_ports],
+        }
+        if runtime_probe is not None:
+            specs["runtime_probe"] = runtime_probe
+            if not runtime_probe["ok"]:
+                extra_info["runtime_probe_reason"] = runtime_probe["reason_code"]
         updated_state = replace(
             ctx.state,
-            specs={
-                **ctx.state.specs,
-                "sysbox_runtime": result.sysbox_runtime,
-                "verified_ports": [p.external for p in result.successful_ports],
-            },
+            specs=specs,
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=verified_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
@@ -167,11 +210,14 @@ class PortConnectivityCheck:
                 updates={"default_extra": {**extra, **extra_info}, "state": updated_state},
             )
 
+        what: dict[str, object] = {"message": msg}
+        if runtime_probe is not None and not runtime_probe["ok"]:
+            what["runtime_probe"] = runtime_probe
         event = render_message(
             Msg.VERIFY_OK,
             ctx=ctx,
             check_id=self.check_id,
-            what={"message": msg},
+            what=what,
             extra=extra_info,
         )
         return CheckResult(
