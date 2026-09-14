@@ -52,7 +52,9 @@ def miner_keypair():
 def client(validator_keypair, miner_keypair, monkeypatch):
     monkeypatch.setattr(settings, "MINER_HOTKEY_SS58_ADDRESS", miner_keypair.ss58_address)
     monkeypatch.setattr(settings, "DEFAULT_MINER_HOTKEY", miner_keypair.ss58_address)
-    monkeypatch.setattr("routes.apis.VALIDATOR_HOTKEY_SS58", validator_keypair.ss58_address)
+    monkeypatch.setattr(
+        "dependencies.auth.VALIDATOR_HOTKEYS_SS58", {"current": validator_keypair.ss58_address}
+    )
 
     app = FastAPI()
     app.add_middleware(MinerMiddleware)

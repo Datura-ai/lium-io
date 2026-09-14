@@ -2,11 +2,26 @@ from fastapi import HTTPException
 import bittensor
 import json
 import time
-from core.config import VALIDATOR_HOTKEY_SS58, settings
+from core.config import VALIDATOR_HOTKEYS_SS58, settings
 from core.logger import get_logger
 from payloads.backend import SignaturePayload, HardwareUtilizationPayload, PingPayload, ContainerUtilizationPayload
 
 logger = get_logger(__name__)
+
+
+def match_validator_hotkey(message: str | bytes, signature: str) -> str | None:
+    """The id (`current` / `next`) of the configured validator hotkey that signed `message`, or None.
+
+    Every validator-signature check in the executor goes through here, so the hotkey rotation
+    (DAH-3394) is one list: VALIDATOR_HOTKEYS_SS58, tried in order. Malformed signatures raise
+    as they did before; the caller decides the status code.
+    """
+    for key_id, ss58 in VALIDATOR_HOTKEYS_SS58.items():
+        if bittensor.Keypair(ss58_address=ss58).verify(message, signature):
+            # the id only: which key is in use is operational information, the key itself is not
+            logger.debug("validator signature verified with the %s hotkey", key_id)
+            return key_id
+    return None
 
 
 async def verify_signature(payload: SignaturePayload, message: str) -> None:
@@ -24,21 +39,16 @@ async def verify_signature(payload: SignaturePayload, message: str) -> None:
         HTTPException: If signature verification fails
     """
     try:
-        # Create keypair from the allowed hotkey SS58 address
-        keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
-
         # Normalize signature format - Bittensor expects 0x prefix
         signature = payload.signature
         if not signature.startswith('0x'):
             signature = '0x' + signature
 
-        # Verify the signature against the message
-        is_valid = keypair.verify(message, signature)
-
-        if not is_valid:
+        # Verify the signature against the message with each configured validator hotkey
+        if match_validator_hotkey(message, signature) is None:
             raise HTTPException(
                 status_code=401,
-                detail=f"Invalid signature from allowed hotkey {VALIDATOR_HOTKEY_SS58}"
+                detail="Invalid signature: not signed by a configured validator hotkey"
             )
 
     except HTTPException:

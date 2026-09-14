@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-import bittensor
 import docker
 from datura.requests.validator_requests import ssh_pubkey_signing_blob
 from fastapi import APIRouter, Depends, Query, Header, HTTPException
@@ -18,11 +17,17 @@ from fastapi.responses import StreamingResponse
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics, get_container_metrics
-from core.config import VALIDATOR_HOTKEY_SS58, settings
+from core.config import settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
-from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature
+from dependencies.auth import (
+    match_validator_hotkey,
+    verify_allowed_hotkey_signature,
+    verify_ping_signature,
+    verify_container_signature,
+    verify_container_logs_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,10 @@ _container_log_stream_executor = ThreadPoolExecutor(
 _active_follow_log_streams = 0
 _active_follow_log_streams_lock = asyncio.Lock()
 
+# Upper bound on a peer-supplied authorized_keys line (the purge re-reads the file every minute):
+# 8192 less the 32 bytes the expiry marker takes (services/ssh_service.py). A real key is far
+# smaller — an ed25519 line is ~100 bytes, an rsa-4096 one ~750.
+MAX_PUBLIC_KEY_BYTES = 8192 - 32
 METRICS_MAX_CONCURRENT = 3
 METRICS_TIMEOUT_SECONDS = 8.0
 CONTAINER_LOOKUP_TIMEOUT_SECONDS = 5.0
@@ -202,6 +211,15 @@ def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
             f"public_key length={len(pk_normalized)}, data_to_sign length={len(dts_normalized)}"
         )
         raise HTTPException(status_code=400, detail="Public key mismatch")
+    # DAH-3394: the key is appended as one authorized_keys line with an expiry marker; a second
+    # line inside it would be a second key without the marker, and so without the expiry
+    if "\n" in pk_normalized or "\r" in pk_normalized:
+        logger.warning("Rejecting a public_key that spans more than one line")
+        raise HTTPException(status_code=400, detail="Public key must be a single line")
+    # bounded input: the line goes into a file the purge re-reads every minute
+    if len(pk_normalized.encode()) > MAX_PUBLIC_KEY_BYTES:
+        logger.warning("Rejecting a public_key of %d bytes", len(pk_normalized.encode()))
+        raise HTTPException(status_code=400, detail=f"Public key longer than {MAX_PUBLIC_KEY_BYTES} bytes")
 
 
 def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: bool = False) -> None:
@@ -217,9 +235,8 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
         logger.warning("Rejecting SSH-key upload without an attestation nonce (enforcement on)")
         raise HTTPException(status_code=401, detail="Attestation nonce required")
     try:
-        keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
         signed_blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce)
-        if not keypair.verify(signed_blob, payload.validator_signature):
+        if match_validator_hotkey(signed_blob, payload.validator_signature) is None:
             raise HTTPException(status_code=401, detail="Invalid validator signature")
         logger.info("Validator signature verification successful")
     except HTTPException:

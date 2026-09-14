@@ -12,6 +12,7 @@ from core.logger import get_logger
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
+from services.ssh_service import run_uploaded_key_purge
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -38,16 +39,19 @@ async def lifespan(app: FastAPI):
     # Start pulling this host's cache template image as soon as the executor
     # boots, and keep it fresh in the background, without blocking startup.
     prefetch_task = asyncio.create_task(run_cache_template_prefetch())
+    # DAH-3394: ssh keys the validator uploaded and never removed expire (EXECUTOR_UPLOADED_KEY_TTL_S)
+    key_purge_task = asyncio.create_task(run_uploaded_key_purge())
     try:
         yield
     finally:
-        prefetch_task.cancel()
-        try:
-            await prefetch_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"cache template pre-pull task ended with error: {e}")
+        for name, task in (("cache template pre-pull", prefetch_task), ("uploaded ssh key purge", key_purge_task)):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"{name} task ended with error: {e}")
 
 
 app = FastAPI(
