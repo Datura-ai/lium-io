@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import ipaddress
 import json
 import logging
 import os
@@ -380,9 +381,29 @@ async def get_version():
     Get the executor version information.
 
     Returns:
-        dict: {"version": "x.y.z", "capabilities": [...]}
+        dict: {"version": "x.y.z", "capabilities": [...]} plus, while `local_verify/1` is
+        advertised, `local_verify_port`: the loopback port the validator's SSH tunnel targets for
+        `POST /verify` (this process's own INTERNAL_PORT; the miner's EXTERNAL_PORT may differ).
+        Read over plain HTTP, so a proxy can change it: a wrong port only fails the tunnel's
+        connect, and the validator then runs its SSH checks as before.
     """
-    return {"version": _get_version(), "capabilities": _capabilities()}
+    version = {"version": _get_version(), "capabilities": _capabilities()}
+    if settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
+        version["local_verify_port"] = settings.INTERNAL_PORT
+    return version
+
+
+def _is_loopback_client(request: Request) -> bool:
+    """True when the TCP peer is this host's loopback: the validator's SSH tunnel (a direct-tcpip
+    channel sshd opens to 127.0.0.1) lands here; a request from the network does not. executor.py
+    starts uvicorn with `proxy_headers=False`, so no `X-Forwarded-For` can stand in for the peer."""
+    client = request.client
+    if client is None or not client.host:
+        return False
+    try:
+        return ipaddress.ip_address(client.host).is_loopback
+    except ValueError:
+        return False
 
 
 _local_verify_nonces = NonceCache()
@@ -406,6 +427,13 @@ def _get_local_verify_service() -> LocalVerifyService:
 async def local_verify(request: Request):
     """Run the verification suite locally from one validator-signed intent (liumd phase 1).
 
+    Reached through the validator's SSH connection only: the validator opens a direct-tcpip
+    channel on the session it already holds (host key pinned to the TDX quote on a CVM) to this
+    process's loopback port and posts the intent through it. The answer is not signed (no
+    executor key exists, `payloads/verify.py`), so it must travel inside that channel: a request
+    whose TCP peer is not loopback is refused 403 before the body is read, and the miner's
+    port-forward from the network can neither read nor rewrite a result.
+
     Auth is the validator hotkey signature every validator-facing route here uses
     (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
     (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
@@ -414,6 +442,16 @@ async def local_verify(request: Request):
     """
     if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
         raise HTTPException(status_code=404, detail="Not Found")
+    if not _is_loopback_client(request):
+        # Logged so a provider can see why a validator that still posts over the network gets the
+        # SSH checks instead: the peer is the docker gateway or the CVM's slirp address, not loopback.
+        logger.warning(
+            "local verify refused: not a loopback peer host=%s",
+            request.client.host if request.client else None,
+        )
+        raise HTTPException(
+            status_code=403, detail="/verify is served on the loopback only (the validator's SSH tunnel)"
+        )
 
     try:
         raw = await request.json()
@@ -435,6 +473,7 @@ async def local_verify(request: Request):
         intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
     ) or check_intent_target(intent, settings.MINER_HOTKEY_SS58_ADDRESS)
     if refused:
+        logger.warning("local verify refused: %s nonce=%s", refused, intent.nonce)
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
     service = _get_local_verify_service()
     # Busy is answered before the nonce is claimed, so a refused-because-busy intent is not burnt:

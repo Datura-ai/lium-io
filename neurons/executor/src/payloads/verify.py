@@ -5,6 +5,12 @@ runs the steps it names locally — the same scripts the SSH-driven checks run �
 result document. The document is evidence, not a verdict: the validator unseals and scores the
 matmul and VerifyX outputs with the code it already has, so a local run and an SSH run of the same
 challenge are judged by the same function.
+
+Transport: the validator posts the intent through a direct-tcpip channel of the SSH session it
+already holds with the executor (on a CVM that session's host key is pinned to the TDX quote),
+to the executor's loopback port; `POST /verify` refuses any other peer (routes/apis.py). The
+result is unsigned, so the channel is what protects it: a proxy on the host's port-forward sees
+neither the intent nor the answer and cannot rewrite `lib_sha256` or a step's output.
 """
 
 from typing import Literal
@@ -194,6 +200,7 @@ class VerifyResult(WireModel):
     deadline_hit: bool = False
     steps: dict[str, StepResult]
     # No executor signing key exists today (design §3: a key on the adversary's host proves only
-    # that the adversary's host signed). The field is here so a future key can fill it.
+    # that the adversary's host signed); integrity comes from the pinned SSH channel this document
+    # travels in (module docstring). The field is here so a future key can fill it.
     signer: str = "none"
     signature: str | None = None

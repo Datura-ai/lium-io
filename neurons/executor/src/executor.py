@@ -69,4 +69,13 @@ app.include_router(apis_router)
 reload = True if settings.ENV == "dev" else False
 
 if __name__ == "__main__":
-    uvicorn.run("executor:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=reload)
+    # No proxy sits between a client and this process, so no X-Forwarded-* header may rewrite the
+    # peer address: routes/apis.py's `/verify` admits loopback peers only (the validator's SSH
+    # tunnel) and reads `request.client` for that.
+    uvicorn.run(
+        "executor:app",
+        host="0.0.0.0",
+        port=settings.INTERNAL_PORT,
+        reload=reload,
+        proxy_headers=False,
+    )

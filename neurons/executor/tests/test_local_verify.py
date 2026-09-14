@@ -44,7 +44,6 @@ from services.local_verify_service import (
     LocalVerifyService,
     NonceCache,
     canonical_intent_message,
-    check_intent_target,
     check_intent_window,
 )
 
@@ -491,23 +490,70 @@ def test_nonce_cache_refuses_replay_until_expiry():
 # --- the route: auth, flag, replay -----------------------------------------------------------
 
 
-@pytest.fixture()
-def client(validator_keypair, monkeypatch, fake_scripts, fake_docker):
+def _app(validator_keypair, monkeypatch) -> FastAPI:
     monkeypatch.setattr("dependencies.auth.VALIDATOR_HOTKEY_SS58", validator_keypair.ss58_address)
     monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_ENABLED", True)
     monkeypatch.setattr(settings, "RENTING_PORT_RANGE", "40000-40009")
+    # The configured miner and the shared portal hotkey are two different keys here, so the
+    # "portal hotkey binds nothing" refusal is tested against a real difference, not conftest's.
+    monkeypatch.setattr(
+        settings, "MINER_HOTKEY_SS58_ADDRESS", bittensor.Keypair.create_from_uri("//Miner").ss58_address
+    )
+    monkeypatch.setattr(
+        settings, "DEFAULT_MINER_HOTKEY", bittensor.Keypair.create_from_uri("//Portal").ss58_address
+    )
     monkeypatch.setattr(apis_module, "_local_verify_service", None)
     monkeypatch.setattr(apis_module, "_local_verify_nonces", NonceCache())
     app = FastAPI()
     app.add_middleware(MinerMiddleware)
     app.include_router(apis_router)
-    return TestClient(app)
+    return app
 
 
-def test_version_advertises_the_capability_only_when_enabled(client, monkeypatch):
-    assert client.get("/version").json()["capabilities"] == [CAPABILITY]
+def _from_peer(app, host: str, port: int = 51234):
+    """The app as seen from a TCP peer at `host` (starlette 0.37's TestClient cannot set one)."""
+
+    async def wrapped(scope, receive, send):
+        if scope["type"] == "http":
+            scope = {**scope, "client": (host, port)}
+        await app(scope, receive, send)
+
+    return wrapped
+
+
+@pytest.fixture()
+def client(validator_keypair, monkeypatch, fake_scripts, fake_docker):
+    # The peer the validator's SSH tunnel presents: sshd's direct-tcpip channel lands on loopback.
+    return TestClient(_from_peer(_app(validator_keypair, monkeypatch), "127.0.0.1"))
+
+
+def test_version_advertises_the_capability_and_tunnel_port_only_when_enabled(client, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_PORT", 8123)
+    version = client.get("/version").json()
+    assert version["capabilities"] == [CAPABILITY] and version["local_verify_port"] == 8123
     monkeypatch.setattr(settings, "EXECUTOR_LOCAL_VERIFY_ENABLED", False)
-    assert client.get("/version").json()["capabilities"] == []
+    version = client.get("/version").json()
+    assert version["capabilities"] == [] and "local_verify_port" not in version
+
+
+def test_a_network_peer_is_403_before_the_body_is_read_and_burns_nothing(
+    validator_keypair, monkeypatch, fake_scripts, fake_docker
+):
+    """The result is unsigned, so it must travel inside the validator's pinned SSH channel: the
+    miner's port-forward (a network peer, here the docker gateway) is refused, a valid intent
+    included, and its nonce stays unclaimed for the tunnel to use."""
+    app = _app(validator_keypair, monkeypatch)
+    from_network = TestClient(_from_peer(app, "172.18.0.1"))
+    intent = _signed(_body(steps=VerifySteps(inspector=True)), validator_keypair)
+    refused = from_network.post("/verify", json=intent)
+    assert refused.status_code == 403 and "loopback" in refused.text
+    assert from_network.post("/verify", data=b"not even json").status_code == 403
+    # The QEMU slirp gateway a CVM sees every outside connection from, and the IPv6 forms.
+    assert TestClient(_from_peer(app, "10.0.2.2")).post("/verify", json=intent).status_code == 403
+    assert TestClient(_from_peer(app, "::ffff:10.0.2.2")).post("/verify", json=intent).status_code == 403
+    assert TestClient(_from_peer(app, "testclient")).post("/verify", json=intent).status_code == 403
+    # IPv6 loopback is the tunnel too; the nonce is still unclaimed after every refusal above.
+    assert TestClient(_from_peer(app, "::1")).post("/verify", json=intent).status_code == 200
 
 
 def test_flag_off_is_404(client, validator_keypair, monkeypatch):
@@ -553,7 +599,6 @@ def test_an_intent_for_another_miners_executor_is_401_and_not_burnt(client, vali
         "/verify", json=_signed(_body(miner_hotkey=settings.DEFAULT_MINER_HOTKEY), validator_keypair)
     )
     assert portal.status_code == 401
-    assert check_intent_target(_body(), settings.MINER_HOTKEY_SS58_ADDRESS) is None
     # refused before the nonce is claimed: the same nonce, correctly addressed, still runs
     body = _body(steps=VerifySteps(inspector=True))
     foreign = _signed(body.model_copy(update={"miner_hotkey": other_miner}), validator_keypair)

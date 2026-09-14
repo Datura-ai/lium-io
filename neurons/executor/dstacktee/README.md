@@ -105,6 +105,7 @@ MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here   # your provider hotkey (SS58)
 VALIDATOR_HOTKEY_SS58_ADDRESS=...            # measured into the CVM attestation (RTMR) by app/init_script.sh; the executor's trusted validator is fixed per image: docker_build.sh writes src/core/config_override.py from VALIDATOR_HOTKEY_SS58 at build time (src/core/config.py holds the default)
 ENABLE_TDX_ATTESTATION=true
 ENABLE_GPU_ATTESTATION=false                 # optional; GPU_ATTESTATION_ARCH=HOPPER | BLACKWELL when on
+# EXECUTOR_LOCAL_VERIFY_ENABLED=false        # optional; the validator's one-call POST /verify over its SSH tunnel (LOCAL_VERIFY_MAX_DEADLINE_SECONDS, LOCAL_VERIFY_INTENT_WINDOW_SECONDS tune it)
 
 # Measured executor-runner release (from the release notes) — required
 EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
