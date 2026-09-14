@@ -79,6 +79,12 @@ class JobResult(BaseModel):
     # rather than re-listing a node nobody tested.
     availability_errors: list[dict[str, Any]] | None = None
 
+    # DAH-3405: the reason code of the event that ended a run without a score (the failed
+    # check's, the finalize or rented halt event's, or EXECUTOR_SSH_UNREACHABLE when the connect
+    # itself failed). None on a scored run and on an error no check produced. Read by the
+    # rollout-grace classifier at the end of the cycle.
+    failure_reason_code: str | None = None
+
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
