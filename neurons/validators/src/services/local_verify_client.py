@@ -23,6 +23,7 @@ falls back to the SSH path and logs the reason. Nothing here can fail a node.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 import time
@@ -358,7 +359,10 @@ class LocalVerifyClient:
             raise LocalVerifyUnavailable("transport", f"{type(exc).__name__}: {exc}")
         finally:
             listener.close()
-            await listener.wait_closed()
+            # wait_closed() waits for the connections the listener accepted, so a channel the
+            # executor never answers holds it open past this call. The listener is already closed.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(listener.wait_closed(), self.connect_timeout_s)
         round_trip_ms = int((time.perf_counter() - started) * 1000)
         text = body[:MAX_ANSWER_BYTES].decode("utf-8", errors="replace")
         if status == 404:

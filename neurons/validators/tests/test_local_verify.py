@@ -594,6 +594,31 @@ async def test_the_post_rides_the_ssh_session_and_the_network_path_is_refused(
 
 
 @pytest.mark.asyncio
+async def test_a_listener_that_never_finishes_closing_does_not_hold_the_call(
+    keypair, local_verify_on
+):
+    """`SSHListener.wait_closed()` waits for the connections the listener accepted, so a channel
+    the executor leaves open would hold `verify()` after the answer is already in hand. The wait
+    is bounded by `connect_timeout_s`; the answer still returns."""
+
+    class _NeverCloses(FakeSSH):
+        async def forward_local_port(self, *args):
+            listener = await super().forward_local_port(*args)
+            listener.wait_closed = lambda: asyncio.sleep(3600)
+            return listener
+
+    async with FakeExecutor(keypair) as executor:
+        client = LocalVerifyClient(
+            keypair, timeout_s=settings.LOCAL_VERIFY_TIMEOUT_SECONDS, connect_timeout_s=0.2
+        )
+        started = time.perf_counter()
+        answer = await asyncio.wait_for(
+            client.verify(_NeverCloses(), executor.server.port, empty_intent()), 10
+        )
+        assert answer.nonce and time.perf_counter() - started < 2
+
+
+@pytest.mark.asyncio
 async def test_client_reports_absent_route_dead_tunnel_and_dead_host_as_fallback_reasons(
     keypair, local_verify_on
 ):
