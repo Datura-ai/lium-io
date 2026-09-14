@@ -415,7 +415,7 @@ async def test_cleanup_reads_candidates_and_ages_from_the_fact_and_proves_the_re
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
     cleanup.prune_dangling_anonymous_volumes = AsyncMock()
 
-    removed, names = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=host_facts(table))
+    removed, names, _unremovable = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=host_facts(table))
 
     assert (removed, names) == (1, ["pod_old"])
     assert not any("docker ps -a" in c for c in commands), "the listing came from the fact"
@@ -435,7 +435,7 @@ async def test_a_container_the_fact_calls_stale_but_ssh_finds_young_is_kept():
     cleanup.prune_dangling_anonymous_volumes = AsyncMock()
     lying = host_facts({"pod_a": created(3)}, now=HOST_NOW + 3600)  # host clock an hour ahead
 
-    removed, names = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=lying)
+    removed, names, _unremovable = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=lying)
 
     assert (removed, names) == (0, [])
     assert not any("docker rm" in c for c in commands)
@@ -458,7 +458,7 @@ async def test_an_unaged_fact_container_falls_to_the_ssh_pair_and_rented_ones_ar
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
     cleanup.prune_dangling_anonymous_volumes = AsyncMock()
 
-    removed, names = await cleanup.cleanup(ssh, rented, EXECUTOR_UUID, host_facts=facts)
+    removed, names, _unremovable = await cleanup.cleanup(ssh, rented, EXECUTOR_UUID, host_facts=facts)
 
     assert (removed, names) == (1, ["pod_unaged"])
     assert any("docker inspect" in c and "pod_unaged" in c for c in commands)
@@ -472,7 +472,7 @@ async def test_facts_that_cannot_age_leave_the_ssh_listing_in_place():
         ssh, commands = ssh_recording(table)
         cleanup = ContainerCleanup(stale_threshold_minutes=15)
         cleanup.prune_dangling_anonymous_volumes = AsyncMock()
-        removed, _ = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=facts)
+        removed, _, _unremovable = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=facts)
         assert removed == 1
         assert any("docker ps -a" in c for c in commands), facts
 
@@ -486,7 +486,7 @@ async def test_a_fact_the_cleanup_cannot_age_lands_on_the_ssh_listing_not_on_rem
     cleanup.prune_dangling_anonymous_volumes = AsyncMock()
     odd = host_facts({"pod_old": created(60)}, now=10**400)  # past the parser, hypothetically: float overflow
 
-    removed, names = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=odd)
+    removed, names, _unremovable = await cleanup.cleanup(ssh, None, EXECUTOR_UUID, host_facts=odd)
 
     assert (removed, names) == (1, ["pod_old"])
     assert any("docker ps -a" in c for c in commands), "the SSH listing ran"
@@ -495,13 +495,15 @@ async def test_a_fact_the_cleanup_cannot_age_lands_on_the_ssh_listing_not_on_rem
 @pytest.mark.asyncio
 async def test_the_stale_check_hands_the_state_facts_to_the_cleanup():
     cleanup = SimpleNamespace(
-        cleanup=AsyncMock(return_value=(0, [])),
+        cleanup=AsyncMock(return_value=(0, [], [])),
         sweep_abandoned_download_temporaries=AsyncMock(return_value=0),
         reclaim_dphn_cache_when_disk_is_tight=AsyncMock(return_value=0),
     )
+    # DAH-1932: an executor this validator has seen before (SADD → 0), so the cleanup runs
+    seen_before = SimpleNamespace(sadd=AsyncMock(return_value=0))
     facts = host_facts({"pod_a": created(1)})
     ctx = make_context(
-        services=build_services(container_cleanup=cleanup),
+        services=build_services(container_cleanup=cleanup, redis=seen_before),
         state=build_state(local_facts=facts, rented_data=None),
     )
     result = await StaleContainerCleanupCheck().run(ctx)
