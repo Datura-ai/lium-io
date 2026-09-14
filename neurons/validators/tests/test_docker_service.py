@@ -5380,6 +5380,53 @@ def _create_payload(pod_id: str, *, encrypted: bool) -> ContainerCreateRequest:
     )
 
 
+def _lift_encrypted_bootstrap_restore_hold(monkeypatch) -> None:
+    # The tests below pin the create-time path the hold keeps back, so the follow-up that lifts
+    # it (workload held stopped for the whole restore) inherits them unchanged.
+    monkeypatch.setattr(docker_service_module, "_ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD", False)
+
+
+@pytest.mark.asyncio
+async def test_create_container_refuses_an_encrypted_restore_while_the_hold_is_on(
+    docker_service,
+    monkeypatch,
+):
+    # DAH-3274 (review, 14 Sep): the image's entrypoint runs while a create-time restore writes
+    # under /root through the pod's mount; until the workload can be held stopped, the create
+    # refuses before the probes, the volume and the pod. A plain volume is not affected.
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    assert docker_service_module._ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD is True
+    probe = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service_module, "supports_bootstrap_restore", probe)
+    docker_run = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", docker_run)
+    restore_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_bootstrap_restore", restore_spy)
+    volume_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "create_local_volume", volume_spy)
+
+    payload = _create_payload(str(uuid4()), encrypted=True)
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest), result
+    assert result.failure_step == "bootstrap_restore_hold"
+    assert "lium bk restore" in result.detail
+    probe.assert_not_awaited()
+    volume_spy.assert_not_awaited()
+    docker_run.assert_not_awaited()
+    restore_spy.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("encrypted", [True, False], ids=["encrypted", "plain"])
 async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
@@ -5390,6 +5437,7 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
     # DAH-3274: a plain volume is restored before `docker run` (data present at entrypoint);
     # an encrypted one only after its gocryptfs mount exists inside the running pod, through
     # that pod — so the executor is never handed the passphrase.
+    _lift_encrypted_bootstrap_restore_hold(monkeypatch)
     monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings,
@@ -5460,6 +5508,7 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_on_an_
 ):
     # DAH-3274 (review): an executor image without `workspace.bootstrap` would ignore the key and
     # refuse the non-empty target after the pod is up; the create fails before `docker run` instead.
+    _lift_encrypted_bootstrap_restore_hold(monkeypatch)
     monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"
@@ -5500,6 +5549,7 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_withou
 ):
     # DAH-3274 (review): new models but no restic binary used to fail inside _run_bootstrap_restore,
     # with the pod already built; the engine check now runs next to the models probe.
+    _lift_encrypted_bootstrap_restore_hold(monkeypatch)
     monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
     monkeypatch.setattr(
         docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!"

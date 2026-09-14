@@ -253,6 +253,13 @@ _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
 # container; /tmp is part of the container's writable layer, i.e. a directory on the provider's
 # disk, where an unlinked file stays recoverable until its blocks are reused.
 _VOLUME_SETUP_TMPFS = "/dev/shm"
+# DAH-3274 (review, 14 Sep): the create-time restore into an encrypted volume runs through the
+# pod's own mount while the image's entrypoint is already running, so the entrypoint and the
+# restore write under /root at the same time. Until the workload can be held stopped for the
+# whole restore, the create refuses an encrypted `--restore-backup` before the volume and the
+# pod exist. Not a setting: nothing in config can lift it. The follow-up that holds the workload
+# removes this constant; the probes and the post-mount restore below it are the path it holds back.
+_ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD = True
 # the path comes from a customer-authored template and the backend only requires a leading slash,
 # so anything that is not a plain absolute path is refused here rather than mounted over
 _PLAINTEXT_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
@@ -5155,6 +5162,16 @@ class DockerService:
                         )
 
                 if payload.bootstrap_restore and use_encrypted_volume:
+                    if _ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD:
+                        # See the constant: the pod's entrypoint would run while the restore
+                        # writes under /root. Refused here, before the volume and the pod exist.
+                        current_step = "bootstrap_restore_hold"
+                        raise RuntimeError(
+                            "an encrypted volume cannot be restored at create time yet: the "
+                            "image's entrypoint keeps running while the restore writes under "
+                            "/root; create the pod without --restore-backup and run "
+                            "`lium bk restore` once it is up"
+                        )
                     # The encrypted restore after `docker run` sends `workspace.bootstrap`; an
                     # executor image from before DAH-3274 ignores the key and refuses the target
                     # the entrypoint has already written to, so the create would fail with the
@@ -5243,7 +5260,9 @@ class DockerService:
                     # place when the image's entrypoint starts. An encrypted volume cannot be:
                     # its plaintext exists only behind the gocryptfs mount inside the running
                     # pod, so that restore runs after setup_encrypted_local_volume below —
-                    # through the pod's own mount, never with the passphrase (DAH-3274).
+                    # through the pod's own mount, never with the passphrase (DAH-3274). That
+                    # path is on hold (_ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD): the preflight
+                    # refused the create before this point.
                     current_step = "bootstrap_restore"
                     await self._run_bootstrap_restore(
                         ssh_client=ssh_client,
@@ -5559,6 +5578,8 @@ class DockerService:
                         prev_timestamp = now_ms()
 
                         if payload.bootstrap_restore:
+                            # Reached only once _ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD is gone: the
+                            # preflight above refuses an encrypted create-time restore today.
                             # DAH-3274: restore into the mounted plaintext through the pod's own
                             # gocryptfs (the executor nsenters the pod's user namespace, as the
                             # online `lium restore` does). The passphrase stays in the
