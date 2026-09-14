@@ -1929,6 +1929,7 @@ async def test_delete_container_remove_read_timeout_with_failing_inspect_fails_u
     assert isinstance(result, FailedContainerRequest)
     assert result.error_code == FailedContainerErrorCodes.UnknownError
     assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
     docker_service.redis_service.remove_rented_machine.assert_not_awaited()
 
 
@@ -1942,6 +1943,7 @@ async def test_delete_container_remove_read_timeout_with_hung_inspect_fails_unde
     monkeypatch.setattr(docker_service_module, "REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS", 0.01)
 
     async def hung_inspect(*, container_name: str):
+        client.inspected_containers.append(container_name)
         await asyncio.sleep(1)
         return None
 
@@ -1956,6 +1958,31 @@ async def test_delete_container_remove_read_timeout_with_hung_inspect_fails_unde
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_read_timeout_with_stateless_inspect_fails_undeploy(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # dockerd knows the name but the inspect body carries no State.Status: not proof of anything
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=[""]
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert "Read timed out" in result.msg
+    assert client.inspected_containers == [payload.container_name]
     docker_service.redis_service.remove_rented_machine.assert_not_awaited()
 
 
@@ -1967,10 +1994,16 @@ async def test_delete_container_remove_connect_timeout_is_not_confirmed(
     client, payload, executor_info = _arm_delete_after_remove_read_timeout(
         docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
     )
-    client.remove_error = Exception(
-        "Docker SDK remove container failed: SSHConnectionPool(host='localhost', port=None): "
-        "Connection to localhost timed out. (connect timeout=60)"
+    from requests.exceptions import ConnectTimeout
+
+    cause = ConnectTimeout(
+        "SSHConnectionPool(host='localhost', port=None): Connection to localhost timed out. "
+        "(connect timeout=60)"
     )
+    client.remove_error = RentalDockerOperationError(
+        _wrap_error_message("Docker SDK remove container failed", cause)
+    )
+    client.remove_error.__cause__ = cause
 
     result = await docker_service.delete_container(
         payload=payload,
@@ -1991,6 +2024,11 @@ def test_docker_read_timeout_detection_matches_the_wrapped_sdk_error_and_the_pro
     assert not _is_docker_read_timeout_error(
         Exception("Docker SDK remove container failed: Connection to localhost timed out. (connect timeout=60)")
     )
+    from requests.exceptions import ConnectTimeout
+
+    connect_timeout = RentalDockerOperationError("Docker SDK remove container failed: connect")
+    connect_timeout.__cause__ = ConnectTimeout("Connection to localhost timed out. (connect timeout=60)")
+    assert not _is_docker_read_timeout_error(connect_timeout)
     assert not _is_docker_read_timeout_error(
         Exception("Docker SDK remove container failed: 500 Server Error: daemon exploded")
     )
