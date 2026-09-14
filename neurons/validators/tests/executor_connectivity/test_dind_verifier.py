@@ -411,6 +411,8 @@ NVML_MISMATCH_STDERR = (
     [
         (NVML_MISMATCH_STDERR, "NVIDIA_RUNTIME_MISMATCH"),
         ("docker: Error response from daemon: Bind for 0.0.0.0:9000 failed: port is already allocated.", "DIND_PROBE_FAILED"),
+        # 600 chars: the stored `error` is cut to 500 so specs stay small
+        ("docker: Error response from daemon: " + "x" * 564, "DIND_PROBE_FAILED"),
     ],
 )
 async def test_dind_verifier_creation_failure_names_the_reason(mocker, stderr, expected_code):
@@ -435,6 +437,7 @@ async def test_dind_verifier_creation_failure_names_the_reason(mocker, stderr, e
     assert result.success is False
     assert result.reason_code == expected_code
     assert result.error == stderr[:500]
+    assert len(result.error) <= 500
 
 
 @pytest.mark.asyncio

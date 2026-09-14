@@ -19,9 +19,9 @@ RUNTIME_PROBE_MESSAGES: dict[str, str] = {
         "driver, then run `docker compose up -d` in the executor folder."
     ),
     DIND_PROBE_FAILED: (
-        "The validator could not start its GPU test container (sysbox runtime, all GPUs) on this "
-        "host. The daemon's message is in the error field; `docker run --rm --runtime=sysbox-runc "
-        "--gpus all daturaai/dind:0.0.1 true` on the host shows the same."
+        "The validator's GPU test container did not come up on this host. The daemon's message "
+        "is shown below; `docker run --rm --runtime=sysbox-runc --gpus all daturaai/dind:0.0.1 "
+        "true` on the host shows the same."
     ),
 }
 
@@ -94,8 +94,8 @@ class PortConnectivityCheck:
             "verified_port_count": verified_port_count,
         }
         # B-176: the DinD probe's outcome rides executor.specs to the backend so the portal can
-        # show the provider why (a failed probe zeroes the sysbox multiplier while this check
-        # still reports PORT_VERIFY_OK; before this it was one ERROR log line on the validator).
+        # show the provider why (this check still reports PORT_VERIFY_OK when the probe fails and
+        # the plain ports pass; before this it was one ERROR log line on the validator).
         runtime_probe = runtime_probe_report(result)
         specs = {
             **ctx.state.specs,
@@ -126,12 +126,18 @@ class PortConnectivityCheck:
             ctx.miner_hotkey, ctx.executor.uuid
         ):
             extra_info["sysbox_downgrade_tolerated"] = True
+            # B-176: the same race killed the probe, so its failure says nothing about the
+            # host's GPU runtime; publish no probe result this cycle (as if it had not run).
+            extra_info.pop("runtime_probe_reason", None)
+            runtime_probe = None
+            tolerated_specs = {
+                **updated_state.specs,
+                "sysbox_runtime": ctx.state.sysbox_runtime,
+            }
+            tolerated_specs.pop("runtime_probe", None)
             updated_state = replace(
                 updated_state,
-                specs={
-                    **updated_state.specs,
-                    "sysbox_runtime": ctx.state.sysbox_runtime,
-                },
+                specs=tolerated_specs,
                 sysbox_runtime=ctx.state.sysbox_runtime,
             )
 
