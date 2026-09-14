@@ -270,9 +270,11 @@ class Settings(BaseSettings):
     # liumd deploy (DAH-2834, speed/DEPLOY_LOCAL_RENT.md): create the rental container with ONE signed
     # `POST /rent` on the executor — the validator's own run spec, made with the same docker-py calls on
     # the host, running-state and sshd-port waits included — instead of the Docker SDK `run` through
-    # the SSH tunnel plus the `docker ps` poll. Only a spec with nothing private (no renter command,
-    # entrypoint or environment: the executor API is plain HTTP) takes it; every refusal, timeout,
-    # 404 or malformed answer falls back to the SDK path unchanged. Off by default.
+    # the SSH tunnel plus the `docker ps` poll. The intent rides the rental's own SSH session to the
+    # executor's loopback port (`/version`'s `local_rent_port`; the answer is unsigned, like
+    # /verify's). Only a spec with nothing private (no renter command, entrypoint or environment)
+    # takes it; every refusal, timeout, missing port, 404 or malformed answer falls back to the SDK
+    # path unchanged. Off by default.
     VALIDATOR_LOCAL_RENT_ENABLED: bool = Field(env="VALIDATOR_LOCAL_RENT_ENABLED", default=False)
     # Whole-call budget for `POST /rent` (seconds); the executor is told to stop EXECUTOR_ROLLBACK_MARGIN_S
     # (15 s) earlier, floor 5 (services/local_rent_client.py: the margin covers its by-id rollback).

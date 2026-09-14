@@ -36,6 +36,7 @@ from datura.rental_spec import (
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.docker_service import DockerService
 from services.local_rent_client import (
+    CAPABILITY,
     SCHEMA,
     LocalRentClient,
     LocalRentUnavailable,
@@ -46,6 +47,7 @@ from services.local_rent_client import (
     parse_answer,
 )
 from services.local_verify_client import canonical_intent_message
+from tests.test_local_verify import _TUNNELLED_SOURCE_PORTS, FakeSSH
 
 from core.config import settings
 from services import local_rent_client as lrc
@@ -332,18 +334,27 @@ def test_an_answer_to_another_intent_is_refused(mutate, reason):
 
 
 class FakeExecutor:
-    def __init__(self, keypair, *, answer=None, status=200, sleep=0.0):
+    """The executor's `/rent` as a fake: the loopback-peer (a request that did not come through
+    FakeSSH's tunnel is 403, as the real route refuses a network peer), signature, host-key and
+    replay checks as the real route. `/version` names this server's own port as `local_rent_port`
+    (the real executor names its INTERNAL_PORT), so a tunnel that targets it lands here."""
+
+    def __init__(self, keypair, *, answer=None, status=200, sleep=0.0, advertise=True):
         self.keypair = keypair
         self.answer = answer  # callable(intent) -> dict
         self.status = status
         self.sleep = sleep
+        self.advertise = advertise
         self.intents: list[dict] = []
         self.seen: set[str] = set()
+        self.refused_peers: list[str] = []  # `/rent` requests that did not come through a tunnel
         self.app = web.Application()
+        self.app.router.add_get("/version", self.version)
         self.app.router.add_post("/rent", self.rent)
         self.server = TestServer(self.app)
 
     async def __aenter__(self):
+        _TUNNELLED_SOURCE_PORTS.clear()
         await self.server.start_server()
         return self
 
@@ -363,7 +374,20 @@ class FakeExecutor:
             ssh_host_key=HOST_KEY,
         )
 
+    async def version(self, request):
+        version = {"version": "4.1.0", "capabilities": [CAPABILITY] if self.advertise else []}
+        if self.advertise:
+            version["local_rent_port"] = self.server.port
+        return web.json_response(version)
+
     async def rent(self, request):
+        peer = request.transport.get_extra_info("peername")
+        if peer is None or peer[1] not in _TUNNELLED_SOURCE_PORTS:
+            self.refused_peers.append(f"{peer[0]}:{peer[1]}" if peer else "?")
+            return web.json_response(
+                {"detail": "/rent is served on the loopback only (the validator's SSH tunnel)"},
+                status=403,
+            )
         raw = await request.json()
         if not self.keypair.verify(canonical_intent_message(raw), raw["signature"]):
             return web.json_response({"detail": "Invalid signature"}, status=401)
@@ -383,29 +407,64 @@ def _client(keypair, timeout_s=5) -> LocalRentClient:
     return LocalRentClient(keypair, timeout_s=timeout_s, connect_timeout_s=2)
 
 
-def test_the_client_posts_a_signed_intent_the_executor_accepts(keypair):
+def test_the_client_posts_a_signed_intent_through_the_tunnel_to_the_advertised_port(keypair):
+    """The POST rides the SSH session to the loopback port `/version` named (the fake admits no
+    other peer), the listener is closed after the call, and the answer reads as created."""
     async def scenario():
         async with FakeExecutor(keypair) as executor:
+            ssh = FakeSSH()
+            client = _client(keypair)
+            port = (await client.advertised(executor.executor_info)).local_rent_port
             intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
-            answer = await _client(keypair).rent(executor.executor_info, intent)
-            return executor.intents, answer
+            answer = await client.rent(ssh, port, intent)
+            return executor, ssh, port, executor.server.port, answer
 
-    intents, answer = asyncio.run(scenario())
+    executor, ssh, port, server_port, answer = asyncio.run(scenario())
+    assert port == server_port
+    assert ssh.forwards == [("127.0.0.1", port)] and ssh.open_listeners == 0
+    assert executor.refused_peers == []
+    intents = executor.intents
     assert len(intents) == 1 and intents[0]["schema"] == SCHEMA and "signature" in intents[0]
     assert intents[0]["steps"]["container"]["name"] == "pod_abc"
     assert answer.created
 
 
-@pytest.mark.parametrize("status, reason", [(404, "not_supported"), (409, "busy_or_replay"), (401, "refused"), (500, "http_error")])
+def test_a_version_without_a_rent_port_names_no_tunnel_target(keypair):
+    async def scenario():
+        async with FakeExecutor(keypair, advertise=False) as executor:
+            return await _client(keypair).advertised(executor.executor_info)
+
+    advertised = asyncio.run(scenario())
+    assert advertised.local_rent_port is None and advertised.capabilities == set()
+
+
+@pytest.mark.parametrize("status, reason", [(404, "not_supported"), (409, "busy_or_replay"), (401, "refused"), (403, "refused"), (500, "http_error")])
 def test_every_non_200_is_a_labelled_unavailable(keypair, status, reason):
     async def scenario():
         async with FakeExecutor(keypair, status=status) as executor:
             intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
             with pytest.raises(LocalRentUnavailable) as exc:
-                await _client(keypair).rent(executor.executor_info, intent)
+                await _client(keypair).rent(FakeSSH(), executor.server.port, intent)
             return exc.value.reason
 
     assert asyncio.run(scenario()) == reason
+
+
+def test_a_tunnel_to_a_port_nobody_listens_on_is_refused_and_may_have_acted(keypair):
+    """sshd closes a channel it cannot open without a byte; aiohttp sees the same disconnect when
+    the session breaks after the send, so the client cannot tell the two apart: `refused` with the
+    tunnel detail, which the fallback treats as may-have-acted (one force-remove of the name)."""
+    async def scenario():
+        async with FakeExecutor(keypair) as executor:
+            unused = executor.server.port + 1 if executor.server.port < 65535 else executor.server.port - 1
+            intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
+            with pytest.raises(LocalRentUnavailable) as exc:
+                await _client(keypair).rent(FakeSSH(), unused, intent)
+            return exc.value, executor.intents
+
+    exc, intents = asyncio.run(scenario())
+    assert exc.reason == "refused" and exc.detail.startswith("tunnel to 127.0.0.1:") and intents == []
+    assert lrc.may_have_acted(exc.reason, exc.detail) is True
 
 
 def test_a_slow_executor_is_a_timeout(keypair):
@@ -413,7 +472,7 @@ def test_a_slow_executor_is_a_timeout(keypair):
         async with FakeExecutor(keypair, sleep=1.5) as executor:
             intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
             with pytest.raises(LocalRentUnavailable) as exc:
-                await _client(keypair, timeout_s=1).rent(executor.executor_info, intent)
+                await _client(keypair, timeout_s=1).rent(FakeSSH(), executor.server.port, intent)
             return exc.value.reason
 
     assert asyncio.run(scenario()) == "timeout"
@@ -426,7 +485,7 @@ def test_a_stranger_cannot_make_the_executor_create(keypair):
         async with FakeExecutor(keypair) as executor:
             intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
             with pytest.raises(LocalRentUnavailable) as exc:
-                await _client(stranger).rent(executor.executor_info, intent)
+                await _client(stranger).rent(FakeSSH(), executor.server.port, intent)
             return exc.value.reason, executor.intents
 
     reason, intents = asyncio.run(scenario())
@@ -446,6 +505,7 @@ def _create(svc, executor_info, keypair, spec, *, image_ships_sshd=True, docker_
         svc._create_with_local_rent(
             executor_info=executor_info,
             keypair=keypair,
+            ssh_client=FakeSSH(),
             docker_client=docker_client or Mock(remove_container=AsyncMock()),
             run_spec=spec,
             image_ships_sshd=image_ships_sshd,
@@ -495,7 +555,7 @@ def test_the_intent_is_bound_to_the_executors_host_key(svc, keypair, monkeypatch
         async with FakeExecutor(keypair) as executor:
             info = executor.executor_info.model_copy(update={"ssh_host_key": "ssh-ed25519 AAAA-other root@other"})
             answer = await svc._create_with_local_rent(
-                executor_info=info, keypair=keypair, docker_client=Mock(),
+                executor_info=info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
             return answer, executor.intents
@@ -512,11 +572,11 @@ def test_a_created_answer_is_taken_and_the_sshd_wait_is_asked_for_only_when_the_
     async def scenario():
         async with FakeExecutor(keypair) as executor:
             taken = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, docker_client=Mock(),
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
             also = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, docker_client=Mock(),
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=False, default_extra={},
             )
             return taken, also, executor.intents
@@ -537,7 +597,7 @@ def test_the_sshd_wait_ships_off(svc, keypair, monkeypatch):
     async def scenario():
         async with FakeExecutor(keypair) as executor:
             await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, docker_client=Mock(),
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
             return executor.intents
@@ -552,7 +612,7 @@ def test_an_executor_without_the_route_means_the_sdk_path(svc, keypair, monkeypa
     async def scenario():
         async with FakeExecutor(keypair, status=404) as executor:
             return await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, docker_client=Mock(),
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
 
@@ -560,23 +620,45 @@ def test_an_executor_without_the_route_means_the_sdk_path(svc, keypair, monkeypa
 
 
 def test_an_unreachable_executor_means_the_sdk_path_and_the_name_is_left_alone(svc, keypair, monkeypatch):
-    """A connection that was never made carried no intent: nothing over there to free."""
+    """An API port nobody answers on names no tunnel port: no intent is posted, nothing to free."""
     monkeypatch.setattr(settings, "VALIDATOR_LOCAL_RENT_ENABLED", True)
     removed = AsyncMock()
+    posted = Mock()
+    monkeypatch.setattr(lrc.LocalRentClient, "rent", posted)
     assert _create(svc, _offline_executor(), keypair, _spec(), docker_client=Mock(remove_container=removed)) is None
     removed.assert_not_awaited()
+    posted.assert_not_called()
+
+
+def test_an_executor_that_names_no_rent_port_is_the_sdk_path_and_nothing_is_posted(svc, keypair, monkeypatch):
+    """An image with the route off (or one without it) advertises no `local_rent_port`: the SDK
+    path runs, no tunnel is opened and no intent leaves the validator."""
+    monkeypatch.setattr(settings, "VALIDATOR_LOCAL_RENT_ENABLED", True)
+
+    async def scenario():
+        ssh = FakeSSH()
+        async with FakeExecutor(keypair, advertise=False) as executor:
+            answer = await svc._create_with_local_rent(
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=ssh, docker_client=Mock(),
+                run_spec=_spec(), image_ships_sshd=True, default_extra={},
+            )
+            return answer, executor.intents, ssh.forwards
+
+    answer, intents, forwards = asyncio.run(scenario())
+    assert answer is None and intents == [] and forwards == []
 
 
 def test_an_old_images_422_is_a_no_route_answer_and_the_name_is_left_alone(svc, keypair, monkeypatch):
-    """An executor image without the route answers the intent 422 from `MinerMiddleware` (no
-    `data_to_sign`), before anything could be created: the SDK path, and no `rm` over the tunnel."""
+    """A 422 is the route's own model check refusing the body before anything could be created
+    (an image without the route is never posted to: it names no `local_rent_port`): the SDK path,
+    and no `rm` over the tunnel."""
     monkeypatch.setattr(settings, "VALIDATOR_LOCAL_RENT_ENABLED", True)
 
     async def scenario():
         removed = AsyncMock()
         async with FakeExecutor(keypair, status=422) as executor:
             answer = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair,
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(),
                 docker_client=Mock(remove_container=removed),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
@@ -598,7 +680,7 @@ def test_a_non_answer_after_the_intent_left_frees_the_name_before_the_sdk_run(sv
         removed = AsyncMock()
         async with FakeExecutor(keypair, **executor_kw) as executor:
             answer = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair,
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(),
                 docker_client=Mock(remove_container=removed),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
@@ -616,7 +698,11 @@ def test_a_non_answer_after_the_intent_left_frees_the_name_before_the_sdk_run(sv
     [
         ("not_supported", "executor answered 404", False),
         ("refused", "Intent refused", False),
+        ("refused", '{"detail":"/rent is served on the loopback only (the validator\'s SSH tunnel)"}', False),
+        ("refused", "tunnel to 127.0.0.1:8001 closed without an answer: ServerDisconnectedError", True),
         ("busy_or_replay", "nonce already used", False),
+        ("transport", "tunnel: ConnectionLost: Connection lost", False),
+        ("timeout", "tunnel listener not bound within 5s", False),
         ("transport", "ClientConnectorError: Cannot connect to host", False),
         ("transport", "ClientConnectorDNSError: no such host", False),
         ("transport", "ServerDisconnectedError: ", True),
@@ -646,7 +732,7 @@ def test_a_container_the_executor_made_but_did_not_see_running_is_removed_before
     async def scenario():
         async with FakeExecutor(keypair, answer=answer) as executor:
             return await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, docker_client=docker_client,
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=docker_client,
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
 
@@ -665,7 +751,7 @@ def test_a_create_the_deadline_cut_is_freed_by_name_before_the_sdk_run(svc, keyp
     async def scenario():
         async with FakeExecutor(keypair, answer=answer) as executor:
             return await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, docker_client=Mock(remove_container=removed),
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(remove_container=removed),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
 
@@ -687,7 +773,7 @@ def test_a_rolled_back_failure_leaves_the_name_alone(svc, keypair, monkeypatch):
     async def scenario():
         async with FakeExecutor(keypair, answer=answer) as executor:
             return await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, docker_client=Mock(remove_container=removed),
+                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(remove_container=removed),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
 

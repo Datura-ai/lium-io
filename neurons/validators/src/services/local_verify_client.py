@@ -247,10 +247,13 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
 class Advertised:
     """What the executor's `/version` says about the local path: the capability list and, while
     `local_verify/1` is served, the loopback port the tunnel targets (None on an image that does
-    not name one — its `/verify` cannot be reached from the network, so it is left to SSH)."""
+    not name one — its `/verify` cannot be reached from the network, so it is left to SSH).
+    `local_rent_port` is the same for the deploy path's `/rent` (its own flag, so its own field;
+    both are this executor process's port, `/rent` as unsigned an answer as `/verify`)."""
 
     capabilities: set[str]
     local_verify_port: int | None
+    local_rent_port: int | None = None
 
 
 def _wire_port(value: Any) -> int | None:
@@ -281,7 +284,7 @@ class LocalVerifyClient:
         loopback port of the executor's container, a peer the miner already controls; whatever
         answers there is judged as the executor's own answer would be (nonce echo, unseal) or
         falls back to SSH."""
-        nothing = Advertised(capabilities=set(), local_verify_port=None)
+        nothing = Advertised(capabilities=set(), local_verify_port=None, local_rent_port=None)
         timeout = aiohttp.ClientTimeout(
             total=self.connect_timeout_s * 2, connect=self.connect_timeout_s
         )
@@ -306,6 +309,7 @@ class LocalVerifyClient:
                 if isinstance(c, str) and len(c) <= MAX_CAPABILITY_CHARS
             },
             local_verify_port=_wire_port(body.get("local_verify_port")),
+            local_rent_port=_wire_port(body.get("local_rent_port")),
         )
 
     async def verify(
@@ -363,6 +367,10 @@ class LocalVerifyClient:
                     status = response.status
         except TimeoutError:
             raise LocalVerifyUnavailable("timeout", f"no answer within {self.timeout_s}s")
+        except aiohttp.ClientConnectorError as exc:
+            # The connect to the listener this process just bound failed (a subclass of
+            # ClientConnectionError, so it is named before it): nothing was sent.
+            raise LocalVerifyUnavailable("transport", f"{type(exc).__name__}: {exc}")
         except aiohttp.ClientConnectionError as exc:
             # asyncssh closes the accepted connection when the channel open fails
             # (SSHLocalForwarder: ChannelOpenError → connection_lost), so aiohttp sees a

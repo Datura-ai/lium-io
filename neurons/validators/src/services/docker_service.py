@@ -1275,6 +1275,7 @@ class DockerService:
         *,
         executor_info: ExecutorSSHInfo,
         keypair,
+        ssh_client: asyncssh.SSHClientConnection,
         docker_client: RentalDockerSdkClient,
         run_spec: ContainerRunSpec,
         image_ships_sshd: bool,
@@ -1282,14 +1283,15 @@ class DockerService:
     ) -> LocalRentAnswer | None:
         """liumd deploy: ONE signed `POST /rent` makes the container on the executor from
         `run_spec` (the same docker-py calls, on the host) and waits for it to run — instead of the
-        SDK `run` through the SSH tunnel and the `docker ps` poll. The answer when the executor
-        made it and saw it running; None whenever the SDK path must run instead: flag off, a spec
-        with private fields (the executor API is plain HTTP), any refusal, timeout, 404 or
-        malformed answer, or an executor that could not prove nothing of its making remains. When
-        the executor may have acted on the intent (an unproven rollback, a timeout, a dropped
-        connection, an unreadable answer) the name is force-removed here first, so the SDK `run`
-        of the same name goes through. No `/version` round trip: the post itself is the probe
-        (404/422 = no route, one log line).
+        SDK `run` through the SSH tunnel and the `docker ps` poll. The intent rides `ssh_client`
+        (the rental's own pinned session) to the executor's loopback port, the one its `/version`
+        names as `local_rent_port`: the answer is unsigned, so it never crosses the network
+        (#1339). The answer when the executor made it and saw it running; None whenever the SDK
+        path must run instead: flag off, a spec with private fields, no advertised port, any
+        refusal, timeout, 404 or malformed answer, or an executor that could not prove nothing of
+        its making remains. When the executor may have acted on the intent (an unproven rollback,
+        a timeout, a tunnel that closed after the send, an unreadable answer) the name is
+        force-removed here first, so the SDK `run` of the same name goes through.
         """
         if not settings.VALIDATOR_LOCAL_RENT_ENABLED:
             return None
@@ -1324,14 +1326,20 @@ class DockerService:
             timeout_s=settings.LOCAL_RENT_TIMEOUT_SECONDS,
             connect_timeout_s=settings.LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS,
         )
+        # One GET over the API port: an executor with the route on names the loopback port the
+        # tunnel targets; an old image, a flag off or an unreachable API port names none.
+        local_rent_port = (await client.advertised(executor_info)).local_rent_port
+        if local_rent_port is None:
+            event("not_taken", reason="no_tunnel_port")
+            return None
         try:
-            answer = await client.rent(executor_info, intent)
+            answer = await client.rent(ssh_client, local_rent_port, intent)
         except LocalRentUnavailable as exc:
             event("unavailable", reason=exc.reason, detail=exc.detail[:300])
             if local_rent_may_have_acted(exc.reason, exc.detail):
-                # The intent may have reached the daemon (a timeout, a dropped connection, an
-                # unreadable answer): the SDK `run` of the same name goes through only if the
-                # name is free — force-removed here, as after an unproven executor rollback.
+                # The intent may have reached the daemon (a timeout, a tunnel that closed after
+                # the send, an unreadable answer): the SDK `run` of the same name goes through
+                # only if the name is free — force-removed here, as after an unproven rollback.
                 await self._remove_failed_rental_container_for_retry(
                     docker_client=docker_client,
                     container_name=run_spec.name,
@@ -5505,6 +5513,7 @@ class DockerService:
                     local_rent = await self._create_with_local_rent(
                         executor_info=executor_info,
                         keypair=keypair,
+                        ssh_client=ssh_client,
                         docker_client=docker_client,
                         run_spec=run_spec,
                         image_ships_sshd=image_manages_services,
