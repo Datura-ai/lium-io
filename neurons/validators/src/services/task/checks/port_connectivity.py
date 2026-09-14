@@ -20,8 +20,8 @@ RUNTIME_PROBE_MESSAGES: dict[str, str] = {
     ),
     DIND_PROBE_FAILED: (
         "The validator's GPU test container did not come up on this host. The daemon's message "
-        "is shown below; `docker run --rm --runtime=sysbox-runc --gpus all daturaai/dind:0.0.1 "
-        "true` on the host shows the same."
+        "is shown below; `docker run --rm --gpus all daturaai/dind:0.0.1 true` on the host (add "
+        "`--runtime=sysbox-runc` when Sysbox is installed) shows the same."
     ),
 }
 
