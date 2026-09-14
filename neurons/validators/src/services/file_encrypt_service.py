@@ -153,6 +153,22 @@ ORIGINAL_KEYS = {
     'data_container_cap_eff': "container_cap_eff",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
+    # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
+    # keys are prefixed so no existing key is a substring of them (ecrypt_miner_job_files renames by
+    # sequential str.replace); the backend names are what MachineSpecs declares.
+    'data_interconnect_scrape_error': "interconnect_scrape_error",
+    'data_interconnect': "interconnect",
+    'ic_devices': "gpu_count",
+    'ic_gpu_pairs': "gpu_pairs",
+    'ic_nvlink_active_links': "nvlink_active_links",
+    'ic_nvlink_links': "nvlink_links",
+    'ic_nvlink_pairs': "nvlink_pairs",
+    'ic_nvlink': "nvlink",
+    'ic_pcie_class': "pcie_class",
+    'ic_p2p_ok_pairs': "p2p_ok_pairs",
+    'ic_p2p_pairs': "p2p_pairs",
+    'ic_p2p': "p2p",
+    'ic_matrix': "matrix",
 }
 
 
@@ -332,6 +348,20 @@ class FileEncryptService:
             'data_container_cap_eff': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
+            # DAH-2922 - longer keys before the key they extend (prefix rule above)
+            'data_interconnect_scrape_error': "",
+            'data_interconnect': "",
+            'ic_devices': "",
+            'ic_gpu_pairs': "",
+            'ic_nvlink_active_links': "",
+            'ic_nvlink_links': "",
+            'ic_nvlink_pairs': "",
+            'ic_nvlink': "",
+            'ic_pcie_class': "",
+            'ic_p2p_ok_pairs': "",
+            'ic_p2p_pairs': "",
+            'ic_p2p': "",
+            'ic_matrix': "",
         }
 
         # Generate dictionary key mapping on validator side
