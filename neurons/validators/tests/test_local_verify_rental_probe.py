@@ -40,6 +40,7 @@ from tests.test_local_verify import (  # the phase-1 fakes
     EXECUTOR_UUID,
     SPECS,
     FakeExecutor,
+    FakeSSH,
     client_factory,
     keypair,  # noqa: F401 — fixture
     local_verify_on,  # noqa: F401 — fixture
@@ -80,6 +81,7 @@ def probe_context(keypair, executor_info, *, validation, verifyx, backend, first
     cleanup = SimpleNamespace(force_remove_health_checks=AsyncMock(return_value=0))
     return make_context(
         executor=executor_info,
+        ssh=FakeSSH(),  # the tunnel the one-call POST rides (#1340)
         services=build_services(
             validation=validation,
             verifyx=verifyx,
