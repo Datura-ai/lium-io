@@ -1525,7 +1525,12 @@ KERNEL_DISK_ERROR_PATTERN = re.compile(
 )
 # errno values, spelled out because the packaged scrape cannot import errno (obfuscator allowlist)
 ERRNO_EIO = 5
+ERRNO_ENOSPC = 28
 ERRNO_EROFS = 30
+ERRNO_EDQUOT = 122
+# /sys/block names that are not disks: loop and ram devices, device-mapper, zram, md arrays, optical
+# and floppy drives, network block devices. Most of them have no `device/` link anyway; sr* does.
+VIRTUAL_BLOCK_DEVICE_PATTERN = re.compile(r"^(loop|ram|zram|dm-|md|sr|fd|nbd)\d")
 
 
 class DiskHealthObservation:
@@ -1591,10 +1596,27 @@ def mounts_holding(mounts_text: str, path: str) -> list[str]:
     return [covering[0]]
 
 
+def write_probe_failure_reason(errno_value) -> str:
+    """The reason a write failed because of the disk itself - a container cannot start on any of
+    these - or '' when the errno says where the scrape runs from (EACCES, ENOENT), not what the disk
+    does. A function, not a module-level dict: obfuscator.py renames a name read inside a function,
+    but not one read as a key of a module-level literal."""
+    if errno_value == ERRNO_EROFS:
+        return "read_only"
+    if errno_value == ERRNO_EIO:
+        return "io_error"
+    if errno_value == ERRNO_ENOSPC:
+        return "no_space"
+    if errno_value == ERRNO_EDQUOT:
+        return "quota"
+    return ""
+
+
 def probe_write(directory: str) -> tuple[str, str]:
     """('ok', '') when a file can be created, written, fsynced and removed under `directory`;
-    ('failed', reason) when the kernel refused with EROFS/EIO - the disk itself is refusing writes;
-    ('skipped', reason) for anything else (no such directory, no permission from where the scrape runs)."""
+    ('failed', '<reason>: <error>') when the kernel refused because of the disk - read_only (EROFS),
+    io_error (EIO), no_space (ENOSPC) or quota (EDQUOT); a container cannot start on any of them;
+    ('skipped', error) for anything else (no such directory, no permission from where the scrape runs)."""
     try:
         with tempfile.NamedTemporaryFile(mode="wb", prefix=".lium-disk-probe-", dir=directory) as probe:
             probe.write(b"lium disk probe\n")
@@ -1602,8 +1624,9 @@ def probe_write(directory: str) -> tuple[str, str]:
             os.fsync(probe.fileno())
         return "ok", ""
     except OSError as e:
-        if e.errno in (ERRNO_EIO, ERRNO_EROFS):
-            return "failed", f"{e.__class__.__name__}: {e}"
+        reason = write_probe_failure_reason(e.errno)
+        if reason:
+            return "failed", f"{reason}: {e.__class__.__name__}: {e}"
         return "skipped", f"{e.__class__.__name__}: {e}"
     except Exception as e:
         return "skipped", f"{e.__class__.__name__}: {e}"
@@ -1616,13 +1639,30 @@ def kernel_disk_errors(log_text: str) -> tuple[int, list[str]]:
     return len(matching), kept
 
 
+def physical_block_devices() -> list[str]:
+    """The /sys/block names backed by a device (sda, sdaa, nvme10n1, nvme0n2, vda, mmcblk0), sorted.
+
+    A `device/` link is what a disk has and a loop, ram, dm or zram entry has not; the names that
+    have one and still are not disks (sr0) are dropped by VIRTUAL_BLOCK_DEVICE_PATTERN. One walk for
+    the sysfs error counters and for smartctl, so neither misses a disk the other sees.
+    """
+    names = []
+    for device_link in sorted(glob.glob(f"{BLOCK_SYSFS_PATH}/*/device")):
+        name = device_link.split("/")[-2]
+        if not VIRTUAL_BLOCK_DEVICE_PATTERN.match(name):
+            names.append(name)
+    return names
+
+
 def block_device_io_errors() -> dict[str, int]:
     """SCSI/SATA devices with a non-zero ioerr_cnt (hex in sysfs); NVMe has no such counter."""
     errors = {}
-    for counter_path in sorted(glob.glob(f"{BLOCK_SYSFS_PATH}/*/device/ioerr_cnt")):
-        device = counter_path.split("/")[-3]
+    for device in physical_block_devices():
+        count_text = read_sysfs_value(f"{BLOCK_SYSFS_PATH}/{device}/device/ioerr_cnt")
+        if not count_text:
+            continue
         try:
-            count = int(read_sysfs_value(counter_path) or "0", 16)
+            count = int(count_text, 16)
         except ValueError:
             continue
         if count:
@@ -1640,10 +1680,19 @@ def nvme_controller_states() -> dict[str, str]:
     return states
 
 
-# A drive that is dying is exactly the one that may not answer a SMART query; `timeout(1)` bounds it
-# so the fatal machine scrape is not held past its own budget (the docker daemon gets the same 30 s).
+# A drive that is dying is exactly the one that may not answer a SMART query; `timeout(1)` bounds
+# each query so the fatal machine scrape is not held past its own budget (the docker daemon gets the
+# same 30 s), and the whole loop stops asking after SMARTCTL_TOTAL_BUDGET_S: a host with many
+# unresponsive disks is reported with the ones it got to, the rest 'unknown'.
 SMARTCTL_TIMEOUT_S = 30
+SMARTCTL_TOTAL_BUDGET_S = 60
 TIMEOUT_EXIT_STATUS = 124
+
+
+def wall_clock_seconds() -> float:
+    # os.times()[4] is the elapsed real time since a fixed point in the past; the packaged scrape
+    # cannot import time (obfuscator allowlist)
+    return os.times()[4]
 
 
 def smart_health() -> dict[str, str] | str:
@@ -1651,16 +1700,31 @@ def smart_health() -> dict[str, str] | str:
 
     `smartctl -H` exits non-zero when the disk is FAILING (bit 3) and when the device has no SMART or
     cannot be opened (bits 1/2) — the verdict is in the JSON on stdout either way, so the exit status
-    alone is never the error; only a timeout or unreadable output is.
+    alone is never the error; only a timeout or unreadable output is. Only PASSED and FAILED are
+    verdicts; a device smartctl cannot open is 'error: <its message>' and a device not queried within
+    the total budget is 'unknown: …' - DiskHealthCheck warns on FAILED alone.
     """
     if not shutil.which("smartctl"):
         return "unavailable"
     verdicts = {}
-    for device in sorted(glob.glob("/dev/sd?") + glob.glob("/dev/nvme?n1")):
+    started = wall_clock_seconds()
+    for name in physical_block_devices():
+        device = f"/dev/{name}"
+        remaining = SMARTCTL_TOTAL_BUDGET_S - (wall_clock_seconds() - started)
+        if remaining <= 0:
+            verdicts[device] = f"unknown: not queried, {SMARTCTL_TOTAL_BUDGET_S}s smartctl budget spent"
+            continue
+        query_timeout = max(1, min(SMARTCTL_TIMEOUT_S, int(remaining)))
         try:
-            proc = run_cmd_result(f"timeout {SMARTCTL_TIMEOUT_S} smartctl -H -j {device}")
-            if proc.returncode == TIMEOUT_EXIT_STATUS:
-                verdicts[device] = f"error: smartctl did not answer within {SMARTCTL_TIMEOUT_S}s"
+            proc = run_cmd_result(f"timeout {query_timeout} smartctl -H -j {device}")
+            if not proc.stdout.strip():
+                # no JSON at all: timeout(1) expired (124 - a legal smartctl bitmask too, but that
+                # one comes with the JSON), or the command did not run (126/127, a signal)
+                if proc.returncode == TIMEOUT_EXIT_STATUS:
+                    verdicts[device] = f"error: smartctl did not answer within {query_timeout}s"
+                else:
+                    stderr = (proc.stderr or "").strip()[:KERNEL_ERROR_LINE_CHARS]
+                    verdicts[device] = f"error: exit {proc.returncode}: {stderr}"
                 continue
             report = json.loads(proc.stdout)
             passed = (report.get("smart_status") or {}).get("passed")

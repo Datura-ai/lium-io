@@ -272,9 +272,11 @@ class DiskHealthMessages:
         severity="warning",
         category="env",
         impact="Proceed; score not changed (observation only until proven on live executors)",
-        remediation="The filesystem holding the docker root is mounted read-only or returned EROFS/EIO "
-        "to a write probe. Check dmesg for I/O errors, run a filesystem check, replace the disk if "
-        "SMART reports a failure, then remount read-write and restart the executor.",
+        remediation="The filesystem holding the docker root is mounted read-only or refused a write "
+        "probe (read_only, io_error, no_space or quota in write_probe_error). For no_space or quota: "
+        "free space on the docker root (docker system prune, a larger disk or quota). Otherwise: check "
+        "dmesg for I/O errors, run a filesystem check, replace the disk if SMART reports a failure, "
+        "then remount read-write and restart the executor.",
     )
     ERRORS_REPORTED = MessageTemplate(
         event="Executor disk reports errors",

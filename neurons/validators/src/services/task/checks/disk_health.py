@@ -19,7 +19,10 @@ def disk_error_summary(health: dict[str, Any]) -> dict[str, Any]:
         summary["nvme_states"] = health["nvme_states"]
     smart = health.get("smart")
     if isinstance(smart, dict):
-        failed = {device: verdict for device, verdict in smart.items() if verdict != "PASSED"}
+        # Only FAILED is a verdict. 'unknown…' and 'error: …' (a RAID controller or a virtual disk
+        # smartctl cannot open, a query past the budget) say nothing about the disk: they travel in
+        # specs.disk_health and in the OK event's `smart`, and never raise a warning.
+        failed = {device: verdict for device, verdict in smart.items() if verdict == "FAILED"}
         if failed:
             summary["smart"] = failed
     return summary
@@ -31,11 +34,11 @@ class DiskHealthCheck:
     Pure-data: reads ``specs.disk_health`` as MachineSpecScrapeCheck left it, so it runs right
     after the GPU spec checks and before the rented short-circuit, for rented and idle executors
     alike. Observe-only, non-fatal: a docker root that is mounted read-only or refuses writes with
-    EROFS/EIO cannot start a container, and the check says so with a warning event, but the score
-    is not changed - a false reading here would zero rented and idle executors fleet-wide, so the
-    reading is proven on live executors first. Kernel I/O errors, sysfs error counters, NVMe
-    controller state and SMART verdicts are reported the same way (they travel to the backend in
-    specs) - a USB stick's errors and a dying NVMe look the same in a count.
+    EROFS/EIO/ENOSPC/EDQUOT cannot start a container, and the check says so with a warning event,
+    but the score is not changed - a false reading here would zero rented and idle executors
+    fleet-wide, so the reading is proven on live executors first. Kernel I/O errors, sysfs error
+    counters, NVMe controller state and SMART FAILED verdicts are reported the same way (they travel
+    to the backend in specs) - a USB stick's errors and a dying NVMe look the same in a count.
     """
 
     check_id = "executor.validate.disk_health"
