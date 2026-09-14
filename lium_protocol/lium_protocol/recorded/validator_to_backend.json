@@ -1,0 +1,451 @@
+{
+  "direction": "validator_to_backend",
+  "about": "One message per ValidatorMessageType, shaped as the validator's own models serialise them (model_dump_json of payload_models / vc_protocol; neurons/validators/tests/test_protocol_compat.py proves that in CI). Addresses are TEST-NET; hotkeys are the Substrate dev keys.",
+  "messages": [
+    {
+      "expect": "AuthenticateRequest",
+      "message": {
+        "message_type": "AuthenticateRequest",
+        "sent_at": null,
+        "forwarded_at": null,
+        "queue_depth": null,
+        "payload": {
+          "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+          "timestamp": 1757363580
+        },
+        "signature": "0x8c2d5b7e1a4f3c6d9e0b2a1c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70"
+      }
+    },
+    {
+      "expect": "MachineSpecRequest",
+      "message": {
+        "message_type": "MachineSpecRequest"
+      }
+    },
+    {
+      "expect": "ExecutorSpecRequest",
+      "note": "a scored node with the DAH-2467 incentive split and one DAH-2340 reason; specs is the scraper's object",
+      "message": {
+        "message_type": "ExecutorSpecRequest",
+        "sent_at": 1757363580.125,
+        "forwarded_at": 1757363580.25,
+        "queue_depth": 3,
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "miner_coldkey": "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy",
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "executor_uuid": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "executor_ip": "203.0.113.10",
+        "executor_port": 8001,
+        "executor_ssh_port": 2200,
+        "price_per_gpu": 2.49,
+        "specs": {
+          "gpu": {
+            "count": 8,
+            "details": [
+              {
+                "name": "NVIDIA H100 80GB HBM3",
+                "capacity": "81559 MiB"
+              }
+            ]
+          },
+          "os": "Ubuntu 22.04.4 LTS"
+        },
+        "score": 0.9875,
+        "synthetic_job_score": 1.0,
+        "log_text": "Miner verified successfully",
+        "log_status": "info",
+        "job_batch_id": "2026-09-08T20:30:00+00:00",
+        "netuid": 51,
+        "scored_at": "2026-09-08T20:33:00Z",
+        "incentive": 0.0042,
+        "incentive_rented": 0.0042,
+        "incentive_idle": 0.0,
+        "incentive_source": "rented",
+        "node_state_at_cycle": "RENTED",
+        "incentive_formula_version": "v3",
+        "incentive_formula_inputs": {
+          "gpu_model": "H100",
+          "gpu_count": 8
+        },
+        "collateral_deposited": true,
+        "ssh_pub_keys": [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYFORTHEWIREONLY0000000000000000 renter"
+        ],
+        "tee_type": null,
+        "attestation_digest": null,
+        "tdx_attestation_passed": null,
+        "gpu_attestation_passed": null,
+        "executor_image": {
+          "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "version": "3.0.0"
+        },
+        "incentive_reasons": [
+          {
+            "reason": "SPOT_TIER",
+            "message_for_miner": "Spot-tier nodes earn no idle incentive.",
+            "context": {
+              "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c"
+            }
+          }
+        ],
+        "batch_total": 140
+      }
+    },
+    {
+      "expect": "ExecutorSpecRequest",
+      "note": "a failed node: specs and score are null, no incentive yet (the older publisher shape — no split, no reasons)",
+      "message": {
+        "message_type": "ExecutorSpecRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "miner_coldkey": "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy",
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "executor_uuid": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "executor_ip": "203.0.113.10",
+        "executor_port": 8001,
+        "specs": null,
+        "score": null,
+        "synthetic_job_score": null,
+        "log_text": "SSH connection failed",
+        "log_status": "error",
+        "job_batch_id": "2026-09-08T20:30:00+00:00",
+        "collateral_deposited": false
+      }
+    },
+    {
+      "expect": "RentedMachineRequest",
+      "message": {
+        "message_type": "RentedMachineRequest"
+      }
+    },
+    {
+      "expect": "LogStreamRequest",
+      "message": {
+        "message_type": "LogStreamRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "executor_uuid": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "logs": [
+          {
+            "uuid": "d1e2f3a4-b5c6-4d7e-8f90-a1b2c3d4e5f6",
+            "container_name": "container_0b1c2d3e",
+            "event": "die",
+            "exit_code": 137,
+            "created_at": "2026-09-08T20:31:07Z"
+          }
+        ]
+      }
+    },
+    {
+      "expect": "InspectorEventRequest",
+      "message": {
+        "message_type": "InspectorEventRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "job_batch_id": "2026-09-08T20:30:00+00:00",
+        "pod_ids": [
+          "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9"
+        ],
+        "outcome": "PASS",
+        "reason_code": "OK",
+        "report": {
+          "gpu_processes": 1
+        },
+        "error": null,
+        "context": {
+          "cycle": 12
+        },
+        "pipeline_id": "p-1",
+        "trace_id": "t-1",
+        "when": "2026-09-08T20:33:00Z"
+      }
+    },
+    {
+      "expect": "DuplicateExecutorsRequest",
+      "message": {
+        "message_type": "DuplicateExecutorsRequest",
+        "sent_at": 1757363580.0
+      }
+    },
+    {
+      "expect": "ResetVerifiedJobRequest",
+      "message": {
+        "message_type": "ResetVerifiedJobRequest",
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_uuid": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "reason": 1
+      }
+    },
+    {
+      "expect": "NormalizedScoreRequest",
+      "message": {
+        "message_type": "NormalizedScoreRequest",
+        "normalized_scores": [
+          {
+            "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+            "score": 0.5
+          }
+        ]
+      }
+    },
+    {
+      "expect": "ScorePortionPerGpuTypeRequest",
+      "message": {
+        "message_type": "ScorePortionPerGpuTypeRequest",
+        "portions": {
+          "NVIDIA H100 80GB HBM3": 0.41,
+          "NVIDIA H200": 0.59
+        }
+      }
+    },
+    {
+      "expect": "RevenuePerGpuTypeRequest",
+      "message": {
+        "message_type": "RevenuePerGpuTypeRequest"
+      }
+    },
+    {
+      "expect": "GpuEstimatesRequest",
+      "message": {
+        "message_type": "GpuEstimatesRequest",
+        "estimates": {
+          "NVIDIA H100 80GB HBM3": {
+            "rented": {
+              "per_gpu_hour": 0.0021
+            },
+            "unrented": {
+              "per_gpu_hour": 0.0009
+            }
+          }
+        }
+      }
+    },
+    {
+      "expect": "EstimateResponse",
+      "message": {
+        "message_type": "EstimateResponse",
+        "request_id": "r-1",
+        "estimate": {
+          "per_gpu_hour": 0.0021
+        }
+      },
+      "note": "the validator's model has no `snapshot`; the backend declares it and reads None"
+    },
+    {
+      "expect": "ContainerCreated",
+      "note": "the DAH-1524 profiler steps are the validator's ProfilerStep wire shape: name + duration, the anchor with timestamp, `skipped` only when true",
+      "message": {
+        "message_type": "ContainerCreated",
+        "sent_at": 1757363700.5,
+        "forwarded_at": 1757363700.75,
+        "queue_depth": 0,
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e",
+        "volume_name": "volume_0b1c2d3e",
+        "port_maps": [
+          [
+            22,
+            40001
+          ],
+          [
+            8888,
+            40002
+          ]
+        ],
+        "profilers": [
+          {
+            "name": "Requested from backend",
+            "timestamp": 1757363650000
+          },
+          {
+            "name": "Docker run step finished",
+            "duration": 4120
+          },
+          {
+            "name": "Finished in subnet.",
+            "duration": 812,
+            "skipped": true
+          }
+        ],
+        "backup_log_id": null,
+        "restore_path": null,
+        "restore_log_id": null,
+        "jupyter_url": "http://203.0.113.10:40002/?token=EXAMPLE",
+        "warnings": null,
+        "storage_limit_gb": 100,
+        "volume_limit_gb": 400,
+        "local_volume_path": "/root",
+        "volume_encryption_status": "DISABLED"
+      }
+    },
+    {
+      "expect": "ContainerStarted",
+      "message": {
+        "message_type": "ContainerStarted",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e"
+      }
+    },
+    {
+      "expect": "ContainerStopped",
+      "message": {
+        "message_type": "ContainerStopped",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e"
+      }
+    },
+    {
+      "expect": "ContainerDeleted",
+      "message": {
+        "message_type": "ContainerDeleted",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "FILLER"
+      }
+    },
+    {
+      "expect": "SshPubKeyAdded",
+      "message": {
+        "message_type": "SshPubKeyAdded",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "user_public_keys": [
+          "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYFORTHEWIREONLY0000000000000000 renter"
+        ]
+      }
+    },
+    {
+      "expect": "SshPubKeyRemoved",
+      "message": {
+        "message_type": "SshPubKeyRemoved",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "user_public_keys": []
+      }
+    },
+    {
+      "expect": "FailedContainerRequest",
+      "note": "an error code and type the backend's copy does not know today (AttestationError, ContainerStopFailed)",
+      "message": {
+        "message_type": "FailedRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "error_type": "ContainerStopFailed",
+        "msg": "Container could not be stopped",
+        "detail": "Container could not be stopped {'executor': '203.0.113.10:2200'}",
+        "error_code": "AttestationError",
+        "failure_step": "Docker run step finished",
+        "volume_encryption_status": "FAILED"
+      }
+    },
+    {
+      "expect": "FailedContainerRequest",
+      "note": "the shape the backend parses today: creation failed, its own error code, no detail (an older validator)",
+      "message": {
+        "message_type": "FailedRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "error_type": "ContainerCreationFailed",
+        "error_code": "NoPortMappings",
+        "msg": "No port mappings available"
+      }
+    },
+    {
+      "expect": "PodLogsResponseToServer",
+      "message": {
+        "message_type": "PodLogsResponseToServer",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e",
+        "logs": [
+          {
+            "uuid": "d1e2f3a4-b5c6-4d7e-8f90-a1b2c3d4e5f6",
+            "container_name": "container_0b1c2d3e",
+            "container_id": "0123456789ab",
+            "event": "start",
+            "exit_code": null,
+            "reason": null,
+            "error": null,
+            "created_at": "2026-09-08T20:31:07Z"
+          }
+        ]
+      }
+    },
+    {
+      "expect": "FailedGetPodLogs",
+      "message": {
+        "message_type": "FailedGetPodLogs",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e",
+        "msg": "container not found"
+      }
+    },
+    {
+      "expect": "DebugSshKeyAdded",
+      "message": {
+        "message_type": "DebugSshKeyAdded",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "address": "203.0.113.10",
+        "port": 8001,
+        "ssh_username": "root",
+        "ssh_port": 2200
+      }
+    },
+    {
+      "expect": "FailedAddDebugSshKey",
+      "message": {
+        "message_type": "FailedAddDebugSshKey",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "msg": "ssh unreachable"
+      }
+    },
+    {
+      "expect": "JupyterServerInstalled",
+      "message": {
+        "message_type": "JupyterServerInstalled",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "jupyter_url": "http://203.0.113.10:40002/?token=EXAMPLE"
+      }
+    },
+    {
+      "expect": "JupyterInstallationFailed",
+      "message": {
+        "message_type": "JupyterInstallationFailed",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "msg": "pip install jupyterlab failed"
+      }
+    }
+  ]
+}

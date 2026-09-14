@@ -11,14 +11,16 @@ description: >-
   (isDoc), so a PR that only edits neurons/validators/README.md runs no tests and tests-ok still
   reports green — the tests exercise code, and none of those files is code. (A docs/ directory
   inside a package, e.g. neurons/executor/dstacktee/docs/, is not dropped: it is part of that
-  package.) Of the rest, only three prefixes select
+  package.) Of the rest, only four prefixes select
   anything: neurons/<pkg>/ selects that package; datura/ (the protocol package every neuron
   installs from a path) and .github/ (a router bug must not hide behind its own filter) select
-  all three. Every other path — the root pyproject.toml and pdm.lock (dev tooling only),
-  scripts/, contrib/, watchtower/, tests/ (an empty package) — selects nothing. A fourth output,
-  e2e, is true when any package is or when e2e/ itself changed: the e2e stack builds every
-  neuron, so it runs whenever one of them could have changed and skips (green, via tests-ok) on
-  a PR that touches none.
+  all four. lium_protocol/ (the validator↔backend wire package) selects protocol and
+  validators (neurons/validators/tests/test_protocol_compat.py replays its recordings through
+  the validator's models). Every other path — the root pyproject.toml and pdm.lock (dev tooling
+  only), scripts/, contrib/, watchtower/, tests/ (an empty package) — selects nothing. A fifth
+  output, e2e, is true when any package is or when e2e/ itself changed: the e2e stack builds
+  every neuron, so it runs whenever one of them could have changed and skips (green, via
+  tests-ok) on a PR that touches none.
 
 outputs:
   validators:
@@ -27,6 +29,8 @@ outputs:
     value: ${{ steps.route.outputs.executor }}
   miners:
     value: ${{ steps.route.outputs.miners }}
+  protocol:
+    value: ${{ steps.route.outputs.protocol }}
   e2e:
     value: ${{ steps.route.outputs.e2e }}
 
@@ -37,12 +41,15 @@ runs:
       uses: actions/github-script@v7
       with:
         script: |
-          const PACKAGES = { validators: 'neurons/validators/', executor: 'neurons/executor/', miners: 'neurons/miners/' };
+          const PACKAGES = { validators: 'neurons/validators/', executor: 'neurons/executor/', miners: 'neurons/miners/', protocol: 'lium_protocol/' };
           // a change to any of these selects every package
           const SHARED = ['datura/', '.github/'];
+          // a change to the wire package also runs the validator's compatibility test against it
+          const ALSO = { validators: ['lium_protocol/'] };
           const isDoc = f => /\.md$|(^|\/)\.gitignore$|^docs\//.test(f);
-          const touches = (files, prefix) =>
-            files.some(f => f.startsWith(prefix)) || files.some(f => SHARED.some(s => f.startsWith(s)));
+          const touches = (files, pkg, prefix) =>
+            files.some(f => f.startsWith(prefix)) || files.some(f => SHARED.some(s => f.startsWith(s)))
+            || files.some(f => (ALSO[pkg] || []).some(s => f.startsWith(s)));
 
           let files = null, why = 'no diff for this event';
           const prNumber = context.payload.pull_request?.number;
@@ -67,13 +74,13 @@ runs:
           const rows = [];
           let anyPackage = false;
           for (const [pkg, prefix] of Object.entries(PACKAGES)) {
-            const changed = files ? touches(files, prefix) : true;
+            const changed = files ? touches(files, pkg, prefix) : true;
             anyPackage ||= changed;
             core.setOutput(pkg, changed);
             rows.push([pkg, changed ? 'changed' : 'unchanged', why]);
           }
           // the e2e stack is built from every package: it runs when any of them did, or when e2e/ itself changed
-          const e2e = anyPackage || (files ? touches(files, 'e2e/') : true);
+          const e2e = anyPackage || (files ? touches(files, 'e2e', 'e2e/') : true);
           core.setOutput('e2e', e2e);
           rows.push(['e2e', e2e ? 'changed' : 'unchanged', why]);
           core.summary

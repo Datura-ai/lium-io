@@ -1,0 +1,5371 @@
+{
+  "$defs": {
+    "AddDebugSshKeyRequest": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "AddDebugSshKeyRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "public_key": {
+          "title": "Public Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "public_key"
+      ],
+      "title": "AddDebugSshKeyRequest",
+      "type": "object"
+    },
+    "AddSshPublicKeyRequest": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "AddSshPublicKey"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "user_public_keys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "User Public Keys",
+          "type": "array"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name"
+      ],
+      "title": "AddSshPublicKeyRequest",
+      "type": "object"
+    },
+    "AuthenticateRequest": {
+      "properties": {
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "AuthenticateRequest"
+        },
+        "payload": {
+          "$ref": "#/$defs/AuthenticationPayload"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "signature": {
+          "title": "Signature",
+          "type": "string"
+        }
+      },
+      "required": [
+        "payload",
+        "signature"
+      ],
+      "title": "AuthenticateRequest",
+      "type": "object"
+    },
+    "AuthenticationPayload": {
+      "properties": {
+        "timestamp": {
+          "title": "Timestamp",
+          "type": "integer"
+        },
+        "validator_hotkey": {
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "validator_hotkey",
+        "timestamp"
+      ],
+      "title": "AuthenticationPayload",
+      "type": "object"
+    },
+    "BackendMessageType": {
+      "enum": [
+        "ContainerCreateRequest",
+        "ContainerStartRequest",
+        "ContainerStopRequest",
+        "ContainerDeleteRequest",
+        "AddSshPublicKey",
+        "RemoveSshPublicKeysRequest",
+        "DuplicateExecutorsResponse",
+        "ExecutorRentFinished",
+        "GetPodLogsRequestFromServer",
+        "AddDebugSshKeyRequest",
+        "BackupContainerRequest",
+        "RestoreContainerRequest",
+        "CancelStorageOperationRequest",
+        "InstallJupyterServer",
+        "ForcedValidationCycleRequest",
+        "GetEstimateRequest"
+      ],
+      "title": "BackendMessageType",
+      "type": "string"
+    },
+    "BackupContainerRequest": {
+      "properties": {
+        "auth_token": {
+          "title": "Auth Token",
+          "type": "string"
+        },
+        "backup_engine": {
+          "default": "tar_aws_cli",
+          "title": "Backup Engine",
+          "type": "string"
+        },
+        "backup_log_id": {
+          "title": "Backup Log Id",
+          "type": "string"
+        },
+        "backup_path": {
+          "title": "Backup Path",
+          "type": "string"
+        },
+        "backup_target_path": {
+          "title": "Backup Target Path",
+          "type": "string"
+        },
+        "backup_volume_info": {
+          "$ref": "#/$defs/ExternalVolumeInfo"
+        },
+        "container_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Container Name"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "failure_timeout_seconds": {
+          "default": 600,
+          "exclusiveMinimum": 0,
+          "title": "Failure Timeout Seconds",
+          "type": "integer"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "BackupContainerRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "repository_password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repository Password"
+        },
+        "repository_pod_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repository Pod Id"
+        },
+        "source_volume": {
+          "title": "Source Volume",
+          "type": "string"
+        },
+        "source_volume_path": {
+          "title": "Source Volume Path",
+          "type": "string"
+        },
+        "volume_encrypted": {
+          "default": false,
+          "title": "Volume Encrypted",
+          "type": "boolean"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "source_volume",
+        "backup_volume_info",
+        "backup_path",
+        "source_volume_path",
+        "backup_target_path",
+        "auth_token",
+        "backup_log_id"
+      ],
+      "title": "BackupContainerRequest",
+      "type": "object"
+    },
+    "BootstrapRestoreSpec": {
+      "properties": {
+        "auth_token": {
+          "title": "Auth Token",
+          "type": "string"
+        },
+        "backup_engine": {
+          "title": "Backup Engine",
+          "type": "string"
+        },
+        "backup_volume_info": {
+          "$ref": "#/$defs/ExternalVolumeInfo"
+        },
+        "failure_timeout_seconds": {
+          "default": 600,
+          "exclusiveMinimum": 0,
+          "title": "Failure Timeout Seconds",
+          "type": "integer"
+        },
+        "legacy_object_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Legacy Object Key"
+        },
+        "legacy_object_size_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Legacy Object Size Bytes"
+        },
+        "repository_password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repository Password"
+        },
+        "repository_pod_id": {
+          "title": "Repository Pod Id",
+          "type": "string"
+        },
+        "restore_log_id": {
+          "title": "Restore Log Id",
+          "type": "string"
+        },
+        "restore_path": {
+          "title": "Restore Path",
+          "type": "string"
+        },
+        "snapshot_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Snapshot Id"
+        }
+      },
+      "required": [
+        "restore_log_id",
+        "backup_engine",
+        "repository_pod_id",
+        "backup_volume_info",
+        "auth_token",
+        "restore_path"
+      ],
+      "title": "BootstrapRestoreSpec",
+      "type": "object"
+    },
+    "CacheVolume": {
+      "description": "DAH-2475: a persistent named docker volume mounted into a FILLER container (`name` must not use the\nephemeral `volume_` prefix).",
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "target": {
+          "title": "Target",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "target"
+      ],
+      "title": "CacheVolume",
+      "type": "object"
+    },
+    "CancelStorageOperationRequest": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "CancelStorageOperationRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "operation_id": {
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "operation_id"
+      ],
+      "title": "CancelStorageOperationRequest",
+      "type": "object"
+    },
+    "ClusterMembership": {
+      "description": "DAH-2620: this pod is one node of a multi-node group rental; the backend mints the WireGuard mesh.",
+      "properties": {
+        "node_index": {
+          "title": "Node Index",
+          "type": "integer"
+        },
+        "ssh_authorized_key": {
+          "default": "",
+          "title": "Ssh Authorized Key",
+          "type": "string"
+        },
+        "ssh_private_key": {
+          "default": "",
+          "title": "Ssh Private Key",
+          "type": "string"
+        },
+        "wireguard_conf": {
+          "title": "Wireguard Conf",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_index",
+        "wireguard_conf"
+      ],
+      "title": "ClusterMembership",
+      "type": "object"
+    },
+    "ContainerCreateRequest": {
+      "description": "Create (or edit) a pod's container. Disk sizing: with `disk_share` set the validator sizes from\nfresh on-host disk state and the two `*_limit_gb` are caps; without it they are exact sizes.",
+      "properties": {
+        "active_container_names": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Active Container Names"
+        },
+        "active_volume_names": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Active Volume Names"
+        },
+        "available_ports": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PayloadPortMapping"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Available Ports"
+        },
+        "backup_log_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backup Log Id"
+        },
+        "bootstrap_restore": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BootstrapRestoreSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cache_volumes": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/CacheVolume"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache Volumes"
+        },
+        "cluster_membership": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClusterMembership"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cpu_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cpu Count"
+        },
+        "custom_options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CustomOptions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "debug": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Debug"
+        },
+        "disk_share": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Disk Share"
+        },
+        "docker_image": {
+          "title": "Docker Image",
+          "type": "string"
+        },
+        "docker_password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Docker Password"
+        },
+        "docker_username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Docker Username"
+        },
+        "dockerfile_content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dockerfile Content"
+        },
+        "enable_jupyter": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Enable Jupyter"
+        },
+        "enable_volume_encryption": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Enable Volume Encryption"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "external_volume_info": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExternalVolumeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "gpu_power_limits": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/GpuPowerLimit"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Power Limits"
+        },
+        "gpu_uuids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Gpu Uuids",
+          "type": "array"
+        },
+        "is_sysbox": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Is Sysbox"
+        },
+        "local_volume": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume"
+        },
+        "memory_gb": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory Gb"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ContainerCreateRequest"
+        },
+        "min_volume_gb": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Volume Gb"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "pod_mapping": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PayloadPortMapping"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pod Mapping"
+        },
+        "pre_dispatch_profilers": {
+          "default": [],
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Pre Dispatch Profilers",
+          "type": "array"
+        },
+        "restore_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Restore Path"
+        },
+        "ships_sshd": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ships Sshd"
+        },
+        "storage_limit_gb": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Storage Limit Gb"
+        },
+        "timestamp": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timestamp"
+        },
+        "user_public_keys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "User Public Keys",
+          "type": "array"
+        },
+        "volume_limit_gb": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Volume Limit Gb"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "docker_image",
+        "gpu_uuids"
+      ],
+      "title": "ContainerCreateRequest",
+      "type": "object"
+    },
+    "ContainerCreated": {
+      "properties": {
+        "backup_log_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backup Log Id"
+        },
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "jupyter_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Jupyter Url"
+        },
+        "local_volume_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume Path"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "ContainerCreated"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "port_maps": {
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "title": "Port Maps",
+          "type": "array"
+        },
+        "profilers": {
+          "default": [],
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Profilers",
+          "type": "array"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "restore_log_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Restore Log Id"
+        },
+        "restore_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Restore Path"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "storage_limit_gb": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Storage Limit Gb"
+        },
+        "volume_encryption_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VolumeEncryptionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "volume_limit_gb": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Volume Limit Gb"
+        },
+        "volume_name": {
+          "title": "Volume Name",
+          "type": "string"
+        },
+        "warnings": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ContainerWarningCode"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Warnings"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name",
+        "volume_name",
+        "port_maps"
+      ],
+      "title": "ContainerCreated",
+      "type": "object"
+    },
+    "ContainerDeleteRequest": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "external_volume": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "External Volume"
+        },
+        "local_volume": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ContainerDeleteRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name"
+      ],
+      "title": "ContainerDeleteRequest",
+      "type": "object"
+    },
+    "ContainerDeleted": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "ContainerDeleted"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id"
+      ],
+      "title": "ContainerDeleted",
+      "type": "object"
+    },
+    "ContainerStartRequest": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "local_volume_path": {
+          "title": "Local Volume Path",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ContainerStartRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name",
+        "local_volume_path"
+      ],
+      "title": "ContainerStartRequest",
+      "type": "object"
+    },
+    "ContainerStarted": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "ContainerStarted"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name"
+      ],
+      "title": "ContainerStarted",
+      "type": "object"
+    },
+    "ContainerStopRequest": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ContainerStopRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name"
+      ],
+      "title": "ContainerStopRequest",
+      "type": "object"
+    },
+    "ContainerStopped": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "ContainerStopped"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name"
+      ],
+      "title": "ContainerStopped",
+      "type": "object"
+    },
+    "ContainerWarningCode": {
+      "enum": [
+        "ExternalVolumeFailed"
+      ],
+      "title": "ContainerWarningCode",
+      "type": "string"
+    },
+    "CustomOptions": {
+      "properties": {
+        "entrypoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Entrypoint"
+        },
+        "environment": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Environment"
+        },
+        "initial_port_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Initial Port Count"
+        },
+        "internal_ports": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Internal Ports"
+        },
+        "shm_size": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Shm Size"
+        },
+        "startup_commands": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Startup Commands"
+        },
+        "volumes": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Volumes"
+        }
+      },
+      "title": "CustomOptions",
+      "type": "object"
+    },
+    "DebugSshKeyAdded": {
+      "properties": {
+        "address": {
+          "title": "Address",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "DebugSshKeyAdded"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "port": {
+          "title": "Port",
+          "type": "integer"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "ssh_port": {
+          "title": "Ssh Port",
+          "type": "integer"
+        },
+        "ssh_username": {
+          "title": "Ssh Username",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "address",
+        "port",
+        "ssh_username",
+        "ssh_port"
+      ],
+      "title": "DebugSshKeyAdded",
+      "type": "object"
+    },
+    "DefaultDockerImage": {
+      "additionalProperties": true,
+      "description": "One item of `GET /executors/default-docker-image`; parsed leniently so new backend fields never\nbreak validation.",
+      "properties": {
+        "docker_image": {
+          "title": "Docker Image",
+          "type": "string"
+        },
+        "docker_image_digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Docker Image Digest"
+        },
+        "docker_image_size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Docker Image Size"
+        },
+        "docker_image_tag": {
+          "title": "Docker Image Tag",
+          "type": "string"
+        }
+      },
+      "required": [
+        "docker_image",
+        "docker_image_tag"
+      ],
+      "title": "DefaultDockerImage",
+      "type": "object"
+    },
+    "DefaultDockerImagesResponse": {
+      "description": "The backend returns a bare JSON list.",
+      "items": {
+        "$ref": "#/$defs/DefaultDockerImage"
+      },
+      "title": "DefaultDockerImagesResponse",
+      "type": "array"
+    },
+    "DuplicateExecutorsRequest": {
+      "properties": {
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "DuplicateExecutorsRequest"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "title": "DuplicateExecutorsRequest",
+      "type": "object"
+    },
+    "DuplicateExecutorsResponse": {
+      "description": "The backend's answer to `DuplicateExecutorsRequest`: executors by miner that share GPU uuids.",
+      "properties": {
+        "executors": {
+          "additionalProperties": {
+            "items": {},
+            "type": "array"
+          },
+          "title": "Executors",
+          "type": "object"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "DuplicateExecutorsResponse"
+        },
+        "rental_succeed_executors": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rental Succeed Executors"
+        }
+      },
+      "required": [
+        "executors"
+      ],
+      "title": "DuplicateExecutorsResponse",
+      "type": "object"
+    },
+    "Error": {
+      "additionalProperties": true,
+      "properties": {
+        "help": {
+          "default": "",
+          "title": "Help",
+          "type": "string"
+        },
+        "msg": {
+          "title": "Msg",
+          "type": "string"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "msg",
+        "type"
+      ],
+      "title": "Error",
+      "type": "object"
+    },
+    "EstimateResponse": {
+      "description": "The validator's answer to the backend's `GetEstimateRequest` (backend_to_validator).",
+      "properties": {
+        "estimate": {
+          "additionalProperties": true,
+          "title": "Estimate",
+          "type": "object"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "EstimateResponse"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "request_id": {
+          "default": "",
+          "title": "Request Id",
+          "type": "string"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "snapshot": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Snapshot"
+        }
+      },
+      "required": [
+        "estimate"
+      ],
+      "title": "EstimateResponse",
+      "type": "object"
+    },
+    "ExecutorHealthCheckResponse": {
+      "properties": {
+        "details": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Details"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "reason_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason Code"
+        },
+        "success": {
+          "title": "Success",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "success"
+      ],
+      "title": "ExecutorHealthCheckResponse",
+      "type": "object"
+    },
+    "ExecutorRentFinishedRequest": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ExecutorRentFinished"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id"
+      ],
+      "title": "ExecutorRentFinishedRequest",
+      "type": "object"
+    },
+    "ExecutorSpecRequest": {
+      "description": "One executor's result for one cycle. `specs` is the scraped machine description; the backend types\nit as its `MachineSpecs`, the validator sends whatever the scraper produced, so the wire type is a\nJSON object.",
+      "properties": {
+        "attestation_digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attestation Digest"
+        },
+        "batch_total": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Batch Total"
+        },
+        "collateral_deposited": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Collateral Deposited"
+        },
+        "executor_image": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Image"
+        },
+        "executor_ip": {
+          "title": "Executor Ip",
+          "type": "string"
+        },
+        "executor_port": {
+          "title": "Executor Port",
+          "type": "integer"
+        },
+        "executor_ssh_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Ssh Port"
+        },
+        "executor_uuid": {
+          "title": "Executor Uuid",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "gpu_attestation_passed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Attestation Passed"
+        },
+        "incentive": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incentive"
+        },
+        "incentive_formula_inputs": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incentive Formula Inputs"
+        },
+        "incentive_formula_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incentive Formula Version"
+        },
+        "incentive_idle": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incentive Idle"
+        },
+        "incentive_reasons": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/IncentiveReason"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incentive Reasons"
+        },
+        "incentive_rented": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incentive Rented"
+        },
+        "incentive_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incentive Source"
+        },
+        "job_batch_id": {
+          "title": "Job Batch Id",
+          "type": "string"
+        },
+        "log_status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Log Status"
+        },
+        "log_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Log Text"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "ExecutorSpecRequest"
+        },
+        "miner_coldkey": {
+          "title": "Miner Coldkey",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "netuid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Netuid"
+        },
+        "node_state_at_cycle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Node State At Cycle"
+        },
+        "price_per_gpu": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Price Per Gpu"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "score": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Score"
+        },
+        "scored_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scored At"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "specs": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Specs"
+        },
+        "ssh_pub_keys": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ssh Pub Keys"
+        },
+        "synthetic_job_score": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Synthetic Job Score"
+        },
+        "tdx_attestation_passed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tdx Attestation Passed"
+        },
+        "tee_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tee Type"
+        },
+        "validator_hotkey": {
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "miner_coldkey",
+        "validator_hotkey",
+        "executor_uuid",
+        "executor_ip",
+        "executor_port",
+        "job_batch_id"
+      ],
+      "title": "ExecutorSpecRequest",
+      "type": "object"
+    },
+    "ExecutorUptimeResponse": {
+      "properties": {
+        "executor_ip_address": {
+          "title": "Executor Ip Address",
+          "type": "string"
+        },
+        "executor_ip_port": {
+          "title": "Executor Ip Port",
+          "type": "string"
+        },
+        "uptime_in_minutes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Uptime In Minutes"
+        }
+      },
+      "required": [
+        "executor_ip_address",
+        "executor_ip_port"
+      ],
+      "title": "ExecutorUptimeResponse",
+      "type": "object"
+    },
+    "ExternalVolumeInfo": {
+      "properties": {
+        "iam_user_access_key": {
+          "title": "Iam User Access Key",
+          "type": "string"
+        },
+        "iam_user_secret_key": {
+          "title": "Iam User Secret Key",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "plugin": {
+          "title": "Plugin",
+          "type": "string"
+        },
+        "session_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Token"
+        }
+      },
+      "required": [
+        "name",
+        "plugin",
+        "iam_user_access_key",
+        "iam_user_secret_key"
+      ],
+      "title": "ExternalVolumeInfo",
+      "type": "object"
+    },
+    "FailedAddDebugSshKey": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "FailedAddDebugSshKey"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "msg": {
+          "title": "Msg",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "msg"
+      ],
+      "title": "FailedAddDebugSshKey",
+      "type": "object"
+    },
+    "FailedContainerErrorCodes": {
+      "enum": [
+        "UnknownError",
+        "NoSshKeys",
+        "ContainerNotRunning",
+        "DeletionInProgress",
+        "NoPortMappings",
+        "InvalidExecutorId",
+        "ExceptionError",
+        "FailedMsgFromMiner",
+        "RentingInProgress",
+        "NoJupyterPortMapping",
+        "AttestationError",
+        "ContainerVanished"
+      ],
+      "title": "FailedContainerErrorCodes",
+      "type": "string"
+    },
+    "FailedContainerErrorTypes": {
+      "enum": [
+        "ContainerCreationFailed",
+        "ContainerDeletionFailed",
+        "ContainerStopFailed",
+        "ContainerStartFailed",
+        "AddSSkeyFailed",
+        "UnknownRequest"
+      ],
+      "title": "FailedContainerErrorTypes",
+      "type": "string"
+    },
+    "FailedContainerRequest": {
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailedContainerErrorCodes"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "error_type": {
+          "$ref": "#/$defs/FailedContainerErrorTypes",
+          "default": "ContainerCreationFailed"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "failure_step": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failure Step"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "FailedRequest"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "msg": {
+          "title": "Msg",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "volume_encryption_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VolumeEncryptionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "msg"
+      ],
+      "title": "FailedContainerRequest",
+      "type": "object"
+    },
+    "FailedGetPodLogs": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "FailedGetPodLogs"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "msg": {
+          "title": "Msg",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name",
+        "msg"
+      ],
+      "title": "FailedGetPodLogs",
+      "type": "object"
+    },
+    "FillerRunActiveResponse": {
+      "properties": {
+        "active": {
+          "title": "Active",
+          "type": "boolean"
+        },
+        "executor_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Id"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started At"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        }
+      },
+      "required": [
+        "active"
+      ],
+      "title": "FillerRunActiveResponse",
+      "type": "object"
+    },
+    "ForcedValidationCycleRequest": {
+      "description": "Staging only: start the validation cycle now. No executor \u2014 the cycle validates the whole fleet.",
+      "properties": {
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ForcedValidationCycleRequest"
+        }
+      },
+      "title": "ForcedValidationCycleRequest",
+      "type": "object"
+    },
+    "GetEstimateRequest": {
+      "description": "Ask the validator for the exact incentive estimate of a node shape; answered by\n`validator_to_backend.EstimateResponse` with the same `request_id`. The validator's copy has no\n`message_type` field and ignores unknown keys, so the backend's copy having carried delivery stamps on\nthis message never mattered.",
+      "properties": {
+        "collateral_deposited": {
+          "default": true,
+          "title": "Collateral Deposited",
+          "type": "boolean"
+        },
+        "gpu_count": {
+          "default": 1,
+          "title": "Gpu Count",
+          "type": "integer"
+        },
+        "gpu_model": {
+          "title": "Gpu Model",
+          "type": "string"
+        },
+        "gpu_splitting": {
+          "default": false,
+          "title": "Gpu Splitting",
+          "type": "boolean"
+        },
+        "gpu_splitting_min_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Splitting Min Count"
+        },
+        "is_rented": {
+          "default": false,
+          "title": "Is Rented",
+          "type": "boolean"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "GetEstimateRequest"
+        },
+        "request_id": {
+          "default": "",
+          "title": "Request Id",
+          "type": "string"
+        },
+        "sysbox_runtime": {
+          "default": true,
+          "title": "Sysbox Runtime",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "gpu_model"
+      ],
+      "title": "GetEstimateRequest",
+      "type": "object"
+    },
+    "GetPodLogsRequestFromServer": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "GetPodLogsRequestFromServer"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name"
+      ],
+      "title": "GetPodLogsRequestFromServer",
+      "type": "object"
+    },
+    "GpuEstimatesRequest": {
+      "properties": {
+        "estimates": {
+          "additionalProperties": true,
+          "title": "Estimates",
+          "type": "object"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "GpuEstimatesRequest"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "required": [
+        "estimates"
+      ],
+      "title": "GpuEstimatesRequest",
+      "type": "object"
+    },
+    "GpuPowerLimit": {
+      "description": "DAH-2356: one GPU's power cap for the Lium PEARL default job; the validator rejects a non-positive\nvalue at the boundary.",
+      "properties": {
+        "gpu_uuid": {
+          "title": "Gpu Uuid",
+          "type": "string"
+        },
+        "watts": {
+          "exclusiveMinimum": 0,
+          "title": "Watts",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "gpu_uuid",
+        "watts"
+      ],
+      "title": "GpuPowerLimit",
+      "type": "object"
+    },
+    "IncentiveReason": {
+      "description": "One structured zero-incentive reason (DAH-2340). `reason` is an append-only machine-readable code\nthe backend keys off; `message_for_miner` is free text; `context` grows by key, never renames.",
+      "properties": {
+        "context": {
+          "additionalProperties": true,
+          "title": "Context",
+          "type": "object"
+        },
+        "message_for_miner": {
+          "title": "Message For Miner",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "message_for_miner"
+      ],
+      "title": "IncentiveReason",
+      "type": "object"
+    },
+    "InspectorEventRequest": {
+      "properties": {
+        "context": {
+          "additionalProperties": true,
+          "title": "Context",
+          "type": "object"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "job_batch_id": {
+          "title": "Job Batch Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "InspectorEventRequest"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "outcome": {
+          "title": "Outcome",
+          "type": "string"
+        },
+        "pipeline_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pipeline Id"
+        },
+        "pod_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pod Ids",
+          "type": "array"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "reason_code": {
+          "title": "Reason Code",
+          "type": "string"
+        },
+        "report": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Report"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "trace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Trace Id"
+        },
+        "validator_hotkey": {
+          "title": "Validator Hotkey",
+          "type": "string"
+        },
+        "when": {
+          "title": "When",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "validator_hotkey",
+        "executor_id",
+        "job_batch_id",
+        "pod_ids",
+        "outcome",
+        "reason_code",
+        "when"
+      ],
+      "title": "InspectorEventRequest",
+      "type": "object"
+    },
+    "InstallJupyterServerRequest": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "jupyter_port_map": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "integer"
+            }
+          ],
+          "title": "Jupyter Port Map",
+          "type": "array"
+        },
+        "local_volume": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume"
+        },
+        "local_volume_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume Path"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "InstallJupyterServer"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name",
+        "jupyter_port_map"
+      ],
+      "title": "InstallJupyterServerRequest",
+      "type": "object"
+    },
+    "JupyterInstallationFailed": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "JupyterInstallationFailed"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "msg": {
+          "title": "Msg",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "msg"
+      ],
+      "title": "JupyterInstallationFailed",
+      "type": "object"
+    },
+    "JupyterServerInstalled": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "jupyter_url": {
+          "title": "Jupyter Url",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "JupyterServerInstalled"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "jupyter_url"
+      ],
+      "title": "JupyterServerInstalled",
+      "type": "object"
+    },
+    "LogStreamRequest": {
+      "properties": {
+        "executor_uuid": {
+          "title": "Executor Uuid",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "logs": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Logs",
+          "type": "array"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "LogStreamRequest"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "validator_hotkey": {
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "validator_hotkey",
+        "executor_uuid",
+        "pod_id",
+        "logs"
+      ],
+      "title": "LogStreamRequest",
+      "type": "object"
+    },
+    "MachineSpecRequest": {
+      "properties": {
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "MachineSpecRequest"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "title": "MachineSpecRequest",
+      "type": "object"
+    },
+    "ManualRentalInfo": {
+      "description": "Specs a special manual (bare-metal) rental is force-passed against; both fields drive the score.",
+      "properties": {
+        "gpu_count": {
+          "title": "Gpu Count",
+          "type": "integer"
+        },
+        "gpu_model": {
+          "title": "Gpu Model",
+          "type": "string"
+        }
+      },
+      "required": [
+        "gpu_model",
+        "gpu_count"
+      ],
+      "title": "ManualRentalInfo",
+      "type": "object"
+    },
+    "NetworkEMA": {
+      "description": "EMA-smoothed network speed measurements for an executor.",
+      "properties": {
+        "ema_download_speed": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ema Download Speed"
+        },
+        "ema_upload_speed": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ema Upload Speed"
+        },
+        "ema_verifyx_download_speed": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ema Verifyx Download Speed"
+        },
+        "ema_verifyx_upload_speed": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ema Verifyx Upload Speed"
+        }
+      },
+      "title": "NetworkEMA",
+      "type": "object"
+    },
+    "NormalizedScoreRequest": {
+      "properties": {
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "NormalizedScoreRequest"
+        },
+        "normalized_scores": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Normalized Scores",
+          "type": "array"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "required": [
+        "normalized_scores"
+      ],
+      "title": "NormalizedScoreRequest",
+      "type": "object"
+    },
+    "NvmlReportAckResponse": {
+      "description": "Ack for a reported unknown driver (DAH-2451); the body is intentionally near-empty.",
+      "properties": {
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        }
+      },
+      "title": "NvmlReportAckResponse",
+      "type": "object"
+    },
+    "PayloadPortMapping": {
+      "properties": {
+        "docker_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Docker Port"
+        },
+        "external_port": {
+          "title": "External Port",
+          "type": "integer"
+        },
+        "internal_port": {
+          "title": "Internal Port",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "internal_port",
+        "external_port"
+      ],
+      "title": "PayloadPortMapping",
+      "type": "object"
+    },
+    "PodHostRebootRecoveredRequest": {
+      "description": "`POST \u2026/host-reboot-recovered`: the container exit the recovery reacted to.",
+      "properties": {
+        "container_finished_at": {
+          "format": "date-time",
+          "title": "Container Finished At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "container_finished_at"
+      ],
+      "title": "PodHostRebootRecoveredRequest",
+      "type": "object"
+    },
+    "PodHostRebootRecoveredResponse": {
+      "properties": {
+        "recorded": {
+          "title": "Recorded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recorded"
+      ],
+      "title": "PodHostRebootRecoveredResponse",
+      "type": "object"
+    },
+    "PodLog": {
+      "properties": {
+        "container_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Container Id"
+        },
+        "container_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Container Name"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "event": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Event"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "uuid": {
+          "title": "Uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uuid",
+        "created_at"
+      ],
+      "title": "PodLog",
+      "type": "object"
+    },
+    "PodLogsResponseToServer": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "logs": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PodLog"
+          },
+          "title": "Logs",
+          "type": "array"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "PodLogsResponseToServer"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name"
+      ],
+      "title": "PodLogsResponseToServer",
+      "type": "object"
+    },
+    "PodRentalActiveResponse": {
+      "properties": {
+        "active": {
+          "title": "Active",
+          "type": "boolean"
+        },
+        "executor_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Id"
+        },
+        "local_volume_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume Path"
+        },
+        "rental_closed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rental Closed At"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        }
+      },
+      "required": [
+        "active"
+      ],
+      "title": "PodRentalActiveResponse",
+      "type": "object"
+    },
+    "RemoveSshPublicKeysRequest": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "RemoveSshPublicKeysRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "user_public_keys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "User Public Keys",
+          "type": "array"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name"
+      ],
+      "title": "RemoveSshPublicKeysRequest",
+      "type": "object"
+    },
+    "RentedContainer": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "rented_ports": {
+          "default": [],
+          "items": {
+            "type": "integer"
+          },
+          "title": "Rented Ports",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "pod_id"
+      ],
+      "title": "RentedContainer",
+      "type": "object"
+    },
+    "RentedExecutor": {
+      "properties": {
+        "executor_ip_address": {
+          "title": "Executor Ip Address",
+          "type": "string"
+        },
+        "executor_ip_port": {
+          "title": "Executor Ip Port",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "owner_flag": {
+          "default": false,
+          "title": "Owner Flag",
+          "type": "boolean"
+        },
+        "pods": {
+          "items": {
+            "$ref": "#/$defs/RentedPod"
+          },
+          "title": "Pods",
+          "type": "array"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_ip_address",
+        "executor_ip_port",
+        "pods"
+      ],
+      "title": "RentedExecutor",
+      "type": "object"
+    },
+    "RentedExecutorsResponse": {
+      "description": "`GET /internal/executors/rented`: every rented executor, the fillers to protect, the bans.",
+      "properties": {
+        "all_filler_containers_by_executor": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "title": "All Filler Containers By Executor",
+          "type": "object"
+        },
+        "banned_coldkeys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Banned Coldkeys",
+          "type": "array"
+        },
+        "banned_guids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Banned Guids",
+          "type": "array"
+        },
+        "banned_hotkeys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Banned Hotkeys",
+          "type": "array"
+        },
+        "banned_provider_guids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Banned Provider Guids",
+          "type": "array"
+        },
+        "default_job_owner_by_executor": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "title": "Default Job Owner By Executor",
+          "type": "object"
+        },
+        "executors": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RentedExecutor"
+          },
+          "title": "Executors",
+          "type": "object"
+        },
+        "filler_containers_by_executor": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "title": "Filler Containers By Executor",
+          "type": "object"
+        },
+        "filler_create_kill_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Filler Create Kill Executor Ids",
+          "type": "array"
+        },
+        "filler_ports_by_executor": {
+          "additionalProperties": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "title": "Filler Ports By Executor",
+          "type": "object"
+        },
+        "gpu_splitting_config": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "default": {},
+          "title": "Gpu Splitting Config",
+          "type": "object"
+        },
+        "manual_rental_executors": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ManualRentalInfo"
+          },
+          "default": {},
+          "title": "Manual Rental Executors",
+          "type": "object"
+        },
+        "network_ema": {
+          "additionalProperties": {
+            "$ref": "#/$defs/NetworkEMA"
+          },
+          "default": {},
+          "title": "Network Ema",
+          "type": "object"
+        },
+        "new_rentals_paused_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "New Rentals Paused Executor Ids",
+          "type": "array"
+        },
+        "provider_discord_connected_executor_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider Discord Connected Executor Ids"
+        },
+        "spot_executor_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Spot Executor Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "executors"
+      ],
+      "title": "RentedExecutorsResponse",
+      "type": "object"
+    },
+    "RentedMachine": {
+      "properties": {
+        "containers": {
+          "items": {
+            "$ref": "#/$defs/RentedContainer"
+          },
+          "title": "Containers",
+          "type": "array"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "executor_ip_address": {
+          "title": "Executor Ip Address",
+          "type": "string"
+        },
+        "executor_ip_port": {
+          "title": "Executor Ip Port",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "owner_flag": {
+          "default": false,
+          "title": "Owner Flag",
+          "type": "boolean"
+        },
+        "rented_ports": {
+          "default": [],
+          "items": {
+            "type": "integer"
+          },
+          "title": "Rented Ports",
+          "type": "array"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "executor_ip_address",
+        "executor_ip_port",
+        "containers"
+      ],
+      "title": "RentedMachine",
+      "type": "object"
+    },
+    "RentedMachineRequest": {
+      "properties": {
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "RentedMachineRequest"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "title": "RentedMachineRequest",
+      "type": "object"
+    },
+    "RentedMachineResponse": {
+      "description": "The answer to `RentedMachineRequest`: every rented machine and the current bans.",
+      "properties": {
+        "banned_coldkeys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Banned Coldkeys",
+          "type": "array"
+        },
+        "banned_guids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Banned Guids",
+          "type": "array"
+        },
+        "banned_hotkeys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Banned Hotkeys",
+          "type": "array"
+        },
+        "banned_provider_guids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Banned Provider Guids",
+          "type": "array"
+        },
+        "machines": {
+          "items": {
+            "$ref": "#/$defs/RentedMachine"
+          },
+          "title": "Machines",
+          "type": "array"
+        }
+      },
+      "required": [
+        "machines"
+      ],
+      "title": "RentedMachineResponse",
+      "type": "object"
+    },
+    "RentedPod": {
+      "properties": {
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Created At"
+        },
+        "gpu_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Count"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "rented_ports": {
+          "default": [],
+          "items": {
+            "type": "integer"
+          },
+          "title": "Rented Ports",
+          "type": "array"
+        }
+      },
+      "required": [
+        "pod_id",
+        "container_name"
+      ],
+      "title": "RentedPod",
+      "type": "object"
+    },
+    "ResetVerifiedJobReason": {
+      "enum": [
+        0,
+        1
+      ],
+      "title": "ResetVerifiedJobReason",
+      "type": "integer"
+    },
+    "ResetVerifiedJobRequest": {
+      "properties": {
+        "executor_uuid": {
+          "title": "Executor Uuid",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "ResetVerifiedJobRequest"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "reason": {
+          "$ref": "#/$defs/ResetVerifiedJobReason",
+          "default": 0
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "validator_hotkey": {
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "validator_hotkey",
+        "miner_hotkey",
+        "executor_uuid"
+      ],
+      "title": "ResetVerifiedJobRequest",
+      "type": "object"
+    },
+    "Response": {
+      "additionalProperties": false,
+      "description": "The backend's answer to `AuthenticateRequest`. The one strict model of the protocol: the validator's\ncopy forbids unknown keys and this mirrors it, so an unexpected key here is an error, not ignored.",
+      "properties": {
+        "errors": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Error"
+          },
+          "title": "Errors",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "error",
+            "success"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "Response",
+      "type": "object"
+    },
+    "RestoreContainerRequest": {
+      "properties": {
+        "auth_token": {
+          "title": "Auth Token",
+          "type": "string"
+        },
+        "backup_engine": {
+          "default": "tar_aws_cli",
+          "title": "Backup Engine",
+          "type": "string"
+        },
+        "backup_source_path": {
+          "title": "Backup Source Path",
+          "type": "string"
+        },
+        "backup_volume_info": {
+          "$ref": "#/$defs/ExternalVolumeInfo"
+        },
+        "container_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Container Name"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "failure_timeout_seconds": {
+          "default": 600,
+          "exclusiveMinimum": 0,
+          "title": "Failure Timeout Seconds",
+          "type": "integer"
+        },
+        "legacy_object_size_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Legacy Object Size Bytes"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "RestoreContainerRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "repository_password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repository Password"
+        },
+        "repository_pod_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repository Pod Id"
+        },
+        "restore_log_id": {
+          "title": "Restore Log Id",
+          "type": "string"
+        },
+        "restore_path": {
+          "title": "Restore Path",
+          "type": "string"
+        },
+        "snapshot_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Snapshot Id"
+        },
+        "target_volume": {
+          "title": "Target Volume",
+          "type": "string"
+        },
+        "target_volume_path": {
+          "title": "Target Volume Path",
+          "type": "string"
+        },
+        "volume_encrypted": {
+          "default": false,
+          "title": "Volume Encrypted",
+          "type": "boolean"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "target_volume",
+        "backup_volume_info",
+        "restore_path",
+        "backup_source_path",
+        "target_volume_path",
+        "auth_token",
+        "restore_log_id"
+      ],
+      "title": "RestoreContainerRequest",
+      "type": "object"
+    },
+    "RevenuePerGpuTypeRequest": {
+      "properties": {
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "RevenuePerGpuTypeRequest"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "title": "RevenuePerGpuTypeRequest",
+      "type": "object"
+    },
+    "RevenuePerGpuTypeResponse": {
+      "description": "The answer to `RevenuePerGpuTypeRequest`.",
+      "properties": {
+        "revenues": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Revenues",
+          "type": "object"
+        }
+      },
+      "required": [
+        "revenues"
+      ],
+      "title": "RevenuePerGpuTypeResponse",
+      "type": "object"
+    },
+    "ScorePortionPerGpuTypeRequest": {
+      "properties": {
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "ScorePortionPerGpuTypeRequest"
+        },
+        "portions": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Portions",
+          "type": "object"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        }
+      },
+      "required": [
+        "portions"
+      ],
+      "title": "ScorePortionPerGpuTypeRequest",
+      "type": "object"
+    },
+    "SshPubKeyAdded": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "SshPubKeyAdded"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "user_public_keys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "User Public Keys",
+          "type": "array"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id"
+      ],
+      "title": "SshPubKeyAdded",
+      "type": "object"
+    },
+    "SshPubKeyRemoved": {
+      "properties": {
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "forwarded_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Forwarded At"
+        },
+        "message_type": {
+          "$ref": "#/$defs/ValidatorMessageType",
+          "default": "SshPubKeyRemoved"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "queue_depth": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Depth"
+        },
+        "sent_at": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sent At"
+        },
+        "user_public_keys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "User Public Keys",
+          "type": "array"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id"
+      ],
+      "title": "SshPubKeyRemoved",
+      "type": "object"
+    },
+    "ValidatorMessageType": {
+      "enum": [
+        "AuthenticateRequest",
+        "MachineSpecRequest",
+        "ExecutorSpecRequest",
+        "RentedMachineRequest",
+        "LogStreamRequest",
+        "InspectorEventRequest",
+        "DuplicateExecutorsRequest",
+        "ResetVerifiedJobRequest",
+        "NormalizedScoreRequest",
+        "ScorePortionPerGpuTypeRequest",
+        "RevenuePerGpuTypeRequest",
+        "GpuEstimatesRequest",
+        "EstimateResponse",
+        "ContainerCreated",
+        "ContainerStarted",
+        "ContainerStopped",
+        "ContainerDeleted",
+        "SshPubKeyAdded",
+        "SshPubKeyRemoved",
+        "FailedRequest",
+        "PodLogsResponseToServer",
+        "FailedGetPodLogs",
+        "DebugSshKeyAdded",
+        "FailedAddDebugSshKey",
+        "JupyterServerInstalled",
+        "JupyterInstallationFailed"
+      ],
+      "title": "ValidatorMessageType",
+      "type": "string"
+    },
+    "VolumeEncryptionStatus": {
+      "enum": [
+        "ENABLED",
+        "UNSUPPORTED_IMAGE",
+        "DISABLED",
+        "FAILED"
+      ],
+      "title": "VolumeEncryptionStatus",
+      "type": "string"
+    },
+    "WorkloadKind": {
+      "description": "What a container is for: a renter's pod or a Lium/miner default job (filler).",
+      "enum": [
+        "CUSTOMER_RENTAL",
+        "FILLER"
+      ],
+      "title": "WorkloadKind",
+      "type": "string"
+    }
+  },
+  "backend_to_validator": {
+    "AddDebugSshKeyRequest": {
+      "$ref": "#/$defs/AddDebugSshKeyRequest"
+    },
+    "AddSshPublicKey": {
+      "$ref": "#/$defs/AddSshPublicKeyRequest"
+    },
+    "BackupContainerRequest": {
+      "$ref": "#/$defs/BackupContainerRequest"
+    },
+    "CancelStorageOperationRequest": {
+      "$ref": "#/$defs/CancelStorageOperationRequest"
+    },
+    "ContainerCreateRequest": {
+      "$ref": "#/$defs/ContainerCreateRequest"
+    },
+    "ContainerDeleteRequest": {
+      "$ref": "#/$defs/ContainerDeleteRequest"
+    },
+    "ContainerStartRequest": {
+      "$ref": "#/$defs/ContainerStartRequest"
+    },
+    "ContainerStopRequest": {
+      "$ref": "#/$defs/ContainerStopRequest"
+    },
+    "DuplicateExecutorsResponse": {
+      "$ref": "#/$defs/DuplicateExecutorsResponse"
+    },
+    "ExecutorRentFinished": {
+      "$ref": "#/$defs/ExecutorRentFinishedRequest"
+    },
+    "ForcedValidationCycleRequest": {
+      "$ref": "#/$defs/ForcedValidationCycleRequest"
+    },
+    "GetEstimateRequest": {
+      "$ref": "#/$defs/GetEstimateRequest"
+    },
+    "GetPodLogsRequestFromServer": {
+      "$ref": "#/$defs/GetPodLogsRequestFromServer"
+    },
+    "InstallJupyterServer": {
+      "$ref": "#/$defs/InstallJupyterServerRequest"
+    },
+    "RemoveSshPublicKeysRequest": {
+      "$ref": "#/$defs/RemoveSshPublicKeysRequest"
+    },
+    "RestoreContainerRequest": {
+      "$ref": "#/$defs/RestoreContainerRequest"
+    }
+  },
+  "http": {
+    "DefaultDockerImagesResponse": {
+      "$ref": "#/$defs/DefaultDockerImagesResponse"
+    },
+    "ExecutorHealthCheckResponse": {
+      "$ref": "#/$defs/ExecutorHealthCheckResponse"
+    },
+    "ExecutorUptimeResponse": {
+      "$ref": "#/$defs/ExecutorUptimeResponse"
+    },
+    "FillerRunActiveResponse": {
+      "$ref": "#/$defs/FillerRunActiveResponse"
+    },
+    "NvmlReportAckResponse": {
+      "$ref": "#/$defs/NvmlReportAckResponse"
+    },
+    "PodHostRebootRecoveredRequest": {
+      "$ref": "#/$defs/PodHostRebootRecoveredRequest"
+    },
+    "PodHostRebootRecoveredResponse": {
+      "$ref": "#/$defs/PodHostRebootRecoveredResponse"
+    },
+    "PodRentalActiveResponse": {
+      "$ref": "#/$defs/PodRentalActiveResponse"
+    },
+    "RentedExecutorsResponse": {
+      "$ref": "#/$defs/RentedExecutorsResponse"
+    }
+  },
+  "protocol_version": "1.0.0",
+  "socket_replies": {
+    "RentedMachineResponse": {
+      "$ref": "#/$defs/RentedMachineResponse"
+    },
+    "Response": {
+      "$ref": "#/$defs/Response"
+    },
+    "RevenuePerGpuTypeResponse": {
+      "$ref": "#/$defs/RevenuePerGpuTypeResponse"
+    }
+  },
+  "validator_to_backend": {
+    "AuthenticateRequest": {
+      "$ref": "#/$defs/AuthenticateRequest"
+    },
+    "ContainerCreated": {
+      "$ref": "#/$defs/ContainerCreated"
+    },
+    "ContainerDeleted": {
+      "$ref": "#/$defs/ContainerDeleted"
+    },
+    "ContainerStarted": {
+      "$ref": "#/$defs/ContainerStarted"
+    },
+    "ContainerStopped": {
+      "$ref": "#/$defs/ContainerStopped"
+    },
+    "DebugSshKeyAdded": {
+      "$ref": "#/$defs/DebugSshKeyAdded"
+    },
+    "DuplicateExecutorsRequest": {
+      "$ref": "#/$defs/DuplicateExecutorsRequest"
+    },
+    "EstimateResponse": {
+      "$ref": "#/$defs/EstimateResponse"
+    },
+    "ExecutorSpecRequest": {
+      "$ref": "#/$defs/ExecutorSpecRequest"
+    },
+    "FailedAddDebugSshKey": {
+      "$ref": "#/$defs/FailedAddDebugSshKey"
+    },
+    "FailedGetPodLogs": {
+      "$ref": "#/$defs/FailedGetPodLogs"
+    },
+    "FailedRequest": {
+      "$ref": "#/$defs/FailedContainerRequest"
+    },
+    "GpuEstimatesRequest": {
+      "$ref": "#/$defs/GpuEstimatesRequest"
+    },
+    "InspectorEventRequest": {
+      "$ref": "#/$defs/InspectorEventRequest"
+    },
+    "JupyterInstallationFailed": {
+      "$ref": "#/$defs/JupyterInstallationFailed"
+    },
+    "JupyterServerInstalled": {
+      "$ref": "#/$defs/JupyterServerInstalled"
+    },
+    "LogStreamRequest": {
+      "$ref": "#/$defs/LogStreamRequest"
+    },
+    "MachineSpecRequest": {
+      "$ref": "#/$defs/MachineSpecRequest"
+    },
+    "NormalizedScoreRequest": {
+      "$ref": "#/$defs/NormalizedScoreRequest"
+    },
+    "PodLogsResponseToServer": {
+      "$ref": "#/$defs/PodLogsResponseToServer"
+    },
+    "RentedMachineRequest": {
+      "$ref": "#/$defs/RentedMachineRequest"
+    },
+    "ResetVerifiedJobRequest": {
+      "$ref": "#/$defs/ResetVerifiedJobRequest"
+    },
+    "RevenuePerGpuTypeRequest": {
+      "$ref": "#/$defs/RevenuePerGpuTypeRequest"
+    },
+    "ScorePortionPerGpuTypeRequest": {
+      "$ref": "#/$defs/ScorePortionPerGpuTypeRequest"
+    },
+    "SshPubKeyAdded": {
+      "$ref": "#/$defs/SshPubKeyAdded"
+    },
+    "SshPubKeyRemoved": {
+      "$ref": "#/$defs/SshPubKeyRemoved"
+    }
+  }
+}
