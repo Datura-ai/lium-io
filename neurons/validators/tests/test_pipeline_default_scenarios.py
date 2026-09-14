@@ -189,6 +189,19 @@ class DummyRedisService:
     async def renting_in_progress(self, miner_hotkey: str, executor_uuid: str):
         return False  # Not renting in progress
 
+    # DAH-2870: the rented check keeps per-pod SSH-probe marks; a bare dict is enough here.
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key: str):
+        return self.store.get(key)
+
+    async def set(self, key: str, value: str):
+        self.store[key] = value
+
+    async def delete(self, key: str):
+        self.store.pop(key, None)
+
 
 class DummyCollateralService:
     """Mock collateral contract service."""

@@ -314,6 +314,13 @@ class Settings(BaseSettings):
     # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
     RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
     RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2870 — a RUNNING rented pod whose SSH port refuses, or whose authorized_keys cannot be
+    # read, after this validator saw it healthy once. Judged from outside the container every cycle;
+    # CYCLES consecutive unhealthy cycles (2 ≈ 30 min) raise RENTED_POD_SSH_UNREACHABLE and one
+    # report to the backend per outage. Observation only: the score is not changed here.
+    RENTED_POD_SSH_PROBE_ENABLED: bool = Field(env="RENTED_POD_SSH_PROBE_ENABLED", default=True)
+    RENTED_POD_SSH_PROBE_CYCLES: int = Field(env="RENTED_POD_SSH_PROBE_CYCLES", default=2)
+    RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS: float = Field(env="RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", default=5.0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement

@@ -107,6 +107,22 @@ class DummyScoreCalc:
         return 0.0, 0.0, ""
 
 
+class FakeRedis:
+    """Dict-backed stand-in for RedisService's get/set/delete, enough for per-pod marks."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key: str):
+        return self.store.get(key)
+
+    async def set(self, key: str, value: str):
+        self.store[key] = value
+
+    async def delete(self, key: str):
+        self.store.pop(key, None)
+
+
 def default_executor() -> ExecutorSSHInfo:
     return ExecutorSSHInfo(
         uuid="executor-123",
@@ -154,7 +170,8 @@ def build_services(**overrides) -> ContextServices:
     backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=False)
     base = dict(
         ssh=None,
-        redis=None,
+        # DAH-2870: the rented check keeps per-pod marks in Redis on every rented cycle.
+        redis=FakeRedis(),
         collateral=None,
         validation=None,
         verifyx=None,
