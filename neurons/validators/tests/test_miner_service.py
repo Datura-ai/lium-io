@@ -11,7 +11,7 @@ PortConnectivityCheck's renting_in_progress tolerate. This test therefore pins
 that a ContainerCreateRequest is delegated to create_container and that
 miner_service no longer makes an early wait_for_port_check_containers call.
 """
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -69,6 +69,8 @@ def miner_service(mocker):
     redis_service = mocker.AsyncMock()
     redis_service.renting_in_progress = AsyncMock(return_value=False)
     redis_service.remove_rented_machine = AsyncMock()
+    # the per-executor create lock held around create_container (DAH-3436): an async context manager
+    redis_service.executor_create_exclusion = MagicMock()
 
     svc = MinerService(
         ssh_service=ssh_service,
@@ -118,15 +120,27 @@ async def test_create_request_delegates_to_create_container(mocker, miner_servic
         "services.miner_service.DockerService.wait_for_port_check_containers",
         AsyncMock(return_value=(True, "No port check containers found")),
     )
+    order: list[str] = []
+
+    async def create(*args, **kwargs):
+        order.append("create")
+        return Mock()
+
     create_mock = mocker.patch(
         "services.miner_service.DockerService.create_container",
-        AsyncMock(return_value=Mock()),
+        AsyncMock(side_effect=create),
     )
+    exclusion = miner_service.redis_service.executor_create_exclusion
+    exclusion.return_value.__aenter__.side_effect = lambda *a: order.append("lock")
+    exclusion.return_value.__aexit__.side_effect = lambda *a: order.append("unlock")
 
     await miner_service._handle_container(payload)
 
     create_mock.assert_awaited_once()
     # First positional arg to create_container is the create payload.
     assert create_mock.call_args.args[0] is payload
+    # DAH-3436 (review): the create ran inside the per-executor create lock the rental probe shares
+    exclusion.assert_called_once_with(executor_id)
+    assert order == ["lock", "create", "unlock"]
     # No pre-flag port-check removal in miner_service anymore.
     wait_mock.assert_not_awaited()

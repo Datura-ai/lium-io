@@ -330,10 +330,11 @@ class Settings(BaseSettings):
     # and the node's verified ports, waits up to RENTAL_PROBE_SSH_DEADLINE_SECONDS for sshd's banner
     # on the mapped port and a login (retried until that deadline), runs `nvidia-smi -L`, and tears
     # the container down through delete_container.
-    # A failed step zeroes the score and clears the verified job for the cycle (RENTAL_PROBE_FAILED),
-    # like the GPU runtime quarantine; the failure is not carried forward, so a node the next cycle
-    # skips (filler running, image gone) or reads inconclusively is verified again by that cycle,
-    # and an idle node with the image pulled is probed again every cycle until it passes. Off by default:
+    # A failed step zeroes the score and clears the verified job (RENTAL_PROBE_FAILED), like the GPU
+    # runtime quarantine, and the failed step stands in Redis until a probe passes: a later cycle with
+    # no verdict of its own (filler running, image gone, inconclusive) fails the node again with it; a
+    # rented node is left alone. An idle node with the image pulled is probed again every cycle until
+    # it passes. Off by default:
     # it rents a container on every idle node every 6 h, so the team turns it on after staging.
     RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)

@@ -95,12 +95,21 @@ _NVIDIA_SMI_TIMEOUT_SECONDS = 30
 # deadline; the image is already on the host, so a create still running after this is a stuck host, and
 # the run's outer timeout (JOB_TIME_OUT) must not be what ends it.
 _CREATE_DEADLINE_SECONDS = 300
+# the idleness re-read runs under the per-executor create lock; the lock's TTL (redis_service.py) covers
+# this budget plus the create deadline, so a re-read that overruns it gives the lock back instead
+_IDLENESS_REREAD_BUDGET_SECONDS = 30
 _TEARDOWN_DEADLINE_SECONDS = 120
 # one shell command over the validation connection (the image check, the by-name removals)
 _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 # every string copied out of the host into the event is bounded (PR_PROCESS §5)
 _TAIL_CHARS = 600
 _REDIS_LAST_OK_PREFIX = "rental_probe_ok"
+# the failed step of the last probe, standing until a probe passes (review: a skipped or inconclusive
+# next cycle must not relist the node without a clean probe)
+_REDIS_FAILED_PREFIX = "rental_probe_failed"
+# both stamps expire, so a deregistered executor's keys age out; a failure is re-written on every failed
+# verdict and an expired OK stamp only makes the probe run again
+_REDIS_STAMP_TTL_SECONDS = 30 * 24 * 3600
 
 
 @dataclass
@@ -145,17 +154,24 @@ class RentalProbeCheck:
 
     A failed step zeroes the score and clears the verified job with reason code RENTAL_PROBE_FAILED
     and the step's name, the same mechanics as the GPU runtime quarantine in rental_verification.py.
-    The penalty is the cycle's: the failure is not carried forward, so the next cycle verifies the
-    node again unless the probe runs and fails again. It runs again when the node is still idle and
-    the image is still pulled (the interval stamp is written on success only); a cycle that skips
-    the node (filler running, image gone) or reads inconclusively restores it without a probe.
-    Otherwise the probe runs at most once per RENTAL_PROBE_INTERVAL_HOURS per executor, or at once
-    when the backend lists the executor in `rental_probe_requested_executor_ids`. It never runs on a rented node or beside a filler: the
-    start path sweeps `pod_*`/`filler_*` containers it was not told about and lifts GPU power caps.
-    The node's idleness is re-read from the backend and this validator's pending-pod marks right
-    before the container starts, not taken from the cycle-start snapshot. Anything the probe cannot
-    read (backend, Redis) makes it skip or reach no verdict; it never penalises on missing data.
-    RENTAL_PROBE_ENABLED is off by default.
+    The failure stands until a probe passes: the failed step is kept in Redis, and every later cycle
+    that reaches no verdict of its own (the node skipped for a filler or a missing image, an
+    inconclusive probe, an unreadable input) fails the node again with that step, so a node is not
+    relisted without a clean probe while Redis is readable (an unreadable Redis is logged and the cycle
+    decides as if no failure stood, as every other unreadable input does). Only a rented node is left
+    alone, whichever read says so (the cycle's snapshot, the re-read before the create, a renter's
+    create holding the lock, a rental during the probe): the probe cannot run there and the renter's
+    pod is the backend's to judge; the standing failure applies again once the node is idle. It runs
+    again when the node is idle and the image is pulled (the interval stamp is written
+    on success only). Otherwise the probe runs at most once per RENTAL_PROBE_INTERVAL_HOURS per
+    executor. It never runs on a rented node or beside a filler: the start path sweeps
+    `pod_*`/`filler_*` containers it was not told about and lifts GPU power caps. Before the
+    container starts the probe takes the per-executor create lock a renter's create holds around
+    `create_container` (RedisService.executor_create_exclusion) without waiting, skips the node when a
+    renter holds it, and re-reads the node's idleness from the backend and this validator's pending-pod
+    marks under the lock, not from the cycle-start snapshot; the lock is released as soon as the
+    create returns. Anything the probe cannot read (backend, Redis) makes it skip or reach no verdict;
+    it never penalises on missing data alone. RENTAL_PROBE_ENABLED is off by default.
     """
 
     check_id = "executor.validate.rental_probe"
@@ -167,44 +183,82 @@ class RentalProbeCheck:
                 passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
             )
 
+        # the last probe's failed step, standing until a probe passes; None when there is none or
+        # Redis could not be read (then this cycle behaves as if there were none, and logs why)
+        standing = await _standing_failure(ctx)
+
         skip_reason, skip_what = await _skip_reason(ctx)
-        if skip_reason:
+        if skip_reason == "rented":
             return self._skipped(ctx, skip_reason, skip_what)
+        if skip_reason:
+            return self._skipped(ctx, skip_reason, skip_what, standing=standing)
 
         missing = _missing_inputs(ctx)
         if missing:
             return self._inconclusive(
-                ctx, f"validator has no {missing} for this executor", steps=[]
+                ctx, f"validator has no {missing} for this executor", steps=[], standing=standing
             )
 
         image_ref = await _default_renter_image(ctx)
         if image_ref is None:
             return self._inconclusive(
-                ctx, "no default renter image for this GPU and driver", steps=[]
+                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing
             )
         image_present = await _image_present_on_host(ctx, image_ref)
         if image_present is None:
             return self._inconclusive(
-                ctx, "could not read the node's image list", steps=[], what={"image": image_ref}
+                ctx,
+                "could not read the node's image list",
+                steps=[],
+                what={"image": image_ref},
+                standing=standing,
             )
         if not image_present:
             # a pull would put minutes of Docker Hub traffic inside the validation cycle; the
             # cached-template check already reports a node that has not pre-pulled the image
             return self._skipped(
-                ctx, "default renter image is not pulled on the node", {"image": image_ref}
+                ctx,
+                "default renter image is not pulled on the node",
+                {"image": image_ref},
+                standing=standing,
             )
 
-        # ctx.state.rented_data is the snapshot the cycle started from, minutes ago for the last
-        # check in the pipeline. create_container sweeps every pod_* container it is not told
-        # about, so the node must be idle NOW: a fresh backend read plus this validator's own
-        # pending-pod mark (a rent it is creating this moment). Unknown counts as busy.
-        busy_now = await _busy_now(ctx)
-        if busy_now is None:
-            return self._inconclusive(ctx, "could not confirm the node is idle", steps=[])
-        if busy_now:
-            return self._skipped(ctx, busy_now)
+        # Review: a renter's create holds the per-executor create lock around create_container. The
+        # probe takes it without waiting (a renter never waits on the probe) and holds it until its own
+        # create returns, so its sweep of pod_* containers cannot run beside a renter's create.
+        create_lock = await _take_create_lock(ctx)
+        if create_lock is None:
+            return self._inconclusive(
+                ctx, "could not take the node's create lock", steps=[], standing=standing
+            )
+        if not create_lock.held:
+            # a renter's create: rented, as far as the standing failure is concerned
+            return self._skipped(ctx, _RENT_IN_PROGRESS)
 
-        outcome = await _probe(ctx, image_ref)
+        try:
+            # ctx.state.rented_data is the snapshot the cycle started from, minutes ago for the last
+            # check in the pipeline. create_container sweeps every pod_* container it is not told
+            # about, so the node must be idle NOW: a fresh backend read plus this validator's own
+            # pending-pod mark (a rent it is creating this moment). Unknown counts as busy.
+            reread_started = time.monotonic()
+            busy_now = await _busy_now(ctx)
+            if busy_now is None:
+                return self._inconclusive(
+                    ctx, "could not confirm the node is idle", steps=[], standing=standing
+                )
+            if busy_now:
+                return self._skipped(
+                    ctx, busy_now, standing=None if busy_now in _RENTED_NOW else standing
+                )
+            if time.monotonic() - reread_started > _IDLENESS_REREAD_BUDGET_SECONDS:
+                # the lock's TTL would run out under the create; give it back rather than sweep late
+                return self._inconclusive(
+                    ctx, "the idleness re-read overran its budget", steps=[], standing=standing
+                )
+
+            outcome = await _probe(ctx, image_ref, create_lock)
+        finally:
+            await create_lock.release(ctx)
         # `steps` is the pipeline's own per-check duration summary on the run's last event
         # (summarize_steps); the probe's records need their own key to survive it.
         what = {
@@ -217,11 +271,12 @@ class RentalProbeCheck:
 
         if outcome.inconclusive_reason:
             return self._inconclusive(
-                ctx, outcome.inconclusive_reason, steps=outcome.steps, what=what
+                ctx, outcome.inconclusive_reason, steps=outcome.steps, what=what, standing=standing
             )
 
         if outcome.failed_step is None:
             await _stamp_last_ok(ctx)
+            await _clear_failure(ctx)
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
@@ -233,25 +288,44 @@ class RentalProbeCheck:
         rented_meanwhile = await _rented_meanwhile(ctx)
         if rented_meanwhile is None:
             return self._inconclusive(
-                ctx, "could not rule out a rental during the probe", steps=outcome.steps, what=what
+                ctx,
+                "could not rule out a rental during the probe",
+                steps=outcome.steps,
+                what=what,
+                standing=standing,
             )
         if rented_meanwhile:
+            # rented: the standing failure is neither applied nor cleared (class docstring); a filler
+            # that started during the probe is not a renter and carries it, as _busy_now's filler does
             return self._inconclusive(
-                ctx, "node was rented during the probe", steps=outcome.steps, what=what
+                ctx,
+                f"node was {rented_meanwhile} during the probe",
+                steps=outcome.steps,
+                what=what,
+                standing=standing if rented_meanwhile == "given a filler" else None,
             )
 
-        # a pass stamped earlier in the interval must not shield this failure: without this a node
-        # the backend forced a probe on would skip as "within interval" next cycle and be relisted
+        # a pass stamped earlier in the interval must not shield this failure, and the failure stands
+        # until a probe passes (see _standing_failure)
         await _clear_last_ok(ctx)
+        failure = _Failure(outcome.failed_step, outcome.create_step)
+        await _stamp_failure(ctx, failure)
         what["failed_step"] = outcome.failed_step
         if outcome.create_step:
             what["create_step"] = outcome.create_step
+        return self._failed(ctx, failure, what=what, ssh_port=outcome.ssh_port)
+
+    def _failed(
+        self, ctx: Context, failure: _Failure, *, what: dict[str, Any], ssh_port: int | None
+    ) -> CheckResult:
         event = render_message(
             Msg.PROBE_FAILED,
             ctx=ctx,
             check_id=self.check_id,
             what=what,
-            remediation=_remediation(outcome, expected_gpus=_expected_gpu_count(ctx)),
+            remediation=_remediation(
+                failure, ssh_port=ssh_port, expected_gpus=_expected_gpu_count(ctx)
+            ),
         )
         return CheckResult(
             passed=False,
@@ -259,21 +333,41 @@ class RentalProbeCheck:
             updates={
                 "score": 0.0,
                 "job_score": 0.0,
-                "score_warning": f"Rental probe failed at {outcome.failed_step}",
+                "score_warning": f"Rental probe failed at {failure.step}",
                 "clear_verified_job_info": True,
                 "clear_verified_job_evidence": {
                     "reason_code": event.reason_code,
                     "check_id": self.check_id,
-                    "failed_step": outcome.failed_step,
-                    "create_step": outcome.create_step,
-                    "ssh_port": outcome.ssh_port,
+                    "failed_step": failure.step,
+                    "create_step": failure.create_step,
+                    "ssh_port": ssh_port,
                 },
             },
         )
 
+    def _carried(self, ctx: Context, standing: _Failure, *, no_verdict: str) -> CheckResult:
+        """This cycle reached no verdict of its own and the last probe failed: fail the node again with
+        that step (review). `no_verdict` is what this cycle would otherwise have reported."""
+        what: dict[str, Any] = {
+            "executor_uuid": ctx.executor.uuid,
+            "failed_step": standing.step,
+            "standing_failure": True,
+            "no_verdict_this_cycle": no_verdict,
+        }
+        if standing.create_step:
+            what["create_step"] = standing.create_step
+        return self._failed(ctx, standing, what=what, ssh_port=None)
+
     def _skipped(
-        self, ctx: Context, reason: str, what: dict[str, Any] | None = None
+        self,
+        ctx: Context,
+        reason: str,
+        what: dict[str, Any] | None = None,
+        *,
+        standing: _Failure | None = None,
     ) -> CheckResult:
+        if standing is not None:
+            return self._carried(ctx, standing, no_verdict=f"skipped: {reason}")
         event = render_message(
             Msg.SKIPPED,
             ctx=ctx,
@@ -283,8 +377,16 @@ class RentalProbeCheck:
         return CheckResult(passed=True, event=event)
 
     def _inconclusive(
-        self, ctx: Context, reason: str, *, steps: list[_Step], what: dict[str, Any] | None = None
+        self,
+        ctx: Context,
+        reason: str,
+        *,
+        steps: list[_Step],
+        what: dict[str, Any] | None = None,
+        standing: _Failure | None = None,
     ) -> CheckResult:
+        if standing is not None:
+            return self._carried(ctx, standing, no_verdict=f"inconclusive: {reason}")
         event = render_message(
             Msg.INCONCLUSIVE,
             ctx=ctx,
@@ -308,11 +410,6 @@ async def _skip_reason(ctx: Context) -> tuple[str | None, dict[str, Any]]:
     if filler_containers:
         return "filler running", {"filler_containers": filler_containers}
 
-    requested = bool(
-        rented_data and ctx.executor.uuid in rented_data.rental_probe_requested_executor_ids
-    )
-    if requested:
-        return None, {}
     try:
         last_ok = await _last_ok_at(ctx)
     except Exception:
@@ -336,6 +433,12 @@ def _read_failed(ctx: Context, what: str) -> None:
     )
 
 
+_RENTED_SINCE_CYCLE_START = "rented since the cycle started"
+_RENT_IN_PROGRESS = "a rent is being created on the node"
+# the busy reasons that mean a renter has the node: a standing failure is not applied on these
+_RENTED_NOW = frozenset({_RENTED_SINCE_CYCLE_START, _RENT_IN_PROGRESS})
+
+
 async def _busy_now(ctx: Context) -> str | None:
     """Why the node is not idle right now, "" when it is, None when that could not be read."""
     try:
@@ -347,12 +450,12 @@ async def _busy_now(ctx: Context) -> str | None:
         return None
     rented_executor = rented.executors.get(ctx.executor.uuid)
     if rented_executor and rented_executor.pods:
-        return "rented since the cycle started"
+        return _RENTED_SINCE_CYCLE_START
     if rented.get_filler_containers(ctx.executor.uuid):
         return "filler started since the cycle started"
     try:
         if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):
-            return "a rent is being created on the node"
+            return _RENT_IN_PROGRESS
     except Exception:
         _read_failed(ctx, "its pending-pod marks in Redis")
         return None
@@ -424,7 +527,9 @@ async def _last_ok_at(ctx: Context) -> float | None:
 async def _stamp_last_ok(ctx: Context) -> None:
     try:
         await ctx.services.redis.set(
-            f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}", str(time.time())
+            f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}",
+            str(time.time()),
+            ex=_REDIS_STAMP_TTL_SECONDS,
         )
     except Exception:
         logger.warning(
@@ -449,10 +554,101 @@ async def _clear_last_ok(ctx: Context) -> None:
         )
 
 
-async def _rented_meanwhile(ctx: Context) -> bool | None:
-    """Whether a renter took the node while the probe ran: the backend lists a pod on it now, or this
-    validator holds a pending-pod mark for it (a renter's create it is running at this moment; the
-    probe's own mark is already cleared when this runs). None when either could not be read."""
+@dataclass(frozen=True)
+class _Failure:
+    step: str
+    create_step: str | None = None
+
+
+async def _standing_failure(ctx: Context) -> _Failure | None:
+    """The last probe's failed step, kept until a probe passes; None when there is none or Redis could
+    not be read (logged; this cycle then decides as if none stood, which is what today's code does)."""
+    try:
+        raw = await ctx.services.redis.get(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
+    except Exception:
+        _read_failed(ctx, "its standing failure in Redis")
+        return None
+    if raw is None:
+        return None
+    text = raw.decode() if isinstance(raw, bytes) else str(raw)
+    step, _, create_step = text.partition(":")
+    return _Failure(step, create_step or None) if step else None
+
+
+async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
+    try:
+        await ctx.services.redis.set(
+            f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}",
+            f"{failure.step}:{failure.create_step or ''}",
+            ex=_REDIS_STAMP_TTL_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            _m(
+                "Rental probe failed but the failure could not be recorded; a cycle without a verdict may relist the node",
+                extra=get_extra_info(ctx.default_extra),
+            ),
+            exc_info=True,
+        )
+
+
+async def _clear_failure(ctx: Context) -> None:
+    try:
+        await ctx.services.redis.delete(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
+    except Exception:
+        logger.warning(
+            _m(
+                "Rental probe passed but its standing failure could not be cleared; the node fails until it is",
+                extra=get_extra_info(ctx.default_extra),
+            ),
+            exc_info=True,
+        )
+
+
+@dataclass
+class _CreateLock:
+    """The per-executor create lock the probe holds from its idleness re-read until its create returns."""
+
+    lock: Any
+    held: bool
+
+    async def release(self, ctx: Context) -> None:
+        if not self.held:
+            return
+        self.held = False
+        try:
+            await self.lock.release()
+        except Exception:
+            # a release past the TTL (LockNotOwnedError) or with Redis gone: the lock is not held anyway
+            logger.warning(
+                _m(
+                    "Rental probe could not release the node's create lock",
+                    extra=get_extra_info(ctx.default_extra),
+                ),
+                exc_info=True,
+            )
+
+
+async def _take_create_lock(ctx: Context) -> _CreateLock | None:
+    """The create lock, held or not (a renter's create holds it); None when Redis could not answer."""
+    lock = ctx.services.redis.executor_create_lock(ctx.executor.uuid)
+    try:
+        held = bool(await lock.acquire(blocking=False))
+    except Exception:
+        _read_failed(ctx, "the node's create lock in Redis")
+        return None
+    return _CreateLock(lock, held)
+
+
+async def _rented_meanwhile(ctx: Context) -> str | None:
+    """How the node was taken while the probe ran, "" when it was not, None when that could not be read.
+
+    "rented": the backend lists a pod on it now, or this validator holds a pending-pod mark for it (a
+    renter's create it is running at this moment; the probe's own mark is already cleared when this
+    runs). "given a filler": the backend lists a filler on it now; a filler's create goes through the
+    same create_container and sweeps `pod_<probe>` the same way, and its pending mark is gone by the
+    time this runs.
+    """
     try:
         rented = await ctx.services.backend.get_all_rented_executors()
     except Exception:
@@ -462,14 +658,16 @@ async def _rented_meanwhile(ctx: Context) -> bool | None:
         return None
     rented_executor = rented.executors.get(ctx.executor.uuid)
     if rented_executor and rented_executor.pods:
-        return True
+        return "rented"
+    if rented.get_filler_containers(ctx.executor.uuid):
+        return "given a filler"
     try:
-        return bool(
-            await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid)
-        )
+        if await ctx.services.redis.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid):
+            return "rented"
     except Exception:
         _read_failed(ctx, "its pending-pod marks in Redis after the probe")
         return None
+    return ""
 
 
 def _probe_payload(
@@ -500,7 +698,7 @@ def _probe_payload(
     )
 
 
-async def _probe(ctx: Context, image_ref: str) -> _ProbeOutcome:
+async def _probe(ctx: Context, image_ref: str, create_lock: _CreateLock) -> _ProbeOutcome:
     """Run the five steps; whatever happens, the node and this validator's Redis are left as found.
 
     The container's name and volume follow from the pod id (`pod_<id>`, `volume_<id>`), so the
@@ -508,7 +706,9 @@ async def _probe(ctx: Context, image_ref: str) -> _ProbeOutcome:
     create_container returned no ContainerCreated: it failed on the host after `docker_run`, was cut
     short by its own deadline here, raised, or was cancelled by the run's outer timeout
     (JOB_TIME_OUT), which arrives as CancelledError and passes every `except Exception`. The
-    cleanup is shielded so a cancelled task still runs it; the cancellation itself propagates.
+    cleanup is shielded so a cancelled task still runs it; the cancellation itself propagates. The
+    create lock is released as soon as create_container returns, raises or is cut short: a renter must
+    wait behind the probe's sweep of `pod_*` containers, not behind its sshd wait or teardown.
     """
     outcome = _ProbeOutcome()
     pod_id = str(uuid.uuid4())
@@ -553,6 +753,8 @@ async def _probe(ctx: Context, image_ref: str) -> _ProbeOutcome:
             )
             outcome.inconclusive_reason = "create_container raised"
             return outcome
+        finally:
+            await asyncio.shield(create_lock.release(ctx))
 
         if not isinstance(result, ContainerCreated):
             detail, create_step = _failure_detail(result)
@@ -735,8 +937,9 @@ async def _remove_over_shell(ctx: Context, *, container_name: str, volume_name: 
             ),
             timeout=_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
-        await asyncio.wait_for(
-            ctx.ssh.run(DockerCommand.volume_remove(volume_name), check=False),
+        # review: DockerCommand.volume_remove masks its exit with `|| true`; the probe needs the answer
+        volume_removed = await asyncio.wait_for(
+            ctx.ssh.run(DockerCommand.volume_remove_strict(volume_name), check=False),
             timeout=_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
     except (TimeoutError, asyncssh.Error, OSError) as exc:
@@ -753,9 +956,19 @@ async def _remove_over_shell(ctx: Context, *, container_name: str, volume_name: 
         )
     # `docker rm -f` of a name that does not exist exits 1 with "No such container": nothing left behind.
     # Any other non-zero exit (dockerd down also exits 1) means the container's state is unknown.
-    if removed.exit_status == 0 or "No such container" in (removed.stderr or ""):
-        return None
-    return f"docker rm exited {removed.exit_status}: {(removed.stderr or '')[-_TAIL_CHARS:]}"
+    if removed.exit_status != 0 and "No such container" not in (removed.stderr or ""):
+        return f"docker rm exited {removed.exit_status}: {(removed.stderr or '')[-_TAIL_CHARS:]}"
+    # the same for the named volume: "no such volume" (either spelling the CLI has used) is nothing
+    # left behind, anything else is unknown
+    if (
+        volume_removed.exit_status != 0
+        and "no such volume" not in (volume_removed.stderr or "").lower()
+    ):
+        return (
+            f"docker volume rm exited {volume_removed.exit_status}: "
+            f"{(volume_removed.stderr or '')[-_TAIL_CHARS:]}"
+        )
+    return None
 
 
 def _failure_detail(result: Any) -> tuple[str, str | None]:
@@ -934,11 +1147,11 @@ async def _remove_pending_pod(ctx: Context, pod_id: str) -> None:
         )
 
 
-def _remediation(outcome: _ProbeOutcome, *, expected_gpus: int) -> str:
-    template = _REMEDIATION_BY_STEP.get(outcome.failed_step or "", "")
+def _remediation(failure: _Failure, *, ssh_port: int | None, expected_gpus: int) -> str:
+    template = _REMEDIATION_BY_STEP.get(failure.step, "")
     return template.format(
-        create_step=outcome.create_step or "unknown",
-        port=outcome.ssh_port if outcome.ssh_port is not None else "?",
+        create_step=failure.create_step or "unknown",
+        port=ssh_port if ssh_port is not None else "?",
         deadline=settings.RENTAL_PROBE_SSH_DEADLINE_SECONDS,
         expected=expected_gpus,
     )
