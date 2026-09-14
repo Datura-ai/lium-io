@@ -4540,9 +4540,9 @@ class DockerService:
         """DAH-3004: enter both connection contexts at once on the caller's exit stack.
 
         ``gather`` waits for both outcomes, so whichever succeeded is already registered on
-        ``connections`` when the first failure is re-raised — the stack closes it on the way out
-        and nothing is leaked, which a bare ``gather`` (one coroutine still connecting while the
-        exception propagates) would not guarantee.
+        ``connections`` when the SSH failure, or the Docker failure if SSH succeeded, is re-raised —
+        the stack closes it on the way out and nothing is leaked, which a bare ``gather`` (one
+        coroutine still connecting while the exception propagates) would not guarantee.
         """
         ssh_outcome, docker_outcome = await asyncio.gather(
             connections.enter_async_context(ssh_connect),
