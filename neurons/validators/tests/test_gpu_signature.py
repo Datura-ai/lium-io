@@ -46,7 +46,7 @@ def test_parse_result_line_none_when_absent():
 
 
 def test_envelope_uncalibrated_does_not_gate():
-    # shipped entries are calibrated=False -> never fail an honest host on a guess
+    # the envelope ships empty (no class calibrated) -> never fail an honest host on a guess
     assert gs.check_envelope("NVIDIA H200", 0.1, 1.0) == []
     assert gs.check_envelope("totally-unknown-model", 0.0, 0.0) == []
 
@@ -105,8 +105,31 @@ def test_parse_result_line_bounded_against_hostile_stdout():
 
 
 def test_evaluate_card_device_mismatch():
-    v = gs.evaluate_card(_sealed(device=2), None, 0)
+    v = gs.evaluate_card(_sealed(device=2), None, 0, have_kernel=True)
     assert not v.ok and "device_mismatch" in v.reasons
+
+
+def test_evaluate_card_missing_kernel_identity_is_a_reason():
+    # A provider that hides /proc/driver/nvidia from the executor container makes the
+    # prober emit an empty kernel_uuid (have_kernel False). That must be a per-card
+    # reason, not a silent pass — otherwise summarize()/kernel_uuid_mismatch, which both
+    # skip empty UUIDs, would clear every count signal.
+    blind = gs.evaluate_card(_sealed(uuid=""), None, 0, have_kernel=False)
+    assert not blind.ok and "no_kernel_identity" in blind.reasons
+    # have_kernel is a plain stdout field the miner can flip; the sealed kernel_uuid is
+    # the one the verifier authenticated. A forged have_kernel=True over an empty
+    # sealed uuid must still carry the reason, or the count signals clear anyway.
+    forged = gs.evaluate_card(_sealed(uuid=""), None, 0, have_kernel=True)
+    assert not forged.ok and "no_kernel_identity" in forged.reasons
+    forged_node = gs.summarize(
+        [gs.evaluate_card(_sealed(uuid=""), None, i, have_kernel=True) for i in range(4)],
+        elapsed_seconds=1.0,
+        claimed_count=4,
+    )
+    assert forged_node.passed is False
+    # a card that read its /proc identity has no such reason
+    seen = gs.evaluate_card(_sealed(uuid="GPU-real"), None, 0, have_kernel=True)
+    assert seen.ok and "no_kernel_identity" not in seen.reasons
 
 
 def test_evaluate_card_calibrated_below_floor_fails(monkeypatch):
@@ -115,7 +138,7 @@ def test_evaluate_card_calibrated_below_floor_fails(monkeypatch):
         "NVIDIA H200",
         gs.SignatureEnvelope(tflops_min=30.0, gbps_min=2000.0, calibrated=True),
     )
-    v = gs.evaluate_card(_sealed(tflops=5.0, gbps=500.0), "NVIDIA H200", 0)
+    v = gs.evaluate_card(_sealed(tflops=5.0, gbps=500.0), "NVIDIA H200", 0, have_kernel=True)
     assert not v.ok and any("gbps" in r for r in v.reasons)
 
 
@@ -123,14 +146,16 @@ def test_evaluate_card_calibrated_below_floor_fails(monkeypatch):
 
 
 def test_summarize_all_good():
-    verdicts = [gs.evaluate_card(_sealed(uuid=f"GPU-{i}"), None, i) for i in range(4)]
+    verdicts = [
+        gs.evaluate_card(_sealed(uuid=f"GPU-{i}"), None, i, have_kernel=True) for i in range(4)
+    ]
     out = gs.summarize(verdicts, elapsed_seconds=10.0, claimed_count=4)
     assert out.passed and out.verified_count == 4 and not out.reasons
 
 
 def test_summarize_count_lie_device_selection():
     # claims 4, only card 0 real: cards 1..3 come back unsealed (device-selection error)
-    verdicts = [gs.evaluate_card(_sealed(uuid="GPU-0"), None, 0)]
+    verdicts = [gs.evaluate_card(_sealed(uuid="GPU-0"), None, 0, have_kernel=True)]
     for i in range(1, 4):
         verdicts.append(
             gs.evaluate_card({"sealed": False, "reason": "prober_error:set_device"}, None, i)
@@ -141,13 +166,17 @@ def test_summarize_count_lie_device_selection():
 
 def test_summarize_duplicate_uuid_is_count_spoof():
     # one physical card answering for four claimed cards -> same kernel UUID
-    verdicts = [gs.evaluate_card(_sealed(uuid="GPU-SAME"), None, i) for i in range(4)]
+    verdicts = [
+        gs.evaluate_card(_sealed(uuid="GPU-SAME"), None, i, have_kernel=True) for i in range(4)
+    ]
     out = gs.summarize(verdicts, elapsed_seconds=10.0, claimed_count=4)
     assert not out.passed and any("duplicate kernel UUID" in r for r in out.reasons)
 
 
 def test_summarize_over_wall_clock():
-    verdicts = [gs.evaluate_card(_sealed(uuid=f"GPU-{i}"), None, i) for i in range(2)]
+    verdicts = [
+        gs.evaluate_card(_sealed(uuid=f"GPU-{i}"), None, i, have_kernel=True) for i in range(2)
+    ]
     out = gs.summarize(verdicts, elapsed_seconds=999.0, claimed_count=2, wall_clock_seconds=120.0)
     assert not out.passed and out.over_wall_clock
 

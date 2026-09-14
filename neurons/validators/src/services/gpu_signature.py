@@ -66,25 +66,16 @@ class SignatureEnvelope:
     calibrated: bool = False
 
 
-# Keyed on the canonical GPU model the pipeline already stores in ctx.state.gpu_model.
-# Numbers below are PROVISIONAL placeholders seeded from public FP32/HBM specs
-# (roughly halved to cover tiled-SGEMM efficiency + slow hosts); every class is
-# calibrated=False, so nothing gates on them until a real pod run with the shipped
-# binary replaces them. See the DAH-3137 design doc §9 and the PR's pod-run log.
-GPU_SIGNATURE_ENVELOPE: dict[str, SignatureEnvelope] = {
-    "NVIDIA B300 SXM6 AC": SignatureEnvelope(gbps_min=3000.0),
-    "NVIDIA B200": SignatureEnvelope(gbps_min=3000.0),
-    "NVIDIA H200": SignatureEnvelope(gbps_min=2000.0),
-    "NVIDIA H200 NVL": SignatureEnvelope(gbps_min=2000.0),
-    "NVIDIA H100 80GB HBM3": SignatureEnvelope(gbps_min=1500.0),
-    "NVIDIA H100 PCIe": SignatureEnvelope(gbps_min=1000.0),
-    "NVIDIA GeForce RTX 5090": SignatureEnvelope(gbps_min=800.0),
-    "NVIDIA GeForce RTX 4090": SignatureEnvelope(gbps_min=500.0),
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": SignatureEnvelope(gbps_min=700.0),
-    "NVIDIA RTX A6000": SignatureEnvelope(gbps_min=350.0),
-    "NVIDIA A100 80GB PCIe": SignatureEnvelope(gbps_min=900.0),
-    "NVIDIA A100-SXM4-80GB": SignatureEnvelope(gbps_min=1000.0),
-}
+# Empty on purpose: no class is calibrated yet, so nothing gates. The earlier
+# provisional placeholders were dropped rather than left as calibrated=False, so a
+# future entry can only be one measured with the shipped binary (DAH-3137 design §9).
+#
+# When floors are added, key them on an AUTHENTICATED field. ctx.state.gpu_model is
+# the NVML-claimed class, which a shim controls, so a wrong-class claim would pick
+# its own (lower) row. The signed record authenticates kernel_uuid and vram_mb but
+# NOT a model string, so the calibrated envelope must key on the authenticated
+# capacity (vram_mb) or a class derived from it, never on the NVML model.
+GPU_SIGNATURE_ENVELOPE: dict[str, SignatureEnvelope] = {}
 
 
 @dataclass
@@ -148,8 +139,8 @@ def kernel_uuid_mismatch(kernel_uuids: list[str], claimed_uuids: list[str]) -> b
 def check_envelope(model: str | None, tflops: float, gbps: float) -> list[str]:
     """Return a list of below-floor reasons for the claimed class (empty = pass).
 
-    Unknown or uncalibrated models gate nothing (fail-open): the signature is
-    logged for calibration, never used to fail an honest host on a guess.
+    Unknown or uncalibrated models are not gated: the signature is logged for
+    calibration, never used to fail an honest host on a guess.
     """
     env = GPU_SIGNATURE_ENVELOPE.get(model or "")
     if env is None or not env.calibrated:
@@ -195,6 +186,14 @@ def evaluate_card(
     reasons = check_envelope(claimed_model, tflops, gbps)
     if seal_verdict.get("device") != 0:
         reasons.append("device_mismatch")
+    # The kernel-reported UUID (/proc/driver/nvidia, outside NVML) is the identity anchor.
+    # An empty one means the prober could not read /proc — a provider that hides it from
+    # the executor container would otherwise pass every count signal (summarize and
+    # kernel_uuid_mismatch both skip empty UUIDs). Make it a per-card reason. Key it on
+    # the SEALED kernel_uuid, not only on have_kernel: have_kernel is a plain stdout
+    # field the miner can flip to true, while kernel_uuid is inside the signed record.
+    if not have_kernel or not kernel_uuid:
+        reasons.append("no_kernel_identity")
 
     return CardVerdict(
         slot=slot,

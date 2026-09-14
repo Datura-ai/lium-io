@@ -313,9 +313,15 @@ class Settings(BaseSettings):
     # False: absence of the binary or the verifier skips the check.
     ENABLE_GPU_SIGNATURE_CHECK: bool = Field(env="ENABLE_GPU_SIGNATURE_CHECK", default=False)
     GPU_SIGNATURE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_SIGNATURE_ENFORCEMENT_ENABLED", default=False)
-    # Must match the key baked into (or injected into) the executor image; provisioned via env /
-    # shared config in prod and rotated per release. The dev default matches the prober's compiled
-    # default. Passed opaquely to libgpusig.so — never used to compute a seal here.
+    # Must match the key baked into (or injected into) the executor image; passed opaquely to
+    # libgpusig.so — never used to compute a seal here. The dev default matches the prober's
+    # compiled default; the string is public because it is committed here (a public repo) and
+    # readable with `strings` on the committed neurons/executor/gpu_sig. Nothing yet delivers LIUM_SIG_KEY into the executor container, so today the executor signs
+    # and this side verifies with the public dev key: the seal proves the answer came from a
+    # binary anyone can build, not from a trusted image. That is why the check is observe-only.
+    # Before GPU_SIGNATURE_ENFORCEMENT_ENABLED gates anything, rotate first: rebuild both
+    # artefacts with `./build.sh --key <hex>` in celium-gpu-verifier, bump the executor and
+    # validator images, and set this to the same <hex>.
     GPU_SIGNATURE_KEY: str = Field(
         env="GPU_SIGNATURE_KEY", default="lium-gpu-sig-dev-key-do-not-use-in-prod"
     )

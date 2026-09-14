@@ -19,6 +19,7 @@ from core.config import settings
 from ..messages import GpuSignatureMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .capability import _get_filler_only_container
 
 # The verifier .so is published from celium-gpu-verifier and moved to /usr/lib by
 # the validator image build (same place as libverifyx.so / libdmcompverify.so).
@@ -55,8 +56,9 @@ class GpuSignatureCheck:
         if gpu_count <= 0 or not gpu_details:
             return self._skip(ctx, "no_gpus")
 
-        # Do not run heavy GPU work on a card a filler is using (mirrors CapabilityCheck).
-        filler = self._filler_only_container(ctx)
+        # Do not run heavy GPU work on a card a filler is using (mirrors CapabilityCheck
+        # and GpuFaultProbeCheck, which import the same helper).
+        filler = _get_filler_only_container(ctx)
         if filler:
             return self._skip(ctx, "filler", extra_what={"filler_container": filler})
 
@@ -88,16 +90,24 @@ class GpuSignatureCheck:
                     f"CUDA_VISIBLE_DEVICES={slot} {shlex.quote(binary_path)} "
                     f"--nonce {slot_nonce} --device 0"
                 )
-                try:
-                    result = await ctx.ssh.run(cmd, timeout=settings.GPU_SIGNATURE_TIMEOUT_SECONDS)
-                    stdout = getattr(result, "stdout", "") or ""
-                except Exception as exc:  # timeout / channel error / device selection
+                # Go through the runner (like the GPU-work siblings gpu_fault_probe /
+                # machine_spec_scrape) so a timeout or channel error is captured with
+                # error_type instead of raising.
+                run = await ctx.runner.run(
+                    cmd,
+                    timeout=settings.GPU_SIGNATURE_TIMEOUT_SECONDS,
+                    retryable=False,
+                )
+                if run.error_type:  # timeout / channel error, never a raise
                     return evaluate_card(
-                        {"sealed": False, "reason": f"ssh:{type(exc).__name__}"},
+                        {"sealed": False, "reason": f"ssh:{run.error_type}"},
                         claimed_model,
                         slot,
                     )
-                parsed = parse_result_line(stdout)
+                # A non-zero exit with no channel error is a prober error whose JSON line
+                # (ok=false, error=...) is on stdout; parse_result_line + _verify_one turn
+                # it into a prober_error verdict.
+                parsed = parse_result_line(run.stdout)
                 return self._verify_one(
                     verifier, master_key, slot_nonce, claimed_model, slot, parsed
                 )
@@ -191,15 +201,6 @@ class GpuSignatureCheck:
             return "GPUSIG_PRESENT" in (getattr(result, "stdout", "") or "")
         except Exception:
             return False
-
-    def _filler_only_container(self, ctx: Context) -> str | None:
-        rented_data = ctx.state.rented_data
-        if not rented_data:
-            return None
-        filler_container = rented_data.get_filler_container(ctx.executor.uuid)
-        rented_executor = rented_data.executors.get(ctx.executor.uuid)
-        has_customer_rental = bool(rented_executor and rented_executor.pods)
-        return filler_container if filler_container and not has_customer_rental else None
 
     def _skip(self, ctx: Context, why: str, extra_what: dict | None = None) -> CheckResult:
         what: dict = {"skipped": why}
