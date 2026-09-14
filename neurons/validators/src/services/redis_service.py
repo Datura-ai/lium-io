@@ -24,6 +24,11 @@ DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
+# The anchor: the GPU UUID set of the executor's first successful verification, kept by every later write.
+GPU_ANCHOR_KEY = "uuids"
+# DAH-3457: field of a verified-job record, set once by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED and kept by
+# every later write; read back by the same check, which then fails the node without comparing the sets.
+GPU_ANCHOR_BROKEN_KEY = "anchor_broken"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
@@ -394,7 +399,7 @@ class RedisService:
         count = prev_info.get('count', 0)
         failed = prev_info.get('failed', 0)
         prev_spec = prev_info.get('spec', '')
-        prev_uuids = prev_info.get('uuids', '')
+        prev_uuids = prev_info.get(GPU_ANCHOR_KEY, '')
 
         if (success):
             count += 1
@@ -412,8 +417,11 @@ class RedisService:
             "count": count,
             "failed": failed,
             "spec": prev_spec if prev_spec else spec,
-            "uuids": prev_uuids if prev_uuids else uuids,
+            GPU_ANCHOR_KEY: prev_uuids if prev_uuids else uuids,
         }
+        # DAH-3457: the anchor and its broken mark outlive every write to the record; only a new executor id starts clean.
+        if prev_info.get(GPU_ANCHOR_BROKEN_KEY):
+            data[GPU_ANCHOR_BROKEN_KEY] = True
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
@@ -424,16 +432,19 @@ class RedisService:
         prev_info: dict = {},
         reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
         evidence: dict | None = None,
+        anchor_broken: bool = False,
     ):
         spec = prev_info.get('spec', '')
-        uuids = prev_info.get('uuids', '')
+        uuids = prev_info.get(GPU_ANCHOR_KEY, '')
 
         data = {
             "count": 0,
             "failed": 0,
             "spec": spec,
-            "uuids": uuids,
+            GPU_ANCHOR_KEY: uuids,
         }
+        if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
+            data[GPU_ANCHOR_BROKEN_KEY] = True
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
         # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the

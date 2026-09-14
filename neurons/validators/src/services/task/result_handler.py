@@ -311,6 +311,7 @@ class ResultHandler:
                     prev_info=verified_job_info,
                     reason=reason,
                     evidence=context.clear_verified_job_evidence,
+                    anchor_broken=context.gpu_anchor_broken,
                 )
             else:
                 await self.redis_service.set_verified_job_info(
