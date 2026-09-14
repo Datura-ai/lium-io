@@ -71,10 +71,14 @@ _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL = frozenset({137, 143})
 def _was_deliberately_stopped_on_the_host(diagnostics: ContainerDeathDiagnostics) -> bool:
     """Whether someone on the host terminated the filler rather than the job dying by itself.
 
-    Fillers run with `restart: unless-stopped`, so anything that merely killed the process would be
-    back up by the next probe; a container still sitting in `exited` after an external signal was
-    stopped on purpose. An out-of-memory kill carries the same exit code but is the kernel
-    reclaiming memory, not a choice the host made, so it is excluded.
+    Fillers run with `restart: on-failure:5` (docker_service.FILLER_RESTART_POLICY, DAH-3475), so a
+    signal that merely killed the process is a non-zero exit dockerd restarts, and the container is
+    back up by the next probe; one still sitting in `exited` after an external signal was stopped on
+    purpose (`docker stop` and `docker kill` cancel the restart), or was killed from outside more
+    often than the policy's five restarts, which is the host's doing either way. An out-of-memory
+    kill carries the same exit code but is the kernel reclaiming memory, not a choice the host made,
+    so it is excluded. An image that traps SIGTERM and exits 0 (the Dolphin entrypoint's on_term)
+    is a plain exit here even after a `docker stop`; the image's own cap exit is code 0 as well.
     """
     if diagnostics.exit_code not in _EXIT_CODES_FROM_AN_EXTERNAL_SIGNAL:
         return False
@@ -562,8 +566,8 @@ class RentalVerificationCheck:
         if not container_was_removed:
             if diagnostics.status != _DOCKER_STATUS_EXITED:
                 # Anything but a recorded exit is unproven: the container may be running again
-                # (fillers carry `restart: unless-stopped`, so docker can bring one back between
-                # the ps probe and this inspect), mid-transition, or unreadable.
+                # (fillers carry `restart: on-failure:5`, so docker can bring a crashed one back
+                # between the ps probe and this inspect), mid-transition, or unreadable.
                 return self._filler_state_unknown_result(
                     ctx,
                     filler_container,
