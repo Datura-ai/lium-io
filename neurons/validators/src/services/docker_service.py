@@ -160,6 +160,18 @@ IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 # that hold GPUs and brick the executor.
 CONTAINER_STOP_GRACE_SECONDS = 30
 
+# DAH-3467: dockerd answers a force-remove only once the rw layer is unlinked, and that can outlive
+# the Docker SDK's 60 s read timeout (prod, 12-14 Sep: 13 deletes, all of them gone by the time the
+# backend retried 9-19 min later). A read timeout therefore says "no answer yet", not "failed": the
+# container is inspected by name for up to REMOVE_CONFIRM_TIMEOUT_SECONDS; only a 404 counts as gone.
+REMOVE_CONFIRM_TIMEOUT_SECONDS = 60.0
+REMOVE_CONFIRM_POLL_SECONDS = 5.0
+# one inspect over the same Docker-over-SSH client; shorter than the SDK's own 60 s read timeout
+REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS = 15.0
+# dockerd's State.Status while it tears the container down (kill is bounded to ~20 s inside dockerd
+# and fails loudly with "did not receive an exit event", so a >60 s remove is in this phase)
+_DOCKER_REMOVING_STATUS = "removing"
+
 # Fillers get a shorter grace window than customer workloads. The backend preempts a filler
 # before a customer rent with a total budget of FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s in
 # compute-app) and starts the rent anyway on timeout. This grace must stay strictly below that
@@ -265,6 +277,8 @@ class _VolumeEncryptionState(enum.Enum):
 
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
+_DOCKER_READ_TIMEOUT_PHRASE = "read timed out"
+_DOCKER_READ_TIMEOUT_EXCEPTION_NAMES = frozenset({"ReadTimeout", "ReadTimeoutError"})
 # DAH-2991: dockerd sent SIGKILL but containerd never reported the task gone — the process is wedged
 # (uninterruptible I/O). `docker rm -f` fails the same way on every retry; only a direct kill of the
 # init and its shim over SSH gets past it (ticket-0287: 4 backend deletes, 5 h at score 0).
@@ -719,6 +733,18 @@ def _is_docker_container_removal_in_progress_error(exc: Exception) -> bool:
         all(phrase in text.lower() for phrase in _DOCKER_REMOVAL_IN_PROGRESS_PHRASES)
         for text in _exception_texts(exc)
     )
+
+
+def _is_docker_read_timeout_error(exc: Exception) -> bool:
+    # requests.ReadTimeout / urllib3.ReadTimeoutError, wrapped by RentalDockerOperationError. Only a
+    # READ timeout: the request reached dockerd and no reply came back. A connect timeout ("Connection
+    # to ... timed out") never reached it and stays a failure.
+    cause: BaseException | None = exc
+    while cause is not None:
+        if cause.__class__.__name__ in _DOCKER_READ_TIMEOUT_EXCEPTION_NAMES:
+            return True
+        cause = cause.__cause__
+    return any(_DOCKER_READ_TIMEOUT_PHRASE in text.lower() for text in _exception_texts(exc))
 
 
 def _is_docker_could_not_kill_error(exc: Exception) -> bool:
@@ -6474,6 +6500,58 @@ class DockerService:
             error_code=FailedContainerErrorCodes.UnknownError,
         )
 
+    def _deletion_in_progress(
+        self, payload: ContainerDeleteRequest, msg: str
+    ) -> FailedContainerRequest:
+        # the backend keeps the pod DELETING and re-asks from its retry sweep; no failure event
+        return FailedContainerRequest(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            msg=msg,
+            error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+            error_code=FailedContainerErrorCodes.DeletionInProgress,
+        )
+
+    async def _confirm_removal_after_timeout(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> str | None:
+        """What became of a force-remove whose reply outlived the SDK read timeout.
+
+        Polls ``inspect`` by name for up to REMOVE_CONFIRM_TIMEOUT_SECONDS. Returns None once dockerd
+        answers 404 (gone), ``"removing"`` when it is still tearing the container down at the end of
+        the window, any other ``State.Status`` as soon as it is seen (the container is not being
+        removed), or ``"unknown"`` when the inspect itself fails or times out. Only None lets the
+        delete report success.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REMOVE_CONFIRM_TIMEOUT_SECONDS
+        while True:
+            try:
+                status = await asyncio.wait_for(
+                    docker_client.container_status(container_name=payload.container_name),
+                    REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Could not inspect the container after the remove timed out",
+                    container_name=payload.container_name,
+                    error=str(exc),
+                )
+                return "unknown"
+            if status is None or status != _DOCKER_REMOVING_STATUS:
+                return status
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return status
+            await asyncio.sleep(min(REMOVE_CONFIRM_POLL_SECONDS, remaining))
+
     async def _stop_container_gracefully(
         self,
         docker_client: RentalDockerSdkClient,
@@ -6549,15 +6627,37 @@ class DockerService:
                     container_name=payload.container_name,
                     error=error_msg,
                 )
-                return FailedContainerRequest(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    pod_id=payload.pod_id,
-                    workload_kind=payload.workload_kind,
-                    msg=error_msg,
-                    error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-                    error_code=FailedContainerErrorCodes.DeletionInProgress,
+                return self._deletion_in_progress(payload, msg=error_msg)
+
+            if _is_docker_read_timeout_error(exc):
+                # DAH-3467: dockerd took the force-remove and has not answered yet. Ask it what
+                # happened instead of failing a delete that is most likely completing.
+                status = await self._confirm_removal_after_timeout(docker_client, payload, log)
+                if status is None:
+                    log.info(
+                        "Container removal outlived the read timeout; inspect confirms it is gone",
+                        container_name=payload.container_name,
+                        error=str(exc),
+                    )
+                    return None
+                if status == _DOCKER_REMOVING_STATUS:
+                    log.info(
+                        "Container deletion is still in progress after the read timeout",
+                        container_name=payload.container_name,
+                        error=str(exc),
+                    )
+                    return self._deletion_in_progress(
+                        payload,
+                        msg=f"{exc}; container still '{status}' after "
+                        f"{REMOVE_CONFIRM_TIMEOUT_SECONDS:.0f}s",
+                    )
+                log.warning(
+                    "Container is still present after the remove timed out",
+                    container_name=payload.container_name,
+                    container_status=status,
+                    error=str(exc),
                 )
+                raise
 
             # DAH-2345: deletion is idempotent for every workload kind — a container
             # that is already gone (e.g. removed by failed-create cleanup) must not
