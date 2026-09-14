@@ -176,6 +176,22 @@ FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
 # path writes it too -- its `executor_id` is the backend's DB row id), plus pod_name, container_names, reason.
 FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 
+# A customer pod comes back after any exit, a host reboot included, until the renter or the
+# backend stops it (DAH-2306 repairs the one reboot case dockerd cannot restart on its own).
+CUSTOMER_RENTAL_RESTART_POLICY = "unless-stopped"
+# DAH-3475: a filler that has nothing to serve ends its own run. The Dolphin image exits 0 once
+# every worker has failed DOLPHIN_MAX_UNSERVED_SPAWNS spawns in a row (computenet-docker-images#71);
+# under `unless-stopped` dockerd restarted it at once with fresh counters (its spawn-state file is
+# the container's own /tmp), so the validator never saw a stopped container and the backend's
+# missing-container close never fired. `on-failure` restarts only a non-zero exit — a crash, an
+# OOM kill, a host reboot of an image that dies on SIGTERM — so crash recovery stays and a zero
+# exit leaves the container `exited` for `rental_verification` to report (Dolphin's own SIGTERM
+# trap exits 0 too, so after a reboot it stays down and the backend relaunches it). dockerd zeroes
+# the count only when it restores the container at daemon start or on a manual `docker start`, so
+# five is the budget between those: a crash loop spends it within seconds instead of hiding forever
+# behind dockerd's one-minute backoff, and a filler that crashed five times is handed back the same way.
+FILLER_RESTART_POLICY = "on-failure:5"
+
 # In-container port the cache-template images' start.sh hardcodes for Jupyter
 # (`jupyter lab --port=8888`). It reads no port from the environment, so the
 # image-managed Jupyter path is only safe while the mapped docker port is this one.
@@ -970,6 +986,13 @@ def _validate_cache_volume(cache_volume: CacheVolume) -> None:
         raise ValueError(f"Unsafe cache volume target: {target!r}")
 
 
+def _restart_policy_for(workload_kind: WorkloadKind) -> str:
+    # Only a FILLER gets the self-ending policy; a customer's pod keeps coming back.
+    if workload_kind == WorkloadKind.FILLER:
+        return FILLER_RESTART_POLICY
+    return CUSTOMER_RENTAL_RESTART_POLICY
+
+
 def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets: set[str]) -> list[VolumeMount]:
     # Persistent named cache volumes for a FILLER container (DPHN model/runtime cache). Empty for any
     # non-FILLER workload even when the field is set — a customer rental must never receive these
@@ -1500,7 +1523,7 @@ class DockerService:
             environment=environment,
             ports=_published_ports(port_maps, cluster_udp_ports),
             volumes=tuple(volumes),
-            restart_policy="unless-stopped",
+            restart_policy=_restart_policy_for(payload.workload_kind),
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
