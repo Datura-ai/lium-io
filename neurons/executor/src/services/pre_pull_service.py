@@ -15,9 +15,11 @@ digest-pinned, and only if
 * the docker root keeps ``PRE_PULL_MIN_FREE_GB`` free afterwards — least-recently-used
   pre-pulled images are evicted first to make room, nothing else is ever removed;
 * it finishes within ``PRE_PULL_TIMEOUT_SECONDS`` and before the next mandatory refresh
-  is due: the sweep runs inside the cache-template loop, so the start delay and the pull
-  are both capped at the refresh deadline the loop hands in, and a pull that would not
-  fit waits for the next sweep. The default image's refresh is never postponed by it.
+  is due: the start delay and the pull are both capped at the refresh deadline the loop
+  hands in, and a pull that would not fit waits for the next sweep. The loop starts the
+  sweep as its own task and never waits for it, so the default image's refresh runs on
+  time even when a sweep overruns (a silent pull stream, a slow eviction); while one
+  sweep is still running the next refresh does not start another.
 
 One pull per sweep per node plus a random start delay keeps a fleet-wide enable from
 stampeding the registry. Every pull attempt ends in exactly one log line
@@ -205,6 +207,10 @@ class PrePuller:
         self.client = client
         self.state = PrePullState(state_path)
         self._first_sweep = True
+        # The mandatory refs (``repo:tag``) as of the loop's latest refresh. The loop writes it
+        # every refresh, so a sweep still running from the previous one never evicts a ref that
+        # became the default in between (``sweep()``'s ``protected`` is only what it saw at start).
+        self.protected: frozenset[str] = frozenset()
 
     async def sweep(
         self,
@@ -218,11 +224,13 @@ class PrePuller:
         sweep: a ref pre-pulled earlier that has since become this node's default is untracked
         here so the disk guard never evicts it.
 
-        ``deadline`` is the ``time.monotonic()`` instant the caller's next mandatory refresh is
-        due. The start jitter and the pull budget are both cut at it, so this sweep holds the
-        default image's refresh by at most one stream read timeout plus a retag (a 15-minute
-        jitter plus a 30-minute pull would otherwise hold the loop for 45 minutes while the
-        validator checks the default digest).
+        ``deadline`` is the ``time.monotonic()`` instant this sweep should be done by; the loop
+        sets it a read timeout plus slack before its next mandatory refresh. The start jitter
+        and the pull budget are both cut at it, so one sweep normally fits in one refresh
+        interval, a node pulls at most one image per interval, and the pull lock is free again
+        when the default image is re-checked. It is a budget, not a guarantee: a silent stream
+        overruns it by the read timeout and eviction is not timed, which is why the loop runs
+        this as a task it does not wait for.
         ``None`` means no cap, which only the tests use."""
         for image_ref in protected & self.state.images.keys():
             self.state.forget(image_ref)
@@ -332,7 +340,9 @@ class PrePuller:
             free = psutil.disk_usage(DISK_PATH).free
             if free - need_bytes >= floor:
                 return True, None
-            victim = self.state.lru(skip)
+            # ``self.protected`` is re-read per victim: the loop may have refreshed it while
+            # this sweep was running.
+            victim = self.state.lru(skip | self.protected)
             if victim is None:
                 return False, (
                     f"free {free / GIB:.0f} GiB < need {need_bytes / GIB:.0f} GiB + floor {floor / GIB:.0f} GiB"

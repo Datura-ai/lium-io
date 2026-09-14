@@ -2,8 +2,8 @@
 
 Off by default (today's behaviour byte-for-byte); on, at most one digest-pinned pull per
 sweep, never while a rental exists or is starting, never below the disk floor (LRU
-pre-pulled images are evicted first), never past the per-image timeout or the loop's
-refresh deadline.
+pre-pulled images are evicted first), its budget cut at the per-image timeout and short of
+the loop's refresh deadline; the loop starts it as a task and never waits for it.
 """
 
 import asyncio
@@ -97,9 +97,17 @@ def _sweep(puller: PrePuller, entries: list[dict]) -> None:
 # --- flag off = today's behaviour -------------------------------------------------------
 
 
-def _one_loop_iteration(monkeypatch, templates: list[dict], puller: type | None = None) -> dict:
-    """Run run_cache_template_prefetch through exactly one sweep and record what it did."""
-    seen: dict = {"params": None, "ensured": [], "swept": [], "protected": [], "pullers": 0}
+def _one_loop_iteration(
+    monkeypatch, templates: list[dict], puller: type | None = None, iterations: int = 1
+) -> dict:
+    """Run run_cache_template_prefetch through ``iterations`` refreshes and record what it did.
+
+    The loop is stopped inside its sleep after the last refresh. The sweep is a task the loop
+    does not await, so the fake sleep yields once before stopping to let it run."""
+    seen: dict = {"params": None, "ensured": [], "swept": [], "protected": [], "pullers": 0, "sleeps": []}
+    seen["protected_at_ensure"] = []  # what the puller's `protected` was while the mandatory pass ran
+    real_sleep = asyncio.sleep
+    pullers: list = []
 
     async def fetch(session, url, params):
         seen["params"] = dict(params)
@@ -107,10 +115,12 @@ def _one_loop_iteration(monkeypatch, templates: list[dict], puller: type | None 
 
     async def ensure(client, data, state, keep_tags=frozenset()):
         seen["ensured"].append((data["docker_image_tag"], set(keep_tags)))
+        seen["protected_at_ensure"].append(getattr(pullers[0], "protected", None) if pullers else None)
 
     class FakePuller:
         def __init__(self, client, state_path=None):
             seen["pullers"] += 1
+            pullers.append(self)
 
         async def sweep(self, entries, protected=frozenset(), deadline=None):
             seen["swept"].append([e["docker_image_tag"] for e in entries])
@@ -119,10 +129,21 @@ def _one_loop_iteration(monkeypatch, templates: list[dict], puller: type | None 
 
     async def stop(seconds):
         seen["slept"] = seconds
-        raise asyncio.CancelledError
+        seen["sleeps"].append(seconds)
+        await real_sleep(0)
+        if len(seen["sleeps"]) >= iterations:
+            raise asyncio.CancelledError
 
     monkeypatch.setattr(cache_template_service, "_fetch_templates", fetch)
     monkeypatch.setattr(cache_template_service, "_ensure_template", ensure)
+    if puller is not None:
+        real_init = puller.__init__
+
+        def init(self, client, state_path=None):
+            pullers.append(self)
+            real_init(self, client, state_path)
+
+        puller.__init__ = init
     monkeypatch.setattr(cache_template_service, "PrePuller", puller or FakePuller)
     monkeypatch.setattr(cache_template_service, "_get_gpu_info", lambda: ("NVIDIA H100 80GB HBM3", "580.65.06", None))
     monkeypatch.setattr(cache_template_service.asyncio, "sleep", stop)
@@ -162,10 +183,10 @@ def test_the_sweep_gets_the_refresh_deadline_and_the_loop_sleeps_only_up_to_it(m
     # review (14 Sep): the sweep used to be awaited with no cap and the loop then slept a full
     # interval, so a 15-minute jitter plus a 30-minute pull postponed the default image's
     # refresh by 45 minutes while the validator checked its digest. The deadline is one
-    # interval after the sweep began; the sleep is what is left of it.
+    # interval after the refresh began; the sleep is what is left of it.
     monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
     monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
-    clock = iter([1000.0, 1600.0])  # deadline computed at 1000; the sweep took until 1600
+    clock = iter([1000.0, 1600.0])  # deadline computed at 1000; the mandatory pass took until 1600
     # the module name only: asyncio keeps the real clock
     monkeypatch.setattr(cache_template_service, "time", SimpleNamespace(monotonic=lambda: next(clock)))
 
@@ -174,8 +195,89 @@ def test_the_sweep_gets_the_refresh_deadline_and_the_loop_sleeps_only_up_to_it(m
         [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
     )
 
-    assert seen["deadline"] == 1900.0
+    # the sweep's budget ends a read timeout plus slack before the refresh (second 14 Sep round):
+    # the pull lock is free again when the default image is re-checked
+    assert seen["deadline"] == 1900.0 - cache_template_service.SWEEP_DEADLINE_MARGIN_SECONDS == 1810.0
     assert seen["slept"] == 300.0
+
+
+def test_a_sweep_that_never_returns_does_not_delay_the_next_refresh(monkeypatch, caplog):
+    # review (14 Sep): the sweep was awaited, so a pull stream that goes silent (read timeout past
+    # the deadline) or an untimed eviction still moved the default image's refresh. The loop now
+    # starts the sweep as a task and refreshes on time; a second refresh finding that task still
+    # running does not start another sweep.
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
+    started: list[str] = []
+    pullers: list = []
+
+    class HangingPuller:
+        def __init__(self, client, state_path=None):
+            pullers.append(self)
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            started.append("sweep")
+            await asyncio.Event().wait()  # never set: the sweep never yields control back
+
+    caplog.set_level(logging.INFO)
+    real_run = asyncio.run
+    # the old code hangs here forever; the cap turns that into a failure
+    monkeypatch.setattr(asyncio, "run", lambda coro: real_run(asyncio.wait_for(coro, timeout=5)))
+    seen = _one_loop_iteration(
+        monkeypatch,
+        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
+        puller=HangingPuller,
+        iterations=2,
+    )
+
+    assert [tag for tag, _ in seen["ensured"]] == [DEFAULT_TAG, DEFAULT_TAG]  # both refreshes ran
+    assert started == ["sweep"]  # one sweep in flight, the second refresh did not start another
+    assert len(seen["sleeps"]) == 2 and all(0 < s <= 900 for s in seen["sleeps"])
+    assert any("previous sweep is still running" in r.message for r in caplog.records)
+    # the mandatory refs are published on the puller every refresh, before the mandatory pass runs,
+    # so a sweep still evicting cannot remove a ref that just became the default (round 2, 14 Sep)
+    default_ref = frozenset({f"{REPO}:{DEFAULT_TAG}"})
+    assert pullers[0].protected == default_ref
+    assert seen["protected_at_ensure"] == [default_ref, default_ref]
+
+
+def test_cancelling_the_loop_cancels_a_running_sweep(monkeypatch):
+    # the loop is cancelled at app shutdown; the sweep task it started must not outlive it
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    sweep_saw: list[str] = []
+
+    class HangingPuller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sweep_saw.append("cancelled")
+                raise
+
+    real_sleep = asyncio.sleep
+
+    async def main(loop_coro):
+        task = asyncio.create_task(loop_coro)
+        for _ in range(20):  # let the loop refresh a few times, the sweep started and hanging
+            await real_sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await real_sleep(0)  # one step for the sweep task to see its cancel
+        assert sweep_saw == ["cancelled"]  # before asyncio.run's own shutdown cleanup
+        raise asyncio.CancelledError  # what the harness expects out of the run
+
+    real_run = asyncio.run
+    monkeypatch.setattr(asyncio, "run", lambda coro: real_run(main(coro)))
+    _one_loop_iteration(
+        monkeypatch,
+        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
+        puller=HangingPuller,
+        iterations=10**6,  # never stops on its own
+    )
 
 
 def test_a_pre_pull_entry_that_is_the_default_image_never_reaches_the_puller(monkeypatch):
@@ -441,6 +543,27 @@ def test_disk_guard_never_evicts_a_tracked_image_that_became_the_default(quiet_n
     client.images.remove.assert_not_called()
     assert quiet_node == []  # insufficient disk: nothing evictable, so nothing pulled
     assert default_ref not in puller.state.images
+
+
+def test_disk_guard_reads_the_refs_that_became_mandatory_while_the_sweep_was_running(quiet_node, monkeypatch):
+    # second 14 Sep round: the sweep is a task the loop does not wait for, so a refresh can make a
+    # tracked pre-pull the node's default while an earlier sweep is still choosing a victim. The
+    # loop publishes the mandatory refs on the puller; the disk guard reads them per victim.
+    client = _client()
+    puller = PrePuller(client, state_path=None)
+    default_ref = f"{REPO}:{DEFAULT_TAG}"
+    puller.state.images = {default_ref: {"digest": DIGEST_DEFAULT, "pulled_at": 50.0}}
+
+    def disk_usage(_):
+        puller.protected = frozenset({default_ref})  # the loop's next refresh, mid-sweep
+        return MagicMock(free=150 * GIB)
+
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", disk_usage)
+    asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], protected=frozenset()))
+
+    client.images.remove.assert_not_called()
+    assert quiet_node == []  # insufficient disk: nothing evictable, so nothing pulled
+    assert default_ref in puller.state.images  # forgotten by the next sweep, not evicted by this one
 
 
 def test_disk_guard_skips_the_pull_when_nothing_can_be_evicted(quiet_node, monkeypatch, caplog):
