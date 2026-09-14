@@ -13,6 +13,7 @@ import pytest
 from clients.compute_client import ComputeClient
 from helpers import build_state, make_context
 from protocol.vc_protocol.validator_requests import (
+    POD_STATES_MAX_ITEMS,
     ContainerState,
     ExecutorSpecRequest,
     PodContainerState,
@@ -192,3 +193,25 @@ async def test_result_handler_copies_the_states_from_the_context() -> None:
 
     assert with_states.pod_states == states
     assert empty.pod_states is None
+
+
+@pytest.mark.asyncio
+async def test_result_handler_never_sends_more_pod_states_than_the_backend_accepts() -> None:
+    """The backend bounds pod_states at 256 (`Field(max_length=256)`, lium-platform#312) and a
+    longer list fails its validation, dropping the whole spec. Observed states go first; a
+    reaped id left out is re-sent from its redis queue next cycle."""
+    reaped = [
+        PodContainerState(pod_id=f"reaped-{i}", container_state=ContainerState.REAPED, observed_at=OBSERVED_AT)
+        for i in range(10)
+    ]
+    observed = [
+        PodContainerState(pod_id=f"seen-{i}", container_state=ContainerState.RUNNING, observed_at=OBSERVED_AT)
+        for i in range(250)
+    ]
+    # the cleanup check runs before the rented-state check, so the state lists reaped first
+    result = await _job_result_for(make_context(state=build_state(pod_states=[*reaped, *observed])))
+
+    assert len(result.pod_states) == POD_STATES_MAX_ITEMS == 256
+    assert result.pod_states[:250] == observed
+    assert result.pod_states[250:] == reaped[:6]
+    ExecutorSpecRequest(**_spec_kwargs(), pod_states=result.pod_states)

@@ -104,6 +104,18 @@ class PodContainerState(pydantic.BaseModel):
     observed_at: datetime
 
 
+# The backend bounds ExecutorSpecRequest.pod_states at 256 entries (lium-platform#312,
+# `Field(max_length=256)`); a longer list fails its validation and the WHOLE spec is dropped, node
+# listing included. The validator never sends more: observed states first, `reaped` after them —
+# a reaped id left out is re-sent from its queue next cycle, an observed one is re-observed.
+POD_STATES_MAX_ITEMS = 256
+
+
+def bound_pod_states(states: list[PodContainerState]) -> list[PodContainerState]:
+    ordered = sorted(states, key=lambda state: state.container_state is ContainerState.REAPED)
+    return ordered[:POD_STATES_MAX_ITEMS]
+
+
 class ExecutorSpecRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ExecutorSpecRequest
     miner_hotkey: str
