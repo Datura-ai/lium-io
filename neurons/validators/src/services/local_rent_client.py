@@ -17,7 +17,7 @@ A proxy on the miner's port-forward can neither read the spec nor rewrite the an
 trust root as the SSH path (taiberium on #1339).
 
 Only a spec that carries nothing private takes this path (`carries_only_public_fields`): the
-executor's API is plain HTTP and the spec is logged there, so a renter's startup command,
+executor's API is plain HTTP inside the miner's own process, so a renter's startup command,
 entrypoint or environment never travels on it — such a rental keeps the SDK path. Any refusal,
 timeout or malformed answer → the SDK path as today (`LocalRentUnavailable.reason` is the log
 label).
@@ -29,11 +29,18 @@ import hashlib
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 import asyncssh
+import pydantic
 from datura.rental_spec import ContainerRunSpec, carries_only_public_fields, spec_to_wire
-from datura.requests.validator_requests import LOCAL_RENT_CAPABILITY, LOCAL_RENT_SCHEMA
+from datura.requests.validator_requests import (
+    LOCAL_RENT_CAPABILITY,
+    LOCAL_RENT_SCHEMA,
+    RentContainerData,
+    RentImageData,
+    RentReadyData,
+)
 from services.local_verify_client import (
     INTENT_TTL_SECONDS,
     LocalVerifyClient,
@@ -144,6 +151,16 @@ def build_intent(
 
 
 @dataclass
+class RentStepEvidence:
+    """One step as the validator reads it: how the run went. The step's evidence is typed beside
+    it on the answer (`image`, `container`, `ready`), never read back out of a dict."""
+
+    status: str
+    ms: int = 0
+    error: str | None = None
+
+
+@dataclass
 class LocalRentAnswer:
     nonce: str
     executor_uuid: str
@@ -151,20 +168,27 @@ class LocalRentAnswer:
     elapsed_ms: int
     deadline_hit: bool
     rolled_back: bool
-    steps: dict[str, StepEvidence] = field(default_factory=dict)
+    steps: dict[str, RentStepEvidence] = field(default_factory=dict)
+    # Each step's evidence in the executor's own model (datura, one definition for both ends);
+    # None when the step did not run, carried none, or carried a shape the model refuses — that
+    # step is then `malformed` in `steps`, so the answer never reads as `created`.
+    image: RentImageData | None = None
+    container: RentContainerData | None = None
+    ready: RentReadyData | None = None
     round_trip_ms: int = 0
 
-    def step(self, name: str) -> StepEvidence:
-        return self.steps.get(name) or StepEvidence(status="skipped")
+    def step(self, name: str) -> RentStepEvidence:
+        return self.steps.get(name) or RentStepEvidence(status="skipped")
 
     @property
     def created(self) -> bool:
-        """The container is up on the executor's word: made, running, sshd answering when asked.
-        The validator's own execs are what confirm it."""
+        """The container is up on the executor's word: made (the container step `ok` with its
+        evidence), running, sshd answering when asked. The validator's own execs are what confirm it."""
         return (
             not self.deadline_hit
             and not self.rolled_back
             and self.step("container").status == "ok"
+            and self.container is not None
             and self.step("ready").status == "ok"
         )
 
@@ -186,9 +210,13 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
         raise LocalRentUnavailable("nonce_mismatch", "answer does not echo the intent nonce")
     if raw.get("executor_uuid") != intent["executor_uuid"]:
         raise LocalRentUnavailable("executor_mismatch", f"got {raw.get('executor_uuid')!r}"[:100])
-    steps = raw.get("steps")
-    if not isinstance(steps, dict):
+    raw_steps = raw.get("steps")
+    if not isinstance(raw_steps, dict):
         raise LocalRentUnavailable("malformed", "steps is not an object")
+    steps: dict[str, RentStepEvidence] = {}
+    image = _step_data(raw_steps, "image", RentImageData, steps)
+    container = _step_data(raw_steps, "container", RentContainerData, steps)
+    ready = _step_data(raw_steps, "ready", RentReadyData, steps)
     return LocalRentAnswer(
         nonce=raw["nonce"],
         executor_uuid=raw["executor_uuid"],
@@ -196,9 +224,40 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
         elapsed_ms=_wire_int(raw.get("elapsed_ms")),
         deadline_hit=bool(raw.get("deadline_hit")),
         rolled_back=bool(raw.get("rolled_back")),
-        steps={name: StepEvidence.from_wire(steps[name]) for name in STEP_NAMES if name in steps},
+        steps=steps,
+        image=image,
+        container=container,
+        ready=ready,
         round_trip_ms=round_trip_ms,
     )
+
+
+_StepData = TypeVar("_StepData", RentImageData, RentContainerData, RentReadyData)
+
+
+def _step_data(
+    raw_steps: dict[str, Any], name: str, model: type[_StepData], steps: dict[str, RentStepEvidence]
+) -> _StepData | None:
+    """Read one step: its run status into `steps`, its `data` as the step's own model. A `data`
+    the model refuses (a field it does not name, a value of another type) makes the step
+    `malformed`, as an unknown status does — the validator does not act on evidence it cannot
+    read, and `created` stays False."""
+    if name not in raw_steps:
+        return None
+    evidence = StepEvidence.from_wire(raw_steps[name])
+    steps[name] = RentStepEvidence(status=evidence.status, ms=evidence.ms, error=evidence.error)
+    if evidence.status == "malformed":
+        return None
+    raw_data = raw_steps[name].get("data")
+    if raw_data is None:
+        return None
+    try:
+        return model.model_validate(raw_data)
+    except pydantic.ValidationError as exc:
+        steps[name] = RentStepEvidence(
+            status="malformed", ms=evidence.ms, error=f"{name} data is not a {model.__name__}: {exc.error_count()} error(s)"
+        )
+        return None
 
 
 class LocalRentClient(LocalVerifyClient):

@@ -1356,10 +1356,10 @@ class DockerService:
             deadline_hit=answer.deadline_hit,
             rolled_back=answer.rolled_back,
         )
-        ready = answer.step("ready").data
+        ready = answer.ready
         ready_fields = {
-            "running_ms": ready.get("running_ms") if isinstance(ready.get("running_ms"), int) else None,
-            "ssh_answered": ready.get("ssh_answered") if isinstance(ready.get("ssh_answered"), bool) else None,
+            "running_ms": ready.running_ms if ready else None,
+            "ssh_answered": ready.ssh_answered if ready else None,
         }
         if answer.created:
             event("created", **fields, **ready_fields)

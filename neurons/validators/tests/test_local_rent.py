@@ -34,6 +34,12 @@ from datura.rental_spec import (
     spec_to_wire,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
+from datura.requests.validator_requests import (
+    RentContainerData,
+    RentContainerState,
+    RentImageData,
+    RentReadyData,
+)
 from services.docker_service import DockerService
 from services.local_rent_client import (
     CAPABILITY,
@@ -225,6 +231,16 @@ def test_create_and_start_issues_the_sdk_paths_exact_calls():
     assert kwargs["volumes"] == ["/root"]
     assert kwargs["host_config"] == {"HostConfig": build_host_config_kwargs(spec)}
     assert "labels" not in kwargs  # the validator's own create carries no label
+    api.start.assert_called_once_with("abc123")  # by the id the create answered, as the rollback goes
+
+
+def test_a_create_that_answered_no_id_is_started_by_name():
+    """docker-py's `create_container` answers `{"Id": …}`; a daemon that answered without one
+    leaves the name as the only handle, so the start goes by it — and only then."""
+    api = Mock()
+    api.create_host_config.side_effect = lambda **kw: {"HostConfig": kw}
+    api.create_container.return_value = {}
+    assert create_and_start(api, _spec()) is None
     api.start.assert_called_once_with("pod_abc")
 
 
@@ -277,7 +293,11 @@ def _answer(intent, **overrides) -> dict:
         "steps": {
             "image": {"status": "ok", "ms": 10, "data": {"present": True, "digest": "sha256:abc"}},
             "container": {"status": "ok", "ms": 1200, "data": {"container_name": "pod_abc", "container_id": "c1"}},
-            "ready": {"status": "ok", "ms": 300, "data": {"state": {"Running": True}, "ssh_answered": True}},
+            "ready": {
+                "status": "ok",
+                "ms": 300,
+                "data": {"state": {"running": True}, "running_ms": 250, "ssh_port": 40001, "ssh_answered": True},
+            },
         },
     }
     answer.update(overrides)
@@ -288,8 +308,36 @@ def test_a_good_answer_reads_as_created():
     intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
     answer = parse_answer(_answer(intent), intent=intent, round_trip_ms=1600)
     assert answer.created and not answer.may_hold_the_name
-    assert answer.step("ready").data["ssh_answered"] is True
     assert answer.executor_version == "4.2.0" and answer.round_trip_ms == 1600
+    # each step's evidence in its own model — the executor's `RentStepResult.data` union, read typed
+    assert answer.image == RentImageData(present=True, digest="sha256:abc")
+    assert answer.container == RentContainerData(container_name="pod_abc", container_id="c1")
+    assert answer.ready == RentReadyData(
+        state=RentContainerState(running=True), running_ms=250, ssh_port=40001, ssh_answered=True
+    )
+
+
+@pytest.mark.parametrize(
+    "ready_data",
+    [
+        {"state": {"running": True}, "running_ms": "fast"},  # a type the model does not take
+        {"state": {"running": True}, "sshd_answered": True},  # a field the model does not name
+        {"running_ms": 250},  # the state block missing
+        "running",  # not an object at all
+    ],
+)
+def test_ready_evidence_the_model_refuses_makes_the_step_malformed_not_created(ready_data):
+    """Before the typed models the client read `running_ms` back with an `isinstance` guard and
+    took the step's `ok` at its word — an executor answering a shape this validator does not know
+    read as created. Now the evidence is parsed as the executor's own model or the step is
+    `malformed`: not created, and the name is freed before the SDK path's own `docker run`."""
+    intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
+    raw = _answer(intent)
+    raw["steps"]["ready"]["data"] = ready_data
+    answer = parse_answer(raw, intent=intent, round_trip_ms=1)
+    assert answer.step("ready").status == "malformed" and answer.ready is None
+    assert not answer.created and answer.may_hold_the_name
+    assert answer.container is not None  # the steps the model accepts are still read
 
 
 @pytest.mark.parametrize(
@@ -303,6 +351,8 @@ def test_a_good_answer_reads_as_created():
         ({"deadline_hit": True, "steps": {"container": {"status": "timeout"}}}, True),
         ({"rolled_back": True, "steps": {"image": {"status": "ok", "data": {"present": False}}}}, False),
         ({"steps": {"container": {"status": "ok"}}}, True),  # no ready step answered: not proven running
+        # an `ok` container step without its evidence: the status alone is not taken at its word
+        ({"steps": {"container": {"status": "ok"}, "ready": {"status": "ok"}}}, True),
     ],
 )
 def test_anything_short_of_made_and_running_is_not_created(overrides, holds_the_name):
