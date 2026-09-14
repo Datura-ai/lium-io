@@ -32,7 +32,7 @@ from services.local_verify_facts import LocalFacts, PreparedDind, judge_dind_ste
 
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state, make_context
-from tests.test_local_verify import SPECS, FakeExecutor
+from tests.test_local_verify import SPECS, FakeExecutor, FakeSSH
 from tests.test_local_verify_facts import facts_answer
 
 # Placeholders, not key material: the private half is an opaque token the verifier hands to
@@ -82,10 +82,16 @@ def dind_context(keypair, executor_info, *, rented_ports=(), filler_ports=(), ss
     ssh = SimpleNamespace(generate_keypair=MagicMock(return_value=(PRIVATE, PUBLIC))) if ssh_service else None
     return make_context(
         executor=executor_info,
+        ssh=FakeSSH(),  # the tunnel the facts POST rides (#1340)
         services=build_services(ssh=ssh),
         config=build_context_config(validator_keypair=keypair, job_batch_id=job_batch_id),
         state=build_state(specs=SPECS, rented_data=rented_data, sysbox_runtime=True),
     )
+
+
+def dind_version(executor):
+    """A `/version` that advertises both capabilities and names the loopback port the tunnel targets (#1340)."""
+    return {"version": "4.2.0", "capabilities": [CAPABILITY, DIND_CAPABILITY], "local_verify_port": executor.server.port}
 
 
 def echo(intent, **step):
@@ -138,7 +144,7 @@ def test_the_echo_must_match_name_and_port_exactly():
 @pytest.mark.asyncio
 async def test_the_facts_call_asks_for_the_validators_own_container(keypair, dind_on):
     async with FakeExecutor(keypair) as executor:
-        executor.version_override = {"version": "4.2.0", "capabilities": [CAPABILITY, DIND_CAPABILITY]}
+        executor.version_override = dind_version(executor)
         executor.answer_override = echo
         ctx = dind_context(keypair, executor.executor_info, rented_ports=(40000,), filler_ports=(40001,))
         result = await LocalFactsCheck(client_factory(keypair)).run(ctx)
@@ -156,12 +162,12 @@ async def test_the_facts_call_asks_for_the_validators_own_container(keypair, din
     "setup, why",
     [
         (lambda ex, mp: mp.setattr(settings, "LOCAL_VERIFY_DIND_IN_INTENT", False), "flag off"),
-        (lambda ex, mp: setattr(ex, "version_override", {"version": "4.1.0", "capabilities": [CAPABILITY]}), "not advertised"),
+        (lambda ex, mp: setattr(ex, "version_override", {"version": "4.1.0", "capabilities": [CAPABILITY], "local_verify_port": ex.server.port}), "not advertised"),
     ],
 )
 async def test_no_dind_step_without_the_flag_or_the_capability(keypair, dind_on, monkeypatch, setup, why):
     async with FakeExecutor(keypair) as executor:
-        executor.version_override = {"version": "4.2.0", "capabilities": [CAPABILITY, DIND_CAPABILITY]}
+        executor.version_override = dind_version(executor)
         setup(executor, monkeypatch)
         executor.answer_override = echo
         ctx = dind_context(keypair, executor.executor_info)
@@ -193,7 +199,7 @@ def test_the_validators_real_key_and_a_real_hotkey_fit_the_shared_dind_bounds():
 @pytest.mark.asyncio
 async def test_a_dind_step_outside_the_shared_bounds_is_not_sent(keypair, dind_on):
     async with FakeExecutor(keypair) as executor:
-        executor.version_override = {"version": "4.2.0", "capabilities": [CAPABILITY, DIND_CAPABILITY]}
+        executor.version_override = dind_version(executor)
         executor.answer_override = echo
         ctx = dind_context(keypair, executor.executor_info)
         ctx.services.ssh.generate_keypair.return_value = (PRIVATE, "ssh-ed25519 not/a/key!! x")
@@ -207,7 +213,7 @@ async def test_a_dind_step_outside_the_shared_bounds_is_not_sent(keypair, dind_o
 @pytest.mark.asyncio
 async def test_no_dind_step_when_every_port_is_taken_or_nothing_can_mint_a_key(keypair, dind_on):
     async with FakeExecutor(keypair) as executor:
-        executor.version_override = {"version": "4.2.0", "capabilities": [CAPABILITY, DIND_CAPABILITY]}
+        executor.version_override = dind_version(executor)
         executor.answer_override = echo
         for ctx in (
             dind_context(keypair, executor.executor_info, rented_ports=(40000, 40001), filler_ports=(40002, 40003)),
@@ -226,7 +232,7 @@ async def test_a_step_that_fails_or_misechoes_leaves_the_probe_to_start_its_own(
         (lambda intent: facts_answer(intent), "not_answered"),
     ):
         async with FakeExecutor(keypair) as executor:
-            executor.version_override = {"version": "4.2.0", "capabilities": [CAPABILITY, DIND_CAPABILITY]}
+            executor.version_override = dind_version(executor)
             executor.answer_override = override
             ctx = dind_context(keypair, executor.executor_info)
             result = await LocalFactsCheck(client_factory(keypair)).run(ctx)
@@ -241,7 +247,7 @@ async def test_a_lost_answer_keeps_the_name_the_validator_asked_for(keypair, din
     excuses it instead of billing its boot to the provider and the settle step removes it; without
     this the state carried no `dind` at all and a running container of ours counted as side load."""
     async with FakeExecutor(keypair) as executor:
-        executor.version_override = {"version": "4.2.0", "capabilities": [CAPABILITY, DIND_CAPABILITY]}
+        executor.version_override = dind_version(executor)
         executor.answer_override = lambda raw: (500, {"detail": "boom"})
         ctx = dind_context(keypair, executor.executor_info)
         result = await LocalFactsCheck(client_factory(keypair)).run(ctx)
