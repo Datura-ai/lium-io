@@ -7,7 +7,7 @@ import re
 import time
 from datetime import datetime
 from typing import Any, ClassVar, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 import bittensor
@@ -305,7 +305,7 @@ class BackendClient:
         the pod's state. Older backends 404 and the caller treats that as nothing to do.
         """
         return await self.post(
-            f"/internal/pods/{pod_id}/ssh-unreachable",
+            f"/internal/pods/{quote(str(pod_id), safe='')}/ssh-unreachable",
             PodSshUnreachableResponse,
             json_data={
                 "ssh_port": ssh_port,
