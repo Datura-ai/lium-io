@@ -205,8 +205,9 @@ def create_and_start(
     them through its SSH tunnel, the executor's `POST /rent` on the host — the same calls, so the
     container is the same whichever side made it (the executor adds its rollback label, nothing
     else). `on_created` gets the id the moment the daemon answers the create, before `start` — so
-    a start that fails still leaves the id with the caller. Returns the id when the daemon gave
-    one. Blocking; callers run it off the event loop."""
+    a start that fails still leaves the id with the caller. The start goes by that id, as the
+    executor's rollback does; only a create that answered no id is started by name. Returns the
+    id when the daemon gave one. Blocking; callers run it off the event loop."""
     host_config = api_client.create_host_config(**build_host_config_kwargs(spec))
     created = api_client.create_container(
         image=spec.image,
@@ -223,7 +224,7 @@ def create_and_start(
     container_id = created.get("Id") if isinstance(created, dict) else None
     if on_created is not None and container_id:
         on_created(container_id)
-    api_client.start(spec.name)
+    api_client.start(container_id or spec.name)
     return container_id
 
 
@@ -478,7 +479,7 @@ def _int(obj: dict, key: str, *, required: bool = False, lo: int, hi: int = 2**3
 
 
 def _port(obj: dict, key: str) -> int:
-    return _int(obj, key, required=True, lo=1, hi=65535)  # type: ignore[return-value]
+    return _int(obj, key, required=True, lo=1, hi=65535)  # type: ignore[return-value] — required=True never returns None
 
 
 def _bool(obj: dict, key: str, *, default: bool) -> bool:

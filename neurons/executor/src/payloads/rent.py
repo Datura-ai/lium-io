@@ -14,6 +14,11 @@ from datura.requests.validator_requests import (
     LOCAL_RENT_CAPABILITY,
     LOCAL_RENT_SCHEMA,
     LocalVerifyWireModel,
+    RentContainerData,  # noqa: F401 — re-exported for the service and the tests
+    RentContainerState,  # noqa: F401
+    RentImageData,  # noqa: F401
+    RentReadyData,  # noqa: F401
+    RentStepData,
 )
 from pydantic import Field
 
@@ -67,9 +72,13 @@ class RentIntent(RentIntentBody):
 
 
 class RentStepResult(WireModel):
-    status: str  # ok | failed | timeout | skipped
+    """One step's evidence. `status` is about the run, not the verdict; `data` is the step's own
+    named model (datura's `RentImageData` / `RentContainerData` / `RentReadyData`), the shape the
+    validator parses — as `/verify`'s `StepResult.data` is its `StepData` union."""
+
+    status: Literal["ok", "failed", "timeout", "skipped"]
     ms: int = 0
-    data: dict[str, Any] | None = None
+    data: RentStepData | None = None
     error: str | None = None
 
 

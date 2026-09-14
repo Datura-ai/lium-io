@@ -143,6 +143,52 @@ class VerifyXStep(LocalVerifyWireModel):
     cipher_text: str = pydantic.Field(min_length=1, max_length=65536)
 
 
+# `/rent`'s step evidence (`RentStepResult.data` on the executor, `LocalRentAnswer` on the
+# validator), one named model per step: the validator parses what the executor built from ONE
+# definition, as it does for the intent's steps above. Strings are bounded: every one of them is
+# the daemon's or the executor's and ends up in a validator log line.
+RENT_STR_MAX = 512
+
+
+class RentImageData(LocalVerifyWireModel):
+    """`docker image inspect` of the spec's image before the create: here or not, and which."""
+
+    present: bool
+    id: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+    digest: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+
+
+class RentContainerData(LocalVerifyWireModel):
+    """What the create made: the spec's name and the id the daemon answered (None when it did not)."""
+
+    container_name: str = pydantic.Field(max_length=RENT_STR_MAX)
+    container_id: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+
+
+class RentContainerState(LocalVerifyWireModel):
+    """The public part of `docker inspect`'s `State` block, as the ready step last saw it."""
+
+    status: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+    running: bool | None = None
+    exit_code: int | None = None
+    error: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+    started_at: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+
+
+class RentReadyData(LocalVerifyWireModel):
+    """The ready step: the container's state when the poll ended, how long until it ran, and the
+    sshd banner probe when the intent asked for one (`ssh_port` set)."""
+
+    state: RentContainerState
+    running_ms: int | None = None
+    ssh_port: int | None = None
+    ssh_answered: bool | None = None
+    ssh_probe_host: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+
+
+RentStepData = RentImageData | RentContainerData | RentReadyData
+
+
 def local_verify_signing_blob(intent: dict[str, object]) -> str:
     """Canonical message the validator signs over a `/verify` intent.
 

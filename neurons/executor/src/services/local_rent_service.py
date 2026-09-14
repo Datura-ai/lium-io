@@ -51,7 +51,18 @@ from datura.rental_spec import (
     ensure_rental_network,
     spec_from_wire,
 )
-from payloads.rent import STEP_NAMES, ReadyStep, RentIntentBody, RentResult, RentStepResult
+from datura.requests.validator_requests import RENT_STR_MAX
+from payloads.rent import (
+    STEP_NAMES,
+    ReadyStep,
+    RentContainerData,
+    RentContainerState,
+    RentImageData,
+    RentIntentBody,
+    RentReadyData,
+    RentResult,
+    RentStepResult,
+)
 from services.local_verify_service import parse_port_range
 
 logger = logging.getLogger(__name__)
@@ -380,8 +391,8 @@ class _Run:
             if self.spec is None:
                 results["image"] = RentStepResult(status="failed", error="no container spec to name the image")
                 return
-            results["image"] = await self._image(self.spec.image)
-            if results["image"].status != "ok" or not (results["image"].data or {}).get("present"):
+            results["image"], image = await self._image(self.spec.image)
+            if image is None or not image.present:
                 return
         if self.spec is None:
             return
@@ -395,26 +406,32 @@ class _Run:
         loop = asyncio.get_running_loop()
         return await asyncio.wait_for(loop.run_in_executor(_rent_executor, func), timeout=timeout)
 
-    async def _image(self, reference: str) -> RentStepResult:
+    async def _image(self, reference: str) -> tuple[RentStepResult, RentImageData | None]:
+        """The step's result and, when the inspect answered, the fact itself (None: no fact, the
+        step failed or timed out)."""
         started = time.perf_counter()
 
-        def inspect() -> dict[str, Any]:
+        def inspect() -> RentImageData:
             try:
                 info = self.api.inspect_image(reference)
             except Exception as exc:  # noqa: BLE001 — "not found" is the fact we came for
                 if _is_not_found(exc):
-                    return {"present": False}
+                    return RentImageData(present=False)
                 raise
             digests = info.get("RepoDigests") or []
-            return {"present": True, "id": info.get("Id"), "digest": digests[0] if digests else None}
+            return RentImageData(
+                present=True,
+                id=_capped(info.get("Id")),
+                digest=_capped(digests[0]) if digests else None,
+            )
 
         try:
             data = await self._in_thread(inspect, INSPECT_TIMEOUT_SECONDS)
-            return RentStepResult(status="ok", ms=_elapsed_ms(started), data=data)
         except TimeoutError:
-            return RentStepResult(status="timeout", ms=_elapsed_ms(started), error="image inspect timed out")
+            return RentStepResult(status="timeout", ms=_elapsed_ms(started), error="image inspect timed out"), None
         except Exception as exc:  # noqa: BLE001 — the validator reads the error and falls back to SSH
-            return RentStepResult(status="failed", ms=_elapsed_ms(started), error=f"{type(exc).__name__}: {exc}")
+            return RentStepResult(status="failed", ms=_elapsed_ms(started), error=f"{type(exc).__name__}: {exc}"), None
+        return RentStepResult(status="ok", ms=_elapsed_ms(started), data=data), data
 
     async def _container(self, spec: ContainerRunSpec) -> RentStepResult:
         started = time.perf_counter()
@@ -448,7 +465,7 @@ class _Run:
         return RentStepResult(
             status="ok",
             ms=_elapsed_ms(started),
-            data={"container_name": spec.name, "container_id": self.container_id},
+            data=RentContainerData(container_name=spec.name, container_id=_capped(self.container_id)),
         )
 
     async def _ready(self, spec: ContainerRunSpec, step: ReadyStep) -> RentStepResult:
@@ -470,25 +487,27 @@ class _Run:
                     status="failed",
                     ms=_elapsed_ms(started),
                     error=f"container is {state.get('Status')}: exit {state.get('ExitCode')} {state.get('Error') or ''}".strip(),
-                    data={"state": _public_state(state)},
+                    data=RentReadyData(state=_public_state(state)),
                 )
             if time.perf_counter() >= running_by:
                 return RentStepResult(
                     status="timeout",
                     ms=_elapsed_ms(started),
                     error=f"not running after {step.running_timeout_s}s",
-                    data={"state": _public_state(state)},
+                    data=RentReadyData(state=_public_state(state)),
                 )
             await asyncio.sleep(RUNNING_POLL_INTERVAL_SECONDS)
 
-        data: dict[str, Any] = {"state": _public_state(state), "running_ms": _elapsed_ms(started)}
+        data = RentReadyData(state=_public_state(state), running_ms=_elapsed_ms(started))
         if step.ssh_host_port is not None:
             hosts = ["127.0.0.1"]
             gateway = self.service._gateway_ip()
             if gateway and gateway not in hosts:
                 hosts.append(gateway)
             answered_on = await _wait_ssh_banner(hosts, step.ssh_host_port, step.ssh_timeout_s)
-            data.update({"ssh_port": step.ssh_host_port, "ssh_answered": answered_on is not None, "ssh_probe_host": answered_on})
+            data = data.model_copy(
+                update={"ssh_port": step.ssh_host_port, "ssh_answered": answered_on is not None, "ssh_probe_host": answered_on}
+            )
             if answered_on is None:
                 return RentStepResult(
                     status="timeout",
@@ -579,8 +598,23 @@ def _close(api: Any) -> None:
             pass
 
 
-def _public_state(state: dict[str, Any]) -> dict[str, Any]:
-    return {k: state.get(k) for k in ("Status", "Running", "ExitCode", "Error", "StartedAt") if k in state}
+def _public_state(state: dict[str, Any]) -> RentContainerState:
+    """`docker inspect`'s `State` block as the wire model: the daemon's strings capped, a value of
+    another type than the model's dropped (the validator would refuse the whole step otherwise)."""
+    exit_code = state.get("ExitCode")
+    running = state.get("Running")
+    return RentContainerState(
+        status=_capped(state.get("Status")),
+        running=running if isinstance(running, bool) else None,
+        exit_code=exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None,
+        error=_capped(state.get("Error")),
+        started_at=_capped(state.get("StartedAt")),
+    )
+
+
+def _capped(value: Any) -> str | None:
+    """A daemon string bounded to what the wire model accepts; anything but a string is None."""
+    return value[:RENT_STR_MAX] if isinstance(value, str) else None
 
 
 def _is_not_found(exc: Exception) -> bool:

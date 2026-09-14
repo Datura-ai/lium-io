@@ -28,8 +28,21 @@ from datura.rental_spec import (
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from middlewares.miner import MinerMiddleware
-from payloads.rent import CAPABILITY, SCHEMA, ReadyStep, RentIntentBody, RentSteps
+from payloads.rent import (
+    CAPABILITY,
+    SCHEMA,
+    ReadyStep,
+    RentContainerData,
+    RentContainerState,
+    RentImageData,
+    RentIntentBody,
+    RentReadyData,
+    RentResult,
+    RentStepResult,
+    RentSteps,
+)
 from payloads.verify import CAPABILITY as VERIFY_CAPABILITY
+from pydantic import ValidationError
 from routes.apis import apis_router
 from services.local_rent_service import (
     NONCE_LABEL,
@@ -130,12 +143,13 @@ class FakeDockerApi:
             raise self.create_then_raise
         return {"Id": cid}
 
-    def start(self, name):
-        self.calls.append(("start", name))
+    def start(self, ref):
+        self.calls.append(("start", ref))
         if self.start_error is not None:
             raise self.start_error
         with self.lock:
-            state = self.made[name]["State"]
+            _name, c = self._by(ref)  # docker's own rule: an id or a name
+            state = c["State"]
             if self.exit_after_create:
                 state.update(Status="exited", Running=False, ExitCode=127, Error="")
             else:
@@ -236,15 +250,20 @@ def test_a_good_intent_makes_the_container_with_the_validators_own_calls():
 
     assert result.schema_id == SCHEMA and result.executor_uuid == EXECUTOR_UUID
     assert not result.deadline_hit and not result.rolled_back
-    assert result.steps["image"].status == "ok" and result.steps["image"].data["present"]
-    assert result.steps["image"].data["digest"] == "daturaai/ubuntu@sha256:abc"
+    assert result.steps["image"].status == "ok"
+    # each step's evidence is its own named model (datura), the shape the validator parses
+    assert result.steps["image"].data == RentImageData(present=True, id="sha256:img", digest="daturaai/ubuntu@sha256:abc")
     assert result.steps["container"].status == "ok"
-    assert result.steps["container"].data["container_name"] == "pod_abc"
-    assert result.steps["ready"].status == "ok" and result.steps["ready"].data["state"]["Running"]
+    assert result.steps["container"].data == RentContainerData(container_name="pod_abc", container_id=api.made["pod_abc"]["Id"])
+    ready = result.steps["ready"]
+    assert ready.status == "ok" and isinstance(ready.data, RentReadyData) and ready.data.state.running is True
+    assert ready.data.running_ms is not None and ready.data.ssh_port is None and ready.data.ssh_answered is None
     names = [c[0] for c in api.calls]
     # the icc-off rental network is made sure of BEFORE the container is created on it (DAH-3199)
     assert names[:6] == ["inspect_image", "inspect_network", "create_network", "inspect_network", "host_config", "create"]
-    assert "start" in names and "remove" not in names
+    assert "remove" not in names
+    # started by the id the daemon answered, as the rollback removes by it — never by the name
+    assert [c[1] for c in api.calls if c[0] == "start"] == [api.made["pod_abc"]["Id"]]
     create = next(c[1] for c in api.calls if c[0] == "create")
     assert create["name"] == "pod_abc" and create["detach"] is True
     assert create["ports"] == [(22, "tcp"), (8888, "tcp")]
@@ -258,7 +277,6 @@ def test_a_good_intent_makes_the_container_with_the_validators_own_calls():
     created_network = next(c[1] for c in api.calls if c[0] == "create_network")
     assert created_network["driver"] == "bridge" and created_network["options"] == {RENTAL_NETWORK_ICC_OPTION: "false"}
     assert create["labels"] == {NONCE_LABEL: result.nonce}  # the rollback's handle, the only addition
-    assert result.steps["container"].data["container_id"] == api.made["pod_abc"]["Id"]
     assert "pod_abc" in api.made
     assert ("close",) in api.calls
 
@@ -312,9 +330,48 @@ def test_a_missing_image_is_a_fact_and_nothing_is_created():
     api = FakeDockerApi()
     body = _body(steps=RentSteps(image=True, container=spec_to_wire(_spec(image="nobody/none:1")), ready=ReadyStep()))
     result = asyncio.run(_service(api).run(body))
-    assert result.steps["image"].status == "ok" and result.steps["image"].data == {"present": False}
+    assert result.steps["image"].status == "ok" and result.steps["image"].data == RentImageData(present=False)
     assert result.steps["container"].status == "skipped" and result.steps["ready"].status == "skipped"
     assert all(c[0] in ("inspect_image", "close") for c in api.calls)
+
+
+def test_a_step_status_outside_the_validators_set_cannot_be_built():
+    """The validator's client knows four statuses and marks any other `malformed`; a fifth spelled
+    here would read as a broken answer over there. The type is the set, as `/verify`'s is."""
+    with pytest.raises(ValidationError):
+        RentStepResult(status="running")
+    with pytest.raises(ValidationError):
+        RentStepResult(status="OK")
+
+
+def test_the_answer_round_trips_with_each_steps_evidence_as_its_own_model():
+    """What leaves the route is `model_dump(by_alias=True)`; parsed back, every step's `data` is the
+    named model the executor built (the union resolves by the fields each model requires), and a
+    `data` of a shape no model has is refused — never carried as a dict."""
+    api = FakeDockerApi()
+    result = asyncio.run(_service(api).run(_body()))
+    wire = result.model_dump(by_alias=True, mode="json")
+    assert wire["steps"]["ready"]["data"]["state"] == {
+        "status": "running", "running": True, "exit_code": 0, "error": "", "started_at": None
+    }
+    parsed = RentResult.model_validate(wire)
+    assert parsed == result
+    assert type(parsed.steps["image"].data) is RentImageData
+    assert type(parsed.steps["container"].data) is RentContainerData
+    assert type(parsed.steps["ready"].data) is RentReadyData
+    assert parsed.steps["ready"].data.state == RentContainerState(status="running", running=True, exit_code=0, error="")
+    wire["steps"]["ready"]["data"] = {"sshd": "up"}
+    with pytest.raises(ValidationError):
+        RentResult.model_validate(wire)
+
+
+def test_the_daemons_strings_are_capped_and_a_state_of_another_shape_is_dropped():
+    """`docker inspect`'s `State` is the daemon's: a string past the wire bound is cut, a value of
+    another type than the model's is dropped rather than failing the whole step."""
+    state = lrs._public_state(
+        {"Status": "x" * 2000, "Running": "yes", "ExitCode": True, "Error": None, "StartedAt": 12, "Pid": 4242}
+    )
+    assert state == RentContainerState(status="x" * lrs.RENT_STR_MAX)
 
 
 def test_a_bad_spec_is_refused_before_docker_is_touched():
@@ -623,11 +680,11 @@ def test_sshd_readiness_is_the_ssh_banner_on_the_published_port():
                 )
             )
         )
-        return answered, silent
+        return answered, silent, port
 
-    answered, silent = asyncio.run(scenario())
-    assert answered.steps["ready"].status == "ok" and answered.steps["ready"].data["ssh_answered"] is True
-    assert answered.steps["ready"].data["ssh_probe_host"] == "127.0.0.1"
+    answered, silent, port = asyncio.run(scenario())
+    assert answered.steps["ready"].status == "ok" and answered.steps["ready"].data.ssh_answered is True
+    assert answered.steps["ready"].data.ssh_probe_host == "127.0.0.1" and answered.steps["ready"].data.ssh_port == port
     assert not answered.rolled_back
     assert silent.steps["ready"].status == "timeout" and silent.rolled_back is True
 
@@ -657,7 +714,7 @@ def test_a_port_that_accepts_but_says_nothing_is_not_sshd():
         return result
 
     result = asyncio.run(scenario())
-    assert result.steps["ready"].status == "timeout" and result.steps["ready"].data["ssh_answered"] is False
+    assert result.steps["ready"].status == "timeout" and result.steps["ready"].data.ssh_answered is False
     assert result.rolled_back is True
 
 
