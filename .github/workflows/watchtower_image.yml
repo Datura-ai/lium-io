@@ -1,0 +1,132 @@
+name: "CD: watchtower image"
+
+# Builds watchtower/ and pushes daturaai/lium-watchtower:<tag> (and <tag>-staging).
+# The executor compose files (neurons/executor/docker-compose*.yml) pull the updater by
+# this version tag (DAH-3419), so the tag must be on Docker Hub before a compose change
+# that names it merges. A manual run publishes the version the branch carries; a
+# `watchtower-v<version>` tag publishes a release, the way `executor-v*` does for the
+# executor (executor_cd_prod.yml). The moving tags `latest` and `staging` are not pushed
+# here: the CVM stack pulls them, and a rebuild of those means a fleet-wide restart
+# (watchtower/README.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to push; must equal project.version in watchtower/pyproject.toml"
+        type: string
+        default: "1.1.0"
+        required: true
+      push_staging:
+        description: "Also build with the staging digest endpoint baked in and push <tag>-staging"
+        type: boolean
+        default: true
+      overwrite:
+        description: "Push over a tag that is already on Docker Hub (only to finish a run that failed halfway)"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'watchtower-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE_REPOSITORY: daturaai/lium-watchtower
+      # The staging backend signs the digest with this hotkey (lium-platform
+      # apps/lium/backend/infrastructure/Pulumi.staging.yaml, DEFAULT_VALIDATOR_HOTKEY); it is
+      # the hotkey the dev executor build trusts too (executor_cd_dev.yml).
+      STAGING_ENDPOINT_URL: https://staging.lium.io/api/watchtower/digest
+      STAGING_VALIDATOR_HOTKEY: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tag and check it against watchtower/pyproject.toml
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUSH_STAGING: ${{ inputs.push_staging }}
+          INPUT_OVERWRITE: ${{ inputs.overwrite }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            TAG="${GITHUB_REF_NAME#watchtower-v}"
+            PUSH_STAGING=true
+            OVERWRITE=false
+          else
+            TAG="$INPUT_TAG"
+            PUSH_STAGING="$INPUT_PUSH_STAGING"
+            OVERWRITE="$INPUT_OVERWRITE"
+          fi
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' watchtower/pyproject.toml)"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag '$TAG' is not the version in watchtower/pyproject.toml ('$VERSION'); bump the version or pass the matching tag"
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "push_staging=$PUSH_STAGING"
+            echo "overwrite=$OVERWRITE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: echo "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      # A version tag is pinned by the compose files and must not move: a mirror that cached
+      # the first build would serve it for ever. The check reads Docker Hub before anything
+      # is built.
+      - name: Refuse a tag that is already on Docker Hub
+        if: steps.tag.outputs.overwrite != 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PUSH_STAGING: ${{ steps.tag.outputs.push_staging }}
+        run: |
+          for ref in "$IMAGE_REPOSITORY:$TAG" $([ "$PUSH_STAGING" = "true" ] && echo "$IMAGE_REPOSITORY:$TAG-staging"); do
+            if docker manifest inspect "$ref" > /dev/null 2>&1; then
+              echo "::error::$ref is already on Docker Hub; bump the version, or re-run with overwrite to finish a failed run"
+              exit 1
+            fi
+          done
+
+      # docker_build.sh tags every build twice (`latest` or `staging`, and the version tag);
+      # only the version tag is pushed.
+      - name: Build and push the prod image
+        env:
+          DEPLOY_ENV: prod
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          cd watchtower
+          bash ./docker_build.sh
+          docker push "$IMAGE_REPOSITORY:$TAG"
+
+      - name: Build and push the staging image
+        if: steps.tag.outputs.push_staging == 'true'
+        env:
+          DEPLOY_ENV: staging
+          WATCHTOWER_ENDPOINT_URL: ${{ env.STAGING_ENDPOINT_URL }}
+          WATCHTOWER_VALIDATOR_HOTKEY: ${{ env.STAGING_VALIDATOR_HOTKEY }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          cd watchtower
+          bash ./docker_build.sh
+          docker push "$IMAGE_REPOSITORY:$TAG-staging"
+
+      - name: Check the tags are on Docker Hub
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PUSH_STAGING: ${{ steps.tag.outputs.push_staging }}
+        run: |
+          docker manifest inspect "$IMAGE_REPOSITORY:$TAG" > /dev/null
+          echo "published $IMAGE_REPOSITORY:$TAG"
+          if [ "$PUSH_STAGING" = "true" ]; then
+            docker manifest inspect "$IMAGE_REPOSITORY:$TAG-staging" > /dev/null
+            echo "published $IMAGE_REPOSITORY:$TAG-staging"
+          fi
