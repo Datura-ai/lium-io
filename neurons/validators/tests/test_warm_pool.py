@@ -19,6 +19,7 @@ import services.docker_service as ds_module
 from payload_models.payloads import (
     BootstrapRestoreSpec,
     ContainerCreated,
+    ContainerCreateRequest,
     CustomOptions,
     ExternalVolumeInfo,
     FailedContainerRequest,
@@ -271,6 +272,85 @@ def test_rentals_a_slot_cannot_serve_are_blocked(
             payload, options, is_custom_build=custom_build, image_managed_jupyter=jupyter
         )
         == expected
+    )
+
+
+# the field sets `adopt_block_reason` was written against (test_create_payload_field_set_is_pinned)
+PINNED_CREATE_REQUEST_FIELDS = frozenset(
+    {
+        "active_container_names",
+        "active_volume_names",
+        "available_ports",
+        "backup_log_id",
+        "bootstrap_restore",
+        "cache_volumes",
+        "cluster_membership",
+        "cpu_count",
+        "custom_options",
+        "debug",
+        "disk_share",
+        "docker_image",
+        "docker_password",
+        "docker_username",
+        "dockerfile_content",
+        "enable_jupyter",
+        "enable_volume_encryption",
+        "executor_id",
+        "external_volume_info",
+        "gpu_power_limits",
+        "gpu_uuids",
+        "is_sysbox",
+        "local_volume",
+        "memory_gb",
+        "message_type",
+        "min_volume_gb",
+        "miner_address",
+        "miner_hotkey",
+        "miner_port",
+        "pod_id",
+        "pod_mapping",
+        "pre_dispatch_profilers",
+        "restore_path",
+        "ships_sshd",
+        "storage_limit_gb",
+        "timestamp",
+        "user_public_keys",
+        "volume_limit_gb",
+        "workload_kind",
+    }
+)
+PINNED_CUSTOM_OPTIONS_FIELDS = frozenset(
+    {
+        "entrypoint",
+        "environment",
+        "initial_port_count",
+        "internal_ports",
+        "shm_size",
+        "startup_commands",
+        "volumes",
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "model, pinned",
+    [
+        (ContainerCreateRequest, PINNED_CREATE_REQUEST_FIELDS),
+        (CustomOptions, PINNED_CUSTOM_OPTIONS_FIELDS),
+    ],
+    ids=["ContainerCreateRequest", "CustomOptions"],
+)
+def test_create_payload_field_set_is_pinned(model, pinned):
+    """A create-time field `adopt_block_reason` has never seen must not be adopted by default."""
+    current = frozenset(model.model_fields)
+    added, removed = sorted(current - pinned), sorted(pinned - current)
+    assert current == pinned, (
+        f"{model.__name__} changed: added {added}, removed {removed}. "
+        "warm_pool.adopt_block_reason is a deny-list, so a rental that sets a new field is "
+        "adopted unless the function names it. Decide whether a warm slot can serve that rental; "
+        "if not, add a block reason to adopt_block_reason and a row to "
+        "test_rentals_a_slot_cannot_serve_are_blocked. Then update the pinned set above in the "
+        "same commit."
     )
 
 
