@@ -187,6 +187,11 @@ async def _lium_workload_live_now(ctx: Context) -> _LiumWorkload | None:
     snapshot knows them), or a pod it lists (BROKEN and DELETING pods are not listed). The same
     two lists are what `TenantEnforcementCheck` and the filler skip above trust at cycle start,
     so this grants at most the one cycle the snapshot missed.
+
+    A pod the backend marks `owner_flag` is the provider renting its own node
+    (lium-platform#432 sets it from the self-rent rule). That rental earns no incentive, so it
+    earns no waiver either: the probe verdict stands. A backend that does not send the field
+    yet parses as `owner_flag=False`, a customer pod, and waives as before.
     """
     try:
         fresh = await ctx.services.backend.get_rented_executors_now()
@@ -203,6 +208,12 @@ async def _lium_workload_live_now(ctx: Context) -> _LiumWorkload | None:
         )
     rented_executor = fresh.executors.get(executor_uuid)
     if rented_executor and rented_executor.pods:
+        if rented_executor.owner_flag:
+            logger.info(
+                "Executor %s holds the provider's own rental; the probe verdict stands",
+                executor_uuid,
+            )
+            return None
         return _LiumWorkload(
             kind="pod",
             container_names=tuple(sorted(pod.container_name for pod in rented_executor.pods)),
