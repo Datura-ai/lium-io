@@ -26,6 +26,35 @@ DIND_SSH_READY_TIMEOUT_SECONDS = 30
 DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 
+# B-176: reason codes for a failed probe, carried to the backend in `specs.runtime_probe` so
+# the provider sees why (the probe used to log at ERROR and vanish). The DinD container is
+# started with `--gpus all`, so the NVIDIA container runtime hook runs first; when the host's
+# driver and its user-space libraries disagree the hook fails before any command runs and the
+# executor's own container (`deploy.resources.reservations.devices: nvidia`) cannot start
+# either. That is the case an image update must wait for (ticket-0325).
+RUNTIME_PROBE_NVIDIA_MISMATCH = "NVIDIA_RUNTIME_MISMATCH"
+DIND_PROBE_FAILED = "DIND_PROBE_FAILED"
+RUNTIME_PROBE_ERROR_MAX_CHARS = 500
+_NVIDIA_MISMATCH_MARKERS = (
+    "driver/library version mismatch",
+    "nvidia-container-cli: initialization error",
+    "nvml error",
+)
+
+
+def classify_runtime_probe_error(error: str | None) -> str:
+    """Map the stderr of a failed `docker run --gpus all` to a reason code."""
+    text = (error or "").lower()
+    if any(marker in text for marker in _NVIDIA_MISMATCH_MARKERS):
+        return RUNTIME_PROBE_NVIDIA_MISMATCH
+    return DIND_PROBE_FAILED
+
+
+def _bounded_error(error: str | None) -> str | None:
+    if not error:
+        return None
+    return error[:RUNTIME_PROBE_ERROR_MAX_CHARS]
+
 
 class DindVerifier:
     """Verifies Docker-in-Docker capability."""
@@ -57,13 +86,21 @@ class DindVerifier:
             result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+                reason_code = classify_runtime_probe_error(error_msg)
+                logger.error(
+                    _m(
+                        "DinD creation failed",
+                        extra=get_extra_info({**log_ctx, "error": error_msg, "reason_code": reason_code}),
+                    )
+                )
                 await ssh_client.run(DockerCommand.remove_with_volumes(name))
                 return DindProbeResult(
                     success=False,
                     log_text=f"dind: check failed port={port.internal}",
                     sysbox_runtime=sysbox,
                     port=port,
+                    reason_code=reason_code,
+                    error=_bounded_error(error_msg),
                 )
 
             logger.info(_m("DinD container created", extra=get_extra_info(log_ctx)))
@@ -123,6 +160,8 @@ class DindVerifier:
                 log_text=f"dind: check failed port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
+                reason_code=DIND_PROBE_FAILED,
+                error=_bounded_error(str(e)),
             )
 
     async def _connect_retrying_until_sshd_answers(

@@ -22,6 +22,11 @@ class DindProbeResult:
     sysbox_runtime: bool
     port: PortPair | None
     log_text: str | None = None
+    # B-176: why the probe failed, for the provider. `reason_code` is one of the
+    # RUNTIME_PROBE_* codes in dind_probe.py; `error` is the bounded stderr of the failed
+    # `docker run`. Both None on success.
+    reason_code: str | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,8 @@ class PortVerificationResult:
     status: str
     error: str | None = None
     elapsed_sec: float | None = None
+    dind_reason_code: str | None = None
+    dind_error: str | None = None
 
 
 @dataclass(frozen=True)
