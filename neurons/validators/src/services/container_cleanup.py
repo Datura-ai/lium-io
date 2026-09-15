@@ -76,12 +76,8 @@ class ContainerCleanup:
         """Remove containers that are not in rented data and are older than threshold.
 
         `host_facts` (liumd phase 2, `services.local_verify_facts.LocalFacts`) is the executor's own
-        container listing with its clock. When it can age containers it stands in for the two
-        read-only listings here — `docker ps -a --filter` and the `inspect .Created` + `date +%s`
-        pair per unrented candidate — and for nothing else: a container the fact calls stale is
-        re-aged over SSH before `docker rm`, so an executor's word alone never removes anything.
-        The fact can only narrow the candidate list; a name it omits is a name the SSH listing
-        would have shown, and the host controlled that listing just the same.
+        container listing with its clock; when it has container ages it stands in for `docker ps -a
+        --filter` and the per-candidate age pair. The `docker rm` stays SSH-proven.
 
         Returns:
             Tuple of (number_removed, removed container names, orphaned containers that survived
@@ -94,25 +90,13 @@ class ContainerCleanup:
             "threshold_minutes": self.stale_threshold_minutes,
         }
 
-        # Outside the guarded block below: a fact that cannot be aged (a bug, an odd value the parser
-        # let through) must land on the SSH listing, not on "removed nothing this cycle".
+        # The fact-or-SSH choice is made before the guarded block: a fact that cannot be aged (a bug,
+        # an odd value the parser let through) must land on the SSH listing, not on "removed
+        # nothing this cycle".
+        fact_ages = self._fact_ages_or_none(host_facts, extra)
         try:
-            fact_ages = self._rental_container_age_minutes_from_facts(host_facts)
-        except Exception as e:  # noqa: BLE001 — the fact is an optimisation; SSH is the source of truth
-            logger.warning(
-                _m(
-                    "Container facts unusable, falling back to the SSH listing",
-                    extra={**extra, "error": str(e)},
-                )
-            )
-            fact_ages = None
-        try:
+            all_containers, fact_ages = await self._list_rental_containers(ssh_client, fact_ages)
             extra["from_facts"] = fact_ages is not None
-            if fact_ages is not None:
-                all_containers = list(fact_ages)
-            else:
-                # Get all containers with rental prefixes.
-                all_containers = await self._get_all_rental_containers(ssh_client)
             extra["total_containers"] = len(all_containers)
 
             # Get currently rented containers for this executor
@@ -186,6 +170,31 @@ class ContainerCleanup:
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    def _fact_ages_or_none(self, host_facts: "LocalFacts | None", extra: dict) -> "dict[str, float] | None":
+        """The per-container ages the executor's fact gives, or None when there is no usable fact;
+        a fact that raises is logged and treated as absent (the fact is an optimisation, SSH is the
+        source of truth)."""
+        try:
+            return self._rental_container_age_minutes_from_facts(host_facts)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                _m(
+                    "Container facts unusable, falling back to the SSH listing",
+                    extra={**extra, "error": str(e)},
+                )
+            )
+            return None
+
+    async def _list_rental_containers(
+        self, ssh_client, fact_ages: "dict[str, float] | None"
+    ) -> "tuple[list[str], dict[str, float] | None]":
+        """The rental-prefixed container names to consider this cycle: the fact's names when the
+        fact can age them, else the `docker ps -a --filter` listing over SSH. Returns the names and
+        the ages that came with them (None when the listing is SSH's)."""
+        if fact_ages is not None:
+            return list(fact_ages), fact_ages
+        return await self._get_all_rental_containers(ssh_client), None
 
     async def prune_dangling_anonymous_volumes(
         self,
@@ -489,7 +498,7 @@ class ContainerCleanup:
     ) -> dict[str, float | None] | None:
         """{name: age_minutes | None} for the fact's rental-prefixed containers, in the SSH
         listing's order; None when the fact cannot age containers (no listing, or no host clock)."""
-        if host_facts is None or not host_facts.can_age_containers():
+        if host_facts is None or not host_facts.has_container_ages():
             return None
         ages: dict[str, float | None] = {}
         for container in host_facts.containers:

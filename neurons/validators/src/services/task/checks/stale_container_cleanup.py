@@ -70,8 +70,7 @@ class StaleContainerCleanupCheck:
         if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
-            # liumd phase 2: the executor's own listing (checks/local_facts) replaces the `docker ps`
-            # and the per-candidate age pair when present; the `docker rm` stays SSH-proven.
+            # liumd phase 2: the container fact stands in for the listings (`local_verify_facts`).
             (
                 removed_count,
                 removed_names,

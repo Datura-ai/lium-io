@@ -37,11 +37,7 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
-        # liumd phase 2: ports the executor's docker already publishes (checks/local_facts) leave
-        # the probed batch — a bind there fails like a bind on a rented port. Host-reported, so the
-        # service applies it to the window it would probe today and never to the selection (it can
-        # shrink the batch, not move it); every port kept is still proven by the connect-back and
-        # the DinD/sysbox probe runs exactly as before. No skip and no verdict comes from the fact.
+        # liumd phase 2: the published-ports fact only shrinks the probed batch (`local_verify_facts`).
         facts = ctx.state.local_facts
         published_ports = (
             sorted(facts.published_ports)

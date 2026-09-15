@@ -78,7 +78,7 @@ class LocalFacts:
     executor_elapsed_ms: int = 0
     step_statuses: dict[str, str] = field(default_factory=dict)  # step -> status as answered
 
-    def can_age_containers(self) -> bool:
+    def has_container_ages(self) -> bool:
         return self.containers is not None and self.host_now is not None
 
 

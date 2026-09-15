@@ -25,6 +25,7 @@ from services.local_verify_client import (
     LocalVerifyClient,
     LocalVerifyUnavailable,
     build_intent,
+    executor_deadline_s,
 )
 from services.local_verify_facts import LocalFacts, parse_facts
 
@@ -33,13 +34,19 @@ from core.utils import _m, get_extra_info
 
 from ..messages import LocalFactsMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import LOCAL_VERIFY_OUTCOME_EVENT, CheckResult, Context
 
 logger = logging.getLogger(__name__)
 
-LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
-# The executor caps each fact collector at 20 s (FAST_STEP_TIMEOUT_SECONDS); ask for no more.
-FACTS_DEADLINE_S = 20
+# The executor caps each fact collector at 20 s (FAST_STEP_TIMEOUT_SECONDS); never ask for more.
+FACTS_DEADLINE_CAP_S = 20
+
+
+def facts_deadline_s() -> int:
+    """The intent's `deadline_s` for the facts call, derived like the GPU call's: the whole-call
+    budget minus the transport margin (`executor_deadline_s`), capped at the executor's collector
+    timeout. With the default 25 s budget that is 5 s, enough for the ~1 s the facts take."""
+    return min(FACTS_DEADLINE_CAP_S, executor_deadline_s(settings.LOCAL_VERIFY_FACTS_TIMEOUT_SECONDS))
 
 
 class LocalFactsCheck:
@@ -118,7 +125,7 @@ class LocalFactsCheck:
             matmul=None,
             verifyx=None,
             parallel_gpu=False,
-            deadline_s=FACTS_DEADLINE_S,
+            deadline_s=facts_deadline_s(),
         )
         if port is None:
             # The capability without the loopback port: `/verify` cannot be reached from the
@@ -159,7 +166,7 @@ class LocalFactsCheck:
         usable = [
             name
             for name, present in (
-                ("containers", facts.can_age_containers()),
+                ("containers", facts.has_container_ages()),
                 ("ports", facts.published_ports is not None),
                 ("inspector", facts.inspector_lib_sha256 is not None),
             )

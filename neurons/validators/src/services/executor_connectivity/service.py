@@ -37,12 +37,9 @@ class ExecutorConnectivityService:
     ) -> PortVerificationResult:
         """Verify executor port connectivity and DinD capability.
 
-        `published_ports` (liumd phase 2): host ports the executor's own docker reports as already
-        published — a bind on them fails the same way a bind on a rented port does. Host-reported,
-        so it is applied to the selected window, not to the selection: it only ever REMOVES ports
-        from the batch the validator would probe today, never moves the batch; which of the
-        remaining ports work is still proven by the connect-back, and none of this changes
-        `rented_ports`' meaning for the sysbox fallback below.
+        `published_ports` (liumd phase 2): host ports the executor's docker already publishes; they
+        are removed from the selected batch (`local_verify_facts`). `rented_ports` keeps its meaning
+        for the sysbox fallback below.
         """
         log_ctx = log_ctx or {}
         t1 = time.monotonic()

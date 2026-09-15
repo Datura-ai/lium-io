@@ -176,10 +176,8 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
-    # liumd phase 2: the executor's read-only host facts from the early facts-only `POST /verify`
-    # bounded and parsed. None = not asked or unusable; the stale cleanup and the port selector
-    # read them when present and run their SSH listings otherwise. Never a verdict: every fact
-    # only narrows what the SSH-proven steps go on to do.
+    # liumd phase 2: the bounded host facts of the early `POST /verify` (`local_verify_facts`);
+    # None = not asked or unusable.
     local_facts: LocalFacts | None = None
 
 

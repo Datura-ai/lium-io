@@ -196,7 +196,7 @@ def test_parse_facts_reads_ok_steps_only_and_needs_the_host_clock_to_age():
     }
     facts = parse_facts(steps, capabilities={CAPABILITY}, local_verify_port=7443, round_trip_ms=400, executor_elapsed_ms=350)
     assert facts.local_verify_port == 7443  # the GPU call tunnels to the port the facts call read
-    assert facts.can_age_containers()
+    assert facts.has_container_ages()
     assert facts.published_ports is None  # a step that is not ok contributes nothing
     assert facts.inspector_lib_sha256 == DIGEST
     assert facts.step_statuses == {"docker": "ok", "ports": "failed", "inspector": "ok"}
@@ -206,7 +206,7 @@ def test_parse_facts_reads_ok_steps_only_and_needs_the_host_clock_to_age():
         capabilities=set(), local_verify_port=None, round_trip_ms=0, executor_elapsed_ms=0,
     )
     assert no_clock.containers == () and no_clock.host_now is None
-    assert not no_clock.can_age_containers()  # a string clock (or a bool) is no clock
+    assert not no_clock.has_container_ages()  # a string clock (or a bool) is no clock
 
     # The clock is bounded: 0 < now < 2**40. A few-hundred-digit int parses as JSON and would
     # overflow the float division in the cleanup; here it is no clock at all.
@@ -215,7 +215,7 @@ def test_parse_facts_reads_ok_steps_only_and_needs_the_host_clock_to_age():
             {"docker": StepEvidence(status="ok", data={"containers": [], "now": bad_now})},
             capabilities=set(), local_verify_port=None, round_trip_ms=0, executor_elapsed_ms=0,
         )
-        assert facts.host_now is None and not facts.can_age_containers(), bad_now
+        assert facts.host_now is None and not facts.has_container_ages(), bad_now
 
 
 # --- the check -------------------------------------------------------------------------------------
@@ -249,12 +249,13 @@ async def test_the_facts_call_asks_for_no_gpu_step_and_leaves_bounded_facts(keyp
 
     (intent,) = executor.intents
     assert intent["steps"] == {"matmul": None, "verifyx": None, "docker": True, "ports": True, "inspector": True}
-    assert intent["parallel_gpu"] is False and intent["deadline_s"] == 20
+    # derived like the GPU call's: the 25 s default budget minus the 30 s transport margin, clamped to 5
+    assert intent["parallel_gpu"] is False and intent["deadline_s"] == 5
     # addressed like the GPU intent (the real route's check_intent_target refuses another miner's; the fake only echoes)
     assert intent["executor_uuid"] == ctx.executor.uuid and intent["miner_hotkey"] == ctx.miner_hotkey
     assert result.passed and result.event.reason_code == "LOCAL_FACTS_OK"
     facts: LocalFacts = result.updates["state"].local_facts
-    assert facts.can_age_containers() and len(facts.containers) == 3 and facts.host_now == HOST_NOW
+    assert facts.has_container_ages() and len(facts.containers) == 3 and facts.host_now == HOST_NOW
     assert facts.published_ports == frozenset({40000, 40001})
     assert facts.inspector_lib_sha256 == DIGEST
     assert facts.capabilities == frozenset({CAPABILITY})
@@ -296,7 +297,7 @@ async def test_a_refusal_or_a_malformed_answer_leaves_the_ssh_listings_in_place(
     assert result.passed and result.event.reason_code == "LOCAL_FACTS_UNAVAILABLE"
     facts = result.updates["state"].local_facts
     # Either no facts at all or facts that no reader can use: the consumers behave as with None.
-    assert facts.containers is None or not facts.can_age_containers()
+    assert facts.containers is None or not facts.has_container_ages()
     (line,) = outcome_lines(metric_log, "facts")
     assert line.outcome == "fallback" and line.reason == reason
     # ... and the first reader proves it: the cleanup runs its SSH listing as today.
@@ -553,7 +554,7 @@ def port_context(facts, *, rented_ports=(), filler_ports=(), port_range="40000-4
 
 
 @pytest.mark.asyncio
-async def test_published_ports_are_handed_to_the_selector_only_when_the_fact_is_present():
+async def test_published_ports_reach_the_connectivity_service_only_when_the_fact_is_present():
     ctx, connectivity = port_context(LocalFacts(published_ports=frozenset({40001, 40000})))
     result = await PortConnectivityCheck().run(ctx)
     assert result.passed

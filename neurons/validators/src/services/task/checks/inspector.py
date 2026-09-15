@@ -15,12 +15,11 @@ from core.utils import _m, get_extra_info
 from ..inspector_verdict import ACTION_QUARANTINE, InspectorVerdict, build_verdict, renter_access_event
 from ..messages import InspectorMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import LOCAL_VERIFY_OUTCOME_EVENT, CheckResult, Context
 from ..models import ValidationEvent
 from protocol.vc_protocol.compute_requests import RentedPod
 
 logger = logging.getLogger(__name__)
-LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
 
 
 class InspectorRentedCheck:
@@ -56,7 +55,7 @@ class InspectorRentedCheck:
             "rented": True,
             "rented_pods": [{"name": p.container_name, "pod_id": p.pod_id} for p in rented_pods],
         }
-        _observe_local_digest(ctx)
+        _log_inspector_digest_agreement(ctx)
 
         sensor_attested = _sensor_attested(ctx)
         result = await ctx.services.inspector.validate_rented_executor(
@@ -267,11 +266,9 @@ class InspectorRentedCheck:
         return CheckResult(passed=not acts, event=event, updates=updates)
 
 
-def _observe_local_digest(ctx: Context) -> None:
-    """liumd phase 2, observe-only: the executor's `inspector.lib_sha256` fact against the digest
-    `validate_rented_executor` is about to require over SSH (`sha256_from_executor`). Logged, never
-    consumed — the SSH pre-check and the inspector run below are unchanged; Loki's agreement rate
-    is what decides whether the fact may ever stand in for the pre-check (jam6099's call)."""
+def _log_inspector_digest_agreement(ctx: Context) -> None:
+    """Logs whether the executor's `inspector.lib_sha256` fact agrees with the digest the SSH
+    pre-check requires (`sha256_from_executor`); observe-only, see `local_verify_facts`."""
     facts = ctx.state.local_facts
     reported = facts.inspector_lib_sha256 if facts is not None else None
     if reported is None:
