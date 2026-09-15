@@ -160,7 +160,7 @@ class Host:
         log = self.docker_state / "calls.log"
         return log.read_text().splitlines() if log.exists() else []
 
-    def env(self, lock_wait: int = 5) -> dict:
+    def env(self, lock_wait: int = 5) -> dict[str, str]:
         env = dict(os.environ)
         env.update(
             PATH=f"{self.bin}:{env['PATH']}",
@@ -173,7 +173,9 @@ class Host:
         )
         return env
 
-    def guard(self, *args: str, checkout: Path | None = None, lock_wait: int = 5):
+    def guard(
+        self, *args: str, checkout: Path | None = None, lock_wait: int = 5
+    ) -> subprocess.CompletedProcess[str]:
         script = (checkout or self.checkout) / "cvm_upgrade_guard.sh"
         return subprocess.run(
             ["bash", str(script), *args],
@@ -183,7 +185,7 @@ class Host:
             timeout=60,
         )
 
-    def lium_cvm(self, *args: str, lock_wait: int = 5):
+    def lium_cvm(self, *args: str, lock_wait: int = 5) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(self.checkout / "lium-cvm.sh"), *args],
             cwd=self.checkout,
