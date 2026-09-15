@@ -117,5 +117,5 @@ def test_dockerfile_pins_the_base_by_digest_and_runs_the_setup():
     assert len(from_lines) == 1
     assert re.fullmatch(r"FROM python:3\.11-slim@sha256:[0-9a-f]{64}", from_lines[0])
     # the setup checks the executor's own sshd_config lines too, so it runs after they are appended
-    accept_env = next(i for i, line in enumerate(lines) if line.startswith("RUN echo 'AcceptEnv CONTAINER_NAME'"))
-    assert lines.index("RUN sh sshd_setup.sh") > accept_env
+    liumuser_block = next(i for i, line in enumerate(lines) if "cat sshd_liumuser.conf >>" in line)
+    assert lines.index("RUN sh sshd_setup.sh") > liumuser_block
