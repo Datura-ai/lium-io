@@ -4080,12 +4080,14 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         dind_name: str,
         dockerfile_content: str,
+        timeout: int | None = None,
     ) -> None:
         """Write the Dockerfile *inside* the DinD container without argv exposure.
 
         Streams user content via stdin into `cat` (through `docker exec -i`) so
         arbitrary content (`EOF` markers, backticks, `$(...)`) cannot escape into
-        the shell. Only the controlled container name reaches argv.
+        the shell. Only the controlled container name reaches argv. `timeout`
+        bounds the SSH command (asyncssh raises `asyncio.TimeoutError`).
         """
         ctx = self._DIND_BUILD_CONTEXT
         inner = f"mkdir -p {ctx} && cat > {ctx}/Dockerfile"
@@ -4093,7 +4095,9 @@ class DockerService:
             f"/usr/bin/docker exec -i {shlex.quote(dind_name)} "
             f"sh -c {shlex.quote(inner)}"
         )
-        result = await ssh_client.run(command, input=dockerfile_content, check=False)
+        result = await ssh_client.run(
+            command, input=dockerfile_content, check=False, timeout=timeout
+        )
         if result.exit_status != 0:
             stderr = (result.stderr or "").strip()
             raise RuntimeError(
@@ -4129,7 +4133,49 @@ class DockerService:
         return cidrs
 
     @staticmethod
-    def _egress_filter_script(dind_ip: str, cidrs: list[str], apply: bool) -> str:
+    def _parse_dind_nameservers(resolv_conf: str, cidrs: list[str]) -> list[str]:
+        """The DinD container's IPv4 nameservers that sit inside a blocked CIDR.
+
+        Docker copies the host's upstream resolvers into the container's
+        /etc/resolv.conf. On a host whose resolver is private (a cloud VPC
+        resolver at the .2 of a 10/8 or 172.16/12 network, a datacenter
+        resolver in 10/8, a router in 192.168/16) that address falls inside
+        the egress block, the
+        DROP rules eat every DNS query and `docker build --pull` fails on
+        `FROM` after the resolver timeout (12 to 15 s with one nameserver,
+        23 s with two, measured from `Building custom image` to the failure:
+        18 of 23 production `docker_build` failures in 1 to 15 Sep 2026 had
+        exactly that duration, a constant per node). Those servers get an
+        ACCEPT on port 53 only; a public resolver needs no rule and is left
+        out.
+        """
+        blocked = []
+        for c in cidrs:
+            try:
+                blocked.append(ipaddress.ip_network(c, strict=False))
+            except ValueError:
+                continue
+        servers: list[str] = []
+        for raw_line in (resolv_conf or "").splitlines():
+            parts = raw_line.split("#", 1)[0].split(";", 1)[0].split()
+            if len(parts) < 2 or parts[0] != "nameserver":
+                continue
+            try:
+                addr = ipaddress.ip_address(parts[1])
+            except ValueError:
+                continue
+            if addr.version != 4:
+                continue
+            if not any(addr in net for net in blocked):
+                continue
+            if str(addr) not in servers:
+                servers.append(str(addr))
+        return servers
+
+    @staticmethod
+    def _egress_filter_script(
+        dind_ip: str, cidrs: list[str], apply: bool, dns_servers: list[str] | tuple[str, ...] = ()
+    ) -> str:
         """Backend-agnostic iptables script for the host DOCKER-USER chain.
 
         Runs inside a `--network=host --cap-add=NET_ADMIN` helper container so it
@@ -4138,8 +4184,14 @@ class DockerService:
         DOCKER-USER chain. Rules are scoped to the DinD container's source IP so
         DinD-internal docker networking (172.x bridges) is never affected.
 
-        `dind_ip` and `cidrs` are pre-validated via `ipaddress`, so they are
-        shell-safe to interpolate.
+        `dns_servers` are the DinD's own resolvers inside the blocked ranges
+        (see `_parse_dind_nameservers`). Each gets an ACCEPT for udp/tcp port
+        53 inserted AFTER the DROP rules, so `-I` puts it above them and only
+        DNS to that one address passes; port 80 to a metadata service on the
+        same address stays dropped.
+
+        `dind_ip`, `cidrs` and `dns_servers` are pre-validated via `ipaddress`,
+        so they are shell-safe to interpolate.
         """
         lines = [
             "IPT=iptables-nft",
@@ -4157,7 +4209,20 @@ class DockerService:
                     f"$IPT -C DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || "
                     f"$IPT -I DOCKER-USER -s {dind_ip} -d {c} -j DROP"
                 )
+            for ns in dns_servers:
+                for proto in ("udp", "tcp"):
+                    rule = f"-s {dind_ip} -d {ns} -p {proto} --dport 53 -j ACCEPT"
+                    lines.append(
+                        f"$IPT -C DOCKER-USER {rule} 2>/dev/null || "
+                        f"$IPT -I DOCKER-USER {rule}"
+                    )
         else:
+            for ns in dns_servers:
+                for proto in ("udp", "tcp"):
+                    lines.append(
+                        f"$IPT -D DOCKER-USER -s {dind_ip} -d {ns} -p {proto} --dport 53 -j ACCEPT "
+                        f"2>/dev/null || true"
+                    )
             for c in cidrs:
                 lines.append(
                     f"$IPT -D DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || true"
@@ -4186,6 +4251,12 @@ class DockerService:
         ctx = self._DIND_BUILD_CONTEXT
         timeout_s = int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
         ready_timeout_s = int(settings.CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS)
+        # Bound for each setup command before the build (sysbox preflight, DinD
+        # start including its image pull, IP and resolver reads, the firewall
+        # helper, the Dockerfile write); the readiness loop keeps its own
+        # `ready_timeout_s`. Before this bound a hung `docker run` here kept
+        # the renter PENDING until the backend's 1 h stale-pod sweep.
+        setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         dind_image = settings.CUSTOM_DOCKERFILE_DIND_IMAGE
         cidrs = self._parse_egress_block_cidrs(settings.CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS)
 
@@ -4209,7 +4280,9 @@ class DockerService:
         #    daemon with no user-namespace containment, defeating the design.
         try:
             info = await ssh_client.run(
-                "/usr/bin/docker info --format '{{json .Runtimes}}'", check=False
+                "/usr/bin/docker info --format '{{json .Runtimes}}'",
+                check=False,
+                timeout=setup_timeout_s,
             )
             if info.exit_status != 0 or "sysbox-runc" not in (info.stdout or ""):
                 await self.stream_log(
@@ -4235,20 +4308,48 @@ class DockerService:
             return False, "build_sysbox_unavailable"
 
         dind_ip: str | None = None
+        dns_servers: list[str] = []
         egress_applied = False
         try:
             # 2. Launch the throwaway DinD build container under sysbox-runc.
             await self.stream_log(
                 f"Starting isolated build container {dind_name}", "success", log_tag
             )
+            # `timeout(1)` on the executor kills the `docker run` (and so the
+            # image pull) when it outlives the bound: asyncssh's own `timeout=`
+            # only stops waiting, the remote command would run on. The
+            # `docker rm -fv` in the finally removes a container that came up
+            # in between.
             run_dind = (
+                f"timeout -k 5 {setup_timeout_s} "
                 f"/usr/bin/docker run -d --runtime=sysbox-runc "
                 f"--name {shlex.quote(dind_name)} "
                 f"--cpus={shlex.quote(str(settings.CUSTOM_DOCKERFILE_DIND_CPUS))} "
                 f"--memory={shlex.quote(str(settings.CUSTOM_DOCKERFILE_DIND_MEMORY))} "
                 f"{shlex.quote(dind_image)}"
             )
-            start_res = await ssh_client.run(run_dind, check=False)
+            try:
+                start_res = await ssh_client.run(
+                    run_dind, check=False, timeout=setup_timeout_s + 15
+                )
+            except asyncio.TimeoutError:
+                await self.stream_log(
+                    f"Build container did not start within {setup_timeout_s}s", "error", log_tag
+                )
+                logger.error(
+                    _m(
+                        "Custom build DinD start timed out",
+                        extra=get_extra_info(
+                            {**default_extra, "setup_timeout_s": setup_timeout_s}
+                        ),
+                    )
+                )
+                return False, "build_dind_start"
+            if start_res.exit_status == 124:
+                # coreutils `timeout` exit code: the start (usually its image pull) outlived the bound.
+                await self.stream_log(
+                    f"Build container did not start within {setup_timeout_s}s", "error", log_tag
+                )
             if start_res.exit_status != 0:
                 logger.error(
                     _m(
@@ -4260,17 +4361,24 @@ class DockerService:
                 )
                 return False, "build_dind_start"
 
-            # 3. Wait for the inner dockerd to accept connections.
-            ready = False
-            for _ in range(max(1, ready_timeout_s)):
-                probe = await ssh_client.run(
-                    f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info",
-                    check=False,
-                )
-                if probe.exit_status == 0:
-                    ready = True
-                    break
-                await asyncio.sleep(1)
+            # 3. Wait for the inner dockerd to accept connections. The loop as a
+            #    whole is bounded by `ready_timeout_s`, so a probe that hangs
+            #    costs the same as probes that keep failing.
+            async def _wait_dind_ready() -> bool:
+                for _ in range(max(1, ready_timeout_s)):
+                    probe = await ssh_client.run(
+                        f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info",
+                        check=False,
+                    )
+                    if probe.exit_status == 0:
+                        return True
+                    await asyncio.sleep(1)
+                return False
+
+            try:
+                ready = await asyncio.wait_for(_wait_dind_ready(), timeout=ready_timeout_s)
+            except asyncio.TimeoutError:
+                ready = False
             if not ready:
                 logger.error(
                     _m(
@@ -4284,12 +4392,22 @@ class DockerService:
 
             # 4. Resolve the DinD container IP and firewall its egress host-side
             #    (block cloud metadata + RFC1918; full public internet stays open).
-            ip_res = await ssh_client.run(
-                "/usr/bin/docker inspect -f "
-                "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
-                f"{shlex.quote(dind_name)}",
-                check=False,
-            )
+            try:
+                ip_res = await ssh_client.run(
+                    "/usr/bin/docker inspect -f "
+                    "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
+                    f"{shlex.quote(dind_name)}",
+                    check=False,
+                    timeout=setup_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    _m(
+                        "Custom build DinD inspect timed out",
+                        extra=get_extra_info({**default_extra, "setup_timeout_s": setup_timeout_s}),
+                    )
+                )
+                return False, "build_egress_setup"
             raw_ip = (ip_res.stdout or "").strip()
             try:
                 dind_ip = str(ipaddress.ip_address(raw_ip))
@@ -4302,7 +4420,45 @@ class DockerService:
                 )
                 return False, "build_egress_setup"
 
-            apply_script = self._egress_filter_script(dind_ip, cidrs, apply=True)
+            # The DinD's resolvers that the block would otherwise eat. Read
+            # from the container itself: that file is what its dockerd (and
+            # so every build step) will query. Unreadable -> no DNS exception,
+            # the build runs under today's rules.
+            try:
+                resolv_res = await ssh_client.run(
+                    f"/usr/bin/docker exec {shlex.quote(dind_name)} cat /etc/resolv.conf",
+                    check=False,
+                    timeout=setup_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    _m(
+                        "Custom build DinD resolv.conf read timed out",
+                        extra=get_extra_info({**default_extra, "setup_timeout_s": setup_timeout_s}),
+                    )
+                )
+                return False, "build_egress_setup"
+            if resolv_res.exit_status == 0:
+                dns_servers = self._parse_dind_nameservers(resolv_res.stdout or "", cidrs)
+            else:
+                logger.warning(
+                    _m(
+                        "Custom build could not read the DinD resolv.conf",
+                        extra=get_extra_info(
+                            {**default_extra, "stderr": (resolv_res.stderr or "").strip()}
+                        ),
+                    )
+                )
+            if dns_servers:
+                await self.stream_log(
+                    f"Build DNS goes to {', '.join(dns_servers)} (allowed through the egress filter)",
+                    "success",
+                    log_tag,
+                )
+
+            apply_script = self._egress_filter_script(
+                dind_ip, cidrs, apply=True, dns_servers=dns_servers
+            )
             egress_cmd = (
                 f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
                 f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
@@ -4313,7 +4469,8 @@ class DockerService:
                 command=egress_cmd,
                 log_tag=log_tag,
                 log_text="Applying build egress firewall",
-                log_extra={**default_extra, "dind_ip": dind_ip},
+                log_extra={**default_extra, "dind_ip": dind_ip, "dns_servers": dns_servers},
+                timeout=setup_timeout_s,
                 raise_exception=False,
             )
             if not ok:
@@ -4332,7 +4489,9 @@ class DockerService:
                 f"Preparing build context in {dind_name}", "success", log_tag
             )
             try:
-                await self._write_dockerfile_into_dind(ssh_client, dind_name, content)
+                await self._write_dockerfile_into_dind(
+                    ssh_client, dind_name, content, timeout=setup_timeout_s
+                )
             except Exception as exc:
                 logger.error(
                     _m(
@@ -4415,6 +4574,7 @@ class DockerService:
                 dind_ip=dind_ip if egress_applied else None,
                 cidrs=cidrs,
                 default_extra=default_extra,
+                dns_servers=dns_servers,
             )
 
     async def _teardown_dind_build(
@@ -4425,20 +4585,27 @@ class DockerService:
         dind_ip: str | None,
         cidrs: list[str],
         default_extra: dict,
+        dns_servers: list[str] | tuple[str, ...] = (),
     ) -> None:
         """Best-effort teardown of the throwaway DinD container + its egress rules.
 
         Always called from `_custom_build_image`'s finally. Failures are logged,
         never raised — the rental flow must not break on cleanup.
         """
+        from core.config import settings
+
+        setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         if dind_ip:
             try:
-                remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)
+                remove_script = self._egress_filter_script(
+                    dind_ip, cidrs, apply=False, dns_servers=dns_servers
+                )
                 await ssh_client.run(
                     f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
                     f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
                     f"-c {shlex.quote(remove_script)}",
                     check=False,
+                    timeout=setup_timeout_s,
                 )
             except Exception as exc:  # noqa: BLE001 — best-effort
                 logger.warning(
@@ -4453,6 +4620,7 @@ class DockerService:
             await ssh_client.run(
                 f"/usr/bin/docker rm -fv {shlex.quote(dind_name)} 2>/dev/null || true",
                 check=False,
+                timeout=setup_timeout_s,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
