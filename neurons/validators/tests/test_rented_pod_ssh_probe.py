@@ -461,3 +461,27 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
 
     with patch("asyncio.open_connection", new=hang):
         assert await tcp_connect_fault("127.0.0.1", open_port, timeout=0.05) == FAULT_TCP_TIMEOUT
+
+
+def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
+    # Regression for the bare-dict version: a `count` that was not a non-negative int fell back to 0
+    # in one place and was read raw in another. The dataclass owns the rule and the wire format.
+    now = "2026-09-15T15:00:00+00:00"
+    stored = rented_pod_ssh.FailStreak(count=2, first_failed_at="2026-09-15T14:30:00+00:00")
+    loaded = rented_pod_ssh.FailStreak.load(stored.dump().encode(), now_iso=now)
+    assert loaded == stored
+    assert loaded.next() == rented_pod_ssh.FailStreak(
+        count=3, first_failed_at=stored.first_failed_at
+    )
+    assert json.loads(stored.dump()) == {"count": 2, "first_failed_at": stored.first_failed_at}
+
+    for raw in (None, b"not json", b"[1]", b'{"count": "2"}', b'{"count": -1}', b'{"count": true}'):
+        assert rented_pod_ssh.FailStreak.load(raw, now_iso=now) == rented_pod_ssh.FailStreak(
+            count=0, first_failed_at=now
+        ), raw
+
+    ok = rented_pod_ssh.OkMark(at=now, boot_id="boot-a")
+    assert rented_pod_ssh.OkMark.load(ok.dump()) == ok
+    assert rented_pod_ssh.OkMark.load(b'{"at": "x"}') == rented_pod_ssh.OkMark(at="x", boot_id=None)
+    assert rented_pod_ssh.OkMark.load(None) is None
+    assert rented_pod_ssh.OkMark.load(b"garbage") is None

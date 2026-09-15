@@ -96,6 +96,61 @@ def _decode(raw: object) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+@dataclass(frozen=True)
+class OkMark:
+    """The `ok` key: when this validator last saw the pod healthy, and the host's boot_id then."""
+
+    at: str
+    boot_id: str | None
+
+    @classmethod
+    def load(cls, raw: object) -> OkMark | None:
+        """None when the key is absent or unreadable (not JSON, not an object)."""
+        value = _decode(raw)
+        if value is None:
+            return None
+        boot_id = value.get("boot_id")
+        return cls(
+            at=str(value.get("at") or ""), boot_id=boot_id if isinstance(boot_id, str) else None
+        )
+
+    def dump(self) -> str:
+        return json.dumps({"at": self.at, "boot_id": self.boot_id})
+
+
+@dataclass(frozen=True)
+class FailStreak:
+    """The `fail` key: how many consecutive cycles the pod has failed, and when the first one was."""
+
+    count: int
+    first_failed_at: str
+
+    @classmethod
+    def load(cls, raw: object, *, now_iso: str) -> FailStreak:
+        """The stored streak, or an empty one (count 0, started now) when the key is absent or unreadable.
+
+        A count that is not a non-negative int is treated as 0, so a corrupt value restarts the streak
+        instead of raising inside the check.
+        """
+        value = _decode(raw) or {}
+        count = value.get("count", 0)
+        first_failed_at = value.get("first_failed_at")
+        return cls(
+            count=count
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            else 0,
+            first_failed_at=first_failed_at
+            if isinstance(first_failed_at, str) and first_failed_at
+            else now_iso,
+        )
+
+    def next(self) -> FailStreak:
+        return replace(self, count=self.count + 1)
+
+    def dump(self) -> str:
+        return json.dumps({"count": self.count, "first_failed_at": self.first_failed_at})
+
+
 async def tcp_connect_fault(host: str, port: int, timeout: float) -> str | None:
     """None when the port accepts a TCP connection; else the fault name."""
     try:
@@ -182,11 +237,7 @@ async def _judge_with_streak(
     now_iso = datetime.now(UTC).isoformat()
 
     if not faults:
-        await store.set(
-            _ok_key(pod.pod_id),
-            json.dumps({"at": now_iso, "boot_id": boot_id_now}),
-            ex=ttl,
-        )
+        await store.set(_ok_key(pod.pod_id), OkMark(at=now_iso, boot_id=boot_id_now).dump(), ex=ttl)
         await store.delete(_fail_key(pod.pod_id))
         return RentedPodSshVerdict(
             pod_id=pod.pod_id,
@@ -195,7 +246,7 @@ async def _judge_with_streak(
             healthy=True,
         )
 
-    ok_mark = _decode(await store.get(_ok_key(pod.pod_id)))
+    ok_mark = OkMark.load(await store.get(_ok_key(pod.pod_id)))
     if ok_mark is None:
         # Never seen healthy by this validator: a template without sshd, a pod still coming up, or
         # a deploy that never worked. Not this outage class; nothing is counted.
@@ -207,22 +258,17 @@ async def _judge_with_streak(
             faults=faults,
         )
 
-    streak = _decode(await store.get(_fail_key(pod.pod_id))) or {}
-    previous = streak.get("count", 0)
-    consecutive = (previous if isinstance(previous, int) and previous >= 0 else 0) + 1
-    first_failed_at = streak.get("first_failed_at") or now_iso
+    streak = FailStreak.load(await store.get(_fail_key(pod.pod_id)), now_iso=now_iso).next()
+    consecutive = streak.count
+    first_failed_at = streak.first_failed_at
     # The ok mark is what makes the streak count; renew its TTL so an outage longer than the TTL
     # keeps naming the pod in the event instead of silently falling back to RENTED. Renewed BEFORE
     # the count is written: the count is the last Redis write before the report decision, so a
     # Redis error can never leave `count == threshold` stored without the one POST that goes with it.
-    await store.set(_ok_key(pod.pod_id), json.dumps(ok_mark), ex=ttl)
-    await store.set(
-        _fail_key(pod.pod_id),
-        json.dumps({"count": consecutive, "first_failed_at": first_failed_at}),
-        ex=ttl,
-    )
+    await store.set(_ok_key(pod.pod_id), ok_mark.dump(), ex=ttl)
+    await store.set(_fail_key(pod.pod_id), streak.dump(), ex=ttl)
 
-    boot_id_at_ok = ok_mark.get("boot_id")
+    boot_id_at_ok = ok_mark.boot_id
     boot_id_changed = boot_id_at_ok != boot_id_now if boot_id_at_ok and boot_id_now else None
     threshold = settings.RENTED_POD_SSH_PROBE_CYCLES
     verdict = RentedPodSshVerdict(
