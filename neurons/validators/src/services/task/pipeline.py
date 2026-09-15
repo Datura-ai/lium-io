@@ -19,6 +19,7 @@ from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
 from services.local_verify_client import BackgroundProbe, LocalVerifyOutcome
+from services.local_verify_facts import LocalFacts
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
@@ -176,10 +177,10 @@ class ContextState:
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
     # liumd phase 2: the executor's read-only host facts from the early facts-only `POST /verify`
-    # (services.local_verify_facts.LocalFacts), bounded and parsed. None = not asked or unusable;
-    # the stale cleanup and the port selector read them when present and run their SSH listings
-    # otherwise. Never a verdict: every fact only narrows what the SSH-proven steps go on to do.
-    local_facts: Any | None = None
+    # bounded and parsed. None = not asked or unusable; the stale cleanup and the port selector
+    # read them when present and run their SSH listings otherwise. Never a verdict: every fact
+    # only narrows what the SSH-proven steps go on to do.
+    local_facts: LocalFacts | None = None
 
 
 class CheckResult(BaseModel):

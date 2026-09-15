@@ -16,6 +16,7 @@ default (`LOCAL_VERIFY_FACTS_ENABLED`, under `VALIDATOR_LOCAL_VERIFY_ENABLED`).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 
 from services.local_verify_client import (
@@ -45,7 +46,7 @@ class LocalFactsCheck:
     check_id = "executor.local_facts"
     fatal = False
 
-    def __init__(self, client_factory=None):
+    def __init__(self, client_factory: Callable[[Context], LocalVerifyClient] | None = None):
         self._client_factory = client_factory or self._default_client
 
     @staticmethod

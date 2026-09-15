@@ -276,7 +276,7 @@ def _observe_local_digest(ctx: Context) -> None:
     reported = facts.inspector_lib_sha256 if facts is not None else None
     if reported is None:
         return
-    expected = getattr(ctx.services.inspector, "local_checksum", None)
+    expected = ctx.services.inspector.local_checksum
     logger.info(
         _m(
             LOCAL_VERIFY_OUTCOME_EVENT,
