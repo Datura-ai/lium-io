@@ -140,11 +140,9 @@ _CONTAINER_GPU_ACCESS_MARKERS = (
     "no CUDA-capable device",
     "CUDA driver version is insufficient for CUDA runtime version",
 )
-# cudaMalloc failing for memory (DAH-3264: 49 such verdicts on 31 executors in 26 h).
-_VRAM_UNAVAILABLE_MARKERS = (
-    "out of memory",
-    "cudaErrorMemoryAllocation",
-)
+# cudaMalloc failing for memory (DAH-3264: 49 such verdicts on 31 executors in 26 h); the message
+# form only — cudaGetErrorString(cudaErrorMemoryAllocation) is "out of memory".
+_VRAM_UNAVAILABLE_MARKERS = ("out of memory",)
 _NO_UUID = {"", "none", "null"}
 
 
@@ -158,7 +156,7 @@ def _failure_template(result: ValidationResult | None) -> MessageTemplate:
 
     A timeout keeps its own reason. An answer with no uuid is classified by what stderr/stdout
     says: CUDA not ready (fabric) → `VERIFY_FAILED_CUDA_NOT_READY`, no CUDA device →
-    `VERIFY_FAILED_CONTAINER_GPU_ACCESS`, out of memory → `VERIFY_FAILED_VRAM_UNAVAILABLE`.
+    `VERIFY_FAILED_NO_CUDA_DEVICE`, out of memory → `VERIFY_FAILED_VRAM_UNAVAILABLE`.
     Each is its own reason code, as `GPU_VERIFY_TIMEOUT` is. A returned uuid that does not match
     — the anti-spoof case; the expected uuid is a per-call nonce, so a genuine executor never
     answers a wrong one — stays the generic `VERIFY_FAILED`, whatever stderr says. So does any
@@ -180,7 +178,7 @@ def _failure_template(result: ValidationResult | None) -> MessageTemplate:
     output = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
     for markers, template in (
         (_CUDA_NOT_READY_MARKERS, Msg.VERIFY_FAILED_CUDA_NOT_READY),
-        (_CONTAINER_GPU_ACCESS_MARKERS, Msg.VERIFY_FAILED_CONTAINER_GPU_ACCESS),
+        (_CONTAINER_GPU_ACCESS_MARKERS, Msg.VERIFY_FAILED_NO_CUDA_DEVICE),
         (_VRAM_UNAVAILABLE_MARKERS, Msg.VERIFY_FAILED_VRAM_UNAVAILABLE),
     ):
         if any(m.lower() in output for m in markers):

@@ -481,7 +481,7 @@ def test_capability_sub_reason_wording_is_provider_facing():
     for template in (
         Msg.VERIFY_FAILED,
         Msg.VERIFY_FAILED_CUDA_NOT_READY,
-        Msg.VERIFY_FAILED_CONTAINER_GPU_ACCESS,
+        Msg.VERIFY_FAILED_NO_CUDA_DEVICE,
         Msg.VERIFY_FAILED_VRAM_UNAVAILABLE,
     ):
         text = template.remediation.lower()
