@@ -54,6 +54,18 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
 EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (seconds)
+# DAH-3436 (review): the per-executor CREATE lock. `create_container` sweeps every `pod_*` container it
+# is not told about, so two creates on one node must not overlap: a renter's create holds this lock from
+# before its call until create_container returns (executor_create_exclusion); the rental probe takes it
+# without waiting, skips the node when it is held, and holds it for at most its idleness re-read budget
+# plus its create deadline (rental_probe.py: 30 s + _CREATE_DEADLINE_SECONDS 300 s). The TTL outlasts
+# that whole hold, so the lock cannot lapse while the probe's create is still to sweep, and a renter's
+# create waits as long: the wait ends when the probe's create returns, in practice tens of seconds, and
+# at the deadline on a host where the renter's own create would hang the same way. Distinct from
+# `lock:executor:` (port allocation), which create_container takes itself and would deadlock on if it
+# shared the key.
+EXECUTOR_CREATE_LOCK_TIMEOUT = 360  # TTL (seconds)
+EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT = 360  # a renter's create waits at most this long
 
 # DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
 # meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
@@ -155,6 +167,60 @@ class RedisService:
             )
             raise
 
+    def executor_create_lock(self, executor_id: str) -> aioredis.lock.Lock:
+        """The per-executor create lock (DAH-3436, review); see EXECUTOR_CREATE_LOCK_TIMEOUT.
+
+        Not taken here: a renter's create takes it through `executor_create_exclusion`, the rental probe
+        with `acquire(blocking=False)` so it never makes a renter wait.
+        """
+        return aioredis.lock.Lock(
+            self.redis,
+            f"lock:executor-create:{executor_id}",
+            timeout=EXECUTOR_CREATE_LOCK_TIMEOUT,
+            blocking_timeout=EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT,
+        )
+
+    @asynccontextmanager
+    async def executor_create_exclusion(self, executor_id: str):
+        """Hold the per-executor create lock around a renter's create_container (DAH-3436, review).
+
+        The lock keeps the rental probe off a node whose rent is being created (the probe's sweep would
+        remove the renter's `pod_*` container) and makes a renter's create wait while the probe's create
+        is on the host, at most EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT (a second renter create on the same
+        executor waits behind the first the same way). A lock that cannot be taken (Redis unreachable, or
+        still held at the deadline) is logged and the create goes ahead: the validator's own housekeeping
+        never refuses a renter. Yields whether the lock is held. A release after the TTL passed
+        (LockNotOwnedError) is expected for a slow create and ignored.
+        """
+        lock = self.executor_create_lock(executor_id)
+        held = False
+        try:
+            held = bool(await lock.acquire())
+            if not held:
+                logger.warning(
+                    _m(f"Create lock for executor {executor_id} still held at the deadline; creating without it")
+                )
+        except Exception as e:
+            logger.warning(
+                _m(
+                    f"Create lock for executor {executor_id} could not be taken; creating without it",
+                    extra={"error": str(e)},
+                )
+            )
+        try:
+            yield held
+        finally:
+            if held:
+                try:
+                    await lock.release()
+                except Exception as e:
+                    logger.debug(
+                        _m(
+                            f"Create lock for executor {executor_id} was not released",
+                            extra={"error": str(e)},
+                        )
+                    )
+
     async def publish(self, channel: str, message: dict):
         """Publish a message to a Redis channel."""
         await self.redis.publish(channel, json.dumps(message))
@@ -197,10 +263,10 @@ class RedisService:
     async def clear_forced_validation_cycle_request(self) -> None:
         await self.delete(FORCED_VALIDATION_CYCLE_KEY)
 
-    async def set(self, key: str, value: str):
-        """Set a key-value pair in Redis."""
+    async def set(self, key: str, value: str, ex: int | None = None):
+        """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
         async with self.lock:
-            await self.redis.set(key, value)
+            await self.redis.set(key, value, ex=ex)
 
     async def get(self, key: str):
         """Get a value by key from Redis."""

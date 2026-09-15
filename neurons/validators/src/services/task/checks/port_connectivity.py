@@ -68,6 +68,7 @@ class PortConnectivityCheck:
             },
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=verified_port_count,
+            verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
         )
 
         # DAH-2272 (tolerate): a customer rental force-removes port-check / DinD

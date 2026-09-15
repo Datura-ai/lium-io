@@ -1165,12 +1165,15 @@ class MinerService:
                                 ),
                             ),
                         )
-                        result = await docker_service.create_container(
-                            payload,
-                            executor,
-                            my_key,
-                            private_key.decode("utf-8"),
-                        )
+                        # DAH-3436 (review): the rental probe takes the same per-executor lock before its
+                        # own create, so its sweep of `pod_*` containers never runs beside this create
+                        async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                            result = await docker_service.create_container(
+                                payload,
+                                executor,
+                                my_key,
+                                private_key.decode("utf-8"),
+                            )
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
@@ -2342,12 +2345,14 @@ class MinerService:
                             ),
                         ),
                     )
-                    result = await docker_service.create_container(
-                        payload,
-                        executor,
-                        my_key,
-                        private_key.decode("utf-8"),
-                    )
+                    # DAH-3436 (review): shared with the rental probe's create, see executor_create_exclusion
+                    async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                        result = await docker_service.create_container(
+                            payload,
+                            executor,
+                            my_key,
+                            private_key.decode("utf-8"),
+                        )
                 elif isinstance(payload, ContainerDeleteRequest):
                     logger.info(
                         _m(
