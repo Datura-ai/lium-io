@@ -59,16 +59,12 @@ from core.utils import _m, get_extra_info
 
 from ..messages import LocalVerifyMessages as Msg
 from ..messages import render_message
-from ..pipeline import RENTAL_PROBE_OUTCOME_EVENT, CheckResult, Context
+from ..pipeline import LOCAL_VERIFY_OUTCOME_EVENT, CheckResult, Context
 from .capability import _get_filler_only_container
-from .rental_verification import RentalProbe, rental_probe_request
+from .rental_verification import HealthCheckProbe, health_check_probe_request
 from .verifyx import _first_pass_challenge_config
 
 logger = logging.getLogger(__name__)
-
-# One event name for every reading of the call, GPU steps and rental probe alike, so Loki counts
-# them together; `pipeline.py` owns the string.
-LOCAL_VERIFY_OUTCOME_EVENT = RENTAL_PROBE_OUTCOME_EVENT
 
 
 def _step_reason(step) -> str:
@@ -145,7 +141,7 @@ class LocalVerifyCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
             )
-        started: list[RentalProbe] = []  # the probe, if _run started one before it raised
+        started: list[HealthCheckProbe] = []  # the probe, if _run started one before it raised
         try:
             return await self._run(ctx, started)
         except Exception as exc:  # noqa: BLE001 — the pipeline has no guard; a bug here must not end the node's cycle
@@ -168,25 +164,25 @@ class LocalVerifyCheck:
                     probe.task.exception()
             raise
 
-    def _start_rental_probe(self, ctx: Context) -> RentalProbe | None:
+    def _start_health_check_probe(self, ctx: Context) -> HealthCheckProbe | None:
         """Phase 2 (LOCAL_VERIFY_RENTAL_PROBE_PARALLEL): start the backend rental probe now, so
         its ≈ 25 s (rent a probe pod, wait for sshd + nvidia-smi inside) overlap the executor's
         GPU steps instead of following them. First pass only — the probe pod takes the GPUs by
         UUID while the first-pass matmul (8 GB VRAM) and VerifyX run; full-size cycles keep the
         serial order (the `parallel_gpu` rule). The request is the one `RentalVerificationCheck`
-        would build (`rental_probe_request`), and that check consumes the task only if its own
+        would build (`health_check_probe_request`), and that check consumes the task only if its own
         request is identical."""
         if not settings.LOCAL_VERIFY_RENTAL_PROBE_PARALLEL or not ctx.config.first_pass:
             return None
-        request = rental_probe_request(ctx)
+        request = health_check_probe_request(ctx)
         if request is None:
             return None
         task = asyncio.create_task(
-            ctx.services.backend.check_executor_health(**asdict(request)), name="local_verify.rental_probe"
+            ctx.services.backend.check_executor_health(**asdict(request)), name="local_verify.health_check_probe"
         )
-        return RentalProbe(task=task, request=request)
+        return HealthCheckProbe(task=task, request=request)
 
-    async def _run(self, ctx: Context, started: list[RentalProbe]) -> CheckResult:
+    async def _run(self, ctx: Context, started: list[HealthCheckProbe]) -> CheckResult:
         specs = ctx.state.specs
         if not specs:
             return self._skipped(ctx, "no specs")
@@ -290,7 +286,7 @@ class LocalVerifyCheck:
         local_verify_port: int,
         matmul_challenge: MatmulChallenge | None,
         verifyx_challenge: VerifyXChallenge | None,
-        started: list[RentalProbe],
+        started: list[HealthCheckProbe],
         *,
         matmul_ssh_reason: str | None,
     ) -> CheckResult:
@@ -324,7 +320,7 @@ class LocalVerifyCheck:
 
         # Started right before the call so it overlaps the executor's GPU steps; every return
         # from here on carries it in `ctx.state.local_verify` for RentalVerificationCheck.
-        probe = self._start_rental_probe(ctx)
+        probe = self._start_health_check_probe(ctx)
         if probe is not None:
             started.append(probe)
 
@@ -337,7 +333,7 @@ class LocalVerifyCheck:
         outcome = self._judge(
             ctx, answer, matmul_challenge, verifyx_challenge, matmul_ssh_reason=matmul_ssh_reason
         )
-        outcome.rental_probe = probe
+        outcome.health_check_probe = probe
         what = {
             "round_trip_ms": outcome.round_trip_ms,
             "executor_elapsed_ms": outcome.executor_elapsed_ms,
@@ -348,7 +344,7 @@ class LocalVerifyCheck:
             ],
             "fallbacks": outcome.fallbacks,
             "deadline_hit": answer.deadline_hit,
-            "rental_probe_started": probe is not None,
+            "health_check_probe_started": probe is not None,
         }
         template = Msg.CONSUMED if what["consumed"] else Msg.FALLBACK
         return CheckResult(
@@ -447,14 +443,14 @@ class LocalVerifyCheck:
         step: str,
         reason: str,
         detail: str,
-        probe: RentalProbe | None = None,
+        probe: HealthCheckProbe | None = None,
     ) -> CheckResult:
         detail = detail[:DETAIL_MAX_CHARS]  # executor-derived text: same cap as the metric line
         self._metric(ctx, "fallback", step, reason, detail=detail)
         # A started rental probe rides along even when the call itself fell back: the state
         # carries no consumed step (both consumers take SSH), only the task for the rental check.
         updates = (
-            {"state": replace(ctx.state, local_verify=LocalVerifyOutcome(rental_probe=probe))}
+            {"state": replace(ctx.state, local_verify=LocalVerifyOutcome(health_check_probe=probe))}
             if probe is not None
             else {}
         )

@@ -19,10 +19,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from neurons.validators.src.services.task.checks.local_verify import LocalVerifyCheck
 from neurons.validators.src.services.task.checks.rental_verification import (
-    RentalProbe,
+    HealthCheckProbe,
     RentalVerificationCheck,
     health_check_request,
-    rental_probe_request,
+    health_check_probe_request,
 )
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as RentalMsg
 from neurons.validators.src.services.task import pipeline as pipeline_module
@@ -117,13 +117,13 @@ def outcome_lines(log) -> list[dict]:
 
 
 def test_the_probe_request_is_the_request_the_check_sends(monkeypatch, probe_on):
-    """`rental_probe_request` must be exactly what `RentalVerificationCheck.run` passes to
+    """`health_check_probe_request` must be exactly what `RentalVerificationCheck.run` passes to
     `check_executor_health` from the same context — the property the consume step checks for."""
     state = build_state(
         specs={**VERIFIED_SPECS, "gpu": {"details": [{"uuid": "GPU-1"}, {"uuid": "GPU-2"}, {"nouuid": 1}]}}
     )
     ctx = make_context(state=state)
-    request = rental_probe_request(ctx)
+    request = health_check_probe_request(ctx)
     assert asdict(request) == {
         "miner_address": "127.0.0.1",
         "miner_port": 8000,
@@ -145,7 +145,7 @@ async def test_the_check_itself_sends_the_builders_request(probe_on):
     )
     result = await RentalVerificationCheck().run(ctx)
     assert result.event.reason_code == RentalMsg.VERIFIED.reason
-    assert backend.check_executor_health.await_args.kwargs == asdict(rental_probe_request(ctx))
+    assert backend.check_executor_health.await_args.kwargs == asdict(health_check_probe_request(ctx))
 
 
 @pytest.mark.parametrize(
@@ -182,7 +182,7 @@ def test_the_probe_request_is_none_where_the_check_would_return_early(monkeypatc
     elif case == "no_ports":
         specs.pop("verified_ports")
     ctx = make_context(state=build_state(specs=specs, rented_data=rented))
-    assert rental_probe_request(ctx) is None
+    assert health_check_probe_request(ctx) is None
 
 
 def test_a_create_kill_in_shadow_still_probes(monkeypatch, probe_on):
@@ -193,7 +193,7 @@ def test_a_create_kill_in_shadow_still_probes(monkeypatch, probe_on):
         executors={}, banned_guids=[], filler_create_kill_executor_ids=[EXECUTOR_UUID]
     )
     ctx = make_context(state=build_state(specs=VERIFIED_SPECS, rented_data=rented))
-    assert rental_probe_request(ctx) is not None
+    assert health_check_probe_request(ctx) is not None
 
 
 # --- the probe beside the GPU steps -----------------------------------------------------------------
@@ -218,8 +218,8 @@ async def test_flag_off_starts_no_probe_and_the_check_calls_as_today(
         ctx2 = ctx.model_copy(update={"state": local.updates.get("state", ctx.state)})
         rental = await RentalVerificationCheck().run(ctx2)
     assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
-    assert local.event.what_we_saw["rental_probe_started"] is False
-    assert local.updates["state"].local_verify.rental_probe is None
+    assert local.event.what_we_saw["health_check_probe_started"] is False
+    assert local.updates["state"].local_verify.health_check_probe is None
     assert rental.event.reason_code == RentalMsg.VERIFIED.reason
     assert backend.check_executor_health.await_count == 1
     # the one call happened inside RentalVerificationCheck, after the local check returned
@@ -249,9 +249,9 @@ async def test_the_probe_runs_beside_the_gpu_steps_and_is_consumed_once(
         assert backend.entered[0] < started + 0.3
     assert elapsed < 1.0, elapsed
     assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
-    assert local.event.what_we_saw["rental_probe_started"] is True
-    probe = ctx2.state.local_verify.rental_probe
-    assert isinstance(probe, RentalProbe) and probe.consumed and probe.task.done()
+    assert local.event.what_we_saw["health_check_probe_started"] is True
+    probe = ctx2.state.local_verify.health_check_probe
+    assert isinstance(probe, HealthCheckProbe) and probe.consumed and probe.task.done()
     assert rental.passed and rental.event.reason_code == RentalMsg.VERIFIED.reason
     assert rental.event.what_we_saw["details"] == {"container_healthy": True}
     assert backend.check_executor_health.await_count == 1
@@ -259,7 +259,7 @@ async def test_the_probe_runs_beside_the_gpu_steps_and_is_consumed_once(
     # DAH-1991: the health_check_* force-remove still runs after the consumed probe
     ctx2.services.container_cleanup.force_remove_health_checks.assert_awaited_once()
     lines = outcome_lines(log)
-    assert [(l["outcome"], l["step"], l["reason"]) for l in lines] == [("consumed", "rental_probe", "ok")]
+    assert [(l["outcome"], l["step"], l["reason"]) for l in lines] == [("consumed", "health_check_probe", "ok")]
     assert lines[0]["first_pass"] is True and "probe_age_ms" in lines[0]
 
 
@@ -276,7 +276,7 @@ async def test_a_probe_exception_takes_the_api_error_path_without_a_second_rent(
         local, rental, ctx2 = await run_local_then_rental(
             ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
         )
-    assert local.event.what_we_saw["rental_probe_started"] is True
+    assert local.event.what_we_saw["health_check_probe_started"] is True
     assert rental.passed is False and rental.event.reason_code == RentalMsg.API_ERROR.reason
     assert rental.event.what_we_saw["error"] == "backend down"
     assert backend.check_executor_health.await_count == 1
@@ -323,7 +323,7 @@ async def test_not_the_first_pass_starts_no_probe(keypair, monkeypatch, probe_on
             ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
         )
         assert len(executor.intents) == 1
-    assert local.event.what_we_saw["rental_probe_started"] is False
+    assert local.event.what_we_saw["health_check_probe_started"] is False
     assert rental.event.reason_code == RentalMsg.VERIFIED.reason
     assert backend.check_executor_health.await_count == 1
 
@@ -355,7 +355,7 @@ async def test_the_express_lane_with_the_fast_path_off_makes_the_call_but_starts
         assert len(executor.intents) == 1
         assert executor.intents[0]["parallel_gpu"] is False
     assert local.event.reason_code == "LOCAL_VERIFY_OK"
-    assert local.event.what_we_saw["rental_probe_started"] is False
+    assert local.event.what_we_saw["health_check_probe_started"] is False
     assert rental.event.reason_code == RentalMsg.VERIFIED.reason
     assert backend.check_executor_health.await_count == 1
 
@@ -381,7 +381,7 @@ async def test_a_call_that_falls_back_still_hands_the_probe_to_the_rental_check(
     outcome = local.updates["state"].local_verify
     assert isinstance(outcome, LocalVerifyOutcome)
     assert outcome.matmul is None and outcome.verifyx is None
-    assert isinstance(outcome.rental_probe, RentalProbe)
+    assert isinstance(outcome.health_check_probe, HealthCheckProbe)
     assert rental.event.reason_code == RentalMsg.VERIFIED.reason
     assert backend.check_executor_health.await_count == 1
 
@@ -403,7 +403,7 @@ async def test_a_bug_after_the_probe_started_still_hands_it_over(
         ):
             local, rental, _ = await run_local_then_rental(ctx, check)
     assert local.event.what_we_saw["reason"] == "internal_error"
-    assert isinstance(local.updates["state"].local_verify.rental_probe, RentalProbe)
+    assert isinstance(local.updates["state"].local_verify.health_check_probe, HealthCheckProbe)
     assert rental.event.reason_code == RentalMsg.VERIFIED.reason
     assert backend.check_executor_health.await_count == 1
 
@@ -423,8 +423,8 @@ async def test_a_probe_for_a_different_request_is_settled_and_the_check_calls_it
         )
         local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
         state = local.updates["state"]
-        probe = state.local_verify.rental_probe
-        assert isinstance(probe, RentalProbe)
+        probe = state.local_verify.health_check_probe
+        assert isinstance(probe, HealthCheckProbe)
         changed = replace(state, specs={**state.specs, "verified_ports": [40002]})
         ctx2 = ctx.model_copy(update={"state": changed})
         # the second call answers at once
@@ -439,7 +439,7 @@ async def test_a_probe_for_a_different_request_is_settled_and_the_check_calls_it
     assert backend.check_executor_health.await_args.kwargs["container_port"] == 40002
     lines = outcome_lines(log)
     assert [(l["outcome"], l["step"], l["reason"], l["settled"]) for l in lines] == [
-        ("fallback", "rental_probe", "request_mismatch", "cancelled")
+        ("fallback", "health_check_probe", "request_mismatch", "cancelled")
     ]
 
 
@@ -468,7 +468,7 @@ async def test_a_fatal_halt_between_the_two_checks_cancels_the_pending_probe(
 ):
     """TdxHost / Capability can end the pipeline between LocalVerifyCheck and
     RentalVerificationCheck; the pending task is cancelled and awaited in `Pipeline.run`'s
-    finally, with one `[local_verify] outcome step=rental_probe` line, and the rental check
+    finally, with one `[local_verify] outcome step=health_check_probe` line, and the rental check
     (never reached) makes no call."""
     backend = backend_with(sleep=5.0)
     validation = matmul_service(monkeypatch)
@@ -485,7 +485,7 @@ async def test_a_fatal_halt_between_the_two_checks_cancels_the_pending_probe(
             ok, events, final_ctx = await pipeline.run(ctx)
             assert time.perf_counter() - started < 1.0
     assert ok is False and [e.check_id for e in events] == ["executor.local_verify", "test.fatal"]
-    probe = final_ctx.state.local_verify.rental_probe
+    probe = final_ctx.state.local_verify.health_check_probe
     assert probe.consumed and probe.task.cancelled()
     assert backend.check_executor_health.await_count == 1  # the probe's own entry, cancelled
     # DAH-1991 on the settle path: the backend spawned a health_check_* pod for the probe and no
@@ -496,7 +496,7 @@ async def test_a_fatal_halt_between_the_two_checks_cancels_the_pending_probe(
     )
     lines = [c.args[0].extra for c in log.info.call_args_list if str(c.args[0]) == "[local_verify] outcome"]
     assert [(l["outcome"], l["step"], l["reason"]) for l in lines] == [
-        ("fallback", "rental_probe", "unconsumed_cancelled")
+        ("fallback", "health_check_probe", "unconsumed_cancelled")
     ]
 
 
@@ -518,7 +518,7 @@ async def test_cancelling_the_check_mid_call_cancels_the_probe_it_started(
         running = asyncio.create_task(check.run(ctx))
         while not backend.entered:  # the probe was started, the call is in flight
             await asyncio.sleep(0.01)
-        probes = [t for t in asyncio.all_tasks() if t.get_name() == "local_verify.rental_probe"]
+        probes = [t for t in asyncio.all_tasks() if t.get_name() == "local_verify.health_check_probe"]
         assert len(probes) == 1 and not probes[0].done()
         running.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -544,7 +544,7 @@ async def test_a_finished_but_unconsumed_probe_is_retrieved_not_cancelled(
         )
         with patch("neurons.validators.src.services.task.pipeline.logger") as log:
             _, _, final_ctx = await pipeline.run(ctx)
-    probe = final_ctx.state.local_verify.rental_probe
+    probe = final_ctx.state.local_verify.health_check_probe
     assert probe.task.done() and not probe.task.cancelled()
     # Retrieved by the settle step already: asyncio clears `_log_traceback` when the exception is
     # read (`Task.exception()` / awaiting it), and it is that flag that drives the "exception was
@@ -554,6 +554,7 @@ async def test_a_finished_but_unconsumed_probe_is_retrieved_not_cancelled(
     lines = [c.args[0].extra for c in log.info.call_args_list if str(c.args[0]) == "[local_verify] outcome"]
     assert lines[-1]["reason"] == "unconsumed_done"
     assert lines[-1]["health_checks_removed"] == 0  # the fake cleanup's answer, awaited once
+    assert "cleanup_error" not in lines[-1]
     ctx.services.container_cleanup.force_remove_health_checks.assert_awaited_once()
 
 
@@ -565,8 +566,8 @@ async def _hang(*_args, **_kwargs):
 @pytest.mark.parametrize(
     "cleanup_effect, recorded",
     [
-        pytest.param(RuntimeError("ssh gone"), "error: RuntimeError", id="raises"),
-        pytest.param(_hang, "error: TimeoutError", id="hangs"),
+        pytest.param(RuntimeError("ssh gone"), "RuntimeError", id="raises"),
+        pytest.param(_hang, "TimeoutError", id="hangs"),
     ],
 )
 async def test_a_halt_whose_probe_cleanup_fails_still_ends_the_pipeline(
@@ -574,8 +575,9 @@ async def test_a_halt_whose_probe_cleanup_fails_still_ends_the_pipeline(
 ):
     """The settle step's two error branches: the force-remove raises (the SSH session is gone with
     the halt) or never answers (a hung connection). Either way the pipeline's own result stands,
-    the outcome line records the failure in `health_checks_removed`, and the hung one is cut at
-    the cleanup timeout instead of holding the cancelled pipeline open."""
+    the outcome line keeps `health_checks_removed` a number (0) and names the failure in
+    `cleanup_error`, and the hung one is cut at the cleanup timeout instead of holding the
+    cancelled pipeline open."""
     monkeypatch.setattr(pipeline_module, "UNCONSUMED_PROBE_CLEANUP_TIMEOUT_S", 0.05)
     cleanup = AsyncMock(side_effect=cleanup_effect)  # built per run, not at collection time
     backend = backend_with(sleep=5.0)
@@ -594,10 +596,12 @@ async def test_a_halt_whose_probe_cleanup_fails_still_ends_the_pipeline(
             ok, events, final_ctx = await pipeline.run(ctx)
             assert time.perf_counter() - started < 1.0
     assert ok is False and [e.check_id for e in events] == ["executor.local_verify", "test.fatal"]
-    assert final_ctx.state.local_verify.rental_probe.consumed
+    assert final_ctx.state.local_verify.health_check_probe.consumed
     cleanup.assert_awaited_once_with(ctx.ssh, ctx.executor.uuid)
     lines = [c.args[0].extra for c in log.info.call_args_list if str(c.args[0]) == "[local_verify] outcome"]
-    assert [(l["reason"], l["health_checks_removed"]) for l in lines] == [("unconsumed_cancelled", recorded)]
+    assert [(l["reason"], l["health_checks_removed"], l["cleanup_error"]) for l in lines] == [
+        ("unconsumed_cancelled", 0, recorded)
+    ]
 
 
 @pytest.mark.asyncio

@@ -28,9 +28,9 @@ from .runner import SSHCommandRunner
 
 logger = logging.getLogger(__name__)
 
-# The one `[local_verify] outcome` line every phase-2 probe reading writes (`step=rental_probe`);
-# Loki counts by (outcome, reason). The checks import it from here.
-RENTAL_PROBE_OUTCOME_EVENT = "[local_verify] outcome"
+# The one `[local_verify] outcome` line every local_verify reading writes (the call, the GPU steps,
+# the `step=health_check_probe` probe); Loki counts by (outcome, step, reason). The checks import it from here.
+LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
 
 # The force-remove of an unconsumed probe's `health_check_*` pod runs over the pipeline's SSH
 # session after the pipeline already ended; a hung connection must not keep it alive past that.
@@ -361,10 +361,10 @@ class Pipeline:
 
             return True, events, current_ctx
         finally:
-            await _settle_background_work(current_ctx)
+            await _cancel_unconsumed_probe(current_ctx)
 
 
-async def _settle_background_work(ctx: Context) -> None:
+async def _cancel_unconsumed_probe(ctx: Context) -> None:
     """liumd phase 2: a check may leave an `asyncio.Task` in `ctx.state.local_verify` for a later
     check to await (the rental probe started beside the GPU steps). A fatal check or a halt in
     between would leave it pending — the backend already rented a probe pod for it — so whatever
@@ -373,7 +373,7 @@ async def _settle_background_work(ctx: Context) -> None:
     `RentalVerificationCheck` did that, so a probe nobody consumed left its pod on the executor).
     The probe owns the how (`BackgroundProbe.cancel_and_await`)."""
     outcome = ctx.state.local_verify
-    probe: BackgroundProbe | None = outcome.rental_probe if outcome is not None else None
+    probe: BackgroundProbe | None = outcome.health_check_probe if outcome is not None else None
     if probe is None or probe.consumed:
         return
     probe.consumed = True
@@ -381,24 +381,28 @@ async def _settle_background_work(ctx: Context) -> None:
         reason = await probe.cancel_and_await()
     except Exception as exc:  # noqa: BLE001 — cleanup must not replace the pipeline's own result
         reason = f"settle_error: {type(exc).__name__}"
-    health_checks_removed: int | str
+    # Two keys, so Loki can sum the count: `health_checks_removed` is always a number (0 when the
+    # cleanup failed) and `cleanup_error` names the exception type, or is absent.
+    health_checks_removed = 0
+    cleanup_error: str | None = None
     try:
         health_checks_removed = await asyncio.wait_for(
             ctx.services.container_cleanup.force_remove_health_checks(ctx.ssh, ctx.executor.uuid),
             UNCONSUMED_PROBE_CLEANUP_TIMEOUT_S,
         )
     except Exception as exc:  # noqa: BLE001 — same: the pipeline's own result stands
-        health_checks_removed = f"error: {type(exc).__name__}"
+        cleanup_error = type(exc).__name__
     logger.info(
         _m(
-            RENTAL_PROBE_OUTCOME_EVENT,
+            LOCAL_VERIFY_OUTCOME_EVENT,
             extra=get_extra_info(
                 {
                     **ctx.default_extra,
                     "outcome": "fallback",
-                    "step": "rental_probe",
+                    "step": "health_check_probe",
                     "reason": f"unconsumed_{reason}",
                     "health_checks_removed": health_checks_removed,
+                    **({"cleanup_error": cleanup_error} if cleanup_error else {}),
                     "first_pass": ctx.config.first_pass,
                 }
             ),

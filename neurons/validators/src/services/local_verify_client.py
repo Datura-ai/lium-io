@@ -167,7 +167,7 @@ def sign_intent(intent: dict[str, Any], keypair) -> dict[str, Any]:
 @runtime_checkable
 class BackgroundProbe(Protocol):
     """A backend call one check started for a later check to await (liumd phase 2: the rental
-    probe beside the GPU steps — `checks/rental_verification.RentalProbe`). Declared as a
+    probe beside the GPU steps — `checks/rental_verification.HealthCheckProbe`). Declared as a
     Protocol here because the checks package imports this module, so naming the dataclass
     itself would be an import cycle; `Pipeline.run` settles whatever is left unconsumed."""
 
@@ -190,7 +190,7 @@ class LocalVerifyOutcome:
     fallbacks: dict[str, str] = field(default_factory=dict)  # step -> reason
     # Phase 2: the backend rental probe started beside the GPU steps (LOCAL_VERIFY_RENTAL_PROBE_PARALLEL);
     # `RentalVerificationCheck` awaits it, `Pipeline.run` settles it on a halt. None = not started.
-    rental_probe: BackgroundProbe | None = None
+    health_check_probe: BackgroundProbe | None = None
 
 
 @dataclass

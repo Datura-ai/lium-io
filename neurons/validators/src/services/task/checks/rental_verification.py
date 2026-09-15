@@ -26,7 +26,7 @@ from protocol.vc_protocol.compute_requests import (
 from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
-from ..pipeline import RENTAL_PROBE_OUTCOME_EVENT, CheckResult, Context
+from ..pipeline import LOCAL_VERIFY_OUTCOME_EVENT, CheckResult, Context
 from .cpu_truth import advertised_cpu_count
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ def _was_deliberately_stopped_on_the_host(diagnostics: ContainerDeathDiagnostics
 @dataclass(frozen=True)
 class HealthCheckRequest:
     """The keyword arguments of `backend.check_executor_health` for one cycle, sent as
-    `**asdict(request)`. Frozen: field equality is what gates the consume step (`RentalProbe`)."""
+    `**asdict(request)`. Frozen: field equality is what gates the consume step (`HealthCheckProbe`)."""
 
     miner_address: str
     miner_port: int
@@ -99,7 +99,7 @@ class HealthCheckRequest:
 
 
 @dataclass
-class RentalProbe:
+class HealthCheckProbe:
     """The backend health check started early (liumd phase 2, `LocalVerifyCheck`) so its ≈ 25 s
     overlap the executor's GPU steps. `request` is the exact keyword set the check below would
     have sent; the check consumes the task only when its own request equals it, so the probe can
@@ -123,7 +123,7 @@ class RentalProbe:
 
 def health_check_request(ctx: Context, *, container_port: int, rental_in_progress: bool) -> HealthCheckRequest:
     """The `check_executor_health` request for this cycle — ONE builder for
-    the check's own call and for the early probe (`rental_probe_request`), so the two cannot drift."""
+    the check's own call and for the early probe (`health_check_probe_request`), so the two cannot drift."""
     # The UUIDs this cycle's scrape saw. The backend probes for exactly these instead of
     # `--gpus all`, so a host advertising cards it cannot hand over fails here rather than in a
     # customer's rental (DAH-2614). Sent from the scrape, not read from the backend's stored
@@ -154,7 +154,7 @@ def health_check_request(ctx: Context, *, container_port: int, rental_in_progres
     )
 
 
-def rental_probe_request(ctx: Context) -> HealthCheckRequest | None:
+def health_check_probe_request(ctx: Context) -> HealthCheckRequest | None:
     """The request `RentalVerificationCheck.run` would send from this context when it reaches the
     backend call with a pod to rent (`rental_in_progress=False` — the ≈ 25 s case), or None when it
     would return earlier: verification skipped, a filler to verify instead, a create-time kill
@@ -178,15 +178,15 @@ def rental_probe_request(ctx: Context) -> HealthCheckRequest | None:
 
 
 def _probe_metric(ctx: Context, outcome: str, reason: str, **fields: Any) -> None:
-    # The phase-1 `[local_verify] outcome` line, `step=rental_probe`; Loki counts by (outcome, reason).
+    # The phase-1 `[local_verify] outcome` line, `step=health_check_probe`; Loki counts by (outcome, reason).
     logger.info(
         _m(
-            RENTAL_PROBE_OUTCOME_EVENT,
+            LOCAL_VERIFY_OUTCOME_EVENT,
             extra=get_extra_info(
                 {
                     **ctx.default_extra,
                     "outcome": outcome,
-                    "step": "rental_probe",
+                    "step": "health_check_probe",
                     "reason": reason,
                     "first_pass": ctx.config.first_pass,
                     **fields,
@@ -461,13 +461,13 @@ class RentalVerificationCheck:
                 ctx.ssh, ctx.executor.uuid
             )
 
-    async def _take_matching_probe(self, ctx: Context, request: HealthCheckRequest) -> RentalProbe | None:
+    async def _take_matching_probe(self, ctx: Context, request: HealthCheckRequest) -> HealthCheckProbe | None:
         """The early probe from `ctx.state.local_verify`, when there is one for exactly this
         request. A probe whose request differs (the state changed between the two checks) is
         settled in the background and the check makes its own call — the verdict never rests on
         a request other than the one this check would have sent."""
-        probe = getattr(ctx.state.local_verify, "rental_probe", None)
-        if not isinstance(probe, RentalProbe) or probe.consumed:
+        probe = getattr(ctx.state.local_verify, "health_check_probe", None)
+        if not isinstance(probe, HealthCheckProbe) or probe.consumed:
             return None
         probe.consumed = True
         if probe.request != request:
