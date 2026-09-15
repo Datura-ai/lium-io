@@ -303,7 +303,7 @@ class ExpressLane:
                     # Never scored, so the pipeline may right-size its probes (DAH-3011) — it
                     # does only with FIRST_PASS_FAST_PATH_ENABLED on — and, as
                     # `ContextConfig.unscored`, may make the one-call `/verify` path
-                    # (LOCAL_VERIFY_FIRST_PASS_ONLY) whatever that flag says.
+                    # (LOCAL_VERIFY_FIRST_PASS_ONLY) whatever FIRST_PASS_FAST_PATH_ENABLED says.
                     first_pass=True,
                 ),
                 timeout=settings.JOB_TIME_OUT,

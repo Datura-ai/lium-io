@@ -166,7 +166,7 @@ class PipelineFactory:
             first_pass: the executor's first, unscored verification (DAH-3011). Sizes the probes
                 only with settings.FIRST_PASS_FAST_PATH_ENABLED; as `ContextConfig.unscored` it
                 also gates the one-call `/verify` path (LOCAL_VERIFY_FIRST_PASS_ONLY), whatever
-                that flag says.
+                FIRST_PASS_FAST_PATH_ENABLED says.
 
         Returns:
             Configured Context ready for pipeline execution
