@@ -16,6 +16,12 @@ from ...const import (
 from ..messages import TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rented_pod_ssh import (
+    RentedPodSshVerdict,
+    forget_rented_pod_ssh,
+    probe_rented_pod_ssh,
+    verdict_log_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +167,8 @@ class TenantEnforcementCheck:
         if rented_pods and len(known_pod_gpu_counts) == len(rented_pods):
             extra["rented_gpu_count"] = sum(known_pod_gpu_counts)
 
+        # DAH-2870: what the renter sees of each RUNNING pod, judged from outside the container.
+        ssh_verdicts: list[RentedPodSshVerdict] = []
         for pod in rented_pods:
             pod_container_name = pod.container_name
             pod_id = pod.pod_id
@@ -179,6 +187,8 @@ class TenantEnforcementCheck:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
+                    # DAH-2870: the rental is closed; its SSH-probe marks go with it.
+                    await forget_rented_pod_ssh(ctx, pod_id)
                     event = render_message(
                         Msg.STALE_POD_NOT_RUNNING,
                         ctx=ctx,
@@ -217,7 +227,12 @@ class TenantEnforcementCheck:
                 if outcome.failure:
                     return outcome.failure
                 ssh_pub_keys = outcome.ssh_pub_keys
+                # Just recovered: judged from the renter's side next cycle, not on the way up.
                 continue
+
+            verdict = await probe_rented_pod_ssh(ctx, pod, ssh_pub_keys)
+            if verdict is not None:
+                ssh_verdicts.append(verdict)
 
         container_names = [pod.container_name for pod in rented_pods]
         container_names.extend(filler_containers)
@@ -250,20 +265,37 @@ class TenantEnforcementCheck:
         score_calculator = ctx.services.score_calculator
         actual_score, job_score, warning_message = score_calculator(ctx, True)
 
-        event = render_message(
-            Msg.ALREADY_RENTED,
-            ctx=ctx,
-            check_id=self.check_id,
-            impact=f"Reported rented score={job_score} (actual={actual_score})",
-            remediation=f"No action needed.{warning_message}" if warning_message else "No action needed.",
-            what={
-                "contract_version": ctx.contract_version,
-                "collateral": ctx.collateral_deposited,
-                "actual_score": actual_score,
-                "job_score": job_score,
-            },
-            extra=extra
-        )
+        what = {
+            "contract_version": ctx.contract_version,
+            "collateral": ctx.collateral_deposited,
+            "actual_score": actual_score,
+            "job_score": job_score,
+        }
+        # A pod that just crossed the unhealthy threshold owns this cycle's event, so the outage is
+        # what the backend stores and the portal shows. The score is the rented score regardless:
+        # whether this verdict should cost the provider is Rustam's call (DAH-2870), not this check's.
+        reported = [verdict for verdict in ssh_verdicts if verdict.report]
+        if reported:
+            event = render_message(
+                Msg.RENTED_POD_SSH_UNREACHABLE,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    **what,
+                    "unreachable_pods": [verdict_log_fields(verdict) for verdict in reported],
+                },
+                extra=extra,
+            )
+        else:
+            event = render_message(
+                Msg.ALREADY_RENTED,
+                ctx=ctx,
+                check_id=self.check_id,
+                impact=f"Reported rented score={job_score} (actual={actual_score})",
+                remediation=f"No action needed.{warning_message}" if warning_message else "No action needed.",
+                what=what,
+                extra=extra
+            )
 
         return CheckResult(
             passed=True,

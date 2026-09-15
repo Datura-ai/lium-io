@@ -773,6 +773,20 @@ class TenantEnforcementMessages:
         category="policy",
         impact="Proceed",
     )
+    # DAH-2870: the container runs but the renter cannot get in (SSH port refuses, or
+    # authorized_keys is unreadable because the volume is not mounted). Reported, not scored.
+    RENTED_POD_SSH_UNREACHABLE = MessageTemplate(
+        event="Rented pod refuses its renter over SSH",
+        reason="RENTED_POD_SSH_UNREACHABLE",
+        severity="error",
+        category="runtime",
+        impact="Reported to the backend and the renter; score unchanged",
+        remediation=(
+            "The pod container is running but its SSH port refuses or has no authorized_keys, "
+            "usually after a host reboot restarted the container without its volume. "
+            "The renter can reboot the pod from the pod page; check the host for unplanned reboots."
+        ),
+    )
 
 
 class GpuUsageMessages:
