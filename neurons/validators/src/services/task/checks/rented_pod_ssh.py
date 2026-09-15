@@ -16,6 +16,11 @@ healthy once (both signals good), so a template that ships no sshd, or a pod tha
 is never reported here. ``RENTED_POD_SSH_PROBE_CYCLES`` consecutive unhealthy cycles (default 2,
 about 30 min) after that raise ``RENTED_POD_SSH_UNREACHABLE`` and one POST to the backend per
 outage. The score is not changed by this module.
+
+Redis is an input to this signal, never to the check's verdict: when Redis fails, the probe logs
+``RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE`` and returns None for that pod and cycle, exactly as when
+the probe is disabled. Both keys carry a TTL (``RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS``, renewed on
+every probe of the pod) and are deleted by ``forget_rented_pod_ssh`` when the rental has closed.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
+import redis.exceptions
 from protocol.vc_protocol.compute_requests import RentedPod
 
 from core.config import settings
@@ -43,6 +49,10 @@ RENTED_POD_SSH_FAIL_KEY_PREFIX = "rented_pod_ssh_fail"
 FAULT_TCP_REFUSED = "tcp_refused"
 FAULT_TCP_TIMEOUT = "tcp_timeout"
 FAULT_AUTHORIZED_KEYS_UNREADABLE = "authorized_keys_unreadable"
+
+# What a failing Redis raises through RedisService: the client's own errors (connection, timeout,
+# response) and the socket errors under them. Anything else is a bug in this module and propagates.
+REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
 
 
 @dataclass(frozen=True)
@@ -109,13 +119,14 @@ async def probe_rented_pod_ssh(
 ) -> RentedPodSshVerdict | None:
     """Judge one RUNNING rented pod from the renter's side and keep the per-pod streak.
 
-    Returns None when the probe is off. The caller (TenantEnforcementCheck) has already confirmed
-    the container is running over the executor's own SSH, so a fault here is the pod, not the host.
+    Returns None when the probe is off, and when Redis fails: this is a signal inside a fatal check,
+    so a Redis outage skips the signal for the cycle (logged at WARNING) and never reaches the
+    verdict. The caller (TenantEnforcementCheck) has already confirmed the container is running
+    over the executor's own SSH, so a fault here is the pod, not the host.
     """
     if not settings.RENTED_POD_SSH_PROBE_ENABLED:
         return None
 
-    redis = ctx.services.redis
     executor_ip = ctx.executor.address
     faults: list[str] = []
     if pod.ssh_port is not None:
@@ -127,12 +138,56 @@ async def probe_rented_pod_ssh(
     if not ssh_pub_keys:
         faults.append(FAULT_AUTHORIZED_KEYS_UNREADABLE)
 
+    try:
+        return await _judge_with_streak(ctx, pod, faults)
+    except REDIS_ERRORS:
+        logger.warning(
+            _m(
+                "RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE",
+                extra=get_extra_info(
+                    {**ctx.default_extra, "pod_id": pod.pod_id, "faults": list(faults)}
+                ),
+            ),
+            exc_info=True,
+        )
+        return None
+
+
+async def forget_rented_pod_ssh(ctx: Context, pod_id: str) -> None:
+    """Drop both marks of a pod whose rental the backend says is closed. Never fatal."""
+    store = ctx.services.redis
+    try:
+        await store.delete(_ok_key(pod_id))
+        await store.delete(_fail_key(pod_id))
+    except REDIS_ERRORS:
+        # The TTL set on every write removes the keys on its own; this only makes it sooner.
+        logger.warning(
+            _m(
+                "RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE",
+                extra=get_extra_info({**ctx.default_extra, "pod_id": pod_id, "on": "forget"}),
+            ),
+            exc_info=True,
+        )
+
+
+async def _judge_with_streak(
+    ctx: Context,
+    pod: RentedPod,
+    faults: list[str],
+) -> RentedPodSshVerdict:
+    """The Redis-backed part of the probe: the ok mark, the streak, and the one report per outage."""
+    store = ctx.services.redis
+    ttl = settings.RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS
     boot_id_now = (ctx.state.specs or {}).get("boot_id")
     now_iso = datetime.now(UTC).isoformat()
 
     if not faults:
-        await redis.set(_ok_key(pod.pod_id), json.dumps({"at": now_iso, "boot_id": boot_id_now}))
-        await redis.delete(_fail_key(pod.pod_id))
+        await store.set(
+            _ok_key(pod.pod_id),
+            json.dumps({"at": now_iso, "boot_id": boot_id_now}),
+            ex=ttl,
+        )
+        await store.delete(_fail_key(pod.pod_id))
         return RentedPodSshVerdict(
             pod_id=pod.pod_id,
             container_name=pod.container_name,
@@ -140,7 +195,7 @@ async def probe_rented_pod_ssh(
             healthy=True,
         )
 
-    ok_mark = _decode(await redis.get(_ok_key(pod.pod_id)))
+    ok_mark = _decode(await store.get(_ok_key(pod.pod_id)))
     if ok_mark is None:
         # Never seen healthy by this validator: a template without sshd, a pod still coming up, or
         # a deploy that never worked. Not this outage class; nothing is counted.
@@ -152,13 +207,19 @@ async def probe_rented_pod_ssh(
             faults=faults,
         )
 
-    streak = _decode(await redis.get(_fail_key(pod.pod_id))) or {}
+    streak = _decode(await store.get(_fail_key(pod.pod_id))) or {}
     previous = streak.get("count", 0)
     consecutive = (previous if isinstance(previous, int) and previous >= 0 else 0) + 1
     first_failed_at = streak.get("first_failed_at") or now_iso
-    await redis.set(
+    # The ok mark is what makes the streak count; renew its TTL so an outage longer than the TTL
+    # keeps naming the pod in the event instead of silently falling back to RENTED. Renewed BEFORE
+    # the count is written: the count is the last Redis write before the report decision, so a
+    # Redis error can never leave `count == threshold` stored without the one POST that goes with it.
+    await store.set(_ok_key(pod.pod_id), json.dumps(ok_mark), ex=ttl)
+    await store.set(
         _fail_key(pod.pod_id),
         json.dumps({"count": consecutive, "first_failed_at": first_failed_at}),
+        ex=ttl,
     )
 
     boot_id_at_ok = ok_mark.get("boot_id")

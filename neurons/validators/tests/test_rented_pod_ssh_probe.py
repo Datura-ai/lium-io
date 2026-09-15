@@ -234,6 +234,144 @@ async def test_backend_error_on_the_report_does_not_fail_the_cycle(context_facto
 
 
 @pytest.mark.asyncio
+async def test_redis_down_skips_the_probe_and_leaves_the_rented_verdict_alone(context_factory):
+    # Regression (Rustam, #1372): the first Redis call in a fatal check was unguarded, so a Redis
+    # outage raised out of the check and failed validation on every rented node. Redis is an input
+    # to the signal, not to the verdict: with Redis down the cycle is RENTED at the rented score,
+    # nothing is counted, and the backend is never told.
+    h = Harness(context_factory)
+    h.redis.failing = True
+    for _ in range(3):
+        result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=[])
+
+    assert result.passed is True and result.halt is True
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert result.updates["score"] == 0.9 and result.updates["job_score"] == 0.9
+    assert h.redis.calls > 0 and h.redis.store == {}
+    h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_redis_down_mid_outage_does_not_report_and_the_streak_resumes_after(context_factory):
+    # Redis down for the whole threshold cycle: no verdict, nothing written; the next cycle with
+    # Redis back reads the streak the earlier cycles left and reports as usual.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    h.redis.failing = True
+    blip = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    h.redis.failing = False
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    assert blip.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    assert h.streak()["count"] == 2
+    h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_write", ["ok", "fail"])
+async def test_a_redis_error_on_either_write_of_the_threshold_cycle_still_posts_once(
+    context_factory, failing_write
+):
+    # Regression (fresh review of #1372): the count was written before the ok mark was renewed, so
+    # a Redis error on the renewal left `count == threshold` stored with no POST; the next cycle
+    # read count 3, `consecutive != threshold`, and the backend was never told for that outage.
+    # The count is now the last write before the report decision: whichever write fails, the
+    # cycle after the blip is the one that reaches the threshold and POSTs.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    prefix = {
+        "ok": rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX,
+        "fail": rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX,
+    }[failing_write]
+    h.redis.fail_next_set_of.add(f"{prefix}:{POD_ID}")
+    blip = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    assert blip.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert h.streak()["count"] == 2
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["consecutive_cycles"] == 2 and pod["reported_to_backend"] is True
+    h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_both_marks_carry_the_ttl_and_every_probe_renews_it(context_factory):
+    # Regression (Rustam, #1372): the marks were set without an expiry, so Redis kept one key pair
+    # per pod for ever. Every write now carries RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS, and an
+    # unhealthy cycle renews the ok mark too, so a long outage keeps naming the pod.
+    h = Harness(context_factory)
+    ok_key = f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"
+    fail_key = f"{rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX}:{POD_ID}"
+    with patch.object(rented_pod_ssh.settings, "RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS", 3600):
+        await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+        assert h.redis.ttl == {ok_key: 3600}
+        h.redis.ttl.clear()
+        await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    assert h.redis.ttl == {fail_key: 3600, ok_key: 3600}
+    assert json.loads(h.redis.store[ok_key])["boot_id"] == "boot-a"
+
+
+@pytest.mark.asyncio
+async def test_a_closed_rental_deletes_both_marks(context_factory):
+    # The pod's container is gone and the backend says the rental closed: the marks go with it
+    # instead of waiting out the TTL.
+    from test_rented_machine_check import DummyBackendClient
+
+    redis = FakeRedis()
+    ok_key = f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"
+    fail_key = f"{rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX}:{POD_ID}"
+    redis.store[ok_key] = json.dumps({"at": "2026-09-14T11:00:00+00:00", "boot_id": "boot-a"})
+    redis.store[fail_key] = json.dumps({"count": 1, "first_failed_at": "2026-09-14T11:15:00+00:00"})
+    redis.store["rented_pod_ssh_ok:other-pod"] = json.dumps({"at": "x", "boot_id": "boot-a"})
+    services = build_services(
+        redis=redis,
+        backend=DummyBackendClient(active=False),
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0),
+        container_cleanup=MockContainerCleanup(),
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(rented_data=rented_data(), specs={"boot_id": "boot-b"}),
+        ssh=DummySSHClient(pod_running=False, ssh_keys=[]),
+        collateral_deposited=True,
+    )
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+    assert set(redis.store) == {"rented_pod_ssh_ok:other-pod"}
+
+
+@pytest.mark.asyncio
+async def test_a_closed_rental_with_redis_down_still_ends_as_stale_pod(context_factory):
+    # The delete is a courtesy; the TTL does the same later. Redis down here changes nothing.
+    from test_rented_machine_check import DummyBackendClient
+
+    services = build_services(
+        redis=FakeRedis(failing=True),
+        backend=DummyBackendClient(active=False),
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0),
+        container_cleanup=MockContainerCleanup(),
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(rented_data=rented_data(), specs={"boot_id": "boot-b"}),
+        ssh=DummySSHClient(pod_running=False, ssh_keys=[]),
+        collateral_deposited=True,
+    )
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
 async def test_probe_disabled_leaves_the_check_as_before(context_factory):
     h = Harness(context_factory)
     with patch(SETTINGS_PATH) as settings:

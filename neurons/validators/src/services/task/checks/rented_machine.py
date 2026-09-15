@@ -16,7 +16,12 @@ from ...const import (
 from ..messages import TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rented_pod_ssh import RentedPodSshVerdict, probe_rented_pod_ssh, verdict_log_fields
+from .rented_pod_ssh import (
+    RentedPodSshVerdict,
+    forget_rented_pod_ssh,
+    probe_rented_pod_ssh,
+    verdict_log_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +187,8 @@ class TenantEnforcementCheck:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
+                    # DAH-2870: the rental is closed; its SSH-probe marks go with it.
+                    await forget_rented_pod_ssh(ctx, pod_id)
                     event = render_message(
                         Msg.STALE_POD_NOT_RUNNING,
                         ctx=ctx,

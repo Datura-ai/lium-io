@@ -196,7 +196,7 @@ class DummyRedisService:
     async def get(self, key: str):
         return self.store.get(key)
 
-    async def set(self, key: str, value: str):
+    async def set(self, key: str, value: str, ex: int | None = None):
         self.store[key] = value
 
     async def delete(self, key: str):

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
+import redis.exceptions
 from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
@@ -108,19 +109,43 @@ class DummyScoreCalc:
 
 
 class FakeRedis:
-    """Dict-backed stand-in for RedisService's get/set/delete, enough for per-pod marks."""
+    """Dict-backed stand-in for RedisService's get/set/delete, enough for per-pod marks.
 
-    def __init__(self):
+    `ttl` records the `ex` of the last set per key (None when set without one), so a
+    test can assert that a mark carries an expiry. `failing` makes every call raise the client's
+    ConnectionError, the shape of a Redis outage seen through RedisService; `fail_next_set_of`
+    makes only the next `set` of those keys raise (one shot each), the shape of a blip that hits
+    one write in the middle of a cycle.
+    """
+
+    def __init__(self, *, failing: bool = False):
         self.store: dict[str, str] = {}
+        self.ttl: dict[str, int | None] = {}
+        self.failing = failing
+        self.fail_next_set_of: set[str] = set()
+        self.calls = 0
+
+    def _touch(self):
+        self.calls += 1
+        if self.failing:
+            raise redis.exceptions.ConnectionError("Error 111 connecting to redis:6379")
 
     async def get(self, key: str):
+        self._touch()
         return self.store.get(key)
 
-    async def set(self, key: str, value: str):
+    async def set(self, key: str, value: str, ex: int | None = None):
+        self._touch()
+        if key in self.fail_next_set_of:
+            self.fail_next_set_of.discard(key)
+            raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
         self.store[key] = value
+        self.ttl[key] = ex
 
     async def delete(self, key: str):
+        self._touch()
         self.store.pop(key, None)
+        self.ttl.pop(key, None)
 
 
 def default_executor() -> ExecutorSSHInfo:
