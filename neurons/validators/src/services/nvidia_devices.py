@@ -389,6 +389,9 @@ KERNEL_GPU_VIEW_CMD = (
     f"stat -c '%n|%F' {PROC_GPU_INFO_GLOB} 2>/dev/null; "
     f"echo {KERNEL_GPU_VIEW_SEPARATOR}; {PROC_GPU_INFO_CMD}"
 )
+# procfs reports size 0 for the card's `information` node, so `stat -c %F` on a real node answers
+# "regular empty file"; a file the peer wrote into the runtime's tmpfs answers "regular file".
+INFORMATION_FILE_KINDS = ("regular file", "regular empty file")
 FOREIGN_MOUNTS_NAMED = 8  # the event names this many; the peer writes mountinfo, so it is capped
 _INFORMATION_FILE_RE = re.compile(
     rf"{re.escape(PROC_NVIDIA_GPUS_PATH)}/[0-9a-fA-F]{{4,8}}:[0-9a-fA-F]{{2}}:[0-9a-fA-F]{{2}}\.[0-7]/information"
@@ -443,7 +446,7 @@ def foreign_mounts_over_proc_nvidia_gpus(mountinfo: str, file_fs: str = "") -> l
             path, kind = line.strip(), ""
         # a stat row whose path is not <gpus>/<pci bus id>/information is foreign too: the peer
         # names the directories under a tmpfs, so a name with a newline would split its own row
-        if kind not in ("", "regular file") or not _INFORMATION_FILE_RE.fullmatch(path):
+        if kind not in ("", *INFORMATION_FILE_KINDS) or not _INFORMATION_FILE_RE.fullmatch(path):
             found.append(f"{path} {kind or 'unexpected path'}")
     return found[:FOREIGN_MOUNTS_NAMED]
 
