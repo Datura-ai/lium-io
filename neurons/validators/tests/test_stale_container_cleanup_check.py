@@ -447,6 +447,30 @@ async def test_a_reaped_pod_older_than_the_retention_window_is_dropped():
     assert redis.hashes[key] == {}
 
 
+def test_a_queued_entry_without_observed_at_is_a_value_error_not_a_key_error():
+    """Regression: `decode` documented ValueError but read the key with `[]`, so an entry this code
+    did not write raised KeyError."""
+    from neurons.validators.src.services.task.checks.stale_container_cleanup import _QueuedReap
+
+    with pytest.raises(ValueError):
+        _QueuedReap.decode(json.dumps({"sent_at": datetime.now(UTC).isoformat()}))
+
+
+@pytest.mark.asyncio
+async def test_a_queued_entry_without_observed_at_is_dropped_like_an_expired_one():
+    executor = default_executor()
+    key = f"{REAPED_POD_STATES_KEY_PREFIX}{executor.uuid}"
+    redis = FakeRedis({key: {EARLIER_POD_ID: json.dumps({"sent_at": datetime.now(UTC).isoformat()})}})
+    cleanup = RecordingContainerCleanup(result=(0, [], []))
+    services = build_services(container_cleanup=cleanup, redis=redis)
+    ctx = make_context(executor=executor, services=services, state=build_state(), ssh="ssh-conn-sentinel")
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates == {}
+    assert redis.hdel_calls == [(key, (EARLIER_POD_ID,))]
+
+
 @pytest.mark.asyncio
 async def test_an_unremovable_pod_is_taken_off_the_queue_and_not_reported_as_reaped():
     """Queued before the attempt (the hook runs first), still on the host after it: not reaped."""
