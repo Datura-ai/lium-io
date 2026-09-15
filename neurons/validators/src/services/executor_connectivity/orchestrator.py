@@ -52,9 +52,13 @@ class ConnectivityOrchestrator:
         as failed and successful).
         """
         unavailable = set(unavailable_ports or [])
+        batch_size = BATCH_PORT_VERIFICATION_SIZE
         if prestarted_dind is not None:
+            # Phase 3: the prestarted port counts as one of the batch's — a host with more ports
+            # than the batch is probed on as many ports as without a prestart.
             unavailable.add(prestarted_dind.port.external)
-        ports = self.port_selector.select(executor_info, BATCH_PORT_VERIFICATION_SIZE, unavailable)
+            batch_size -= 1
+        ports = self.port_selector.select(executor_info, batch_size, unavailable)
         if published_ports:
             published = set(published_ports)
             if prestarted_dind is not None:
@@ -110,8 +114,11 @@ class ConnectivityOrchestrator:
         failed = list(probe_result.failed)
 
         dind_result = None
+        selected = list(ports)
         if prestarted_dind is not None:
             dind_port = prestarted_dind.port
+            if dind_port not in selected:
+                selected.append(dind_port)  # probed too: the DinD probe below is its probe
             dind_result = await self.dind_probe.verify(
                 dind_port,
                 ssh_client=ssh_client,
@@ -152,7 +159,7 @@ class ConnectivityOrchestrator:
 
         status = "ok" if successful else "no_working_ports"
         return PortVerificationResult(
-            selected_ports=tuple(ports),
+            selected_ports=tuple(selected),
             successful_ports=tuple(successful),
             failed_ports=tuple(failed),
             dind_port=dind_port,
