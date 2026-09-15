@@ -817,10 +817,6 @@ def _build_rental_ssh_http_adapter_class(
 _build_host_config_kwargs = build_host_config_kwargs
 
 
-def _binds(volumes: tuple[VolumeMount, ...]) -> list[str]:
-    return build_host_config_kwargs(ContainerRunSpec(image="-", name="-", volumes=volumes))["binds"]
-
-
 def _encode_exec_stdin(value: str | bytes | None) -> bytes | None:
     if value is None:
         return None

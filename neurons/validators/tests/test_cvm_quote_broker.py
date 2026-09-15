@@ -33,7 +33,7 @@ from services.rental_docker_sdk import (
     ContainerExecResult,
     GpuDockerConfig,
     RentalDockerOperationError,
-    _binds,
+    build_host_config_kwargs,
 )
 
 
@@ -297,7 +297,7 @@ def test_run_spec_appends_the_quote_socket_after_the_rental_volume(docker_servic
         (QUOTE_BROKER_SOCKET_PATH, DSTACK_GUEST_SOCKET_PATH),
     ]
     # what actually reaches dockerd
-    assert _binds(run_spec.volumes)[-1] == "/var/run/lium-dstack/dstack.sock:/var/run/dstack.sock:ro"
+    assert build_host_config_kwargs(run_spec)["binds"][-1] == "/var/run/lium-dstack/dstack.sock:/var/run/dstack.sock:ro"
 
 
 def test_run_spec_default_is_no_socket(docker_service):

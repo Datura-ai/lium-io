@@ -51,7 +51,6 @@ from services.local_verify_client import (
 
 SCHEMA = LOCAL_RENT_SCHEMA
 CAPABILITY = LOCAL_RENT_CAPABILITY
-STEP_NAMES = ("image", "container", "ready")
 EXECUTOR_VERSION_MAX_CHARS = 64
 
 # The executor's `ready` step: how long it waits for State.Running (the SSH path's poll is 10 tries
@@ -190,6 +189,7 @@ class LocalRentAnswer:
             and self.step("container").status == "ok"
             and self.container is not None
             and self.step("ready").status == "ok"
+            and self.ready is not None
         )
 
     @property
