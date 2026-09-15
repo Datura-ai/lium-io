@@ -1415,17 +1415,21 @@ async def test_an_oversized_capability_list_and_answer_are_bounded_before_use(
 
 
 @pytest.mark.asyncio
-async def test_a_scored_cycle_sends_full_size_challenges_serially(
+async def test_a_scored_cycle_sends_full_size_verifyx_only(
     keypair, monkeypatch, local_verify_on, verifyx_service
 ):
-    """Not the first pass: `parallel_gpu` is off (the two GPU steps run one after the other, the
-    OOM-safety rule of the SSH path), the matmul has no VRAM budget and VerifyX no first-pass
-    overrides, and every metric line says `first_pass: False`."""
+    """Not the first pass: `parallel_gpu` is off (the OOM-safety rule of the SSH path) and VerifyX
+    is full size, so the round trip the matmul is judged by holds the whole serial VerifyX run
+    (80 s p50, 149 s p90) and is no measure of the matmul. Before the fix the matmul was still
+    asked for, ran on the executor, and fell back as `step_overtime` whenever VerifyX ran long.
+    Now it is not asked for: no challenge is built, the intent carries no matmul, the SSH matmul
+    path runs, and VerifyX is consumed with no first-pass overrides. Every metric line says
+    `first_pass: False`."""
     validation = matmul_service(monkeypatch)
-    prepare_matmul = MagicMock(wraps=validation.prepare_matmul_challenge)
     prepare_verifyx = MagicMock(wraps=verifyx_service.prepare_verifyx_challenge)
-    validation.prepare_matmul_challenge = prepare_matmul
     verifyx_service.prepare_verifyx_challenge = prepare_verifyx
+    ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
+    validation.validate_gpu_model_and_process_job = ssh_matmul
     async with FakeExecutor(keypair) as executor:
         ctx = context(
             keypair,
@@ -1435,17 +1439,49 @@ async def test_a_scored_cycle_sends_full_size_challenges_serially(
             first_pass=False,
         )
         with patch("neurons.validators.src.services.task.checks.local_verify.logger") as log:
-            local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
-    assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
+            local, verifyx, capability = await run_local_then_consumers(
+                ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+            )
+    assert executor.intents[0]["steps"]["matmul"] is None
     assert executor.intents[0]["parallel_gpu"] is False
-    assert prepare_matmul.call_args.kwargs["vram_budget_mb"] is None
+    assert validation.wrapper.generateChallenge.call_count == 0  # no challenge built for nothing
+    assert local.event.what_we_saw["consumed"] == ["verifyx"]
+    assert local.event.what_we_saw["fallbacks"] == {"matmul": "scored_ssh"}
     assert prepare_verifyx.call_args.kwargs["challenge_config_overrides"] is None
+    assert capability.event.what_we_saw["transport"] == "ssh"
+    ssh_matmul.assert_awaited_once()
+    assert verifyx.event.what_we_saw["transport"] == "local_verify"
     outcomes = [
         call.args[0].extra
         for call in log.info.call_args_list
         if str(call.args[0]) == "[local_verify] outcome"
     ]
     assert outcomes and all(o["first_pass"] is False for o in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_a_scored_cycle_with_verifyx_off_sends_the_matmul_alone(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """`scored_ssh` is about the serial VerifyX inflating the matmul's round trip. With VerifyX
+    off there is no VerifyX in the call, the round trip is the matmul's own, and the full-size
+    matmul rides the call and is consumed — the shape #1340 had before the gate; a gate that also
+    fired here would turn a working call into "nothing to run"."""
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair,
+            executor.executor_info,
+            validation=validation,
+            verifyx=verifyx_service,
+            first_pass=False,
+            verifyx_enabled=False,
+        )
+        local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+    assert executor.intents[0]["steps"]["verifyx"] is None
+    assert executor.intents[0]["steps"]["matmul"]["cipher_text"]
+    assert local.event.what_we_saw["consumed"] == ["matmul"]
+    assert local.event.what_we_saw["fallbacks"] == {}
 
 
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():

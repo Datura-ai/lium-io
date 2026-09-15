@@ -163,6 +163,17 @@ class VerifyXChallenge:
 class VerifyXValidationService:
     def __init__(self):
         self.lib_name = "/usr/lib/libverifyx.so"
+        self._lib_sha256: str | None = None
+
+    def lib_sha256(self) -> str:
+        """sha256 of the validator's own libverifyx.so, read once per process.
+
+        The file changes only with a validator upgrade, which restarts the process, so both readers
+        (the SSH path's checksum gate and the challenge's `expected_lib_sha256`) share one digest.
+        """
+        if self._lib_sha256 is None:
+            self._lib_sha256 = sha256_from_path(self.lib_name)
+        return self._lib_sha256
 
     def prepare_verifyx_challenge(
         self,
@@ -218,7 +229,7 @@ class VerifyXValidationService:
             cipher_text=cipher_text,
             challenge_input=challenge_input,
             log_extra=log_extra,
-            expected_lib_sha256=sha256_from_path(self.lib_name),
+            expected_lib_sha256=self.lib_sha256(),
         )
 
     def evaluate_verifyx_capture(
@@ -278,7 +289,7 @@ class VerifyXValidationService:
         # (checks/local_verify.py) calls the same prepare/evaluate around `POST /verify`.
         try:
             # Verify checksum before proceeding with validation
-            local_checksum = sha256_from_path(self.lib_name)
+            local_checksum = self.lib_sha256()
             executor_checksum = await sha256_from_executor(shell, self.lib_name)
 
             if local_checksum != executor_checksum:

@@ -15,10 +15,12 @@ that arrived later than the SSH
 path's own cap for that step (`ROUND_TRIP_CAP_MS_BY_STEP`, measured on the validator's clock) — leaves
 that step to the SSH path, so the new transport can only save time, never change a verdict on its
 own. The matmul is not asked for
-at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on: the all-cards work-proof runs inside the SSH
-matmul path and a consumed local pass must not skip it. Every outcome is one `[local_verify]
-outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric). Off by default
-(VALIDATOR_LOCAL_VERIFY_ENABLED).
+at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
+matmul path and a consumed local pass must not skip it), nor when VerifyX runs full size and in
+series with it (`ctx.config.first_pass` off, VerifyX on): the round trip then measures both steps
+and is no bound on the matmul alone, see `_matmul_ssh_reason`. Every outcome is one
+`[local_verify] outcome` log line with `outcome`, `step` and `reason` (the per-outcome metric).
+Off by default (VALIDATOR_LOCAL_VERIFY_ENABLED).
 """
 
 from __future__ import annotations
@@ -83,6 +85,29 @@ def _over_time(name: str, answer: LocalVerifyAnswer) -> bool:
     return answer.round_trip_ms > ROUND_TRIP_CAP_MS_BY_STEP[name]
 
 
+def _matmul_ssh_reason(ctx: Context) -> str | None:
+    """Why the matmul is not asked for in the one call, or None when it is.
+
+    `allcards_ssh` (DAH-2671 item 3): the all-cards work-proof (`_probe_all_claimed_cards`, one
+    pinned run per card) lives inside the SSH matmul path only. While that check is on, the matmul
+    stays on SSH so a consumed local pass can never skip the probe or its enforcement; phase 2
+    carries `devices` in the intent and judges the per-card output here.
+
+    `scored_ssh`: with `ctx.config.first_pass` off (a scored cycle, or any cycle while
+    FIRST_PASS_FAST_PATH_ENABLED is off) VerifyX is full size and the two GPU steps run one after
+    the other (`parallel_gpu` off). The round trip is the only clock the validator holds, and it
+    then holds the whole VerifyX run (80 s p50, 149 s p90 in SWEEP_provider_verify) on top of the
+    matmul, so `ROUND_TRIP_CAP_MS_BY_STEP["matmul"]` (120 s) fails a passing matmul on a large
+    share of hosts and measures it on none. The matmul is not asked for; the executor does not run
+    it twice. With VerifyX off the call carries the matmul alone and the bound is fair.
+    """
+    if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
+        return "allcards_ssh"
+    if ctx.config.verifyx_enabled and not ctx.config.first_pass:
+        return "scored_ssh"
+    return None
+
+
 class _NothingToSend(Exception):
     """The challenges could not be built on our side; the check falls back with this reason."""
 
@@ -130,14 +155,10 @@ class LocalVerifyCheck:
                 ctx, "call", "no_keypair", "pipeline has no validator keypair to sign with"
             )
 
-        # DAH-2671 item 3: the all-cards work-proof (`_probe_all_claimed_cards`, one pinned run per
-        # card) lives inside the SSH matmul path only. While that check is on, the matmul stays on
-        # SSH so a consumed local pass can never skip the probe or its enforcement; phase 2 carries
-        # `devices` in the intent and judges the per-card output here.
-        matmul_on_ssh = settings.MATMUL_ALLCARDS_CHECK_ENABLED
-        if matmul_on_ssh and not ctx.config.verifyx_enabled:
+        matmul_ssh_reason = _matmul_ssh_reason(ctx)
+        if matmul_ssh_reason is not None and not ctx.config.verifyx_enabled:
             return self._fallback(
-                ctx, "call", "allcards_ssh", "all-cards check on and VerifyX off: nothing to run"
+                ctx, "call", matmul_ssh_reason, "matmul on SSH and VerifyX off: nothing to run"
             )
 
         client = self._client_factory(ctx)
@@ -162,13 +183,18 @@ class LocalVerifyCheck:
 
         try:
             matmul_challenge, verifyx_challenge = self._prepare_challenges(
-                ctx, specs, matmul_on_ssh=matmul_on_ssh
+                ctx, specs, matmul_on_ssh=matmul_ssh_reason is not None
             )
         except _NothingToSend as exc:
             return self._fallback(ctx, "call", exc.reason, exc.detail)
         try:
             return await self._call_and_judge(
-                ctx, client, advertised.local_verify_port, matmul_challenge, verifyx_challenge
+                ctx,
+                client,
+                advertised.local_verify_port,
+                matmul_challenge,
+                verifyx_challenge,
+                matmul_ssh_reason=matmul_ssh_reason,
             )
         finally:
             if matmul_challenge is not None:
@@ -214,6 +240,8 @@ class LocalVerifyCheck:
         local_verify_port: int,
         matmul_challenge: MatmulChallenge | None,
         verifyx_challenge: VerifyXChallenge | None,
+        *,
+        matmul_ssh_reason: str | None,
     ) -> CheckResult:
         first_pass = ctx.config.first_pass
         matmul_step = None
@@ -249,7 +277,9 @@ class LocalVerifyCheck:
         except LocalVerifyUnavailable as exc:
             return self._fallback(ctx, "call", exc.reason, exc.detail)
 
-        outcome = self._judge(ctx, answer, matmul_challenge, verifyx_challenge)
+        outcome = self._judge(
+            ctx, answer, matmul_challenge, verifyx_challenge, matmul_ssh_reason=matmul_ssh_reason
+        )
         what = {
             "round_trip_ms": outcome.round_trip_ms,
             "executor_elapsed_ms": outcome.executor_elapsed_ms,
@@ -274,6 +304,8 @@ class LocalVerifyCheck:
         answer: LocalVerifyAnswer,
         matmul_challenge: MatmulChallenge | None,
         verifyx_challenge: VerifyXChallenge | None,
+        *,
+        matmul_ssh_reason: str | None,
     ) -> LocalVerifyOutcome:
         outcome = LocalVerifyOutcome(
             round_trip_ms=answer.round_trip_ms,
@@ -284,9 +316,10 @@ class LocalVerifyCheck:
 
         step = answer.step("matmul")
         if matmul_challenge is None:
-            # Not asked for: the all-cards work-proof keeps the matmul on SSH (see _run).
-            outcome.fallbacks["matmul"] = "allcards_ssh"
-            self._metric(ctx, "fallback", "matmul", "allcards_ssh", **common)
+            # Not asked for (see _matmul_ssh_reason): the SSH matmul path runs as today.
+            reason = matmul_ssh_reason or "not_asked"
+            outcome.fallbacks["matmul"] = reason
+            self._metric(ctx, "fallback", "matmul", reason, **common)
         elif step.status != "ok" or step.stdout is None:
             reason = _step_reason(step)
             outcome.fallbacks["matmul"] = reason
