@@ -6,6 +6,7 @@ set -e
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
+#                                                     (a WARN line is a met requirement on a setup we do not recommend; it never fails)
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
 #   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
@@ -133,10 +134,25 @@ fail_no_idmapped() {
 
 MIN_NVIDIA_DRIVER="580.65.06"   # validators' MIN_NVIDIA_DRIVER_VERSION: an idle node below it earns nothing after the cutoff
 MIN_DISK_TO_VRAM_RATE="1.5"     # validators' MIN_DISK_TO_VRAM_RATE (rental_price.py): idle pay needs total disk >= 1.5x total VRAM
-PREFLIGHT_PASS=0 PREFLIGHT_FIX=0 PREFLIGHT_SKIP=0
+# DAH-3456: the kernel families (major.minor) the docs list as recommended — Ubuntu 24.04's GA kernel and
+# 22.04's HWE kernel. This constant is the one list; widen it by a PR, like MIN_NVIDIA_DRIVER above.
+# Any other 5.19+ kernel works and gets a WARN line, never a FIX: the docs page explains what we
+# recommend and why. The validators do not check the kernel family; the fleet count comes from
+# `executor.specs.kernel`, which every cycle already reports.
+RECOMMENDED_KERNEL_FAMILIES="6.8"
+SUPPORTED_OS_DOCS_URL="https://docs.lium.io/providers/nodes/quickstart#supported-operating-systems"
+PREFLIGHT_PASS=0 PREFLIGHT_FIX=0 PREFLIGHT_SKIP=0 PREFLIGHT_WARN=0
 
 pf_pass() { PREFLIGHT_PASS=$((PREFLIGHT_PASS + 1)); echo -e "  ${G}PASS${N} $1"; }
 pf_skip() { PREFLIGHT_SKIP=$((PREFLIGHT_SKIP + 1)); echo -e "  ${Y}SKIP${N} $1"; }
+pf_warn() {
+    # a requirement that is met, on a setup we do not recommend: printed, counted, never a FIX
+    PREFLIGHT_WARN=$((PREFLIGHT_WARN + 1))
+    echo -e "  ${Y}WARN${N} $1"
+    shift
+    local line
+    for line in "$@"; do echo "         $line"; done
+}
 pf_fix() {
     # $1 what is wrong; every further argument is one line of the fix
     PREFLIGHT_FIX=$((PREFLIGHT_FIX + 1))
@@ -194,11 +210,31 @@ check_arch() {
     pf_fix "Architecture $arch — sysbox ships for x86_64 only." "Use an x86_64 host."
 }
 
+kernel_family() {
+    # "6.8.0-45-generic" -> "6.8"
+    local major minor
+    major=${1%%.*} minor=${1#*.} minor=${minor%%.*}
+    echo "$major.$minor"
+}
+
+kernel_family_recommended() {
+    # true when the kernel's major.minor is one of RECOMMENDED_KERNEL_FAMILIES (comma or space separated)
+    local family
+    for family in ${RECOMMENDED_KERNEL_FAMILIES//,/ }; do
+        [ "$family" = "$1" ] && return 0
+    done
+    return 1
+}
+
 check_kernel() {
-    local kernel version_id
+    local kernel version_id family
     kernel=$(uname -r)
     if kernel_supports_idmapped; then
         pf_pass "Kernel $kernel (>= 5.19, ID-mapped mounts available)."
+        family=$(kernel_family "$kernel")
+        kernel_family_recommended "$family" \
+            || pf_warn "Kernel $kernel is a $family kernel; we recommend ${RECOMMENDED_KERNEL_FAMILIES//,/ or } (Ubuntu 24.04, or 22.04 with the HWE kernel). It works and we measure it." \
+                   "What we recommend and why: $SUPPORTED_OS_DOCS_URL"
         return 0
     fi
     if [ "${SYSBOX_SKIP_KERNEL_CHECK:-0}" = "1" ]; then
@@ -443,8 +479,11 @@ check_sysbox() {
 }
 
 preflight_summary() {
+    local warn_summary_suffix=""
+    # WARN is listed only when there is one; a WARN never changes the exit status
+    if [ "$PREFLIGHT_WARN" -gt 0 ]; then warn_summary_suffix=", $PREFLIGHT_WARN WARN"; fi
     echo ""
-    echo "  Preflight: $PREFLIGHT_PASS PASS, $PREFLIGHT_FIX FIX, $PREFLIGHT_SKIP SKIP."
+    echo "  Preflight: $PREFLIGHT_PASS PASS, $PREFLIGHT_FIX FIX, $PREFLIGHT_SKIP SKIP$warn_summary_suffix."
     [ "$PREFLIGHT_FIX" -eq 0 ]
 }
 
@@ -495,7 +534,8 @@ case "${1:-}" in
         echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
         echo "               a FIX on root, x86_64, kernel or Docker stops the install, any other FIX is printed and the install goes on"
-        echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
+        echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX;"
+        echo "               a WARN line (kernel outside the recommended families) never changes the exit status"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
         exit 0
         ;;

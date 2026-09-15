@@ -230,6 +230,33 @@ def test_kernel_override_is_honoured(tmp_path):
     assert "PASS Kernel 5.15.0-91-generic accepted because SYSBOX_SKIP_KERNEL_CHECK=1" in out
 
 
+def test_kernel_6_8_gets_no_warn(tmp_path):
+    """DAH-3456: the recommended family (Ubuntu 24.04 GA / 22.04 HWE) prints PASS alone."""
+    _, out, _ = run_check(tmp_path, "check_kernel")
+    assert "WARN" not in out
+
+
+@pytest.mark.parametrize("kernel", ["7.0.0-30-generic", "6.17.0-8-generic", "6.14.0-1065-azure"])
+def test_kernel_outside_the_recommended_families_passes_with_a_warn_and_the_docs_link(tmp_path, kernel):
+    """DAH-3456: a 5.19+ kernel we do not recommend still passes (rc 0, no FIX); the WARN names the
+    family, the recommendation and the docs page. Regression guarded: the WARN turning into a FIX
+    (a refusal) or the PASS line going missing."""
+    rc, out, fix = run_check(tmp_path, "check_kernel", env={"STUB_KERNEL": kernel})
+    family = ".".join(kernel.split(".")[:2])
+    assert rc == 0 and fix == 0
+    assert f"PASS Kernel {kernel} (>= 5.19" in out
+    assert f"WARN Kernel {kernel} is a {family} kernel; we recommend 6.8 (Ubuntu 24.04, or 22.04 with the HWE kernel)." in out
+    assert "https://docs.lium.io/providers/nodes/quickstart#supported-operating-systems" in out
+    assert "FIX  " not in out
+
+
+def test_kernel_below_5_19_is_a_fix_not_a_warn(tmp_path):
+    """The WARN is for kernels sysbox can use; a kernel sysbox cannot use stays a FIX with no WARN on top."""
+    rc, out, fix = run_check(tmp_path, "check_kernel", env={"STUB_KERNEL": "5.15.0-91-generic"})
+    assert rc == 1 and fix == 1
+    assert "WARN" not in out
+
+
 # ── docker ───────────────────────────────────────────────────────────────────
 
 
@@ -583,6 +610,26 @@ def test_check_mode_on_a_good_host_exits_zero_with_a_summary(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FIX  " not in proc.stdout
     assert "Preflight: 12 PASS, 0 FIX, 0 SKIP." in proc.stdout
+
+
+def test_check_mode_on_a_7_0_kernel_exits_zero_and_counts_the_warn(tmp_path):
+    """DAH-3456: `--check` on Ubuntu 26.04 (kernel 7.0): every requirement met, one WARN, exit 0.
+    Regression guarded: the WARN counted as a FIX (exit 1 and 'Fix the lines above')."""
+    proc = run_script(tmp_path, "--check", env={"STUB_KERNEL": "7.0.0-30-generic"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "WARN Kernel 7.0.0-30-generic is a 7.0 kernel" in proc.stdout
+    assert "Preflight: 12 PASS, 0 FIX, 0 SKIP, 1 WARN." in proc.stdout
+    assert "Fix the lines above" not in proc.stdout
+
+
+def test_install_mode_on_a_7_0_kernel_reaches_the_install_steps(tmp_path):
+    """DAH-3456: install mode treats the WARN like a PASS: the install goes on, nothing says 'Nothing was installed'."""
+    proc = run_script(tmp_path, env={"STUB_KERNEL": "7.0.0-30-generic"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "WARN Kernel 7.0.0-30-generic is a 7.0 kernel" in proc.stdout
+    assert "Preflight: 9 PASS, 0 FIX, 0 SKIP, 1 WARN." in proc.stdout
+    assert "Nothing was installed." not in proc.stdout
+    assert "Sysbox is already working. Nothing to do." in proc.stdout
 
 
 def test_check_mode_without_a_gpu_reports_the_nvidia_fixes_and_exits_one(tmp_path):
