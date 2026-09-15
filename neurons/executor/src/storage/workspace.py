@@ -39,20 +39,7 @@ class DockerUserNamespaceWorkspace:
     read_only: bool
 
 
-@dataclass(frozen=True)
-class DockerEncryptedVolumeWorkspace:
-    image: str
-    volume_name: str
-    path: PurePosixPath
-    volume_passphrase: str
-
-
-ResolvedWorkspace = (
-    LocalWorkspace
-    | DockerVolumeWorkspace
-    | DockerUserNamespaceWorkspace
-    | DockerEncryptedVolumeWorkspace
-)
+ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace
 
 
 @dataclass(frozen=True)
@@ -75,9 +62,7 @@ class WorkspaceResolver:
     def resolve(self, operation: StorageOperationSpec) -> ResolvedWorkspace:
         if operation.workspace.mode is WorkspaceMode.PLAIN_VOLUME:
             return self._resolve_plain_volume(operation)
-        if operation.workspace.mode is WorkspaceMode.ENCRYPTED_RUNNING:
-            return self._resolve_encrypted_running(operation)
-        return self._resolve_encrypted_bootstrap(operation)
+        return self._resolve_encrypted_running(operation)
 
     def _resolve_plain_volume(self, operation: StorageOperationSpec) -> DockerVolumeWorkspace:
         workspace = DockerVolumeWorkspace(
@@ -121,6 +106,7 @@ class WorkspaceResolver:
             visible_path=visible_path,
             requested_path=requested_path,
             action=operation.action,
+            overwrite_fresh_target=operation.workspace.bootstrap,
         )
 
         confirmed_identity, _ = self._inspect_running_container(container_name)
@@ -133,21 +119,6 @@ class WorkspaceResolver:
             pid=identity.pid,
             path=visible_path,
             read_only=operation.action is StorageAction.BACKUP,
-        )
-
-    def _resolve_encrypted_bootstrap(self, operation: StorageOperationSpec) -> DockerEncryptedVolumeWorkspace:
-        passphrase = operation.workspace.volume_passphrase
-        if not passphrase:
-            raise WorkspaceResolutionError("encrypted bootstrap workspace is missing volume passphrase")
-        return DockerEncryptedVolumeWorkspace(
-            image=self._helper_image(),
-            volume_name=operation.workspace.volume_name,
-            path=_map_requested_path(
-                operation.workspace.requested_path,
-                operation.workspace.volume_path,
-                PurePosixPath("/workspace"),
-            ),
-            volume_passphrase=passphrase,
         )
 
     def _helper_image(self) -> str:
@@ -206,10 +177,20 @@ class WorkspaceResolver:
         visible_path: PurePosixPath,
         requested_path: PurePosixPath,
         action: StorageAction,
+        overwrite_fresh_target: bool = False,
     ) -> None:
         if action is StorageAction.BACKUP:
             check_script = 'test -d "$1"'
             error = f"backup source is not a directory: {requested_path}"
+        elif overwrite_fresh_target:
+            # Create-time restore into the pod's fresh mount (DAH-3274): the entrypoint may have
+            # dropped `.jupyter`, `.bashrc` or a shell history there since `docker run`. The
+            # backup wins. That flips the old order, where the restore ran first and the
+            # entrypoint wrote last; at create time nothing in the mount is the customer's, so the
+            # backup is the right winner. Only the shape is checked — the target must be absent
+            # or a directory, never a file.
+            check_script = 'target="$1"; if [ ! -e "$target" ]; then exit 0; fi; if [ ! -d "$target" ]; then exit 20; fi'
+            error = f"restore target is not a directory: {requested_path}"
         else:
             check_script = (
                 'target="$1"; '
