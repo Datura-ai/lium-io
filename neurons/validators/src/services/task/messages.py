@@ -237,6 +237,21 @@ class GpuModelMessages:
         impact="Job skipped; score set to 0",
         remediation="GPU count and details length don't match. Check GPU detection.",
     )
+    # P125: a rented node whose scrape lost a card (GPU_DETAILS_MISMATCH, or GPU_MODEL_UNSUPPORTED with
+    # no card to name) on RENTED_GPU_FAULT_CYCLES consecutive scrapes. The verified job is cleared, so the backend delists
+    # the node and tells the renter; the renter's pod is left to the renter.
+    RENTED_NODE_GPU_FAULT = MessageTemplate(
+        event="GPU fault under a live rental",
+        reason="RENTED_NODE_GPU_FAULT",
+        severity="error",
+        category="env",
+        impact="Score set to 0; verified job cleared; the backend delists the node (renter notice: lium-platform#465)",
+        remediation=(
+            "The host lists fewer GPUs than this node advertises while a renter holds it. "
+            "Check `nvidia-smi -L` and `dmesg` for a card that fell off the PCIe bus (Xid 79) and reseat "
+            "or replace it; the node is relisted after a clean verification."
+        ),
+    )
     MODEL_OK = MessageTemplate(
         event="GPU model validated",
         reason="GPU_MODEL_OK",
