@@ -425,7 +425,7 @@ class RentalVolumeSizing:
     per rental — by the warm-pool lookup when it has a slot to bound, else by
     `_size_and_create_rental_volume` — and reused by the create."""
 
-    probe: VolumeHostProbe | None
+    host_probe: VolumeHostProbe | None
     sizing: VolumeSizingResult
 
 
@@ -1368,7 +1368,7 @@ class DockerService:
             log_extra=default_extra,
             host_probe=volume_probe,
         )
-        return RentalVolumeSizing(probe=volume_probe, sizing=sizing)
+        return RentalVolumeSizing(host_probe=volume_probe, sizing=sizing)
 
     async def _size_and_create_rental_volume(
         self,
@@ -1392,7 +1392,7 @@ class DockerService:
                 default_extra=default_extra,
                 set_step=set_step,
             )
-        volume_probe, sizing = volume_sizing.probe, volume_sizing.sizing
+        volume_probe, sizing = volume_sizing.host_probe, volume_sizing.sizing
         set_step("volume_creation")
         local_volume = f"volume_{payload.pod_id}"
         # DAH-2265 Plan 3: only full-node rentals (disk_share >= 1.0) get a
@@ -1435,10 +1435,9 @@ class DockerService:
         """The slot this rental will adopt, or a *miss* (logged with its reason), plus the rental's
         volume sizing when a slot had to be bounded by it.
 
-        One host command lists the image and every created slot; the slot must be fresh, of this
-        image, bound to ports the backend offers this rental, and sized between what this rental's
-        own sizing gives it now and the backend's caps. The field-by-field HostConfig comparison
-        happens in `_adopt_warm_slot`, once the run spec exists.
+        One host command lists the image and every created slot; `_first_adoptable_warm_slot` then
+        walks the slots. The field-by-field HostConfig comparison happens in `_adopt_warm_slot`,
+        once the run spec exists.
         """
         volume_sizing: RentalVolumeSizing | None = None
         reason = warm_pool.adopt_block_reason(
@@ -1467,101 +1466,137 @@ class DockerService:
             if reason is None and slot_docs is None:
                 reason = "slot listing unreadable"
             if reason is None:
-                now = datetime.now(UTC)
-                max_age = timedelta(hours=settings.WARM_POOL_MAX_AGE_HOURS)
-                for doc in slot_docs:
-                    # A document the host authored: anything unreadable in it is a miss, never a
-                    # failed rental.
-                    try:
-                        slot = warm_pool.slot_from_inspect(
-                            doc, image_id=image_doc.get("Id") or "", now=now, max_age=max_age
-                        )
-                        port_maps = (
-                            None
-                            if slot is None
-                            else warm_pool.slot_port_maps(slot, payload.available_ports, rental_port_maps)
-                        )
-                    except Exception as exc:
-                        logger.info(
-                            _m("warm_pool slot=unreadable", extra=get_extra_info({**default_extra, "error": str(exc)}))
-                        )
-                        continue
-                    if slot is None or port_maps is None:
-                        continue
-                    if volume_sizing is None:
-                        # The floor a slot must meet is what this rental's own sizing gives it on
-                        # the host as it is now (a slot sized while a filler's data held the disk
-                        # is smaller); sized once here, and handed back so a miss does not size again.
-                        volume_sizing = await self._resolve_rental_volume_sizing(
-                            ssh_client=ssh_client,
-                            payload=payload,
-                            log_tag=log_tag,
-                            default_extra=default_extra,
-                            set_step=set_step,
-                        )
-                    size_reason = warm_pool.slot_disk_sizes_fit(
-                        slot,
-                        payload,
-                        sized_volume_gb=volume_sizing.sizing.volume_limit_gb,
-                        sized_storage_gb=volume_sizing.sizing.storage_limit_gb,
-                    )
-                    if size_reason in warm_pool.SLOT_BELOW_SIZING_REASONS:
-                        # smaller than what the host gives a whole-host rental now: rather than wait
-                        # for a rental with a cap small enough to fit it, it goes, and the next
-                        # filler start leaves one sized for the host as it is (one create's cost)
-                        logger.info(
-                            _m(
-                                "warm_pool slot=remove reason=undersized",
-                                extra=get_extra_info({**default_extra, "slot": slot.name, "detail": size_reason}),
-                            )
-                        )
-                        with contextlib.suppress(Exception):
-                            await ssh_client.run(
-                                warm_pool.remove_slot_command(slot.name, slot.volume_name),
-                                check=False,
-                                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
-                            )
-                        continue
-                    if size_reason is not None:
-                        # larger than this rental's cap: the slot may fit a rental with a larger one
-                        logger.info(
-                            _m(
-                                "warm_pool slot=skip reason=sizes",
-                                extra=get_extra_info({**default_extra, "slot": slot.name, "detail": size_reason}),
-                            )
-                        )
-                        continue
-                    # The size labels sit on a container the miner's daemon holds: the volume the
-                    # rental would be granted is read from the volume plugin itself before adoption.
-                    volume_reason = await self._warm_slot_volume_mismatch(ssh_client, slot)
-                    if volume_reason is not None:
-                        logger.warning(
-                            _m(
-                                "warm_pool slot=remove reason=volume differs",
-                                extra=get_extra_info(
-                                    {**default_extra, "slot": slot.name, "volume": slot.volume_name, "detail": volume_reason}
-                                ),
-                            )
-                        )
-                        with contextlib.suppress(Exception):
-                            await ssh_client.run(
-                                warm_pool.remove_slot_command(slot.name, slot.volume_name),
-                                check=False,
-                                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
-                            )
-                        continue
-                    logger.info(
-                        _m(
-                            "warm_pool adopt=candidate",
-                            extra=get_extra_info({**default_extra, "slot": slot.name, "volume": slot.volume_name}),
-                        )
-                    )
-                    return WarmPoolLookup(
-                        adoption=WarmPoolAdoption(slot=slot, port_maps=port_maps, image_doc=image_doc),
-                        volume_sizing=volume_sizing,
-                    )
+                lookup = await self._first_adoptable_warm_slot(
+                    ssh_client=ssh_client,
+                    payload=payload,
+                    rental_port_maps=rental_port_maps,
+                    image_doc=image_doc,
+                    slot_docs=slot_docs,
+                    log_tag=log_tag,
+                    default_extra=default_extra,
+                    set_step=set_step,
+                )
+                if lookup.adoption is not None:
+                    return lookup
+                volume_sizing = lookup.volume_sizing
                 reason = "no fresh slot of this image fits" if slot_docs else "no slot"
         logger.info(_m("warm_pool adopt=miss", extra=get_extra_info({**default_extra, "reason": reason})))
+        return WarmPoolLookup(adoption=None, volume_sizing=volume_sizing)
+
+    async def _first_adoptable_warm_slot(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        rental_port_maps: list[tuple[int, int, int]],
+        image_doc: dict,
+        slot_docs: list[dict],
+        log_tag: str,
+        default_extra: dict,
+        set_step: Callable[[str], None],
+    ) -> WarmPoolLookup:
+        """Walk the listed slots and return the first this rental can adopt, or a lookup with no
+        adoption when none fits.
+
+        A slot must be fresh, of this image, bound to ports the backend offers this rental, and
+        sized between what this rental's own sizing gives it now and the backend's caps; its live
+        volume must match its labels. The rental's volume sizing is computed once, at the first
+        slot that needs it, and comes back in the result either way so a miss does not size again.
+        """
+        volume_sizing: RentalVolumeSizing | None = None
+        now = datetime.now(UTC)
+        max_age = timedelta(hours=settings.WARM_POOL_MAX_AGE_HOURS)
+        for doc in slot_docs:
+            # A document the host authored: anything unreadable in it is a miss, never a
+            # failed rental.
+            try:
+                slot = warm_pool.slot_from_inspect(
+                    doc, image_id=image_doc.get("Id") or "", now=now, max_age=max_age
+                )
+                port_maps = (
+                    None
+                    if slot is None
+                    else warm_pool.slot_port_maps(slot, payload.available_ports, rental_port_maps)
+                )
+            except Exception as exc:
+                logger.info(
+                    _m("warm_pool slot=unreadable", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                )
+                continue
+            if slot is None or port_maps is None:
+                continue
+            if volume_sizing is None:
+                # The floor a slot must meet is what this rental's own sizing gives it on
+                # the host as it is now (a slot sized while a filler's data held the disk
+                # is smaller); sized once here, and handed back so a miss does not size again.
+                volume_sizing = await self._resolve_rental_volume_sizing(
+                    ssh_client=ssh_client,
+                    payload=payload,
+                    log_tag=log_tag,
+                    default_extra=default_extra,
+                    set_step=set_step,
+                )
+            size_reason = warm_pool.slot_disk_sizes_fit(
+                slot,
+                payload,
+                sized_volume_gb=volume_sizing.sizing.volume_limit_gb,
+                sized_storage_gb=volume_sizing.sizing.storage_limit_gb,
+            )
+            if size_reason in warm_pool.SLOT_BELOW_SIZING_REASONS:
+                # smaller than what the host gives a whole-host rental now: rather than wait
+                # for a rental with a cap small enough to fit it, it goes, and the next
+                # filler start leaves one sized for the host as it is (one create's cost)
+                logger.info(
+                    _m(
+                        "warm_pool slot=remove reason=undersized",
+                        extra=get_extra_info({**default_extra, "slot": slot.name, "detail": size_reason}),
+                    )
+                )
+                with contextlib.suppress(Exception):
+                    await ssh_client.run(
+                        warm_pool.remove_slot_command(slot.name, slot.volume_name),
+                        check=False,
+                        timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+                    )
+                continue
+            if size_reason is not None:
+                # larger than this rental's cap: the slot may fit a rental with a larger one
+                logger.info(
+                    _m(
+                        "warm_pool slot=skip reason=sizes",
+                        extra=get_extra_info({**default_extra, "slot": slot.name, "detail": size_reason}),
+                    )
+                )
+                continue
+            # The size labels sit on a container the miner's daemon holds: the volume the
+            # rental would be granted is read from the volume plugin itself before adoption.
+            volume_reason = await self._warm_slot_volume_mismatch(ssh_client, slot)
+            if volume_reason is not None:
+                logger.warning(
+                    _m(
+                        "warm_pool slot=remove reason=volume differs",
+                        extra=get_extra_info(
+                            {**default_extra, "slot": slot.name, "volume": slot.volume_name, "detail": volume_reason}
+                        ),
+                    )
+                )
+                with contextlib.suppress(Exception):
+                    await ssh_client.run(
+                        warm_pool.remove_slot_command(slot.name, slot.volume_name),
+                        check=False,
+                        timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+                    )
+                continue
+            logger.info(
+                _m(
+                    "warm_pool adopt=candidate",
+                    extra=get_extra_info({**default_extra, "slot": slot.name, "volume": slot.volume_name}),
+                )
+            )
+            return WarmPoolLookup(
+                adoption=WarmPoolAdoption(slot=slot, port_maps=port_maps, image_doc=image_doc),
+                volume_sizing=volume_sizing,
+            )
         return WarmPoolLookup(adoption=None, volume_sizing=volume_sizing)
 
     async def _warm_slot_volume_mismatch(
@@ -5880,7 +5915,7 @@ class DockerService:
                 warm_adoption: WarmPoolAdoption | None = None
                 # the rental's volume sizing, when the lookup computed it to bound a slot: the create
                 # path reuses it on a miss instead of sizing again
-                warm_volume_sizing: RentalVolumeSizing | None = None
+                lookup_volume_sizing: RentalVolumeSizing | None = None
                 if settings.WARM_POOL_ENABLED and not local_volume:
                     current_step = "warm_pool_lookup"
                     lookup = await self._find_warm_pool_adoption(
@@ -5895,7 +5930,7 @@ class DockerService:
                         default_extra=default_extra,
                         set_step=_set_current_step,
                     )
-                    warm_adoption, warm_volume_sizing = lookup.adoption, lookup.volume_sizing
+                    warm_adoption, lookup_volume_sizing = lookup.adoption, lookup.volume_sizing
                     if warm_adoption is not None:
                         local_volume = warm_adoption.slot.volume_name
                         effective_volume_limit_gb = warm_adoption.slot.volume_limit_gb
@@ -5907,7 +5942,7 @@ class DockerService:
                         ProfilerStep.since(
                             ProfilerStepName.WARM_POOL_LOOKUP,
                             prev_timestamp,
-                            skipped=warm_adoption is None and warm_volume_sizing is None,
+                            skipped=warm_adoption is None and lookup_volume_sizing is None,
                         )
                     )
                     prev_timestamp = now_ms()
@@ -5920,7 +5955,7 @@ class DockerService:
                         log_tag=log_tag,
                         default_extra=default_extra,
                         set_step=_set_current_step,
-                        volume_sizing=warm_volume_sizing,
+                        volume_sizing=lookup_volume_sizing,
                     )
                     local_volume = created_volume.name
                     effective_volume_limit_gb = created_volume.volume_limit_gb
@@ -6174,7 +6209,7 @@ class DockerService:
                                 log_tag=log_tag,
                                 default_extra=default_extra,
                                 set_step=_set_current_step,
-                                volume_sizing=warm_volume_sizing,
+                                volume_sizing=lookup_volume_sizing,
                             )
                             local_volume = created_volume.name
                             effective_volume_limit_gb = created_volume.volume_limit_gb
