@@ -255,7 +255,7 @@ class LocalRentService:
             logger.error("local rent: docker client unavailable: %r", exc)
             results["container"] = RentStepResult(status="failed", error=f"docker client: {type(exc).__name__}: {exc}")
             return self._result(body, started_wall, started, deadline, results, deadline_hit=False, rolled_back=True)
-        run = _Run(self, api, body, results)
+        run = _RentAttempt(self, api, body, results)
 
         task = asyncio.ensure_future(run.steps())
         try:
@@ -356,7 +356,7 @@ class LocalRentService:
         return None
 
 
-class _Run:
+class _RentAttempt:
     """One intent's steps against one docker-py client; owns what was created for the rollback."""
 
     def __init__(self, service: LocalRentService, api: Any, body: RentIntentBody, results: dict[str, RentStepResult]):

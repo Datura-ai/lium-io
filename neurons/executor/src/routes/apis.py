@@ -570,7 +570,7 @@ async def local_rent(request: Request):
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors())
     await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))
-    body = RentIntentBody.model_validate({k: v for k, v in raw.items() if k != "signature"})
+    body: RentIntentBody = intent
 
     refused = check_intent_window(body, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS)
     if refused:

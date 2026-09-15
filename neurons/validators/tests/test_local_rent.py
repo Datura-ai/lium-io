@@ -353,6 +353,16 @@ def test_ready_evidence_the_model_refuses_makes_the_step_malformed_not_created(r
         ({"steps": {"container": {"status": "ok"}}}, True),  # no ready step answered: not proven running
         # an `ok` container step without its evidence: the status alone is not taken at its word
         ({"steps": {"container": {"status": "ok"}, "ready": {"status": "ok"}}}, True),
+        # an `ok` ready step without its evidence: made, but not proven running
+        (
+            {
+                "steps": {
+                    "container": {"status": "ok", "data": {"container_name": "pod_abc", "container_id": "c1"}},
+                    "ready": {"status": "ok"},
+                }
+            },
+            True,
+        ),
     ],
 )
 def test_anything_short_of_made_and_running_is_not_created(overrides, holds_the_name):
