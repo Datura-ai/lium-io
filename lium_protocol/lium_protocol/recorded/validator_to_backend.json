@@ -370,6 +370,44 @@
       }
     },
     {
+      "expect": "FailedContainerRequest",
+      "note": "DAH-3504 (protocol 1.1.0): a custom-Dockerfile build failed; build_log_tail is the renter's own build output, step_detail stays None",
+      "message": {
+        "message_type": "FailedRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "error_type": "ContainerCreationFailed",
+        "error_code": "UnknownError",
+        "msg": "Failed create_container",
+        "detail": "Failed create_container {'executor': '203.0.113.10:2200', 'error': 'Custom dockerfile build failed (failure_step=docker_build): #7 2.114 ERROR: No matching distribution found for torch==9.9.9', 'failure_step': 'docker_build'}",
+        "failure_step": "docker_build",
+        "volume_encryption_status": null,
+        "build_log_tail": "#7 [3/5] RUN pip install -r requirements.txt\n#7 2.114 ERROR: No matching distribution found for torch==9.9.9\n#7 ERROR: process \"/bin/sh -c pip install -r requirements.txt\" did not complete successfully: exit code: 1",
+        "step_detail": null
+      }
+    },
+    {
+      "expect": "FailedContainerRequest",
+      "note": "DAH-3505 (protocol 1.1.0): the volume step failed after a long build; step_detail is the Docker daemon's reason, build_log_tail stays None",
+      "message": {
+        "message_type": "FailedRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "error_type": "ContainerCreationFailed",
+        "error_code": "UnknownError",
+        "msg": "Failed create_container",
+        "detail": "Failed create_container {'executor': '203.0.113.10:2200', 'error': \"Docker SDK create volume failed: 'NoneType' object has no attribute 'settimeout'\", 'failure_step': 'volume_creation'}",
+        "failure_step": "volume_creation",
+        "volume_encryption_status": null,
+        "build_log_tail": null,
+        "step_detail": "the Docker connection to the executor dropped while the pod was being prepared: Docker SDK create volume failed: 'NoneType' object has no attribute 'settimeout'"
+      }
+    },
+    {
       "expect": "PodLogsResponseToServer",
       "message": {
         "message_type": "PodLogsResponseToServer",
