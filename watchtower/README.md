@@ -8,7 +8,8 @@ Monitors a Docker image for validator-signed updates and automatically pulls and
 2. Reads the digest of the image that container runs
 3. Fetches the latest authorized digest from the validator-signed endpoint
 4. Verifies the signature using the validator's public key (hotkey)
-5. If digests differ, pulls `image@digest` (never a tag), then recreates the container from it (10 s stop timeout)
+5. If digests differ, checks that the host's NVIDIA runtime can start a GPU container: a throwaway container from the runner's own image with every GPU requested and the entrypoint `true` (nothing pulled, removed afterwards). If it cannot start, the cycle ends with `Update held` and a `reason_code` (`NVIDIA_RUNTIME_MISMATCH` for the driver/library mismatch, else `RUNTIME_PROBE_FAILED`); the check repeats every cycle, so the update resumes once the host is fixed. A first boot with no runner skips this step.
+6. Pulls `image@digest` (never a tag), then recreates the container from it (10 s stop timeout)
 
 ### Pull by digest, and the mirror bypass
 

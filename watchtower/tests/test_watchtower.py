@@ -27,6 +27,10 @@ from watchtower import (
     pull_image_by_digest,
     recreate_container,
     check_and_update,
+    classify_runtime_probe_error,
+    nvidia_runtime_ready,
+    RUNTIME_PROBE_FAILED,
+    RUNTIME_PROBE_NVIDIA_MISMATCH,
 )
 from models import WatchtowerDigestResponse
 
@@ -339,6 +343,8 @@ def _client_with(container, old_image=None, pulled_image=None):
 
     client.containers.get.side_effect = containers_get
     client.containers.list.return_value = [container] if container else []
+    # the runtime probe container (B-176): starts and exits 0 unless a test says otherwise
+    client.containers.create.return_value.wait.return_value = {"StatusCode": 0}
     client.api.create_container.return_value = {"Id": "newid"}
     client.api.create_endpoint_config.side_effect = lambda aliases=None: {"Aliases": aliases}
     client.api.create_networking_config.side_effect = lambda endpoints: {"EndpointsConfig": endpoints}
@@ -852,3 +858,172 @@ def test_check_and_update_handles_docker_connection_error(mock_docker):
 
     # Act / Assert — top-level exception handler prevents propagation
     check_and_update()
+
+
+# ── B-176: the update waits for a working NVIDIA runtime ─────────────────────
+
+NVML_MISMATCH = (
+    "500 Server Error: Internal Server Error (\"failed to create task for container: failed to "
+    "create shim task: OCI runtime create failed: runc create failed: unable to start container "
+    "process: error during container init: error running prestart hook #0: exit status 1, stdout: , "
+    "stderr: Auto-detected mode as 'legacy'\nnvidia-container-cli: initialization error: nvml error: "
+    "driver/library version mismatch: unknown\")"
+)
+
+
+def test_classify_runtime_probe_error_names_the_driver_library_mismatch():
+    """The daemon's message for a driver package updated without a reboot (ticket-0325) is the
+    mismatch code; any other start failure is the generic one (negative control)."""
+    assert classify_runtime_probe_error(NVML_MISMATCH) == RUNTIME_PROBE_NVIDIA_MISMATCH
+    assert classify_runtime_probe_error("500 Server Error: no such image") == RUNTIME_PROBE_FAILED
+
+
+def test_nvidia_runtime_ready_requests_every_gpu_and_removes_the_probe_container():
+    """The probe asks the daemon for all GPUs with entrypoint `true` from the runner's own image
+    (no pull), reads exit 0 as ready, and removes the container."""
+    client = _client_with(_fake_container())
+
+    probe = nvidia_runtime_ready(client, "sha256:oldimageid")
+
+    assert probe.ok is True and probe.reason_code is None
+    kwargs = client.containers.create.call_args.kwargs
+    assert client.containers.create.call_args.args[0] == "sha256:oldimageid"
+    assert kwargs["entrypoint"] == ["true"]
+    assert kwargs["device_requests"][0]["Count"] == -1
+    assert kwargs["device_requests"][0]["Capabilities"] == [["gpu"]]
+    client.containers.create.return_value.remove.assert_called_once_with(force=True)
+
+
+def test_nvidia_runtime_ready_reads_a_failed_start_as_the_mismatch_and_still_removes_the_container():
+    """Regression: on the ticket-0325 host `docker run --gpus all` fails in the NVIDIA prestart
+    hook. The probe reports the mismatch code with the daemon's text and cleans up."""
+    client = _client_with(_fake_container())
+    client.containers.create.return_value.start.side_effect = docker.errors.APIError(NVML_MISMATCH)
+
+    probe = nvidia_runtime_ready(client, "sha256:oldimageid")
+
+    assert probe.ok is False
+    assert probe.reason_code == RUNTIME_PROBE_NVIDIA_MISMATCH
+    assert "driver/library version mismatch" in probe.error
+    client.containers.create.return_value.remove.assert_called_once_with(force=True)
+
+
+def test_nvidia_runtime_ready_reads_a_nonzero_exit_as_not_ready():
+    client = _client_with(_fake_container())
+    client.containers.create.return_value.wait.return_value = {"StatusCode": 125}
+
+    probe = nvidia_runtime_ready(client, "sha256:oldimageid")
+
+    assert probe.ok is False and probe.reason_code == RUNTIME_PROBE_FAILED
+
+
+def test_nvidia_runtime_ready_reads_a_hung_probe_as_not_ready_and_removes_it():
+    """A container that never exits (a wedged hook) hits `wait`'s timeout: not ready, generic
+    code, and the container is still force-removed."""
+    client = _client_with(_fake_container())
+    client.containers.create.return_value.wait.side_effect = requests.exceptions.ReadTimeout("wait timed out")
+
+    probe = nvidia_runtime_ready(client, "sha256:oldimageid")
+
+    assert probe.ok is False and probe.reason_code == RUNTIME_PROBE_FAILED
+    assert "timed out" in probe.error
+    client.containers.create.return_value.remove.assert_called_once_with(force=True)
+
+
+@patch('watchtower.logger')
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_holds_when_the_runner_has_no_image_id(
+    mock_settings, mock_docker, mock_fetch, mock_pull, mock_logger
+):
+    """No image id to probe with is a hold, not a crash into the outer handler."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    mock_settings.WATCHTOWER_INTERVAL = 300
+    runner = _fake_container()
+    runner.attrs["Image"] = None
+    client = _client_with(runner)
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
+
+    check_and_update()
+
+    mock_pull.assert_not_called()
+    client.containers.create.assert_not_called()
+    held = [str(c.args[0]) for c in mock_logger.warning.call_args_list if "Update held" in str(c.args[0])]
+    assert len(held) == 1 and RUNTIME_PROBE_FAILED in held[0]
+
+
+@patch('watchtower.logger')
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_holds_the_update_while_the_nvidia_runtime_probe_fails(
+    mock_settings, mock_docker, mock_fetch, mock_pull, mock_logger
+):
+    """Regression (ticket-0325): a new signed digest on a host whose NVIDIA runtime is broken
+    pulled and recreated the runner; the new executor never started. Now nothing is pulled
+    and the log says why, with the reason code."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    mock_settings.WATCHTOWER_INTERVAL = 300
+    client = _client_with(_fake_container())
+    client.containers.create.return_value.start.side_effect = docker.errors.APIError(NVML_MISMATCH)
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
+
+    check_and_update()
+
+    mock_pull.assert_not_called()
+    held = [str(c.args[0]) for c in mock_logger.warning.call_args_list if "Update held" in str(c.args[0])]
+    assert len(held) == 1
+    assert RUNTIME_PROBE_NVIDIA_MISMATCH in held[0]
+    assert "driver/library version mismatch" in held[0]
+
+
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_resumes_once_the_nvidia_runtime_probe_passes(
+    mock_settings, mock_docker, mock_fetch, mock_pull
+):
+    """Two cycles on the same host: the first holds (hook fails), the second, after the
+    reboot, pulls with the same signed digest. No state is kept between cycles."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    mock_settings.WATCHTOWER_INTERVAL = 300
+    client = _client_with(_fake_container())
+    probe_container = client.containers.create.return_value
+    probe_container.start.side_effect = [docker.errors.APIError(NVML_MISMATCH), None]
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
+    mock_pull.return_value = True
+
+    check_and_update()
+    mock_pull.assert_not_called()
+
+    check_and_update()
+    mock_pull.assert_called_once_with(client, IMAGE, NEW_DIGEST)
+
+
+@patch('watchtower.nvidia_runtime_ready')
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_skips_the_probe_when_there_is_no_runner_yet(
+    mock_settings, mock_docker, mock_fetch, mock_pull, mock_probe
+):
+    """A first CVM boot has no runner image on the host to probe with and nothing running
+    to break; the create path is unchanged."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    client = _client_with(None)
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
+    mock_pull.return_value = True
+
+    check_and_update()
+
+    mock_probe.assert_not_called()
+    mock_pull.assert_called_once_with(client, IMAGE, NEW_DIGEST)
