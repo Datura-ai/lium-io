@@ -8,6 +8,7 @@ __pycache__/
 !libdmcompverify.so
 !libverifyx.so
 !libinspector.so
+!libgpusig.so
 # Distribution / packaging
 .Python
 build/
