@@ -872,7 +872,7 @@ def _create_docker_api_client_with_rental_ssh_adapter(
         docker_api_client.SSHHTTPAdapter = original_adapter
 
 
-# DAH-3504: the Docker SDK's own SSH session (paramiko) is opened once per create_container and
+# DAH-3505: the Docker SDK's own SSH session (paramiko) is opened once per create_container and
 # then sits idle while a custom-Dockerfile build runs over the validator's asyncssh session. The
 # asyncssh session has a keepalive; this one had none, so a build longer than the path's idle
 # timeout (all 10 custom-build `volume_creation` failures in the 14 d to 15 Sep 2026 came after

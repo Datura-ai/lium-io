@@ -513,12 +513,13 @@ def custom_build_log_tail(output: str | None) -> str | None:
     return tail[-CUSTOM_BUILD_LOG_TAIL_MAX_CHARS:]
 
 
-# DAH-3504: the create steps whose exception text is the Docker daemon's own reason for the
+# DAH-3505: the create steps whose exception text is the Docker daemon's own reason for the
 # volume (size, plugin, disk, or the SDK's transport) and carries no executor host data.
 VOLUME_STEP_NAMES = frozenset({"volume_sizing", "volume_creation"})
 VOLUME_STEP_DETAIL_MAX_CHARS = 300
-# docker-py raises this from inside its SSH transport when the session under the Docker SDK client
-# is gone; the text alone reads like a code bug, so the detail says what it means.
+# docker-py's SSH transport stack (urllib3 over a paramiko channel) raises these once the session
+# under the Docker SDK client is gone; the text alone reads like a code bug, so the detail says what
+# it means.
 _STALE_SDK_TRANSPORT_MARKERS = (
     "has no attribute 'settimeout'",
     "SSH session not active",
