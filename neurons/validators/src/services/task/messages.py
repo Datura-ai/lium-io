@@ -1122,7 +1122,7 @@ class CapabilityMessages:
             "page."
         ),
     )
-    VERIFY_FAILED_CONTAINER_GPU_ACCESS = MessageTemplate(
+    VERIFY_FAILED_NO_CUDA_DEVICE = MessageTemplate(
         event="GPU capability verification failed: no CUDA device in the container",
         reason="GPU_VERIFY_NO_CUDA_DEVICE",
         severity="error",
