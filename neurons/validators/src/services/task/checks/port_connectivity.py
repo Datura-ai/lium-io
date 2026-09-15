@@ -37,6 +37,14 @@ class PortConnectivityCheck:
         # fillers has no rented_executor entry at all — hence the separate lookup.
         filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
+        # liumd phase 2: the published-ports fact only shrinks the probed batch (`local_verify_facts`).
+        facts = ctx.state.local_facts
+        published_ports = (
+            sorted(facts.published_ports)
+            if facts is not None and facts.published_ports is not None
+            else None
+        )
+
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
@@ -53,6 +61,7 @@ class PortConnectivityCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "executor_ip": ctx.executor.address,
             },
+            published_ports=published_ports,
         )
         verified_port_count = len(result.successful_ports)
         extra_info = {

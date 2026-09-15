@@ -33,8 +33,14 @@ class ExecutorConnectivityService:
         rented_pod_names: list[str] | None = None,
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
+        published_ports: list[int] | None = None,
     ) -> PortVerificationResult:
-        """Verify executor port connectivity and DinD capability."""
+        """Verify executor port connectivity and DinD capability.
+
+        `published_ports` (liumd phase 2): host ports the executor's docker already publishes; they
+        are removed from the selected batch (`local_verify_facts`). `rented_ports` keeps its meaning
+        for the sysbox fallback below.
+        """
         log_ctx = log_ctx or {}
         t1 = time.monotonic()
         try:
@@ -48,6 +54,7 @@ class ExecutorConnectivityService:
                 # customer rental — the sysbox fallback below reads it that way (DAH-2527)
                 unavailable_ports=(rented_ports or []) + (filler_ports or []),
                 log_ctx=log_ctx,
+                published_ports=published_ports,
             )
             sysbox_result = verification.sysbox_runtime
             if not sysbox_result and rented_ports and sysbox_runtime:

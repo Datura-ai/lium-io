@@ -34,6 +34,7 @@ class ConnectivityOrchestrator:
         unavailable_ports: list[int] | None,
         ssh_client,
         log_ctx: dict | None = None,
+        published_ports: list[int] | None = None,
     ) -> PortVerificationResult:
         log_ctx = {
             **(log_ctx or {}),
@@ -43,6 +44,11 @@ class ConnectivityOrchestrator:
         ports = self.port_selector.select(
             executor_info, BATCH_PORT_VERIFICATION_SIZE, set(unavailable_ports or [])
         )
+        if published_ports:
+            # liumd phase 2: applied AFTER the selection, never to it (`local_verify_facts`); an
+            # empty remainder keeps the full window.
+            published = set(published_ports)
+            ports = [pair for pair in ports if pair.external not in published] or ports
 
         if not ports:
             return PortVerificationResult(

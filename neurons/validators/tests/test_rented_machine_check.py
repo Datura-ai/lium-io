@@ -19,8 +19,8 @@ from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 class MockContainerCleanup:
     """Mock container cleanup service for tests."""
-    async def cleanup(self, ssh_client, rented_data, executor_uuid):
-        return 0, []
+    async def cleanup(self, ssh_client, rented_data, executor_uuid, host_facts=None):
+        return 0, [], []
 
 
 def convert_rented_machine_to_rented_data(

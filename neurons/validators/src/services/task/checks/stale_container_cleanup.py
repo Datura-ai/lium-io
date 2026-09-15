@@ -70,6 +70,7 @@ class StaleContainerCleanupCheck:
         if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
+            # liumd phase 2: the container fact stands in for the listings (`local_verify_facts`).
             (
                 removed_count,
                 removed_names,
@@ -78,6 +79,7 @@ class StaleContainerCleanupCheck:
                 ssh_client=ctx.ssh,
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
+                host_facts=ctx.state.local_facts,
             )
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
@@ -120,7 +122,18 @@ class StaleContainerCleanupCheck:
         )
         # DAH-2991: an orphan that survived removal still holds its ports; PortCountCheck names it
         # instead of reporting a bare count the provider has to diagnose by hand.
-        updates = {"state": replace(ctx.state, orphaned_containers=unremovable_names)} if unremovable_names else {}
+        # liumd phase 2: the published-ports fact was collected BEFORE this check. A container
+        # removed here has just freed its host ports, so a port window narrowed by that fact would
+        # skip ports the connect-back could now bind and count. The fact is dropped for this cycle
+        # and the port check lists ports over SSH as today; the other facts stand (the removal is
+        # what they were for).
+        state_changes = {}
+        if unremovable_names:
+            state_changes["orphaned_containers"] = unremovable_names
+        facts = ctx.state.local_facts
+        if removed_count > 0 and facts is not None and facts.published_ports is not None:
+            state_changes["local_facts"] = replace(facts, published_ports=None)
+        updates = {"state": replace(ctx.state, **state_changes)} if state_changes else {}
         return CheckResult(passed=True, event=event, updates=updates)
 
     async def _first_sight(self, ctx: Context) -> bool:

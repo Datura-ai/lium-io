@@ -46,6 +46,7 @@ from .checks import (
     GpuUsageCheck,
     GpuVramPrecheck,
     InspectorRentedCheck,
+    LocalFactsCheck,
     LocalVerifyCheck,
     MachineSpecScrapeCheck,
     NvmlDigestCheck,
@@ -303,6 +304,9 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
+                # liumd phase 2 (DAH-2834): one facts-only POST /verify (≈ 1 s, no GPU work) for
+                # the two checks after it and the inspector pre-check (`local_verify_facts`).
+                LocalFactsCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
                 # platform deliberately does not tear down) keeps binding the rental port range.

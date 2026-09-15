@@ -19,6 +19,7 @@ from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
 from services.local_verify_client import BackgroundProbe, LocalVerifyOutcome
+from services.local_verify_facts import LocalFacts
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
@@ -175,6 +176,9 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # liumd phase 2: the bounded host facts of the early `POST /verify` (`local_verify_facts`);
+    # None = not asked or unusable.
+    local_facts: LocalFacts | None = None
 
 
 class CheckResult(BaseModel):

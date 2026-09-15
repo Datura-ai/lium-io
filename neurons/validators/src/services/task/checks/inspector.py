@@ -15,7 +15,7 @@ from core.utils import _m, get_extra_info
 from ..inspector_verdict import ACTION_QUARANTINE, InspectorVerdict, build_verdict, renter_access_event
 from ..messages import InspectorMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import LOCAL_VERIFY_OUTCOME_EVENT, CheckResult, Context
 from ..models import ValidationEvent
 from protocol.vc_protocol.compute_requests import RentedPod
 
@@ -55,6 +55,7 @@ class InspectorRentedCheck:
             "rented": True,
             "rented_pods": [{"name": p.container_name, "pod_id": p.pod_id} for p in rented_pods],
         }
+        _log_inspector_digest_agreement(ctx)
 
         sensor_attested = _sensor_attested(ctx)
         result = await ctx.services.inspector.validate_rented_executor(
@@ -263,6 +264,28 @@ class InspectorRentedCheck:
             # in calculate_scores reads this flag (same mechanics as cpu_truth_passed).
             updates["inspector_passed"] = False
         return CheckResult(passed=not acts, event=event, updates=updates)
+
+
+def _log_inspector_digest_agreement(ctx: Context) -> None:
+    """Logs whether the executor's `inspector.lib_sha256` fact agrees with the digest the SSH
+    pre-check requires (`sha256_from_executor`); observe-only, see `local_verify_facts`."""
+    facts = ctx.state.local_facts
+    reported = facts.inspector_lib_sha256 if facts is not None else None
+    if reported is None:
+        return
+    expected = ctx.services.inspector.local_checksum
+    logger.info(
+        _m(
+            LOCAL_VERIFY_OUTCOME_EVENT,
+            extra={
+                **ctx.default_extra,
+                "outcome": "observed",
+                "step": "inspector",
+                "reason": "digest_match" if reported == expected else "digest_mismatch",
+                "first_pass": ctx.config.first_pass,
+            },
+        )
+    )
 
 
 def _build_inspector_event(
