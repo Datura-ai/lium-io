@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 from core.config import settings
 
@@ -105,7 +105,11 @@ class CapabilityCheck:
                     Msg.RENTED_SKIPPED,
                     ctx=ctx,
                     check_id=self.check_id,
-                    what={**lium_workload, "probe": failure_details},
+                    what={
+                        "workload": lium_workload.kind,
+                        "containers": list(lium_workload.container_names),
+                        "probe": failure_details,
+                    },
                 )
                 return CheckResult(passed=True, event=event)
 
@@ -141,7 +145,16 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
     return (result.returned_uuid or "").strip().lower() in _NO_UUID
 
 
-async def _lium_workload_live_now(ctx: Context) -> dict[str, Any] | None:
+@dataclass(frozen=True)
+class _LiumWorkload:
+    """A workload the backend says holds this node's cards right now: which kind (`filler` or
+    `pod`) and the container names it listed, sorted."""
+
+    kind: str
+    container_names: tuple[str, ...]
+
+
+async def _lium_workload_live_now(ctx: Context) -> _LiumWorkload | None:
     """Ask the backend whether a workload it started holds this node's cards right now.
 
     `rented_data` is read once, at cycle start. A filler the backend starts right after a rental
@@ -168,13 +181,13 @@ async def _lium_workload_live_now(ctx: Context) -> dict[str, Any] | None:
     executor_uuid = ctx.executor.uuid
     filler_containers = fresh.get_filler_containers(executor_uuid)
     if filler_containers:
-        return {"workload": "filler", "containers": sorted(filler_containers)}
+        return _LiumWorkload(kind="filler", container_names=tuple(sorted(filler_containers)))
     rented_executor = fresh.executors.get(executor_uuid)
     if rented_executor and rented_executor.pods:
-        return {
-            "workload": "pod",
-            "containers": sorted(pod.container_name for pod in rented_executor.pods),
-        }
+        return _LiumWorkload(
+            kind="pod",
+            container_names=tuple(sorted(pod.container_name for pod in rented_executor.pods)),
+        )
     return None
 
 
