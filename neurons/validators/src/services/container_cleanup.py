@@ -171,7 +171,7 @@ class ContainerCleanup:
 
         return len(removed_names), removed_names, unremovable_names
 
-    def _fact_ages_or_none(self, host_facts: "LocalFacts | None", extra: dict) -> "dict[str, float] | None":
+    def _fact_ages_or_none(self, host_facts: "LocalFacts | None", extra: dict) -> "dict[str, float | None] | None":
         """The per-container ages the executor's fact gives, or None when there is no usable fact;
         a fact that raises is logged and treated as absent (the fact is an optimisation, SSH is the
         source of truth)."""
@@ -187,8 +187,8 @@ class ContainerCleanup:
             return None
 
     async def _list_rental_containers(
-        self, ssh_client, fact_ages: "dict[str, float] | None"
-    ) -> "tuple[list[str], dict[str, float] | None]":
+        self, ssh_client, fact_ages: "dict[str, float | None] | None"
+    ) -> "tuple[list[str], dict[str, float | None] | None]":
         """The rental-prefixed container names to consider this cycle: the fact's names when the
         fact can age them, else the `docker ps -a --filter` listing over SSH. Returns the names and
         the ages that came with them (None when the listing is SSH's)."""
