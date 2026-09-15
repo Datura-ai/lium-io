@@ -2706,6 +2706,18 @@
     },
     "FailedContainerRequest": {
       "properties": {
+        "build_log_tail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Log Tail"
+        },
         "detail": {
           "anyOf": [
             {
@@ -2800,6 +2812,18 @@
           ],
           "default": null,
           "title": "Sent At"
+        },
+        "step_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Step Detail"
         },
         "volume_encryption_status": {
           "anyOf": [
@@ -5276,7 +5300,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.0.0",
+  "protocol_version": "1.1.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
