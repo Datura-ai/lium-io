@@ -1356,19 +1356,22 @@ def test_rental_ssh_adapter_sets_a_keepalive_on_its_transport(monkeypatch, tmp_p
         key_path=key_path,
         known_hosts_path=known_hosts_path,
     )
-    adapter = adapter_class.__new__(adapter_class)
-    adapter._create_paramiko_client("ssh://root@127.0.0.1:2222")
-
-    adapter._connect()
+    # Through docker-py's own constructor: SSHHTTPAdapter.__init__ is what calls _connect, so the
+    # hook the fix relies on is pinned here, not assumed.
+    adapter = adapter_class("ssh://root@127.0.0.1:2222")
 
     assert adapter.ssh_client.connected_with["hostname"] == "127.0.0.1"
     assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC]
     assert 0 < RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC <= 60
 
+    # docker-py reconnects a closed transport through the same hook.
+    adapter._connect()
+    assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC] * 2
+
 
 def test_rental_ssh_adapter_connect_without_transport_does_not_fail(monkeypatch, tmp_path):
-    """A connect that leaves no transport (paramiko raised, or a stub client) must not turn into
-    an AttributeError of our own; the SDK's usual connection error is the one the caller sees."""
+    """A connect that leaves no transport (a stub client, or docker-py's shell-out mode) must not
+    turn into an AttributeError of our own."""
     import paramiko
 
     key_path = tmp_path / "id_executor"
