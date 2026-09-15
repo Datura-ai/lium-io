@@ -872,6 +872,15 @@ def _create_docker_api_client_with_rental_ssh_adapter(
         docker_api_client.SSHHTTPAdapter = original_adapter
 
 
+# DAH-3504: the Docker SDK's own SSH session (paramiko) is opened once per create_container and
+# then sits idle while a custom-Dockerfile build runs over the validator's asyncssh session. The
+# asyncssh session has a keepalive; this one had none, so a build longer than the path's idle
+# timeout (all 10 custom-build `volume_creation` failures in the 14 d to 15 Sep 2026 came after
+# 9 to 14 min builds, every build under 6 min got its volume) left a dead transport under the
+# first SDK call after the build. Same cadence as _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC.
+RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC = 30
+
+
 def _build_rental_ssh_http_adapter_class(
     *,
     key_path: Path,
@@ -880,6 +889,12 @@ def _build_rental_ssh_http_adapter_class(
     from docker.transport.sshconn import SSHHTTPAdapter
 
     class RentalSSHHTTPAdapter(SSHHTTPAdapter):
+        def _connect(self):
+            super()._connect()
+            transport = self.ssh_client.get_transport() if self.ssh_client else None
+            if transport is not None:
+                transport.set_keepalive(RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC)
+
         def _create_paramiko_client(self, base_url):
             import logging
             import urllib.parse

@@ -513,6 +513,33 @@ def custom_build_log_tail(output: str | None) -> str | None:
     return tail[-CUSTOM_BUILD_LOG_TAIL_MAX_CHARS:]
 
 
+# DAH-3504: the create steps whose exception text is the Docker daemon's own reason for the
+# volume (size, plugin, disk, or the SDK's transport) and carries no executor host data.
+VOLUME_STEP_NAMES = frozenset({"volume_sizing", "volume_creation"})
+VOLUME_STEP_DETAIL_MAX_CHARS = 300
+# docker-py raises this from inside its SSH transport when the session under the Docker SDK client
+# is gone; the text alone reads like a code bug, so the detail says what it means.
+_STALE_SDK_TRANSPORT_MARKERS = (
+    "has no attribute 'settimeout'",
+    "SSH session not active",
+    "Socket is closed",
+)
+STALE_SDK_TRANSPORT_HINT = (
+    "the Docker connection to the executor dropped while the pod was being prepared"
+)
+
+
+def volume_step_detail(exc: BaseException) -> str | None:
+    """One bounded line saying why the volume step failed, or None when the exception has no text.
+    A dead Docker SDK transport gets a plain-language hint in front of the raw error."""
+    text = " ".join(str(exc).split())
+    if not text:
+        return None
+    if any(marker in text for marker in _STALE_SDK_TRANSPORT_MARKERS):
+        text = f"{STALE_SDK_TRANSPORT_HINT}: {text}"
+    return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
+
+
 class CustomBuildFailed(Exception):
     """A custom-Dockerfile build did not produce an image. `failure_step` is the CCF step
     (docker_build, build_timeout, build_dind_start, ...); `log_tail` is what the build printed last,
@@ -5849,6 +5876,8 @@ class DockerService:
                 ),
                 # Renter-safe on its own: the output of the renter's Dockerfile, no executor host data.
                 build_log_tail=e.log_tail if isinstance(e, CustomBuildFailed) else None,
+                # The Docker daemon's reason for a volume failure; every other step stays None.
+                step_detail=volume_step_detail(e) if current_step in VOLUME_STEP_NAMES else None,
             )
 
     async def _run_bootstrap_restore(
