@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from core.config import settings
-from services.nvidia_devices import read_kernel_gpu_uuids
+from services.nvidia_devices import KernelGpuView, read_kernel_gpu_view
 
 from ..messages import BannedProviderMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -13,17 +13,21 @@ def reported_gpu_uuids(ctx: Context) -> list[str]:
     return [gpu_uuid for gpu_uuid in (ctx.state.gpu_uuids or "").split(",") if gpu_uuid]
 
 
-async def kernel_gpu_uuids(ctx: Context) -> list[str] | None:
+async def kernel_gpu_view(ctx: Context) -> KernelGpuView:
     """Kernel-side GPU identity, read once per cycle: this check stores it in ctx.state for BannedGpuCheck.
 
     `kernel_gpu_uuids_read` marks the attempt, so an unreadable procfs is read once per cycle too —
     the second check must not open another 15 s SSH read on the same wedged host.
     """
     if ctx.state.kernel_gpu_uuids_read:
-        return ctx.state.kernel_gpu_uuids
+        return KernelGpuView(ctx.state.kernel_gpu_uuids, ctx.state.kernel_gpu_foreign_mounts)
     if ctx.ssh is None:
-        return None
-    return await read_kernel_gpu_uuids(ctx.ssh)
+        return KernelGpuView(uuids=None, foreign_mounts=[])
+    return await read_kernel_gpu_view(ctx.ssh)
+
+
+async def kernel_gpu_uuids(ctx: Context) -> list[str] | None:
+    return (await kernel_gpu_view(ctx)).uuids
 
 
 def uuids_to_match_bans_against(reported: list[str], kernel: list[str] | None) -> list[str]:
@@ -46,7 +50,9 @@ class BannedProviderCheck:
         # backend keys future bans on an identity the host did not choose. Shadow first
         # (KERNEL_GPU_BAN_ENFORCEMENT_ENABLED=False): the kernel list is read and recorded, the ban
         # is still matched on the reported list, and `kernel_view_would_ban` says what the flip changes.
-        kernel_uuids = await kernel_gpu_uuids(ctx)
+        # A foreign mount over the gpus path (the 2026-08-19 kit) means the kernel list is not the
+        # kernel's: it is dropped (None), named on the event, and fails the check once enforcing.
+        kernel_uuids, foreign_mounts = await kernel_gpu_view(ctx)
         is_banned = bool(
             rented_data
             and rented_data.is_provider_banned(
@@ -72,13 +78,18 @@ class BannedProviderCheck:
             and set(gpu_uuids) != set(kernel_uuids),
             "kernel_view_would_ban": kernel_view_would_ban,
             "kernel_ban_enforced": settings.KERNEL_GPU_BAN_ENFORCEMENT_ENABLED,
+            "kernel_gpu_foreign_mounts": foreign_mounts,
         }
         specs = ctx.state.specs
         if kernel_uuids is not None:
             specs = {**specs, "kernel_gpu_uuids": kernel_uuids}
         updates: dict[str, object] = {
             "state": replace(
-                ctx.state, kernel_gpu_uuids=kernel_uuids, kernel_gpu_uuids_read=True, specs=specs
+                ctx.state,
+                kernel_gpu_uuids=kernel_uuids,
+                kernel_gpu_uuids_read=True,
+                kernel_gpu_foreign_mounts=foreign_mounts,
+                specs=specs,
             )
         }
 
@@ -87,6 +98,12 @@ class BannedProviderCheck:
             return CheckResult(
                 passed=False, event=event, updates={**updates, "is_provider_banned": True}
             )
+
+        if foreign_mounts and settings.KERNEL_GPU_BAN_ENFORCEMENT_ENABLED:
+            event = render_message(
+                Msg.KERNEL_GPU_VIEW_OVERLAID, ctx=ctx, check_id=self.check_id, what=what
+            )
+            return CheckResult(passed=False, event=event, updates=updates)
 
         event = render_message(Msg.PROVIDER_ALLOWED, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event, updates=updates)

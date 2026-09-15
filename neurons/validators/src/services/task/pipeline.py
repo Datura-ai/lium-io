@@ -136,6 +136,9 @@ class ContextState:
     # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
     kernel_gpu_uuids: list[str] | None = None
     kernel_gpu_uuids_read: bool = False
+    # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
+    # non-empty = the kernel list above was withheld because it was read through them
+    kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
     verified_port_count: int = 0
     # DAH-2991: orphaned rental containers the stale cleanup could not remove this cycle; they still
     # hold their published ports, so PortCountCheck names them in INSUFFICIENT_PORTS.

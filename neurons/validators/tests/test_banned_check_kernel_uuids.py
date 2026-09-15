@@ -26,10 +26,43 @@ from tests.helpers import build_state
 REAL = "GPU-f2bfa67f-5281-aabc-aa90-c91764f90d17"  # what the kernel sees
 SPOOFED = "GPU-f2bfa67f-5281-aabc-aa90-c91764f90d18"  # what the shimmed NVML reports
 
+# /proc/self/mountinfo as seen from inside a GPU container (1×A100 Lium pod, 15 Sep 2026):
+# libnvidia-container's own tmpfs at /proc/driver/nvidia, then the real procfs bound per card.
+CONTAINER_MOUNTS = [
+    "1575 1532 0:126 / /proc/driver/nvidia rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,mode=555,inode64",
+    "1619 1575 0:23 /driver/nvidia/gpus/0001:00:00.0 /proc/driver/nvidia/gpus/0001:00:00.0 "
+    "ro,nosuid,nodev,noexec,relatime master:5 - proc proc rw",
+]
+# The 2026-08-19 kit (providerban ddae45d9: "tmpfs overlay on /proc/driver/nvidia/gpus"), as the same
+# container shows it after `mount -t tmpfs none /proc/driver/nvidia/gpus/0001:00:00.0` (same pod).
+OVERLAY_MOUNT = (
+    "1424 1619 0:133 / /proc/driver/nvidia/gpus/0001:00:00.0 rw,relatime - tmpfs none "
+    "rw,uid=231072,gid=231072,inode64"
+)
 
-def _ssh_with_procfs(lines: list[str]):
+
+INFO_FILE = "/proc/driver/nvidia/gpus/0001:00:00.0/information"
+
+
+def _ssh_with_procfs(
+    lines: list[str], mounts: list[str] = CONTAINER_MOUNTS, file_fs: list[str] | None = None
+):
+    """The one round-trip read_kernel_gpu_view makes: mountinfo, `stat -f` per file, the UUID rows."""
+    if file_fs is None:
+        file_fs = [f"{INFO_FILE} proc" for _ in lines] + [
+            f"{INFO_FILE}|regular file" for _ in lines
+        ]
+    stdout = "\n".join(
+        [
+            *mounts,
+            nvidia_devices.KERNEL_GPU_FS_SEPARATOR,
+            *file_fs,
+            nvidia_devices.KERNEL_GPU_VIEW_SEPARATOR,
+            *lines,
+        ]
+    )
     ssh = AsyncMock()
-    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout="\n".join(lines), stderr=""))
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout, stderr=""))
     return ssh
 
 
@@ -269,3 +302,138 @@ async def test_hung_procfs_read_is_bounded_and_falls_back_to_reported_uuids(
     assert result.passed is True
     assert result.event.what_we_saw["kernel_gpu_uuids"] is None
     ssh.run.assert_awaited_once()
+
+
+def test_foreign_mount_parser_passes_the_container_runtime_layout_and_flags_the_overlay():
+    """Regression: a "tmpfs under /proc/driver/nvidia" rule would flag every GPU container (the
+    runtime's own tmpfs sits there); the rule is a non-procfs mount on the gpus subtree."""
+    assert nvidia_devices.foreign_mounts_over_proc_nvidia_gpus("\n".join(CONTAINER_MOUNTS)) == []
+    assert nvidia_devices.foreign_mounts_over_proc_nvidia_gpus(
+        "\n".join([*CONTAINER_MOUNTS, OVERLAY_MOUNT])
+    ) == ["/proc/driver/nvidia/gpus/0001:00:00.0 tmpfs"]
+
+
+@pytest.mark.asyncio
+async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails_when_enforcing(
+    context_factory, enforcing
+):
+    """The shim test: the overlay serves a clean UUID, the kernel list is withheld, the check fails."""
+    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids=SPOOFED, rented_data=rented),
+        ssh=_ssh_with_procfs([f"{SPOOFED}, 0"], mounts=[*CONTAINER_MOUNTS, OVERLAY_MOUNT]),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
+    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == [
+        "/proc/driver/nvidia/gpus/0001:00:00.0 tmpfs"
+    ]
+    assert "kernel_gpu_uuids" not in result.updates["state"].specs
+    assert "is_provider_banned" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_overlay_in_shadow_passes_but_names_the_mount_and_hands_it_to_the_gpu_check(
+    context_factory, shadow
+):
+    rented = RentedExecutorsResponse(executors={}, banned_guids=[REAL])
+    ssh = _ssh_with_procfs([f"{SPOOFED}, 0"], mounts=[*CONTAINER_MOUNTS, OVERLAY_MOUNT])
+    ctx = context_factory(state=build_state(gpu_uuids=SPOOFED, rented_data=rented), ssh=ssh)
+
+    provider = await BannedProviderCheck().run(ctx)
+    gpu = await BannedGpuCheck().run(_after(ctx, provider))
+
+    assert provider.passed is True
+    assert provider.event.reason_code == BannedProviderMessages.PROVIDER_ALLOWED.reason
+    assert provider.event.what_we_saw["kernel_gpu_foreign_mounts"] == [
+        "/proc/driver/nvidia/gpus/0001:00:00.0 tmpfs"
+    ]
+    assert gpu.passed is True
+    assert gpu.event.what_we_saw["kernel_gpu_uuids"] is None
+    ssh.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_information_file_not_on_procfs_is_withheld_even_with_no_mount_of_its_own(
+    context_factory, enforcing
+):
+    """Regression (self-review, 15 Sep): the executor container is privileged, so an operator can
+    drop the card's proc bind and write a plain `information` file into the runtime's tmpfs; the
+    mount table then shows nothing on the gpus subtree. The file's own filesystem still says tmpfs."""
+    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids=SPOOFED, rented_data=rented),
+        ssh=_ssh_with_procfs(
+            [f"{SPOOFED}, 0"], mounts=CONTAINER_MOUNTS[:1], file_fs=[f"{INFO_FILE} tmpfs"]
+        ),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == [f"{INFO_FILE} tmpfs"]
+    assert result.updates["state"].kernel_gpu_uuids is None
+
+
+@pytest.mark.asyncio
+async def test_uuid_rows_without_a_procfs_stat_row_are_unreadable_not_a_finding(
+    context_factory, enforcing
+):
+    """No `stat` output (an image without GNU stat) is fail-open like every other unreadable procfs."""
+    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids="GPU-honest", rented_data=rented),
+        ssh=_ssh_with_procfs([f"{REAL}, 0"], file_fs=[]),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_gpu_uuids"] is None
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
+
+
+@pytest.mark.parametrize(
+    ("mounts", "file_fs", "expected"),
+    [
+        pytest.param(
+            CONTAINER_MOUNTS,
+            [f"{INFO_FILE} proc", f"{INFO_FILE}|symbolic link"],
+            [f"{INFO_FILE} symbolic link"],
+            id="symlink-to-another-procfs-file",
+        ),
+        pytest.param(
+            [
+                CONTAINER_MOUNTS[0],
+                "1620 1575 0:23 /sys/kernel/core_pattern /proc/driver/nvidia/gpus/0001:00:00.0/information "
+                "rw,relatime - proc proc rw",
+            ],
+            [f"{INFO_FILE} proc", f"{INFO_FILE}|regular file"],
+            [f"{INFO_FILE} proc:/sys/kernel/core_pattern"],
+            id="proc-bind-of-another-procfs-file",
+        ),
+    ],
+)
+def test_a_procfs_file_that_is_not_the_cards_own_node_is_foreign(mounts, file_fs, expected):
+    """Regression (self-review round 2): "on procfs" is not "the driver's node". A symlink or a
+    proc bind pointing at a root-writable procfs file passes the fstype rules alone."""
+    assert (
+        nvidia_devices.foreign_mounts_over_proc_nvidia_gpus("\n".join(mounts), "\n".join(file_fs))
+        == expected
+    )
+
+
+def test_a_stat_row_whose_path_is_not_a_cards_information_file_is_foreign():
+    """Regression (self-review round 3): a directory name with a newline under gpus/ splits its own
+    stat rows, so neither half starts with the gpus path; every row must be <gpus>/<bus id>/information."""
+    rows = "/proc/driver/nvidia/gpus/0001:00:00.0/information proc\n/proc/driver/nvidia/gpus/s\n"
+    rows += "ym/information proc\n/proc/driver/nvidia/gpus/s\nym/information|symbolic link"
+    found = nvidia_devices.foreign_mounts_over_proc_nvidia_gpus("\n".join(CONTAINER_MOUNTS), rows)
+    assert found[0] == "/proc/driver/nvidia/gpus/s unexpected path"
+    assert "ym/information proc" not in found  # a split half is named, never counted as evidence
+    assert len(found) == 4
