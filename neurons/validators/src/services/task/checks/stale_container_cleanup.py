@@ -151,7 +151,7 @@ class StaleContainerCleanupCheck:
         for name in unremovable_names:
             # queued before the attempt (the hook runs first), still on the host: not reaped
             await queue.drop(name)
-        reaped = await queue.states(limit=self._reaped_share(ctx))
+        reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
         if not unremovable_names and not reaped:
             return CheckResult(passed=True, event=event)
         state = replace(
@@ -162,7 +162,7 @@ class StaleContainerCleanupCheck:
         return CheckResult(passed=True, event=event, updates={"state": state})
 
     @staticmethod
-    def _reaped_share(ctx: Context) -> int | None:
+    def _reaped_slots_in_spec(ctx: Context) -> int | None:
         """How many queued reaped ids go into this cycle's message; None for all of them.
 
         With POD_STATES_REPORT_ENABLED the states travel as PodStatesReport chunks after the spec
