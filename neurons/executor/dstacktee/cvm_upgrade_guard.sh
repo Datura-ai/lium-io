@@ -20,13 +20,21 @@
 # the provider through cvm_guard_start and register their VM directory), so an
 # upgrade and a CVM creation or start never interleave.
 #
+# key-provider/docker-compose.yaml only names the images; the `build:` sections
+# live in key-provider/docker-compose.build.yaml, which only this guard passes
+# to compose (cvm_guard_compose_build). A hand-run `docker compose build` or
+# `docker compose up` in key-provider/ therefore builds nothing. The preflight
+# refuses to run at all when docker-compose.yaml declares a `build:` again or
+# a file compose auto-loads (an override file, compose.yaml) sits beside it.
+#
 # Host state (override for tests with the LIUM_CVM_* variables):
 #   /var/lock/lium-cvm.lock                the host lock (flock)
 #   /var/lib/lium-cvm/vm-dirs              every VM directory root ever used
 #   /var/lib/lium-cvm/key-provider.image   the pinned image id
 #
 # Exit codes: 0 allowed/done · 1 usage or tool error (docker unreachable, flock
-#             missing, a failed build) · 3 refused, CVM disks exist · 4 refused,
+#             missing, a failed build, a `build:` in docker-compose.yaml) · 3
+#             refused, CVM disks exist · 4 refused,
 #             inventory incomplete · 5 lock busy · 6 pinned image missing or not
 #             the one running
 
@@ -50,6 +58,8 @@ CVM_GUARD_AESMD_IMAGE="lium-aesmd:local"
 CVM_GUARD_CONTAINER="dstack-key-provider"
 CVM_GUARD_AESMD_CONTAINER="dstack-aesmd"
 CVM_GUARD_SERVICE="gramine-sealing-key-provider"
+CVM_GUARD_COMPOSE_FILE="docker-compose.yaml"
+CVM_GUARD_BUILD_FILE="docker-compose.build.yaml"
 # Image names docker compose gave the builds before this guard named them.
 CVM_GUARD_LEGACY_IMAGES="key-provider-gramine-sealing-key-provider key-provider_gramine-sealing-key-provider"
 CVM_GUARD_LEGACY_AESMD_IMAGES="key-provider-aesmd key-provider_aesmd"
@@ -65,8 +75,45 @@ CVM_GUARD_NO_DISK_YET=()
 cvm_guard_say() { echo "[cvm-guard] $*"; }
 cvm_guard_err() { echo "[cvm-guard] ERROR: $*" >&2; }
 
+# Runtime compose: docker-compose.yaml alone, named with -f so an override
+# file or COMPOSE_FILE in the environment never reaches the guard's own calls.
 cvm_guard_compose() {
-    (cd "$CVM_GUARD_KP_DIR" && docker compose "$@")
+    (cd "$CVM_GUARD_KP_DIR" && docker compose -f "$CVM_GUARD_COMPOSE_FILE" "$@")
+}
+
+# The only build path. The build file is passed explicitly, so nothing outside
+# this function can rebuild through compose.
+cvm_guard_compose_build() {
+    (cd "$CVM_GUARD_KP_DIR" && docker compose -f "$CVM_GUARD_COMPOSE_FILE" -f "$CVM_GUARD_BUILD_FILE" build "$@")
+}
+
+# Files compose loads on its own when run in key-provider/ without -f (its
+# default names, docker-compose.yml among them and preferred over .yaml, and
+# the override names). A `build:` in any of them lets a hand-run
+# `docker compose build` rebuild the enclave, so none may exist.
+CVM_GUARD_AUTOLOAD_FILES="docker-compose.yml docker-compose.override.yaml docker-compose.override.yml compose.yaml compose.yml compose.override.yaml compose.override.yml"
+
+# docker-compose.yaml must not declare a build:, and no auto-loaded compose
+# file may sit beside it: either lets `docker compose build` or `up` by hand
+# rebuild the key provider past this guard.
+cvm_guard_check_compose_file() {
+    local file="$CVM_GUARD_KP_DIR/$CVM_GUARD_COMPOSE_FILE" extra
+    if [ ! -f "$file" ]; then
+        cvm_guard_err "$file is missing"
+        return 1
+    fi
+    if grep -qE '^[[:space:]]+build:' "$file"; then
+        cvm_guard_err "$file declares a 'build:' section. With it, a hand-run 'docker compose build' or 'docker compose up' rebuilds the key provider past this guard."
+        cvm_guard_err "Builds belong in $CVM_GUARD_KP_DIR/$CVM_GUARD_BUILD_FILE only; remove the 'build:' section and run this command again."
+        return 1
+    fi
+    # shellcheck disable=SC2086 # space-separated list on purpose
+    for extra in $CVM_GUARD_AUTOLOAD_FILES; do
+        [ -e "$CVM_GUARD_KP_DIR/$extra" ] || continue
+        cvm_guard_err "$CVM_GUARD_KP_DIR/$extra exists. docker compose loads that file on its own, so a 'build:' in it rebuilds the key provider past this guard."
+        cvm_guard_err "Remove it (the build definition is $CVM_GUARD_BUILD_FILE, which only this guard passes) and run this command again."
+        return 1
+    done
 }
 
 # The tools the guard needs, before any verdict that could be misread: a docker
@@ -77,6 +124,7 @@ cvm_guard_preflight() {
         cvm_guard_err "flock (util-linux) is not installed"
         return 1
     fi
+    cvm_guard_check_compose_file || return 1
     if ! docker info >/dev/null 2>&1; then
         cvm_guard_err "docker is not reachable (daemon down, or run with sudo)"
         return 1
@@ -384,7 +432,7 @@ cvm_guard_ensure_aesmd() {
         return 0
     fi
     cvm_guard_say "building the aesmd sidecar (it holds no key material)"
-    cvm_guard_compose build aesmd
+    cvm_guard_compose_build aesmd
 }
 
 # Start (or keep) the key provider on the exact pinned image. Builds only when
@@ -406,7 +454,7 @@ cvm_guard_start() {
                 return 6
             fi
             cvm_guard_say "first start on a host with no CVM disk: building the key provider"
-            cvm_guard_compose build || return 1
+            cvm_guard_compose_build || return 1
             pinned="$(cvm_guard_image_id "$CVM_GUARD_IMAGE")" || pinned=""
             [ -n "$pinned" ] || { cvm_guard_err "build produced no $CVM_GUARD_IMAGE"; return 1; }
             cvm_guard_write_pin "$pinned"
@@ -485,14 +533,14 @@ cvm_guard_upgrade() {
     fi
 
     cvm_guard_say "no CVM disk on this host: rebuilding the key provider"
-    cvm_guard_compose build || return 1
+    cvm_guard_compose_build || return 1
     new_id="$(cvm_guard_image_id "$CVM_GUARD_IMAGE")" || new_id=""
     [ -n "$new_id" ] || { cvm_guard_err "build produced no $CVM_GUARD_IMAGE"; return 1; }
     cvm_guard_write_pin "$new_id"
     cvm_guard_ensure_aesmd || return 1
     cvm_guard_compose up -d --no-build || return 1
     cvm_guard_say "key provider rebuilt: $new_id"
-    cvm_guard_say "new MRENCLAVE: docker compose -f $CVM_GUARD_KP_DIR/docker-compose.yaml logs $CVM_GUARD_SERVICE | grep -m1 mr_enclave"
+    cvm_guard_say "new MRENCLAVE: docker compose -f $CVM_GUARD_KP_DIR/$CVM_GUARD_COMPOSE_FILE logs $CVM_GUARD_SERVICE | grep -m1 mr_enclave"
     return 0
 }
 

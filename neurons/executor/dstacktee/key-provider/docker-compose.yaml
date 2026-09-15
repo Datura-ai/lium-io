@@ -1,3 +1,9 @@
+# Runtime definition of the SGX services. It names the images and has no
+# `build:` section on purpose: a hand-run `docker compose build` here builds
+# nothing, and `docker compose up` cannot rebuild a missing image. The build
+# lives in docker-compose.build.yaml and only ../cvm_upgrade_guard.sh runs it,
+# after its CVM disk inventory. A rebuilt key provider has a new MRENCLAVE and
+# every CVM data disk on the host becomes unreadable (docs/host-setup.md §4).
 x-common: &common-config
   restart: always
   logging:
@@ -11,9 +17,6 @@ services:
     <<: *common-config
     container_name: dstack-aesmd
     image: lium-aesmd:local
-    build:
-      context: .
-      dockerfile: Dockerfile.aesmd
     privileged: true
     devices:
       - "/dev/sgx_enclave:/dev/sgx_enclave"
@@ -27,11 +30,8 @@ services:
     <<: *common-config
     container_name: dstack-key-provider
     # Fixed name so cvm_upgrade_guard.sh can pin the exact image id and
-    # restart from it; `docker compose up` alone would rebuild on a missing image.
+    # restart from it.
     image: lium-key-provider:local
-    build:
-      context: .
-      dockerfile: Dockerfile.key-provider
     privileged: true
     devices:
       - "/dev/sgx_enclave:/dev/sgx_enclave"

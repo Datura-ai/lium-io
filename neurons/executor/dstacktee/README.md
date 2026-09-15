@@ -132,7 +132,7 @@ CVM_GPUS=all  # or "19:00.0,3b:00.0"
 cd key-provider && docker compose logs -f
 ```
 
-**Start or upgrade the key provider** (never `docker compose up --build` by hand; a rebuild changes MRENCLAVE and locks every CVM out of its data disk):
+**Start or upgrade the key provider** (`docker compose build` in `key-provider/` builds nothing: the compose file has no `build:` section, the guard builds through `docker-compose.build.yaml`; a rebuild changes MRENCLAVE and locks every CVM out of its data disk):
 ```bash
 sudo ./cvm_upgrade_guard.sh start      # pinned image; builds only on a host with no CVM disk
 sudo ./lium-cvm.sh inventory           # every CVM disk on the host

@@ -1,0 +1,22 @@
+# Build definition of the SGX services, kept out of docker-compose.yaml so a
+# hand-run `docker compose build` or `docker compose up` in this directory
+# cannot rebuild the key provider. Only ../cvm_upgrade_guard.sh uses this file:
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.build.yaml build
+#
+# and only after its inventory found no CVM disk on the host (`upgrade`, or the
+# first `start` on an empty host). Do not run that line by hand while a CVM
+# disk exists: the rebuilt enclave has a new MRENCLAVE and every CVM data disk
+# on the host becomes unreadable at its next boot (docs/host-setup.md §6.1).
+# The file is not named docker-compose.override.yaml on purpose: compose loads
+# that name on its own.
+services:
+  aesmd:
+    build:
+      context: .
+      dockerfile: Dockerfile.aesmd
+
+  gramine-sealing-key-provider:
+    build:
+      context: .
+      dockerfile: Dockerfile.key-provider

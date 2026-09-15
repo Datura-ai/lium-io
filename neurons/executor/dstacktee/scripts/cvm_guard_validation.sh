@@ -113,7 +113,7 @@ phase1() {
     need_cvm
     load_env
     mkdir -p "$STATE"
-    local out rc pin_before img_before mr_before console fp tmp_state
+    local out rc pin_before img_before mr_before console fp tmp_state images_before
     pin_before="$(pinned_id)"
     img_before="$(container_image)"
     say "phase1 on $(hostname): CVM $CVM, pinned image ${pin_before:-<none>}, container image ${img_before:-<none>}"
@@ -132,6 +132,14 @@ phase1() {
     check "pinned image unchanged" [ "$(pinned_id)" = "$pin_before" ]
     check "container image unchanged" [ "$(container_image)" = "$img_before" ]
     check "hda.img still present" [ -f "$DSTACKTEE/run/vms/$CVM/hda.img" ]
+
+    say "case 2b: a hand-run docker compose build in key-provider builds nothing"
+    images_before="$(docker images -q | sort -u)"
+    out="$(cd "$KP_DIR" && docker compose build 2>&1)"; rc=$?
+    indent "$out"
+    check "compose build exits 0 with nothing to build" [ "$rc" -eq 0 ]
+    check "image set unchanged" [ "$(docker images -q | sort -u)" = "$images_before" ]
+    check "lium-key-provider:local still the pinned image" [ "$(docker image inspect --format '{{.Id}}' lium-key-provider:local 2>/dev/null)" = "$pin_before" ]
 
     say "case 3: record the guest's identity before the reboot"
     check "executor API answers on $EXTERNAL_PORT" api_answers
@@ -157,13 +165,12 @@ phase1() {
     tmp_state="$(mktemp -d)"
     cp "${LIUM_CVM_STATE_DIR:-/var/lib/lium-cvm}/vm-dirs" "$tmp_state/vm-dirs" 2>/dev/null || echo "$DSTACKTEE/run/vms" >"$tmp_state/vm-dirs"
     echo "sha256:$(printf '0%.0s' $(seq 64)) validation" >"$tmp_state/key-provider.image"
-    local images_before
-    images_before="$(docker images -q | sort -u | wc -l)"
+    images_before="$(docker images -q | sort -u)"
     out="$(LIUM_CVM_STATE_DIR="$tmp_state" "$GUARD" start 2>&1)"; rc=$?
     indent "$out"
     check "start exits 6 with the pinned image missing" [ "$rc" -eq 6 ]
     check "start prints recovery guidance" grep -q "Recovery" <<<"$out"
-    check "no image was built" [ "$(docker images -q | sort -u | wc -l)" = "$images_before" ]
+    check "no image was built" [ "$(docker images -q | sort -u)" = "$images_before" ]
     check "real pin untouched" [ "$(pinned_id)" = "$pin_before" ]
     rm -rf "$tmp_state"
 

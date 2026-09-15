@@ -7,6 +7,10 @@ The regressions these tests guard:
   unreadable at its next boot.
 - Nothing looked at other checkouts, other VM directories or stopped CVMs before a
   rebuild, and nothing serialised a rebuild against `lium-cvm.sh new`/`run`.
+- `key-provider/docker-compose.yaml` kept its `build:` sections, so a hand-run
+  `docker compose build` in that directory rebuilt the enclave past the guard
+  (Rustam on #1366). The build now lives in `docker-compose.build.yaml`, which only
+  the guard passes to compose.
 
 Docker is a stub on PATH that records every call and keeps images/containers as
 files, so the tests assert which docker commands the guard issued. They need
@@ -14,6 +18,7 @@ Linux `flock` (util-linux) and bash 4; CI's ubuntu runner has both.
 """
 
 import fcntl
+import json
 import os
 import shutil
 import stat
@@ -22,17 +27,37 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 DSTACKTEE = Path(__file__).resolve().parents[1] / "dstacktee"
 KP_IMAGE = "lium-key-provider:local"
 OLD_ID = "sha256:" + "a" * 64
 NEW_ID = "sha256:" + "b" * 64
 STRAY_ID = "sha256:" + "c" * 64
+# The one compose line that builds: docker-compose.yaml has no `build:`, the build
+# file adds it, and only the guard passes both.
+BUILD_CALL = "compose -f docker-compose.yaml -f docker-compose.build.yaml build"
+# The names compose loads without -f (compose-go DefaultFileNames + the override
+# names), read from the guard so the test and the tripwire cannot drift apart.
+AUTOLOAD_NAMES = subprocess.run(
+    [
+        "bash",
+        "-c",
+        f'source "{DSTACKTEE}/cvm_upgrade_guard.sh" && echo "$CVM_GUARD_AUTOLOAD_FILES"',
+    ],
+    capture_output=True,
+    text=True,
+    check=True,
+).stdout.split()
+assert {"docker-compose.yml", "docker-compose.override.yaml", "compose.yaml"} <= set(AUTOLOAD_NAMES)
 
 FAKE_DOCKER = r"""#!/bin/bash
 # docker stub: images/<name> holds an image id, containers/<name> holds the image a
 # container runs, calls.log records every invocation. `compose up` without --no-build
-# exits 99 so a test that triggers an implicit build fails loudly.
+# exits 99 so a test that triggers an implicit build fails loudly; `compose build`
+# without the build file exits 98 for the same reason (the real compose would build
+# nothing there, because docker-compose.yaml declares no build:); a runtime compose
+# call that does not name docker-compose.yaml with -f exits 97.
 S="$FAKE_DOCKER_STATE"
 echo "$*" >>"$S/calls.log"
 echo "docker $*" >>"$S/seq.log"
@@ -41,6 +66,18 @@ resolve() { # name or id -> id
     for f in "$S"/images/*; do [ -f "$f" ] && [ "$(cat "$f")" = "$1" ] && { echo "$1"; return 0; }; done
     return 1
 }
+if [ "$1" = compose ]; then
+    # docker compose [-f FILE]... <subcommand> ...: fold the -f pairs into $files
+    shift; files=""
+    while [ "$1" = "-f" ]; do files="$files $2"; shift 2; done
+    set -- compose "$@"
+    if [ "$2" = build ]; then
+        case " $files " in *" docker-compose.build.yaml "*) ;; *) echo "BUILD WITHOUT BUILD FILE" >&2; exit 98 ;; esac
+    elif [ "$files" != " docker-compose.yaml" ]; then
+        # the runtime calls name their one file, so an override file or COMPOSE_FILE never reaches them
+        echo "RUNTIME CALL WITHOUT -f docker-compose.yaml: $files" >&2; exit 97
+    fi
+fi
 case "$1 $2" in
 "info ")
     [ -f "$S/daemon_down" ] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
@@ -203,10 +240,131 @@ def host(tmp_path: Path) -> Host:
     return Host(tmp_path)
 
 
+def _is_build(call: str) -> bool:
+    parts = call.split()
+    return parts[:1] == ["compose"] and "build" in parts
+
+
 def _built(calls: list[str]) -> bool:
-    return any(
-        c.startswith("compose build") and not c.startswith("compose build aesmd") for c in calls
+    """A key-provider build was issued (the aesmd sidecar build does not count)."""
+    return any(_is_build(c) and not c.endswith(" aesmd") for c in calls)
+
+
+def _service_config(*compose_files: Path) -> dict:
+    """`docker compose config` of the given files; skips when compose is unavailable."""
+    if (
+        shutil.which("docker") is None
+        or subprocess.run(["docker", "compose", "version"], capture_output=True).returncode != 0
+    ):
+        pytest.skip("needs docker compose")
+    cmd = ["docker", "compose"]
+    for f in compose_files:
+        cmd += ["-f", str(f)]
+    r = subprocess.run(
+        cmd + ["config", "--format", "json"],
+        cwd=compose_files[0].parent,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)["services"]
+
+
+# --- the compose file cannot build --------------------------------------------
+
+
+def test_compose_file_names_images_and_declares_no_build():
+    # The regression: `build:` in docker-compose.yaml let `docker compose build` in
+    # key-provider/ rebuild the enclave past the guard.
+    kp = DSTACKTEE / "key-provider"
+    runtime = yaml.safe_load((kp / "docker-compose.yaml").read_text())["services"]
+    build = yaml.safe_load((kp / "docker-compose.build.yaml").read_text())["services"]
+
+    assert set(runtime) == {"aesmd", "gramine-sealing-key-provider"}
+    for name, service in runtime.items():
+        assert "build" not in service, f"{name} declares build: in docker-compose.yaml"
+        assert service["image"] in (KP_IMAGE, "lium-aesmd:local")
+    assert set(build) == set(runtime)
+    for name, service in build.items():
+        assert set(service) == {"build"}, f"{name}: the build file carries only build:"
+        assert service["build"]["context"] == "."
+        assert (kp / service["build"]["dockerfile"]).is_file()
+    # compose loads its default and override names by itself (docker-compose.yml is
+    # preferred over .yaml); the guard's list names them, and none may exist.
+    for extra in AUTOLOAD_NAMES:
+        assert not (kp / extra).exists(), extra
+    assert not list(kp.glob("compose.*"))
+    assert {p.name for p in kp.glob("*.y*ml")} == {
+        "docker-compose.yaml",
+        "docker-compose.build.yaml",
+    }
+
+
+def test_real_compose_sees_nothing_to_build_without_the_build_file():
+    kp = DSTACKTEE / "key-provider"
+    runtime = _service_config(kp / "docker-compose.yaml")
+    with_build = _service_config(kp / "docker-compose.yaml", kp / "docker-compose.build.yaml")
+
+    assert all("build" not in s for s in runtime.values()), runtime
+    assert all("build" in s for s in with_build.values()), with_build
+    assert with_build["gramine-sealing-key-provider"]["image"] == KP_IMAGE
+
+
+def _add_build_section(compose_file: Path) -> None:
+    text = compose_file.read_text()
+    marker = f"    image: {KP_IMAGE}\n"
+    assert marker in text
+    compose_file.write_text(
+        text.replace(
+            marker,
+            marker + "    build:\n      context: .\n      dockerfile: Dockerfile.key-provider\n",
+        )
+    )
+
+
+def test_guard_refuses_a_compose_file_that_declares_build(host: Host):
+    _add_build_section(host.checkout / "key-provider" / "docker-compose.yaml")
+    host.pin(OLD_ID)
+    host.set_image(KP_IMAGE, OLD_ID)
+
+    start = host.guard("start")
+    upgrade = host.guard("upgrade")
+
+    for r in (start, upgrade):
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "declares a 'build:' section" in r.stderr
+        assert "docker-compose.build.yaml" in r.stderr
+    assert host.calls() == [], host.calls()  # refused before any docker call
+    assert host.pinned() == OLD_ID
+
+
+def test_guard_refuses_a_compose_file_that_declares_build_on_an_empty_host(host: Host):
+    # No CVM disk: an upgrade would otherwise build. The file defect is refused first.
+    _add_build_section(host.checkout / "key-provider" / "docker-compose.yaml")
+
+    r = host.guard("upgrade")
+
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert not _built(host.calls())
+    assert not (host.state / "key-provider.image").exists()
+
+
+@pytest.mark.parametrize("name", AUTOLOAD_NAMES)
+def test_guard_refuses_an_auto_loaded_compose_file_beside_the_runtime_file(host: Host, name: str):
+    # compose loads these names without -f, so a `build:` in one of them is a hand-run
+    # rebuild path the runtime file's own check would not see.
+    (host.checkout / "key-provider" / name).write_text(
+        "services:\n  gramine-sealing-key-provider:\n    build: .\n"
+    )
+    host.pin(OLD_ID)
+    host.set_image(KP_IMAGE, OLD_ID)
+
+    r = host.guard("start")
+
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"{name} exists" in r.stderr
+    assert host.calls() == [], host.calls()
 
 
 # --- inventory and upgrade -----------------------------------------------------
@@ -331,8 +489,10 @@ def test_empty_host_upgrade_keeps_old_image_and_pins_new(host: Host):
     assert r.returncode == 0, r.stdout + r.stderr
     calls = host.calls()
     assert any(c.startswith(f"tag {OLD_ID} lium-key-provider:pre-upgrade-") for c in calls), calls
-    assert "compose build" in calls
-    assert "compose up -d --no-build" in calls
+    assert [c for c in calls if _is_build(c)] == [BUILD_CALL], (
+        calls
+    )  # one build, through both files
+    assert "compose -f docker-compose.yaml up -d --no-build" in calls
     assert host.pinned() == NEW_ID
     assert (host.docker_state / "containers" / "dstack-key-provider").read_text().strip() == NEW_ID
 
@@ -443,7 +603,7 @@ def test_start_runs_pinned_image_without_build(host: Host):
 
     assert r.returncode == 0, r.stdout + r.stderr
     calls = host.calls()
-    assert "compose up -d --no-build" in calls
+    assert "compose -f docker-compose.yaml up -d --no-build" in calls
     assert not _built(calls), calls
     assert (host.docker_state / "containers" / "dstack-key-provider").read_text().strip() == OLD_ID
 
@@ -502,7 +662,7 @@ def test_start_adopts_running_containers_on_host_without_pin(host: Host):
     assert host.pinned() == OLD_ID
     assert f"tag {OLD_ID} {KP_IMAGE}" in host.calls()
     assert f"tag {aesmd_id} lium-aesmd:local" in host.calls()
-    assert not any(c.startswith("compose build") for c in host.calls()), host.calls()
+    assert not any(_is_build(c) for c in host.calls()), host.calls()
 
 
 def test_start_refuses_build_when_disks_exist_and_nothing_to_adopt(host: Host):
@@ -519,7 +679,7 @@ def test_start_builds_once_on_empty_host(host: Host):
     r2 = host.guard("start")
 
     assert r.returncode == 0 and r2.returncode == 0, r.stdout + r.stderr + r2.stdout + r2.stderr
-    assert host.calls().count("compose build") == 1, host.calls()
+    assert host.calls().count(BUILD_CALL) == 1, host.calls()
     assert host.pinned() == NEW_ID
 
 
@@ -538,7 +698,7 @@ def test_run_sh_starts_through_the_guard(host: Host):
     )
 
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "compose up -d --no-build" in host.calls()
+    assert "compose -f docker-compose.yaml up -d --no-build" in host.calls()
     assert not _built(host.calls())
     assert "Services started!" in r.stdout
 
@@ -566,7 +726,7 @@ def test_lium_cvm_run_takes_lock_registers_root_and_creates_disk_first(host: Hos
     assert r.returncode == 0, r.stdout + r.stderr
     vms_dir = str(host.checkout / "run" / "vms")
     assert vms_dir in (host.state / "vm-dirs").read_text().splitlines()
-    assert "compose up -d --no-build" in host.calls()
+    assert "compose -f docker-compose.yaml up -d --no-build" in host.calls()
     assert not _built(host.calls())
     assert (
         host.docker_state / "qemu-img.log"
@@ -574,7 +734,7 @@ def test_lium_cvm_run_takes_lock_registers_root_and_creates_disk_first(host: Hos
     assert (vm / "hda.img").exists()
     # Order: provider up, then the disk, then dstack.py (which inherits no lock).
     stub_call_order = host.stub_call_order()
-    up = stub_call_order.index("docker compose up -d --no-build")
+    up = stub_call_order.index("docker compose -f docker-compose.yaml up -d --no-build")
     disk = next(i for i, s in enumerate(stub_call_order) if s.startswith("qemu-img create"))
     run = next(
         i
