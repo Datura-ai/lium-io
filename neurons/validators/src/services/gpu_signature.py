@@ -15,7 +15,7 @@ Response JSON schema emitted by ``bin/gpu_sig`` (one line on stdout):
      "msg": "<opaque signed record>", "sig": "<opaque hex>"}
 On failure it prints ``{"gpusig": 2, "ok": false, ..., "error": "<code>"}``.
 
-Trust model (DAH-3137 design doc): the prober ships in the signed executor image
+Trust model (DAH-3137 design doc): the prober ships in the executor image
 and is driven with a fresh per-card nonce; the seal is bound to that nonce and to
 the card identity, so a precomputed/replayed answer for a different nonce fails
 authentication. This closes cheap/scalable spoofs (NVML shims, canned/replayed
@@ -28,19 +28,19 @@ until the envelope is calibrated on real hardware.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
-# Aggregate wall-clock ceiling (seconds) across all claimed cards. N honest cards
-# answer N nonce-bound challenges concurrently in ~single-card time; a count lie
-# serialises onto fewer real cards and takes ~N× as long. This is a COARSE backstop:
-# it only trips a serialisation slow enough to exceed the ceiling (fast cards may not),
-# so the robust count signals are device-selection failure + duplicate kernel UUID.
-# Wide on purpose (honest thermal throttle / a card busy with a filler must not trip it)
-# and left uncalibrated until real per-class timings are collected.
-GPU_SIGNATURE_WALL_CLOCK_SECONDS = 120.0
+# The prober's schema: the response object carries "gpusig": <version> and
+# "scheme": <tag>. A line is a result only when both match, so a cross-repo rename
+# of either is reported (no_result with the matched/parsed counts), never silently
+# parsed as something else.
+GPUSIG_VERSION = 2
+GPUSIG_SCHEME = "lium.gpusig.v2"
 
-# The JSON marker the prober prints; only a line carrying it is parsed from stdout.
+# The JSON marker the prober prints; only a line carrying it is a candidate. The
+# schema check above decides whether a candidate is a result.
 RESULT_MARKER = '"gpusig"'
 
 # Hard caps on peer-controlled input (§5 "bounded input"): the real response line is
@@ -100,23 +100,71 @@ class SignatureVerdict:
     verified_count: int
 
 
-def parse_result_line(stdout: str) -> dict[str, Any] | None:
-    """Return the last parseable gpu_sig JSON object printed on stdout, or None.
+@dataclass(frozen=True)
+class ParsedResult:
+    """Outcome of scanning one prober stdout.
 
-    Stdout is miner-controlled and the image may print other lines, so scan from
-    the end for the marker and take the first that parses.
+    ``result`` is the newest line that parsed AND matched the schema (or None).
+    ``matched`` counts lines carrying the marker, ``parsed`` those that were JSON
+    objects; on no_result they tell a renamed key apart from an empty stdout.
     """
+
+    result: dict[str, Any] | None
+    matched: int
+    parsed: int
+
+    @property
+    def no_result_reason(self) -> str:
+        return f"no_result:matched={self.matched},parsed={self.parsed}"
+
+
+def wall_clock_seconds(gpu_count: int, timeout_seconds: float, max_concurrent: int) -> float:
+    """Aggregate ceiling for ``gpu_count`` per-card runs, each bounded by
+    ``timeout_seconds``, at most ``max_concurrent`` at a time.
+
+    N honest cards answer concurrently in ~single-card time per wave; a count lie
+    serialises onto fewer real cards and takes longer. The ceiling is timeout x waves,
+    so an honest 14-card host at 8 concurrent (two waves) is never flagged for
+    needing its second wave. This is a COARSE backstop: the robust count signals are
+    device-selection failure + duplicate kernel UUID.
+    """
+    waves = max(1, math.ceil(max(1, gpu_count) / max(1, max_concurrent)))
+    return float(timeout_seconds) * waves
+
+
+def parse_result(stdout: str) -> ParsedResult:
+    """Scan miner-controlled stdout for the prober's result line.
+
+    The image may print other lines, so scan from the end for the marker and take
+    the first that parses AND matches the schema (``gpusig == 2`` and
+    ``scheme == "lium.gpusig.v2"``).
+    """
+    matched = parsed = 0
+    result: dict[str, Any] | None = None
     for line in reversed(stdout.splitlines()):
         line = line.strip()
         if RESULT_MARKER not in line or len(line) > MAX_RESULT_LINE:
             continue
+        matched += 1
         try:
             obj = json.loads(line)
         except Exception:  # noqa: BLE001 — any parse failure (incl. RecursionError) skips the line
             continue
-        if isinstance(obj, dict) and "gpusig" in obj:
-            return obj
-    return None
+        if not isinstance(obj, dict):
+            continue
+        parsed += 1
+        if (
+            result is None
+            and obj.get("gpusig") == GPUSIG_VERSION
+            and obj.get("scheme") == GPUSIG_SCHEME
+        ):
+            result = obj
+    return ParsedResult(result=result, matched=matched, parsed=parsed)
+
+
+def parse_result_line(stdout: str) -> dict[str, Any] | None:
+    """Return the newest schema-matching gpu_sig JSON object on stdout, or None."""
+    return parse_result(stdout).result
 
 
 def seal_within_bounds(msg: str, sig: str) -> bool:
@@ -170,7 +218,9 @@ def evaluate_card(
     its own ``--device 0`` inside that masked view.
     """
     if not isinstance(seal_verdict, dict) or not seal_verdict.get("sealed"):
-        reason = (seal_verdict.get("reason") if isinstance(seal_verdict, dict) else None) or "unsealed"
+        reason = (
+            seal_verdict.get("reason") if isinstance(seal_verdict, dict) else None
+        ) or "unsealed"
         return CardVerdict(slot=slot, ok=False, reasons=[reason])
 
     # The verifier .so is separately versioned; treat any shape drift (a non-numeric
@@ -182,9 +232,14 @@ def evaluate_card(
         return CardVerdict(slot=slot, ok=False, reasons=["verifier_bad_output"])
     kernel_uuid = seal_verdict.get("kernel_uuid")
     kernel_uuid = kernel_uuid if isinstance(kernel_uuid, str) else ""
+    # `device` must be present and integral before it can be compared: a missing or
+    # non-int device is schema drift (bad output), not a card answering for another slot.
+    device = seal_verdict.get("device")
+    if isinstance(device, bool) or not isinstance(device, int):
+        return CardVerdict(slot=slot, ok=False, reasons=["verifier_bad_output"])
 
     reasons = check_envelope(claimed_model, tflops, gbps)
-    if seal_verdict.get("device") != 0:
+    if device != 0:
         reasons.append("device_mismatch")
     # The kernel-reported UUID (/proc/driver/nvidia, outside NVML) is the identity anchor.
     # An empty one means the prober could not read /proc — a provider that hides it from
@@ -210,9 +265,16 @@ def summarize(
     verdicts: list[CardVerdict],
     elapsed_seconds: float,
     claimed_count: int,
-    wall_clock_seconds: float = GPU_SIGNATURE_WALL_CLOCK_SECONDS,
+    wall_clock_seconds: float,
 ) -> SignatureVerdict:
-    """Aggregate per-card verdicts into a node verdict (the count-spoof gate)."""
+    """Aggregate per-card verdicts into a node verdict (the count-spoof gate).
+
+    ``claimed_count`` is the NVML-claimed card count the check challenged; it is
+    reported, not compared: the check issues exactly one challenge per claimed slot,
+    so a count lie surfaces as failed slots (device-selection error), duplicate
+    kernel UUIDs or a blown wall clock, never as a shorter verdict list.
+    ``wall_clock_seconds`` comes from :func:`wall_clock_seconds` (timeout x waves).
+    """
     verified = [v for v in verdicts if v.ok]
     failed = [v for v in verdicts if not v.ok]
     over_wall_clock = elapsed_seconds > wall_clock_seconds
@@ -226,8 +288,6 @@ def summarize(
     duplicate_uuids = sorted(u for u, n in seen.items() if n > 1)
 
     reasons: list[str] = []
-    if len(verdicts) != claimed_count:
-        reasons.append(f"card_count {len(verdicts)} != claimed {claimed_count}")
     if failed:
         reasons.append(f"{len(failed)}/{len(verdicts)} card(s) failed signature")
     if duplicate_uuids:
@@ -239,12 +299,7 @@ def summarize(
         )
 
     return SignatureVerdict(
-        passed=(
-            not failed
-            and not over_wall_clock
-            and not duplicate_uuids
-            and len(verdicts) == claimed_count
-        ),
+        passed=(not failed and not over_wall_clock and not duplicate_uuids),
         reasons=reasons,
         per_card=[
             {

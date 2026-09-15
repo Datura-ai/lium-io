@@ -273,8 +273,7 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 90% of the default limit reported by NVML."
         ),
     )
     DATA_INCOMPLETE = MessageTemplate(
@@ -1536,4 +1535,11 @@ class GpuSignatureMessages:
             "Provider: ensure every advertised GPU is physically present and healthy. "
             "Ops: review per-card reasons before enabling GPU_SIGNATURE_ENFORCEMENT_ENABLED."
         ),
+    )
+    # Impact override used when GPU_SIGNATURE_ENFORCEMENT_ENABLED is on: the event is an
+    # error (alerting sees it) but the score gate is not wired yet, so the text must not
+    # read as if the flag were still off.
+    FAILED_ENFORCEMENT_FLAG_IMPACT = (
+        "GPU_SIGNATURE_ENFORCEMENT_ENABLED is on: this failure is raised as an error for "
+        "alerting; the score gate is not wired yet, so the score is still NOT affected"
     )

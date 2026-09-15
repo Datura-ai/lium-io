@@ -6,11 +6,13 @@ import shlex
 import time
 
 from services.gpu_signature import (
+    ParsedResult,
     evaluate_card,
     kernel_uuid_mismatch,
-    parse_result_line,
+    parse_result,
     seal_within_bounds,
     summarize,
+    wall_clock_seconds,
 )
 from services.gpusig_validator import GpuSigVerifier
 
@@ -40,8 +42,9 @@ class GpuSignatureCheck:
 
     Additive and observe-only: it logs a verdict and never changes the score.
     ``GPU_SIGNATURE_ENFORCEMENT_ENABLED`` currently only raises the failing event
-    from warning to error; wiring a score gate is a follow-up once the envelope
-    is calibrated on real hardware (DAH-3137 design doc §9).
+    from warning to error (and says so in the event's impact); wiring a score gate
+    is a follow-up once the envelope is calibrated on real hardware (DAH-3137
+    design doc §9).
     """
 
     check_id = "gpu.validate.signature"
@@ -66,7 +69,10 @@ class GpuSignatureCheck:
             f"{ctx.executor.root_dir.rstrip('/')}/"
             f"{settings.GPU_SIGNATURE_BINARY_RELATIVE.lstrip('/')}"
         )
-        if not await self._binary_present(ctx, binary_path):
+        present = await self._binary_present(ctx, binary_path)
+        if present is None:
+            return self._skip(ctx, "binary_probe_failed", extra_what={"binary_path": binary_path})
+        if not present:
             return self._skip(ctx, "binary_absent", extra_what={"binary_path": binary_path})
 
         try:
@@ -107,16 +113,22 @@ class GpuSignatureCheck:
                 # A non-zero exit with no channel error is a prober error whose JSON line
                 # (ok=false, error=...) is on stdout; parse_result_line + _verify_one turn
                 # it into a prober_error verdict.
-                parsed = parse_result_line(run.stdout)
                 return self._verify_one(
-                    verifier, master_key, slot_nonce, claimed_model, slot, parsed
+                    verifier, master_key, slot_nonce, claimed_model, slot, parse_result(run.stdout)
                 )
 
         start = time.perf_counter()
         verdicts = await asyncio.gather(*(run_slot(slot) for slot in range(gpu_count)))
         elapsed = time.perf_counter() - start
 
-        verdict = summarize(verdicts, elapsed, gpu_count)
+        # The aggregate ceiling follows the per-card timeout and the number of waves the
+        # concurrency cap forces, so an honest host that needs two waves is not flagged.
+        ceiling = wall_clock_seconds(
+            gpu_count,
+            settings.GPU_SIGNATURE_TIMEOUT_SECONDS,
+            settings.GPU_SIGNATURE_MAX_CONCURRENT,
+        )
+        verdict = summarize(verdicts, elapsed, gpu_count, ceiling)
 
         # Cross-check the AUTHENTICATED /proc-sourced kernel UUIDs against the NVML-claimed
         # set: a kernel UUID that NVML never advertised is a userspace NVML shim (DAH-2662).
@@ -133,6 +145,7 @@ class GpuSignatureCheck:
             "claimed_count": verdict.claimed_count,
             "verified_count": verdict.verified_count,
             "elapsed_seconds": verdict.elapsed_seconds,
+            "wall_clock_ceiling_seconds": ceiling,
             "over_wall_clock": verdict.over_wall_clock,
             "gpu_model": claimed_model,
             "per_card": verdict.per_card,
@@ -143,10 +156,16 @@ class GpuSignatureCheck:
 
         template = Msg.OK if node_ok else Msg.FAILED
         # Enforcement (not yet wired to scoring) raises the failing event from warning to error
-        # so it is visible in alerting during the warn phase; the score is still untouched.
-        severity = "error" if (settings.GPU_SIGNATURE_ENFORCEMENT_ENABLED and not node_ok) else None
+        # so it is visible in alerting during the warn phase; the score is still untouched, and
+        # the impact text says exactly that instead of the warn-phase wording.
+        enforcing = settings.GPU_SIGNATURE_ENFORCEMENT_ENABLED and not node_ok
         event = render_message(
-            template, ctx=ctx, check_id=self.check_id, what=what, severity=severity
+            template,
+            ctx=ctx,
+            check_id=self.check_id,
+            what=what,
+            severity="error" if enforcing else None,
+            impact=Msg.FAILED_ENFORCEMENT_FLAG_IMPACT if enforcing else None,
         )
         # Observe-only: never fail the pipeline or the score yet.
         return CheckResult(passed=True, event=event)
@@ -158,7 +177,7 @@ class GpuSignatureCheck:
         nonce: str,
         claimed_model: str | None,
         slot: int,
-        parsed: dict | None,
+        outcome: ParsedResult,
     ):
         """Authenticate one raw response through libgpusig.so, then score it.
 
@@ -166,8 +185,13 @@ class GpuSignatureCheck:
         non-dict verifier body all become an unsealed (failed) verdict, never an exception
         that could escape into the pipeline.
         """
+        parsed = outcome.result
         if parsed is None:
-            return evaluate_card({"sealed": False, "reason": "no_result"}, claimed_model, slot)
+            # matched/parsed counts tell "prober printed nothing" apart from "prober printed
+            # a line whose schema we no longer recognise" (a cross-repo rename).
+            return evaluate_card(
+                {"sealed": False, "reason": outcome.no_result_reason}, claimed_model, slot
+            )
         if parsed.get("ok") is not True:
             err = str(parsed.get("error", "unknown"))[:64]
             return evaluate_card(
@@ -193,14 +217,20 @@ class GpuSignatureCheck:
             seal_verdict, claimed_model, slot, have_kernel=bool(parsed.get("have_kernel"))
         )
 
-    async def _binary_present(self, ctx: Context, binary_path: str) -> bool:
-        try:
-            result = await ctx.ssh.run(
-                f"test -x {shlex.quote(binary_path)} && echo GPUSIG_PRESENT", timeout=15
-            )
-            return "GPUSIG_PRESENT" in (getattr(result, "stdout", "") or "")
-        except Exception:
-            return False
+    async def _binary_present(self, ctx: Context, binary_path: str) -> bool | None:
+        """True/False when the probe ran; None when the channel failed (timeout, error).
+
+        Goes through the runner like every other command here, so a dead channel is
+        reported as binary_probe_failed instead of being read as an absent binary.
+        """
+        run = await ctx.runner.run(
+            f"test -x {shlex.quote(binary_path)} && echo GPUSIG_PRESENT",
+            timeout=15,
+            retryable=False,
+        )
+        if run.error_type:
+            return None
+        return "GPUSIG_PRESENT" in (run.stdout or "")
 
     def _skip(self, ctx: Context, why: str, extra_what: dict | None = None) -> CheckResult:
         what: dict = {"skipped": why}
