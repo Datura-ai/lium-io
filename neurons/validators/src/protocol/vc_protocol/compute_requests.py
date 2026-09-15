@@ -49,6 +49,8 @@ class RentedExecutor(BaseModel):
     executor_ip_address: str
     executor_ip_port: str
     pods: list[RentedPod]
+    # True when every listed pod is the provider's own rental (lium-platform#432 sets it from the
+    # backend's self-rent rule). A backend that predates the field sends nothing: False, a customer.
     owner_flag: bool = False
 
     def get_rented_ports(self) -> list[int]:
