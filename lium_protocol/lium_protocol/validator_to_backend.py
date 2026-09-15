@@ -343,6 +343,14 @@ class FailedContainerRequest(PodContainerResponse):
     detail: str | None = None
     failure_step: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # DAH-3504 (protocol 1.1.0): for a custom-Dockerfile build that failed, the last lines the build
+    # printed, the timeout or a one-line reason for the setup steps. Renter-safe: the renter's own
+    # Dockerfile output, never executor host data. None for every other failure and from old validators.
+    build_log_tail: str | None = None
+    # DAH-3505 (protocol 1.1.0): for the volume step (volume_sizing / volume_creation) the Docker daemon's
+    # own error text, bounded. Renter-safe: the volume and the daemon's reason, never the executor's
+    # address, port or hotkey. None for every other step and from old validators.
+    step_detail: str | None = None
 
 
 class PodLog(pydantic.BaseModel):
