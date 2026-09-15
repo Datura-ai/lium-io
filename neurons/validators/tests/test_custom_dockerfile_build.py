@@ -912,8 +912,8 @@ async def test_A20_volume_step_failure_carries_the_daemon_reason(svc, monkeypatc
 @pytest.mark.asyncio
 async def test_A20c_volume_sizing_failure_carries_the_min_size_reason(svc, monkeypatch):
     """`volume_sizing` is the other step a pod dies at before its volume exists; its
-    VolumeMinSizeError text is the renter's answer and travels as `step_detail`, without the hint."""
-    from services.docker_service import STALE_SDK_TRANSPORT_HINT, VolumeMinSizeError
+    VolumeMinSizeError text is the renter's answer and travels as `step_detail` unchanged."""
+    from services.docker_service import VolumeMinSizeError
 
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_ssh_result())
@@ -940,7 +940,7 @@ async def test_A20c_volume_sizing_failure_carries_the_min_size_reason(svc, monke
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "volume_sizing"
     assert result.step_detail == "Fresh vloopback sizing produced 3GB volume, below required minimum 20GB"
-    assert not result.step_detail.startswith(STALE_SDK_TRANSPORT_HINT)
+
 
 @pytest.mark.asyncio
 async def test_A20b_non_volume_failures_have_no_step_detail(svc, monkeypatch):
