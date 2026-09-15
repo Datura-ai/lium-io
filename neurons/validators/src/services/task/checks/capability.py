@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from core.config import settings
 
@@ -10,6 +10,7 @@ from ..messages import CapabilityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 if TYPE_CHECKING:
+    from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
     from services.matrix_validation_service import ValidationResult
 
 logger = logging.getLogger(__name__)
@@ -111,7 +112,13 @@ class CapabilityCheck:
                         "probe": failure_details,
                     },
                 )
-                return CheckResult(passed=True, event=event)
+                # The fresh snapshot replaces the stale one, so RentalVerificationCheck and
+                # GpuFaultProbeCheck later in the cycle see the same workload this waiver saw.
+                return CheckResult(
+                    passed=True,
+                    event=event,
+                    updates={"state": replace(ctx.state, rented_data=lium_workload.snapshot)},
+                )
 
         template = Msg.VERIFY_TIMEOUT if result is not None and result.timed_out else Msg.VERIFY_FAILED
         event = render_message(
@@ -148,10 +155,11 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
 @dataclass(frozen=True)
 class _LiumWorkload:
     """A workload the backend says holds this node's cards right now: which kind (`filler` or
-    `pod`) and the container names it listed, sorted."""
+    `pod`), the container names it listed, sorted, and the snapshot it came from."""
 
-    kind: str
+    kind: Literal["filler", "pod"]
     container_names: tuple[str, ...]
+    snapshot: RentedExecutorsResponse
 
 
 async def _lium_workload_live_now(ctx: Context) -> _LiumWorkload | None:
@@ -181,12 +189,15 @@ async def _lium_workload_live_now(ctx: Context) -> _LiumWorkload | None:
     executor_uuid = ctx.executor.uuid
     filler_containers = fresh.get_filler_containers(executor_uuid)
     if filler_containers:
-        return _LiumWorkload(kind="filler", container_names=tuple(sorted(filler_containers)))
+        return _LiumWorkload(
+            kind="filler", container_names=tuple(sorted(filler_containers)), snapshot=fresh
+        )
     rented_executor = fresh.executors.get(executor_uuid)
     if rented_executor and rented_executor.pods:
         return _LiumWorkload(
             kind="pod",
             container_names=tuple(sorted(pod.container_name for pod in rented_executor.pods)),
+            snapshot=fresh,
         )
     return None
 

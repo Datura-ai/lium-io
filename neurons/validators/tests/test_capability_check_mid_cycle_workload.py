@@ -112,6 +112,9 @@ async def test_allocation_failure_is_not_scored_when_the_backend_reports_a_workl
     assert probe.calls == 1
     assert result.event.what_we_saw["probe"]["stderr"] == OOM_STDERR
     backend.get_rented_executors_now.assert_awaited_once()
+    # The fresh read replaces the cycle snapshot: the checks after this one (rental verification,
+    # the GPU fault probe) read `ctx.state.rented_data` and would otherwise keep the stale one.
+    assert result.updates["state"].rented_data is fresh
 
 
 @pytest.mark.asyncio
