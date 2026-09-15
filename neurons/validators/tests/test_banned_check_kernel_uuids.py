@@ -141,6 +141,45 @@ async def test_gpu_ban_catches_spoofed_uuid_through_the_kernel_view(context_fact
 
 
 @pytest.mark.asyncio
+async def test_gpu_ban_with_no_reported_uuids_is_still_matched_on_the_kernel_view(
+    context_factory, enforcing
+):
+    """Regression: the check used to return GPU_UUID_EMPTY before the kernel read, so a host that
+    reported no UUIDs at all slipped past a ban keyed on the kernel's list."""
+    rented = RentedExecutorsResponse(executors={}, banned_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids=None, rented_data=rented),
+        ssh=_ssh_with_procfs([f"{REAL}, 0"]),
+    )
+
+    result = await BannedGpuCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == BannedGpuMessages.GPU_BANNED.reason
+    assert result.event.what_we_saw["kernel_gpu_uuids"] == [REAL]
+
+
+@pytest.mark.asyncio
+async def test_no_reported_uuids_in_shadow_mode_stays_empty_but_records_the_kernel_view(
+    context_factory, shadow
+):
+    """Control: with enforcement off the empty list still passes as GPU_UUID_EMPTY, and the event
+    carries what the flip would change."""
+    rented = RentedExecutorsResponse(executors={}, banned_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids=None, rented_data=rented),
+        ssh=_ssh_with_procfs([f"{REAL}, 0"]),
+    )
+
+    result = await BannedGpuCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == BannedGpuMessages.UUID_EMPTY.reason
+    assert result.event.what_we_saw["kernel_gpu_uuids"] == [REAL]
+    assert result.event.what_we_saw["kernel_view_would_ban"] is True
+
+
+@pytest.mark.asyncio
 async def test_kernel_identity_is_recorded_on_state_and_specs_for_the_backend(context_factory):
     rented = RentedExecutorsResponse(executors={})
     ctx = context_factory(

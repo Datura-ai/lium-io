@@ -26,7 +26,7 @@ async def kernel_gpu_uuids(ctx: Context) -> list[str] | None:
     return await read_kernel_gpu_uuids(ctx.ssh)
 
 
-def ban_match_uuids(reported: list[str], kernel: list[str] | None) -> list[str]:
+def uuids_to_match_bans_against(reported: list[str], kernel: list[str] | None) -> list[str]:
     """The UUID list a ban is matched against: reported + kernel once enforcement is on, reported only in shadow."""
     if not settings.KERNEL_GPU_BAN_ENFORCEMENT_ENABLED:
         return reported
@@ -52,7 +52,7 @@ class BannedProviderCheck:
             and rented_data.is_provider_banned(
                 miner_hotkey=ctx.miner_hotkey,
                 miner_coldkey=ctx.miner_coldkey,
-                gpu_uuids=ban_match_uuids(gpu_uuids, kernel_uuids),
+                gpu_uuids=uuids_to_match_bans_against(gpu_uuids, kernel_uuids),
             )
         )
         # what flipping enforcement changes: a kernel UUID on the ban list (hotkey/coldkey bans
