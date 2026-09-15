@@ -1,3 +1,5 @@
+from datura.requests.validator_requests import LOCAL_VERIFY_DIND_IMAGE
+
 MIN_JOB_TAKEN_TIME = 20
 
 GPU_MODEL_RATES = {
@@ -144,7 +146,7 @@ SECONDS_PER_BLOCK = 12  # seconds per block
 FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
 
 IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
-DOCKER_DIND_IMAGE = "daturaai/dind:0.0.1"
+DOCKER_DIND_IMAGE = LOCAL_VERIFY_DIND_IMAGE  # datura: the executor starts the same image (liumd 2c)
 
 LIB_NVIDIA_ML_DIGESTS = {
     "535.54.03": "49e63c42aa95bba6b9aa562ee57e496c:15a37892671187547b6dd21a07e8149315e529211dc30ca6ee8d8d089a338d53",

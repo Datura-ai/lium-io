@@ -42,31 +42,50 @@ class DindVerifier:
         container_name_prefix: str,
         sysbox: bool,
         log_ctx: dict | None = None,
+        prestarted=None,
     ) -> DindProbeResult:
-        """Verify DinD on port."""
+        """Verify DinD on port.
+
+        `prestarted` (liumd phase 2c, `local_verify_facts.PreparedDind`): the executor already ran
+        this very `docker run` from the validator's signed intent — same name, same port, the key
+        pair the validator minted. Only the `docker run` round trip and the container's boot are
+        skipped; the connection with the validator's private key, the sysbox proof and the removal
+        are this method's own, so the executor's word ("started") decides nothing on its own: a
+        container that does not answer the key is a failed probe, exactly as today.
+        """
         name = f"{container_name_prefix}_{port.external}"
         log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
+        if prestarted is not None:
+            if prestarted.name != name or prestarted.port != port:
+                # Not the container this probe is about: start our own and leave it UNconsumed,
+                # so the pipeline's settle step still removes it.
+                prestarted = None
+            else:
+                prestarted.consumed = True  # ours from here: removed on every path below
 
         try:
-            logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
+            logger.info(_m("DinD start", extra=get_extra_info({**log_ctx, "prestarted": prestarted is not None})))
 
-            private_key, public_key = self.ssh_service.generate_keypair()
-            cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
-            logger.debug("run: %s...", cmd[:100])
+            if prestarted is not None:
+                private_key = prestarted.private_key
+            else:
+                private_key, public_key = self.ssh_service.generate_keypair()
+                cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
+                logger.debug("run: %s...", cmd[:100])
 
-            result = await ssh_client.run(cmd)
-            if result.exit_status != 0:
-                error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
-                await ssh_client.run(DockerCommand.remove_with_volumes(name))
-                return DindProbeResult(
-                    success=False,
-                    log_text=f"dind: check failed port={port.internal}",
-                    sysbox_runtime=sysbox,
-                    port=port,
-                )
+                result = await ssh_client.run(cmd)
+                if result.exit_status != 0:
+                    error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
+                    logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+                    await ssh_client.run(DockerCommand.remove_with_volumes(name))
+                    return DindProbeResult(
+                        success=False,
+                        log_text=f"dind: check failed port={port.internal}",
+                        sysbox_runtime=sysbox,
+                        port=port,
+                    )
 
-            logger.info(_m("DinD container created", extra=get_extra_info(log_ctx)))
+                logger.info(_m("DinD container created", extra=get_extra_info(log_ctx)))
 
             # Test SSH
             pkey = asyncssh.import_private_key(private_key)
@@ -215,6 +234,7 @@ class DindProbe:
         container_name_prefix: str,
         sysbox_runtime: bool,
         log_ctx: dict | None = None,
+        prestarted=None,
     ) -> DindProbeResult:
         return await self.verifier.verify(
             port,
@@ -223,4 +243,5 @@ class DindProbe:
             container_name_prefix=container_name_prefix,
             sysbox=sysbox_runtime,
             log_ctx=log_ctx,
+            prestarted=prestarted,
         )

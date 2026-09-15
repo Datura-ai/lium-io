@@ -365,7 +365,18 @@ class Pipeline:
 
             return True, events, current_ctx
         finally:
-            await _cancel_unconsumed_probe(current_ctx)
+            await _settle_background_work(current_ctx)
+
+
+async def _settle_background_work(ctx: Context) -> None:
+    """liumd phase 2: a check may leave work in flight for a later check — the health-check probe
+    task in `ctx.state.local_verify` (2b) and the DinD container the executor started for the port
+    check in `ctx.state.local_facts.dind` (2c). A fatal check or a halt in between would leave it
+    pending — a probe pod the backend already rented, a container holding a rental port — so
+    whatever is still unconsumed is settled here, once, whatever ended the pipeline. Each step owns
+    its own how."""
+    await _remove_unconsumed_dind(ctx)
+    await _cancel_unconsumed_probe(ctx)
 
 
 async def _cancel_unconsumed_probe(ctx: Context) -> None:
@@ -410,5 +421,60 @@ async def _cancel_unconsumed_probe(ctx: Context) -> None:
                     "first_pass": ctx.config.first_pass,
                 }
             ),
+        )
+    )
+
+
+DIND_SETTLE_TIMEOUT_SECONDS = 15
+
+
+# Facts-call outcomes under which the executor provably ran nothing of ours: the intent was refused
+# before any step (401 / 409), never understood (no capability), or the executor's own `dind` step
+# answered `skipped` / `failed` (its by-label cleanup took its half-made container). Nothing to remove —
+# and the name is derived from the miner hotkey and the port, the same for every validator probing
+# that miner, so a container that IS there under it is another validator's probe, never ours.
+DIND_NEVER_STARTED_REASONS = frozenset({"refused", "busy_or_replay", "not_supported", "skipped", "failed"})
+
+
+async def _remove_unconsumed_dind(ctx: Context) -> None:
+    """Remove the DinD container the validator asked the executor to start from the facts intent
+    when no probe took it (the port check never ran, ran before the facts arrived, or the answer was
+    lost after the executor may have started it: timeout, transport, http_error, a malformed answer
+    or a schema/nonce/executor mismatch in it, a mismatched echo, a missing step). The name is
+    the miner hotkey plus the port, the same for every validator probing that miner, so on a lost
+    answer (a timeout above all) the `docker rm -f` can hit another validator's probe under that
+    name; the command itself is safe whether or not the container exists. Best effort over the
+    pipeline's SSH — the executor's TTL and the stale cleanup (`container_` prefix) are the
+    backstops. An outcome under
+    which the executor ran nothing of ours (`DIND_NEVER_STARTED_REASONS`) removes nothing: a
+    same-named container then is another validator's."""
+    facts = ctx.state.local_facts
+    dind = facts.dind if facts is not None else None
+    if dind is None or dind.consumed:
+        return
+    dind.consumed = True
+    reason = "removed"
+    if not dind.started and dind.reason in DIND_NEVER_STARTED_REASONS:
+        reason = f"never_started_{dind.reason}"
+    elif ctx.ssh is None:
+        reason = "no_ssh"
+    else:
+        try:
+            await asyncio.wait_for(
+                ctx.ssh.run(f"/usr/bin/docker rm -fv {dind.name}"), timeout=DIND_SETTLE_TIMEOUT_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 — cleanup must not replace the pipeline's own result
+            reason = f"rm_error: {type(exc).__name__}"
+    logger.info(
+        _m(
+            LOCAL_VERIFY_OUTCOME_EVENT,
+            extra={
+                **ctx.default_extra,
+                "outcome": "fallback",
+                "step": "dind",
+                "reason": f"unconsumed_{reason}",
+                "started": dind.started,
+                "first_pass": ctx.config.first_pass,
+            },
         )
     )

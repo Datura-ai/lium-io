@@ -18,6 +18,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import secrets
 import shutil
 import sys
 import threading
@@ -26,11 +28,13 @@ from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from datura.requests.validator_requests import local_verify_signing_blob
+from datura.requests.validator_requests import LOCAL_VERIFY_DIND_IMAGE, local_verify_signing_blob
 from payloads.verify import (
     STEP_NAMES,
     CardRun,
     ContainerFact,
+    DindData,
+    DindStep,
     DiskFact,
     DockerFacts,
     InspectorFacts,
@@ -381,6 +385,169 @@ def _inspector_facts() -> InspectorFacts:
     )
 
 
+# liumd phase 2c: the validator's port-check DinD container, started here instead of over SSH.
+# Image and command are the validator's `DockerCommand.run_dind` byte-for-byte — the image is the one
+# datura constant both sides read; the validator connects to sshd inside, runs its sysbox proof and
+# removes the container as today. A container the validator never comes for is removed after this long.
+DIND_IMAGE = LOCAL_VERIFY_DIND_IMAGE
+DIND_ORPHAN_TTL_SECONDS = 600
+# A cancelled `docker run -d` is removed at once and once more after this: the CLI was killed
+# mid-request, and a slow daemon may finish `containers/create` after the first rm found nothing.
+DIND_CANCELLED_RM_RETRY_SECONDS = 5
+# name → the timer armed for the container of THAT name, and the container id it will remove. The
+# name is deterministic (`container_<hotkey>_<first free port>`) and the verify cadence is about the
+# TTL, so a timer is cancelled when the same name is started again, and it removes by the id
+# `docker run -d` printed — a stale timer can never hit a later container of the same name.
+_dind_orphan_timers: dict[str, asyncio.TimerHandle] = {}
+_DOCKER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+
+
+# Every container this service starts carries this label with a per-call token, so a removal that
+# runs after the answer has left can target THIS call's container only — never a container of the
+# same name the validator started itself over SSH in the meantime (it reads `started=False` and runs
+# today's probe; a by-name `docker rm` then would kill its own probe container).
+DIND_RUN_LABEL = "lium.local_verify.run"
+
+
+def dind_argv(step: DindStep, publish_port: int, run_token: str | None = None) -> list[str]:
+    ssh_cmd = (
+        "mkdir -p ~/.ssh && echo "
+        f'"{step.public_key}" >> ~/.ssh/authorized_keys '
+        "&& ssh-keygen -A && service ssh start && tail -f /dev/null"
+    )
+    argv = ["/usr/bin/docker", "run", "-d"]
+    if step.sysbox:
+        argv.append("--runtime=sysbox-runc")
+    if run_token is not None:
+        argv += ["--label", f"{DIND_RUN_LABEL}={run_token}"]
+    argv += ["--name", step.name, "--gpus", "all", "-p", f"{publish_port}:22", DIND_IMAGE, "sh", "-c", ssh_cmd]
+    return argv
+
+
+async def _containers_with_run_token(run_token: str) -> list[str]:
+    """Ids of the containers this call's `docker run` created (by label), whatever their name."""
+    proc = await asyncio.create_subprocess_exec(
+        "/usr/bin/docker", "ps", "-aq", "--filter", f"label={DIND_RUN_LABEL}={run_token}",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=FAST_STEP_TIMEOUT_SECONDS)
+    except TimeoutError:
+        await _kill(proc)
+        raise
+    return [line.strip() for line in out.decode(errors="replace").splitlines() if _DOCKER_ID_RE.fullmatch(line.strip())]
+
+
+async def _remove_dind_orphan(
+    name: str, container_id: str | None = None, run_token: str | None = None
+) -> None:
+    """`docker rm -fv` of the container this call made — by the id `docker run` printed when there
+    is one (a timer must only ever remove the container it was armed for), by this call's label
+    token when the CLI was killed before it printed one or exited non-zero (`run_token`: only what
+    this call created, never a same-named container another validator or the validator's own SSH
+    path started); by bare name only from the orphan timer armed without an id."""
+    _dind_orphan_timers.pop(name, None)
+    try:
+        if run_token is not None:
+            targets = await _containers_with_run_token(run_token)
+        else:
+            targets = [container_id or name]
+        for target in targets:
+            proc = await asyncio.create_subprocess_exec(
+                "/usr/bin/docker", "rm", "-fv", target,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=FAST_STEP_TIMEOUT_SECONDS)
+            except TimeoutError:
+                await _kill(proc)
+                raise
+            logger.info("local verify dind: removed %s (%s)", name, target)
+    except Exception as exc:  # noqa: BLE001 — best effort; the validator's stale cleanup is the backstop
+        logger.warning("local verify dind: removal of %s failed: %s", name, exc)
+
+
+async def _remove_dind_orphan_twice(name: str, run_token: str) -> None:
+    """The cancelled path's removal: this call's container (by its label token) now, and again a
+    few seconds later, for the container a slow daemon creates after the killed CLI's first rm
+    found nothing. By token, never by name: once the answer has left, a same-named container may
+    be the validator's own (it reads `started=False` and runs today's probe). No orphan timer is
+    armed for it; the stale cleanup remains the backstop past the retry."""
+    await _remove_dind_orphan(name, run_token=run_token)
+    await asyncio.sleep(DIND_CANCELLED_RM_RETRY_SECONDS)
+    await _remove_dind_orphan(name, run_token=run_token)
+
+
+def _arm_dind_orphan_timer(name: str, container_id: str | None) -> None:
+    previous = _dind_orphan_timers.pop(name, None)
+    if previous is not None:
+        previous.cancel()  # the earlier cycle's timer for this name must not fire on this container
+    loop = asyncio.get_running_loop()
+    _dind_orphan_timers[name] = loop.call_later(
+        DIND_ORPHAN_TTL_SECONDS,
+        lambda: asyncio.ensure_future(_remove_dind_orphan(name, container_id)),
+    )
+
+
+async def run_dind(step: DindStep, port_pairs: list[tuple[int, int]], ssh_port: int) -> StepResult:
+    """`docker run -d` of the DinD image publishing sshd on `step.port`, which must be one of this
+    executor's own configured rental ports (never its sshd port): the intent chooses among the
+    ports the executor already offers, nothing else."""
+    started = time.perf_counter()
+    # the validator names the external port; docker publishes on the internal one it maps to
+    internal_port = next((i for i, e in port_pairs if e == step.port), None)
+    if internal_port is None or step.port == ssh_port or internal_port == ssh_port:
+        return StepResult(status="failed", error="port is not one of this executor's rental ports")
+    run_token = secrets.token_hex(8)
+    try:
+        result = await run_script(
+            dind_argv(step, internal_port, run_token), timeout=FAST_STEP_TIMEOUT_SECONDS
+        )
+    except asyncio.CancelledError:
+        # The intent's deadline cancelled the step while `docker run -d` was in flight: the CLI is
+        # killed but the daemon may already hold this call's container, or make one a moment
+        # later. Remove it off the cancelled path, twice, by this call's label — a container nobody
+        # comes for must not hold the name and the port, and a same-named one the validator starts
+        # meanwhile must not be touched.
+        asyncio.get_running_loop().create_task(_remove_dind_orphan_twice(step.name, run_token))
+        raise
+    if result.status == "timeout":
+        # The CLI was killed at the cap while the daemon may still be creating the container (a
+        # slow daemon, a first pull of the image): the same case as a cancellation — removed now
+        # and once more after the retry delay, by this call's label.
+        asyncio.get_running_loop().create_task(_remove_dind_orphan_twice(step.name, run_token))
+        return result
+    if result.status != "ok":
+        # A half-created container (bind failed after the create) must not hold the port or the
+        # name — removed by THIS call's label, never by the name: a `Conflict … name is already in
+        # use` means the live container is someone else's (another validator's probe of this miner,
+        # or the validator's own SSH-started one), and this call created nothing.
+        await _remove_dind_orphan(step.name, run_token=run_token)
+        return result
+    printed = (result.stdout or "").strip()
+    container_id = printed if _DOCKER_ID_RE.fullmatch(printed) else None
+    _arm_dind_orphan_timer(step.name, container_id)
+    return StepResult(
+        status="ok",
+        ms=int((time.perf_counter() - started) * 1000),
+        exit_status=0,
+        data=DindData(container_name=step.name, port=step.port, publish_port=internal_port),
+    )
+
+
+def _answer(result: StepResult) -> StepRunner:
+    async def runner() -> StepResult:
+        return result
+
+    return runner
+
+
+def dind_disabled() -> StepResult:
+    """The executor operator's kill switch (EXECUTOR_LOCAL_VERIFY_DIND_ENABLED=false): a signed
+    intent that carries the step anyway is answered, never run."""
+    return StepResult(status="skipped", error="dind not enabled on this executor")
+
+
 async def run_facts(name: str, func: Callable[[], StepData]) -> StepResult:
     """A read-only fact collector, off the event loop, bounded like every other step."""
     started = time.perf_counter()
@@ -422,6 +589,7 @@ class LocalVerifyService:
         port_mappings: str | None = None,
         ssh_port: int = 22,
         python: str = sys.executable,
+        dind_enabled: bool = False,
     ) -> None:
         self.executor_version = executor_version
         self.max_deadline_s = max_deadline_s
@@ -429,6 +597,7 @@ class LocalVerifyService:
         self.port_mappings = port_mappings
         self.ssh_port = ssh_port
         self.python = python
+        self.dind_enabled = dind_enabled
         self._busy = asyncio.Lock()
 
     @property
@@ -451,6 +620,12 @@ class LocalVerifyService:
             )
         if steps.inspector:
             facts["inspector"] = lambda: run_facts("inspector", _inspector_facts)
+        if steps.dind is not None and not self.dind_enabled:
+            facts["dind"] = _answer(dind_disabled())
+        elif steps.dind is not None:
+            facts["dind"] = lambda: run_dind(
+                steps.dind, parse_port_range(self.port_range, self.port_mappings), self.ssh_port
+            )
         gpu_step_names = list(gpu)
         return {**gpu, **facts}, gpu_step_names
 
