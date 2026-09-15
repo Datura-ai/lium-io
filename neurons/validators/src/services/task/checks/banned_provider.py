@@ -16,10 +16,10 @@ def reported_gpu_uuids(ctx: Context) -> list[str]:
 async def kernel_gpu_view(ctx: Context) -> KernelGpuView:
     """Kernel-side GPU identity, read once per cycle: this check stores it in ctx.state for BannedGpuCheck.
 
-    `kernel_gpu_uuids_read` marks the attempt, so an unreadable procfs is read once per cycle too —
+    `kernel_gpu_uuids_read_attempted` marks the attempt, so an unreadable procfs is read once per cycle too —
     the second check must not open another 15 s SSH read on the same wedged host.
     """
-    if ctx.state.kernel_gpu_uuids_read:
+    if ctx.state.kernel_gpu_uuids_read_attempted:
         return KernelGpuView(ctx.state.kernel_gpu_uuids, ctx.state.kernel_gpu_foreign_mounts)
     if ctx.ssh is None:
         return KernelGpuView(uuids=None, foreign_mounts=[])
@@ -44,14 +44,7 @@ class BannedProviderCheck:
     async def run(self, ctx: Context) -> CheckResult:
         rented_data = ctx.state.rented_data
         gpu_uuids = reported_gpu_uuids(ctx)
-        # DAH-2662: a banned operator re-registers the same cards under a fresh hotkey with the
-        # reported UUIDs rewritten by an NVML shim. Match the ban against the kernel's view as well —
-        # the shim does not author /proc/driver/nvidia — and record it on the executor's specs so the
-        # backend keys future bans on an identity the host did not choose. Shadow first
-        # (KERNEL_GPU_BAN_ENFORCEMENT_ENABLED=False): the kernel list is read and recorded, the ban
-        # is still matched on the reported list, and `kernel_view_would_ban` says what the flip changes.
-        # A foreign mount over the gpus path (the 2026-08-19 kit) means the kernel list is not the
-        # kernel's: it is dropped (None), named on the event, and fails the check once enforcing.
+        # DAH-2662: match bans against the kernel's GPU list too (flag and shapes: config.py, kernel_gpu_view)
         kernel_uuids, foreign_mounts = await kernel_gpu_view(ctx)
         is_banned = bool(
             rented_data
@@ -87,7 +80,7 @@ class BannedProviderCheck:
             "state": replace(
                 ctx.state,
                 kernel_gpu_uuids=kernel_uuids,
-                kernel_gpu_uuids_read=True,
+                kernel_gpu_uuids_read_attempted=True,
                 kernel_gpu_foreign_mounts=foreign_mounts,
                 specs=specs,
             )

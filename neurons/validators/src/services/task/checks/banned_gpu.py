@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.config import settings
+
 from ..messages import BannedGpuMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .banned_provider import kernel_gpu_uuids, reported_gpu_uuids, uuids_to_match_bans_against
@@ -32,45 +34,24 @@ class BannedGpuCheck:
         is_banned = any(
             guid in banned_guids for guid in uuids_to_match_bans_against(uuids, kernel_uuids)
         )
-        kernel_view_would_ban = any(guid in banned_guids for guid in kernel_uuids or [])
+        what = {
+            "gpu_uuids": current_uuids,
+            "kernel_gpu_uuids": kernel_uuids,
+            "kernel_view_would_ban": any(guid in banned_guids for guid in kernel_uuids or []),
+            "kernel_ban_enforced": settings.KERNEL_GPU_BAN_ENFORCEMENT_ENABLED,
+        }
 
         if not current_uuids and not is_banned:
-            event = render_message(
-                Msg.UUID_EMPTY,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "kernel_gpu_uuids": kernel_uuids,
-                    "kernel_view_would_ban": kernel_view_would_ban,
-                },
-            )
+            event = render_message(Msg.UUID_EMPTY, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=True, event=event)
 
         if is_banned:
-            event = render_message(
-                Msg.GPU_BANNED,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "gpu_uuids": current_uuids,
-                    "kernel_gpu_uuids": kernel_uuids,
-                    "kernel_view_would_ban": kernel_view_would_ban,
-                },
-            )
+            event = render_message(Msg.GPU_BANNED, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(
                 passed=False,
                 event=event,
                 updates={"clear_verified_job_info": True},
             )
 
-        event = render_message(
-            Msg.GPU_ALLOWED,
-            ctx=ctx,
-            check_id=self.check_id,
-            what={
-                "gpu_uuids": current_uuids,
-                "kernel_gpu_uuids": kernel_uuids,
-                "kernel_view_would_ban": kernel_view_would_ban,
-            },
-        )
+        event = render_message(Msg.GPU_ALLOWED, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)

@@ -479,19 +479,29 @@ async def read_kernel_gpu_view(ssh: asyncssh.SSHClientConnection) -> KernelGpuVi
     except Exception as exc:
         # fail-open by design; the line is what tells ops the kernel view was missing on this host
         logger.warning(
-            "kernel GPU UUID read failed, bans matched on the reported list only: %r", exc
+            "kernel GPU UUID read failed, bans matched on the reported list only: %s",
+            repr(exc)[:500],
+            extra={"executor_peer": _ssh_peer(ssh)},
         )
         return KernelGpuView(uuids=None, foreign_mounts=[])
     foreign_mounts = foreign_mounts_over_proc_nvidia_gpus(mountinfo, file_fs)
     if foreign_mounts:
-        logger.warning("foreign mount over %s: %s", PROC_NVIDIA_GPUS_PATH, foreign_mounts)
+        logger.warning(
+            "foreign mount over %s: %s",
+            PROC_NVIDIA_GPUS_PATH,
+            foreign_mounts,
+            extra={"executor_peer": _ssh_peer(ssh)},
+        )
         return KernelGpuView(uuids=None, foreign_mounts=foreign_mounts)
     uuids = list(_parse_uuid_minor_csv(uuid_lines))
     # positive evidence: every UUID row must come from a file stat placed on procfs; a host whose
     # stat printed nothing is unreadable (None), not a finding
     procfs_rows = [line for line in file_fs.splitlines() if line.strip().endswith(" proc")]
     if len(procfs_rows) < len(uuids):
-        logger.warning("kernel GPU UUID read had no procfs evidence for every card; withheld")
+        logger.warning(
+            "kernel GPU UUID read had no procfs evidence for every card; withheld",
+            extra={"executor_peer": _ssh_peer(ssh)},
+        )
         return KernelGpuView(uuids=None, foreign_mounts=[])
     return KernelGpuView(uuids=uuids or None, foreign_mounts=[])
 

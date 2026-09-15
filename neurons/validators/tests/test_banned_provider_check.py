@@ -110,7 +110,7 @@ async def test_clean_provider_passes(context_factory):
     assert result.event.reason_code == Msg.PROVIDER_ALLOWED.reason
     assert "is_provider_banned" not in result.updates
     # DAH-2662: no ssh here, so the kernel read is skipped — and remembered as attempted
-    assert result.updates["state"].kernel_gpu_uuids_read is True
+    assert result.updates["state"].kernel_gpu_uuids_read_attempted is True
     assert result.updates["state"].kernel_gpu_uuids is None
 
 

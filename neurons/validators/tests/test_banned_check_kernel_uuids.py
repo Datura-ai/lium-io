@@ -18,6 +18,7 @@ from core.config import settings
 from neurons.validators.src.services.task.checks.banned_gpu import BannedGpuCheck
 from neurons.validators.src.services.task.checks.banned_provider import BannedProviderCheck
 from neurons.validators.src.services.task.messages import BannedGpuMessages, BannedProviderMessages
+from neurons.validators.src.services.task.pipeline import CheckResult, Context
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
 from services import nvidia_devices  # the module banned_provider.py reads the timeout from
@@ -46,7 +47,7 @@ INFO_FILE = "/proc/driver/nvidia/gpus/0001:00:00.0/information"
 
 def _ssh_with_procfs(
     lines: list[str], mounts: list[str] = CONTAINER_MOUNTS, file_fs: list[str] | None = None
-):
+) -> AsyncMock:
     """The one round-trip read_kernel_gpu_view makes: mountinfo, `stat -f` per file, the UUID rows."""
     if file_fs is None:
         file_fs = [f"{INFO_FILE} proc" for _ in lines] + [
@@ -76,7 +77,7 @@ def shadow(monkeypatch):
     monkeypatch.setattr(settings, "KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", False)
 
 
-def _after(ctx, result):
+def _after(ctx: Context, result: CheckResult) -> Context:
     """The pipeline's handoff: the next check runs on the context with this result's updates applied."""
     return ctx.model_copy(update=result.updates)
 
@@ -244,7 +245,7 @@ async def test_unreadable_procfs_falls_back_to_reported_uuids_and_is_not_a_spoof
     assert result.event.what_we_saw["kernel_gpu_uuids"] is None
     assert result.event.what_we_saw["reported_uuids_differ_from_kernel"] is False
     # the failed attempt is remembered; specs never carry a kernel list the host did not give
-    assert result.updates["state"].kernel_gpu_uuids_read is True
+    assert result.updates["state"].kernel_gpu_uuids_read_attempted is True
     assert result.updates["state"].kernel_gpu_uuids is None
     assert "kernel_gpu_uuids" not in result.updates["state"].specs
 

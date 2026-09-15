@@ -132,10 +132,10 @@ class ContextState:
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
     # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
-    # None = unreadable or not read; `kernel_gpu_uuids_read` tells the two apart so a failed read is
+    # None = unreadable or not read; `kernel_gpu_uuids_read_attempted` tells the two apart so a failed read is
     # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
     kernel_gpu_uuids: list[str] | None = None
-    kernel_gpu_uuids_read: bool = False
+    kernel_gpu_uuids_read_attempted: bool = False
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
     # non-empty = the kernel list above was withheld because it was read through them
     kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
