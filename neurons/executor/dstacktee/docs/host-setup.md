@@ -148,13 +148,13 @@ A release that changes `key-provider/` (its `Cargo.lock`, Dockerfile or upstream
 sudo ./lium-cvm.sh inventory                         # every CVM disk on this host, all checkouts, stopped CVMs included
 # drain rentals, then per CVM whose data is no longer needed:
 sudo ./lium-cvm.sh stop my-executor
-sudo rm -rf run/vms/my-executor                      # by hand; the guard prints this exact line per disk
+sudo rm -rf run/vms/my-executor                      # by hand; the guard prints this exact line per running or stopped disk
 sudo ./cvm_upgrade_guard.sh upgrade                  # refused with exit 3 while any disk remains, exit 4 while the inventory is incomplete
 cd key-provider && docker compose logs gramine-sealing-key-provider | grep -m1 mr_enclave   # the new MRENCLAVE
 sudo ./lium-cvm.sh new my-executor && sudo ./lium-cvm.sh run my-executor
 ```
 
-`upgrade` keeps the previous image as `lium-key-provider:pre-upgrade-<timestamp>` and pins the new image id. `sudo ./cvm_upgrade_guard.sh upgrade --dry-run` runs the inventory and reports without changing anything. The inventory covers this checkout's `run/vms`, every VM root a `lium-cvm.sh new` or `run` on this host ever registered in `/var/lib/lium-cvm/vm-dirs`, and a sweep of `/home /root /opt /srv /mnt /data` plus every filesystem mounted below them for any other `hda.img`, with or without a `vm-manifest.json` beside it (`LIUM_CVM_SWEEP_ROOTS` widens it). A disk that is not running and whose manifest is gone is listed as `orphan` and blocks the upgrade like any other. A registered VM root that is missing (an unmounted disk looks like a removed checkout) or a directory the sweep cannot read makes the inventory incomplete, and the upgrade is refused until it is mounted, readable, or removed from `vm-dirs`.
+`upgrade` keeps the previous image as `lium-key-provider:pre-upgrade-<timestamp>` and pins the new image id. `sudo ./cvm_upgrade_guard.sh upgrade --dry-run` runs the inventory and reports without changing anything. The inventory covers this checkout's `run/vms`, every VM root a `lium-cvm.sh new` or `run` on this host ever registered in `/var/lib/lium-cvm/vm-dirs`, and a sweep of `/home /root /opt /srv /mnt /data` plus every filesystem mounted below them for any other `hda.img`, with or without a `vm-manifest.json` beside it (`LIUM_CVM_SWEEP_ROOTS` widens it). A disk that is not running and whose manifest is gone is listed as `orphan` and blocks the upgrade like any other; the guard prints no `rm` line for it, because nothing proves the CVM stack made that directory, so check it by hand. A registered VM root that is missing (an unmounted disk looks like a removed checkout) or a directory the sweep cannot read makes the inventory incomplete, and the upgrade is refused until it is mounted, readable, or removed from `vm-dirs`.
 
 ## Troubleshooting
 

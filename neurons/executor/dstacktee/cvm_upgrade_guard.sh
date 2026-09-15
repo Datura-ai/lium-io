@@ -166,15 +166,40 @@ cvm_guard_submounts() {
     done <"$CVM_GUARD_MOUNTS"
 }
 
+# The directory of every hda.img under CVM_GUARD_SWEEP_ROOTS, one per line.
+# find's errors (unreadable directories) are appended to the file named by $1.
+# `find -xdev` stays on one filesystem, so every real filesystem mounted below
+# a root is swept as its own root.
+cvm_guard_sweep_dirs() {
+    local err_file="$1" root line found
+    local sweep=()
+    # shellcheck disable=SC2086 # the roots are a space-separated list on purpose
+    for root in $CVM_GUARD_SWEEP_ROOTS; do
+        [ -d "$root" ] || continue
+        sweep+=("$root")
+        while IFS= read -r line; do
+            [ -n "$line" ] && sweep+=("$line")
+        done < <(cvm_guard_submounts "$root")
+    done
+    for root in "${sweep[@]}"; do
+        # The trailing slash makes find enter a root that is a symlink
+        # (/data -> /mnt/nvme0); in -P mode a bare symlink start point is skipped.
+        found="$(find "$root/" -xdev -type f -name hda.img -print 2>>"$err_file")" || true
+        while IFS= read -r line; do
+            [ -n "$line" ] && dirname "$line"
+        done <<<"$found"
+    done
+}
+
 # Fill CVM_GUARD_DISKS / CVM_GUARD_UNREADABLE from: this checkout's run/vms,
-# every root in the registry, and a sweep of CVM_GUARD_SWEEP_ROOTS for any
-# hda.img the registry does not know about.
+# every root in the registry (the registry walk), and cvm_guard_sweep_dirs for
+# any hda.img the registry does not know about (the sweep).
 cvm_guard_inventory() {
     CVM_GUARD_DISKS=()
     CVM_GUARD_UNREADABLE=()
     CVM_GUARD_NO_DISK_YET=()
     local -A seen=()
-    local root dir line err_file found
+    local root dir line err_file
 
     local roots=("$CVM_GUARD_DIR/run/vms")
     if [ -e "$CVM_GUARD_REGISTRY" ]; then
@@ -208,31 +233,13 @@ cvm_guard_inventory() {
         done
     done
 
-    # Sweep: any hda.img under the sweep roots. `find -xdev` stays on one
-    # filesystem, so every real filesystem mounted below a root is swept as its
-    # own root.
     err_file="$(mktemp)"
-    local sweep=()
-    # shellcheck disable=SC2086 # the roots are a space-separated list on purpose
-    for root in $CVM_GUARD_SWEEP_ROOTS; do
-        [ -d "$root" ] || continue
-        sweep+=("$root")
-        while IFS= read -r line; do
-            [ -n "$line" ] && sweep+=("$line")
-        done < <(cvm_guard_submounts "$root")
-    done
-    for root in "${sweep[@]}"; do
-        # The trailing slash makes find enter a root that is a symlink
-        # (/data -> /mnt/nvme0); in -P mode a bare symlink start point is skipped.
-        found="$(find "$root/" -xdev -type f -name hda.img -print 2>>"$err_file")" || true
-        while IFS= read -r line; do
-            [ -n "$line" ] || continue
-            dir="$(dirname "$line")"
-            [ -n "${seen[$dir]:-}" ] && continue
-            seen[$dir]=1
-            cvm_guard_classify_dir "$dir"
-        done <<<"$found"
-    done
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        [ -n "${seen[$dir]:-}" ] && continue
+        seen[$dir]=1
+        cvm_guard_classify_dir "$dir"
+    done < <(cvm_guard_sweep_dirs "$err_file")
     if [ -s "$err_file" ]; then
         while IFS= read -r line; do
             CVM_GUARD_UNREADABLE+=("$line")
@@ -287,7 +294,14 @@ cvm_guard_removal_steps() {
         if [ "$state" = running ] && [ -x "$checkout/lium-cvm.sh" ]; then
             printf '  sudo %q stop %q\n' "$checkout/lium-cvm.sh" "$name"
         fi
-        printf '  sudo rm -rf %q\n' "$dir"
+        # The rm line is printed only for a directory the CVM stack made: it has
+        # the manifest (vm-manifest.json) or QEMU's runtime.json beside hda.img.
+        # An orphan hda.img may belong to something else; name it, remove nothing.
+        if [ "$state" = orphan ]; then
+            printf '  # %q: disk with no vm-manifest.json beside it; confirm it is a Lium CVM before you remove anything\n' "$dir"
+        else
+            printf '  sudo rm -rf %q\n' "$dir"
+        fi
     done
     cvm_guard_say "then run the upgrade again."
 }
@@ -315,7 +329,7 @@ cvm_guard_write_pin() {
 # On a host that predates the pin file, the image in use is the one the
 # dstack-key-provider container runs, else the image compose named before this
 # guard. Pins it. Returns 1 when nothing is there to adopt.
-cvm_guard_adopt_existing() {
+cvm_guard_adopt_existing_image() {
     local id legacy
     id="$(docker inspect --format '{{.Image}}' "$CVM_GUARD_CONTAINER" 2>/dev/null)" || id=""
     if [ -z "$id" ]; then
@@ -382,7 +396,7 @@ cvm_guard_start() {
     cvm_guard_lock || return $?
 
     if ! pinned="$(cvm_guard_pinned_id)" || [ -z "$pinned" ]; then
-        if ! cvm_guard_adopt_existing; then
+        if ! cvm_guard_adopt_existing_image; then
             cvm_guard_inventory
             cvm_guard_report >/dev/null || rc=$?
             if [ "$rc" -ne 0 ]; then
@@ -458,7 +472,7 @@ cvm_guard_upgrade() {
 
     if pinned="$(cvm_guard_pinned_id)" && [ -n "$pinned" ]; then
         :
-    elif cvm_guard_adopt_existing; then
+    elif cvm_guard_adopt_existing_image; then
         pinned="$(cvm_guard_pinned_id)"
     else
         pinned=""

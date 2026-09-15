@@ -152,7 +152,7 @@ class Host:
         with open(self.state / "vm-dirs", "a") as f:
             f.write(str(vms_dir) + "\n")
 
-    def seq(self) -> list[str]:
+    def stub_call_order(self) -> list[str]:
         log = self.docker_state / "seq.log"
         return log.read_text().splitlines() if log.exists() else []
 
@@ -279,7 +279,10 @@ def test_swept_disk_without_manifest_is_an_orphan_and_refuses(host: Host):
     listed = [ln.split() for ln in r.stdout.splitlines() if ln.startswith("  ") and "hda.img" in ln]
     assert listed == [["orphan", str(vm / "hda.img")]]
     assert "orphan = hda.img with no vm-manifest.json" in r.stdout
-    assert f"sudo rm -rf {vm}" in r.stdout
+    # No manifest and not running: nothing proves the CVM stack made this directory, so the
+    # guard names it and prints no rm line for it.
+    assert f"sudo rm -rf {vm}" not in r.stdout
+    assert f"# {vm}: disk with no vm-manifest.json beside it" in r.stdout
 
     r = host.guard("upgrade")
     assert r.returncode == 3, r.stdout + r.stderr
@@ -298,7 +301,8 @@ def test_registered_disk_without_manifest_is_an_orphan(host: Host, tmp_path: Pat
 
     assert r.returncode == 3, r.stdout + r.stderr
     assert f"  orphan   {vm / 'hda.img'}" in r.stdout
-    assert f"sudo rm -rf {vm}" in r.stdout
+    assert f"sudo rm -rf {vm}" not in r.stdout
+    assert f"# {vm}: disk with no vm-manifest.json beside it" in r.stdout
 
 
 def test_running_disk_without_manifest_is_running_and_keeps_the_stop_line(host: Host):
@@ -569,13 +573,15 @@ def test_lium_cvm_run_takes_lock_registers_root_and_creates_disk_first(host: Hos
     ).read_text().strip() == f"create -f qcow2 {vm}/hda.img 20G"
     assert (vm / "hda.img").exists()
     # Order: provider up, then the disk, then dstack.py (which inherits no lock).
-    seq = host.seq()
-    up = seq.index("docker compose up -d --no-build")
-    disk = next(i for i, s in enumerate(seq) if s.startswith("qemu-img create"))
+    stub_call_order = host.stub_call_order()
+    up = stub_call_order.index("docker compose up -d --no-build")
+    disk = next(i for i, s in enumerate(stub_call_order) if s.startswith("qemu-img create"))
     run = next(
-        i for i, s in enumerate(seq) if s.startswith("python3 ") and f"dstack.py run {vm}" in s
+        i
+        for i, s in enumerate(stub_call_order)
+        if s.startswith("python3 ") and f"dstack.py run {vm}" in s
     )
-    assert up < disk < run, seq
+    assert up < disk < run, stub_call_order
     # dstack.py run starts QEMU, which must not inherit the host lock.
     probes = (host.docker_state / "lock-at-python3.log").read_text().splitlines()
     assert any(p.startswith("free ") and "dstack.py run" in p for p in probes), probes
