@@ -103,6 +103,15 @@ from services.rental_docker_observability import (
     rental_run_spec_log_fields,
     run_logged_rental_docker_sdk_operation,
 )
+from services.local_rent_client import (
+    LocalRentAnswer,
+    LocalRentClient,
+    LocalRentUnavailable,
+    build_intent as build_local_rent_intent,
+    eligible as local_rent_eligible,
+    executor_deadline_s as local_rent_executor_deadline_s,
+    may_have_acted as local_rent_may_have_acted,
+)
 from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     ContainerExecSpec,
@@ -1260,6 +1269,112 @@ class DockerService:
                     }),
                 )
             )
+
+    async def _create_with_local_rent(
+        self,
+        *,
+        executor_info: ExecutorSSHInfo,
+        keypair,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_client: RentalDockerSdkClient,
+        run_spec: ContainerRunSpec,
+        image_ships_sshd: bool,
+        default_extra: dict,
+    ) -> LocalRentAnswer | None:
+        """liumd deploy: ONE signed `POST /rent` makes the container on the executor from
+        `run_spec` (the same docker-py calls, on the host) and waits for it to run — instead of the
+        SDK `run` through the SSH tunnel and the `docker ps` poll. The intent rides `ssh_client`
+        (the rental's own pinned session) to the executor's loopback port, the one its `/version`
+        names as `local_rent_port`: the answer is unsigned, so it never crosses the network
+        (#1339). The answer when the executor made it and saw it running; None whenever the SDK
+        path must run instead: flag off, a spec with private fields, no advertised port, any
+        refusal, timeout, 404 or malformed answer, or an executor that could not prove nothing of
+        its making remains. When the executor may have acted on the intent (an unproven rollback,
+        a timeout, a tunnel that closed after the send, an unreadable answer) the name is
+        force-removed here first, so the SDK `run` of the same name goes through.
+        """
+        if not settings.VALIDATOR_LOCAL_RENT_ENABLED:
+            return None
+        log_extra = {**default_extra, "container_name": run_spec.name}
+
+        def event(outcome: str, **fields) -> None:
+            logger.info(
+                _m(
+                    f"[local_rent] {outcome}",
+                    extra=get_extra_info({**log_extra, "local_rent_outcome": outcome, **fields}),
+                )
+            )
+
+        ineligible = local_rent_eligible(run_spec, executor_info.ssh_host_key)
+        if ineligible:
+            event("not_taken", reason=ineligible)
+            return None
+        ssh_host_port = next(
+            (p.host_port for p in run_spec.ports if p.container_port == 22 and p.protocol == "tcp"),
+            None,
+        )
+        intent = build_local_rent_intent(
+            executor_uuid=executor_info.uuid,
+            host_key=executor_info.ssh_host_key,
+            spec=run_spec,
+            deadline_s=local_rent_executor_deadline_s(settings.LOCAL_RENT_TIMEOUT_SECONDS),
+            ssh_host_port=ssh_host_port if image_ships_sshd else None,
+            ssh_wait_s=settings.LOCAL_RENT_SSHD_WAIT_SECONDS,
+        )
+        client = LocalRentClient(
+            keypair,
+            timeout_s=settings.LOCAL_RENT_TIMEOUT_SECONDS,
+            connect_timeout_s=settings.LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS,
+        )
+        # One GET over the API port: an executor with the route on names the loopback port the
+        # tunnel targets; an old image, a flag off or an unreachable API port names none.
+        local_rent_port = (await client.advertised(executor_info)).local_rent_port
+        if local_rent_port is None:
+            event("not_taken", reason="no_tunnel_port")
+            return None
+        try:
+            answer = await client.rent(ssh_client, local_rent_port, intent)
+        except LocalRentUnavailable as exc:
+            event("unavailable", reason=exc.reason, detail=exc.detail[:300])
+            if local_rent_may_have_acted(exc.reason, exc.detail):
+                # The intent may have reached the daemon (a timeout, a tunnel that closed after
+                # the send, an unreadable answer): the SDK `run` of the same name goes through
+                # only if the name is free — force-removed here, as after an unproven rollback.
+                await self._remove_failed_rental_container_for_retry(
+                    docker_client=docker_client,
+                    container_name=run_spec.name,
+                    default_extra=default_extra,
+                    warning_event="LOCAL_RENT_FALLBACK_RM_FAILED",
+                )
+            return None
+        steps = {name: step.status for name, step in answer.steps.items()}
+        fields = dict(
+            round_trip_ms=answer.round_trip_ms,
+            executor_ms=answer.elapsed_ms,
+            executor_version=answer.executor_version,
+            steps=steps,
+            deadline_hit=answer.deadline_hit,
+            rolled_back=answer.rolled_back,
+        )
+        ready = answer.ready
+        ready_fields = {
+            "running_ms": ready.running_ms if ready else None,
+            "ssh_answered": ready.ssh_answered if ready else None,
+        }
+        if answer.created:
+            event("created", **fields, **ready_fields)
+            return answer
+        failed = next((s for s in answer.steps.values() if s.status != "ok" and s.status != "skipped"), None)
+        # Executor-controlled text is bounded before it reaches a log line (PR_PROCESS §5).
+        event("fell_back", **fields, error=(failed.error or "")[:300] if failed else None)
+        if answer.may_hold_the_name:
+            await self._remove_failed_rental_container_for_retry(
+                docker_client=docker_client,
+                container_name=run_spec.name,
+                default_extra=default_extra,
+                warning_event="LOCAL_RENT_FALLBACK_RM_FAILED",
+            )
+        return None
 
     def _build_rental_container_run_spec(
         self,
@@ -5393,15 +5508,27 @@ class DockerService:
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     await self.stream_log("Creating docker container", "success", log_tag)
-                    await self._run_rental_docker_create_with_port_retry(
-                        docker_client=docker_client,
+                    # liumd deploy: the executor makes the container from this very spec in one
+                    # signed call, running-state wait included; None → the SDK path below as today.
+                    local_rent = await self._create_with_local_rent(
+                        executor_info=executor_info,
+                        keypair=keypair,
                         ssh_client=ssh_client,
+                        docker_client=docker_client,
                         run_spec=run_spec,
-                        container_name=container_name,
+                        image_ships_sshd=image_manages_services,
                         default_extra=default_extra,
-                        local_volume=local_volume,
-                        log_tag=log_tag,
                     )
+                    if local_rent is None:
+                        await self._run_rental_docker_create_with_port_retry(
+                            docker_client=docker_client,
+                            ssh_client=ssh_client,
+                            run_spec=run_spec,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            local_volume=local_volume,
+                            log_tag=log_tag,
+                        )
 
                     container_created = True
                     logger.info("Container creation step finished")
@@ -5412,9 +5539,10 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_RUN, prev_timestamp))
                     prev_timestamp = now_ms()
 
-                    # check if the container is running correctly
+                    # check if the container is running correctly (the local rent call already
+                    # waited for State.Running on the host; the exec that follows re-inspects)
                     current_step = "container_health_check"
-                    if not await self.check_container_running(ssh_client, container_name):
+                    if local_rent is None and not await self.check_container_running(ssh_client, container_name):
                         # Capture the failure reason and check whether it points to our
                         # --device flags (DAH-1987). State.Error covers cgroup / device
                         # failures; logs --tail covers entrypoint failures.

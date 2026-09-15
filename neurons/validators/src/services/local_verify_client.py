@@ -275,10 +275,13 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
 class Advertised:
     """What the executor's `/version` says about the local path: the capability list and, while
     `local_verify/1` is served, the loopback port the tunnel targets (None on an image that does
-    not name one — its `/verify` cannot be reached from the network, so it is left to SSH)."""
+    not name one — its `/verify` cannot be reached from the network, so it is left to SSH).
+    `local_rent_port` is the same for the deploy path's `/rent` (its own flag, so its own field;
+    both are this executor process's port, `/rent` as unsigned an answer as `/verify`)."""
 
     capabilities: set[str]
     local_verify_port: int | None
+    local_rent_port: int | None = None
 
 
 def _wire_port(value: Any) -> int | None:
@@ -309,7 +312,7 @@ class LocalVerifyClient:
         loopback port of the executor's container, a peer the miner already controls; whatever
         answers there is judged as the executor's own answer would be (nonce echo, unseal) or
         falls back to SSH."""
-        nothing = Advertised(capabilities=set(), local_verify_port=None)
+        nothing = Advertised(capabilities=set(), local_verify_port=None, local_rent_port=None)
         timeout = aiohttp.ClientTimeout(
             total=self.connect_timeout_s * 2, connect=self.connect_timeout_s
         )
@@ -334,24 +337,42 @@ class LocalVerifyClient:
                 if isinstance(c, str) and len(c) <= MAX_CAPABILITY_CHARS
             },
             local_verify_port=_wire_port(body.get("local_verify_port")),
+            local_rent_port=_wire_port(body.get("local_rent_port")),
         )
 
     async def verify(
         self, ssh: asyncssh.SSHClientConnection, local_verify_port: int, intent: dict[str, Any]
     ) -> LocalVerifyAnswer:
         """Sign the intent and POST it through `ssh` to `127.0.0.1:<local_verify_port>` on the
-        executor. The listener this binds lives for this one call; sshd opens the direct-tcpip
-        channel when aiohttp connects to it. A channel sshd cannot open (nothing on that loopback
-        port, or forwarding disabled) closes the local end without a byte: `refused`, like a 403.
+        executor (`post_signed`); the answer must be to this intent (`parse_answer`)."""
+        raw, round_trip_ms = await self.post_signed(ssh, local_verify_port, "/verify", intent)
+        return parse_answer(raw, intent=intent, round_trip_ms=round_trip_ms)
+
+    async def post_signed(
+        self,
+        ssh: asyncssh.SSHClientConnection,
+        local_port: int,
+        path: str,
+        intent: dict[str, Any],
+    ) -> tuple[Any, int]:
+        """One signed intent to `path` through `ssh` to `127.0.0.1:<local_port>` on the executor;
+        the executor's JSON answer back (bounded) with the round trip in ms. `/verify` and the
+        deploy path's `/rent` post the same way: both answers are unsigned, so both travel only
+        inside the authenticated SSH session (the executor serves them to loopback peers only).
+
+        The listener this binds lives for this one call; sshd opens the direct-tcpip channel when
+        aiohttp connects to it. A channel sshd cannot open (nothing on that loopback port, or
+        forwarding disabled) closes the local end without a byte: `refused`, like a 403.
         `connect_timeout_s` bounds the local bind and connect only; the channel open on the
-        executor's side is inside the whole-call `timeout_s`."""
+        executor's side is inside the whole-call `timeout_s`. Every non-200 and every transport
+        error is a `LocalVerifyUnavailable` whose reason names it."""
         signed = sign_intent(intent, self.keypair)
         timeout = aiohttp.ClientTimeout(total=self.timeout_s, connect=self.connect_timeout_s)
         started = time.perf_counter()
         try:
             listener = await asyncio.wait_for(
                 ssh.forward_local_port(
-                    TUNNEL_LISTEN_HOST, 0, EXECUTOR_LOOPBACK, local_verify_port
+                    TUNNEL_LISTEN_HOST, 0, EXECUTOR_LOOPBACK, local_port
                 ),
                 self.connect_timeout_s,
             )
@@ -364,7 +385,7 @@ class LocalVerifyClient:
         try:
             async with self._session_factory(timeout=timeout) as session:
                 async with session.post(
-                    f"http://{TUNNEL_LISTEN_HOST}:{listener.get_port()}/verify",
+                    f"http://{TUNNEL_LISTEN_HOST}:{listener.get_port()}{path}",
                     json=signed,
                     allow_redirects=False,
                 ) as response:
@@ -374,13 +395,17 @@ class LocalVerifyClient:
                     status = response.status
         except TimeoutError:
             raise LocalVerifyUnavailable("timeout", f"no answer within {self.timeout_s}s")
+        except aiohttp.ClientConnectorError as exc:
+            # The connect to the listener this process just bound failed (a subclass of
+            # ClientConnectionError, so it is named before it): nothing was sent.
+            raise LocalVerifyUnavailable("transport", f"{type(exc).__name__}: {exc}")
         except aiohttp.ClientConnectionError as exc:
             # asyncssh closes the accepted connection when the channel open fails
             # (SSHLocalForwarder: ChannelOpenError → connection_lost), so aiohttp sees a
             # disconnect before any status line.
             raise LocalVerifyUnavailable(
                 "refused",
-                f"tunnel to {EXECUTOR_LOOPBACK}:{local_verify_port} closed without an answer: "
+                f"tunnel to {EXECUTOR_LOOPBACK}:{local_port} closed without an answer: "
                 f"{type(exc).__name__}",
             )
         except Exception as exc:  # other aiohttp client errors
@@ -414,4 +439,4 @@ class LocalVerifyClient:
             raw = json.loads(text)
         except ValueError:
             raise LocalVerifyUnavailable("malformed", "answer is not JSON")
-        return parse_answer(raw, intent=intent, round_trip_ms=round_trip_ms)
+        return raw, round_trip_ms

@@ -92,6 +92,13 @@ LOCAL_VERIFY_DIND_NAME_MAX = 128
 LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN = r"^ssh-(ed25519|rsa) [A-Za-z0-9+/=]{1,900}( [A-Za-z0-9@._-]{1,64})?$"
 LOCAL_VERIFY_DIND_PUBLIC_KEY_MAX = 1024
 
+# liumd deploy (DAH-2834, `speed/DEPLOY_LOCAL_RENT.md`): the validator's one-call rental create,
+# `POST /rent` on the executor — the rental container made from the validator's own run spec
+# (`datura.rental_spec`) by the executor's docker-py on the host, instead of over the SSH tunnel.
+# Signed with `local_verify_signing_blob` like `/verify`; advertised as its own capability.
+LOCAL_RENT_SCHEMA = "lium.local_rent/1"
+LOCAL_RENT_CAPABILITY = "local_rent/1"
+
 
 # The largest card count one host can claim; bounds the matmul fan-out an intent can ask for.
 LOCAL_VERIFY_MAX_DEVICES = 64
@@ -167,6 +174,52 @@ class DindStep(LocalVerifyWireModel):
         pattern=LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN, max_length=LOCAL_VERIFY_DIND_PUBLIC_KEY_MAX
     )
     sysbox: bool = False
+
+
+# `/rent`'s step evidence (`RentStepResult.data` on the executor, `LocalRentAnswer` on the
+# validator), one named model per step: the validator parses what the executor built from ONE
+# definition, as it does for the intent's steps above. Strings are bounded: every one of them is
+# the daemon's or the executor's and ends up in a validator log line.
+RENT_STR_MAX = 512
+
+
+class RentImageData(LocalVerifyWireModel):
+    """`docker image inspect` of the spec's image before the create: here or not, and which."""
+
+    present: bool
+    id: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+    digest: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+
+
+class RentContainerData(LocalVerifyWireModel):
+    """What the create made: the spec's name and the id the daemon answered (None when it did not)."""
+
+    container_name: str = pydantic.Field(max_length=RENT_STR_MAX)
+    container_id: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+
+
+class RentContainerState(LocalVerifyWireModel):
+    """The public part of `docker inspect`'s `State` block, as the ready step last saw it."""
+
+    status: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+    running: bool | None = None
+    exit_code: int | None = None
+    error: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+    started_at: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+
+
+class RentReadyData(LocalVerifyWireModel):
+    """The ready step: the container's state when the poll ended, how long until it ran, and the
+    sshd banner probe when the intent asked for one (`ssh_port` set)."""
+
+    state: RentContainerState
+    running_ms: int | None = None
+    ssh_port: int | None = None
+    ssh_answered: bool | None = None
+    ssh_probe_host: str | None = pydantic.Field(default=None, max_length=RENT_STR_MAX)
+
+
+RentStepData = RentImageData | RentContainerData | RentReadyData
 
 
 def local_verify_signing_blob(intent: dict[str, object]) -> str:
