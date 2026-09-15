@@ -236,6 +236,17 @@ class Settings(BaseSettings):
     # authorized_keys and /etc/environment in ONE `docker exec` after the mount. Every step still
     # completes before ContainerCreated is returned. Off: the serial order as before.
     RENTAL_POSTRUN_CONCURRENT_ENABLED: bool = Field(env="RENTAL_POSTRUN_CONCURRENT_ENABLED", default=False)
+    # Warm container pool (speed/WARM_POOL.md in the loop's docs). ON: after this validator starts a
+    # filler on a node it also leaves one created-never-started `warm_<uuid>` container per image
+    # the executor keeps pre-pulled, with a fresh sparse volume and the rental HostConfig; a
+    # whole-host rental of that image then adopts it (inspect → rename → start) instead of creating
+    # a volume and running a new container; the rental is still sized, and the slot must hold at
+    # least that. Any mismatch or failure takes the path below as if the pool did not exist.
+    # OFF (default): nothing is created, nothing is adopted.
+    WARM_POOL_ENABLED: bool = Field(env="WARM_POOL_ENABLED", default=False)
+    # A slot older than this is removed and recreated on the next filler start, so a node never
+    # serves a container created from an image it has since re-pulled.
+    WARM_POOL_MAX_AGE_HOURS: int = Field(env="WARM_POOL_MAX_AGE_HOURS", default=24)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
