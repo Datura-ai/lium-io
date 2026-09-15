@@ -169,6 +169,14 @@ ORIGINAL_KEYS = {
     'ic_p2p_pairs': "p2p_pairs",
     'ic_p2p': "p2p",
     'ic_matrix': "matrix",
+    # DAH-2928: disk health. Prefixed so no existing key is a substring (ecrypt_miner_job_files
+    # renames by sequential str.replace); the longer of two keys sharing a prefix comes first.
+    'data_disk_health_scrape_error': "disk_health_scrape_error",
+    'data_disk_health': "disk_health",
+    'dh_docker_root_dir': "docker_root_dir",
+    'dh_read_only_mounts': "read_only_mounts",
+    'dh_write_probe_error': "write_probe_error",
+    'dh_write_probe': "write_probe",
 }
 
 
@@ -362,6 +370,13 @@ class FileEncryptService:
             'ic_p2p_pairs': "",
             'ic_p2p': "",
             'ic_matrix': "",
+            # DAH-2928 - longer keys before the key they extend (prefix rule above)
+            'data_disk_health_scrape_error': "",
+            'data_disk_health': "",
+            'dh_docker_root_dir': "",
+            'dh_read_only_mounts': "",
+            'dh_write_probe_error': "",
+            'dh_write_probe': "",
         }
 
         # Generate dictionary key mapping on validator side

@@ -35,6 +35,7 @@ from .checks import (
     CollateralCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
+    DiskHealthCheck,
     DuplicateExecutorCheck,
     ExecutorImageCheck,
     FinalizeCheck,
@@ -283,6 +284,11 @@ class PipelineFactory:
                 # here — before the rented short-circuit (TenantEnforcementCheck)
                 # — to gate rented and idle executors alike.
                 GpuVramPrecheck(),
+                # DAH-2928: pure-data, non-fatal report on specs.disk_health from the scrape. A
+                # docker root that refuses writes cannot start a container; placed before the rented
+                # short-circuit so a rented host that has just lost its disk is reported too. The
+                # score is not changed until the reading is proven on live executors.
+                DiskHealthCheck(),
                 # DAH-2671 item 2a: non-fatal, observe-only CPU-count corroboration. Placed right
                 # after the GPU spec-check group (and before the rented short-circuit) so it reads
                 # advertised specs already populated by the scrape; it only reads over SSH, mutates
@@ -375,6 +381,8 @@ class PipelineFactory:
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
+                # DAH-2928: pure-data report on specs.disk_health, same place as in build_checks.
+                DiskHealthCheck(),
                 # DAH-2671 item 2a: read-only SSH corroboration, safe in dry run (mutates nothing).
                 CpuTruthCheck(),
                 # DAH-2734: specs arithmetic plus a read-only SSH reading — safe in dry run.
