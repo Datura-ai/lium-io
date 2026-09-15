@@ -101,6 +101,38 @@ sysbox_idmapped_report() {
         | tail -1 | awk '{print $NF}'
 }
 
+sysbox_runc_version() {
+    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.6.6" is one of the
+    # tab-indented lines after it (edition, version, commit, ...), so the first line is never the
+    # version. Prints the number; exit 1 when the binary is missing or prints no version.
+    sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep .
+}
+
+daemon_feature_state() {
+    # features.<$1> in /etc/docker/daemon.json for the diagnostics: true, false, "not set" (key
+    # absent or null), "no daemon.json", or "unreadable" when jq cannot parse the file or is not
+    # installed. Written with `if`, not jq's `//`: the alternative operator treats false like
+    # null, and false is the value this installer writes.
+    local file
+    file=$(host_path /etc/docker/daemon.json)
+    [ -r "$file" ] || { echo "no daemon.json"; return 0; }
+    jq -r --arg k "$1" '.features[$k] | if . == null then "not set" else tostring end' "$file" 2>/dev/null \
+        || echo "unreadable (invalid JSON, or jq missing)"
+}
+
+failure_diagnostics() {
+    # what a provider pastes into a ticket when the verify container did not start
+    echo "    Docker daemon:       $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
+    echo "    Kernel:              $(uname -r)"
+    echo "    ID-mapped mounts:    $(sysbox_idmapped_report | grep . || echo 'not reported by sysbox-mgr')"
+    echo "    NVIDIA driver:       $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo FAILED)"
+    echo "    /proc/driver/nvidia: $(ls /proc/driver/nvidia &>/dev/null && echo exists || echo MISSING)"
+    echo "    sysbox-runc:         $(sysbox_runc_version || echo 'not found')"
+    echo "    CDI specs:           $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo none)"
+    echo "    daemon.json cdi:     $(daemon_feature_state cdi)"
+    echo "    daemon.json time-ns: $(daemon_feature_state time-namespaces)"
+}
+
 abort_on_active_rentals() {
     # a rental blocks every path below, so check before anything that costs the node time or bandwidth
     docker ps --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
@@ -438,8 +470,7 @@ check_sysbox() {
             "$(self_cmd)   # re-applies the Docker 29 settings and re-verifies; then: journalctl -u sysbox-mgr --no-pager -n 20"
         return 1
     fi
-    # `sysbox-runc --version` prints its name on the first line and "version: 0.6.6" on the second
-    pf_pass "sysbox-runc $(sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep . || echo installed) runs a container."
+    pf_pass "sysbox-runc $(sysbox_runc_version || echo installed) runs a container."
 }
 
 preflight_summary() {
@@ -742,15 +773,7 @@ else
     echo ""
     fail "Verification FAILED. Diagnostics:"
     echo ""
-    echo "    Docker daemon:       $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
-    echo "    Kernel:              $(uname -r)"
-    echo "    ID-mapped mounts:    $(sysbox_idmapped_report | grep . || echo 'not reported by sysbox-mgr')"
-    echo "    NVIDIA driver:       $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo FAILED)"
-    echo "    /proc/driver/nvidia: $(ls /proc/driver/nvidia &>/dev/null && echo exists || echo MISSING)"
-    echo "    sysbox-runc:         $(sysbox-runc --version 2>/dev/null | head -1 || echo 'not found')"
-    echo "    CDI specs:           $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo none)"
-    echo "    daemon.json cdi:     $(jq -r '.features.cdi // "not set"' /etc/docker/daemon.json 2>/dev/null)"
-    echo "    daemon.json time-ns: $(jq -r '.features["time-namespaces"] | if . == null then "not set" else tostring end' /etc/docker/daemon.json 2>/dev/null)"
+    failure_diagnostics
     echo ""
     if docker_version_ge 29 5; then
         fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
