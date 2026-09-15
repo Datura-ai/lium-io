@@ -268,14 +268,15 @@ class Settings(BaseSettings):
     # connect; the direct-tcpip channel open on the executor runs inside the whole-call budget.
     LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
     # liumd phase 2 (DAH-2834): make the one call on the first pass only. The first pass is where
-    # the SSH round trips it saves are waited on (verification < 2 min); every cycle that makes the
-    # call risks a VerifyX past ≈ 110 s pushing it over the matmul's 120 s wall-clock cap, after
-    # which a PASSING matmul is re-run over SSH (`step_overtime`) — so scored cycles, with nothing
-    # to gain, take the SSH path without a `/version` round trip. On by default. "First pass" here
-    # is the caller's word (`ContextConfig.unscored`, the express lane's first verification) and
-    # does NOT need FIRST_PASS_FAST_PATH_ENABLED; that flag sizes the probes, and only with it on
-    # do the two GPU steps run side by side (max(45, 10) s instead of 55 s) — with it off the first
-    # pass's call is serial and full size, the same shape and overtime exposure as a scored cycle's.
+    # the SSH round trips it saves are waited on (verification < 2 min); a scored cycle's call would
+    # carry the full-size VerifyX alone (the matmul stays on SSH, `scored_ssh` in checks/local_verify)
+    # and cut a VerifyX the SSH path allows 600 s at the call's budget — so scored cycles, with
+    # nothing to gain, take the SSH path without a `/version` round trip. On by default. "First
+    # pass" here is the caller's word (`ContextConfig.unscored`, the express lane's first
+    # verification) and does NOT need FIRST_PASS_FAST_PATH_ENABLED; that flag sizes the probes and
+    # decides whether the matmul rides the call: with it on the two GPU steps run side by side
+    # (max(45, 10) s instead of 55 s); with it off the first pass's call is the scored shape,
+    # VerifyX alone, full size.
     # It DOES need EXPRESS_LANE_ENABLED: the express lane (`core/express_lane.py`) is the only caller
     # that passes `first_pass=True`; with it off and this flag on, `/verify` is never called.
     LOCAL_VERIFY_FIRST_PASS_ONLY: bool = Field(env="LOCAL_VERIFY_FIRST_PASS_ONLY", default=True)

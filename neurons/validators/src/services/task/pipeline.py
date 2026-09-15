@@ -118,7 +118,8 @@ class ContextConfig:
     # liumd phase 2: the caller's word alone — this is the executor's first, unscored verification
     # (the express lane, DAH-2958), whether or not FIRST_PASS_FAST_PATH_ENABLED sizes the probes.
     # The one-call `/verify` gate reads this, never `first_pass`: the saving is per cycle kind, not
-    # per probe size, and the two flags stay independent.
+    # per probe size. `first_pass` still decides what rides the call (the matmul only at first-pass
+    # sizes, `checks/local_verify._matmul_ssh_reason`), so the two flags are read at different points.
     unscored: bool = False
 
 
