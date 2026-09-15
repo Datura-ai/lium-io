@@ -29,13 +29,16 @@ is the hard gate — a cap that cannot be observed on the GPU does not exist.
 cap could not be fully applied, after undoing whatever it already capped or stored; the caller then
 REFUSES to start the PEARL filler (running the miner uncapped defeats the whole point).
 **Restore stays best-effort**: teardown must never be blocked by a power-limit hiccup; a record
-whose restore failed is kept and retried by the safety nets.
+whose restore failed is kept and retried by the safety nets. Restores and raises run several GPUs
+at a time (``POWER_LIMIT_SET_CONCURRENCY``): both sit between a customer's rent request and the
+container it waits for.
 Every power-limit change is logged via ``_m`` (so the fields reach the JSON/Loki output) with
 executor_id, gpu_uuid, watts before/after, and status.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shlex
@@ -70,6 +73,13 @@ STALE_CAP_GRACE_SECONDS = 30 * 60
 # Floor enforced by GpuPowerLimitCheck. Doubles as the raise trigger at rental start: a limit
 # below this can't be a legitimate miner setting (the check would zero-score it anyway).
 MIN_POWER_LIMIT_RATIO = 0.9
+# GPUs restored (or raised) at the same time. One verified set is three nvidia-smi round trips
+# (-pm 1, -pl, readback), about 1.8 s on a loaded host; done one GPU after another an 8-GPU PEARL
+# node spent ~15 s here inside the filler's delete, before the ContainerDeleted callback the
+# backend's 30 s preemption wait is for (Loki, 48 h to 15 Sep 2026: 8-GPU PEARL deletes p50
+# 27.7 s, 65 % over 25 s; 1-GPU 7.3 s). Each in-flight set holds one SSH channel; OpenSSH's
+# default MaxSessions is 10, so this stays under it with room for the caller's own channel.
+POWER_LIMIT_SET_CONCURRENCY = 8
 
 
 class GpuPowerRestoreRecord(BaseModel):
@@ -407,28 +417,36 @@ async def _restore_records(
     log_extra: dict[str, object] | None,
 ) -> int:
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
-    (a failed restore keeps it for the safety nets to retry). Returns the restored count."""
-    restored = 0
-    for record in records:
-        state = state_by_uuid.get(record.gpu_uuid)
-        watts_before = state.current_watts if state else None
-        changed = await _set_and_log_power_limit(
-            ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
-        )
-        if not changed:
-            continue
-        try:
-            await redis.delete(_restore_key(record.gpu_uuid))
-            restored += 1
-        except Exception as exc:
-            _log(
-                logging.ERROR,
-                f"gpu power restore: restored {record.gpu_uuid} but could not clear its record: {exc}; "
-                f"a duplicate restore may follow",
-                {"gpu_uuid": record.gpu_uuid},
-                log_extra,
+    (a failed restore keeps it for the safety nets to retry). Returns the restored count.
+
+    The records are restored side by side (``POWER_LIMIT_SET_CONCURRENCY`` at a time): each GPU is
+    its own device, and the delete that calls this holds the customer's rent until it answers."""
+    limit = asyncio.Semaphore(POWER_LIMIT_SET_CONCURRENCY)
+
+    async def restore_one(record: GpuPowerRestoreRecord) -> bool:
+        async with limit:
+            state = state_by_uuid.get(record.gpu_uuid)
+            watts_before = state.current_watts if state else None
+            changed = await _set_and_log_power_limit(
+                ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
             )
-    return restored
+            if not changed:
+                return False
+            try:
+                await redis.delete(_restore_key(record.gpu_uuid))
+                return True
+            except Exception as exc:
+                _log(
+                    logging.ERROR,
+                    f"gpu power restore: restored {record.gpu_uuid} but could not clear its record: {exc}; "
+                    "a duplicate restore may follow",
+                    {"gpu_uuid": record.gpu_uuid},
+                    log_extra,
+                )
+                return False
+
+    outcomes = await asyncio.gather(*(restore_one(record) for record in records))
+    return sum(1 for restored in outcomes if restored)
 
 
 async def restore_tracked_gpu_power_limits(
@@ -500,19 +518,27 @@ async def raise_low_power_limits_to_default(
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
     target_uuids: list[str] = gpu_uuids if gpu_uuids else list(state_by_uuid)
-    raised = 0
+    below_floor: list[tuple[str, int, int]] = []  # gpu_uuid, current watts, default watts
     for gpu_uuid in target_uuids:
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None:
             continue
         if state.current_watts >= MIN_POWER_LIMIT_RATIO * state.default_watts:
             continue
-        lifted = await _set_and_log_power_limit(
-            ssh, "raise", executor_id, gpu_uuid, state.current_watts, state.default_watts, log_extra
-        )
-        if lifted:
-            raised += 1
-    return raised
+        below_floor.append((gpu_uuid, state.current_watts, state.default_watts))
+    if not below_floor:
+        return 0
+    # Side by side, like the restore: this runs before the customer's `docker run`.
+    limit = asyncio.Semaphore(POWER_LIMIT_SET_CONCURRENCY)
+
+    async def raise_one(gpu_uuid: str, current_watts: int, default_watts: int) -> bool:
+        async with limit:
+            return await _set_and_log_power_limit(
+                ssh, "raise", executor_id, gpu_uuid, current_watts, default_watts, log_extra
+            )
+
+    outcomes = await asyncio.gather(*(raise_one(*target) for target in below_floor))
+    return sum(1 for lifted in outcomes if lifted)
 
 
 async def restore_filler_pod_gpu_power_limits(
