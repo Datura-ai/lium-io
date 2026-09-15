@@ -365,7 +365,8 @@ class Settings(BaseSettings):
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
     # P125: a RENTED node whose scrape lists fewer GPUs than it advertises (GPU_DETAILS_MISMATCH or
-    # GPU_COUNT_ZERO: a card fell off the bus) for RENTED_GPU_FAULT_CYCLES cycles in a row is
+    # GPU_MODEL_UNSUPPORTED with no card to name, count 0 / empty list: a card fell off the bus) on
+    # RENTED_GPU_FAULT_CYCLES consecutive scrapes within the streak's 60 min Redis TTL is
     # reported as RENTED_NODE_GPU_FAULT and its verified job is cleared, so the backend delists it
     # and notifies the renter. Below the threshold the cycle scores 0 as before. One cycle is
     # ~15 min, so 2 cycles is ~30 min. The count lives in Redis and a clean scrape resets it.

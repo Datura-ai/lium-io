@@ -30,10 +30,11 @@ class GpuModelValidCheck:
     when a miner advertises off-policy hardware.
 
     P125: on a RENTED node a short GPU list is a card off the bus under a renter's pod (F-1361:
-    8 advertised, 1 enumerated, the renter deleted a $1,023 rental himself and the node stayed
-    listed). After RENTED_GPU_FAULT_CYCLES such cycles in a row the result is RENTED_NODE_GPU_FAULT
+    8 advertised, 1 enumerated, the renter deleted a $988 rental himself 18 min later and the node
+    stayed listed). After RENTED_GPU_FAULT_CYCLES such scrapes within the streak's 60 min TTL (a
+    cycle that never reaches this check neither counts nor resets) the result is RENTED_NODE_GPU_FAULT
     and the verified job is cleared, which is the path the rental probe (DAH-3436) uses to delist a
-    node; the backend also notifies the renter and stamps the rental. Below the threshold, or on an
+    node; lium-platform#465 has the backend notify the renter and stamp the rental. Below the threshold, or on an
     idle node, the cycle scores 0 as it always did.
     """
 
@@ -79,8 +80,9 @@ class GpuModelValidCheck:
                     f"{', '.join(supported_models[:5])}{'...' if len(supported_models) > 5 else ''}"
                 ),
             )
-            if gpu_model is None:
-                # no card to name a model from (count 0 or an empty list): the same missing-GPU shape
+            if gpu_count == 0 or not gpu_details:
+                # no card to name a model from (count 0 or an empty list): the same missing-GPU shape.
+                # A full list whose first entry has no name is a scrape bug, not a missing card
                 return await self._rented_fault_or(ctx, event, gpu_count=gpu_count, details_len=len(gpu_details))
             return CheckResult(passed=False, event=event)
 
@@ -114,7 +116,7 @@ class GpuModelValidCheck:
     async def _rented_fault_or(
         self, ctx: Context, event: ValidationEvent, *, gpu_count: int, details_len: int
     ) -> CheckResult:
-        """The plain failure, or RENTED_NODE_GPU_FAULT once a rented node has failed enough cycles in a row."""
+        """The plain failure, or RENTED_NODE_GPU_FAULT once a rented node has failed enough consecutive scrapes."""
         plain = CheckResult(passed=False, event=event)
         pod_ids = _rented_pod_ids(ctx)
         if not pod_ids:
