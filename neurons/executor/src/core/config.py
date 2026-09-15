@@ -109,9 +109,7 @@ class Settings(BaseSettings):
     # Free space the docker root must keep after a pre-pull; least-recently-used
     # pre-pulled images are evicted first to stay above it.
     PRE_PULL_MIN_FREE_GB: int = Field(env="PRE_PULL_MIN_FREE_GB", default=200)
-    # A single pre-pull is cancelled past this and retried on a later sweep. A pull also has
-    # to end before the next refresh, so the loop caps this at CACHE_TEMPLATE_REFRESH_SECONDS
-    # minus its sweep margin and warns once at startup when the value cannot apply.
+    # A single pre-pull is cancelled past this and retried on a later sweep.
     PRE_PULL_TIMEOUT_SECONDS: int = Field(env="PRE_PULL_TIMEOUT_SECONDS", default=30 * 60)
     # Random delay before this node's first pre-pull, so a fleet-wide enable does not
     # send every executor to the registry at once.

@@ -16,13 +16,11 @@ digest-pinned, and only if
   pre-pulled images are evicted first to make room, nothing else is ever removed;
 * it finishes within ``PRE_PULL_TIMEOUT_SECONDS`` and before the next mandatory refresh
   is due: the start delay and the pull are both capped at the refresh deadline the loop
-  hands in, and a pull that would not fit waits for the next sweep. A timeout longer than
-  one refresh interval can therefore never apply; the loop caps it at startup and warns
-  once (``cache_template_service.pre_pull_timeout_for``). The loop starts the sweep as
-  its own task and never waits for it, so the default image's refresh runs on time even
-  when a sweep overruns (a silent pull stream, a slow eviction); while one sweep is still
-  running the next refresh does not start another, and the task is cancelled when the
-  loop ends, however it ends.
+  hands in, and a pull that would not fit waits for the next sweep. The loop starts the
+  sweep as its own task and never waits for it, so the default image's refresh runs on
+  time even when a sweep overruns (a silent pull stream, a slow eviction); while one
+  sweep is still running the next refresh does not start another, and the task is
+  cancelled when the loop ends, however it ends.
 
 One pull per sweep per node plus a random start delay keeps a fleet-wide enable from
 stampeding the registry. Every pull attempt ends in exactly one log line
@@ -82,10 +80,7 @@ def rental_activity(client: "docker.DockerClient") -> str | None:
     ``created`` is a rental starting. Exited/dead leftovers awaiting cleanup do not.
     """
     for container in client.containers.list(all=True):
-        if (container.name or "").startswith(RENTAL_CONTAINER_PREFIX) and container.status not in (
-            "exited",
-            "dead",
-        ):
+        if (container.name or "").startswith(RENTAL_CONTAINER_PREFIX) and container.status not in ("exited", "dead"):
             return f"rental container {container.name}"
     for proc in psutil.process_iter(["cmdline"]):
         if any(DOCKER_OVER_SSH_MARKER in part for part in (proc.info.get("cmdline") or [])):
@@ -124,9 +119,7 @@ class PrePullState:
             return None
         return min(
             candidates,
-            key=lambda ref: self.images[ref].get("last_used_at")
-            or self.images[ref].get("pulled_at")
-            or 0,
+            key=lambda ref: self.images[ref].get("last_used_at") or self.images[ref].get("pulled_at") or 0,
         )
 
     def flush(self) -> None:
@@ -211,22 +204,9 @@ def _pull_pinned(
 
 
 class PrePuller:
-    def __init__(
-        self,
-        client: "docker.DockerClient",
-        state_path: str | None = STATE_PATH,
-        pull_timeout_seconds: float | None = None,
-    ):
+    def __init__(self, client: "docker.DockerClient", state_path: str | None = STATE_PATH):
         self.client = client
         self.state = PrePullState(state_path)
-        # Budget of one pull. The loop passes ``PRE_PULL_TIMEOUT_SECONDS`` capped at what fits
-        # in one refresh interval (``cache_template_service.pre_pull_timeout_for``); ``None``
-        # is the raw setting, which only the tests use.
-        self.pull_timeout_seconds = float(
-            settings.PRE_PULL_TIMEOUT_SECONDS
-            if pull_timeout_seconds is None
-            else pull_timeout_seconds
-        )
         self._first_sweep = True
         # The mandatory refs (``repo:tag``) as of the loop's latest refresh. The loop writes it
         # every refresh, so a sweep still running from the previous one never evicts a ref that
@@ -255,9 +235,7 @@ class PrePuller:
         ``None`` means no cap, which only the tests use."""
         for image_ref in protected & self.state.images.keys():
             self.state.forget(image_ref)
-            logger.info(
-                f"pre-pull: {image_ref} is now a mandatory image; no longer tracked for eviction"
-            )
+            logger.info(f"pre-pull: {image_ref} is now a mandatory image; no longer tracked for eviction")
         if not entries:
             self.state.flush()
             return
@@ -283,11 +261,7 @@ class PrePuller:
         )
 
         for data in entries:
-            repo, tag, digest = (
-                data.get("docker_image"),
-                data.get("docker_image_tag"),
-                data.get("docker_image_digest"),
-            )
+            repo, tag, digest = data.get("docker_image"), data.get("docker_image_tag"), data.get("docker_image_digest")
             if not repo or not tag or not digest:
                 continue  # pre-pull is digest-pinned only
             image_ref = f"{repo}:{tag}"
@@ -314,7 +288,7 @@ class PrePuller:
             room, detail = await self._make_room(image_ref, int(size * ON_DISK_MULTIPLIER))
             # The budget is measured after eviction, which takes time of its own: the pull's
             # clock starts below, so this is what cuts it at the deadline.
-            budget = self.pull_timeout_seconds
+            budget = float(settings.PRE_PULL_TIMEOUT_SECONDS)
             if deadline is not None:
                 budget = max(0.0, min(budget, deadline - time.monotonic()))
                 if budget < MIN_PULL_BUDGET_SECONDS:
@@ -381,7 +355,5 @@ class PrePuller:
                 digest_ref = f"{victim.rpartition(':')[0]}@{digest}"
                 removed = await asyncio.to_thread(_remove_ref, self.client, digest_ref) and removed
             if removed:
-                logger.info(
-                    f"pre-pull: evicted {victim} (least recently used) to keep disk headroom"
-                )
+                logger.info(f"pre-pull: evicted {victim} (least recently used) to keep disk headroom")
                 self.state.forget(victim)
