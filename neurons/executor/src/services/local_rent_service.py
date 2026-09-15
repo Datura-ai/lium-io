@@ -32,6 +32,7 @@ injection, rm — those stay the validator's SSH execs (LIUMD_PHASE2 NEVER-repla
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import socket
@@ -117,7 +118,11 @@ def host_gateway_ip(route_table: str | None = None) -> str | None:
     """The default gateway of this container's network namespace (Linux `/proc/net/route`), which
     on a bridge is the host itself; None when not readable."""
     try:
-        text = route_table if route_table is not None else open(_HOST_GATEWAY_ROUTE).read()
+        if route_table is not None:
+            text = route_table
+        else:
+            with open(_HOST_GATEWAY_ROUTE) as fh:
+                text = fh.read()
     except OSError:
         return None
     for line in text.splitlines()[1:]:
@@ -655,6 +660,8 @@ async def _wait_ssh_banner(hosts: list[str], port: int, timeout_s: float) -> str
             head = b""
         finally:
             writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
         if head.startswith(b"SSH-"):
             return host
         await asyncio.sleep(min(SSH_POLL_INTERVAL_SECONDS, max(0.0, until - time.perf_counter())))
