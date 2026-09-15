@@ -173,10 +173,10 @@ class TenantEnforcementCheck:
 
         # DAH-3338: pod_id -> what this cycle saw of its container. A pod the loop never reached
         # (an earlier pod's verdict returned first, or the transport died) is reported unknown.
-        observed: dict[str, ContainerState] = {}
+        state_by_pod_id: dict[str, ContainerState] = {}
 
         def with_pod_states(result: CheckResult) -> CheckResult:
-            return _with_pod_states(result, ctx, rented_pods, observed)
+            return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
         for pod in rented_pods:
             pod_container_name = pod.container_name
@@ -195,10 +195,10 @@ class TenantEnforcementCheck:
                     )
                 )
             if pod_running:
-                observed[pod_id] = ContainerState.RUNNING
+                state_by_pod_id[pod_id] = ContainerState.RUNNING
             else:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
-                observed[pod_id] = _container_state_from_diagnostics(diagnostics)
+                state_by_pod_id[pod_id] = _container_state_from_diagnostics(diagnostics)
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
                     event = render_message(
@@ -238,7 +238,7 @@ class TenantEnforcementCheck:
                     local_volume_path=rental_active.local_volume_path if rental_active else None,
                     extra=extra,
                 )
-                observed[pod_id] = outcome.container_state
+                state_by_pod_id[pod_id] = outcome.container_state
                 if outcome.failure:
                     return with_pod_states(outcome.failure)
                 ssh_pub_keys = outcome.ssh_pub_keys
@@ -414,7 +414,7 @@ def _with_pod_states(
     result: CheckResult,
     ctx: Context,
     rented_pods: list[RentedPod],
-    observed: dict[str, ContainerState],
+    state_by_pod_id: dict[str, ContainerState],
 ) -> CheckResult:
     # DAH-3338: every verdict of the check carries one state per rented pod into ctx.state, on top
     # of what StaleContainerCleanupCheck reaped earlier in the cycle. A pod without an observation
@@ -425,7 +425,7 @@ def _with_pod_states(
         *(
             PodContainerState(
                 pod_id=pod.pod_id,
-                container_state=observed.get(pod.pod_id, ContainerState.UNKNOWN),
+                container_state=state_by_pod_id.get(pod.pod_id, ContainerState.UNKNOWN),
                 observed_at=observed_at,
             )
             for pod in rented_pods
