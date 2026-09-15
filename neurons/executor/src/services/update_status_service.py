@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Optional
+from typing import Any
 
 import docker
 import requests
@@ -48,14 +48,14 @@ _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PREVIOUS_RUNNER_NAME = re.compile(r"^.+-previous-[0-9a-f]+$")
 
 
-def digest_endpoint_url() -> Optional[str]:
+def digest_endpoint_url() -> str | None:
     base_url = settings.COMPUTE_REST_API_URL
     if not base_url:
         return None
     return f"{base_url.rstrip('/')}/watchtower/digest"
 
 
-def verify_signed_digest(payload: dict[str, Any], now: Optional[int] = None) -> str:
+def verify_signed_digest(payload: dict[str, Any], now: int | None = None) -> str:
     """Return the digest from a ``/watchtower/digest`` response after checking its signature.
 
     The validator signs ``"<digest>:<timestamp>"`` with its hotkey; the timestamp must be
@@ -87,12 +87,12 @@ class ExpectedDigestCache:
     """The signed runner digest, refreshed at most every ``ttl_seconds``."""
 
     ttl_seconds: float = EXPECTED_DIGEST_CACHE_SECONDS
-    _digest: Optional[str] = None
-    _error: Optional[str] = None
+    _digest: str | None = None
+    _error: str | None = None
     _fetched_at: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def get(self, now: Optional[float] = None) -> tuple[Optional[str], Optional[str]]:
+    def get(self, now: float | None = None) -> tuple[str | None, str | None]:
         """``(digest, error)``: the last good digest survives a failed refresh, with the error beside it."""
         if now is None:
             now = time.monotonic()
@@ -139,7 +139,7 @@ def find_runner_container(client: docker.DockerClient):
     return matches[0] if matches else None
 
 
-def container_image_digest(client: docker.DockerClient, container) -> Optional[str]:
+def container_image_digest(client: docker.DockerClient, container) -> str | None:
     """``sha256:…`` from the RepoDigests of the image a container runs, or None (local build)."""
     image_id = container.attrs.get("Image")
     if not image_id:
@@ -152,7 +152,7 @@ def container_image_digest(client: docker.DockerClient, container) -> Optional[s
     return None
 
 
-def own_container_id() -> Optional[str]:
+def own_container_id() -> str | None:
     """The executor's own container id: docker sets the hostname to it."""
     return os.environ.get("HOSTNAME") or socket.gethostname() or None
 
@@ -173,9 +173,9 @@ def collect_update_status(
     """
     expected_digest, expected_error = cache.get()
 
-    runner_digest: Optional[str] = None
-    runner_name: Optional[str] = None
-    executor_digest: Optional[str] = None
+    runner_digest: str | None = None
+    runner_name: str | None = None
+    executor_digest: str | None = None
     errors: list[str] = []
     try:
         client = client_factory()
@@ -196,7 +196,7 @@ def collect_update_status(
     if expected_error:
         errors.append(expected_error)
 
-    update_pending: Optional[bool] = None
+    update_pending: bool | None = None
     if runner_digest and expected_digest:
         update_pending = runner_digest != expected_digest
 
