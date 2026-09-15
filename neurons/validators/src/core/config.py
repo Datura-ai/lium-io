@@ -572,6 +572,15 @@ class Settings(BaseSettings):
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60,
         description="Max seconds to wait for the inner DinD dockerd to become ready.",
     )
+    CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS", default=180,
+        description=(
+            "Max seconds for each setup command before a custom build (sysbox preflight, DinD "
+            "start including its image pull, IP and resolver reads, the egress firewall helper, "
+            "the Dockerfile write; the readiness loop keeps CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS). "
+            "A command over the bound fails the build at its own step instead of leaving the pod PENDING."
+        ),
+    )
     CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS: str = Field(
         env="CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS",
         default="169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
