@@ -44,8 +44,9 @@ class DockerCommand:
 
     @staticmethod
     def remove_with_volumes(name: str) -> str:
-        """Build docker rm command that also removes anonymous volumes."""
-        return f"/usr/bin/docker rm -fv {name}"
+        """Build docker rm command that also removes anonymous volumes. The name is shell-quoted
+        here, so callers pass it bare."""
+        return f"/usr/bin/docker rm -fv {shlex.quote(name)}"
 
     @staticmethod
     def kill_container_processes(name: str) -> str:
@@ -83,6 +84,12 @@ class DockerCommand:
     def logs(container_id: str) -> str:
         """Build docker logs command."""
         return f"/usr/bin/docker logs {container_id} 2>&1 | head -20"
+
+    @staticmethod
+    def inspect_running(name: str) -> str:
+        """Build docker inspect for the running flag: `true` / `false` on stdout, exit 1 when the
+        container does not exist (stderr silenced so the exit status is the answer)."""
+        return f"/usr/bin/docker inspect {shlex.quote(name)} --format '{{{{.State.Running}}}}' 2>/dev/null"
 
     @staticmethod
     def inspect_exit_code(container_id: str) -> str:

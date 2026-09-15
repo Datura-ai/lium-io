@@ -1045,7 +1045,7 @@ async def _remove_over_shell(ctx: Context, *, container_name: str, volume_name: 
     try:
         removed = await asyncio.wait_for(
             ctx.ssh.run(
-                DockerCommand.remove_with_volumes(shlex.quote(container_name)), check=False
+                DockerCommand.remove_with_volumes(container_name), check=False
             ),
             timeout=_SHELL_COMMAND_TIMEOUT_SECONDS,
         )

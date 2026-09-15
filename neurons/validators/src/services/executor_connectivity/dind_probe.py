@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import asyncssh
@@ -25,6 +26,15 @@ logger = logging.getLogger(__name__)
 DIND_SSH_READY_TIMEOUT_SECONDS = 30
 DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
+# The liveness read on a prestarted container (`docker inspect` over the host SSH) after a failed
+# connect: bounded so it cannot stretch the probe past the ready timeout by itself.
+DIND_LIVENESS_READ_TIMEOUT_SECONDS = 5
+
+
+class DindContainerGone(Exception):
+    """liumd phase 2c/3: the prestarted container is no longer running on the host — a rental's
+    `wait_for_port_check_containers` force-removed it, or it exited — so no amount of waiting will
+    get sshd to answer. Raised instead of running the ready timeout down."""
 
 
 class DindVerifier:
@@ -66,8 +76,20 @@ class DindVerifier:
         try:
             logger.info(_m("DinD start", extra=get_extra_info({**log_ctx, "prestarted": prestarted is not None})))
 
+            still_running = None
             if prestarted is not None:
                 private_key = prestarted.private_key
+
+                async def still_running() -> bool:
+                    # Only read once a connection attempt has failed: a container that a rental
+                    # removed the moment it landed (DAH-2272) would otherwise cost the whole ready
+                    # timeout (30 s) before today's probe runs on a proven port. One `inspect`
+                    # (≈ 0.3 s) per failed attempt, never on the path of a container that answers.
+                    result = await asyncio.wait_for(
+                        ssh_client.run(DockerCommand.inspect_running(name)),
+                        timeout=DIND_LIVENESS_READ_TIMEOUT_SECONDS,
+                    )
+                    return result.exit_status == 0 and (result.stdout or "").strip() == "true"
             else:
                 private_key, public_key = self.ssh_service.generate_keypair()
                 cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
@@ -90,7 +112,7 @@ class DindVerifier:
             # Test SSH
             pkey = asyncssh.import_private_key(private_key)
             async with await self._connect_retrying_until_sshd_answers(
-                host, port, pkey, log_ctx
+                host, port, pkey, log_ctx, still_running=still_running
             ) as ssh:
                 # Test sysbox
                 if sysbox:
@@ -131,6 +153,17 @@ class DindVerifier:
                 port=port,
             )
 
+        except DindContainerGone as e:
+            # Not the host's failure: the container the validator was coming for was removed
+            # under it (a rental landing in the window). The orchestrator runs today's probe next.
+            logger.warning(_m("DinD prestart gone", extra=get_extra_info({**log_ctx, "error": str(e)})))
+            await ssh_client.run(DockerCommand.remove_with_volumes(name))
+            return DindProbeResult(
+                success=False,
+                log_text=f"dind: prestart gone port={port.internal}",
+                sysbox_runtime=sysbox,
+                port=port,
+            )
         except Exception as e:
             logger.error(
                 _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
@@ -150,8 +183,14 @@ class DindVerifier:
         port: PortPair,
         pkey: SSHKey,
         log_ctx: dict[str, Any],
+        still_running: Callable[[], Awaitable[bool]] | None = None,
     ) -> SSHClientConnection:
         """Connect to the freshly started DinD container, retrying until sshd answers.
+
+        `still_running` (an async callable, prestarted containers only): asked after a failed
+        attempt whether the container is still there; `False` raises `DindContainerGone` at once
+        instead of polling a removed container until the deadline. An error in the question itself
+        is not an answer — the poll goes on as before.
 
         The deadline caps the whole wait, not just the moment an attempt starts: a hanging
         attempt gets whatever is left of the budget rather than a fresh 12s on top of it, so a
@@ -185,6 +224,10 @@ class DindVerifier:
                 )
             except Exception as error:
                 last_error = error
+                if still_running is not None and await self._is_gone(still_running, log_ctx):
+                    raise DindContainerGone(
+                        f"prestarted DinD container is gone after {attempts} attempt(s): {error}"
+                    ) from error
                 if loop.time() + DIND_SSH_POLL_INTERVAL_SECONDS >= deadline:
                     break
                 await asyncio.sleep(DIND_SSH_POLL_INTERVAL_SECONDS)
@@ -217,6 +260,14 @@ class DindVerifier:
             )
         )
         raise last_error
+
+    @staticmethod
+    async def _is_gone(still_running: Callable[[], Awaitable[bool]], log_ctx: dict[str, Any]) -> bool:
+        try:
+            return not await still_running()
+        except Exception as error:  # noqa: BLE001 — an unreadable host is not "gone"; keep polling
+            logger.info(_m("DinD liveness read failed; polling on", extra=get_extra_info({**log_ctx, "error": str(error)})))
+            return False
 
 
 class DindProbe:

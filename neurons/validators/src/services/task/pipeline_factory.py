@@ -48,6 +48,7 @@ from .checks import (
     InspectorRentedCheck,
     LocalFactsCheck,
     LocalVerifyCheck,
+    LocalVerifyStartCheck,
     MachineSpecScrapeCheck,
     NvmlDigestCheck,
     PortConnectivityCheck,
@@ -307,6 +308,11 @@ class PipelineFactory:
                 # liumd phase 2 (DAH-2834): one facts-only POST /verify (≈ 1 s, no GPU work) for
                 # the two checks after it and the inspector pre-check (`local_verify_facts`).
                 LocalFactsCheck(),
+                # liumd phase 3 (DAH-2834): the GPU `/verify` leaves NOW as a background task — the
+                # same intent LocalVerifyCheck below would send, judged there — so the executor's
+                # first-pass GPU work overlaps the port check's remaining round trips instead of
+                # following them. Off by default; a halt before the judge cancels it (Pipeline.run).
+                LocalVerifyStartCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
                 # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
                 # platform deliberately does not tear down) keeps binding the rental port range.
