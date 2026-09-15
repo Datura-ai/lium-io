@@ -269,12 +269,13 @@ class Settings(BaseSettings):
     LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
     # liumd phase 2 (DAH-2834): make the one call on the first pass only. The first pass is where
     # the SSH round trips it saves are waited on (verification < 2 min); a scored cycle's call would
-    # carry the full-size VerifyX alone (the matmul stays on SSH, `scored_ssh` in checks/local_verify)
-    # and cut a VerifyX the SSH path allows 600 s at the call's budget — so scored cycles, with
-    # nothing to gain, take the SSH path without a `/version` round trip. On by default. "First
-    # pass" here is the caller's word (`ContextConfig.unscored`, the express lane's first
-    # verification) and does NOT need FIRST_PASS_FAST_PATH_ENABLED; that flag sizes the probes and
-    # decides whether the matmul rides the call: with it on the two GPU steps run side by side
+    # carry the full-size VerifyX alone with VerifyX on (the matmul stays on SSH, `scored_ssh` in
+    # checks/local_verify; with VerifyX off the matmul rides the call alone) and cut a VerifyX the
+    # SSH path allows 600 s at the call's budget — so scored cycles, with nothing to gain, take the
+    # SSH path without a `/version` round trip. On by default. "First pass" here is the caller's
+    # word (`ContextConfig.unscored`, the express lane's first verification) and does NOT need
+    # FIRST_PASS_FAST_PATH_ENABLED; that flag sizes the probes and, with VerifyX on, decides
+    # whether the matmul rides the call: with it on the two GPU steps run side by side
     # (max(45, 10) s instead of 55 s); with it off the first pass's call is the scored shape,
     # VerifyX alone, full size.
     # It DOES need EXPRESS_LANE_ENABLED: the express lane (`core/express_lane.py`) is the only caller

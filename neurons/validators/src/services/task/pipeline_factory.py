@@ -164,9 +164,11 @@ class PipelineFactory:
             tdx_attestation_passed: Whether TDX attestation passed
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
             first_pass: the executor's first, unscored verification (DAH-3011). Sizes the probes
-                and puts the matmul in the one call only with settings.FIRST_PASS_FAST_PATH_ENABLED;
-                as `ContextConfig.unscored` it also gates the one-call `/verify` path
-                (LOCAL_VERIFY_FIRST_PASS_ONLY), whatever FIRST_PASS_FAST_PATH_ENABLED says.
+                and, with VerifyX on, puts the matmul in the one call only with
+                settings.FIRST_PASS_FAST_PATH_ENABLED (with VerifyX off the matmul rides the call
+                alone on any cycle, `_matmul_ssh_reason`); as `ContextConfig.unscored` it also
+                gates the one-call `/verify` path (LOCAL_VERIFY_FIRST_PASS_ONLY), whatever
+                FIRST_PASS_FAST_PATH_ENABLED says.
 
         Returns:
             Configured Context ready for pipeline execution
