@@ -18,6 +18,8 @@ from watchtower import (
     RunnerLookupError,
     container_create_kwargs,
     find_runner_container,
+    is_previous_runner_name,
+    previous_runner_name,
     fetch_verified_digest,
     verify_watchtower_signature,
     find_container_by_name,
@@ -289,12 +291,13 @@ def _fake_image(digest: str, cmd=None, entrypoint=None):
     return image
 
 
-def _fake_container(name="executor-executor-runner-1", cmd=None, entrypoint=None):
+def _fake_container(name="executor-executor-runner-1", cmd=None, entrypoint=None, status="running", container_id=None):
     """The standard stack's runner: compose labels, `.env` bind, `unless-stopped`, one network."""
     container = Mock()
     container.name = name
-    container.id = "0123456789abcdef" * 4
+    container.id = container_id or "0123456789abcdef" * 4
     container.short_id = container.id[:12]
+    container.status = status
     container.attrs = {
         "Id": container.id,
         "Name": f"/{name}",
@@ -405,9 +408,9 @@ def test_find_runner_container_finds_the_compose_service_by_label():
     client = _client_with(runner)
 
     assert find_runner_container(client) is runner
-    client.containers.list.assert_called_once_with(
-        all=True, filters={"label": "com.docker.compose.service=executor-runner"}
-    )
+    assert client.containers.list.call_args_list[0].kwargs == {
+        "all": True, "filters": {"label": "com.docker.compose.service=executor-runner"}
+    }
 
 
 def test_find_runner_container_raises_when_the_label_is_ambiguous():
@@ -429,6 +432,124 @@ def test_find_runner_container_raises_when_listing_fails():
 
     with pytest.raises(RunnerLookupError):
         find_runner_container(client)
+
+
+def _leftover(runner, status="exited"):
+    """The old runner as `recreate_container` leaves it when it dies between the rename and the remove."""
+    return _fake_container(
+        name=previous_runner_name(runner.name, "fedcba987654"),
+        status=status,
+        container_id="fedcba9876543210" * 4,
+    )
+
+
+def test_find_runner_container_skips_and_removes_a_leftover_previous_container():
+    """Regression (taiberium, #1359): `recreate_container` died between renaming the old runner
+    to `<name>-previous-<id>` and removing it. The leftover keeps the compose service label, so
+    the lookup saw two runners and raised on every cycle: the node never updated again. The
+    leftover is recognised by its name, removed (the step the interrupted update did not reach)
+    and the runner under the real name is returned."""
+    runner = _fake_container()
+    leftover = _leftover(runner)
+    client = _client_with(runner)
+    client.containers.list.return_value = [leftover, runner]
+
+    assert find_runner_container(client) is runner
+    leftover.remove.assert_called_once_with(force=True)
+    runner.remove.assert_not_called()
+
+
+def test_find_runner_container_finishes_the_switch_beside_a_runner_that_was_never_started():
+    """Regression: the update died between `create_container` and `start`. The runner under the
+    real name is `created` with the signed digest, so the digest check would say "up to date" on
+    every cycle while nothing runs (or only the leftover does). The lookup finishes the switch:
+    starts the runner, removes the leftover."""
+    runner = _fake_container(status="created")
+    leftover = _leftover(runner, status="running")
+    client = _client_with(runner)
+    client.containers.list.return_value = [runner, leftover]
+
+    assert find_runner_container(client) is runner
+    runner.start.assert_called_once_with()
+    leftover.remove.assert_called_once_with(force=True)
+
+
+def test_find_runner_container_keeps_both_when_the_stopped_runner_cannot_start():
+    """The runner under the real name does not start (a port taken, a broken image), so the
+    leftover may be the only working copy: nothing is removed, the runner is still returned, and
+    the cycle goes on instead of raising for ever."""
+    runner = _fake_container(status="exited")
+    runner.start.side_effect = docker.errors.APIError("port is already allocated")
+    leftover = _leftover(runner, status="running")
+    client = _client_with(runner)
+    client.containers.list.return_value = [runner, leftover]
+
+    assert find_runner_container(client) is runner
+    leftover.remove.assert_not_called()
+
+
+def test_find_runner_container_finds_the_cvm_leftover_by_name():
+    """The CVM runner `executor-runner` carries no compose label, so its leftover is not in the
+    label listing. Without the name listing the lookup answered None and a second runner was
+    created beside the leftover. It is found by name, renamed back and returned."""
+    cvm = _fake_container(name="executor-runner")
+    leftover = _leftover(cvm, status="running")
+    client = _client_with(None)
+    client.containers.list.side_effect = lambda all, filters: [leftover] if "name" in filters else []
+
+    assert find_runner_container(client) is leftover
+    leftover.rename.assert_called_once_with("executor-runner")
+    client.containers.run.assert_not_called()
+
+
+def test_find_runner_container_still_returns_the_runner_when_the_leftover_cannot_be_removed():
+    """A daemon error on the remove does not turn into "no runner" or a raise: the runner is
+    returned and the remove is retried on the next cycle."""
+    runner = _fake_container()
+    leftover = _leftover(runner)
+    leftover.remove.side_effect = docker.errors.APIError("device busy")
+    client = _client_with(runner)
+    client.containers.list.return_value = [runner, leftover]
+
+    assert find_runner_container(client) is runner
+
+
+def test_find_runner_container_restores_a_lone_leftover():
+    """`recreate_container` died after the rename and before the create (or the create failed
+    and the rename back failed): the leftover is the only runner on the host. It gets its name
+    back and is returned, so the next update recreates it under the compose name."""
+    runner = _fake_container()
+    leftover = _leftover(runner, status="running")
+    client = _client_with(None)
+    client.containers.list.return_value = [leftover]
+
+    assert find_runner_container(client) is leftover
+    leftover.rename.assert_called_once_with("executor-executor-runner-1")
+    leftover.remove.assert_not_called()
+
+
+def test_find_runner_container_raises_when_only_leftovers_remain():
+    """Two leftovers and no runner: which one to restore is a person's call. (Two label matches
+    raised before this change too; the test pins that the leftover branch keeps raising here.)"""
+    runner = _fake_container()
+    first = _leftover(runner)
+    second = _fake_container(name=previous_runner_name(runner.name, "0123456789ab"), status="exited", container_id="a" * 64)
+    client = _client_with(None)
+    client.containers.list.return_value = [first, second]
+
+    with pytest.raises(RunnerLookupError):
+        find_runner_container(client)
+    first.remove.assert_not_called()
+    second.remove.assert_not_called()
+
+
+def test_previous_runner_name_is_what_the_lookup_recognises():
+    """Pins the two sides of the suffix to each other: a rename in `recreate_container` that the
+    lookup does not recognise brings the stuck cycle back."""
+    assert is_previous_runner_name(previous_runner_name("executor-executor-runner-1", "a41fe4ee0a94"))
+    assert not is_previous_runner_name("executor-executor-runner-1")
+    assert not is_previous_runner_name("other-executor-runner-1")
+    assert not is_previous_runner_name("executor-runner-previous-build")
 
 
 # ── container_create_kwargs / recreate_container ─────────────────────────────
@@ -652,6 +773,31 @@ def test_check_and_update_pulls_nothing_when_the_runner_is_not_identified(mock_s
 
     mock_fetch.assert_not_called()
     mock_pull.assert_not_called()
+
+
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_goes_on_when_a_leftover_previous_container_sits_beside_the_runner(
+    mock_settings, mock_docker, mock_fetch, mock_pull
+):
+    """Regression (taiberium, #1359): the listing holds the runner and a `-previous-` leftover
+    of an interrupted update. The cycle used to end at the lookup on every run; now the
+    leftover goes, the runner's digest is compared and the update runs."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    runner = _fake_container()
+    leftover = _leftover(runner)
+    client = _client_with(runner)
+    client.containers.list.return_value = [leftover, runner]
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
+    mock_pull.return_value = True
+
+    check_and_update()
+
+    leftover.remove.assert_called_once_with(force=True)
+    mock_pull.assert_called_once_with(client, IMAGE, NEW_DIGEST)
 
 
 @patch('watchtower.pull_and_restart_containers')

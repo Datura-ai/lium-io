@@ -231,10 +231,28 @@ def test_collect_update_status_names_an_ambiguous_runner_label():
     client = _client()
     client.containers.list.side_effect = lambda all, filters: [
         _container("executor-executor-runner-1", "sha256:a"),
-        _container("executor-executor-runner-1-previous-abc", "sha256:b"),
+        _container("other-executor-runner-1", "sha256:b"),
     ]
 
     status = _status(client, _cache(digest=NEW_DIGEST))
 
     assert status["runner"]["update_pending"] is None
     assert status["runner"]["error"] == "RunnerLookupError: 2 containers carry com.docker.compose.service=executor-runner"
+
+
+def test_collect_update_status_skips_a_leftover_previous_runner():
+    """Regression (taiberium, #1359): the updater's `-previous-<id>` leftover of an interrupted update
+    keeps the runner label. It read as a second runner, so the report said `update_pending: null` on
+    every poll while the runbook promises `false` once the node is current. The leftover is skipped and
+    the runner under the real name is reported."""
+    client = _client(images={"sha256:runnerimage": [f"{RUNNER_IMAGE}@{NEW_DIGEST}"]})
+    client.containers.list.side_effect = lambda all, filters: [
+        _container("executor-executor-runner-1-previous-a41fe4ee0a94", "sha256:oldimage"),
+        _container("executor-executor-runner-1", "sha256:runnerimage"),
+    ]
+
+    status = _status(client, _cache(digest=NEW_DIGEST))
+
+    assert status["runner"]["error"] is None
+    assert status["runner"]["update_pending"] is False
+    assert status["runner"]["container"] == "executor-executor-runner-1"
