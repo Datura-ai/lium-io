@@ -314,6 +314,15 @@ def test_foreign_mount_parser_passes_the_container_runtime_layout_and_flags_the_
     ) == ["/proc/driver/nvidia/gpus/0001:00:00.0 tmpfs"]
 
 
+def test_a_real_nodes_stat_rows_are_not_a_finding():
+    """Staging, 15 Sep: procfs reports size 0 for the card's `information` node, so `stat -c %F`
+    answers "regular empty file" on every containerised executor. The earlier rule read that as an
+    overlay, withheld the kernel list on every honest node, and would have failed them all when
+    enforcement is on."""
+    rows = "\n".join([f"{INFO_FILE} proc", f"{INFO_FILE}|regular empty file"])
+    assert nvidia_devices.foreign_mounts_over_proc_nvidia_gpus("\n".join(CONTAINER_MOUNTS), rows) == []
+
+
 @pytest.mark.asyncio
 async def test_kernel_list_read_through_an_overlay_is_not_trusted_and_fails_when_enforcing(
     context_factory, enforcing
