@@ -25,6 +25,7 @@ from neurons.validators.src.services.task.checks.rental_verification import (
     rental_probe_request,
 )
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as RentalMsg
+from neurons.validators.src.services.task import pipeline as pipeline_module
 from neurons.validators.src.services.task.pipeline import CheckResult, LoggerSink, Pipeline
 from protocol.vc_protocol.compute_requests import (
     ExecutorHealthCheckResponse,
@@ -554,6 +555,49 @@ async def test_a_finished_but_unconsumed_probe_is_retrieved_not_cancelled(
     assert lines[-1]["reason"] == "unconsumed_done"
     assert lines[-1]["health_checks_removed"] == 0  # the fake cleanup's answer, awaited once
     ctx.services.container_cleanup.force_remove_health_checks.assert_awaited_once()
+
+
+async def _hang(*_args, **_kwargs):
+    await asyncio.sleep(30)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cleanup_effect, recorded",
+    [
+        pytest.param(RuntimeError("ssh gone"), "error: RuntimeError", id="raises"),
+        pytest.param(_hang, "error: TimeoutError", id="hangs"),
+    ],
+)
+async def test_a_halt_whose_probe_cleanup_fails_still_ends_the_pipeline(
+    keypair, monkeypatch, probe_on, verifyx_service, cleanup_effect, recorded
+):
+    """The settle step's two error branches: the force-remove raises (the SSH session is gone with
+    the halt) or never answers (a hung connection). Either way the pipeline's own result stands,
+    the outcome line records the failure in `health_checks_removed`, and the hung one is cut at
+    the cleanup timeout instead of holding the cancelled pipeline open."""
+    monkeypatch.setattr(pipeline_module, "UNCONSUMED_PROBE_CLEANUP_TIMEOUT_S", 0.05)
+    cleanup = AsyncMock(side_effect=cleanup_effect)  # built per run, not at collection time
+    backend = backend_with(sleep=5.0)
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        ctx = probe_context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service, backend=backend
+        )
+        ctx.services.container_cleanup.force_remove_health_checks = cleanup
+        pipeline = Pipeline(
+            [LocalVerifyCheck(client_factory=client_factory(keypair)), _Fatal(), RentalVerificationCheck()],
+            sink=LoggerSink(MagicMock()),
+        )
+        with patch("neurons.validators.src.services.task.pipeline.logger") as log:
+            started = time.perf_counter()
+            ok, events, final_ctx = await pipeline.run(ctx)
+            assert time.perf_counter() - started < 1.0
+    assert ok is False and [e.check_id for e in events] == ["executor.local_verify", "test.fatal"]
+    assert final_ctx.state.local_verify.rental_probe.consumed
+    cleanup.assert_awaited_once_with(ctx.ssh, ctx.executor.uuid)
+    lines = [c.args[0].extra for c in log.info.call_args_list if str(c.args[0]) == "[local_verify] outcome"]
+    assert [(l["reason"], l["health_checks_removed"]) for l in lines] == [("unconsumed_cancelled", recorded)]
 
 
 @pytest.mark.asyncio

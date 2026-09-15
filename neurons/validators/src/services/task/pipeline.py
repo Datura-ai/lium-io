@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 # The one `[local_verify] outcome` line every phase-2 probe reading writes (`step=rental_probe`);
 # Loki counts by (outcome, reason). The checks import it from here.
 RENTAL_PROBE_OUTCOME_EVENT = "[local_verify] outcome"
+
+# The force-remove of an unconsumed probe's `health_check_*` pod runs over the pipeline's SSH
+# session after the pipeline already ended; a hung connection must not keep it alive past that.
+UNCONSUMED_PROBE_CLEANUP_TIMEOUT_S = 15
 
 
 @runtime_checkable
@@ -376,13 +381,14 @@ async def _settle_background_work(ctx: Context) -> None:
         reason = await probe.cancel_and_await()
     except Exception as exc:  # noqa: BLE001 — cleanup must not replace the pipeline's own result
         reason = f"settle_error: {type(exc).__name__}"
-    removed: int | str
+    health_checks_removed: int | str
     try:
-        removed = await ctx.services.container_cleanup.force_remove_health_checks(
-            ctx.ssh, ctx.executor.uuid
+        health_checks_removed = await asyncio.wait_for(
+            ctx.services.container_cleanup.force_remove_health_checks(ctx.ssh, ctx.executor.uuid),
+            UNCONSUMED_PROBE_CLEANUP_TIMEOUT_S,
         )
     except Exception as exc:  # noqa: BLE001 — same: the pipeline's own result stands
-        removed = f"error: {type(exc).__name__}"
+        health_checks_removed = f"error: {type(exc).__name__}"
     logger.info(
         _m(
             RENTAL_PROBE_OUTCOME_EVENT,
@@ -392,7 +398,7 @@ async def _settle_background_work(ctx: Context) -> None:
                     "outcome": "fallback",
                     "step": "rental_probe",
                     "reason": f"unconsumed_{reason}",
-                    "health_checks_removed": removed,
+                    "health_checks_removed": health_checks_removed,
                     "first_pass": ctx.config.first_pass,
                 }
             ),

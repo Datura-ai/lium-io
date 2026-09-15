@@ -59,14 +59,16 @@ from core.utils import _m, get_extra_info
 
 from ..messages import LocalVerifyMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import RENTAL_PROBE_OUTCOME_EVENT, CheckResult, Context
 from .capability import _get_filler_only_container
 from .rental_verification import RentalProbe, rental_probe_request
 from .verifyx import _first_pass_challenge_config
 
 logger = logging.getLogger(__name__)
 
-LOCAL_VERIFY_OUTCOME_EVENT = "[local_verify] outcome"
+# One event name for every reading of the call, GPU steps and rental probe alike, so Loki counts
+# them together; `pipeline.py` owns the string.
+LOCAL_VERIFY_OUTCOME_EVENT = RENTAL_PROBE_OUTCOME_EVENT
 
 
 def _step_reason(step) -> str:
