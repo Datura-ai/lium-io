@@ -123,9 +123,8 @@ def _one_loop_iteration(
         seen["protected_at_ensure"].append(getattr(pullers[0], "protected", None) if pullers else None)
 
     class FakePuller:
-        def __init__(self, client, state_path=None, pull_timeout_seconds=None):
+        def __init__(self, client, state_path=None):
             seen["pullers"] += 1
-            seen["pull_timeout"] = pull_timeout_seconds
             pullers.append(self)
 
         async def sweep(self, entries, protected=frozenset(), deadline=None):
@@ -145,9 +144,9 @@ def _one_loop_iteration(
     if puller is not None:
         real_init = puller.__init__
 
-        def init(self, client, state_path=None, pull_timeout_seconds=None):
+        def init(self, client, state_path=None):
             pullers.append(self)
-            real_init(self, client, state_path, pull_timeout_seconds)
+            real_init(self, client, state_path)
 
         puller.__init__ = init
     monkeypatch.setattr(cache_template_service, "PrePuller", puller or FakePuller)
@@ -218,7 +217,7 @@ def test_a_sweep_that_never_returns_does_not_delay_the_next_refresh(monkeypatch,
     pullers: list = []
 
     class HangingPuller:
-        def __init__(self, client, state_path=None, pull_timeout_seconds=None):
+        def __init__(self, client, state_path=None):
             pullers.append(self)
 
         async def sweep(self, entries, protected=frozenset(), deadline=None):
@@ -253,7 +252,7 @@ def test_cancelling_the_loop_cancels_a_running_sweep(monkeypatch):
     sweep_saw: list[str] = []
 
     class HangingPuller:
-        def __init__(self, client, state_path=None, pull_timeout_seconds=None):
+        def __init__(self, client, state_path=None):
             pass
 
         async def sweep(self, entries, protected=frozenset(), deadline=None):
@@ -297,7 +296,7 @@ def test_the_sweep_is_cancelled_however_the_loop_ends(monkeypatch):
         pass
 
     class HangingPuller:
-        def __init__(self, client, state_path=None, pull_timeout_seconds=None):
+        def __init__(self, client, state_path=None):
             pass
 
         async def sweep(self, entries, protected=frozenset(), deadline=None):
@@ -325,57 +324,6 @@ def test_the_sweep_is_cancelled_however_the_loop_ends(monkeypatch):
         puller=HangingPuller,
         stop_with=Quit,
     )
-
-
-def test_pull_timeout_is_capped_at_the_refresh_interval_with_one_warning_at_startup(monkeypatch, caplog):
-    # r149 follow-up: the pull budget is min(PRE_PULL_TIMEOUT_SECONDS, time to the sweep deadline),
-    # so the default 1800 under the default 900 s refresh never applied and nothing said so
-    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
-    monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
-    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TIMEOUT_SECONDS", 1800)
-    caplog.set_level(logging.WARNING)
-
-    seen = _one_loop_iteration(
-        monkeypatch,
-        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
-        iterations=3,
-    )
-
-    assert seen["pull_timeout"] == 900 - cache_template_service.SWEEP_DEADLINE_MARGIN_SECONDS == 810.0
-    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1, warnings  # three refreshes, one warning: at startup
-    assert "PRE_PULL_TIMEOUT_SECONDS=1800" in warnings[0] and "gets 810s" in warnings[0]
-
-
-def test_a_pull_timeout_that_fits_the_refresh_interval_is_kept_without_a_warning(monkeypatch, caplog):
-    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
-    monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
-    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TIMEOUT_SECONDS", 600)
-    caplog.set_level(logging.WARNING)
-
-    seen = _one_loop_iteration(
-        monkeypatch,
-        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
-    )
-
-    assert seen["pull_timeout"] == 600.0
-    assert [r.message for r in caplog.records if r.levelno == logging.WARNING] == []
-
-
-def test_a_refresh_interval_too_short_for_any_pull_is_warned_at_startup(monkeypatch, caplog):
-    # under MIN_PULL_BUDGET_SECONDS per sweep every pull is deferred to "the next sweep" forever
-    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
-    monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 120)
-    caplog.set_level(logging.WARNING)
-
-    _one_loop_iteration(
-        monkeypatch,
-        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
-    )
-
-    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1 and warnings[0].startswith("pre-pull can never run: CACHE_TEMPLATE_REFRESH_SECONDS=120")
-    assert "30s per sweep" in warnings[0] and "60s minimum" in warnings[0]
 
 
 def test_a_pre_pull_entry_that_is_the_default_image_never_reaches_the_puller(monkeypatch):
@@ -406,7 +354,7 @@ def test_state_is_published_before_the_sweep_can_block(monkeypatch):
         return real_flush(self)
 
     class Puller:
-        def __init__(self, client, state_path=None, pull_timeout_seconds=None):
+        def __init__(self, client, state_path=None):
             pass
 
         async def sweep(self, entries, protected=frozenset(), deadline=None):
@@ -803,18 +751,6 @@ def test_pull_budget_stays_the_per_image_timeout_when_the_deadline_is_far(quiet_
     asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], deadline=1000.0 + 3600.0))
 
     assert [pull[3] for pull in quiet_node] == [1800.0]
-
-
-def test_the_pull_budget_is_the_timeout_the_loop_handed_in_not_the_raw_setting(quiet_node, monkeypatch):
-    # r149 follow-up: the loop passes PRE_PULL_TIMEOUT_SECONDS capped at the refresh interval;
-    # a sweep that read the setting itself would quietly undo the cap
-    monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_TIMEOUT_SECONDS", 1800)
-    monkeypatch.setattr(pre_pull_service, "time", SimpleNamespace(monotonic=lambda: 1000.0, time=time.time))
-    puller = PrePuller(_client(), state_path=None, pull_timeout_seconds=810.0)
-
-    asyncio.run(puller.sweep([_entry(REPO, CU128_TAG, DIGEST_CU128)], deadline=1000.0 + 3600.0))
-
-    assert [pull[3] for pull in quiet_node] == [810.0]
 
 
 def test_start_jitter_never_runs_past_the_refresh_deadline(quiet_node, monkeypatch):

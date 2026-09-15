@@ -28,11 +28,7 @@ import pynvml
 from core.config import settings
 from core.logger import get_logger
 from services.cache_prefetch_state import STATE_PATH, CachePrefetchState, Outcome
-from services.pre_pull_service import (
-    MIN_PULL_BUDGET_SECONDS,
-    STREAM_READ_TIMEOUT_SECONDS,
-    PrePuller,
-)
+from services.pre_pull_service import STREAM_READ_TIMEOUT_SECONDS, PrePuller
 from services.pull_lock import cache_pull_lock
 
 logger = get_logger(__name__)
@@ -47,33 +43,6 @@ ERROR_INTERVAL_SECONDS = 5 * 60
 SWEEP_DEADLINE_MARGIN_SECONDS = STREAM_READ_TIMEOUT_SECONDS + 30
 
 DEFAULT_DOCKER_IMAGE_PATH = "/executors/default-docker-image"
-
-
-def pre_pull_timeout_for(refresh_interval: float, configured: float) -> tuple[float, str | None]:
-    """The pull budget one sweep can honour, and the warning to log once when it is not the setting.
-
-    A sweep's budget ends ``SWEEP_DEADLINE_MARGIN_SECONDS`` before the next refresh, so a
-    ``PRE_PULL_TIMEOUT_SECONDS`` (``configured``) above ``refresh_interval`` minus that margin
-    never applies: the default 1800 s under the default 900 s refresh is really 810 s. Saying
-    so at startup beats reading it off ``outcome=timeout`` lines. A refresh interval that
-    leaves less than ``MIN_PULL_BUDGET_SECONDS`` per sweep defers every pull forever; that is
-    the other warning.
-    """
-    cap = max(float(refresh_interval - SWEEP_DEADLINE_MARGIN_SECONDS), 0.0)
-    configured = float(configured)
-    if cap < MIN_PULL_BUDGET_SECONDS:
-        return cap, (
-            f"pre-pull can never run: CACHE_TEMPLATE_REFRESH_SECONDS={refresh_interval:.0f} leaves "
-            f"{cap:.0f}s per sweep after the {SWEEP_DEADLINE_MARGIN_SECONDS}s margin, under the "
-            f"{MIN_PULL_BUDGET_SECONDS}s minimum a pull needs; raise CACHE_TEMPLATE_REFRESH_SECONDS"
-        )
-    if configured > cap:
-        return cap, (
-            f"PRE_PULL_TIMEOUT_SECONDS={configured:.0f} does not fit one refresh interval; a pre-pull "
-            f"gets {cap:.0f}s (CACHE_TEMPLATE_REFRESH_SECONDS={refresh_interval:.0f} minus the "
-            f"{SWEEP_DEADLINE_MARGIN_SECONDS}s margin)"
-        )
-    return configured, None
 
 
 def _get_gpu_info() -> tuple[str, str, str | None]:
@@ -307,7 +276,9 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
     )
 
     if not base_url:
-        logger.warning("COMPUTE_REST_API_URL not set; cache template pre-pull disabled")
+        logger.warning(
+            "COMPUTE_REST_API_URL not set; cache template pre-pull disabled"
+        )
         state.record_loop_outcome(Outcome.PREFETCH_DISABLED_NO_BACKEND_URL)
         state.flush()
         return
@@ -329,14 +300,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
 
     # DAH-2977: off by default. When on, the backend is asked for the top-N official
     # templates too (`pre_pull: true` entries) and PrePuller warms one per sweep while idle.
-    pre_puller: PrePuller | None = None
-    if settings.PRE_PULL_TEMPLATES_ENABLED:
-        pull_timeout, timeout_warning = pre_pull_timeout_for(
-            refresh_interval, settings.PRE_PULL_TIMEOUT_SECONDS
-        )
-        if timeout_warning:
-            logger.warning(timeout_warning)  # once, here; the sweeps stay quiet about it
-        pre_puller = PrePuller(client, pull_timeout_seconds=pull_timeout)
+    pre_puller = PrePuller(client) if settings.PRE_PULL_TEMPLATES_ENABLED else None
     # The sweep in flight, if any. The loop starts it and never awaits it (review, DAH-2977):
     # a pull stream that goes silent holds the sweep for the read timeout past its deadline
     # and eviction has no deadline at all, so awaiting it would move the default image's
@@ -362,9 +326,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                     # unknown: at early boot the NVIDIA driver may not be ready yet,
                     # and caching "unknown" once would wedge the loop forever.
                     if gpu_model == "unknown":
-                        gpu_model, driver_version, gpu_error = await asyncio.to_thread(
-                            _get_gpu_info
-                        )
+                        gpu_model, driver_version, gpu_error = await asyncio.to_thread(_get_gpu_info)
                         state.note_gpu(gpu_model, driver_version, error=gpu_error)
                         if gpu_model == "unknown":
                             logger.warning("GPU not detected yet; retrying cache pre-pull shortly")
@@ -411,9 +373,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                         not in mandatory_refs
                     ]
                     keep_tags = frozenset(
-                        data["docker_image_tag"]
-                        for data in pre_pull
-                        if data.get("docker_image_tag")
+                        data["docker_image_tag"] for data in pre_pull if data.get("docker_image_tag")
                     )
                     if pre_puller:
                         # Published before the mandatory pass, every refresh, so a sweep still
