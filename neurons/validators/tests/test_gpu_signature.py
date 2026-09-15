@@ -8,6 +8,8 @@ returns â€” envelope gating, per-card scoring, and the count-spoof aggregation â
 feeding synthesised verifier verdicts. One behaviour per test function.
 """
 
+import json
+
 import pytest
 
 from services import gpu_signature as gs
@@ -87,7 +89,17 @@ def test_parse_result_line_skips_deeply_nested_line_without_raising():
 
 
 def test_parse_result_line_drops_line_over_length_cap():
-    assert gs.parse_result_line('{"gpusig":2}' + "x" * gs.MAX_RESULT_LINE) is None
+    # The same valid, schema-matching line parses just under the cap and is dropped
+    # just over it: only the length decides.
+    def line(pad: int) -> str:
+        return json.dumps({"gpusig": 2, "scheme": gs.GPUSIG_SCHEME, "pad": "x" * pad})
+
+    under = line(gs.MAX_RESULT_LINE - 60)
+    assert len(under) <= gs.MAX_RESULT_LINE
+    assert gs.parse_result_line(under)["gpusig"] == 2
+    over = line(gs.MAX_RESULT_LINE)
+    assert len(over) > gs.MAX_RESULT_LINE
+    assert gs.parse_result_line(over) is None
 
 
 def test_seal_within_bounds_caps_each_field():
