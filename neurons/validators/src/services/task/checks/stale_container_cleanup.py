@@ -239,7 +239,7 @@ class _QueuedReap:
 
     @classmethod
     def decode(cls, raw: str) -> _QueuedReap:
-        """Raises ValueError on a value this code did not write."""
+        """Raises ValueError on a value this code did not write (an entry without ``observed_at`` included)."""
         try:
             value = json.loads(raw)
         except ValueError:
@@ -247,9 +247,12 @@ class _QueuedReap:
         if not isinstance(value, dict):
             # a bare timestamp, as the first cut of this queue wrote it: reaped then, never sent
             return cls(datetime.fromisoformat(raw))
+        observed_at = value.get("observed_at")
+        if observed_at is None:
+            raise ValueError(f"queued reap entry without observed_at: {raw!r}")
         sent_at = value.get("sent_at")
         return cls(
-            datetime.fromisoformat(str(value["observed_at"])),
+            datetime.fromisoformat(str(observed_at)),
             datetime.fromisoformat(str(sent_at)) if sent_at else None,
         )
 
