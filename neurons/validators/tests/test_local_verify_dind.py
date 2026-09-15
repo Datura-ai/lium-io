@@ -194,6 +194,11 @@ def test_the_validators_real_key_and_a_real_hotkey_fit_the_shared_dind_bounds():
     assert not dind_step_fits_the_wire_bounds("container_" + "x" * 101 + "_1", public_key.strip())
     assert not dind_step_fits_the_wire_bounds("container_ok_1", "ssh-ed25519 not base64!")
     assert not dind_step_fits_the_wire_bounds("container_ok_1", "ssh-ed25519 " + "A" * 1100)
+    # `DindStep.port` is 1..65535; `get_all_ports` passes a `port_range` such as "65530-65540" or a
+    # `port_mappings` external of 0 through unchecked, and the DindStep(...) would raise instead.
+    assert dind_step_fits_the_wire_bounds(f"container_{hotkey}_1", public_key.strip(), 1)
+    assert not dind_step_fits_the_wire_bounds(f"container_{hotkey}_65536", public_key.strip(), 65536)
+    assert not dind_step_fits_the_wire_bounds(f"container_{hotkey}_0", public_key.strip(), 0)
 
 
 @pytest.mark.asyncio

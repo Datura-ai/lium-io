@@ -64,14 +64,19 @@ _DIND_NAME_RE = re.compile(LOCAL_VERIFY_DIND_NAME_PATTERN)
 _DIND_KEY_RE = re.compile(LOCAL_VERIFY_DIND_PUBLIC_KEY_PATTERN)
 
 
-def dind_step_fits_the_wire_bounds(name: str, public_key: str) -> bool:
+def dind_step_fits_the_wire_bounds(name: str, public_key: str, port: int = 1) -> bool:
     """The executor's `DindStep` bounds (datura), applied here first so the two ends cannot drift
-    apart silently: a step this returns False for would be a 422 on the whole intent."""
+    apart silently: a step this returns False for would be a 422 on the whole intent. `port` is
+    the external port the step publishes (`DindStep.port`, 1..65535): `get_all_ports` does not
+    bound `port_range` / `port_mappings` values, and a `DindStep(...)` built with one outside the
+    range raises before the intent is sent."""
     return (
         len(name) <= LOCAL_VERIFY_DIND_NAME_MAX
         and _DIND_NAME_RE.fullmatch(name) is not None
         and len(public_key) <= LOCAL_VERIFY_DIND_PUBLIC_KEY_MAX
         and _DIND_KEY_RE.fullmatch(public_key) is not None
+        and isinstance(port, int)
+        and 1 <= port <= 65535
     )
 
 
@@ -273,7 +278,7 @@ class LocalFactsCheck:
         private_key, public_key = ctx.services.ssh.generate_keypair()
         port = PortPair(*pair)
         name, public_key = f"container_{ctx.miner_hotkey}_{port.external}", public_key.strip()
-        if not dind_step_fits_the_wire_bounds(name, public_key):
+        if not dind_step_fits_the_wire_bounds(name, public_key, port.external):
             # The executor's DindStep would reject it with a 422 on the WHOLE intent — every fact
             # lost for a step that is an optimisation. Leave the step out; the probe runs as today.
             logger.warning(
