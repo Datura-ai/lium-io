@@ -125,8 +125,8 @@ class PendingVerify:
     to cancel; `close()` releases the matmul challenge's native handle on every path."""
 
     task: asyncio.Task | None  # None only while `LocalVerifyStartCheck._start` is creating it
-    matmul_challenge: Any | None
-    verifyx_challenge: Any | None
+    matmul_challenge: MatmulChallenge | None
+    verifyx_challenge: VerifyXChallenge | None
     started_at: float = field(default_factory=time.perf_counter)
     consumed: bool = False
     _closed: bool = field(default=False, repr=False)
@@ -152,8 +152,8 @@ class _Prepared:
     """The challenges and the signed intent one `/verify` call is made of — built the same way
     whether the call is made now (`LocalVerifyCheck`) or started early (`LocalVerifyStartCheck`)."""
 
-    matmul_challenge: Any | None
-    verifyx_challenge: Any | None
+    matmul_challenge: MatmulChallenge | None
+    verifyx_challenge: VerifyXChallenge | None
     intent: dict[str, Any]
 
 
@@ -164,8 +164,8 @@ class _Call:
     to make it with now. The challenges are the ones the answer is judged against either way."""
 
     pending: PendingVerify | None
-    matmul_challenge: Any | None
-    verifyx_challenge: Any | None
+    matmul_challenge: MatmulChallenge | None
+    verifyx_challenge: VerifyXChallenge | None
     client: LocalVerifyClient | None = None
     port: int | None = None
     intent: dict[str, Any] | None = None
@@ -695,12 +695,14 @@ class LocalVerifyStartCheck(LocalVerifyCheck):
             return self._not_started(ctx, "no_facts", "no facts call this cycle; the check decides later")
         if CAPABILITY not in capabilities:
             return self._not_started(ctx, "not_advertised", "executor does not advertise local verification")
+        if facts.local_verify_port is None:
+            # Before the steps test: without a port `LocalFactsCheck` never made the POST, so its
+            # `step_statuses` is empty too and the reason would otherwise read `facts_unanswered`.
+            return self._not_started(ctx, "no_tunnel_port", "/version names no local_verify_port; nothing to tunnel to")
         if not facts.step_statuses:
             # `/version` answered but the facts POST did not (busy, timeout, refused): the executor
             # is not taking intents right now; the later check asks again where it does today.
             return self._not_started(ctx, "facts_unanswered", "the facts call did not come back; the check decides later")
-        if facts.local_verify_port is None:
-            return self._not_started(ctx, "no_tunnel_port", "/version names no local_verify_port; nothing to tunnel to")
         if not ctx.config.unscored:
             # The early start is for the first pass only, whatever LOCAL_VERIFY_FIRST_PASS_ONLY
             # says: the overlap pays where the owner waits, and a scored cycle's full-size serial

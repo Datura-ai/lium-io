@@ -297,6 +297,7 @@ def filler_state():
         ("no_facts", "no_facts"),
         ("not_advertised", "not_advertised"),
         ("facts_unanswered", "facts_unanswered"),
+        ("no_tunnel_port", "no_tunnel_port"),
         ("scored", "not_first_pass"),
         ("rented", "rented"),
         ("wedge_candidate", "gpu_reread_pending"),
@@ -319,6 +320,11 @@ async def test_nothing_starts_early_when_the_check_itself_would_not_call_or_the_
     elif case == "facts_unanswered":
         # `/version` advertised the capability but the facts POST itself failed (busy / timeout):
         # `LocalFactsCheck._unavailable` keeps the capabilities and no steps.
+        state = build_state(specs=SPECS, local_facts=LocalFacts(capabilities=frozenset({CAPABILITY}), step_statuses={}))
+    elif case == "no_tunnel_port":
+        # `/version` advertised the capability but named no port: `LocalFactsCheck` made no POST, so
+        # the steps are empty too. The port test comes first, or this reads as `facts_unanswered`
+        # (it did until this row).
         state = build_state(specs=SPECS, local_facts=LocalFacts(capabilities=frozenset({CAPABILITY}), step_statuses={}))
     elif case == "scored":
         # The start check's own rule, not `_gate_reason`'s: with LOCAL_VERIFY_FIRST_PASS_ONLY off
@@ -348,7 +354,7 @@ async def test_nothing_starts_early_when_the_check_itself_would_not_call_or_the_
             ssh=FakeSSH(),
             services=build_services(validation=validation, verifyx=verifyx_service),
             config=build_context_config(validator_keypair=kp, first_pass=unscored, unscored=unscored, verifyx_enabled=True),
-            state=with_tunnel_port(state, executor.executor_info),
+            state=state if case == "no_tunnel_port" else with_tunnel_port(state, executor.executor_info),
         )
         with MagicMock() as log:
             monkeypatch.setattr("neurons.validators.src.services.task.checks.local_verify.logger", log)

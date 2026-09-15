@@ -44,8 +44,9 @@ class DockerCommand:
 
     @staticmethod
     def remove_with_volumes(name: str) -> str:
-        """Build docker rm command that also removes anonymous volumes."""
-        return f"/usr/bin/docker rm -fv {name}"
+        """Build docker rm command that also removes anonymous volumes. The name is shell-quoted
+        here, so callers pass it bare."""
+        return f"/usr/bin/docker rm -fv {shlex.quote(name)}"
 
     @staticmethod
     def kill_container_processes(name: str) -> str:
