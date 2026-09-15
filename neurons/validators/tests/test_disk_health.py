@@ -1,10 +1,10 @@
 """DAH-2928 — get_disk_health() in machine_scrape.py and DiskHealthCheck in the pipeline.
 
 A renter's file on a pod changed on disk after it was written, with no error reaching the container;
-the executor's specs said nothing about its disks. The scrape now reports four independent readings
-(read-only docker-root mount, a write probe, kernel disk errors, sysfs/SMART state); the check is
-non-fatal and warns on the one that is unambiguous, the docker root refusing writes, without
-changing the score until the reading is proven on live executors.
+the executor's specs said nothing about its disks. The scrape now reports two readings (is the
+docker root's filesystem mounted read-only, does a write to it go through); the check is non-fatal
+and warns when the docker root refuses writes, without changing the score until the reading is
+proven on live executors.
 
 machine_scrape.py is a script, not a module — importing it runs the whole scrape — so the helpers are
 extracted by ast and executed in their own namespace (same pattern as test_scrape_infiniband.py).
@@ -13,19 +13,14 @@ extracted by ast and executed in their own namespace (same pattern as test_scrap
 from __future__ import annotations
 
 import ast
-import glob
-import json
 import os
-import re
-import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 from neurons.validators.tests.helpers import build_scrape_namespace, build_state
-from services.task.checks.disk_health import DiskHealthCheck, disk_error_summary
+from services.task.checks.disk_health import DiskHealthCheck
 from services.task.checks.gpu_vram_precheck import GpuVramPrecheck
 from services.task.messages import DiskHealthMessages as Msg
 from services.task.pipeline_factory import PipelineFactory
@@ -35,32 +30,14 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 DISK_HEALTH_HELPERS = {
     "HOST_MOUNTS_PATH",
     "HOST_ROOT_PREFIX",
-    "BLOCK_SYSFS_PATH",
-    "NVME_SYSFS_PATH",
-    "KERNEL_ERRORS_CMD",
-    "KERNEL_ERROR_LINES_KEPT",
-    "KERNEL_ERROR_LINE_CHARS",
-    "KERNEL_DISK_ERROR_PATTERN",
     "ERRNO_EIO",
     "ERRNO_ENOSPC",
     "ERRNO_EROFS",
     "ERRNO_EDQUOT",
-    "VIRTUAL_BLOCK_DEVICE_PATTERN",
-    "read_sysfs_value",
     "DiskHealthObservation",
     "mounts_holding",
     "write_probe_failure_reason",
     "probe_write",
-    "kernel_disk_errors",
-    "physical_block_devices",
-    "block_device_io_errors",
-    "nvme_controller_states",
-    "SMARTCTL_TIMEOUT_S",
-    "SMARTCTL_TOTAL_BUDGET_S",
-    "TIMEOUT_EXIT_STATUS",
-    "wall_clock_seconds",
-    "run_cmd_result",
-    "smart_health",
     "get_disk_health",
 }
 
@@ -75,23 +52,13 @@ tmpfs /run tmpfs rw,nosuid,nodev,size=13158620k,mode=755 0 0
 # The same host after ext4 hit an error and honoured errors=remount-ro on the docker disk.
 HOST_MOUNTS_DOCKER_RO = HOST_MOUNTS.replace("/var/lib/docker ext4 rw,relatime", "/var/lib/docker ext4 ro,relatime")
 
-# dmesg --level=err on a host with a failing NVMe and one unrelated error, as printed by 6.x kernels.
-DMESG_WITH_DISK_ERRORS = """
-[  120.442112] nvme nvme1: I/O Cmd(0x2) @ LBA 2411724800, 256 blocks, I/O Error (sct 0x2 / sc 0x81) MORE
-[  120.442131] critical medium error, dev nvme1n1, sector 2411724800 op 0x0:(READ) flags 0x80700 phys_seg 32 prio class 2
-[  120.442140] EXT4-fs error (device nvme1n1): ext4_find_entry:1663: inode #131073: comm dockerd: reading directory lblock 0
-[  121.001003] EXT4-fs (nvme1n1): Remounting filesystem read-only
-[  200.100000] usb 1-1: device descriptor read/64, error -71
-"""
-
-
 @pytest.fixture
 def scrape() -> dict[str, Any]:
     """The disk-health helpers, executed in a namespace of their own."""
     return build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         DISK_HEALTH_HELPERS,
-        {"os": os, "re": re, "glob": glob, "json": json, "shutil": shutil, "tempfile": tempfile},
+        {"os": os, "tempfile": tempfile},
     )
 
 
@@ -259,212 +226,10 @@ def test_write_probe_is_skipped_on_a_missing_directory(scrape: dict[str, Any], t
 # --------------------------------------------------------------------------------------------------
 # kernel log
 # --------------------------------------------------------------------------------------------------
-def test_kernel_disk_errors_counts_block_and_filesystem_faults_only(scrape: dict[str, Any]) -> None:
-    # Act
-    count, lines = scrape["kernel_disk_errors"](DMESG_WITH_DISK_ERRORS)
-
-    # Assert — the USB descriptor error is not a disk fault
-    assert count == 4
-    assert [line.split("] ", 1)[1][:22] for line in lines] == [
-        "nvme nvme1: I/O Cmd(0x",
-        "critical medium error,",
-        "EXT4-fs error (device ",
-        "EXT4-fs (nvme1n1): Rem",
-    ]
-
-
-def test_kernel_disk_errors_keeps_only_the_tail_and_truncates_lines(scrape: dict[str, Any]) -> None:
-    # Arrange — 20 SATA errors of 300 characters
-    long_line = "[1.0] ata3.00: failed command: READ FPDMA QUEUED " + "x" * 300
-    log = "\n".join([long_line] * 20)
-
-    # Act
-    count, lines = scrape["kernel_disk_errors"](log)
-
-    # Assert
-    assert count == 20
-    assert len(lines) == scrape["KERNEL_ERROR_LINES_KEPT"]
-    assert all(len(line) == scrape["KERNEL_ERROR_LINE_CHARS"] for line in lines)
-
-
-def test_a_clean_kernel_log_counts_nothing(scrape: dict[str, Any]) -> None:
-    log = "[1.0] usb 1-1: device descriptor read/64, error -71\n[2.0] nvidia: loading out-of-tree module taints kernel.\n"
-
-    assert scrape["kernel_disk_errors"](log) == (0, [])
-
-
-# --------------------------------------------------------------------------------------------------
-# sysfs and SMART
-# --------------------------------------------------------------------------------------------------
-def _fake_sys_block(root: Path, backed: tuple[str, ...], virtual: tuple[str, ...] = ()) -> None:
-    """A /sys/block tree: `backed` names get the `device/` link a real disk has, `virtual` names do not."""
-    for name in backed:
-        (root / name / "device").mkdir(parents=True)
-    for name in virtual:
-        (root / name).mkdir(parents=True)
-
-
-def test_block_io_error_counters_report_only_nonzero_devices(scrape: dict[str, Any], tmp_path: Path) -> None:
-    # Arrange — sysfs prints the SCSI counters in hex
-    for device, count in (("sda", "0x0"), ("sdb", "0x1a"), ("nvme0n1", None)):
-        device_dir = tmp_path / device / "device"
-        device_dir.mkdir(parents=True)
-        if count is not None:
-            (device_dir / "ioerr_cnt").write_text(f"{count}\n")
-    scrape["BLOCK_SYSFS_PATH"] = str(tmp_path)
-
-    # Act / Assert
-    assert scrape["block_device_io_errors"]() == {"sdb": 26}
-
-
-def test_physical_block_devices_walks_sysfs_and_skips_what_is_not_a_disk(
-    scrape: dict[str, Any], tmp_path: Path
-) -> None:
-    # Arrange — a 28-disk SAS host with a 10th NVMe namespace, a second namespace, a virtio disk and
-    # an eMMC: the `/dev/sd?` + `/dev/nvme?n1` globs saw none of sdaa, nvme10n1, nvme0n2, vda,
-    # mmcblk0. sr0 has a `device/` link like a disk; the others have none.
-    _fake_sys_block(
-        tmp_path,
-        backed=("sda", "sdaa", "nvme0n1", "nvme0n2", "nvme10n1", "vda", "mmcblk0", "sr0"),
-        virtual=("loop0", "ram0", "dm-0", "zram0", "md0"),
-    )
-    scrape["BLOCK_SYSFS_PATH"] = str(tmp_path)
-
-    # Act / Assert
-    assert scrape["physical_block_devices"]() == [
-        "mmcblk0",
-        "nvme0n1",
-        "nvme0n2",
-        "nvme10n1",
-        "sda",
-        "sdaa",
-        "vda",
-    ]
-
-
-def test_nvme_controller_states_report_only_controllers_that_are_not_live(
-    scrape: dict[str, Any], tmp_path: Path
-) -> None:
-    for controller, state in (("nvme0", "live"), ("nvme1", "resetting")):
-        (tmp_path / controller).mkdir()
-        (tmp_path / controller / "state").write_text(f"{state}\n")
-    scrape["NVME_SYSFS_PATH"] = str(tmp_path)
-
-    assert scrape["nvme_controller_states"]() == {"nvme1": "resetting"}
-
-
-def test_smart_is_unavailable_without_smartctl(scrape: dict[str, Any], monkeypatch) -> None:
-    monkeypatch.setattr(shutil, "which", lambda name: None)
-
-    assert scrape["smart_health"]() == "unavailable"
-
-
-# smartctl -j's message for a device it cannot open (exit status 2, no smart_status block)
-CANNOT_OPEN_MESSAGE = {"string": "Unable to detect device type", "severity": "error"}
-
-
-def test_smart_reads_a_failing_disk_from_the_json_although_smartctl_exits_non_zero(
-    scrape: dict[str, Any], tmp_path: Path, monkeypatch
-) -> None:
-    # Arrange — what smartctl -H -j really does: exit 0 for a healthy disk, exit 8 (bit 3, DISK FAILING)
-    # for a failing one WITH the verdict in its JSON, exit 2 with no smart_status for a device it
-    # cannot open, timeout(1)'s 124 with no output for a drive that never answers, 124 WITH the JSON
-    # for a badly failing drive (bits 2-6 set), and 127 with no output where timeout(1) is missing
-    results = {
-        "/dev/nvme0n1": (0, json.dumps({"smart_status": {"passed": True}}), ""),
-        "/dev/sda": (8, json.dumps({"smart_status": {"passed": False}}), ""),
-        "/dev/sdb": (2, json.dumps({"smartctl": {"messages": [CANNOT_OPEN_MESSAGE]}}), ""),
-        "/dev/sdc": (124, "", ""),
-        "/dev/sdd": (124, json.dumps({"smart_status": {"passed": False}}), ""),
-        "/dev/sde": (127, "", "/bin/sh: 1: timeout: not found"),
-    }
-
-    def fake_run_cmd_result(cmd):
-        assert cmd.startswith(f"timeout {scrape['SMARTCTL_TIMEOUT_S']} smartctl -H -j /dev/")
-        returncode, stdout, stderr = results[cmd.split()[-1]]
-        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
-
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/smartctl")
-    _fake_sys_block(tmp_path, backed=("sda", "sdb", "sdc", "sdd", "sde", "nvme0n1"))
-    scrape["BLOCK_SYSFS_PATH"] = str(tmp_path)
-    scrape["run_cmd_result"] = fake_run_cmd_result
-
-    # Act
-    verdicts = scrape["smart_health"]()
-
-    # Assert — the failing disk is FAILED, not an "error: run_cmd error …" string
-    assert verdicts["/dev/nvme0n1"] == "PASSED"
-    assert verdicts["/dev/sda"] == "FAILED"
-    assert verdicts["/dev/sdb"] == "error: Unable to detect device type"
-    assert verdicts["/dev/sdc"] == "error: smartctl did not answer within 30s"
-    assert verdicts["/dev/sdd"] == "FAILED"
-    assert verdicts["/dev/sde"] == "error: exit 127: /bin/sh: 1: timeout: not found"
-
-
-def test_smart_queries_every_sysfs_disk_not_only_the_first_nvme_namespace(
-    scrape: dict[str, Any], tmp_path: Path, monkeypatch
-) -> None:
-    # Arrange — the disks the old globs missed
-    _fake_sys_block(tmp_path, backed=("sdaa", "nvme10n1", "vda"), virtual=("loop0", "dm-0"))
-    scrape["BLOCK_SYSFS_PATH"] = str(tmp_path)
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/smartctl")
-    queried = []
-
-    def fake_run_cmd_result(cmd):
-        queried.append(cmd.split()[-1])
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"smart_status": {"passed": True}}), stderr="")
-
-    scrape["run_cmd_result"] = fake_run_cmd_result
-
-    # Act
-    verdicts = scrape["smart_health"]()
-
-    # Assert
-    assert queried == ["/dev/nvme10n1", "/dev/sdaa", "/dev/vda"]
-    assert verdicts == {"/dev/nvme10n1": "PASSED", "/dev/sdaa": "PASSED", "/dev/vda": "PASSED"}
-
-
-def test_smart_stops_asking_once_the_total_budget_is_spent(
-    scrape: dict[str, Any], tmp_path: Path, monkeypatch
-) -> None:
-    # Arrange — four disks that each take 25 s to answer: with a 30 s per-device timeout alone the
-    # loop ran 100 s; the 60 s budget lets the first two through in full, gives the third the 10 s
-    # that are left, and does not ask the fourth at all
-    _fake_sys_block(tmp_path, backed=("sda", "sdb", "sdc", "sdd"))
-    scrape["BLOCK_SYSFS_PATH"] = str(tmp_path)
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/smartctl")
-    clock = {"now": 1000.0}
-    scrape["wall_clock_seconds"] = lambda: clock["now"]
-    commands = []
-
-    def slow_run_cmd_result(cmd):
-        commands.append(cmd)
-        query_timeout = int(cmd.split()[1])
-        if query_timeout < 25:
-            clock["now"] += query_timeout
-            return subprocess.CompletedProcess(cmd, scrape["TIMEOUT_EXIT_STATUS"], stdout="", stderr="")
-        clock["now"] += 25
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"smart_status": {"passed": True}}), stderr="")
-
-    scrape["run_cmd_result"] = slow_run_cmd_result
-
-    # Act
-    verdicts = scrape["smart_health"]()
-
-    # Assert — 60 s in total, the device past the bound is unknown (not an error)
-    assert [cmd.split()[1] for cmd in commands] == ["30", "30", "10"]
-    assert clock["now"] - 1000.0 == 60
-    assert verdicts["/dev/sda"] == "PASSED"
-    assert verdicts["/dev/sdb"] == "PASSED"
-    assert verdicts["/dev/sdc"] == "error: smartctl did not answer within 10s"
-    assert verdicts["/dev/sdd"] == "unknown: not queried, 60s smartctl budget spent"
-    assert disk_error_summary(_health(smart=verdicts)) == {}
-
-
 # --------------------------------------------------------------------------------------------------
 # the whole observation
 # --------------------------------------------------------------------------------------------------
-def test_get_disk_health_reports_every_reading_side_by_side(
+def test_get_disk_health_reports_both_readings_side_by_side(
     scrape: dict[str, Any], tmp_path: Path, monkeypatch
 ) -> None:
     # Arrange — a host whose docker disk just went read-only; the scrape sees the host through /proc/1/root
@@ -472,11 +237,7 @@ def test_get_disk_health_reports_every_reading_side_by_side(
     mounts_path.write_text(HOST_MOUNTS_DOCKER_RO)
     scrape["HOST_MOUNTS_PATH"] = str(mounts_path)
     scrape["HOST_ROOT_PREFIX"] = str(tmp_path / "host-root")
-    scrape["BLOCK_SYSFS_PATH"] = str(tmp_path / "block")
-    scrape["NVME_SYSFS_PATH"] = str(tmp_path / "nvme")
     scrape["docker_api_get"] = lambda path: {"DockerRootDir": "/var/lib/docker"}
-    scrape["run_cmd"] = lambda cmd: DMESG_WITH_DISK_ERRORS
-    monkeypatch.setattr(shutil, "which", lambda name: None)
 
     def refuse(*args, **kwargs):
         raise OSError(30, "Read-only file system")
@@ -491,29 +252,16 @@ def test_get_disk_health_reports_every_reading_side_by_side(
     assert payload["dh_read_only_mounts"] == ["/var/lib/docker"]
     assert payload["dh_write_probe"] == "failed"
     assert "Read-only file system" in payload["dh_write_probe_error"]
-    assert payload["dh_kernel_io_errors"] == 4
-    assert len(payload["dh_kernel_io_error_lines"]) == 4
-    assert payload["dh_kernel_log_error"] == ""
-    assert payload["dh_block_io_errors"] == {}
-    assert payload["dh_nvme_states"] == {}
-    assert payload["dh_smart"] == "unavailable"
+    assert set(payload) == {"dh_docker_root_dir", "dh_read_only_mounts", "dh_write_probe", "dh_write_probe_error"}
 
 
-def test_get_disk_health_records_an_unreadable_kernel_log_instead_of_a_zero(
-    scrape: dict[str, Any], tmp_path: Path, monkeypatch
+def test_get_disk_health_falls_back_to_the_default_docker_root_and_an_unreadable_mount_table(
+    scrape: dict[str, Any], tmp_path: Path
 ) -> None:
-    # Arrange — dmesg without CAP_SYSLOG
+    # Arrange — no docker /info answer, no readable mount table: unknown mounts, not a false ro
     scrape["HOST_MOUNTS_PATH"] = str(tmp_path / "missing-mounts")
     scrape["HOST_ROOT_PREFIX"] = str(tmp_path / "host-root")
-    scrape["BLOCK_SYSFS_PATH"] = str(tmp_path / "block")
-    scrape["NVME_SYSFS_PATH"] = str(tmp_path / "nvme")
     scrape["docker_api_get"] = lambda path: {}
-
-    def denied(cmd):
-        raise RuntimeError("run_cmd error 'dmesg' returncode=1 stderr='dmesg: read kernel buffer failed: Operation not permitted'")
-
-    scrape["run_cmd"] = denied
-    monkeypatch.setattr(shutil, "which", lambda name: None)
     scrape["probe_write"] = lambda directory: ("ok", "")
 
     # Act
@@ -521,8 +269,7 @@ def test_get_disk_health_records_an_unreadable_kernel_log_instead_of_a_zero(
 
     # Assert
     assert payload["dh_docker_root_dir"] == "/var/lib/docker"
-    assert payload["dh_kernel_io_errors"] == 0
-    assert "Operation not permitted" in payload["dh_kernel_log_error"]
+    assert payload["dh_read_only_mounts"] == []
     assert payload["dh_write_probe"] == "ok"
 
 
@@ -567,12 +314,6 @@ def _health(**overrides) -> dict[str, Any]:
         "read_only_mounts": [],
         "write_probe": "ok",
         "write_probe_error": "",
-        "kernel_io_errors": 0,
-        "kernel_io_error_lines": [],
-        "kernel_log_error": "",
-        "block_io_errors": {},
-        "nvme_states": {},
-        "smart": "unavailable",
     }
     base.update(overrides)
     return base
@@ -639,66 +380,6 @@ async def test_a_skipped_write_probe_does_not_fail(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_kernel_io_errors_are_reported_but_do_not_fail(context_factory):
-    health = _health(kernel_io_errors=3, kernel_io_error_lines=["critical medium error, dev nvme1n1"])
-    ctx = context_factory(state=build_state(specs={"disk_health": health}))
-
-    result = await DiskHealthCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.ERRORS_REPORTED.reason
-    assert result.event.what_we_saw["kernel_io_errors"] == 3
-
-
-# what smartctl says per disk on a host with one healthy disk, one failing, one behind a RAID
-# controller it cannot open, and one the budget did not reach
-SMART_MIXED = {
-    "/dev/sda": "PASSED",
-    "/dev/sdb": "FAILED",
-    "/dev/sdc": "error: Unable to detect device type",
-    "/dev/sdd": "unknown: not queried, 60s smartctl budget spent",
-}
-
-
-@pytest.mark.asyncio
-async def test_a_failed_smart_verdict_is_reported(context_factory):
-    health = _health(smart=dict(SMART_MIXED))
-    ctx = context_factory(state=build_state(specs={"disk_health": health}))
-
-    result = await DiskHealthCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.ERRORS_REPORTED.reason
-    assert result.event.what_we_saw["smart"] == {"/dev/sdb": "FAILED"}
-
-
-@pytest.mark.asyncio
-async def test_smart_unknown_and_error_verdicts_alone_do_not_warn(context_factory):
-    # a RAID controller or a virtual disk smartctl cannot open raised DISK_ERRORS_REPORTED every
-    # cycle under `!= "PASSED"`; the readings still travel in the OK event
-    smart = {device: verdict for device, verdict in SMART_MIXED.items() if verdict != "FAILED"}
-    ctx = context_factory(state=build_state(specs={"disk_health": _health(smart=smart)}))
-
-    result = await DiskHealthCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.OK.reason
-    assert result.event.severity == "info"
-    assert result.event.what_we_saw["smart"] == smart
-
-
-@pytest.mark.parametrize(
-    ("verdict", "is_error"),
-    [("PASSED", False), ("FAILED", True), ("unknown", False), ("error: Unable to detect device type", False)],
-)
-def test_only_a_failed_smart_verdict_is_a_disk_error(verdict: str, is_error: bool):
-    summary = disk_error_summary(_health(smart={"/dev/sda": verdict}))
-
-    assert (summary.get("smart") == {"/dev/sda": "FAILED"}) is is_error
-    assert ("smart" in summary) is is_error
-
-
-@pytest.mark.asyncio
 async def test_a_scrape_without_the_probe_is_unknown_not_bad(context_factory):
     ctx = context_factory(state=build_state(specs={"disk_health_scrape_error": "RuntimeError('x')"}))
 
@@ -707,12 +388,6 @@ async def test_a_scrape_without_the_probe_is_unknown_not_bad(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.UNKNOWN.reason
     assert result.event.what_we_saw["scrape_error"] == "RuntimeError('x')"
-
-
-def test_disk_error_summary_keeps_only_the_readings_that_say_something_is_wrong():
-    health = _health(block_io_errors={"sdb": 26}, nvme_states={"nvme1": "resetting"}, smart={"/dev/sda": "PASSED"})
-
-    assert disk_error_summary(health) == {"block_io_errors": {"sdb": 26}, "nvme_states": {"nvme1": "resetting"}}
 
 
 # --------------------------------------------------------------------------------------------------

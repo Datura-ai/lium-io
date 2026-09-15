@@ -630,18 +630,12 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         raise NVMLError(ret)
 
 
-def run_cmd_result(cmd) -> subprocess.CompletedProcess:
-    """`run_cmd` without the raise: the caller reads returncode / stdout / stderr itself (smartctl
-    reports a failing disk through its exit status AND its JSON, DAH-2928)."""
+def run_cmd(cmd):
     # Strip LD_LIBRARY_PATH so PyInstaller's bundled libs don't leak into subprocesses
     # and conflict with system-linked shared libs (e.g. libssl vs libcrypto version mismatch).
     env = {**os.environ}
     env.pop("LD_LIBRARY_PATH", None)
-    return subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
-
-
-def run_cmd(cmd):
-    proc = run_cmd_result(cmd)
+    proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
     if proc.returncode != 0:
         raise RuntimeError(
             f"run_cmd error {cmd=!r} {proc.returncode=} {proc.stdout=!r} {proc.stderr=!r}"
@@ -1504,33 +1498,17 @@ def get_gpu_interconnect():
     except Exception as exc:
         return GpuInterconnectObservation(None, f"parse: {exc!r}"[:400])
     return GpuInterconnectObservation(payload, "; ".join(errors))
-# DAH-2928: the host's own view of its disks. The scrape shares the host PID namespace (see the
-# /proc/1/root walks above), so /proc/1/mounts is the host mount table and /sys is the host sysfs.
+
+
+# DAH-2928: the host's own view of the disk that holds the containers. The scrape shares the host
+# PID namespace (see the /proc/1/root walks above), so /proc/1/mounts is the host mount table.
 HOST_MOUNTS_PATH = "/proc/1/mounts"
 HOST_ROOT_PREFIX = "/proc/1/root"
-BLOCK_SYSFS_PATH = "/sys/block"
-NVME_SYSFS_PATH = "/sys/class/nvme"
-KERNEL_ERRORS_CMD = "dmesg --level=emerg,alert,crit,err"
-KERNEL_ERROR_LINES_KEPT = 8
-KERNEL_ERROR_LINE_CHARS = 200
-# Messages the block layer, the filesystems and the disk drivers print when a disk misbehaves.
-# What they have in common is that the data was not read or written as asked.
-KERNEL_DISK_ERROR_PATTERN = re.compile(
-    r"I/O error|Buffer I/O error|print_req_error|EXT4-fs error|EXT4-fs \([^)]*\): [^\n]*(error|corrupt)"
-    r"|XFS \([^)]*\): [^\n]*(error|corrupt|shutdown)|Remounting filesystem read-only|critical medium error"
-    r"|Medium Error|Unrecovered read error|BTRFS[^\n]*(csum failed|corrupt)"
-    r"|nvme[^\n]*(timeout|reset controller|failed|Removing after probe failure|I/O Cmd)"
-    r"|ata\d+(\.\d+)?: (exception Emask|failed command|status: \{ DRDY ERR)",
-    re.IGNORECASE,
-)
 # errno values, spelled out because the packaged scrape cannot import errno (obfuscator allowlist)
 ERRNO_EIO = 5
 ERRNO_ENOSPC = 28
 ERRNO_EROFS = 30
 ERRNO_EDQUOT = 122
-# /sys/block names that are not disks: loop and ram devices, device-mapper, zram, md arrays, optical
-# and floppy drives, network block devices. Most of them have no `device/` link anyway; sr* does.
-VIRTUAL_BLOCK_DEVICE_PATTERN = re.compile(r"^(loop|ram|zram|dm-|md|sr|fd|nbd)\d")
 
 
 class DiskHealthObservation:
@@ -1540,23 +1518,11 @@ class DiskHealthObservation:
         read_only_mounts: list[str],
         write_probe: str,
         write_probe_error: str,
-        kernel_io_errors: int,
-        kernel_io_error_lines: list[str],
-        kernel_log_error: str,
-        block_io_errors: dict[str, int],
-        nvme_states: dict[str, str],
-        smart: dict[str, str] | str,
     ) -> None:
         self.docker_root_dir = docker_root_dir
         self.read_only_mounts = read_only_mounts
         self.write_probe = write_probe
         self.write_probe_error = write_probe_error
-        self.kernel_io_errors = kernel_io_errors
-        self.kernel_io_error_lines = kernel_io_error_lines
-        self.kernel_log_error = kernel_log_error
-        self.block_io_errors = block_io_errors
-        self.nvme_states = nvme_states
-        self.smart = smart
 
     def as_payload(self) -> dict:
         return {
@@ -1564,12 +1530,6 @@ class DiskHealthObservation:
             "dh_read_only_mounts": self.read_only_mounts,
             "dh_write_probe_error": self.write_probe_error,
             "dh_write_probe": self.write_probe,
-            "dh_kernel_io_error_lines": self.kernel_io_error_lines,
-            "dh_kernel_io_errors": self.kernel_io_errors,
-            "dh_kernel_log_error": self.kernel_log_error,
-            "dh_block_io_errors": self.block_io_errors,
-            "dh_nvme_states": self.nvme_states,
-            "dh_smart": self.smart,
         }
 
 
@@ -1632,128 +1592,15 @@ def probe_write(directory: str) -> tuple[str, str]:
         return "skipped", f"{e.__class__.__name__}: {e}"
 
 
-def kernel_disk_errors(log_text: str) -> tuple[int, list[str]]:
-    """How many kernel error lines describe a disk fault, and the last few of them."""
-    matching = [line.strip() for line in log_text.splitlines() if KERNEL_DISK_ERROR_PATTERN.search(line)]
-    kept = [line[:KERNEL_ERROR_LINE_CHARS] for line in matching[-KERNEL_ERROR_LINES_KEPT:]]
-    return len(matching), kept
-
-
-def physical_block_devices() -> list[str]:
-    """The /sys/block names backed by a device (sda, sdaa, nvme10n1, nvme0n2, vda, mmcblk0), sorted.
-
-    A `device/` link is what a disk has and a loop, ram, dm or zram entry has not; the names that
-    have one and still are not disks (sr0) are dropped by VIRTUAL_BLOCK_DEVICE_PATTERN. One walk for
-    the sysfs error counters and for smartctl, so neither misses a disk the other sees.
-    """
-    names = []
-    for device_link in sorted(glob.glob(f"{BLOCK_SYSFS_PATH}/*/device")):
-        name = device_link.split("/")[-2]
-        if not VIRTUAL_BLOCK_DEVICE_PATTERN.match(name):
-            names.append(name)
-    return names
-
-
-def block_device_io_errors() -> dict[str, int]:
-    """SCSI/SATA devices with a non-zero ioerr_cnt (hex in sysfs); NVMe has no such counter."""
-    errors = {}
-    for device in physical_block_devices():
-        count_text = read_sysfs_value(f"{BLOCK_SYSFS_PATH}/{device}/device/ioerr_cnt")
-        if not count_text:
-            continue
-        try:
-            count = int(count_text, 16)
-        except ValueError:
-            continue
-        if count:
-            errors[device] = count
-    return errors
-
-
-def nvme_controller_states() -> dict[str, str]:
-    """NVMe controllers whose state is anything but 'live' (resetting, connecting, dead, deleting)."""
-    states = {}
-    for state_path in sorted(glob.glob(f"{NVME_SYSFS_PATH}/*/state")):
-        state = read_sysfs_value(state_path)
-        if state and state != "live":
-            states[state_path.split("/")[-2]] = state
-    return states
-
-
-# A drive that is dying is exactly the one that may not answer a SMART query; `timeout(1)` bounds
-# each query so the fatal machine scrape is not held past its own budget (the docker daemon gets the
-# same 30 s), and the whole loop stops asking after SMARTCTL_TOTAL_BUDGET_S: a host with many
-# unresponsive disks is reported with the ones it got to, the rest 'unknown'.
-SMARTCTL_TIMEOUT_S = 30
-SMARTCTL_TOTAL_BUDGET_S = 60
-TIMEOUT_EXIT_STATUS = 124
-
-
-def wall_clock_seconds() -> float:
-    # os.times()[4] is the elapsed real time since a fixed point in the past; the packaged scrape
-    # cannot import time (obfuscator allowlist)
-    return os.times()[4]
-
-
-def smart_health() -> dict[str, str] | str:
-    """smartctl's overall health verdict per disk, or 'unavailable' where smartctl is not installed.
-
-    `smartctl -H` exits non-zero when the disk is FAILING (bit 3) and when the device has no SMART or
-    cannot be opened (bits 1/2) — the verdict is in the JSON on stdout either way, so the exit status
-    alone is never the error; only a timeout or unreadable output is. Only PASSED and FAILED are
-    verdicts; a device smartctl cannot open is 'error: <its message>' and a device not queried within
-    the total budget is 'unknown: …' - DiskHealthCheck warns on FAILED alone.
-    """
-    if not shutil.which("smartctl"):
-        return "unavailable"
-    verdicts = {}
-    started = wall_clock_seconds()
-    for name in physical_block_devices():
-        device = f"/dev/{name}"
-        remaining = SMARTCTL_TOTAL_BUDGET_S - (wall_clock_seconds() - started)
-        if remaining <= 0:
-            verdicts[device] = f"unknown: not queried, {SMARTCTL_TOTAL_BUDGET_S}s smartctl budget spent"
-            continue
-        query_timeout = max(1, min(SMARTCTL_TIMEOUT_S, int(remaining)))
-        try:
-            proc = run_cmd_result(f"timeout {query_timeout} smartctl -H -j {device}")
-            if not proc.stdout.strip():
-                # no JSON at all: timeout(1) expired (124 - a legal smartctl bitmask too, but that
-                # one comes with the JSON), or the command did not run (126/127, a signal)
-                if proc.returncode == TIMEOUT_EXIT_STATUS:
-                    verdicts[device] = f"error: smartctl did not answer within {query_timeout}s"
-                else:
-                    stderr = (proc.stderr or "").strip()[:KERNEL_ERROR_LINE_CHARS]
-                    verdicts[device] = f"error: exit {proc.returncode}: {stderr}"
-                continue
-            report = json.loads(proc.stdout)
-            passed = (report.get("smart_status") or {}).get("passed")
-            if passed is None:
-                messages = (report.get("smartctl") or {}).get("messages") or []
-                first = next(
-                    (m.get("string") for m in messages if isinstance(m, dict) and m.get("string")),
-                    "",
-                )
-                verdicts[device] = (
-                    f"error: {first[:KERNEL_ERROR_LINE_CHARS]}" if first else "unknown"
-                )
-            else:
-                verdicts[device] = "PASSED" if passed else "FAILED"
-        except Exception as e:
-            verdicts[device] = f"error: {str(e)[:KERNEL_ERROR_LINE_CHARS]}"
-    return verdicts
-
-
 def get_disk_health() -> DiskHealthObservation:
-    """Whether the disk that holds the containers is still taking writes, and what the kernel and
-    the drives say about it (DAH-2928).
+    """Whether the disk that holds the containers is still taking writes (DAH-2928).
 
     A renter's file on a pod changed on disk after it was written, with no error reaching the
     container. The scrape reported capacity and usage and nothing about health, so the node kept
-    being listed. Four independent readings are taken and reported side by side; deciding what to
-    do with an error count is the backend's job. A docker root that refuses writes is a node that
-    cannot start a container; DiskHealthCheck reports it as a warning (no score change) until the
-    reading is proven on live executors.
+    being listed. Two readings: is the docker root's filesystem mounted read-only, and does a write
+    to it go through. A docker root that refuses writes is a node that cannot start a container;
+    DiskHealthCheck reports it as a warning (no score change) until the reading is proven on live
+    executors.
     """
     try:
         docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
@@ -1772,26 +1619,7 @@ def get_disk_health() -> DiskHealthObservation:
         host_docker_root if os.path.isdir(host_docker_root) else docker_root_dir
     )
 
-    kernel_log_error = ""
-    try:
-        kernel_io_errors, kernel_io_error_lines = kernel_disk_errors(run_cmd(KERNEL_ERRORS_CMD))
-    except Exception as e:
-        # dmesg needs CAP_SYSLOG or kernel.dmesg_restrict=0; without it the count is unknown, not 0
-        kernel_io_errors, kernel_io_error_lines = 0, []
-        kernel_log_error = str(e)[:KERNEL_ERROR_LINE_CHARS]
-
-    return DiskHealthObservation(
-        docker_root_dir,
-        read_only_mounts,
-        write_probe,
-        write_probe_error,
-        kernel_io_errors,
-        kernel_io_error_lines,
-        kernel_log_error,
-        block_device_io_errors(),
-        nvme_controller_states(),
-        smart_health(),
-    )
+    return DiskHealthObservation(docker_root_dir, read_only_mounts, write_probe, write_probe_error)
 
 
 def get_machine_specs():

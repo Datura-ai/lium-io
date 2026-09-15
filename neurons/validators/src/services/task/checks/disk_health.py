@@ -1,31 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-
 from ..messages import DiskHealthMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-
-
-def disk_error_summary(health: dict[str, Any]) -> dict[str, Any]:
-    """The readings that say something is wrong, and nothing else - what the event carries."""
-    summary: dict[str, Any] = {}
-    if health.get("kernel_io_errors"):
-        summary["kernel_io_errors"] = health["kernel_io_errors"]
-        summary["kernel_io_error_lines"] = health.get("kernel_io_error_lines") or []
-    if health.get("block_io_errors"):
-        summary["block_io_errors"] = health["block_io_errors"]
-    if health.get("nvme_states"):
-        summary["nvme_states"] = health["nvme_states"]
-    smart = health.get("smart")
-    if isinstance(smart, dict):
-        # Only FAILED is a verdict. 'unknown…' and 'error: …' (a RAID controller or a virtual disk
-        # smartctl cannot open, a query past the budget) say nothing about the disk: they travel in
-        # specs.disk_health and in the OK event's `smart`, and never raise a warning.
-        failed = {device: verdict for device, verdict in smart.items() if verdict == "FAILED"}
-        if failed:
-            summary["smart"] = failed
-    return summary
 
 
 class DiskHealthCheck:
@@ -36,9 +13,7 @@ class DiskHealthCheck:
     alike. Observe-only, non-fatal: a docker root that is mounted read-only or refuses writes with
     EROFS/EIO/ENOSPC/EDQUOT cannot start a container, and the check says so with a warning event,
     but the score is not changed - a false reading here would zero rented and idle executors
-    fleet-wide, so the reading is proven on live executors first. Kernel I/O errors, sysfs error
-    counters, NVMe controller state and SMART FAILED verdicts are reported the same way (they travel
-    to the backend in specs) - a USB stick's errors and a dying NVMe look the same in a count.
+    fleet-wide, so the reading is proven on live executors first.
     """
 
     check_id = "executor.validate.disk_health"
@@ -68,20 +43,9 @@ class DiskHealthCheck:
                     "read_only_mounts": read_only_mounts,
                     "write_probe": health.get("write_probe"),
                     "write_probe_error": health.get("write_probe_error"),
-                    **disk_error_summary(health),
                 },
             )
             # Non-fatal and passed: the event is the warning; nothing downstream reads a verdict.
-            return CheckResult(passed=True, event=event)
-
-        summary = disk_error_summary(health)
-        if summary:
-            event = render_message(
-                Msg.ERRORS_REPORTED,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={"docker_root_dir": health.get("docker_root_dir"), **summary},
-            )
             return CheckResult(passed=True, event=event)
 
         event = render_message(
@@ -91,7 +55,6 @@ class DiskHealthCheck:
             what={
                 "docker_root_dir": health.get("docker_root_dir"),
                 "write_probe": health.get("write_probe"),
-                "smart": health.get("smart"),
             },
         )
         return CheckResult(passed=True, event=event)

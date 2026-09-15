@@ -275,17 +275,8 @@ class DiskHealthMessages:
         remediation="The filesystem holding the docker root is mounted read-only or refused a write "
         "probe (read_only, io_error, no_space or quota in write_probe_error). For no_space or quota: "
         "free space on the docker root (docker system prune, a larger disk or quota). Otherwise: check "
-        "dmesg for I/O errors, run a filesystem check, replace the disk if SMART reports a failure, "
-        "then remount read-write and restart the executor.",
-    )
-    ERRORS_REPORTED = MessageTemplate(
-        event="Executor disk reports errors",
-        reason="DISK_ERRORS_REPORTED",
-        severity="warning",
-        category="env",
-        impact="Proceed; readings forwarded to the backend in specs.disk_health",
-        remediation="The kernel log, a sysfs error counter, an NVMe controller state or SMART reports "
-        "disk errors on this host. Check dmesg and smartctl before the disk fails outright.",
+        "dmesg for I/O errors, run a filesystem check, replace the disk if it is failing, then remount "
+        "read-write and restart the executor.",
     )
     UNKNOWN = MessageTemplate(
         event="Executor disk health not reported",

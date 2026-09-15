@@ -177,12 +177,6 @@ ORIGINAL_KEYS = {
     'dh_read_only_mounts': "read_only_mounts",
     'dh_write_probe_error': "write_probe_error",
     'dh_write_probe': "write_probe",
-    'dh_kernel_io_error_lines': "kernel_io_error_lines",
-    'dh_kernel_io_errors': "kernel_io_errors",
-    'dh_kernel_log_error': "kernel_log_error",
-    'dh_block_io_errors': "block_io_errors",
-    'dh_nvme_states': "nvme_states",
-    'dh_smart': "smart",
 }
 
 
@@ -383,12 +377,6 @@ class FileEncryptService:
             'dh_read_only_mounts': "",
             'dh_write_probe_error': "",
             'dh_write_probe': "",
-            'dh_kernel_io_error_lines': "",
-            'dh_kernel_io_errors': "",
-            'dh_kernel_log_error': "",
-            'dh_block_io_errors': "",
-            'dh_nvme_states': "",
-            'dh_smart': "",
         }
 
         # Generate dictionary key mapping on validator side
