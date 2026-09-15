@@ -42,6 +42,10 @@ ENDPOINT_TIMEOUT_SECONDS = 5.0
 # Same window the updater applies to the signed timestamp (watchtower/src/watchtower.py).
 TIMESTAMP_MAX_SKEW_SECONDS = 10 * 60
 _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+# The updater renames the old runner to `<name>-previous-<short id>` while it creates the new one and removes it
+# last (watchtower.py `previous_runner_name`). A leftover of an interrupted update keeps the runner label; it is
+# never the runner this report describes.
+_PREVIOUS_RUNNER_NAME = re.compile(r"^.+-previous-[0-9a-f]+$")
 
 
 def digest_endpoint_url() -> Optional[str]:
@@ -118,13 +122,18 @@ class RunnerLookupError(Exception):
 def find_runner_container(client: docker.DockerClient):
     """The runner container: the CVM name first, then the compose service label (one match).
 
-    Returns None when there is none. Raises ``RunnerLookupError`` for two or more matches.
+    A ``<name>-previous-<id>`` leftover of an interrupted update is skipped (the updater removes it).
+    Returns None when there is none. Raises ``RunnerLookupError`` for two or more live matches.
     """
     try:
         return client.containers.get(RUNNER_CVM_NAME)
     except docker.errors.NotFound:
         pass
-    matches = client.containers.list(all=True, filters={"label": RUNNER_SERVICE_LABEL})
+    matches = [
+        c
+        for c in client.containers.list(all=True, filters={"label": RUNNER_SERVICE_LABEL})
+        if not _PREVIOUS_RUNNER_NAME.match(c.name)
+    ]
     if len(matches) > 1:
         raise RunnerLookupError(f"{len(matches)} containers carry {RUNNER_SERVICE_LABEL}")
     return matches[0] if matches else None

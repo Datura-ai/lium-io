@@ -1,4 +1,5 @@
 import docker
+import re
 import requests
 import bittensor
 import time
@@ -28,6 +29,23 @@ class DigestMismatchError(Exception):
 
 class RunnerLookupError(Exception):
     """The runner container could not be identified this cycle (ambiguous label or a listing error)."""
+
+
+# `recreate_container` renames the old runner to `<name>-previous-<short id>` while the new one is
+# created. The old container keeps its compose labels, so a lookup by label sees two runners until
+# it is removed. The suffix is how the lookup tells the leftover from the runner.
+PREVIOUS_RUNNER_SUFFIX = "-previous-"
+_PREVIOUS_RUNNER_NAME = re.compile(rf"^(?P<runner>.+){re.escape(PREVIOUS_RUNNER_SUFFIX)}[0-9a-f]+$")
+
+
+def previous_runner_name(name: str, short_id: str) -> str:
+    """The name `recreate_container` gives the old runner while the new one is created."""
+    return f"{name}{PREVIOUS_RUNNER_SUFFIX}{short_id}"
+
+
+def is_previous_runner_name(name: str) -> bool:
+    """True for a container `recreate_container` renamed aside and did not remove."""
+    return _PREVIOUS_RUNNER_NAME.match(name) is not None
 
 
 def image_has_digest(image, digest: str) -> bool:
@@ -72,30 +90,111 @@ def find_runner_container(client: docker.DockerClient) -> Optional[Container]:
     """
     Find the executor-runner container: by the CVM name first, then by the compose service label.
 
+    A container named `<runner>-previous-<id>` is a leftover of an interrupted
+    `recreate_container` (the daemon or this process died between the rename and the
+    remove). It keeps the compose labels (the CVM one is found by its name), so it is never
+    taken for a second runner: beside the runner under the real name that update is
+    finished (the runner started if it is not running, the leftover removed); when the
+    start fails both are kept with a warning; alone, it is renamed back and used.
+
     Returns:
         The container, or None when there is none (a first boot).
 
     Raises:
-        RunnerLookupError: the label matches more than one container (for example while
-            `docker compose up -d` renames the old runner and creates the new one), or the
-            listing failed. The caller must not pull or create anything in that state.
+        RunnerLookupError: the label matches more than one live container (for example
+            while `docker compose up -d` renames the old runner and creates the new one),
+            more than one leftover and no live runner, or the listing failed. The caller
+            must not pull or create anything in that state.
     """
     container = find_container_by_name(client, EXECUTOR_RUNNER_CONTAINER_NAME)
     if container is not None:
         return container
     try:
         matches = client.containers.list(all=True, filters={"label": EXECUTOR_RUNNER_SERVICE_LABEL})
+        # the CVM runner carries no compose label: its leftover is found by name
+        cvm_leftovers = client.containers.list(
+            all=True, filters={"name": f"^/?{EXECUTOR_RUNNER_CONTAINER_NAME}{PREVIOUS_RUNNER_SUFFIX}"}
+        )
     except Exception as e:
         raise RunnerLookupError(f"listing containers by label {EXECUTOR_RUNNER_SERVICE_LABEL} failed: {e}") from e
-    if len(matches) > 1:
+    runners = [c for c in matches if not is_previous_runner_name(c.name)]
+    leftovers = [c for c in matches if is_previous_runner_name(c.name)]
+    seen = {c.name for c in leftovers}
+    leftovers += [c for c in cvm_leftovers if is_previous_runner_name(c.name) and c.name not in seen]
+    if len(runners) > 1:
         raise RunnerLookupError(
-            f"{len(matches)} containers carry {EXECUTOR_RUNNER_SERVICE_LABEL}: {[c.name for c in matches]}"
+            f"{len(runners)} containers carry {EXECUTOR_RUNNER_SERVICE_LABEL}: {[c.name for c in runners]}"
         )
-    if not matches:
-        logger.info(_m("No runner container", {"name": EXECUTOR_RUNNER_CONTAINER_NAME, "label": EXECUTOR_RUNNER_SERVICE_LABEL}))
-        return None
-    logger.info(_m("Found runner container by label", {"name": matches[0].name, "id": matches[0].short_id}))
-    return matches[0]
+    if runners:
+        for leftover in leftovers:
+            _clear_previous_runner(leftover, runners[0])
+        logger.info(_m("Found runner container by label", {"name": runners[0].name, "id": runners[0].short_id}))
+        return runners[0]
+    if len(leftovers) > 1:
+        raise RunnerLookupError(
+            f"{len(leftovers)} leftover containers carry {EXECUTOR_RUNNER_SERVICE_LABEL} and no runner: "
+            f"{[c.name for c in leftovers]}"
+        )
+    if leftovers:
+        return _restore_previous_runner(leftovers[0])
+    logger.info(_m("No runner container", {"name": EXECUTOR_RUNNER_CONTAINER_NAME, "label": EXECUTOR_RUNNER_SERVICE_LABEL}))
+    return None
+
+
+def _clear_previous_runner(leftover: Container, runner: Container) -> None:
+    """Finish the switch an interrupted `recreate_container` left behind: start the runner if it is not
+    running, then remove the `-previous-` leftover.
+
+    The runner under the real name is the new container of that update (created, maybe never started,
+    when the process died between create and start). Starting it and removing the leftover are the two
+    steps the update did not reach. When the start fails the leftover may be the only working copy on
+    the host, so both are kept with a warning and a person decides (`docker compose up -d`, then
+    `docker rm -f` the leftover).
+    """
+    if runner.status != "running":
+        try:
+            logger.warning(_m("Starting the runner left behind by an interrupted update", {
+                "runner": runner.name,
+                "runner_status": runner.status,
+            }))
+            runner.start()
+        except Exception as e:
+            logger.warning(_m("Leftover runner container kept: the runner is not running", {
+                "leftover": leftover.name,
+                "runner": runner.name,
+                "runner_status": runner.status,
+                "error": str(e),
+            }))
+            return
+    logger.warning(_m("Removing leftover runner container from an interrupted update", {
+        "leftover": leftover.name,
+        "runner": runner.name,
+    }))
+    try:
+        leftover.remove(force=True)
+    except Exception as e:
+        # the lookup still returns the runner; the next cycle tries again
+        logger.error(_m("Failed to remove leftover runner container", {"leftover": leftover.name, "error": str(e)}))
+
+
+def _restore_previous_runner(leftover: Container) -> Container:
+    """A `-previous-` leftover with no runner beside it IS the runner: put its name back and return it.
+
+    `recreate_container` renamed it and then died (or its create failed and the rename back
+    failed too). The container itself is intact, with its compose labels and configuration.
+    """
+    runner_name = _PREVIOUS_RUNNER_NAME.match(leftover.name).group("runner")
+    logger.warning(_m("Restoring the name of a leftover runner container from an interrupted update", {
+        "leftover": leftover.name,
+        "name": runner_name,
+    }))
+    try:
+        leftover.rename(runner_name)
+        leftover.reload()
+    except Exception as e:
+        # still the runner: used under its leftover name, the rename is retried next cycle
+        logger.error(_m("Failed to rename leftover runner container", {"leftover": leftover.name, "error": str(e)}))
+    return leftover
 
 
 def container_image_digest(client: docker.DockerClient, container: Container) -> Optional[str]:
@@ -270,7 +369,7 @@ def recreate_container(client: docker.DockerClient, old: Container, image_refere
     """
     kwargs = container_create_kwargs(client, old, image_reference)
     name = kwargs["name"]
-    previous_name = f"{name}-previous-{old.short_id}"
+    previous_name = previous_runner_name(name, old.short_id)
     logger.info(_m("Renaming existing container aside", {"name": name, "id": old.short_id, "to": previous_name}))
     old.rename(previous_name)
     try:
