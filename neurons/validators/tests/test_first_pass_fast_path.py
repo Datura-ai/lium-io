@@ -91,6 +91,10 @@ async def test_context_first_pass_needs_the_flag_and_the_caller(monkeypatch, fla
     )
 
     assert ctx.config.first_pass is expected
+    # liumd phase 2 (2d): `unscored` carries the caller's `first_pass` untouched whatever the flag —
+    # the one-call `/verify` gate reads it, so the express lane's first verification makes the
+    # call with the fast path off.
+    assert ctx.config.unscored is first_pass
 
 
 def test_context_config_default_is_not_a_first_pass():
