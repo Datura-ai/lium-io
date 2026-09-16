@@ -151,6 +151,16 @@ class PowerLimitSetOutcome:
     persistence_enabled: bool | None
 
 
+@dataclass(frozen=True)
+class _BelowFloorGpu:
+    """One GPU ``raise_low_power_limits_to_default`` lifts: its limit sits below
+    ``MIN_POWER_LIMIT_RATIO`` x the default it is raised to."""
+
+    gpu_uuid: str
+    current_watts: int
+    default_watts: int
+
+
 # nvidia-smi's own labels; anything else means the GPU did not report the field.
 _PERSISTENCE_BY_LABEL: dict[str, bool] = {"enabled": True, "disabled": False}
 # nvidia-smi could not be read at all — not "the limit is unset", just no answer.
@@ -332,7 +342,7 @@ async def _set_and_log_power_limit(
 ) -> bool:
     # Reviewer contract (PR #1115): every PL change is logged with executor, GPU, before/after, status.
     # Raises only asyncssh.ChannelOpenError, from -pl or the readback: the host refused the session,
-    # so no change was made and nothing is logged here; _set_side_by_side retries the GPU alone,
+    # so the set may or may not have applied and nothing is logged here; _set_side_by_side retries the GPU alone,
     # _set_alone logs it as failed. A refusal of the best-effort -pm 1 is not one: that step logs it
     # and the set goes on.
     await _enable_persistence_mode(ssh, gpu_uuid, log_extra)
@@ -626,20 +636,34 @@ async def raise_low_power_limits_to_default(
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
     target_uuids: list[str] = gpu_uuids if gpu_uuids else list(state_by_uuid)
-    below_floor: list[tuple[str, int, int]] = []  # gpu_uuid, current watts, default watts
+    below_floor: list[_BelowFloorGpu] = []
     for gpu_uuid in target_uuids:
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None:
             continue
         if state.current_watts >= MIN_POWER_LIMIT_RATIO * state.default_watts:
             continue
-        below_floor.append((gpu_uuid, state.current_watts, state.default_watts))
+        below_floor.append(
+            _BelowFloorGpu(
+                gpu_uuid=gpu_uuid,
+                current_watts=state.current_watts,
+                default_watts=state.default_watts,
+            )
+        )
     if not below_floor:
         return 0
+
     # Side by side, like the restore: this runs before the customer's `docker run`.
-    async def raise_one(target: tuple[str, int, int], setter: _Setter) -> bool:
-        gpu_uuid, current_watts, default_watts = target
-        return await setter(ssh, "raise", executor_id, gpu_uuid, current_watts, default_watts, log_extra)
+    async def raise_one(target: _BelowFloorGpu, setter: _Setter) -> bool:
+        return await setter(
+            ssh,
+            "raise",
+            executor_id,
+            target.gpu_uuid,
+            target.current_watts,
+            target.default_watts,
+            log_extra,
+        )
 
     return await _set_side_by_side("raise", below_floor, raise_one, log_extra)
 
