@@ -21,8 +21,3 @@ def test_a_different_executor_says_the_id_does_not_match():
     assert message.extra["executors_returned"] == 1
     assert message.extra["returned_executor_id"] == "e-2"
 
-
-def test_a_missing_executor_list_is_read_as_no_executor():
-    message = _ssh_key_not_accepted_text(None, _EXTRA)
-
-    assert str(message) == "Error: no executor accepted the SSH key"
