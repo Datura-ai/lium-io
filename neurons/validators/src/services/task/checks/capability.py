@@ -144,7 +144,6 @@ class CapabilityCheck:
 # What the probe answers when it never reached the UUID step: the wrapper prints "UUID:  None"
 # after a failed cudaMalloc, and the service reports that as a mismatch against 'None'.
 _NO_UUID = frozenset({"", "none", "null"})
-_UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
 
 
 def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
@@ -158,7 +157,7 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
         return False
     if result.timed_out:
         return True
-    if not (result.error_message or "").startswith(_UUID_MISMATCH_ERROR_PREFIX):
+    if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
         return False
     return (result.returned_uuid or "").strip().lower() in _NO_UUID
 

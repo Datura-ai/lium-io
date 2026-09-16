@@ -160,7 +160,7 @@ class VerifierParams:
 
 
 # The error a probe that ran and answered no (or a wrong) uuid gets. CapabilityCheck classifies
-# only this failure by the probe's stderr: the other empty-uuid results (a sealed blob that failed
+# only this failure by the probe's output (stderr and stdout): the other empty-uuid results (a sealed blob that failed
 # authentication, a stdout that could not be parsed) are not the probe's answer.
 UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
 
