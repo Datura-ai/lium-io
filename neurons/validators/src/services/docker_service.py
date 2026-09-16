@@ -4188,7 +4188,10 @@ class DockerService:
         (see `_parse_dind_nameservers`). Each gets an ACCEPT for udp/tcp port
         53 inserted AFTER the DROP rules, so `-I` puts it above them and only
         DNS to that one address passes; port 80 to a metadata service on the
-        same address stays dropped.
+        same address stays dropped. Every matching ACCEPT already in the chain
+        (left by a build whose teardown failed) is deleted first: a `-C` check
+        would find such a stale rule below the DROP just inserted and skip the
+        insert, and DNS would still be dropped.
 
         `dind_ip`, `cidrs` and `dns_servers` are pre-validated via `ipaddress`,
         so they are shell-safe to interpolate.
@@ -4212,17 +4215,16 @@ class DockerService:
             for ns in dns_servers:
                 for proto in ("udp", "tcp"):
                     rule = f"-s {dind_ip} -d {ns} -p {proto} --dport 53 -j ACCEPT"
-                    lines.append(
-                        f"$IPT -C DOCKER-USER {rule} 2>/dev/null || "
-                        f"$IPT -I DOCKER-USER {rule}"
-                    )
+                    # Not `-C || -I`: a stale ACCEPT below the new DROP satisfies
+                    # `-C` and the insert is skipped. Delete every copy, then
+                    # insert one at the top of the chain.
+                    lines.append(f"while $IPT -D DOCKER-USER {rule} 2>/dev/null; do :; done")
+                    lines.append(f"$IPT -I DOCKER-USER {rule}")
         else:
             for ns in dns_servers:
                 for proto in ("udp", "tcp"):
-                    lines.append(
-                        f"$IPT -D DOCKER-USER -s {dind_ip} -d {ns} -p {proto} --dport 53 -j ACCEPT "
-                        f"2>/dev/null || true"
-                    )
+                    rule = f"-s {dind_ip} -d {ns} -p {proto} --dport 53 -j ACCEPT"
+                    lines.append(f"while $IPT -D DOCKER-USER {rule} 2>/dev/null; do :; done")
             for c in cidrs:
                 lines.append(
                     f"$IPT -D DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || true"
