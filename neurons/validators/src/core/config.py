@@ -569,8 +569,12 @@ class Settings(BaseSettings):
         description="--memory limit for the throwaway DinD build container.",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
-        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60,
-        description="Max seconds to wait for the inner DinD dockerd to become ready.",
+        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
+        description=(
+            "Readiness budget for the inner DinD dockerd: this many one-second probes, and the "
+            "bound on any single probe (a hung `docker info` ends the wait). Zero or negative "
+            "would cancel the only probe, so the setting refuses them at load time."
+        ),
     )
     CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS", default=180, gt=0,
