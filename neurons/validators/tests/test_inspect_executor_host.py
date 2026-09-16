@@ -96,14 +96,18 @@ class _FakeConn(_FakeSSHClient):
         return None
 
 
+_UNSET = object()  # `remove_body` not given: the remove answers SSHKeyRemoved (None is a real body, a JSON null)
+
+
 class _FakeMinerRest:
     """Stands in for ``MinerService._make_rest_request``; answers the submit with the executors given."""
 
-    def __init__(self, executors, submit_status=200, remove_status=200, submit_times_out=False):
+    def __init__(self, executors, submit_status=200, remove_status=200, submit_times_out=False, remove_body=_UNSET):
         self.executors = executors
         self.submit_status = submit_status
         self.remove_status = remove_status
         self.submit_times_out = submit_times_out  # `_make_rest_request` re-raises asyncio.TimeoutError
+        self.remove_body = remove_body  # the 200 body of the remove; _UNSET = SSHKeyRemoved
         self.calls: list[tuple[str, dict]] = []
 
     async def __call__(self, *, method, url, json_data, headers, timeout, log_extra, operation_name):
@@ -117,7 +121,7 @@ class _FakeMinerRest:
         if url.endswith("/ssh-pubkey-remove"):
             if self.remove_status != 200:
                 return self.remove_status, {"message_type": "FailedRequest", "details": "no"}
-            return 200, {"message_type": "SSHKeyRemoved"}
+            return 200, {"message_type": "SSHKeyRemoved"} if self.remove_body is _UNSET else self.remove_body
         raise AssertionError(f"unexpected miner URL {url}")
 
     def urls(self):
@@ -133,12 +137,16 @@ def my_key():
 def wired(monkeypatch):
     """A fake miner + fake sshd; returns (conn, captured connect kwargs, rest, inspect coroutine factory)."""
 
-    def _wire(executors=None, submit_status=200, conn=None, remove_status=200, submit_times_out=False):
+    def _wire(executors=None, submit_status=200, conn=None, remove_status=200, submit_times_out=False, remove_body=_UNSET):
         conn = conn or _FakeConn()
         captured: dict = {}
         monkeypatch.setattr(sct.asyncssh, "connect", _connect_returning(conn, capture=captured))
         rest = _FakeMinerRest(
-            executors if executors is not None else [_executor()], submit_status, remove_status, submit_times_out
+            executors if executors is not None else [_executor()],
+            submit_status,
+            remove_status,
+            submit_times_out,
+            remove_body,
         )
         monkeypatch.setattr(MinerService, "_make_rest_request", rest)
         return conn, captured, rest
@@ -352,6 +360,41 @@ async def test_a_remove_the_miner_did_not_accept_is_a_node_error_and_exit_1(my_k
     assert ieh.exit_code([clean]) == 0
     never_submitted = ieh.NodeReport(target=report.target, error="miner axon lookup failed: x")  # key_removed None
     assert ieh.exit_code([never_submitted]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"message_type": "FailedRequest", "details": "deregister_pubkey: executor not found"},  # the route's except branch
+        {},  # no message_type at all
+        None,  # a JSON `null` body: `response.json()` gives None
+    ],
+)
+async def test_a_200_whose_body_is_not_ssh_key_removed_is_not_a_removal(my_key, wired, body):
+    """Regression (taiberium, #1385): `/api/validator/ssh-pubkey-remove` answers HTTP 200 with a
+    `FailedRequest` body when `deregister_pubkey` raised, and `_remove_ssh_key_via_rest` returned
+    True on the status alone, so the node exited 0 with the key still installed."""
+    conn, captured, rest = wired(remove_body=body)
+
+    report = await _inspect(my_key)
+
+    assert report.key_removed is False
+    assert report.error == "key remove not accepted by miner: the key may still be installed, re-run this node"
+    assert rest.urls() == ["ssh-pubkey-submit", "ssh-pubkey-remove"]
+    assert ieh.exit_code([report]) == 1
+
+
+def test_runner_log_is_read_next_to_watchtowers():
+    """Regression (taiberium, #1385): only Watchtower's log was read, and a `docker compose up --wait`
+    that never came up healthy is in the runner's entrypoint output, not Watchtower's."""
+    commands = dict(ieh.COMMANDS)
+    assert commands["runner_log"].startswith(f"docker logs {ieh.RUNNER_CONTAINER} --tail 50")
+    # the fallback finds the runner by service name when the compose project is not `executor`
+    assert "docker ps -qf name=executor-runner" in commands["runner_log"]
+    assert ieh.RUNNER_CONTAINER == "executor-executor-runner-1" and ieh.WATCHTOWER_CONTAINER == "executor-watchtower-1"
+    labels = [label for label, _ in ieh.COMMANDS]
+    assert labels.index("runner_log") == labels.index("watchtower_log") + 1
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,9 @@ is the running runner's digest against Docker Hub's ``compute-subnet-executor-ru
 image Watchtower updates. Running digests come from every running container's image (by the
 image's repository, as ``machine_scrape`` finds the executor), so zero matches read ``none`` and
 several containers on different digests are listed by name instead of one being picked.
+``watchtower_log`` and ``runner_log`` are the last 50 lines of each container: Watchtower says
+what it pulled and restarted; the runner (``executor-executor-runner-1``) says whether its
+``docker compose up --wait`` came up healthy, which is where a stale executor's failed start shows.
 
 Usage (from the validator checkout, with the validator's env loaded):
 
@@ -83,6 +86,10 @@ from services.ssh_service import SSHService  # noqa: E402
 RUNNER_IMAGE = "daturaai/compute-subnet-executor-runner"
 EXECUTOR_IMAGE = "daturaai/compute-subnet-executor"
 WATCHTOWER_CONTAINER = "executor-watchtower-1"
+# the compose service `executor-runner` (neurons/executor/docker-compose.yml): its entrypoint runs
+# `docker compose up --pull always --detach --wait --force-recreate`, so a `--wait` that failed
+# (the executor never reported healthy) is in THIS log, not in Watchtower's
+RUNNER_CONTAINER = "executor-executor-runner-1"
 NO_DAEMON_JSON = "NO_DAEMON_JSON"
 DAEMON_JSON_IS_DIR = "DAEMON_JSON_IS_DIR"  # docker made a directory because the host file did not exist at first `up`
 
@@ -119,6 +126,13 @@ COMMANDS: tuple[tuple[str, str], ...] = (
         "watchtower_log",
         f"docker logs {WATCHTOWER_CONTAINER} --tail 50 2>&1"
         " || docker logs $(docker ps -qf name=watchtower) --tail 50 2>&1",
+    ),
+    (
+        # `docker compose up --wait` failures are here (the runner's entrypoint, `set -e`, exits
+        # on them and the container restarts, so the last attempt's lines are at the tail)
+        "runner_log",
+        f"docker logs {RUNNER_CONTAINER} --tail 50 2>&1"
+        " || docker logs $(docker ps -qf name=executor-runner) --tail 50 2>&1",
     ),
     ("cgroup", "head -1 /proc/1/cgroup; head -1 /proc/self/cgroup"),
     ("dockerenv", "test -f /.dockerenv && echo IN_CONTAINER || echo NO_DOCKERENV; hostname"),

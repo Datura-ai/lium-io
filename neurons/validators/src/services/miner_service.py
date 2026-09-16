@@ -1939,7 +1939,9 @@ class MinerService:
             log_extra: Additional logging context
 
         Returns:
-            True if removal was successful (status 200), False otherwise.
+            True only when the miner answered 200 with an ``SSHKeyRemoved`` body. The
+            route answers 200 with a ``FailedRequest`` body when ``deregister_pubkey``
+            raised, so the status alone does not say the key is gone. False otherwise.
             Logs warnings for failures but does not raise exceptions.
         """
         try:
@@ -1950,7 +1952,7 @@ class MinerService:
                 miner_hotkey=miner_hotkey,
             )
 
-            status, _ = await self._make_rest_request(
+            status, response_data = await self._make_rest_request(
                 method="POST",
                 url=f"{base_url}/api/validator/ssh-pubkey-remove",
                 json_data=self._serialize_request(remove_request),
@@ -1960,13 +1962,17 @@ class MinerService:
                 operation_name="SSH key removal",
             )
 
-            if status != 200:
+            body = response_data if isinstance(response_data, dict) else {}
+            message_type = body.get("message_type")
+            if status != 200 or message_type != RequestType.SSHKeyRemoved.value:
                 logger.warning(
                     _m(
                         "Failed to remove SSH key via REST API. Validator key may still be present on miner",
                         extra=get_extra_info({
                             **log_extra,
                             "status": status,
+                            "message_type": message_type,
+                            "details": body.get("details"),
                             "miner_hotkey": miner_hotkey,
                             "executor_id": executor_id,
                         }),
