@@ -1,3 +1,6 @@
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -181,3 +184,49 @@ async def test_cancel_waits_for_runner_then_reports_terminal_status(
     cancel_command = ssh_client.run.await_args_list[1].args[0]
     assert f"{OPERATION_ID}.cancel" in cancel_command
     assert "kill -0" in cancel_command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_status, expected", [(0, True), (3, False)])
+async def test_supports_bootstrap_restore_asks_the_executor_models_for_the_field(
+    exit_status, expected
+) -> None:
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status, stderr=""))
+
+    supported = await storage_operations.supports_bootstrap_restore(ssh_client, "/usr/bin/python3")
+    assert supported is expected
+
+    command = ssh_client.run.await_args.args[0]
+    assert command.startswith("/usr/bin/python3 -c ")
+    assert "WorkspaceSpec.__dataclass_fields__" in command and "'bootstrap'" in command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_status, stderr",
+    [
+        (127, "bash: /usr/bin/python3: No such file or directory"),
+        (1, "ModuleNotFoundError: No module named 'storage'"),
+    ],
+)
+async def test_a_probe_that_cannot_run_is_reported_not_read_as_an_old_image(
+    exit_status, stderr
+) -> None:
+    # review (taiberium): every non-zero exit used to read as "old executor image"; a missing
+    # interpreter (127) or a broken import (1) is a different failure and says so
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=SimpleNamespace(exit_status=exit_status, stderr=stderr))
+
+    with pytest.raises(RuntimeError, match=rf"exit {exit_status}") as raised:
+        await storage_operations.supports_bootstrap_restore(ssh_client, "/usr/bin/python3")
+    assert stderr[-30:] in str(raised.value)
+
+
+def test_bootstrap_probe_finds_the_field_in_this_repo_s_executor_models() -> None:
+    # The probe imports the executor's own storage.models; run it against this checkout's copy
+    # so a renamed field or a wrong sys.path root fails here, not on every encrypted create.
+    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
+    probe = storage_operations._BOOTSTRAP_PROBE.replace("/root/app/src", str(executor_src))
+
+    assert subprocess.run([sys.executable, "-c", probe], check=False).returncode == 0
