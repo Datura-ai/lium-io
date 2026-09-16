@@ -32,6 +32,7 @@ COMPOSE := docker compose --env-file stack.env $(COMPOSE_FILES)
 
 # E2E_CACHE=gha (CI only): bake the images with a GitHub Actions layer cache. One scope per image: a shared scope
 # lets the last export overwrite the others' index. ignore-error: a failed export never fails the build.
+# fs.read=..: the build contexts read ../neurons and ../datura; buildx refuses them otherwise.
 E2E_CACHE ?=
 BAKE_IMAGES := dind executor miner validator tester
 BAKE_CACHE = $(foreach i,$(BAKE_IMAGES),--set '$(i).cache-from=type=$(E2E_CACHE),scope=e2e-$(i)' --set '$(i).cache-to=type=$(E2E_CACHE),scope=e2e-$(i),mode=max,ignore-error=true')
@@ -53,7 +54,7 @@ ifeq ($(E2E_CACHE),)
 	$(COMPOSE) build
 	$(COMPOSE) --profile tools build tester
 else
-	docker buildx bake $(COMPOSE_FILES) --load $(BAKE_CACHE)
+	docker buildx bake $(COMPOSE_FILES) --allow=fs.read=.. --load $(BAKE_CACHE)
 endif
 
 up:
