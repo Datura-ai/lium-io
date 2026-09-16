@@ -17,6 +17,7 @@ SSH path until the executor has a key of its own.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -294,6 +295,22 @@ IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:@+-]{0,511}$")
 PROTOCOLS = ("tcp", "udp")
 RESTART_POLICIES = ("no", "always", "on-failure", "unless-stopped")
 PERMISSIONS_PATTERN = re.compile(r"^[rwm]{1,3}$")
+# A mount target or a device path inside the container: absolute, and only characters docker's
+# `binds` / `devices` strings carry unambiguously — no `:` (the field separator of both), no
+# whitespace, no control characters. Wide enough for a template's own volume path.
+CONTAINER_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9_.+/@~=,%-]*$")
+# `--shm-size`: a byte count with an optional k/m/g unit — the form the validator's own
+# `CustomOptions._sanitize_shm_size` lets through (`^\d+[kmg]?$`, case-insensitive).
+SHM_SIZE_PATTERN = re.compile(r"^[0-9]{1,15}[kmgKMG]?$")
+
+
+def host_key_sha256(host_key_line: str | None) -> str | None:
+    """The digest both ends compute of the executor's SSH host public key line (the one the miner
+    reports and the validator pins for its SSH connections): the rent intent is bound to it.
+    None for no key — nothing to bind to, so the SDK path runs."""
+    if not host_key_line or not host_key_line.strip():
+        return None
+    return hashlib.sha256(host_key_line.strip().encode("utf-8")).hexdigest()
 
 
 class WireError(ValueError):
@@ -389,8 +406,8 @@ def spec_from_wire(raw: Any) -> ContainerRunSpec:
         for v in _objects(raw, "volumes")
     )
     for volume in volumes:
-        if not volume.target.startswith("/"):
-            raise WireError("volume target is not an absolute path")
+        if not CONTAINER_PATH_PATTERN.fullmatch(volume.target):
+            raise WireError("volume target is not an absolute path of plain characters")
     ulimits = tuple(
         ContainerUlimit(
             name=_str(u, "name", required=True),
@@ -412,8 +429,10 @@ def spec_from_wire(raw: Any) -> ContainerRunSpec:
             device.permissions
         ):
             raise WireError("device is not a /dev path with rwm permissions")
-        if device.path_in_container is not None and not device.path_in_container.startswith("/"):
-            raise WireError("device path in container is not absolute")
+        if device.path_in_container is not None and not CONTAINER_PATH_PATTERN.fullmatch(
+            device.path_in_container
+        ):
+            raise WireError("device path in container is not an absolute path of plain characters")
     device_requests = tuple(
         GpuDeviceRequest(
             count=_int(r, "count", lo=-1),
@@ -433,6 +452,9 @@ def spec_from_wire(raw: Any) -> ContainerRunSpec:
     network = _str(raw, "network")
     if network is not None and not NAME_PATTERN.fullmatch(network):
         raise WireError("network is not a docker network name")
+    shm_size = _str(raw, "shm_size")
+    if shm_size is not None and not SHM_SIZE_PATTERN.fullmatch(shm_size):
+        raise WireError("shm_size is not a byte count with an optional k/m/g unit")
     return ContainerRunSpec(
         image=image,
         name=name,
@@ -450,7 +472,7 @@ def spec_from_wire(raw: Any) -> ContainerRunSpec:
         cpu_count=_int(raw, "cpu_count", lo=1),
         memory_gb=_int(raw, "memory_gb", lo=1),
         storage_limit_gb=_int(raw, "storage_limit_gb", lo=1),
-        shm_size=_str(raw, "shm_size"),
+        shm_size=shm_size,
         entrypoint=_str(raw, "entrypoint"),
         network=network,
     )

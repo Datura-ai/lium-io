@@ -26,7 +26,7 @@ from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload, SignaturePayload
 from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
 from payloads.rent import CAPABILITY as LOCAL_RENT_CAPABILITY, RentIntent, RentIntentBody
-from services.local_rent_service import BusyError as RentBusyError, LocalRentService
+from services.local_rent_service import BusyError as RentBusyError, LocalRentService, NonceUsedError
 from services.ssh_service import SSHService
 from dependencies.auth import (
     match_validator_hotkey,
@@ -543,10 +543,12 @@ async def local_rent(request: Request):
     (`_is_loopback_client`), and the miner's port-forward from the network can neither read the
     spec nor rewrite what was made. `/version` names the port as `local_rent_port`.
 
-    Auth, nonce and window exactly as `/verify` (the intent is signed as sent, replay refused).
-    Flag off → 404; the validator treats every non-200 as "use SSH". Nonces are shared with
-    `/verify`: one cache, one rule. Busy → 409 before the nonce is claimed, so the same signed
-    intent may be re-sent.
+    Auth, nonce, window and miner target exactly as `/verify` (the intent is signed as sent,
+    replay refused, `miner_hotkey` must be this executor's miner); on top, `ssh_host_key_sha256`
+    must be this host's. Flag off → 404; the validator treats every non-200 as "use SSH". Nonces
+    are shared with `/verify`: one cache, one rule. Busy → 409 with the nonce NOT claimed, so the
+    same signed intent may be re-sent: the service decides busy and claims the nonce under one
+    lock (`LocalRentService.run`), so no second guard can burn a nonce it then refuses.
     """
     if not settings.EXECUTOR_LOCAL_RENT_ENABLED:
         raise HTTPException(status_code=404, detail="Not Found")
@@ -572,22 +574,22 @@ async def local_rent(request: Request):
     await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))
     body: RentIntentBody = intent
 
-    refused = check_intent_window(body, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS)
+    refused = check_intent_window(
+        body, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
+    ) or check_intent_target(body, settings.MINER_HOTKEY_SS58_ADDRESS)
     if refused:
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
     service = _get_local_rent_service()
     refused = service.refuse_intent(body)
     if refused:
         raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
-    if service.busy:
-        raise HTTPException(status_code=409, detail="a rental create is already running")
-    if not _local_verify_nonces.claim(body.nonce, float(body.expires_at)):
-        raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
 
     try:
-        result = await service.run(body)
+        result = await service.run(body, lambda: _local_verify_nonces.claim(body.nonce, float(body.expires_at)))
     except RentBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except NonceUsedError:
+        raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
     logger.info(
         "local rent done nonce=%s elapsed_ms=%d deadline_hit=%s rolled_back=%s steps=%s",
         body.nonce,

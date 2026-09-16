@@ -53,13 +53,14 @@ from services.local_rent_client import (
     parse_answer,
 )
 from services.local_verify_client import canonical_intent_message
-from tests.test_local_verify import _TUNNELLED_SOURCE_PORTS, FakeSSH
 
 from core.config import settings
 from services import local_rent_client as lrc
+from tests.test_local_verify import _TUNNELLED_SOURCE_PORTS, FakeSSH
 
 EXECUTOR_UUID = "11111111-2222-3333-4444-555555555555"
 HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExecutorHostKey0000000000000000000000000000 root@executor"
+MINER_HOTKEY = "5MinerHotkeyForTheExecutorsProvider000000000000"
 
 
 @pytest.fixture(scope="module")
@@ -169,6 +170,16 @@ def test_a_zero_limit_travels_as_no_limit_and_builds_the_same_host_config():
         (lambda w: w["devices"].append({"path_on_host": "/etc/passwd"}), "device"),
         (lambda w: w["devices"].append({"path_on_host": "/dev/nvidia1", "permissions": "rwx"}), "device"),
         (lambda w: w["devices"].append({"path_on_host": "/dev/nvidia1", "path_in_container": "relative"}), "device"),
+        # a `:`, whitespace or a control character in a mount target or a device path would land
+        # in docker's `binds` / `devices` strings (`source:target:mode`) — refused at the wire
+        (lambda w: w["volumes"].append({"source": "pod_abc_vol", "target": "/root:rw"}), "volume target"),
+        (lambda w: w["volumes"].append({"source": "pod_abc_vol", "target": "/root\n"}), "volume target"),
+        (lambda w: w["volumes"].append({"source": "pod_abc_vol", "target": "/root x"}), "volume target"),
+        (lambda w: w["devices"].append({"path_on_host": "/dev/nvidia1", "path_in_container": "/dev/x:rwm"}), "device path"),
+        # `shm_size` is interpolated into the host config as sent: a byte count with a unit only
+        (lambda w: w.update(shm_size="16g;x"), "shm_size"),
+        (lambda w: w.update(shm_size="lots"), "shm_size"),
+        (lambda w: w.update(shm_size="16 g"), "shm_size"),
     ],
 )
 def test_a_wire_document_outside_a_rentals_shape_is_refused(mutate, why):
@@ -213,6 +224,10 @@ def test_only_a_spec_with_nothing_private_may_travel_on_http():
     assert not carries_only_public_fields(_spec(environment={**PUBLIC_ENVIRONMENT, "HF_TOKEN": "hf_x"}))
     assert not carries_only_public_fields(_spec(environment={}))
     assert eligible(_spec(environment={**PUBLIC_ENVIRONMENT, "JUPYTER_PASSWORD": "t"}), HOST_KEY) == "private_fields"
+    # a template volume path the executor's wire parse would refuse (a `:`) takes the SDK path here,
+    # not one wasted round trip; a plain template path (`/data@v2`, `/mnt/a,b`) travels
+    assert eligible(_spec(volumes=(VolumeMount("pod_abc_vol", "/root:x"),)), HOST_KEY) == "volume_target_charset"
+    assert eligible(_spec(volumes=(VolumeMount("pod_abc_vol", "/data@v2"), VolumeMount("ext-vol_1", "/mnt/a,b"))), HOST_KEY) is None
 
 
 def test_create_and_start_issues_the_sdk_paths_exact_calls():
@@ -261,8 +276,11 @@ def test_create_and_start_hands_the_id_over_before_start_and_labels_only_when_as
 
 def test_the_intent_carries_the_spec_and_asks_for_sshd_only_when_the_image_ships_it():
     spec = _spec()
-    with_sshd = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=40001, ssh_wait_s=10, now=1000)
+    with_sshd = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=40001, ssh_wait_s=10, now=1000)
     assert with_sshd["schema"] == SCHEMA and with_sshd["executor_uuid"] == EXECUTOR_UUID
+    # the miner, as on `/verify`: with the host-key digest it binds the intent to one provider's one host
+    assert with_sshd["miner_hotkey"] == MINER_HOTKEY
+    assert with_sshd["nonce"] == with_sshd["nonce"].lower() and len(with_sshd["nonce"]) == 32
     assert with_sshd["ssh_host_key_sha256"] == host_key_sha256(HOST_KEY) == host_key_sha256(f"  {HOST_KEY}\n")
     assert len(with_sshd["ssh_host_key_sha256"]) == 64
     assert with_sshd["issued_at"] == 1000 and with_sshd["expires_at"] == 1120
@@ -270,13 +288,13 @@ def test_the_intent_carries_the_spec_and_asks_for_sshd_only_when_the_image_ships
     assert with_sshd["steps"]["image"] is True
     assert spec_from_wire(with_sshd["steps"]["container"]) == spec
     assert with_sshd["steps"]["ready"] == {"running_timeout_s": 10, "ssh_host_port": 40001, "ssh_timeout_s": 10}
-    without = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=None, ssh_wait_s=10)
+    without = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=None, ssh_wait_s=10)
     assert without["steps"]["ready"] == {"running_timeout_s": 10}
-    no_wait = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=40001, ssh_wait_s=0)
+    no_wait = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=40001, ssh_wait_s=0)
     assert no_wait["steps"]["ready"] == {"running_timeout_s": 10}
     assert without["nonce"] != with_sshd["nonce"]
     # an operator's LOCAL_RENT_SSHD_WAIT_SECONDS=90 is not a 422 from the executor's `le=60` on every rent
-    long_wait = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=40001, ssh_wait_s=90)
+    long_wait = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=spec, deadline_s=40, ssh_host_port=40001, ssh_wait_s=90)
     assert long_wait["steps"]["ready"]["ssh_timeout_s"] == 60
 
 
@@ -305,7 +323,7 @@ def _answer(intent, **overrides) -> dict:
 
 
 def test_a_good_answer_reads_as_created():
-    intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
+    intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
     answer = parse_answer(_answer(intent), intent=intent, round_trip_ms=1600)
     assert answer.created and not answer.may_hold_the_name
     assert answer.executor_version == "4.2.0" and answer.round_trip_ms == 1600
@@ -331,7 +349,7 @@ def test_ready_evidence_the_model_refuses_makes_the_step_malformed_not_created(r
     took the step's `ok` at its word — an executor answering a shape this validator does not know
     read as created. Now the evidence is parsed as the executor's own model or the step is
     `malformed`: not created, and the name is freed before the SDK path's own `docker run`."""
-    intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
+    intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
     raw = _answer(intent)
     raw["steps"]["ready"]["data"] = ready_data
     answer = parse_answer(raw, intent=intent, round_trip_ms=1)
@@ -366,7 +384,7 @@ def test_ready_evidence_the_model_refuses_makes_the_step_malformed_not_created(r
     ],
 )
 def test_anything_short_of_made_and_running_is_not_created(overrides, holds_the_name):
-    intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
+    intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
     answer = parse_answer(_answer(intent, **overrides), intent=intent, round_trip_ms=1)
     assert not answer.created
     assert answer.may_hold_the_name is holds_the_name
@@ -382,7 +400,7 @@ def test_anything_short_of_made_and_running_is_not_created(overrides, holds_the_
     ],
 )
 def test_an_answer_to_another_intent_is_refused(mutate, reason):
-    intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
+    intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
     raw = _answer(intent)
     mutate(raw)
     with pytest.raises(LocalRentUnavailable) as exc:
@@ -457,6 +475,8 @@ class FakeExecutor:
             return web.json_response({"detail": "nonce already used"}, status=409)
         if raw.get("ssh_host_key_sha256") != host_key_sha256(HOST_KEY):
             return web.json_response({"detail": "Intent refused: bound to another executor"}, status=401)
+        if raw.get("miner_hotkey") != MINER_HOTKEY:  # the route's check_intent_target
+            return web.json_response({"detail": "Intent refused: intent is for another miner's executor"}, status=401)
         self.seen.add(raw["nonce"])
         self.intents.append(raw)
         await asyncio.sleep(self.sleep)
@@ -477,7 +497,7 @@ def test_the_client_posts_a_signed_intent_through_the_tunnel_to_the_advertised_p
             ssh = FakeSSH()
             client = _client(keypair)
             port = (await client.advertised(executor.executor_info)).local_rent_port
-            intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
+            intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=40001)
             answer = await client.rent(ssh, port, intent)
             return executor, ssh, port, executor.server.port, answer
 
@@ -504,7 +524,7 @@ def test_a_version_without_a_rent_port_names_no_tunnel_target(keypair):
 def test_every_non_200_is_a_labelled_unavailable(keypair, status, reason):
     async def scenario():
         async with FakeExecutor(keypair, status=status) as executor:
-            intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
+            intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
             with pytest.raises(LocalRentUnavailable) as exc:
                 await _client(keypair).rent(FakeSSH(), executor.server.port, intent)
             return exc.value.reason
@@ -519,7 +539,7 @@ def test_a_tunnel_to_a_port_nobody_listens_on_is_refused_and_may_have_acted(keyp
     async def scenario():
         async with FakeExecutor(keypair) as executor:
             unused = executor.server.port + 1 if executor.server.port < 65535 else executor.server.port - 1
-            intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
+            intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
             with pytest.raises(LocalRentUnavailable) as exc:
                 await _client(keypair).rent(FakeSSH(), unused, intent)
             return exc.value, executor.intents
@@ -532,7 +552,7 @@ def test_a_tunnel_to_a_port_nobody_listens_on_is_refused_and_may_have_acted(keyp
 def test_a_slow_executor_is_a_timeout(keypair):
     async def scenario():
         async with FakeExecutor(keypair, sleep=1.5) as executor:
-            intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
+            intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
             with pytest.raises(LocalRentUnavailable) as exc:
                 await _client(keypair, timeout_s=1).rent(FakeSSH(), executor.server.port, intent)
             return exc.value.reason
@@ -545,7 +565,7 @@ def test_a_stranger_cannot_make_the_executor_create(keypair):
 
     async def scenario():
         async with FakeExecutor(keypair) as executor:
-            intent = build_intent(executor_uuid=EXECUTOR_UUID, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
+            intent = build_intent(executor_uuid=EXECUTOR_UUID, miner_hotkey=MINER_HOTKEY, host_key=HOST_KEY, spec=_spec(), deadline_s=40, ssh_host_port=None)
             with pytest.raises(LocalRentUnavailable) as exc:
                 await _client(stranger).rent(FakeSSH(), executor.server.port, intent)
             return exc.value.reason, executor.intents
@@ -566,6 +586,7 @@ def _create(svc, executor_info, keypair, spec, *, image_ships_sshd=True, docker_
     return asyncio.run(
         svc._create_with_local_rent(
             executor_info=executor_info,
+            miner_hotkey=MINER_HOTKEY,
             keypair=keypair,
             ssh_client=FakeSSH(),
             docker_client=docker_client or Mock(remove_container=AsyncMock()),
@@ -593,7 +614,7 @@ def _nothing_posted(svc, keypair, *, executor_info=None, spec=None):
     async def scenario():
         async with FakeExecutor(keypair) as executor:
             answer = await svc._create_with_local_rent(
-                executor_info=executor_info or executor.executor_info, keypair=keypair, ssh_client=FakeSSH(),
+                executor_info=executor_info or executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(),
                 docker_client=Mock(remove_container=AsyncMock()), run_spec=spec or _spec(),
                 image_ships_sshd=True, default_extra={"executor_id": EXECUTOR_UUID},
             )
@@ -625,7 +646,7 @@ def test_an_executor_without_a_pinned_host_key_gets_no_intent(svc, keypair, monk
         async with FakeExecutor(keypair) as executor:
             info = executor.executor_info.model_copy(update={"ssh_host_key": None})
             answer = await svc._create_with_local_rent(
-                executor_info=info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
+                executor_info=info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
             # `posts`, not `intents`: the fake answers an unbound intent 401 before it records it,
@@ -645,7 +666,7 @@ def test_the_intent_is_bound_to_the_executors_host_key(svc, keypair, monkeypatch
         async with FakeExecutor(keypair) as executor:
             info = executor.executor_info.model_copy(update={"ssh_host_key": "ssh-ed25519 AAAA-other root@other"})
             answer = await svc._create_with_local_rent(
-                executor_info=info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
+                executor_info=info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
             return answer, executor.intents
@@ -662,11 +683,11 @@ def test_a_created_answer_is_taken_and_the_sshd_wait_is_asked_for_only_when_the_
     async def scenario():
         async with FakeExecutor(keypair) as executor:
             taken = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
             also = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=False, default_extra={},
             )
             return taken, also, executor.intents
@@ -687,7 +708,7 @@ def test_the_sshd_wait_ships_off(svc, keypair, monkeypatch):
     async def scenario():
         async with FakeExecutor(keypair) as executor:
             await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
             return executor.intents
@@ -702,7 +723,7 @@ def test_an_executor_without_the_route_means_the_sdk_path(svc, keypair, monkeypa
     async def scenario():
         async with FakeExecutor(keypair, status=404) as executor:
             return await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
 
@@ -729,7 +750,7 @@ def test_an_executor_that_names_no_rent_port_is_the_sdk_path_and_nothing_is_post
         ssh = FakeSSH()
         async with FakeExecutor(keypair, advertise=False) as executor:
             answer = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=ssh, docker_client=Mock(),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=ssh, docker_client=Mock(),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
             return answer, executor.intents, ssh.forwards
@@ -748,7 +769,7 @@ def test_an_old_images_422_is_a_no_route_answer_and_the_name_is_left_alone(svc, 
         removed = AsyncMock()
         async with FakeExecutor(keypair, status=422) as executor:
             answer = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(),
                 docker_client=Mock(remove_container=removed),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
@@ -770,7 +791,7 @@ def test_a_non_answer_after_the_intent_left_frees_the_name_before_the_sdk_run(sv
         removed = AsyncMock()
         async with FakeExecutor(keypair, **executor_kw) as executor:
             answer = await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(),
                 docker_client=Mock(remove_container=removed),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
@@ -822,7 +843,7 @@ def test_a_container_the_executor_made_but_did_not_see_running_is_removed_before
     async def scenario():
         async with FakeExecutor(keypair, answer=answer) as executor:
             return await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=docker_client,
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=docker_client,
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
 
@@ -841,7 +862,7 @@ def test_a_create_the_deadline_cut_is_freed_by_name_before_the_sdk_run(svc, keyp
     async def scenario():
         async with FakeExecutor(keypair, answer=answer) as executor:
             return await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(remove_container=removed),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(remove_container=removed),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
 
@@ -863,7 +884,7 @@ def test_a_rolled_back_failure_leaves_the_name_alone(svc, keypair, monkeypatch):
     async def scenario():
         async with FakeExecutor(keypair, answer=answer) as executor:
             return await svc._create_with_local_rent(
-                executor_info=executor.executor_info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(remove_container=removed),
+                executor_info=executor.executor_info, miner_hotkey=MINER_HOTKEY, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(remove_container=removed),
                 run_spec=_spec(), image_ships_sshd=True, default_extra={},
             )
 

@@ -48,6 +48,8 @@ from services.local_rent_service import (
     NONCE_LABEL,
     BusyError,
     LocalRentService,
+    NonceUsedError,
+    _RentAttempt,
     host_gateway_ip,
     host_key_sha256,
     refuse_spec,
@@ -216,6 +218,7 @@ def _body(**overrides) -> RentIntentBody:
         issued_at=now,
         expires_at=now + 120,
         executor_uuid=EXECUTOR_UUID,
+        miner_hotkey=settings.MINER_HOTKEY_SS58_ADDRESS,
         ssh_host_key_sha256=host_key_sha256(HOST_KEY),
         deadline_s=30,
         steps=RentSteps(
@@ -393,7 +396,18 @@ def test_a_bad_spec_is_refused_before_docker_is_touched():
         (dict(volumes=(VolumeMount("/", "/host"),)), "host path"),
         (dict(volumes=(VolumeMount("/var/run/docker.sock", "/var/run/docker.sock"),)), "host path"),
         (dict(volumes=(VolumeMount("/var/run/lium-dstack/../docker.sock", "/x"),)), "host path"),
+        # the broker socket read-write, or its whole IPC directory: the honest path binds the one
+        # socket read-only (`cvm_quote_broker.quote_broker_socket_mount`) and nothing else
+        (dict(volumes=(VolumeMount("/var/run/lium-dstack/dstack.sock", "/var/run/dstack.sock"),)), "not read-only"),
+        (dict(volumes=(VolumeMount("/var/run/lium-dstack/", "/x", read_only=True),)), "host path"),
+        (dict(volumes=(VolumeMount("/var/run/lium-dstack/other.sock", "/x", read_only=True),)), "host path"),
         (dict(volumes=(VolumeMount("../etc", "/x"),)), "volume name"),
+        # a sibling of a rental's device node is not one: the names are spelled out, not prefixed
+        (dict(devices=(DeviceMount("/dev/nvidia-foo"),)), "device"),
+        (dict(devices=(DeviceMount("/dev/nvidia0extra"),)), "device"),
+        (dict(devices=(DeviceMount("/dev/fuse2"),)), "device"),
+        (dict(devices=(DeviceMount("/dev/net/tun0"),)), "device"),
+        (dict(devices=(DeviceMount("/dev/infiniband/../sda"),)), "device"),
         (dict(runtime="kata"), "runtime"),
         (dict(cap_add=("SYS_ADMIN",)), "capabilities"),
         (dict(devices=(DeviceMount("/dev/sda"),)), "device"),
@@ -433,6 +447,13 @@ def test_a_rentals_own_extras_pass_the_executors_policy():
     )
     assert refuse_spec(spec) is None
     assert refuse_spec(_spec(runtime=None)) is None
+    # every node `nvidia_devices.shared_device_nodes_command` can list on a whole-host rental
+    nodes = (
+        "/dev/nvidia7", "/dev/nvidiactl", "/dev/nvidia-modeset", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools",
+        "/dev/nvidia-nvswitchctl", "/dev/nvidia-nvswitch3", "/dev/nvidia-nvlink12", "/dev/nvidia-caps/nvidia-cap1",
+        "/dev/nvidia-caps-imex-channels/channel0", "/dev/infiniband/rdma_cm", "/dev/dri/renderD128",
+    )
+    assert refuse_spec(_spec(devices=tuple(DeviceMount(n) for n in nodes))) is None
 
 
 @pytest.mark.parametrize(
@@ -734,6 +755,105 @@ def test_second_concurrent_intent_is_refused_as_busy():
     assert result.steps["container"].status == "ok"
 
 
+def test_a_busy_refusal_never_claims_the_nonce_and_a_used_nonce_creates_nothing():
+    """Regression (review on this PR): the route checked `busy`, claimed the nonce, then `run`
+    re-checked `_busy` — a 409 from that second guard would have burnt the nonce, so the same
+    signed intent could not be re-sent as the contract says. One guard now: `run` decides busy and
+    claims the nonce under the same lock; a busy refusal is answered with the claim never made."""
+    api = FakeDockerApi()
+    api.create_delay_s = 0.3
+    service = _service(api)
+    claims: list[str] = []
+
+    async def scenario():
+        first = asyncio.ensure_future(service.run(_body(), lambda: claims.append("first") or True))
+        await asyncio.sleep(0.05)
+        with pytest.raises(BusyError):
+            await service.run(_body(), lambda: claims.append("second") or True)
+        result = await first
+        # a nonce seen before is refused under the lock, before any docker call
+        with pytest.raises(NonceUsedError):
+            await service.run(_body(), lambda: False)
+        return result
+
+    result = asyncio.run(scenario())
+    assert result.steps["container"].status == "ok"
+    assert claims == ["first"]
+    assert [c[0] for c in api.calls].count("create") == 1
+
+
+def test_the_deadline_counts_the_docker_client_open_too():
+    """Regression (review on this PR): the deadline clock started after `_open_api`, so a slow
+    client constructor (its own 10 s bound) was time the validator's wait did not have; the
+    executor could answer after the validator had force-removed the name. The clock now starts at
+    the top of the run: a 0.7 s open plus a 0.6 s create do not fit a 1 s deadline (under the old
+    clock the create landed at 0.6 s of a 1 s window and the run answered ok). The cut create is
+    still in the daemon's hands when the rollback looks for it; the label lookup is delayed past
+    the create so the by-label removal is what proves nothing of ours remains."""
+    api = FakeDockerApi()
+    api.create_delay_s = 0.6
+    api.list_delay_s = 0.8  # the by-label find lands at ~1.8 s, well after the create finished at ~1.3 s
+
+    def slow_open():
+        time.sleep(0.7)
+        return api
+
+    result = asyncio.run(_service(api, max_deadline_s=1, docker_api=slow_open).run(_body()))
+    assert result.deadline_hit is True
+    assert result.steps["container"].status == "timeout"
+    assert result.rolled_back is True and api.made == {} and len(api.removed()) == 1
+    assert [c[0] for c in api.calls].count("list") == 1  # found by label: the create had not answered when the deadline cut it
+
+
+def test_the_rollback_runs_on_its_own_worker_while_both_rent_workers_are_wedged():
+    """Regression (review on this PR): `asyncio.wait_for` cancels the await, not the thread; two
+    creates wedged in docker-py held both `_rent_executor` workers and the rollback queued behind
+    them past the validator's budget. The rollback has its own executor: with both rent workers
+    blocked, a remove by id still lands within its own bound."""
+    api = FakeDockerApi()
+    release = threading.Event()
+    wedged = [lrs._rent_executor.submit(release.wait) for _ in range(2)]
+    try:
+        run = _RentAttempt(_service(api), api, _body(), {})
+        api.made["pod_abc"] = {"Id": "f" * 64, "Labels": {NONCE_LABEL: run.body.nonce}, "State": {}}
+        run.container_id = "f" * 64
+        run.create_attempted = True
+
+        async def scenario():
+            return await asyncio.wait_for(run.rollback(), timeout=2.0)
+
+        assert asyncio.run(scenario()) is True
+        assert api.removed() == ["f" * 64] and api.made == {}
+        assert all(not f.done() for f in wedged)  # the rent workers were still held throughout
+    finally:
+        release.set()
+        for f in wedged:
+            f.result(timeout=5)
+
+
+def test_executor_starts_uvicorn_without_proxy_headers():
+    """Regression pin (review on this PR): `/rent` and `/verify` admit loopback peers only by
+    `request.client`, which is the TCP peer ONLY while uvicorn ignores `X-Forwarded-For`. The
+    `uvicorn.run(...)` call in `executor.py` must keep `proxy_headers=False`; read from the source
+    tree (the module starts the server at import under `__main__`, so it is not imported here)."""
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "src" / "executor.py").read_text()
+    runs = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "uvicorn"
+    ]
+    assert len(runs) == 1, "exactly one uvicorn.run(...) call is expected in executor.py"
+    proxy_headers = [kw.value for kw in runs[0].keywords if kw.arg == "proxy_headers"]
+    assert proxy_headers and isinstance(proxy_headers[0], ast.Constant) and proxy_headers[0].value is False
+
+
 def test_host_gateway_ip_reads_the_default_route():
     table = (
         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
@@ -875,6 +995,25 @@ def test_an_intent_bound_to_another_executors_host_key_is_refused(client, valida
     other = _body(ssh_host_key_sha256=host_key_sha256("ssh-ed25519 AAAA-somebody-else root@other"))
     response = client.post("/rent", json=_signed(other, validator_keypair))
     assert response.status_code == 401 and "host key" in response.text
+    assert client.fake_api.calls == []
+
+
+def test_an_intent_for_another_miners_executor_is_refused(client, validator_keypair):
+    """As `/verify`: `miner_hotkey` is signed and must be this executor's miner. With the host-key
+    digest it binds the intent to one provider's one host; two hosts that present the same SSH
+    host key (a copied `SSH_HOST_KEY_PATH`) still refuse each other's intents when their miners differ."""
+    other = bittensor.Keypair.create_from_uri("//OtherMiner").ss58_address
+    response = client.post("/rent", json=_signed(_body(miner_hotkey=other), validator_keypair))
+    assert response.status_code == 401 and "another miner" in response.text
+    assert client.fake_api.calls == []
+
+
+def test_a_nonce_outside_lower_case_hex_is_422_before_any_signature_check(client):
+    """The nonce is a docker label value and the label filter the rollback removes by: only the
+    validator's `secrets.token_hex` alphabet is accepted on the wire."""
+    for nonce in ("Z" * 32, "a" * 31 + "-", "a" * 31 + " ", "A" * 32, "0" * 15):
+        wire = {**_body().model_dump(by_alias=True), "nonce": nonce, "signature": "0x00"}
+        assert client.post("/rent", json=wire).status_code == 422, nonce
     assert client.fake_api.calls == []
 
 

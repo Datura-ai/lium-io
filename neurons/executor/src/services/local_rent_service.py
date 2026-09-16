@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
+import re
 import socket
 import time
 from collections.abc import Callable
@@ -50,6 +50,7 @@ from datura.rental_spec import (
     carries_only_public_fields,
     create_and_start,
     ensure_rental_network,
+    host_key_sha256,  # noqa: F401 — one definition for both ends (datura); re-exported for the route and the tests
     spec_from_wire,
 )
 from datura.requests.validator_requests import RENT_STR_MAX
@@ -68,11 +69,19 @@ from services.local_verify_service import parse_port_range
 
 logger = logging.getLogger(__name__)
 
-# docker-py is synchronous; its calls run here, never on the event loop. Two workers: a create in
-# flight and its rollback, nothing wider — the route runs one intent at a time.
+# docker-py is synchronous; its calls run here, never on the event loop. Two workers for the run
+# (the client open, the inspects, the create) — the route runs one intent at a time. The rollback
+# has its own worker: `asyncio.wait_for` cancels the await, not the thread, so a create the
+# deadline cut still holds its worker until docker-py's own timeout; a rollback queued behind it
+# would wait that long, and the validator's budget does not.
 _rent_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="local-rent")
+# Two: the in-request rollback and the late label pass of the previous intent may overlap.
+_rollback_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="local-rent-rollback")
 
 INSPECT_TIMEOUT_SECONDS = 10
+# docker-py's client timeout on the create/start call: how long a create the deadline cut can
+# still hold its `_rent_executor` worker. Not shorter: the executor accepts deadlines up to
+# LOCAL_RENT_MAX_DEADLINE_SECONDS (120), and the deadline, not this, is what cuts a slow create.
 CREATE_TIMEOUT_SECONDS = 60
 # The rollback's own bound; the validator's call budget leaves room for it after the deadline
 # (LOCAL_RENT_TIMEOUT_SECONDS − deadline_s ≥ this + a margin).
@@ -98,8 +107,24 @@ ALLOWED_CAPABILITIES = frozenset({"NET_ADMIN", "IPC_LOCK"})
 # The one sysctl a rental sets (WireGuard's mark routing) and the one ulimit (memlock for RDMA).
 ALLOWED_SYSCTLS = {"net.ipv4.conf.all.src_valid_mark": "1"}
 ALLOWED_ULIMIT_NAMES = frozenset({"memlock"})
-ALLOWED_DEVICE_PREFIXES = ("/dev/nvidia", "/dev/infiniband/", "/dev/net/tun", "/dev/fuse", "/dev/dri/")
-ALLOWED_HOST_BIND_PREFIXES = ("/var/run/lium-dstack/",)
+# The device nodes a rental gets (`nvidia_devices.shared_device_nodes_command`, the per-GPU
+# `/dev/nvidiaN`, `docker_service` for tun/fuse): each name spelled out, so a sibling such as
+# `/dev/nvidia-foo` or `/dev/fuse2` is not a rental's.
+ALLOWED_DEVICE_PATTERN = re.compile(
+    r"^/dev/(?:"
+    r"nvidia(?:[0-9]{1,4}|ctl|-modeset|-uvm|-uvm-tools|-nvswitchctl|-nvswitch[0-9]{1,4}|-nvlink[0-9]{1,4})"
+    r"|nvidia-caps/nvidia-cap[0-9]{1,6}"
+    r"|nvidia-caps-imex-channels/channel[0-9]{1,6}"
+    r"|infiniband/(?:uverbs[0-9]{1,4}|rdma_cm)"
+    r"|net/tun|fuse"
+    r"|dri/(?:card[0-9]{1,4}|renderD[0-9]{1,4})"
+    r")$"
+)
+# The one host path a rental ever binds, and only read-only: the CVM quote broker's socket
+# (`cvm_quote_broker.quote_broker_socket_mount`, `/var/run/lium-dstack/dstack.sock` → the guest's
+# `/var/run/dstack.sock`). Every other host path — the broker's own directory, the docker socket —
+# is refused, whoever signed.
+ALLOWED_HOST_BINDS_READ_ONLY = frozenset({"/var/run/lium-dstack/dstack.sock"})
 # A rental joins the icc-off rental bridge (DAH-3199) and nothing else: not the daemon's default
 # bridge (inter-container traffic on — the state that network exists to end; the SSH path never
 # builds a rental without it), not `host`, `none` or `container:<id>` (the host's or another
@@ -139,26 +164,23 @@ def host_gateway_ip(route_table: str | None = None) -> str | None:
     return None
 
 
-def host_key_sha256(host_key_line: str | None) -> str | None:
-    """The digest both ends compute of the executor's SSH host public key line (the one the miner
-    reports and the validator pins for its SSH connections)."""
-    if not host_key_line or not host_key_line.strip():
-        return None
-    return hashlib.sha256(host_key_line.strip().encode("utf-8")).hexdigest()
-
-
 def refuse_spec(spec: ContainerRunSpec) -> str | None:
     """None when the spec is a rental container's; otherwise why it is refused (the validator's
     log label). Enforced HERE, not only by the sender: the validator hotkey alone must not be able
-    to run anything but a rental's image with a rental's mounts on this host."""
+    to start a container on this host with anything but a rental's shape — no command, entrypoint
+    or private environment; a rental's name; named volumes and the one read-only host socket; a
+    rental's runtime, capabilities, sysctls, ulimits, device nodes and network. What it does NOT
+    pin, because a rental legitimately varies in them and docker refuses the absurd: the image
+    (a renter picks any image), `device_requests`, `shm_size`, `cpu_count`, `memory_gb` and
+    `storage_limit_gb` — those are bounded in shape by `spec_from_wire` and forwarded as sent."""
     if not carries_only_public_fields(spec):
         return "spec carries a command, an entrypoint or a private environment"
     if not spec.name.startswith(RENTAL_CONTAINER_NAME_PREFIXES):
         return f"container name {spec.name!r} is not a rental's (pod_/filler_)"
     for volume in spec.volumes:
         if volume.source.startswith("/"):
-            if not volume.source.startswith(ALLOWED_HOST_BIND_PREFIXES) or ".." in volume.source:
-                return f"volume source {volume.source!r} is a host path outside a rental's"
+            if volume.source not in ALLOWED_HOST_BINDS_READ_ONLY or not volume.read_only:
+                return f"volume source {volume.source!r} is a host path outside a rental's (or not read-only)"
         elif not NAME_PATTERN.fullmatch(volume.source):
             return f"volume source {volume.source!r} is not a docker volume name"
     if spec.runtime not in ALLOWED_RUNTIMES:
@@ -170,7 +192,7 @@ def refuse_spec(spec: ContainerRunSpec) -> str | None:
     if not {u.name for u in spec.ulimits} <= ALLOWED_ULIMIT_NAMES:
         return f"ulimits {sorted({u.name for u in spec.ulimits} - ALLOWED_ULIMIT_NAMES)} are not a rental's"
     for device in spec.devices:
-        if not device.path_on_host.startswith(ALLOWED_DEVICE_PREFIXES) or ".." in device.path_on_host:
+        if not ALLOWED_DEVICE_PATTERN.fullmatch(device.path_on_host):
             return f"device {device.path_on_host!r} is not a rental's"
     if spec.network not in ALLOWED_NETWORKS:
         return f"network {spec.network!r} is not a rental's"
@@ -222,10 +244,6 @@ class LocalRentService:
         # reference is not the only one.
         self._late_rollbacks: set[asyncio.Task] = set()
 
-    @property
-    def busy(self) -> bool:
-        return self._busy.locked()
-
     def hold_late_rollback(self, task: asyncio.Task) -> None:
         self._late_rollbacks.add(task)
         task.add_done_callback(self._late_rollbacks.discard)
@@ -240,10 +258,16 @@ class LocalRentService:
             return "intent is bound to another executor's SSH host key"
         return None
 
-    async def run(self, body: RentIntentBody) -> RentResult:
+    async def run(self, body: RentIntentBody, claim_nonce: Callable[[], bool] = lambda: True) -> RentResult:
+        """Busy is decided ONCE, here, before the nonce is claimed: a second intent while one runs
+        raises `BusyError` (the route's 409) with `claim_nonce` never called, so the same signed
+        intent may be re-sent once the executor is free. `claim_nonce` runs under the lock; False
+        (seen before) raises `NonceUsedError`, and nothing is created."""
         if self._busy.locked():
             raise BusyError("a rental create is already running")
         async with self._busy:
+            if not claim_nonce():
+                raise NonceUsedError("nonce already used")
             return await self._run(body)
 
     # --- the run -------------------------------------------------------------------------------
@@ -264,7 +288,9 @@ class LocalRentService:
 
         task = asyncio.ensure_future(run.steps())
         try:
-            done, pending = await asyncio.wait({task}, timeout=deadline)
+            # The deadline counts from the top of the run, the client open included: the validator's
+            # wait (`deadline_s` + its rollback margin) started when it sent the intent.
+            done, pending = await asyncio.wait({task}, timeout=max(0.0, deadline - (time.perf_counter() - started)))
         except asyncio.CancelledError:
             # The request itself was cancelled (client gone): nothing of ours may stay behind.
             task.cancel()
@@ -272,8 +298,11 @@ class LocalRentService:
             await asyncio.shield(run.rollback())
             _close(api)
             raise
-        deadline_hit = bool(pending)
-        if pending:
+        # The task's state decides, not the timer: a task `asyncio.wait` reports pending is one that
+        # was not done when the wait woke (CPython sorts by `f.done()` there), so the second clause
+        # is belt and braces — what a run finished is kept, never rolled back as a timeout.
+        deadline_hit = bool(pending) and not task.done()
+        if deadline_hit:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         elif task.exception() is not None:
@@ -291,9 +320,9 @@ class LocalRentService:
         _close(api)
         return self._result(body, started_wall, started, deadline, results, deadline_hit=deadline_hit, rolled_back=rolled_back)
 
-    async def _open_api(self) -> Any:
+    async def _open_api(self, executor: ThreadPoolExecutor = _rent_executor) -> Any:
         loop = asyncio.get_running_loop()
-        return await asyncio.wait_for(loop.run_in_executor(_rent_executor, self._docker_api), timeout=INSPECT_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(loop.run_in_executor(executor, self._docker_api), timeout=INSPECT_TIMEOUT_SECONDS)
 
     def _result(
         self,
@@ -407,9 +436,11 @@ class _RentAttempt:
         if body.steps.ready is not None:
             results["ready"] = await self._ready(self.spec, body.steps.ready)
 
-    async def _in_thread(self, func: Callable[[], Any], timeout: float) -> Any:
+    async def _in_thread(
+        self, func: Callable[[], Any], timeout: float, *, executor: ThreadPoolExecutor = _rent_executor
+    ) -> Any:
         loop = asyncio.get_running_loop()
-        return await asyncio.wait_for(loop.run_in_executor(_rent_executor, func), timeout=timeout)
+        return await asyncio.wait_for(loop.run_in_executor(executor, func), timeout=timeout)
 
     async def _image(self, reference: str) -> tuple[RentStepResult, RentImageData | None]:
         """The step's result and, when the inspect answered, the fact itself (None: no fact, the
@@ -549,7 +580,7 @@ class _RentAttempt:
     async def _remove_later(self, nonce: str) -> None:
         await asyncio.sleep(ROLLBACK_RETRY_SECONDS)
         try:
-            api = await self.service._open_api()
+            api = await self.service._open_api(_rollback_executor)
         except Exception as exc:  # noqa: BLE001 — logged; the validator's cleanup is the backstop
             logger.warning("local rent: late rollback has no docker client: %s", exc)
             return
@@ -564,7 +595,7 @@ class _RentAttempt:
             self.api.remove_container(container_id, v=True, force=True)
 
         try:
-            await self._in_thread(remove, REMOVE_TIMEOUT_SECONDS)
+            await self._in_thread(remove, REMOVE_TIMEOUT_SECONDS, executor=_rollback_executor)
             logger.info("local rent: rolled back %s", container_id[:12])
             return True
         except Exception as exc:  # noqa: BLE001 — logged; the validator's cleanup is the backstop
@@ -582,7 +613,7 @@ class _RentAttempt:
             return [c.get("Id") for c in listed if isinstance(c, dict) and c.get("Id")]
 
         try:
-            ids = await self._in_thread(find, INSPECT_TIMEOUT_SECONDS)
+            ids = await self._in_thread(find, INSPECT_TIMEOUT_SECONDS, executor=_rollback_executor)
         except Exception as exc:  # noqa: BLE001 — unknown is not proven clean: answered False, the validator frees the name
             logger.warning("local rent: listing by label failed: %s", exc)
             return False
@@ -669,3 +700,7 @@ async def _wait_ssh_banner(hosts: list[str], port: int, timeout_s: float) -> str
 
 class BusyError(RuntimeError):
     pass
+
+
+class NonceUsedError(RuntimeError):
+    """`claim_nonce` said no under the busy lock: the intent was seen before; nothing was made."""

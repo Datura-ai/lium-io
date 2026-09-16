@@ -53,10 +53,20 @@ class RentSteps(WireModel):
 
 class RentIntentBody(WireModel):
     schema_id: Literal["lium.local_rent/1"] = Field(alias="schema", default=SCHEMA)
-    nonce: str = Field(min_length=16, max_length=128)
+    # Lower-case hex only (the validator sends `secrets.token_hex(16)`): the nonce is a docker
+    # label value and the label filter the rollback removes by (`local_rent_service.NONCE_LABEL`),
+    # so the destructive path never rests on the daemon's parsing of an arbitrary string.
+    nonce: str = Field(min_length=16, max_length=128, pattern=r"^[0-9a-f]{16,128}$")
     issued_at: int
     expires_at: int
     executor_uuid: str = Field(min_length=1, max_length=128)
+    # The miner this executor belongs to, as the validator knows it — as on `/verify`, checked by
+    # the same `check_intent_target`. With the host-key digest below the intent is bound to one
+    # provider's one host: an intent relayed to another provider's executor is refused there (401)
+    # even when both hosts happen to present the same SSH host key. The executor cannot check
+    # `executor_uuid` (it does not know its own), so two executors of ONE miner that share a host
+    # key file (`SSH_HOST_KEY_PATH`) are told apart only by the tunnel the intent arrives on.
+    miner_hotkey: str = Field(min_length=1, max_length=128)
     # sha256 (hex) of the executor's SSH host public key line — the one the miner reports and the
     # validator pins for SSH. The executor compares it with its own: a captured intent replayed to
     # another executor is refused there (401). Signed with the rest.

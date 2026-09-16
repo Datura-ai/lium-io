@@ -25,6 +25,7 @@ import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Protocol
 
 from datura.requests.validator_requests import local_verify_signing_blob
 from payloads.verify import (
@@ -93,8 +94,18 @@ class NonceCache:
             return True
 
 
-def check_intent_window(body: VerifyIntentBody, now: float, window_s: int) -> str | None:
-    """None when the intent is fresh; otherwise why it is refused."""
+class _TimedIntent(Protocol):
+    issued_at: int
+    expires_at: int
+
+
+class _TargetedIntent(Protocol):
+    miner_hotkey: str
+
+
+def check_intent_window(body: _TimedIntent, now: float, window_s: int) -> str | None:
+    """None when the intent is fresh; otherwise why it is refused. Shared by `/verify` and
+    `/rent`: both intents carry the same `issued_at`/`expires_at` pair."""
     if body.expires_at <= now:
         return "intent expired"
     if abs(body.issued_at - now) > window_s:
@@ -104,8 +115,9 @@ def check_intent_window(body: VerifyIntentBody, now: float, window_s: int) -> st
     return None
 
 
-def check_intent_target(body: VerifyIntentBody, miner_hotkey: str) -> str | None:
-    """None when the intent names this executor's miner; otherwise why it is refused. The
+def check_intent_target(body: _TargetedIntent, miner_hotkey: str) -> str | None:
+    """None when the intent names this executor's miner; otherwise why it is refused (`/verify`
+    and `/rent` alike: both intents carry `miner_hotkey`). The
     configured miner only — never the shared portal hotkey, which every executor trusts and so
     would bind the intent to nothing."""
     if body.miner_hotkey != miner_hotkey:

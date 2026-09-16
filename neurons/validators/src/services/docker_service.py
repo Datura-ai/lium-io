@@ -1274,6 +1274,7 @@ class DockerService:
         self,
         *,
         executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
         keypair,
         ssh_client: asyncssh.SSHClientConnection,
         docker_client: RentalDockerSdkClient,
@@ -1315,6 +1316,7 @@ class DockerService:
         )
         intent = build_local_rent_intent(
             executor_uuid=executor_info.uuid,
+            miner_hotkey=miner_hotkey,
             host_key=executor_info.ssh_host_key,
             spec=run_spec,
             deadline_s=local_rent_executor_deadline_s(settings.LOCAL_RENT_TIMEOUT_SECONDS),
@@ -5512,6 +5514,7 @@ class DockerService:
                     # signed call, running-state wait included; None → the SDK path below as today.
                     local_rent = await self._create_with_local_rent(
                         executor_info=executor_info,
+                        miner_hotkey=payload.miner_hotkey,
                         keypair=keypair,
                         ssh_client=ssh_client,
                         docker_client=docker_client,

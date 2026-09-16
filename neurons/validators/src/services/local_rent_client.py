@@ -25,7 +25,6 @@ label).
 
 from __future__ import annotations
 
-import hashlib
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -33,7 +32,13 @@ from typing import Any, TypeVar
 
 import asyncssh
 import pydantic
-from datura.rental_spec import ContainerRunSpec, carries_only_public_fields, spec_to_wire
+from datura.rental_spec import (
+    CONTAINER_PATH_PATTERN,
+    ContainerRunSpec,
+    carries_only_public_fields,
+    host_key_sha256,
+    spec_to_wire,
+)
 from datura.requests.validator_requests import (
     LOCAL_RENT_CAPABILITY,
     LOCAL_RENT_SCHEMA,
@@ -104,26 +109,22 @@ def executor_deadline_s(timeout_s: int) -> int:
     return max(EXECUTOR_DEADLINE_MIN_S, timeout_s - EXECUTOR_ROLLBACK_MARGIN_S)
 
 
-def host_key_sha256(host_key_line: str | None) -> str | None:
-    """The digest the executor computes of its own SSH host public key line (the miner-reported
-    `ssh_host_key` the validator already pins for SSH): the intent is bound to it."""
-    if not host_key_line or not host_key_line.strip():
-        return None
-    return hashlib.sha256(host_key_line.strip().encode("utf-8")).hexdigest()
-
-
 def eligible(spec: ContainerRunSpec, host_key: str | None) -> str | None:
     """None when the spec may travel on the executor's HTTP API; otherwise why not (the label)."""
     if not carries_only_public_fields(spec):
         return "private_fields"
     if host_key_sha256(host_key) is None:
         return "no_host_key"  # nothing to bind the intent to (the SDK path would refuse too)
+    if any(not CONTAINER_PATH_PATTERN.fullmatch(v.target) for v in spec.volumes):
+        # the executor's wire parse would refuse it (422, one wasted round trip): the SDK path here
+        return "volume_target_charset"
     return None
 
 
 def build_intent(
     *,
     executor_uuid: str,
+    miner_hotkey: str,
     host_key: str,
     spec: ContainerRunSpec,
     deadline_s: int,
@@ -143,6 +144,9 @@ def build_intent(
         "issued_at": int(now),
         "expires_at": int(now) + INTENT_TTL_SECONDS,
         "executor_uuid": executor_uuid,
+        # the miner this executor belongs to, as on `/verify`: with the host-key digest it binds
+        # the intent to one provider's one host (the executor checks both, 401 otherwise)
+        "miner_hotkey": miner_hotkey,
         "ssh_host_key_sha256": host_key_sha256(host_key),
         "deadline_s": deadline_s,
         "steps": {"image": True, "container": spec_to_wire(spec), "ready": ready},
