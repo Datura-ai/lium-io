@@ -35,11 +35,12 @@ COMPOSE := docker compose --env-file stack.env $(COMPOSE_FILES)
 # builds (dind, executor, miner, validator, tester) come out of one `docker buildx bake` over the same compose file(s), each
 # image reading from and writing to its own cache scope (`e2e-<service>`: one shared scope would let the last export
 # overwrite the others' index), `mode=max` so the intermediate layers (apt, pdm install) are cached and not only the final
-# ones. `--load` puts the images on this daemon under their `image:` tags, where `up` finds them. The gha backend reads its URL
-# and token from ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN and needs a builder that can export cache (test.yml sets both up).
+# ones, `ignore-error=true` so a cache service that refuses or times out the export costs the next run its cache, never this
+# run its build. `--load` puts the images on this daemon under their `image:` tags, where `up` finds them. The gha backend reads
+# its URL and token from ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN and needs a builder that can export cache (test.yml sets both up).
 E2E_CACHE ?=
 BAKE_IMAGES := dind executor miner validator tester
-BAKE_CACHE = $(foreach i,$(BAKE_IMAGES),--set '$(i).cache-from=type=$(E2E_CACHE),scope=e2e-$(i)' --set '$(i).cache-to=type=$(E2E_CACHE),scope=e2e-$(i),mode=max')
+BAKE_CACHE = $(foreach i,$(BAKE_IMAGES),--set '$(i).cache-from=type=$(E2E_CACHE),scope=e2e-$(i)' --set '$(i).cache-to=type=$(E2E_CACHE),scope=e2e-$(i),mode=max,ignore-error=true')
 
 .PHONY: e2e e2e-full build up seed test logs down
 
