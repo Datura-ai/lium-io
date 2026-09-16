@@ -593,7 +593,7 @@ class Settings(BaseSettings):
         description="Max seconds to wait for the inner DinD dockerd to become ready.",
     )
     CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS: int = Field(
-        env="CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS", default=180,
+        env="CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS", default=180, gt=0,
         description=(
             "Max seconds for each setup command before a custom build (sysbox preflight, DinD "
             "start including its image pull, IP and resolver reads, the egress firewall helper, "

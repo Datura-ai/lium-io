@@ -1303,11 +1303,21 @@ def test_A21_egress_script_allows_port_53_to_the_resolver_above_the_drops():
     assert last_drop < first_accept
     assert any(drop_10 in s for s in steps)
     assert "-p udp --dport 53" in apply and "--dport 80" not in apply
+    # A stale ACCEPT from a build whose teardown failed sits BELOW the DROP just
+    # inserted; `-C` finds it, the insert is skipped and DNS stays dropped. So
+    # the ACCEPT is never `-C`-guarded: every copy is deleted, then one is
+    # inserted at the top.
+    assert not any("-C DOCKER-USER" in s and "-j ACCEPT" in s for s in steps)
+    for proto, insert in (("udp", accept_udp), ("tcp", accept_tcp)):
+        rule = f"-s 172.20.0.2 -d 10.0.0.2 -p {proto} --dport 53 -j ACCEPT"
+        assert f"while $IPT -D DOCKER-USER {rule} 2>/dev/null; do :; done" in apply
+        assert apply.index(f"-D DOCKER-USER {rule}") < apply.index(insert)
 
     remove = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=False, dns_servers=["10.0.0.2"])
-    assert "$IPT -D DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p udp --dport 53 -j ACCEPT" in remove
-    assert "$IPT -D DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p tcp --dport 53 -j ACCEPT" in remove
+    assert "while $IPT -D DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p udp --dport 53 -j ACCEPT 2>/dev/null; do :; done" in remove
+    assert "while $IPT -D DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p tcp --dport 53 -j ACCEPT 2>/dev/null; do :; done" in remove
     assert "$IPT -D DOCKER-USER -s 172.20.0.2 -d 10.0.0.0/8 -j DROP" in remove
+    assert "-I DOCKER-USER" not in remove
 
     # No resolver inside the block: the script is exactly today's.
     plain = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=True)
@@ -1465,6 +1475,21 @@ async def test_A24_egress_helper_runs_under_the_setup_bound(svc, monkeypatch):
     assert len(egress) == 1 and egress[0].get("timeout") == 11
     build = [k for k in seen_kwargs if "docker build" in k.get("command", "")]
     assert build and build[0].get("timeout") == int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_A25_setup_step_timeout_rejects_zero_and_negative(bad):
+    """asyncssh's `run(timeout=0)` and `timeout=-1` time out at once, while
+    `execute_and_stream_logs(timeout=0)` disables its bound: a zero or negative
+    value would fail every setup command on the spot or unbound the helper.
+    The setting refuses both at load time."""
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS=bad)
+    assert Settings(_env_file=None, CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS=1).CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS == 1
 
 
 # ------------------------------------------------------------------
