@@ -32,7 +32,7 @@ def validator_keypair():
 
 @pytest.fixture(autouse=True)
 def trust_the_test_validator(validator_keypair, monkeypatch):
-    monkeypatch.setattr(auth, "VALIDATOR_HOTKEY_SS58", validator_keypair.ss58_address)
+    monkeypatch.setattr(auth, "VALIDATOR_HOTKEYS_SS58", {"current": validator_keypair.ss58_address})
     monkeypatch.setattr(settings, "CONTAINER_SIGNATURE_MAX_AGE_SECONDS", WINDOW)
 
 

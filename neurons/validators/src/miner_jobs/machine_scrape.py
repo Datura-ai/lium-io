@@ -1342,6 +1342,286 @@ def get_infiniband_ports() -> InfinibandObservation:
     return InfinibandObservation(ports, "")
 
 
+# GPU-to-GPU interconnect (DAH-2922). Two "8x H200" listings can differ in whether the cards share
+# NVLink and allow peer-to-peer at all; tensor-parallel and FSDP jobs run several times slower on
+# PCIe and NCCL does not start where P2P is off. nvidia-smi is the source because it is what a
+# renter runs first on the pod, so what the listing says and what the renter sees cannot disagree.
+NVIDIA_SMI_TOPO_MATRIX_CMD = "nvidia-smi topo -m"
+NVIDIA_SMI_TOPO_P2P_READ_CMD = "nvidia-smi topo -p2p r"
+NVIDIA_SMI_NVLINK_STATUS_CMD = "nvidia-smi nvlink -s"
+# nvidia-smi's own classes, worst first: SYS crosses the inter-socket link, PIX is one PCIe switch.
+PCIE_LINK_CLASSES_WORST_FIRST = ["SYS", "NODE", "PHB", "PXB", "PIX"]
+TOPO_GPU_LABEL_PATTERN = r"^GPU\d+$"
+TOPO_NVLINK_CELL_PATTERN = r"^NV(\d+)$"
+NVLINK_ACTIVE_LINK_PATTERN = r"Link \d+: [\d.]+ GB/s"
+NVLINK_GPU_HEADER_PATTERN = r"^GPU \d+:"
+
+
+def parse_topology_matrix(output):
+    """The GPU-by-GPU cells of an `nvidia-smi topo -m` or `nvidia-smi topo -p2p r` table.
+
+    Returns (labels, rows): labels in table order ("GPU0", ...), rows[i][j] the cell for
+    (labels[i], labels[j]). NIC columns/rows and the affinity columns are dropped so the matrix is
+    square; the legend is ignored. ([], []) when the output has no GPU header row.
+    """
+    header = None
+    gpu_columns = []
+    labels = []
+    rows = []
+    for line in output.splitlines():
+        cells = [cell.strip() for cell in re.split(r"\t+|\s{2,}", line.rstrip())]
+        if header is None:
+            if len(cells) > 1 and cells[0] == "" and re.match(TOPO_GPU_LABEL_PATTERN, cells[1]):
+                header = cells
+                gpu_columns = [index for index, cell in enumerate(cells) if re.match(TOPO_GPU_LABEL_PATTERN, cell)]
+            continue
+        if not cells or not re.match(TOPO_GPU_LABEL_PATTERN, cells[0]):
+            continue
+        if len(cells) <= max(gpu_columns):
+            continue
+        labels.append(cells[0])
+        rows.append([cells[index] for index in gpu_columns])
+    return labels, rows
+
+
+def count_active_nvlinks_per_gpu(output):
+    """Active NVLink count per GPU block of `nvidia-smi nvlink -s`; [] when no GPU block is listed."""
+    counts = []
+    for line in output.splitlines():
+        if re.match(NVLINK_GPU_HEADER_PATTERN, line.strip()):
+            counts.append(0)
+        elif counts and re.search(NVLINK_ACTIVE_LINK_PATTERN, line):
+            counts[-1] += 1
+    return counts
+
+
+class GpuInterconnectObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, payload, scrape_error):
+        self.payload = payload
+        self.scrape_error = scrape_error
+
+
+def summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output):
+    """Facts a renter needs from the three nvidia-smi tables, in one flat payload.
+
+    nvlink is True only when EVERY GPU pair is joined by NVLink (what an HGX board looks like); a
+    4-GPU box with two NVLink bridges is not "NVLink" for a TP=4 job. p2p is True only when every
+    pair reads OK. Both are None when the table is missing or the host has a single GPU.
+    """
+    labels, rows = parse_topology_matrix(topo_output)
+    gpu_count = len(labels)
+    gpu_pairs = gpu_count * (gpu_count - 1) // 2
+    nvlink_pairs = 0
+    nvlink_link_counts = []
+    pcie_classes_seen = set()
+    for i in range(gpu_count):
+        for j in range(i + 1, gpu_count):
+            cell = rows[i][j]
+            nv_match = re.match(TOPO_NVLINK_CELL_PATTERN, cell)
+            if nv_match:
+                nvlink_pairs += 1
+                nvlink_link_counts.append(int(nv_match.group(1)))
+            elif cell in PCIE_LINK_CLASSES_WORST_FIRST:
+                pcie_classes_seen.add(cell)
+
+    pcie_class = None
+    for candidate in PCIE_LINK_CLASSES_WORST_FIRST:
+        if candidate in pcie_classes_seen:
+            pcie_class = candidate
+            break
+
+    p2p = None
+    p2p_pairs = None
+    p2p_ok_pairs = None
+    if p2p_output is not None:
+        p2p_labels, p2p_rows = parse_topology_matrix(p2p_output)
+        p2p_count = len(p2p_labels)
+        p2p_pairs = p2p_count * (p2p_count - 1) // 2
+        p2p_ok_pairs = 0
+        for i in range(p2p_count):
+            for j in range(i + 1, p2p_count):
+                if p2p_rows[i][j] == "OK":
+                    p2p_ok_pairs += 1
+        if p2p_pairs > 0:
+            p2p = p2p_ok_pairs == p2p_pairs
+
+    nvlink_active_links = None
+    if nvlink_output is not None:
+        active_counts = count_active_nvlinks_per_gpu(nvlink_output)
+        if active_counts:
+            nvlink_active_links = min(active_counts)
+
+    return {
+        "ic_devices": gpu_count,
+        "ic_gpu_pairs": gpu_pairs,
+        "ic_nvlink": (nvlink_pairs == gpu_pairs) if gpu_pairs > 0 else None,
+        "ic_nvlink_pairs": nvlink_pairs,
+        "ic_nvlink_links": min(nvlink_link_counts) if nvlink_link_counts else None,
+        "ic_nvlink_active_links": nvlink_active_links,
+        "ic_pcie_class": pcie_class,
+        "ic_p2p": p2p,
+        "ic_p2p_pairs": p2p_pairs,
+        "ic_p2p_ok_pairs": p2p_ok_pairs,
+        "ic_matrix": rows,
+    }
+
+
+def get_gpu_interconnect():
+    """Run the three nvidia-smi topology tables and summarize them; never fails the scrape.
+
+    `topo -m` is required - without it there is nothing to report and the reason travels in
+    scrape_error. `topo -p2p r` and `nvlink -s` are optional: older drivers and PCIe-only cards exit
+    non-zero on them, which is itself the answer, so their fields are None and the error is kept.
+    """
+    errors = []
+    try:
+        topo_output = run_cmd(NVIDIA_SMI_TOPO_MATRIX_CMD)
+    except Exception as exc:
+        return GpuInterconnectObservation(None, f"{NVIDIA_SMI_TOPO_MATRIX_CMD}: {exc!r}"[:400])
+
+    p2p_output = None
+    try:
+        p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
+    except Exception as exc:
+        errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
+
+    nvlink_output = None
+    try:
+        nvlink_output = run_cmd(NVIDIA_SMI_NVLINK_STATUS_CMD)
+    except Exception as exc:
+        errors.append(f"{NVIDIA_SMI_NVLINK_STATUS_CMD}: {exc!r}"[:200])
+
+    try:
+        payload = summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output)
+    except Exception as exc:
+        return GpuInterconnectObservation(None, f"parse: {exc!r}"[:400])
+    return GpuInterconnectObservation(payload, "; ".join(errors))
+
+
+# DAH-2928: the host's own view of the disk that holds the containers. The scrape shares the host
+# PID namespace (see the /proc/1/root walks above), so /proc/1/mounts is the host mount table.
+HOST_MOUNTS_PATH = "/proc/1/mounts"
+HOST_ROOT_PREFIX = "/proc/1/root"
+# errno values, spelled out because the packaged scrape cannot import errno (obfuscator allowlist)
+ERRNO_EIO = 5
+ERRNO_ENOSPC = 28
+ERRNO_EROFS = 30
+ERRNO_EDQUOT = 122
+
+
+class DiskHealthObservation:
+    def __init__(
+        self,
+        docker_root_dir: str,
+        read_only_mounts: list[str],
+        write_probe: str,
+        write_probe_error: str,
+    ) -> None:
+        self.docker_root_dir = docker_root_dir
+        self.read_only_mounts = read_only_mounts
+        self.write_probe = write_probe
+        self.write_probe_error = write_probe_error
+
+    def as_payload(self) -> dict:
+        return {
+            "dh_docker_root_dir": self.docker_root_dir,
+            "dh_read_only_mounts": self.read_only_mounts,
+            "dh_write_probe_error": self.write_probe_error,
+            "dh_write_probe": self.write_probe,
+        }
+
+
+def mounts_holding(mounts_text: str, path: str) -> list[str]:
+    """The mount point a write to `path` lands on, when that filesystem is mounted read-only.
+
+    `mounts_text` is /proc/<pid>/mounts. Only the covering mount counts - the longest mount point
+    that is `path` or a parent of it, the last line winning when a point is mounted over - because
+    a mount above it says nothing about writes below: `ro /` with `rw /var/lib/docker` is a docker
+    root that takes writes, and returns []. One element or none; a list so the payload shape
+    holds."""
+    covering: tuple[str, list[str]] | None = None
+    for line in mounts_text.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        mount_point, options = fields[1], fields[3].split(",")
+        if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
+            continue
+        if covering is None or len(mount_point) >= len(covering[0]):
+            covering = (mount_point, options)
+    if covering is None or "ro" not in covering[1]:
+        return []
+    return [covering[0]]
+
+
+def write_probe_failure_reason(errno_value) -> str:
+    """The reason a write failed because of the disk itself - a container cannot start on any of
+    these - or '' when the errno says where the scrape runs from (EACCES, ENOENT), not what the disk
+    does. A function, not a module-level dict: obfuscator.py renames a name read inside a function,
+    but not one read as a key of a module-level literal."""
+    if errno_value == ERRNO_EROFS:
+        return "read_only"
+    if errno_value == ERRNO_EIO:
+        return "io_error"
+    if errno_value == ERRNO_ENOSPC:
+        return "no_space"
+    if errno_value == ERRNO_EDQUOT:
+        return "quota"
+    return ""
+
+
+def probe_write(directory: str) -> tuple[str, str]:
+    """('ok', '') when a file can be created, written, fsynced and removed under `directory`;
+    ('failed', '<reason>: <error>') when the kernel refused because of the disk - read_only (EROFS),
+    io_error (EIO), no_space (ENOSPC) or quota (EDQUOT); a container cannot start on any of them;
+    ('skipped', error) for anything else (no such directory, no permission from where the scrape runs)."""
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=".lium-disk-probe-", dir=directory) as probe:
+            probe.write(b"lium disk probe\n")
+            probe.flush()
+            os.fsync(probe.fileno())
+        return "ok", ""
+    except OSError as e:
+        reason = write_probe_failure_reason(e.errno)
+        if reason:
+            return "failed", f"{reason}: {e.__class__.__name__}: {e}"
+        return "skipped", f"{e.__class__.__name__}: {e}"
+    except Exception as e:
+        return "skipped", f"{e.__class__.__name__}: {e}"
+
+
+def get_disk_health() -> DiskHealthObservation:
+    """Whether the disk that holds the containers is still taking writes (DAH-2928).
+
+    A renter's file on a pod changed on disk after it was written, with no error reaching the
+    container. The scrape reported capacity and usage and nothing about health, so the node kept
+    being listed. Two readings: is the docker root's filesystem mounted read-only, and does a write
+    to it go through. A docker root that refuses writes is a node that cannot start a container;
+    DiskHealthCheck reports it as a warning (no score change) until the reading is proven on live
+    executors.
+    """
+    try:
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+
+    try:
+        with open(HOST_MOUNTS_PATH) as mounts_file:
+            mounts_text = mounts_file.read()
+    except Exception:
+        mounts_text = ""
+    read_only_mounts = mounts_holding(mounts_text, docker_root_dir)
+
+    host_docker_root = f"{HOST_ROOT_PREFIX}{docker_root_dir}"
+    write_probe, write_probe_error = probe_write(
+        host_docker_root if os.path.isdir(host_docker_root) else docker_root_dir
+    )
+
+    return DiskHealthObservation(docker_root_dir, read_only_mounts, write_probe, write_probe_error)
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -1474,6 +1754,11 @@ def get_machine_specs():
     if infiniband.scrape_error:
         data["data_infiniband_scrape_error"] = infiniband.scrape_error
 
+    interconnect = get_gpu_interconnect()
+    data["data_interconnect"] = interconnect.payload
+    if interconnect.scrape_error:
+        data["data_interconnect_scrape_error"] = interconnect.scrape_error
+
     try:
         lscpu_output = run_cmd("lscpu")
         data["data_cpu"]["cpu_model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
@@ -1528,6 +1813,11 @@ def get_machine_specs():
         # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
         # node that loses only the breakdown must keep reporting total/used/free.
         data["hard_disk_docker_scrape_error"] = repr(exc)
+
+    try:
+        data["data_disk_health"] = get_disk_health().as_payload()
+    except Exception as exc:
+        data["data_disk_health_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:

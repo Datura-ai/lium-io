@@ -262,6 +262,22 @@ class Settings(BaseSettings):
     # measurements are still taken and published; only the amount of RAM/disk written shrinks.
     FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
     FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
+    # liumd phase 1 (DAH-2834): for an executor whose `/version` advertises `local_verify/1`, run the
+    # capability matmul and VerifyX with ONE signed `POST /verify` instead of the SSH commands, and
+    # judge the answer with the same unseal/verify code. The POST travels through a direct-tcpip
+    # channel of the pipeline's SSH session to the executor's loopback port (`/version` names it);
+    # the executor refuses any other peer. Any refusal, timeout, mismatch or local failure falls
+    # back to the SSH path for that step (logged per outcome, `[local_verify]`).
+    # Off by default; the SSH path is unchanged either way.
+    VALIDATOR_LOCAL_VERIFY_ENABLED: bool = Field(env="VALIDATOR_LOCAL_VERIFY_ENABLED", default=False)
+    # Whole-call budget for `POST /verify` (seconds). Sized for the first pass; a full-size VerifyX
+    # may take longer and then falls back, so keep this above VERIFYX first-pass p90 (90 s) + matmul.
+    # The executor is told to stop 30 s earlier (`deadline_s` = this − 30, min 5) so a cut answer
+    # with finished steps inside still arrives inside the budget.
+    LOCAL_VERIFY_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_TIMEOUT_SECONDS", default=240)
+    # `GET /version` (connect, and twice this as its whole budget) and the tunnel's local bind and
+    # connect; the direct-tcpip channel open on the executor runs inside the whole-call budget.
+    LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS: int = Field(env="LOCAL_VERIFY_CONNECT_TIMEOUT_SECONDS", default=5)
     # DAH-2667: measure a RoCE fabric with ib_write_bw between the free hosts of one segment, rather
     # than inferring it from the addresses alone. The backend reads a flag of the SAME name to decide
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
@@ -285,6 +301,11 @@ class Settings(BaseSettings):
     # away, and refuse the spoofable nvidia-smi XML fallback when it disagrees with the kernel map.
     KERNEL_GPU_VERDICT_CHECK_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_CHECK_ENABLED", default=True)
     KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2662 — match provider/GPU bans against the kernel's GPU UUIDs (/proc/driver/nvidia) as well
+    # as the host-reported ones. Shadow by default: the kernel list is read, recorded on specs and
+    # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
+    # matched on the reported list until this is flipped from a week of clean fleet data.
+    KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
     # Item 2a — corroborate the advertised CPU(s) count against sources the lscpu wrapper does not
     # author (/proc/cpuinfo, /sys present population, docker NCPU).
     CPU_TRUTH_CHECK_ENABLED: bool = Field(env="CPU_TRUTH_CHECK_ENABLED", default=True)
@@ -319,6 +340,15 @@ class Settings(BaseSettings):
     # a foreign GPU workload takes the card. CHECK observes and logs; ENFORCEMENT zeroes the
     # score. Enforcement defaults off: a provider's own nginx also burns CPU, so the floors
     # need a shadow week over the live fleet before the first payout is cut.
+    # DAH-3457 (owner, 13 Sep 2026): a listed node keeps one fixed set of GPU UUIDs (the anchor). Off = a changed
+    # set is GPU_UUID_CHANGED (verification reset, the anchor is kept) and the event's what_we_saw carries the
+    # would-be hard decision; a missing or added card is GPU_UUID_CHANGED too now that the fingerprint check
+    # runs before the spec check (the count change made it SPEC_CHANGED). On = a strict subset of the anchor is GPU_MISSING (score 0
+    # this cycle, the node returns when the full set is back); any UUID outside the anchor marks the node
+    # "anchor broken": score 0 on every later cycle under this executor id, no re-verification; the provider
+    # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
+    # Flip after reading a week of the warn-mode rows.
+    GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_CHECK_ENABLED: bool = Field(env="PROVIDER_SIDE_LOAD_CHECK_ENABLED", default=True)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
@@ -335,6 +365,21 @@ class Settings(BaseSettings):
     # default off: the probe is new GPU work on every idle node per cycle, so it starts as an opt-in shadow.
     GPU_FAULT_PROBE_CHECK_ENABLED: bool = Field(env="GPU_FAULT_PROBE_CHECK_ENABLED", default=False)
     GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
+    # DAH-3436: the synthetic rental probe. On an idle node (no renter pod, no filler) the validator
+    # rents the node from itself once per RENTAL_PROBE_INTERVAL_HOURS: it starts the default renter
+    # image through the same create_container path a renter's pod takes, with a probe-owned SSH key
+    # and the node's verified ports, waits up to RENTAL_PROBE_SSH_DEADLINE_SECONDS for sshd's banner
+    # on the mapped port and a login (retried until that deadline), runs `nvidia-smi -L`, and tears
+    # the container down through delete_container.
+    # A failed step zeroes the score and clears the verified job (RENTAL_PROBE_FAILED), like the GPU
+    # runtime quarantine, and the failed step stands in Redis until a probe passes: a later cycle with
+    # no verdict of its own (filler running, image gone, inconclusive) fails the node again with it; a
+    # rented node is left alone. An idle node with the image pulled is probed again every cycle until
+    # it passes. Off by default:
+    # it rents a container on every idle node every 6 h, so the team turns it on after staging.
+    RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
+    RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
+    RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
@@ -349,6 +394,16 @@ class Settings(BaseSettings):
     # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
     # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
     EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
+    # DAH-3405: for this many validation cycles, counting the one in which the registry digest of
+    # EXECUTOR_IMAGE_REF was seen to change, an executor that fails the way a watchtower restart
+    # makes it fail (SSH gone, scrape failed, ports missing, image not yet the new one) gets no
+    # verdict instead of a 0. 2 = the cycle the push landed in and the next (watchtower polls
+    # every 60 s; a node that has not pulled and restarted 15 minutes later is a node whose
+    # watchtower is not working). Cycles are counted as the validator runs them, never by the
+    # clock. Capped at MAX_ROLLOUT_GRACE_CYCLES (2, services/executor_rollout.py): a withheld
+    # executor publishes nothing, and the backend marks an executor inactive (with the
+    # EXECUTOR_INACTIVE_MID_RENTAL penalty) when its row is not updated for 1 h. 0 turns it off.
+    EXECUTOR_ROLLOUT_GRACE_CYCLES: int = Field(env="EXECUTOR_ROLLOUT_GRACE_CYCLES", default=2)
 
     # DAH-2272: when on, raise the asyncssh logger to DEBUG (debug level 2) so the
     # SSH handshake (banner / key exchange / auth) is logged per connection, and

@@ -2,7 +2,7 @@ from lium_core.shared_config.model import SharedConfig
 
 DEFAULT_SHARED_CONFIG = SharedConfig(
     machine_prices={
-        "NVIDIA B300 SXM6 AC": 5.10,
+        "NVIDIA B300 SXM6 AC": 6.4,
         "NVIDIA B200": 4.25,
         "NVIDIA H200": 2.85,
         "NVIDIA H200 NVL": 2.90,

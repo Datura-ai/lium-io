@@ -1,7 +1,18 @@
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
+from neurons.validators.src.services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
+from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.checks.tdx_host import TdxHostCheck
 from neurons.validators.src.services.task.messages import TdxHostMessages as Msg
+from neurons.validators.src.services.task.pipeline import Pipeline
+from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
+from neurons.validators.src.protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedPod,
+)
 from tests.helpers import build_context_config, build_services, build_state
 
 
@@ -105,3 +116,71 @@ async def test_tdx_host_check_run(specs, expected_pass, expected_reason, expecte
     assert result.event.reason_code == expected_reason
     # tdx_host_supported must be written into the updated specs
     assert result.updates["state"].specs["tdx_host_supported"] is expected_tdx_flag
+
+
+def _index_of(checks, check_type) -> int:
+    return next(index for index, check in enumerate(checks) if isinstance(check, check_type))
+
+
+def test_tdx_host_check_runs_after_the_scrape_and_before_the_rented_halt_in_both_pipelines():
+    # DAH-3484: TenantEnforcementCheck halts the pipeline for a rented executor. With TdxHostCheck
+    # behind that halt, a rented host published specs without tdx_host_supported and the backend
+    # stored false for it. The check needs specs.cpu.model, so it also has to follow the scrape.
+    for checks in (PipelineFactory.build_checks(), PipelineFactory.build_dry_run_checks()):
+        scrape_index = _index_of(checks, MachineSpecScrapeCheck)
+        tdx_index = _index_of(checks, TdxHostCheck)
+        tenant_index = _index_of(checks, TenantEnforcementCheck)
+        assert scrape_index < tdx_index < tenant_index
+
+
+class _RentedPodSSH:
+    """Answers the two docker commands TenantEnforcementCheck runs for a healthy rented pod."""
+
+    async def run(self, command: str):
+        result = Mock()
+        result.stdout = "container-id" if "docker ps" in command else ""
+        return result
+
+
+@pytest.mark.asyncio
+async def test_rented_executor_publishes_tdx_host_supported(context_factory):
+    # The prod case behind DAH-3484: executor 82c3bf72 (Xeon 6767P) read true while idle and
+    # flipped to false on the first cycle after a pod was placed on it. Run the factory's own
+    # order through the real Pipeline, reduced to the two checks that matter, on a rented context.
+    executor_uuid = "executor-123"
+    rented_data = RentedExecutorsResponse(
+        executors={
+            executor_uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=[RentedPod(pod_id="pod-1", container_name="tenant-1", rented_ports=[])],
+                owner_flag=False,
+            )
+        },
+        banned_guids=[],
+    )
+    state = build_state(
+        specs={"cpu": {"model": "Intel(R) Xeon(R) 6767P"}},
+        rented_data=rented_data,
+    )
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(),
+        state=state,
+        ssh=_RentedPodSSH(),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+    )
+    checks = [
+        check
+        for check in PipelineFactory.build_checks()
+        if isinstance(check, TdxHostCheck | TenantEnforcementCheck)
+    ]
+
+    passed, events, final_ctx = await Pipeline(checks, sink=AsyncMock()).run(ctx)
+
+    assert passed is True
+    assert final_ctx.rented is True
+    assert [event.check_id for event in events][-1] == TenantEnforcementCheck.check_id
+    assert final_ctx.state.specs["tdx_host_supported"] is True

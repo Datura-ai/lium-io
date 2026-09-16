@@ -108,6 +108,9 @@ Optional, commented out in the template (`src/core/config.py` has the defaults):
 - **COMPUTE_REST_API_URL**: the Lium backend the executor pre-pulls its GPU's cache template image from (default `https://lium.io/api`; empty disables the pre-pull)
 - **CACHE_TEMPLATE_REFRESH_SECONDS**: how often the template digest is re-checked (default `900`)
 - **CONTAINER_SIGNATURE_MAX_AGE_SECONDS**: maximum clock skew accepted on signed pod-metrics and pod-log requests (default `300`; keep the host on NTP rather than widening this)
+- **EXECUTOR_LOCAL_VERIFY_ENABLED**: answer the validator's one-call `POST /verify` (the verification suite from one signed intent, posted through the validator's SSH connection to the executor's loopback port; a request from the network is refused, and so is an intent that does not name this host's `MINER_HOTKEY_SS58_ADDRESS`) instead of 404 (default `false`; the validator falls back to its SSH checks either way)
+- **LOCAL_VERIFY_MAX_DEADLINE_SECONDS**: the longest a `/verify` intent may keep the GPU before the executor answers with what finished (default `600`)
+- **LOCAL_VERIFY_INTENT_WINDOW_SECONDS**: how far a `/verify` intent's `issued_at` may be from this host's clock (default `120`; NTP, as above)
 
 
 * Run project
@@ -196,3 +199,9 @@ sudo systemctl restart docker
 ## The executor image
 
 `Dockerfile` starts from `python:3.11-slim` pinned by digest; the comment above the `FROM` line names the tag and the date the digest was taken. To move to a newer base, resolve the tag (`docker buildx imagetools inspect python:3.11-slim`), put the new digest on that line and rebuild. The build ends with `sshd_setup.sh`: it turns sshd's `PerSourcePenalties` off through `/etc/ssh/sshd_config.d/lium.conf` when the base's OpenSSH knows the directive (9.8 and later), and fails the build when `sshd -T` rejects the rendered configuration.
+
+### Validator hotkeys and uploaded ssh keys
+
+The executor accepts a request signed by the validator hotkey only. The hotkey is compiled into the image (`src/core/config.py`, `VALIDATOR_HOTKEY_SS58`, overridable at build time with `VALIDATOR_HOTKEY_SS58=<ss58> bash docker_build.sh`). During a hotkey rotation the image accepts a second one, `VALIDATOR_NEXT_HOTKEY_SS58` (same file, or `VALIDATOR_HOTKEY_SS58=<ss58> VALIDATOR_NEXT_HOTKEY_SS58=<ss58>` at build time; `docker_build.sh` refuses `next` without `current`), and a signature by either is valid; with it empty only the first hotkey is accepted. Neither hotkey is read from the environment: the signers an executor trusts are fixed by its image.
+
+An ssh key the validator installs through `/upload_ssh_key` is appended to the container's `~/.ssh/authorized_keys` with a `lium-uploaded-at=<unix time>` comment. The validator removes its key through `/remove_ssh_key` when its job is done; a key still present `EXECUTOR_UPLOADED_KEY_TTL_S` seconds after the upload (default 900) is removed by the executor itself, checked every `EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S` seconds (default 60). Only lines carrying that comment are expired. `authorized_keys` lives on the disk reserve (`setup_disk_reserve.sh`), so keys uploaded before this release survive the upgrade without the comment. At its first start on this release the executor adds the comment, with the start time, to every key line that lacks it (blank lines and `#` comments are skipped; a stamped line is rewritten as the key, one space, the comment) and logs `legacy keys stamped: N`; those keys then expire `EXECUTOR_UPLOADED_KEY_TTL_S` seconds later like any upload. Lines that already carry the comment keep their own time. The stamp runs once: it writes `~/.ssh/.lium-uploaded-keys-stamped` next to `authorized_keys`, and a later start that finds that file does nothing.

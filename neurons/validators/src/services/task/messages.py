@@ -265,6 +265,35 @@ class GpuVramMessages:
     )
 
 
+class DiskHealthMessages:
+    NOT_WRITABLE = MessageTemplate(
+        event="Executor disk refuses writes",
+        reason="DISK_NOT_WRITABLE",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed (observation only until proven on live executors)",
+        remediation="The filesystem holding the docker root is mounted read-only or refused a write "
+        "probe (read_only, io_error, no_space or quota in write_probe_error). For no_space or quota: "
+        "free space on the docker root (docker system prune, a larger disk or quota). Otherwise: check "
+        "dmesg for I/O errors, run a filesystem check, replace the disk if it is failing, then remount "
+        "read-write and restart the executor.",
+    )
+    UNKNOWN = MessageTemplate(
+        event="Executor disk health not reported",
+        reason="DISK_HEALTH_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Executor disk health ok",
+        reason="DISK_HEALTH_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",
@@ -361,6 +390,8 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
+    # Warn mode (GPU_ANCHOR_HARD_ENABLED off): the legacy verdict. Its what_we_saw carries `anchor_hard_would_be`
+    # (GPU_MISSING or ANCHOR_BROKEN) so the hard rule can be read from a week of rows before it is switched on.
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
@@ -368,6 +399,32 @@ class GpuFingerprintMessages:
         category="env",
         impact="Verification reset; score set to 0",
         remediation="Ensure the same physical GPUs remain attached and stable.",
+    )
+    # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
+    # scores again on the first cycle that shows the full set.
+    GPU_MISSING = MessageTemplate(
+        event="GPU missing from the listed set",
+        reason="GPU_MISSING",
+        severity="warning",
+        category="env",
+        impact="Verification reset; score set to 0 until every listed GPU is visible again",
+        remediation=(
+            "One or more GPUs this node listed are not visible. Check `nvidia-smi -L` and `dmesg` on the host. "
+            "The node scores again when the full set is back."
+        ),
+    )
+    # Hard mode: the scrape shows a GPU that is not in the anchored set (swap, added card, or a set
+    # replaced by a different one). Permanent for this executor id; re-registering the node is the only way out.
+    ANCHOR_BROKEN = MessageTemplate(
+        event="GPU set differs from the listed set",
+        reason="GPU_UUID_CHANGED",
+        severity="error",
+        category="env",
+        impact="Score 0 on every cycle for this node id; verification does not restart",
+        remediation=(
+            "A listed node keeps one fixed set of GPUs. To list a different set, re-register the node. "
+            "Uptime starts over; penalties stay."
+        ),
     )
     UUID_OK = MessageTemplate(
         event="GPU fingerprints stable",
@@ -419,6 +476,16 @@ class BannedProviderMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+    # DAH-2662: a mount that is not procfs sits on /proc/driver/nvidia/gpus, so the kernel's GPU
+    # list cannot be read (the 2026-08-19 kit). Emitted only when KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    KERNEL_GPU_VIEW_OVERLAID = MessageTemplate(
+        event="A foreign mount covers the kernel's GPU list",
+        reason="KERNEL_GPU_VIEW_OVERLAID",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0 while the mount is in place",
+        remediation="Remove the mount over /proc/driver/nvidia/gpus on the host.",
     )
 
 
@@ -1018,6 +1085,17 @@ class CapabilityMessages:
         category="policy",
         impact="Active filler runtime preserved; capability probe would compete for VRAM.",
     )
+    RENTED_SKIPPED = MessageTemplate(
+        event="GPU capability verification not scored: a Lium workload took the cards during this cycle",
+        reason="GPU_VERIFY_SKIPPED_RENTED",
+        severity="info",
+        category="policy",
+        impact=(
+            "Score unchanged; the probe could not get the GPU because a Lium pod or default job "
+            "started after this cycle's rental snapshot. The next cycle verifies again."
+        ),
+        remediation="No action needed.",
+    )
     VERIFY_FAILED = MessageTemplate(
         event="GPU capability verification failed",
         reason="GPU_VERIFY_FAILED",
@@ -1238,6 +1316,47 @@ class RentalVerificationMessages:
     )
 
 
+class RentalProbeMessages:
+    """DAH-3436: the synthetic rental probe. A failed step zeroes the score and clears the verified job
+    (RENTAL_PROBE_FAILED) until a probe passes; an idle node with the image pulled is probed again next cycle."""
+
+    DISABLED = MessageTemplate(
+        event="Rental probe disabled",
+        reason="RENTAL_PROBE_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Rental probe skipped",
+        reason="RENTAL_PROBE_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed; the probe runs on an idle node once per interval",
+    )
+    PROBE_OK = MessageTemplate(
+        event="Rental probe passed: a renter container started, sshd listened and the GPUs were visible",
+        reason="RENTAL_PROBE_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    PROBE_FAILED = MessageTemplate(
+        event="Rental probe failed: a renter could not use this node",
+        reason="RENTAL_PROBE_FAILED",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0 and the verified job cleared until a probe passes; the node is probed again next cycle while it stays idle",
+    )
+    INCONCLUSIVE = MessageTemplate(
+        event="Rental probe could not reach a verdict",
+        reason="RENTAL_PROBE_INCONCLUSIVE",
+        severity="warning",
+        category="runtime",
+        impact="Proceed without penalty; the probe runs again next cycle",
+    )
+
+
 class CpuTruthMessages:
     """DAH-2671 item 2a — corroborate advertised CPU(s) against sources the lscpu wrapper does not
     author. Shadow (CPU_TRUTH_CHECK_ENABLED without enforcement) emits CPU_MISMATCH as a warning and
@@ -1393,4 +1512,45 @@ class CachedTemplateMessages:
         severity="info",
         category="runtime",
         impact="None — digest unknown this cycle (no backend digest / unreadable RepoDigests)",
+    )
+
+
+class LocalVerifyMessages:
+    """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
+
+    DISABLED = MessageTemplate(
+        event="Local verification disabled",
+        reason="LOCAL_VERIFY_DISABLED",
+        severity="info",
+        category="transport",
+        impact="None — every check runs over SSH as before",
+    )
+    SKIPPED = MessageTemplate(
+        event="Local verification skipped",
+        reason="LOCAL_VERIFY_SKIPPED",
+        severity="info",
+        category="transport",
+        impact="None — nothing for the local path to run this cycle",
+    )
+    NOT_ADVERTISED = MessageTemplate(
+        event="Executor does not advertise local verification",
+        reason="LOCAL_VERIFY_NOT_ADVERTISED",
+        severity="info",
+        category="transport",
+        impact="None — the matmul and VerifyX run over SSH as before",
+        remediation="Update the executor image and set EXECUTOR_LOCAL_VERIFY_ENABLED=true to take the one-call path.",
+    )
+    FALLBACK = MessageTemplate(
+        event="Local verification not used, SSH path taken",
+        reason="LOCAL_VERIFY_FALLBACK",
+        severity="info",
+        category="transport",
+        impact="None on the verdict — the SSH-driven checks decide; only the time saved is lost",
+    )
+    CONSUMED = MessageTemplate(
+        event="Local verification answered in one call",
+        reason="LOCAL_VERIFY_OK",
+        severity="info",
+        category="transport",
+        impact="The matmul and VerifyX verdicts below come from the executor's local run, judged by the validator",
     )

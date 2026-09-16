@@ -168,6 +168,30 @@ def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
     return inflight_creates.is_running(payload.pod_id)
 
 
+def _ssh_key_not_accepted_text(executors: list[ExecutorSSHInfo], default_extra: dict) -> _StructuredMessage:
+    """Why the miner's answer carried no executor this validator can use (DAH-3508).
+
+    An empty list is the usual case and says nothing about the id: the miner lists only the
+    executors that answered its SSH key upload, so a node that did not answer is left out. The old
+    text for both cases read "Invalid executor id", which sent every reader after a wrong uuid.
+    """
+    if not executors:
+        return _m(
+            "Error: no executor accepted the SSH key",
+            extra=get_extra_info({**default_extra, "executors_returned": 0}),
+        )
+    return _m(
+        "Error: the miner returned a different executor id",
+        extra=get_extra_info(
+            {
+                **default_extra,
+                "executors_returned": len(executors),
+                "returned_executor_id": str(executors[0].uuid),
+            }
+        ),
+    )
+
+
 JOB_LENGTH = 30
 
 # HTTP timeout constants for REST API calls
@@ -1100,7 +1124,7 @@ class MinerService:
                         executor = None
 
                     if executor is None or executor.uuid != payload.executor_id:
-                        log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+                        log_text = _ssh_key_not_accepted_text(msg.executors, default_extra)
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
@@ -1165,12 +1189,15 @@ class MinerService:
                                 ),
                             ),
                         )
-                        result = await docker_service.create_container(
-                            payload,
-                            executor,
-                            my_key,
-                            private_key.decode("utf-8"),
-                        )
+                        # DAH-3436 (review): the rental probe takes the same per-executor lock before its
+                        # own create, so its sweep of `pod_*` containers never runs beside this create
+                        async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                            result = await docker_service.create_container(
+                                payload,
+                                executor,
+                                my_key,
+                                private_key.decode("utf-8"),
+                            )
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
@@ -1548,7 +1575,7 @@ class MinerService:
                         executor = None
 
                     if executor is None or executor.uuid != payload.executor_id:
-                        log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+                        log_text = _ssh_key_not_accepted_text(msg.executors, default_extra)
                         logger.error(log_text)
 
                         await miner_client.send_model(
@@ -2265,7 +2292,7 @@ class MinerService:
                     executor = None
 
                 if executor is None or executor.uuid != payload.executor_id:
-                    log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+                    log_text = _ssh_key_not_accepted_text(msg.executors, default_extra)
 
                     # Remove SSH key only if it was accepted
                     if ssh_key_accepted:
@@ -2342,12 +2369,14 @@ class MinerService:
                             ),
                         ),
                     )
-                    result = await docker_service.create_container(
-                        payload,
-                        executor,
-                        my_key,
-                        private_key.decode("utf-8"),
-                    )
+                    # DAH-3436 (review): shared with the rental probe's create, see executor_create_exclusion
+                    async with self.redis_service.executor_create_exclusion(payload.executor_id):
+                        result = await docker_service.create_container(
+                            payload,
+                            executor,
+                            my_key,
+                            private_key.decode("utf-8"),
+                        )
                 elif isinstance(payload, ContainerDeleteRequest):
                     logger.info(
                         _m(
@@ -2635,7 +2664,7 @@ class MinerService:
                     executor = None
 
                 if executor is None or executor.uuid != payload.executor_id:
-                    log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+                    log_text = _ssh_key_not_accepted_text(msg.executors, default_extra)
                     logger.error(log_text)
 
                     # Remove SSH key only if it was accepted

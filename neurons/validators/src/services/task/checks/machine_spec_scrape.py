@@ -150,6 +150,17 @@ class StdinAttempt:
         }
 
 
+def _interconnect_summary(specs: dict[str, Any]) -> dict[str, Any] | None:
+    # what the scrape said about GPU-to-GPU wiring, minus the matrix (it is in specs for the backend)
+    interconnect = specs.get("interconnect")
+    if not isinstance(interconnect, dict):
+        return {"scrape_error": specs.get("interconnect_scrape_error")} if specs.get("interconnect_scrape_error") else None
+    summary = {key: value for key, value in interconnect.items() if key != "matrix"}
+    if specs.get("interconnect_scrape_error"):
+        summary["scrape_error"] = specs["interconnect_scrape_error"]
+    return summary
+
+
 def _binary_command(remote_dir: str, script_filename: str) -> str:
     script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
     return f"chmod +x {script_path} && {script_path}"
@@ -347,6 +358,8 @@ class MachineSpecScrapeCheck:
                     "gpu_count": gpu_count,
                     "gpu_model": gpu_model,
                     "network": specs.get("network"),
+                    # DAH-2922: the NVLink/P2P verdict per cycle, without the 8x8 matrix
+                    "interconnect": _interconnect_summary(specs),
                 },
                 extra=extra_info,
             )

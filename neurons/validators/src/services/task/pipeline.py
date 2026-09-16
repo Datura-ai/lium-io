@@ -17,6 +17,7 @@ from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
+from services.local_verify_client import LocalVerifyOutcome
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
@@ -26,10 +27,30 @@ from .runner import SSHCommandRunner
 
 @runtime_checkable
 class PodRecoverer(Protocol):
-    # The slice of DockerService the rented-machine check needs. Declared here because
-    # docker_service imports this package, so naming the class itself would be an import
+    # The slice of DockerService the rented-machine check and the rental probe need. Declared here
+    # because docker_service imports this package, so naming the class itself would be an import
     # cycle — and Context is a pydantic model, so a TYPE_CHECKING-only name would leave it
     # unbuildable and every validation cycle would raise instead of running.
+
+    # DAH-3436: the rental probe rents the node through the same two entry points a renter's pod
+    # takes (miner_service hands the backend's requests to these), so there is one start path and
+    # one teardown path to keep correct. `private_key` is the Fernet-encrypted key as the backend
+    # sends it; both decrypt it themselves.
+    async def create_container(
+        self,
+        payload: Any,
+        executor_info: ExecutorSSHInfo,
+        keypair: Any,
+        private_key: str,
+    ) -> Any: ...
+
+    async def delete_container(
+        self,
+        payload: Any,
+        executor_info: ExecutorSSHInfo,
+        keypair: Any,
+        private_key: str,
+    ) -> Any: ...
 
     async def recover_pod_after_stale_vloopback_mount(
         self,
@@ -111,10 +132,22 @@ class ContextState:
     gpu_splitting_min_count: int | None = None
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
+    # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
+    # None = unreadable or not read; `kernel_gpu_uuids_read_attempted` tells the two apart so a failed read is
+    # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    kernel_gpu_uuids: list[str] | None = None
+    kernel_gpu_uuids_read_attempted: bool = False
+    # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
+    # non-empty = the kernel list above was withheld because it was read through them
+    kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
     verified_port_count: int = 0
     # DAH-2991: orphaned rental containers the stale cleanup could not remove this cycle; they still
     # hold their published ports, so PortCountCheck names them in INSUFFICIENT_PORTS.
     orphaned_containers: list[str] = field(default_factory=list)
+    # DAH-3436: the (internal, external) pairs PortConnectivityCheck proved reachable this cycle.
+    # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
+    # needs both to hand create_container the ports as the backend would.
+    verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None
@@ -128,6 +161,10 @@ class ContextState:
     # (not cached / no backend digest / unreadable RepoDigest — strict fail-open).
     recommended_image_digest_match: bool | None = None
     executor_image_report: ExecutorImageReport | None = None
+    # liumd phase 1 (DAH-2834): what `POST /verify` answered this cycle, already judged. None =
+    # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
+    # step when present and run over SSH otherwise.
+    local_verify: LocalVerifyOutcome | None = None
 
 
 class CheckResult(BaseModel):
@@ -153,6 +190,10 @@ class Context(BaseModel):
     # Already decrypted: pod recovery re-runs the rental start path, which opens its own
     # connection to the host rather than reusing `ssh`.
     executor_ssh_private_key: str | None = None
+    # DAH-3436: the same key as the backend sent it (Fernet-encrypted with the validator's hotkey).
+    # create_container and delete_container decrypt it themselves, so the rental probe hands them
+    # this one and never re-encrypts.
+    executor_ssh_private_key_encrypted: str | None = None
     default_extra: dict[str, Any] = {}
     services: ContextServices
     config: ContextConfig
@@ -164,6 +205,10 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
+    # DAH-3457: set by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED when the scrape shows a GPU outside the
+    # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
+    # node scores 0 on every later cycle under this executor id and is never re-anchored.
+    gpu_anchor_broken: bool = False
     collateral_deposited: bool = False
     collateral_error_message: str | None = None
     contract_version: str | None = None

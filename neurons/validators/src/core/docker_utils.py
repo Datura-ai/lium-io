@@ -96,6 +96,15 @@ class DockerCommand:
         return f"/usr/bin/docker volume rm {names} 2>/dev/null || true"
 
     @staticmethod
+    def volume_remove_strict(volume_name: str) -> str:
+        """Build docker volume rm for ONE volume that reports its own exit status and stderr.
+
+        DAH-3436 (review): `volume_remove` masks every failure with `|| true`; the rental probe's
+        teardown has to know whether its volume is gone ("No such volume" counts as gone).
+        """
+        return f"/usr/bin/docker volume rm {shlex.quote(volume_name)}"
+
+    @staticmethod
     def volume_ls_dangling() -> str:
         """Build docker volume ls command listing dangling volume names."""
         return "/usr/bin/docker volume ls -qf dangling=true"

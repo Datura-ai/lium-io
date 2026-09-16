@@ -24,6 +24,7 @@ from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
 from .availability import availability_errors, build_ssh_unreachable_event
+from .messages import TenantEnforcementMessages
 from .models import JobResult
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
@@ -126,7 +127,9 @@ class TaskService:
         has_reached_the_node = False
 
         try:
-            # Decrypt private key
+            # Decrypt private key. The encrypted form is kept for the rental probe (DAH-3436), whose
+            # create_container / delete_container calls decrypt it themselves like a backend request.
+            encrypted_private_key = private_key
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
 
             # Prepare attestation host policy before SSH connection
@@ -180,6 +183,7 @@ class TaskService:
                     tdx_attestation_passed=attestation_passed,
                     gpu_attestation_passed=gpu_attestation_passed,
                     first_pass=first_pass,
+                    encrypted_private_key=encrypted_private_key,
                 )
 
                 # Build and run validation pipeline
@@ -216,9 +220,15 @@ class TaskService:
                 result.availability_errors = [
                     error.model_dump(mode="json") for error in availability_errors(events)
                 ]
+                # DAH-3405: the last event is the one that ended the run — the failed fatal check,
+                # the finalize event of a run that completed without a score, or the rented halt
+                # (success=True, score 0 when the image is OUTDATED).
+                if not success or result.score <= 0:
+                    result.failure_reason_code = last_event.reason_code
                 return result
 
         except Exception as e:
+            failure_reason_code = None
             # DAH-2748: SSH we could not open is an availability error, not a verdict on the
             # machine. One is enough to hide the node until a cycle succeeds.
             if is_opening_ssh_connection and _is_ssh_transport_failure(e):
@@ -230,7 +240,17 @@ class TaskService:
                 )
                 log_text = _m(event.event, extra=event.model_dump())
                 availability_problems = [error.model_dump(mode="json") for error in availability_errors([event])]
+                failure_reason_code = event.reason_code
             else:
+                # DAH-3405: a shell that died under a check that lets asyncssh raise (a watchtower
+                # recreate mid-run) ends here; name it the way the rented-machine check names the
+                # same death so the rollout classifier sees it. Not an availability error: the
+                # connect succeeded, and the code says nothing about the machine's own sshd. Any
+                # OSError after the connect takes the name too (an aiohttp connection error from a
+                # backend call included): inside a rollout window that withholds a verdict for two
+                # cycles at most, outside it the name changes nothing.
+                if has_reached_the_node and _is_ssh_transport_failure(e):
+                    failure_reason_code = TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
                 log_text = _m(
                     "Pipeline validation error",
                     extra=get_extra_info({
@@ -265,6 +285,7 @@ class TaskService:
                 tee_type=tee_type,
                 gpu_attestation_passed=gpu_attestation_passed,
                 availability_errors=availability_problems,
+                failure_reason_code=failure_reason_code,
             )
 
 

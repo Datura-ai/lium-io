@@ -1,5 +1,7 @@
 import asyncio
 import functools
+import ipaddress
+import json
 import logging
 import os
 import threading
@@ -10,19 +12,35 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-import bittensor
 import docker
 from datura.requests.validator_requests import ssh_pubkey_signing_blob
-from fastapi import APIRouter, Depends, Query, Header, HTTPException
+from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics, get_container_metrics
-from core.config import VALIDATOR_HOTKEY_SS58, settings
+from core.config import settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
-from payloads.backend import ContainerUtilizationPayload
-from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature
+from payloads.backend import ContainerUtilizationPayload, SignaturePayload
+from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
+from dependencies.auth import (
+    match_validator_hotkey,
+    verify_allowed_hotkey_signature,
+    verify_ping_signature,
+    verify_container_signature,
+    verify_container_logs_signature,
+    verify_signature,
+)
+from services.local_verify_service import (
+    BusyError,
+    LocalVerifyService,
+    NonceCache,
+    canonical_intent_message,
+    check_intent_target,
+    check_intent_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +60,10 @@ _container_log_stream_executor = ThreadPoolExecutor(
 _active_follow_log_streams = 0
 _active_follow_log_streams_lock = asyncio.Lock()
 
+# Upper bound on a peer-supplied authorized_keys line (the purge re-reads the file every minute):
+# 8192 less the 32 bytes the expiry marker takes (services/ssh_service.py). A real key is far
+# smaller — an ed25519 line is ~100 bytes, an rsa-4096 one ~750.
+MAX_PUBLIC_KEY_BYTES = 8192 - 32
 METRICS_MAX_CONCURRENT = 3
 METRICS_TIMEOUT_SECONDS = 8.0
 CONTAINER_LOOKUP_TIMEOUT_SECONDS = 5.0
@@ -202,6 +224,15 @@ def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
             f"public_key length={len(pk_normalized)}, data_to_sign length={len(dts_normalized)}"
         )
         raise HTTPException(status_code=400, detail="Public key mismatch")
+    # DAH-3394: the key is appended as one authorized_keys line with an expiry marker; a second
+    # line inside it would be a second key without the marker, and so without the expiry
+    if "\n" in pk_normalized or "\r" in pk_normalized:
+        logger.warning("Rejecting a public_key that spans more than one line")
+        raise HTTPException(status_code=400, detail="Public key must be a single line")
+    # bounded input: the line goes into a file the purge re-reads every minute
+    if len(pk_normalized.encode()) > MAX_PUBLIC_KEY_BYTES:
+        logger.warning("Rejecting a public_key of %d bytes", len(pk_normalized.encode()))
+        raise HTTPException(status_code=400, detail=f"Public key longer than {MAX_PUBLIC_KEY_BYTES} bytes")
 
 
 def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: bool = False) -> None:
@@ -217,9 +248,8 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
         logger.warning("Rejecting SSH-key upload without an attestation nonce (enforcement on)")
         raise HTTPException(status_code=401, detail="Attestation nonce required")
     try:
-        keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
         signed_blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce)
-        if not keypair.verify(signed_blob, payload.validator_signature):
+        if match_validator_hotkey(signed_blob, payload.validator_signature) is None:
             raise HTTPException(status_code=401, detail="Invalid validator signature")
         logger.info("Validator signature verification successful")
     except HTTPException:
@@ -339,15 +369,141 @@ async def ping(_: None = Depends(verify_ping_signature)):
     return {"status": "pong"}
 
 
+def _capabilities() -> list[str]:
+    # What a validator may call beyond the routes every executor has. Read per request so a flag
+    # flip is visible without a restart of anything but this process.
+    return [LOCAL_VERIFY_CAPABILITY] if settings.EXECUTOR_LOCAL_VERIFY_ENABLED else []
+
+
 @apis_router.get("/version")
 async def get_version():
     """
     Get the executor version information.
 
     Returns:
-        dict: {"version": "x.y.z"}
+        dict: {"version": "x.y.z", "capabilities": [...]} plus, while `local_verify/1` is
+        advertised, `local_verify_port`: the loopback port the validator's SSH tunnel targets for
+        `POST /verify` (this process's own INTERNAL_PORT; the miner's EXTERNAL_PORT may differ).
+        Read over plain HTTP, so a proxy can change it: a wrong port only fails the tunnel's
+        connect, and the validator then runs its SSH checks as before.
     """
-    return {"version": _get_version()}
+    version = {"version": _get_version(), "capabilities": _capabilities()}
+    if settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
+        version["local_verify_port"] = settings.INTERNAL_PORT
+    return version
+
+
+def _is_loopback_client(request: Request) -> bool:
+    """True when the TCP peer is this host's loopback: the validator's SSH tunnel (a direct-tcpip
+    channel sshd opens to 127.0.0.1) lands here; a request from the network does not. executor.py
+    starts uvicorn with `proxy_headers=False`, so no `X-Forwarded-For` can stand in for the peer."""
+    client = request.client
+    if client is None or not client.host:
+        return False
+    try:
+        return ipaddress.ip_address(client.host).is_loopback
+    except ValueError:
+        return False
+
+
+_local_verify_nonces = NonceCache()
+_local_verify_service: LocalVerifyService | None = None
+
+
+def _get_local_verify_service() -> LocalVerifyService:
+    global _local_verify_service
+    if _local_verify_service is None:
+        _local_verify_service = LocalVerifyService(
+            executor_version=_get_version(),
+            max_deadline_s=settings.LOCAL_VERIFY_MAX_DEADLINE_SECONDS,
+            port_range=settings.RENTING_PORT_RANGE,
+            port_mappings=settings.RENTING_PORT_MAPPINGS,
+            ssh_port=settings.SSH_PORT,
+        )
+    return _local_verify_service
+
+
+async def _admit_verify_intent(request: Request) -> VerifyIntent:
+    """The guards a `/verify` intent passes before anything runs: the flag, the loopback peer, the
+    body, the validator signature, the time window and the miner it names. Returns the admitted
+    intent; raises the HTTP refusal otherwise. Claims no nonce, so a refusal here leaves the signed
+    intent usable."""
+    if not settings.EXECUTOR_LOCAL_VERIFY_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not _is_loopback_client(request):
+        # Logged so a provider can see why a validator that still posts over the network gets the
+        # SSH checks instead: the peer is the docker gateway or the CVM's slirp address, not loopback.
+        logger.warning(
+            "local verify refused: not a loopback peer host=%s",
+            request.client.host if request.client else None,
+        )
+        raise HTTPException(
+            status_code=403, detail="/verify is served on the loopback only (the validator's SSH tunnel)"
+        )
+
+    try:
+        raw = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Body is not JSON")
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=422, detail="Body is not an object")
+    try:
+        intent = VerifyIntent.model_validate(raw)
+    except ValidationError as exc:
+        # `exc.errors()` carries the raising ValueError object in `ctx` for a model_validator
+        # refusal (a shared card challenge): serialised here, or the 422 would be a 500.
+        raise HTTPException(status_code=422, detail=json.loads(exc.json()))
+    # Signed as sent: the validator signs the document it puts on the wire, so a field it left at
+    # its default is not re-serialised here and a field it did send cannot be altered in flight.
+    await verify_signature(SignaturePayload(signature=intent.signature), canonical_intent_message(raw))
+
+    refused = check_intent_window(
+        intent, time.time(), settings.LOCAL_VERIFY_INTENT_WINDOW_SECONDS
+    ) or check_intent_target(intent, settings.MINER_HOTKEY_SS58_ADDRESS)
+    if refused:
+        logger.warning("local verify refused: %s nonce=%s", refused, intent.nonce)
+        raise HTTPException(status_code=401, detail=f"Intent refused: {refused}")
+    return intent
+
+
+@apis_router.post("/verify")
+async def local_verify(request: Request):
+    """Run the verification suite locally from one validator-signed intent (liumd phase 1).
+
+    Reached through the validator's SSH connection only: the validator opens a direct-tcpip
+    channel on the session it already holds (host key pinned to the TDX quote on a CVM) to this
+    process's loopback port and posts the intent through it. The answer is not signed (no
+    executor key exists, `payloads/verify.py`), so it must travel inside that channel: a request
+    whose TCP peer is not loopback is refused 403 before the body is read, and the miner's
+    port-forward from the network can neither read nor rewrite a result.
+
+    Auth is the validator hotkey signature every validator-facing route here uses
+    (`dependencies.auth.verify_signature`), over the canonical JSON of the request body as sent
+    (minus `signature`), plus a nonce that is refused when seen before and an issued_at/expires_at
+    window. Flag off → 404. (An image without the route answers 422 from MinerMiddleware instead;
+    the validator treats every non-200 as "use SSH".)
+    """
+    intent = await _admit_verify_intent(request)
+    service = _get_local_verify_service()
+    # Busy is answered before the nonce is claimed, so a refused-because-busy intent is not burnt:
+    # the validator may re-send the same signed intent once the executor is free.
+    if service.busy:
+        raise HTTPException(status_code=409, detail="a verification is already running")
+    if not _local_verify_nonces.claim(intent.nonce, float(intent.expires_at)):
+        raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
+
+    try:
+        result = await service.run(intent)
+    except BusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    logger.info(
+        "local verify done nonce=%s elapsed_ms=%d deadline_hit=%s steps=%s",
+        intent.nonce,
+        result.elapsed_ms,
+        result.deadline_hit,
+        {name: step.status for name, step in result.steps.items()},
+    )
+    return result.model_dump(by_alias=True)
 
 
 @apis_router.get("/containers/{container_name}/logs")

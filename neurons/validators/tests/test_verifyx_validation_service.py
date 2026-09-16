@@ -9,14 +9,15 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from neurons.validators.src.services.verifyx_validation_service import (
     MIN_CIPHER_LEN,
+    OUTDATED_LIBRARY_ERROR,
     VerifyXFailureClass,
     VerifyXValidationService,
 )
@@ -118,3 +119,42 @@ async def test_run_ssh_command_is_bounded_by_the_hard_timeout():
     run.assert_awaited_once_with(
         "python verifyx_executor.py", timeout=vvs.VERIFYX_COMMAND_TIMEOUT_SECONDS
     )
+
+
+@pytest.mark.asyncio
+async def test_the_library_digest_is_read_once_per_service(tmp_path):
+    """Review round on #1340: `validate_verifyx_and_process_job` hashed libverifyx.so for the
+    checksum gate and `prepare_verifyx_challenge` hashed it again for `expected_lib_sha256`, so
+    every SSH run read the .so twice. The digest is cached on the service: the file is hashed
+    on the first SSH run and a later rewrite of it is not seen — neither by the next SSH run's
+    checksum gate nor by `prepare_verifyx_challenge`."""
+    lib = tmp_path / "libverifyx.so"
+    lib.write_bytes(b"first build")
+    first_digest = hashlib.sha256(b"first build").hexdigest()
+    service = VerifyXValidationService()
+    service.lib_name = str(lib)
+    with patch(
+        "neurons.validators.src.services.verifyx_validation_service.VerifyXValidator"
+    ) as fake_validator_cls:
+        fake_validator_cls.return_value.generate_challenge.return_value = "deadbeef"
+        shell = MagicMock()
+        shell.get_sha256_checksum_by_path = AsyncMock(return_value=first_digest)
+        shell.ssh_client = MagicMock()
+        shell.ssh_client.run = AsyncMock(
+            return_value=SimpleNamespace(stdout="", stderr="", exit_status=1)
+        )
+        machine_spec = {"gpu": {"count": 1, "details": [{"uuid": "u", "name": "H100"}]}}
+        run = dict(
+            shell=shell,
+            executor_info=_executor_info(),
+            default_extra={"executor_uuid": "exec-1", "miner_hotkey": "hk"},
+            machine_spec=machine_spec,
+        )
+        first = await service.validate_verifyx_and_process_job(**run)
+        lib.write_bytes(b"second build")  # a re-read here would fail the gate against first_digest
+        second = await service.validate_verifyx_and_process_job(**run)
+        challenge = service.prepare_verifyx_challenge(machine_spec, {"executor_uuid": "exec-1"})
+
+    assert first.error != OUTDATED_LIBRARY_ERROR and second.error != OUTDATED_LIBRARY_ERROR
+    assert service.lib_sha256() == first_digest
+    assert challenge.expected_lib_sha256 == first_digest
