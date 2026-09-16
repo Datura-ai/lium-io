@@ -19,13 +19,22 @@ How the connect path is reused (no new protocol, no new key handling):
 4. ``services.ssh_connect_timing.connect_with_phase_timing(host, port, username,
    client_keys=[pkey], known_hosts=None)`` opens the session, the same call
    ``DockerService.wait_for_port_check_containers`` makes.
-5. The read-only commands in ``COMMANDS`` run, then ``MinerService._remove_ssh_key_via_rest``
-   takes the key back, in a ``finally``.
+5. The read-only commands in ``COMMANDS`` run, each wrapped by ``capped()`` so the node cuts
+   stdout and stderr at ``OUTPUT_CAP`` bytes each before they reach the validator, then
+   ``MinerService._remove_ssh_key_via_rest`` takes the key back, in a ``finally``.
 
 The sshd we reach runs inside the ``executor-executor-1`` container. That container mounts the
 host's ``/var/run/docker.sock`` and ``/etc/docker/daemon.json`` (neurons/executor/docker-compose.app.yml),
 so ``docker info`` reports the HOST daemon's registry configuration and ``cat /etc/docker/daemon.json``
 reads the HOST file. The cgroup and ``/.dockerenv`` lines in each block say where the shell ran.
+
+What the table compares: ``executor_vs_hub`` is the digest of the image the running executor
+container(s) run against ``fetch_executor_image_digest()``, the registry digest of
+``settings.EXECUTOR_IMAGE_REF`` that the validator scores against (DAH-2701); ``runner_vs_hub``
+is the running runner's digest against Docker Hub's ``compute-subnet-executor-runner:latest``, the
+image Watchtower updates. Running digests come from every running container's image (by the
+image's repository, as ``machine_scrape`` finds the executor), so zero matches read ``none`` and
+several containers on different digests are listed by name instead of one being picked.
 
 Usage (from the validator checkout, with the validator's env loaded):
 
@@ -56,7 +65,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 from core.config import settings  # noqa: E402
 from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo  # noqa: E402
 from datura.requests.validator_requests import SSHPubKeySubmitRequest  # noqa: E402
-from services.default_docker_image_digest_service import fetch_registry_digest  # noqa: E402
+from services.default_docker_image_digest_service import (  # noqa: E402
+    fetch_executor_image_digest,
+    fetch_registry_digest,
+)
 from services.miner_service import (  # noqa: E402
     REST_SSH_SUBMIT_TIMEOUT,
     MinerService,
@@ -67,10 +79,15 @@ from services.ssh_service import SSHService  # noqa: E402
 
 RUNNER_IMAGE = "daturaai/compute-subnet-executor-runner"
 EXECUTOR_IMAGE = "daturaai/compute-subnet-executor"
-RUNNER_CONTAINER_FILTER = "executor-runner"
 WATCHTOWER_CONTAINER = "executor-watchtower-1"
 NO_DAEMON_JSON = "NO_DAEMON_JSON"
 DAEMON_JSON_IS_DIR = "DAEMON_JSON_IS_DIR"  # docker made a directory because the host file did not exist at first `up`
+
+# Bytes per stream per command that the node may send; `head -c` on the node cuts the rest.
+OUTPUT_CAP = 65536
+# The wrapped command's exit status rides on the last stdout line, after a blank one.
+RC_MARKER = "__inspect_rc="
+TRUNCATED_NOTE = f"[truncated at {OUTPUT_CAP} bytes]"
 
 # Every command reads. ``test_every_command_is_read_only`` refuses a verb that writes.
 COMMANDS: tuple[tuple[str, str], ...] = (
@@ -81,15 +98,20 @@ COMMANDS: tuple[tuple[str, str], ...] = (
         f" || cat /etc/docker/daemon.json 2>/dev/null || echo {NO_DAEMON_JSON}",
     ),
     ("pulled_runner_images", f"docker images --digests {RUNNER_IMAGE}"),
-    (
-        # the image the runner container RUNS, not the newest one pulled: a Watchtower that pulled
-        # and failed to restart leaves both on the host
-        "running_runner_digest",
-        "docker image inspect --format '{{index .RepoDigests 0}}'"
-        f" $(docker inspect --format '{{{{.Image}}}}' $(docker ps -qf name={RUNNER_CONTAINER_FILTER})) 2>&1",
-    ),
     ("executor_images", f"docker images --digests {EXECUTOR_IMAGE}"),
     ("running", "docker ps --format '{{.Names}} {{.Image}}'"),
+    (
+        # the image each running container RUNS (name → image id), not the newest one pulled: a
+        # Watchtower that pulled and failed to restart leaves both on the host
+        "running_containers",
+        "docker inspect --format '{{.Name}} {{.Image}}' $(docker ps -q) 2>&1",
+    ),
+    (
+        # the repository digests of those image ids; `running_digests_by_repo` joins the two reads
+        "running_image_digests",
+        "docker image inspect --format '{{.Id}} {{json .RepoDigests}}'"
+        " $(docker inspect --format '{{.Image}}' $(docker ps -q)) 2>&1",
+    ),
     (
         "watchtower_log",
         f"docker logs {WATCHTOWER_CONTAINER} --tail 50 2>&1"
@@ -100,6 +122,21 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 Resolver = Callable[[str], Awaitable[tuple[str, int]]]
+
+
+def capped(command: str) -> str:
+    """``command`` with stdout and stderr each cut at ``OUTPUT_CAP`` bytes on the node.
+
+    POSIX sh only (dash included): the inner group's stdout is parked on fd 3 while its stderr
+    goes through the first ``head``, then fd 3 comes back as stdout for the second ``head``. A
+    command that keeps writing past the cap gets SIGPIPE and stops. The command's exit status is
+    printed as the last stdout line (``RC_MARKER``); a stdout that ``head`` cut has no marker, so
+    the client reads it as truncated and the exit status as unknown.
+    """
+    return (
+        f"{{ {{ {command}; printf '\\n{RC_MARKER}%s\\n' \"$?\"; }} 2>&1 1>&3 3>&-"
+        f" | head -c {OUTPUT_CAP} 1>&2 3>&-; }} 3>&1 | head -c {OUTPUT_CAP}"
+    )
 
 
 @dataclass(frozen=True)
@@ -113,6 +150,38 @@ class CommandOutput:
     exit_status: int | None
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class HubDigests:
+    """What the running digests are compared with; ``None`` means not fetched or unreachable."""
+
+    executor: str | None = None  # fetch_executor_image_digest(): settings.EXECUTOR_IMAGE_REF, what the validator scores
+    runner: str | None = None  # Docker Hub RUNNER_IMAGE:latest, what Watchtower pulls
+
+
+def split_exit_status(stdout: str) -> tuple[str, int | None]:
+    """(stdout without the ``RC_MARKER`` line, exit status); ``None`` when the marker is missing."""
+    body, marker, rest = stdout.rpartition("\n" + RC_MARKER)
+    if not marker or not rest.endswith("\n"):  # no marker, or the cap fell inside its digits
+        return stdout, None
+    digits = rest.strip()
+    return body, int(digits) if digits.isdigit() else None
+
+
+def clip(text: str, note: str | None = None) -> str:
+    """Never keep more than ``OUTPUT_CAP`` characters of a stream; a stream at the cap says so."""
+    if len(text) >= OUTPUT_CAP:
+        text, note = text[:OUTPUT_CAP], TRUNCATED_NOTE
+    text = text.strip()
+    return f"{text}\n{note}".strip() if note else text
+
+
+def capped_output(result) -> CommandOutput:
+    """The ``CommandOutput`` for one ``capped()`` run: marker off, both streams clipped."""
+    stdout, exit_status = split_exit_status(result.stdout or "")
+    note = None if exit_status is not None else f"[no exit status: stdout cut at {OUTPUT_CAP} bytes or the shell stopped early]"
+    return CommandOutput(exit_status=exit_status, stdout=clip(stdout, note), stderr=clip(result.stderr or ""))
 
 
 @dataclass
@@ -189,15 +258,16 @@ async def resolve_axon_from_metagraph(hotkey: str) -> tuple[str, int]:
 
 
 async def run_commands(ssh_client, outputs: dict[str, CommandOutput], per_command_timeout: float) -> None:
-    """Fill ``outputs`` one command at a time, so a node budget that runs out keeps what was read."""
+    """Fill ``outputs`` one command at a time, so a node budget that runs out keeps what was read.
+
+    Each command runs through ``capped()``, so ``ssh_client.run()`` never buffers more than
+    ``OUTPUT_CAP`` bytes per stream; ``errors="replace"`` keeps a multibyte character that
+    ``head -c`` split from failing the read.
+    """
     for label, command in COMMANDS:
         try:
-            result = await asyncio.wait_for(ssh_client.run(command), timeout=per_command_timeout)
-            outputs[label] = CommandOutput(
-                exit_status=result.exit_status,
-                stdout=(result.stdout or "").strip(),
-                stderr=(result.stderr or "").strip(),
-            )
+            result = await asyncio.wait_for(ssh_client.run(capped(command), errors="replace"), timeout=per_command_timeout)
+            outputs[label] = capped_output(result)
         except Exception as exc:  # one failed read must not hide the others
             outputs[label] = CommandOutput(exit_status=None, stdout="", stderr=f"{type(exc).__name__}: {exc}")
 
@@ -210,7 +280,7 @@ async def inspect_executor(
     resolve_axon: Resolver,
     node_timeout: float,
 ) -> NodeReport:
-    """Key submit → connect → read → key remove, for one executor. Never raises."""
+    """Key submit → connect → read → key remove, for one executor. Raises only when the local key generation or signing fails."""
     report = NodeReport(target=target)
     log_extra = {"miner_hotkey": target.miner_hotkey, "executor_id": target.executor_id, "context": "inspect_executor_host"}
     try:
@@ -287,7 +357,83 @@ async def inspect_executor(
     return report
 
 
-def summarise(report: NodeReport, hub_runner_digest: str | None) -> dict[str, str]:
+def running_digests_by_repo(outputs: dict[str, CommandOutput]) -> dict[str, list[tuple[str, str]]] | None:
+    """``repository -> [(container name, digest)]`` for every running container; ``None`` when a read failed.
+
+    Joins ``running_containers`` (name, image id) with ``running_image_digests`` (image id,
+    RepoDigests). A container is matched by its image's repository, the way ``machine_scrape``
+    finds the executor container, never by its name.
+    """
+    containers = outputs.get("running_containers")
+    images = outputs.get("running_image_digests")
+    if containers is None or images is None or containers.exit_status != 0 or images.exit_status != 0:
+        return None
+    image_by_container: dict[str, str] = {}
+    for line in containers.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].startswith("sha256:"):
+            image_by_container[parts[0].lstrip("/")] = parts[1]
+    repo_digests_by_image: dict[str, list[str]] = {}
+    for line in images.stdout.splitlines():
+        image_id, _, rest = line.partition(" ")
+        if not image_id.startswith("sha256:"):
+            continue
+        try:
+            repo_digests_by_image[image_id] = [d for d in (json.loads(rest) or []) if isinstance(d, str)]
+        except (ValueError, TypeError):  # `null` for an image without RepoDigests, or a cut line
+            continue
+    if not set(image_by_container.values()) <= set(repo_digests_by_image):
+        return None  # a container started or stopped between the two `docker ps -q`; say "?" rather than "none"
+    by_repo: dict[str, list[tuple[str, str]]] = {}
+    for name, image_id in sorted(image_by_container.items()):
+        for entry in repo_digests_by_image[image_id]:
+            repo, _, digest = entry.partition("@")
+            if digest.startswith("sha256:"):
+                by_repo.setdefault(repo, []).append((name, digest))
+    return by_repo
+
+
+def _short(digest: str) -> str:
+    return digest[:19] if digest.startswith("sha256:") else digest
+
+
+@dataclass(frozen=True)
+class RunningImage:
+    """One image's running containers: the table cell, and their image's digests when they all run the same image."""
+
+    cell: str
+    digests: frozenset[str] | None = None
+
+    def vs_hub(self, hub_digest: str | None) -> str:
+        if self.digests is None:
+            return {"?": "?", "none": "none running"}.get(self.cell, "MIXED")
+        if not hub_digest:
+            return "?"
+        return "current" if hub_digest in self.digests else "STALE"
+
+
+def describe_running(matches: list[tuple[str, str]] | None) -> RunningImage:
+    """``?`` when the reads failed, ``none`` when no running container runs the image, the digest
+    (``×N`` for N containers on it) when they all run the same image, every container by name when
+    they do not. One image can carry two RepoDigests of the same repository (pulled by tag and by
+    digest); they are shown joined with ``+`` and either one counts as current."""
+    if matches is None:
+        return RunningImage("?")
+    if not matches:
+        return RunningImage("none")
+    per_container: dict[str, set[str]] = {}
+    for name, digest in matches:
+        per_container.setdefault(name, set()).add(digest)
+    distinct = {frozenset(digests) for digests in per_container.values()}
+    if len(distinct) == 1:
+        digests = next(iter(distinct))
+        suffix = f" ×{len(per_container)}" if len(per_container) > 1 else ""
+        return RunningImage("+".join(_short(d) for d in sorted(digests)) + suffix, digests)
+    listed = ", ".join(f"{name}={'+'.join(_short(d) for d in sorted(digests))}" for name, digests in sorted(per_container.items()))
+    return RunningImage(f"{len(distinct)} images in {len(per_container)} containers: {listed}")
+
+
+def summarise(report: NodeReport, hub: HubDigests) -> dict[str, str]:
     """The one-line facts per node; every value is a string ready for the table."""
     out = report.outputs
     registry = out.get("registry_config")
@@ -295,9 +441,12 @@ def summarise(report: NodeReport, hub_runner_digest: str | None) -> dict[str, st
     if registry and registry.stdout:
         try:
             cfg = json.loads(registry.stdout)
+        except ValueError:
+            cfg = None
+        if isinstance(cfg, dict):  # `null` when the daemon behind the socket did not answer
             listed = cfg.get("Mirrors") or []
             mirrors = ", ".join(listed) if listed else "none"
-        except ValueError:
+        else:
             mirrors = "unparsable"
     daemon = out.get("daemon_json")
     if daemon is None or daemon.exit_status is None or not daemon.stdout:
@@ -318,16 +467,9 @@ def summarise(report: NodeReport, hub_runner_digest: str | None) -> dict[str, st
                 pulled_digest = cols[2]
                 break
 
-    running_digest = "?"
-    running = out.get("running_runner_digest")
-    if running and running.exit_status == 0 and "@sha256:" in running.stdout:
-        running_digest = "sha256:" + running.stdout.strip().rsplit("@sha256:", 1)[1]
-    vs_hub = "?"
-    if hub_runner_digest and running_digest.startswith("sha256:"):
-        vs_hub = "current" if running_digest == hub_runner_digest else "STALE"
-
-    def _short(digest: str) -> str:
-        return digest[:19] if digest.startswith("sha256:") else digest
+    by_repo = running_digests_by_repo(out)
+    executor = describe_running(None if by_repo is None else by_repo.get(EXECUTOR_IMAGE, []))
+    runner = describe_running(None if by_repo is None else by_repo.get(RUNNER_IMAGE, []))
 
     watchtower = out.get("watchtower_log")
     last_line = "?"
@@ -346,20 +488,28 @@ def summarise(report: NodeReport, hub_runner_digest: str | None) -> dict[str, st
         "node": report.target.executor_id,
         "mirror": mirrors,
         "daemon_json": daemon_present,
-        "running_digest": _short(running_digest),
-        "pulled_digest": _short(pulled_digest),
-        "vs_hub": vs_hub,
+        "executor_running": executor.cell,
+        "executor_vs_hub": executor.vs_hub(hub.executor),
+        "runner_running": runner.cell,
+        "runner_pulled": _short(pulled_digest),
+        "runner_vs_hub": runner.vs_hub(hub.runner),
         "shell_ran_in": where,
         "watchtower_last_line": last_line,
         "error": report.error or "",
     }
 
 
+SUMMARY_COLUMNS = [
+    "node", "mirror", "daemon_json", "executor_running", "executor_vs_hub", "runner_running", "runner_pulled",
+    "runner_vs_hub", "shell_ran_in", "watchtower_last_line", "error",
+]
+
+
 def render_node_block(report: NodeReport) -> str:
     head = f"### {report.target.executor_id} (miner {report.target.miner_hotkey})"
     if report.executor is not None:
         head += f" — {report.executor.address}:{report.executor.ssh_port} as {report.executor.ssh_username}"
-    lines = [head, "```"]
+    lines = [head, "```", f"# each command below ran wrapped by capped(): stdout and stderr cut at {OUTPUT_CAP} bytes on the node"]
     if report.error:
         lines.append(f"ERROR: {report.error}")
     for label, command in COMMANDS:
@@ -379,10 +529,12 @@ def render_node_block(report: NodeReport) -> str:
     return "\n".join(lines)
 
 
-def render_summary(rows: list[dict[str, str]], hub_runner_digest: str | None) -> str:
-    columns = ["node", "mirror", "daemon_json", "running_digest", "pulled_digest", "vs_hub", "shell_ran_in", "watchtower_last_line", "error"]
+def render_summary(rows: list[dict[str, str]], hub: HubDigests) -> str:
+    columns = SUMMARY_COLUMNS
     lines = [
-        f"Docker Hub {RUNNER_IMAGE}:latest digest now: {hub_runner_digest or 'not fetched'}",
+        f"Expected executor digest ({settings.EXECUTOR_IMAGE_REF}, fetch_executor_image_digest, what the validator"
+        f" scores against): {hub.executor or 'not fetched'}",
+        f"Docker Hub {RUNNER_IMAGE}:latest digest now: {hub.runner or 'not fetched'}",
         "",
         "| " + " | ".join(columns) + " |",
         "|" + "---|" * len(columns),
@@ -400,14 +552,19 @@ def render_plan(targets: list[Target], concurrency: int, node_timeout: float) ->
     ]
     for _, command in COMMANDS:
         lines.append(f"  $ {command}")
+    lines.append(f"Each read runs wrapped, stdout and stderr cut at {OUTPUT_CAP} bytes on the node, e.g.:")
+    lines.append(f"  $ {capped(COMMANDS[0][1])}")
     for target in targets:
         lines.append(f"- {target.executor_id}  miner {target.miner_hotkey}")
     return "\n".join(lines)
 
 
-async def fetch_hub_runner_digest() -> str | None:
+async def fetch_hub_digests() -> HubDigests:
+    """The executor digest the validator scores against, and the runner digest Watchtower pulls."""
+    executor = await fetch_executor_image_digest()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-        return await fetch_registry_digest(session, f"{RUNNER_IMAGE}:latest")
+        runner = await fetch_registry_digest(session, f"{RUNNER_IMAGE}:latest")
+    return HubDigests(executor=executor, runner=runner)
 
 
 async def run(
@@ -418,7 +575,7 @@ async def run(
     resolve_axon: Resolver,
     miner_service: MinerService,
     my_key: bittensor.Keypair,
-    hub_runner_digest: str | None,
+    hub: HubDigests,
     out=sys.stdout,
 ) -> list[NodeReport]:
     semaphore = asyncio.Semaphore(concurrency)
@@ -437,7 +594,7 @@ async def run(
     for report in reports:
         print(render_node_block(report), file=out)
         print(file=out)
-    print(render_summary([summarise(r, hub_runner_digest) for r in reports], hub_runner_digest), file=out)
+    print(render_summary([summarise(r, hub) for r in reports], hub), file=out)
     return list(reports)
 
 
@@ -448,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--axon", action="append", default=[], metavar="HOTKEY=IP:PORT", help="skip the metagraph lookup for this miner")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=60.0, help="seconds per node for connect + reads (default 60)")
-    parser.add_argument("--no-hub-digest", action="store_true", help="do not ask Docker Hub for the current runner digest")
+    parser.add_argument("--no-hub-digest", action="store_true", help="do not ask Docker Hub for the expected executor and runner digests")
     parser.add_argument("--dry-run", action="store_true", help="print the plan; open nothing")
     return parser
 
@@ -484,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     async def _main() -> int:
-        hub_digest = None if args.no_hub_digest else await fetch_hub_runner_digest()
+        hub = HubDigests() if args.no_hub_digest else await fetch_hub_digests()
         my_key = settings.get_bittensor_wallet().get_hotkey()
         resolve_axon = await resolve_axons_once({t.miner_hotkey for t in targets}, overrides)
         reports = await run(
@@ -494,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
             resolve_axon=resolve_axon,
             miner_service=make_miner_service(),
             my_key=my_key,
-            hub_runner_digest=hub_digest,
+            hub=hub,
         )
         return 1 if any(r.error for r in reports) else 0
 

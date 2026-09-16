@@ -8,8 +8,10 @@ underneath ``connect_with_phase_timing`` and captures the connect kwargs.
 import asyncio
 import importlib.util
 import io
+import json
 import pathlib
 import re
+import subprocess
 import sys
 
 import bittensor
@@ -31,10 +33,14 @@ EXECUTOR_ID = "2e2cfbdf-75c2-427c-93b4-f3758d983802"
 MINER_HOTKEY = "5DhzqmmkD99d8MFbEEFgtQYSUWyYHRLNJKpVjYQFn5d6hJsv"
 HUB_DIGEST = "sha256:" + "f590fed3" * 8
 OLD_DIGEST = "sha256:" + "8c07d3a9" * 8
+EXECUTOR_HUB_DIGEST = "sha256:" + "1a2b3c4d" * 8
+EXECUTOR_OLD_DIGEST = "sha256:" + "9e8f7a6b" * 8
+HUB = ieh.HubDigests(executor=EXECUTOR_HUB_DIGEST, runner=HUB_DIGEST)
 
-READ_ONLY_PROGRAMS = {"cat", "echo", "head", "test", "hostname"}
+READ_ONLY_PROGRAMS = {"cat", "echo", "head", "test", "hostname", "printf"}
 READ_ONLY_DOCKER_VERBS = {"info", "images", "ps", "logs", "inspect"}
 READ_ONLY_DOCKER_IMAGE_VERBS = {"inspect", "ls", "history"}
+_FD_DUP = re.compile(r"^\d*>&(\d+|-)$")  # 2>&1, 1>&3, 3>&- : fd plumbing, no file written
 
 
 def _segments(command: str):
@@ -62,11 +68,26 @@ def _executor(uuid=EXECUTOR_ID):
 
 
 class _FakeConn(_FakeSSHClient):
-    """The validator's fake SSH client plus the close pair ``connect_with_phase_timing`` calls on exit."""
+    """The validator's fake SSH client plus the close pair ``connect_with_phase_timing`` calls on exit.
+
+    ``run`` answers like a node that ran the ``capped()`` wrapper on a small output: the configured
+    result's exit status rides on the last stdout line and the pipeline's own status is 0. A test
+    that wants the raw stream (a stdout ``head`` cut, so no marker) sets ``remote_marker = False``.
+    """
 
     def __init__(self):
         super().__init__()
         self.closed = False
+        self.remote_marker = True
+        self.run_kwargs: list[dict] = []
+
+    async def run(self, command, **kwargs):
+        self.run_kwargs.append(kwargs)
+        result = await super().run(command)
+        if not self.remote_marker:
+            return result
+        marker = f"\n{ieh.RC_MARKER}{result.exit_status}\n"
+        return _SSHRunResult(exit_status=0, stdout=(result.stdout or "") + marker, stderr=result.stderr)
 
     def close(self):
         self.closed = True
@@ -133,7 +154,8 @@ async def _inspect(my_key, resolve=_resolve, node_timeout=5.0):
 
 
 def _is_read_only(words: list[str]) -> bool:
-    words = [w for w in words if w not in ("2>/dev/null", "2>&1")]  # stderr routing writes no file
+    # stderr routing, fd-to-fd plumbing and the wrapper's group braces write no file
+    words = [w for w in words if w != "2>/dev/null" and w not in ("{", "}") and not _FD_DUP.match(w)]
     if not words:
         return True
     if ">" in " ".join(words):  # any remaining redirect writes a file
@@ -150,12 +172,59 @@ def _is_read_only(words: list[str]) -> bool:
 def test_every_command_is_read_only():
     """Regression: a later edit adds `docker compose pull`, `docker update` or a restart to COMMANDS."""
     for label, command in ieh.COMMANDS:
-        for words in _segments(command):
+        for words in _segments(ieh.capped(command)):  # the wrapped form is what the node runs
             assert _is_read_only(words), f"{label}: {' '.join(words)!r} is not on the read-only allow-list"
-    # the allow-list itself refuses what the ticket must never do
+    # the allow-list itself refuses what the ticket must never do, wrapped or not
     for bad in ("docker compose pull", "docker update --restart=no c", "docker container create x", "docker rm x",
                 "docker image prune", "cat a > /etc/docker/daemon.json", "docker ps > /tmp/x", "systemctl restart docker"):
         assert not all(_is_read_only(w) for w in _segments(bad)), bad
+        assert not all(_is_read_only(w) for w in _segments(ieh.capped(bad))), bad
+
+
+@pytest.mark.parametrize(
+    "command, want_stdout, want_stderr, want_rc",
+    [
+        # a small output: both streams whole, the exit status on the marker line
+        ("printf out; printf err >&2; (exit 3)", b"out", b"err", 3),
+        # 200 kB on stdout: the node sends exactly the cap and the marker never arrives
+        ("head -c 200000 /dev/zero | tr '\\0' a; echo err >&2", b"a" * ieh.OUTPUT_CAP, b"err\n", None),
+        # 200 kB on stderr: stderr is cut, stdout and its exit status are whole
+        ("head -c 200000 /dev/zero | tr '\\0' b >&2; echo ok", b"ok\n", b"b" * ieh.OUTPUT_CAP, 0),
+        # a `docker info` style warning on stderr stays out of the JSON on stdout
+        ("echo '{\"Mirrors\":[]}'; echo 'WARNING: No swap limit support' >&2", b'{"Mirrors":[]}\n', b"WARNING: No swap limit support\n", 0),
+    ],
+)
+def test_capped_wrapper_cuts_each_stream_on_the_node_and_keeps_the_exit_status(command, want_stdout, want_stderr, want_rc):
+    """Regression: `ssh_client.run()` buffered a 30 MB daemon.json or log line whole (Rustam, #1385)."""
+    done = subprocess.run(["sh", "-c", ieh.capped(command)], capture_output=True, timeout=30)
+    stdout, rc = ieh.split_exit_status(done.stdout.decode())
+    assert (stdout.encode(), done.stderr, rc) == (want_stdout, want_stderr, want_rc)
+    assert len(done.stdout) <= ieh.OUTPUT_CAP and len(done.stderr) <= ieh.OUTPUT_CAP
+
+
+@pytest.mark.asyncio
+async def test_a_stream_at_the_cap_is_cut_and_marked_on_the_client_too(my_key, wired):
+    """Regression: a node whose shell ignored the wrapper (no `head`, no marker) gets its whole stream printed, and read as `yes`."""
+    conn = _FakeConn()
+    conn.remote_marker = False  # raw streams: a stdout `head` cut has no marker; nothing capped the 3× stderr
+    conn.results_by_substring["daemon.json"] = _SSHRunResult(stdout="x" * ieh.OUTPUT_CAP, stderr="e" * (3 * ieh.OUTPUT_CAP))
+    conn.results_by_substring["docker ps --format"] = _SSHRunResult(stdout="executor-executor-1 daturaai/compute-subnet-executor@sha256:…")
+    conn.results_by_substring["docker info"] = _SSHRunResult(stdout="null")  # the daemon behind the socket did not answer
+    wired(conn=conn)
+
+    report = await _inspect(my_key)
+
+    daemon = report.outputs["daemon_json"]
+    assert daemon.exit_status is None
+    assert daemon.stdout.startswith("x" * 100) and daemon.stdout.endswith(ieh.TRUNCATED_NOTE)
+    assert daemon.stderr == "e" * ieh.OUTPUT_CAP + "\n" + ieh.TRUNCATED_NOTE
+    assert len(daemon.stdout) <= ieh.OUTPUT_CAP + len(ieh.TRUNCATED_NOTE) + 1
+    running = report.outputs["running"]  # short stdout, no marker: the shell stopped early, the note says so
+    assert running.exit_status is None
+    assert running.stdout == "executor-executor-1 daturaai/compute-subnet-executor@sha256:…\n[no exit status: stdout cut at 65536 bytes or the shell stopped early]"
+    row = ieh.summarise(report, HUB)
+    assert (row["daemon_json"], row["mirror"]) == ("?", "unparsable")  # a cut read is not "yes"; a `null` registry config is not a crash
+    assert all(kwargs == {"errors": "replace"} for kwargs in conn.run_kwargs)  # a split multibyte char is not a failed read
 
 
 @pytest.mark.asyncio
@@ -169,7 +238,8 @@ async def test_connects_where_the_miner_said_and_takes_the_key_back(my_key, wire
     assert (captured["host"], captured["port"], captured["username"]) == ("203.0.113.10", 2200, "root")
     assert captured["known_hosts"] is None
     assert len(captured["client_keys"]) == 1
-    assert conn.commands == [command for _, command in ieh.COMMANDS]
+    assert conn.commands == [ieh.capped(command) for _, command in ieh.COMMANDS]  # never a bare, uncapped read
+    assert all(output.exit_status == 0 for output in report.outputs.values())  # the marker's status, not head's
     assert rest.urls() == ["ssh-pubkey-submit", "ssh-pubkey-remove"]
     submit = rest.calls[0][1]
     assert submit["executor_id"] == EXECUTOR_ID
@@ -201,8 +271,9 @@ def test_summary_says_unknown_not_yes_for_a_read_that_failed():
     report = _report_with({})
     report.outputs["daemon_json"] = ieh.CommandOutput(None, "", "TimeoutError: ")
     report.outputs["dockerenv"] = ieh.CommandOutput(None, "", "TimeoutError: ")
-    row = ieh.summarise(report, hub_runner_digest=None)
-    assert (row["daemon_json"], row["shell_ran_in"]) == ("?", "?")
+    report.outputs["registry_config"] = ieh.CommandOutput(0, "null", "")  # the daemon behind the socket did not answer
+    row = ieh.summarise(report, ieh.HubDigests())
+    assert (row["daemon_json"], row["shell_ran_in"], row["mirror"]) == ("?", "?", "unparsable")
 
 
 def test_main_refuses_a_bad_axon_and_zero_concurrency(capsys):
@@ -256,8 +327,25 @@ def _report_with(outputs: dict[str, str]) -> "ieh.NodeReport":
     return report
 
 
-def test_summary_reads_mirror_daemon_json_digest_and_where_the_shell_ran():
-    """Regression: the table says `none`/`yes`/`current` for a node that has a mirror, no file and the old runner."""
+def _running(*containers: tuple[str, str, list[str] | None]) -> dict[str, str]:
+    """The two reads for running containers: ``(name, image id, RepoDigests)`` per container, as docker prints them."""
+    names = "\n".join(f"/{name} {image_id}" for name, image_id, _ in containers)
+    digests = "\n".join(f"{image_id} {json.dumps(repo_digests)}" for _, image_id, repo_digests in containers)
+    return {"running_containers": names, "running_image_digests": digests}
+
+
+STANDARD_STACK = _running(
+    ("executor-executor-1", "sha256:" + "e" * 64, [f"{ieh.EXECUTOR_IMAGE}@{EXECUTOR_OLD_DIGEST}"]),
+    ("executor-monitor-1", "sha256:" + "e" * 64, [f"{ieh.EXECUTOR_IMAGE}@{EXECUTOR_OLD_DIGEST}"]),
+    ("executor-executor-runner-1", "sha256:" + "a" * 64, [f"{ieh.RUNNER_IMAGE}@{OLD_DIGEST}"]),
+    ("executor-watchtower-1", "sha256:" + "b" * 64, ["containrrr/watchtower@sha256:" + "c" * 64]),
+    ("executor-autoheal-1", "sha256:" + "d" * 64, []),  # a locally built image has no RepoDigests
+    ("executor-nginx-1", "sha256:" + "f" * 64, None),  # some engines print `null` instead of `[]`
+)
+
+
+def test_summary_reads_mirror_daemon_json_digests_and_where_the_shell_ran():
+    """Regression: the table says `none`/`yes`/`current` for a node that has a mirror, no file and the old images."""
     images = (
         "REPOSITORY   TAG   DIGEST   IMAGE ID   CREATED   SIZE\n"
         f"{ieh.RUNNER_IMAGE}   latest   {OLD_DIGEST}   0123456789ab   4 weeks ago   200MB\n"
@@ -266,18 +354,20 @@ def test_summary_reads_mirror_daemon_json_digest_and_where_the_shell_ran():
         "registry_config": '{"Mirrors":["https://mirror.example.internal"],"IndexConfigs":{}}',
         "daemon_json": ieh.NO_DAEMON_JSON,
         "pulled_runner_images": images,
-        "running_runner_digest": f"{ieh.RUNNER_IMAGE}@{OLD_DIGEST}",
+        **STANDARD_STACK,
         "watchtower_log": "time=... msg=\"Found new image\"\ntime=... msg=\"Unable to update container\"\n",
         "dockerenv": "IN_CONTAINER\nabcdef012345",
     })
 
-    row = ieh.summarise(report, hub_runner_digest=HUB_DIGEST)
+    row = ieh.summarise(report, HUB)
 
     assert row["mirror"] == "https://mirror.example.internal"
     assert row["daemon_json"] == "no"
-    assert row["running_digest"] == OLD_DIGEST[:19]
-    assert row["pulled_digest"] == OLD_DIGEST[:19]
-    assert row["vs_hub"] == "STALE"
+    assert row["executor_running"] == EXECUTOR_OLD_DIGEST[:19] + " ×2"  # executor + monitor run the same image
+    assert row["executor_vs_hub"] == "STALE"
+    assert row["runner_running"] == OLD_DIGEST[:19]
+    assert row["runner_pulled"] == OLD_DIGEST[:19]
+    assert row["runner_vs_hub"] == "STALE"
     assert row["shell_ran_in"] == "executor container"
     assert row["watchtower_last_line"] == 'time=... msg="Unable to update container"'
 
@@ -285,37 +375,110 @@ def test_summary_reads_mirror_daemon_json_digest_and_where_the_shell_ran():
         "registry_config": '{"Mirrors":[]}',
         "daemon_json": '{"runtimes": {}}',
         "pulled_runner_images": images.replace(OLD_DIGEST, HUB_DIGEST),
-        "running_runner_digest": f"{ieh.RUNNER_IMAGE}@{HUB_DIGEST}",
+        **{k: v.replace(EXECUTOR_OLD_DIGEST, EXECUTOR_HUB_DIGEST).replace(OLD_DIGEST, HUB_DIGEST) for k, v in STANDARD_STACK.items()},
         "dockerenv": "NO_DOCKERENV\nhost-1",
     })
-    row = ieh.summarise(fresh, hub_runner_digest=HUB_DIGEST)
-    assert (row["mirror"], row["daemon_json"], row["vs_hub"], row["shell_ran_in"]) == ("none", "yes", "current", "host")
+    row = ieh.summarise(fresh, HUB)
+    assert (row["mirror"], row["daemon_json"], row["shell_ran_in"]) == ("none", "yes", "host")
+    assert (row["executor_vs_hub"], row["runner_vs_hub"]) == ("current", "current")
     assert row["watchtower_last_line"] == "?"
 
 
-def test_vs_hub_follows_the_running_image_not_the_newest_pull():
+def test_executor_vs_hub_compares_the_executor_image_the_validator_scores_not_the_runner():
+    """Regression: `vs_hub` read `current` on a node whose runner was current while its executor was the old image (Rustam, #1385)."""
+    runner_current_executor_old = _running(
+        ("executor-executor-1", "sha256:" + "e" * 64, [f"{ieh.EXECUTOR_IMAGE}@{EXECUTOR_OLD_DIGEST}"]),
+        ("executor-executor-runner-1", "sha256:" + "a" * 64, [f"{ieh.RUNNER_IMAGE}@{HUB_DIGEST}"]),
+    )
+    row = ieh.summarise(_report_with(runner_current_executor_old), HUB)
+    assert (row["executor_vs_hub"], row["runner_vs_hub"]) == ("STALE", "current")
+    assert row["executor_running"] == EXECUTOR_OLD_DIGEST[:19]
+
+
+@pytest.mark.asyncio
+async def test_hub_digests_come_from_the_validators_own_executor_lookup(monkeypatch):
+    """Regression: the run fetched the runner tag only and compared nothing against EXECUTOR_IMAGE_REF's digest."""
+    asked = []
+
+    async def fake_executor_digest():
+        asked.append("executor")
+        return EXECUTOR_HUB_DIGEST
+
+    async def fake_registry_digest(session, ref):
+        asked.append(ref)
+        return HUB_DIGEST
+
+    monkeypatch.setattr(ieh, "fetch_executor_image_digest", fake_executor_digest)
+    monkeypatch.setattr(ieh, "fetch_registry_digest", fake_registry_digest)
+
+    assert await ieh.fetch_hub_digests() == HUB
+    assert asked == ["executor", f"{ieh.RUNNER_IMAGE}:latest"]
+
+
+def test_runner_vs_hub_follows_the_running_image_not_the_newest_pull():
     """Regression: Watchtower pulled the new runner and failed to restart; `docker images` lists the new one first."""
     images = (
         "REPOSITORY TAG DIGEST IMAGE_ID CREATED SIZE\n"
         f"{ieh.RUNNER_IMAGE} latest {HUB_DIGEST} aaaaaaaaaaaa 1 hour ago 200MB\n"
         f"{ieh.RUNNER_IMAGE} <none> {OLD_DIGEST} bbbbbbbbbbbb 4 weeks ago 200MB\n"
     )
-    report = _report_with({"pulled_runner_images": images, "running_runner_digest": f"{ieh.RUNNER_IMAGE}@{OLD_DIGEST}"})
-    row = ieh.summarise(report, hub_runner_digest=HUB_DIGEST)
-    assert (row["pulled_digest"], row["running_digest"], row["vs_hub"]) == (HUB_DIGEST[:19], OLD_DIGEST[:19], "STALE")
+    report = _report_with({"pulled_runner_images": images, **STANDARD_STACK})
+    row = ieh.summarise(report, HUB)
+    assert (row["runner_pulled"], row["runner_running"], row["runner_vs_hub"]) == (HUB_DIGEST[:19], OLD_DIGEST[:19], "STALE")
 
 
-def test_summary_marks_a_daemon_json_directory_and_a_missing_runner_container():
-    report = _report_with({"daemon_json": ieh.DAEMON_JSON_IS_DIR})
-    report.outputs["running_runner_digest"] = ieh.CommandOutput(1, "", "Error: No such object:")
-    row = ieh.summarise(report, hub_runner_digest=HUB_DIGEST)
+def test_summary_reports_zero_and_several_runner_containers_instead_of_picking_one():
+    """Regression: `docker ps -qf name=executor-runner` matched two containers and the table showed the last digest (Rustam, #1385)."""
+    no_runner = _running(("executor-executor-1", "sha256:" + "e" * 64, [f"{ieh.EXECUTOR_IMAGE}@{EXECUTOR_HUB_DIGEST}"]))
+    row = ieh.summarise(_report_with(no_runner), HUB)
+    assert (row["runner_running"], row["runner_vs_hub"]) == ("none", "none running")
+    assert (row["executor_running"], row["executor_vs_hub"]) == (EXECUTOR_HUB_DIGEST[:19], "current")
+
+    two_runners = _running(
+        ("executor-executor-runner-1", "sha256:" + "a" * 64, [f"{ieh.RUNNER_IMAGE}@{OLD_DIGEST}"]),
+        ("old-executor-runner-1", "sha256:" + "f" * 64, [f"{ieh.RUNNER_IMAGE}@{HUB_DIGEST}"]),
+    )
+    row = ieh.summarise(_report_with(two_runners), HUB)
+    assert row["runner_running"] == (
+        f"2 images in 2 containers: executor-executor-runner-1={OLD_DIGEST[:19]}, old-executor-runner-1={HUB_DIGEST[:19]}"
+    )
+    assert row["runner_vs_hub"] == "MIXED"
+    assert (row["executor_running"], row["executor_vs_hub"]) == ("none", "none running")
+
+    # one image pulled by tag and by digest carries two RepoDigests of the repo: one container, both shown, either counts
+    two_digests_one_image = _running(
+        ("executor-executor-1", "sha256:" + "e" * 64, [f"{ieh.EXECUTOR_IMAGE}@{EXECUTOR_HUB_DIGEST}", f"{ieh.EXECUTOR_IMAGE}@{EXECUTOR_OLD_DIGEST}"]),
+    )
+    row = ieh.summarise(_report_with(two_digests_one_image), HUB)
+    assert row["executor_running"] == f"{EXECUTOR_HUB_DIGEST[:19]}+{EXECUTOR_OLD_DIGEST[:19]}"
+    assert row["executor_vs_hub"] == "current"
+
+
+def test_summary_marks_a_daemon_json_directory_and_a_failed_container_read():
+    report = _report_with({"daemon_json": ieh.DAEMON_JSON_IS_DIR, **STANDARD_STACK})
+    report.outputs["running_image_digests"] = ieh.CommandOutput(1, "", "Error: No such object:")
+    row = ieh.summarise(report, HUB)
     assert row["daemon_json"] == "DIR"
-    assert (row["running_digest"], row["vs_hub"]) == ("?", "?")
+    assert (row["executor_running"], row["executor_vs_hub"], row["runner_running"], row["runner_vs_hub"]) == ("?", "?", "?", "?")
+
+    # a container that started between the two `docker ps -q` has no digest line: "?", never "none"
+    skewed = _report_with(STANDARD_STACK)
+    skewed.outputs["running_containers"].stdout += "\n/executor-executor-runner-2 sha256:" + "9" * 64
+    row = ieh.summarise(skewed, HUB)
+    assert (row["runner_running"], row["runner_vs_hub"]) == ("?", "?")
+
+
+def test_split_exit_status_refuses_a_marker_the_cap_cut_in_half():
+    """Regression: `__inspect_rc=12` left of a cut `127` read as exit 12 with no truncation note."""
+    assert ieh.split_exit_status("out\n__inspect_rc=127\n") == ("out", 127)
+    assert ieh.split_exit_status("out\n__inspect_rc=12") == ("out\n__inspect_rc=12", None)
+    assert ieh.split_exit_status("no marker") == ("no marker", None)
 
 
 def test_summary_without_a_hub_digest_does_not_call_a_node_stale():
-    report = _report_with({"running_runner_digest": f"{ieh.RUNNER_IMAGE}@{OLD_DIGEST}"})
-    assert ieh.summarise(report, hub_runner_digest=None)["vs_hub"] == "?"
+    row = ieh.summarise(_report_with(STANDARD_STACK), ieh.HubDigests())
+    assert (row["executor_vs_hub"], row["runner_vs_hub"]) == ("?", "?")
+    assert row["executor_running"] == EXECUTOR_OLD_DIGEST[:19] + " ×2"
 
 
 @pytest.mark.asyncio
@@ -323,10 +486,10 @@ async def test_a_hung_read_keeps_the_earlier_reads_and_names_the_budget(my_key, 
     """Regression: the node budget fires mid-read and every finished read is thrown away."""
 
     class _HangingConn(_FakeConn):
-        async def run(self, command):
+        async def run(self, command, **kwargs):
             if "docker logs" in command:
                 await asyncio.sleep(3600)
-            return await super().run(command)
+            return await super().run(command, **kwargs)
 
     conn = _HangingConn()
     wired(conn=conn)
@@ -401,7 +564,7 @@ def test_dry_run_prints_the_plan_and_opens_nothing(monkeypatch, capsys):
     monkeypatch.setattr(sct.asyncssh, "connect", refuse)
     monkeypatch.setattr(MinerService, "_make_rest_request", refuse)
     monkeypatch.setattr(ieh, "resolve_axon_from_metagraph", refuse)
-    monkeypatch.setattr(ieh, "fetch_hub_runner_digest", refuse)
+    monkeypatch.setattr(ieh, "fetch_hub_digests", refuse)
 
     rc = ieh.main(["--executor-ids", f"{EXECUTOR_ID} {MINER_HOTKEY}", "--dry-run", "--concurrency", "2"])
 
@@ -411,6 +574,7 @@ def test_dry_run_prints_the_plan_and_opens_nothing(monkeypatch, capsys):
     assert f"- {EXECUTOR_ID}  miner {MINER_HOTKEY}" in out
     for _, command in ieh.COMMANDS:
         assert f"  $ {command}" in out
+    assert f"  $ {ieh.capped(ieh.COMMANDS[0][1])}" in out  # the plan shows the wrapped form that will run
 
 
 @pytest.mark.asyncio
@@ -423,11 +587,13 @@ async def test_run_prints_a_block_per_node_then_the_table(my_key, wired):
     reports = await ieh.run(
         [ieh.Target(EXECUTOR_ID, MINER_HOTKEY)],
         concurrency=4, node_timeout=5.0, resolve_axon=_resolve,
-        miner_service=ieh.make_miner_service(), my_key=my_key, hub_runner_digest=HUB_DIGEST, out=out,
+        miner_service=ieh.make_miner_service(), my_key=my_key, hub=HUB, out=out,
     )
 
     text = out.getvalue()
     assert len(reports) == 1 and reports[0].error is None
     assert text.index(f"### {EXECUTOR_ID}") < text.index("| node | mirror |")
+    assert f"fetch_executor_image_digest, what the validator scores against): {EXECUTOR_HUB_DIGEST}" in text
     assert f"Docker Hub {ieh.RUNNER_IMAGE}:latest digest now: {HUB_DIGEST}" in text
+    assert "| executor_running | executor_vs_hub | runner_running | runner_pulled | runner_vs_hub |" in text
     assert "| https://m.example.internal |" in text
