@@ -211,6 +211,11 @@ class PodHostRebootRecoveredResponse(BaseModel):
     recorded: bool
 
 
+class GpuFaultProbeReportResponse(BaseModel):
+    # DAH-3490: False when the backend already knew this (pod, phase) report
+    recorded: bool
+
+
 class VerificationStartedResponse(BaseModel):
     """Ack for DAH-3019 `verification-started` (one request per miner): how many of the batch's
     executors the backend stored the run start for, so the provider portal can show which step

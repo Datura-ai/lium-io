@@ -323,6 +323,20 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
 
+    async def container_started_at(self, *, container_name: str) -> str | None:
+        """`State.StartedAt` of the container as dockerd reports it (RFC 3339), None when absent (DAH-3490).
+
+        The container name is SDK data here, as everywhere on this client: it never reaches a host shell.
+        """
+        try:
+            state = await _in_docker_thread(self._api_client.inspect_container, container_name)
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+        started_at = ((state or {}).get("State") or {}).get("StartedAt") if isinstance(state, dict) else None
+        return str(started_at) if started_at else None
+
     async def create_volume(
         self,
         *,

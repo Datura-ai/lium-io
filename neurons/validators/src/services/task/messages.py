@@ -1164,6 +1164,63 @@ class GpuFaultProbeMessages:
     )
 
 
+class RentalGpuFaultMessages:
+    """DAH-3490 — who broke the card during a rental: the host's NVRM Xid lines inside the rental window,
+    split into the renter's application errors (Xid 13/31/43/45) and the provider's hardware faults. Never
+    changes the score mid-rental; the rental-end verdict lives in DockerService.delete_container."""
+
+    DISABLED = MessageTemplate(
+        event="Rental GPU-fault attribution disabled",
+        reason="RENTAL_GPU_FAULT_DISABLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    NOT_RENTED = MessageTemplate(
+        event="Rental GPU-fault attribution skipped: no rented pod",
+        reason="RENTAL_GPU_FAULT_NOT_RENTED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    NO_FAULT = MessageTemplate(
+        event="No GPU fault logged during the rental",
+        reason="RENTAL_GPU_FAULT_NONE",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    WORKLOAD_FAULT = MessageTemplate(
+        event="The renter's workload raised a GPU fault",
+        reason="GPU_FAULT_RENTAL_WORKLOAD",
+        severity="warning",
+        category="env",
+        impact="Score unchanged; the renter and the provider are told through the backend",
+        remediation=(
+            "An application Xid (13, 31, 43 or 45) from the renter's container is in the host's kernel log. "
+            "The provider is paid in full. Reboot the node after the rental ends if the card does not answer."
+        ),
+    )
+    HARDWARE_FAULT = MessageTemplate(
+        event="A GPU raised a hardware fault during the rental",
+        reason="GPU_FAULT_RENTAL_HARDWARE",
+        severity="warning",
+        category="env",
+        impact="Score unchanged this cycle; the fault is the hardware's, not the workload's",
+        remediation=(
+            "A hardware Xid (48, 79, 94, 95 or another non-application code) or uncorrected ECC errors are in the "
+            "host's kernel log. Check `nvidia-smi -q -d ECC` and `dmesg`; reseat, reset or replace the card."
+        ),
+    )
+    PROBE_ERROR = MessageTemplate(
+        event="Rental GPU-fault attribution could not read the host",
+        reason="RENTAL_GPU_FAULT_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed; nothing is attributed from this cycle",
+    )
+
+
 class ScoreMessages:
     SCORE_COMPUTED = MessageTemplate(
         event="Scores computed",

@@ -80,6 +80,7 @@ class RecordingRentalDockerClient:
         self.exec_specs = []
         self.started_containers = []
         self.stopped_containers = []
+        self.inspected_containers = []
         self.removed_containers = []
         self.created_volumes = []
         self.removed_volumes = []
@@ -110,6 +111,11 @@ class RecordingRentalDockerClient:
 
     async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
         self.stopped_containers.append(container_name)
+
+    async def container_started_at(self, *, container_name: str) -> str | None:
+        # DAH-3490: the rental-end probe reads the window start through the SDK, never a host shell
+        self.inspected_containers.append(container_name)
+        return "2026-09-16T09:00:00.000000000Z"
 
     async def remove_container(
         self,

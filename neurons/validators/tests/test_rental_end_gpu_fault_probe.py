@@ -1,0 +1,164 @@
+"""DAH-3490: after a rental's container is removed, the validator names who broke the card, posts the result as
+its own request, and delists a node the workload broke that still does not answer — with no penalty reason."""
+
+from contextlib import asynccontextmanager, contextmanager
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+import services.docker_service as module
+from payload_models.payloads import ContainerDeleteRequest, WorkloadKind
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
+from services.docker_service import DockerService
+from services.gpu_xid_attribution import ECC_QUERY_COMMAND, XID_LOG_COMMAND
+
+from tests.helpers import default_executor
+
+EXECUTOR = "d51b8008-7338-4c49-a5ae-d37e876ff79f"
+POD = "11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+STARTED = datetime.now(UTC) - timedelta(hours=2)
+LOST_CARD = "Unable to determine the device handle for GPU 0000:81:00.0: Unknown Error"
+
+
+def xid(minutes_after_start: int, code: int, pid: int | None = 4242) -> str:
+    stamp = (STARTED + timedelta(minutes=minutes_after_start)).strftime("%Y-%m-%dT%H:%M:%S")
+    pid_part = f"pid={pid}, name=python, " if pid is not None else ""
+    return f"{stamp},000000+00:00 NVRM: Xid (PCI:0000:81:00): {code}, {pid_part}Ch 00000008"
+
+
+def payload(kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerDeleteRequest:
+    return ContainerDeleteRequest(
+        miner_hotkey="miner", executor_id=EXECUTOR, pod_id=POD, container_name=f"pod_{POD}", workload_kind=kind
+    )
+
+
+class FakeSSH:
+    """The host's answers to the probe's two commands, over the probe's own SSH session."""
+
+    def __init__(self, *, xid_lines: str, gpu_exit: int, gpu_out: str, gpu_err: str = ""):
+        self.answers = {XID_LOG_COMMAND: (0, xid_lines, ""), ECC_QUERY_COMMAND: (gpu_exit, gpu_out, gpu_err)}
+        self.calls: list[str] = []
+
+    async def run(self, cmd, input=None):
+        self.calls.append(cmd)
+        exit_status, stdout, stderr = self.answers[cmd]
+        return Mock(exit_status=exit_status, stdout=stdout, stderr=stderr)
+
+
+@contextmanager
+def probe_flag(enabled: bool = True):
+    with patch("services.docker_service.settings") as s:
+        s.RENTAL_GPU_FAULT_PROBE_ENABLED = enabled
+        yield
+
+
+def service(ssh: FakeSSH) -> DockerService:
+    redis = AsyncMock()
+    redis.get_verified_job_info.return_value = {"spec": "NVIDIA H100:8", "uuids": "GPU-a"}
+    svc = DockerService(ssh_service=Mock(), redis_service=redis, attestation_service=Mock(), backend_client=AsyncMock())
+
+    @asynccontextmanager
+    async def connect(**kwargs):
+        yield ssh
+
+    svc._connect_for_test = connect
+    return svc
+
+
+async def run_probe(svc: DockerService, started_at=STARTED, kind=WorkloadKind.CUSTOMER_RENTAL):
+    with patch.object(module.asyncssh, "connect", svc._connect_for_test):
+        return await svc._probe_rental_end_gpu_fault(payload(kind), default_executor(), Mock(), Mock(), started_at, {})
+
+
+@pytest.mark.asyncio
+async def test_a_workload_fault_on_a_node_that_no_longer_answers_delists_it_without_a_penalty_reason():
+    """On origin/main the undeploy ends at ContainerDeleted: nothing reads the kernel log, ResetVerifiedJobReason has no
+    workload member, and the node keeps its verification while its lost card fails every later cycle at score 0 with a
+    reason the backend penalises. Here: one probe, one report, one reset with the no-penalty reason."""
+    ssh = FakeSSH(xid_lines=xid(30, 31), gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
+    svc = service(ssh)
+
+    report = await run_probe(svc)
+
+    assert ssh.calls == [XID_LOG_COMMAND, ECC_QUERY_COMMAND]
+    assert report["phase"] == "rental_end" and report["attribution"] == "workload"
+    assert report["node_answers"] is False and LOST_CARD in report["nvidia_smi_error"]
+    svc.backend_client.report_gpu_fault_probe.assert_awaited_once_with(EXECUTOR, report)
+    svc.redis_service.clear_verified_job_info.assert_awaited_once()
+    reset = svc.redis_service.clear_verified_job_info.await_args.kwargs
+    assert reset["reason"] == ResetVerifiedJobReason.GPU_FAULT_AFTER_RENTAL_WORKLOAD
+    assert reset["reason"].value == 2  # the wire value the backend reads as "delist, no penalty"
+    assert reset["executor_id"] == EXECUTOR and reset["miner_hotkey"] == "miner"
+    assert reset["evidence"]["reason_code"] == "GPU_FAULT_AFTER_RENTAL_WORKLOAD"
+    assert reset["evidence"]["check_id"] == "docker.delete.rental_end_gpu_fault"
+    assert reset["evidence"]["pod_id"] == POD and len(reset["evidence"]["workload_xids"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_workload_fault_on_a_node_that_answers_is_reported_and_nothing_is_reset():
+    # the card came back after the container died: the renter and provider were told mid-rental; the node stays listed
+    ssh = FakeSSH(xid_lines=xid(30, 31), gpu_exit=0, gpu_out="00000000:81:00.0, GPU-a, 0\n")
+    svc = service(ssh)
+    report = await run_probe(svc)
+    assert report["attribution"] == "workload" and report["node_answers"] is True
+    svc.backend_client.report_gpu_fault_probe.assert_awaited_once()
+    svc.redis_service.clear_verified_job_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_hardware_fault_is_not_this_path_even_when_the_node_does_not_answer():
+    # Xid 79 (off the bus) is the provider's: the existing checks handle the node; no no-penalty reset from here
+    ssh = FakeSSH(xid_lines=xid(30, 79, pid=None), gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
+    svc = service(ssh)
+    report = await run_probe(svc)
+    assert report["attribution"] == "hardware"
+    svc.redis_service.clear_verified_job_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_window_start_means_no_verdict():
+    ssh = FakeSSH(xid_lines=xid(30, 31), gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
+    svc = service(ssh)
+    report = await run_probe(svc, started_at=None)
+    assert report["attribution"] == "none" and report["container_started_at"] is None
+    svc.redis_service.clear_verified_job_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_host_that_cannot_be_reached_reports_nothing_and_raises_nothing():
+    svc = service(FakeSSH(xid_lines="", gpu_exit=0, gpu_out=""))
+
+    @asynccontextmanager
+    async def refuse(**kwargs):
+        raise OSError("connection refused")
+        yield  # pragma: no cover
+
+    svc._connect_for_test = refuse
+    assert await run_probe(svc) is None
+    svc.backend_client.report_gpu_fault_probe.assert_not_awaited()
+    svc.redis_service.clear_verified_job_info.assert_not_awaited()
+
+
+def test_only_a_customer_rental_is_probed_and_only_under_the_flag():
+    with probe_flag():
+        assert DockerService._rental_end_gpu_fault_probe_applies(payload()) is True
+        assert DockerService._rental_end_gpu_fault_probe_applies(payload(WorkloadKind.FILLER)) is False
+    with probe_flag(enabled=False):
+        assert DockerService._rental_end_gpu_fault_probe_applies(payload()) is False
+
+
+@pytest.mark.asyncio
+async def test_the_probe_is_scheduled_not_awaited_and_tracked_until_done():
+    svc = service(FakeSSH(xid_lines="", gpu_exit=0, gpu_out=""))
+    started = []
+
+    async def probe(*args):
+        started.append(args[0].pod_id)
+        return {"attribution": "none"}
+
+    with patch.object(svc, "_probe_rental_end_gpu_fault", probe):
+        task = svc._schedule_rental_end_gpu_fault_probe(payload(), default_executor(), Mock(), Mock(), STARTED, {})
+        assert task in svc.rental_end_gpu_fault_tasks and started == []  # nothing ran before the caller yields
+        assert await task == {"attribution": "none"}
+    assert started == [POD]
+    assert task not in svc.rental_end_gpu_fault_tasks

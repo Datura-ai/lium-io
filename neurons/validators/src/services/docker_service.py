@@ -11,6 +11,7 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID, uuid4
@@ -92,6 +93,17 @@ from services.prerun_host_probe import (
     prerun_host_probe_command,
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.gpu_xid_attribution import (
+    ATTRIBUTION_WORKLOAD,
+    ECC_QUERY_COMMAND,
+    HOST_COMMAND_TIMEOUT_SECONDS,
+    XID_LOG_COMMAND,
+    attribute,
+    node_answers,
+    parse_docker_started_at,
+    parse_ecc_uncorrected,
+    parse_xid_lines,
+)
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
@@ -133,6 +145,8 @@ from services.task.runner import SSHCommandRunner
 from tenacity import RetryError
 
 from core.config import settings
+from clients.backend_client import BackendClient
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
 from services.volume_keys import VolumeKeyDeriver
@@ -926,10 +940,16 @@ class DockerService:
         redis_service: Annotated[RedisService, Depends(RedisService)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
         rental_docker_client_factory: RentalDockerSdkClientFactory | None = None,
+        backend_client: BackendClient | None = None,
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
+        # DAH-3490: the rental-end GPU-fault report goes to the backend as its own request; None (tests,
+        # an older ioc) skips the report and keeps the verdict local.
+        self.backend_client = backend_client
+        # the rental-end probes in flight; a bare create_task result would be garbage-collected mid-run
+        self.rental_end_gpu_fault_tasks: set[asyncio.Task] = set()
         self.rental_docker_client_factory = (
             rental_docker_client_factory
             or RentalDockerSdkClientFactory(
@@ -6596,6 +6616,159 @@ class DockerService:
         log.info("Killed the container's processes", result=(killed.stdout or "").strip())
         return await self._force_remove_container(docker_client, payload, log)
 
+    # DAH-3490 — rental-end GPU-fault attribution (Rustam + Mikhail, 16 Sep 2026)
+
+    RENTAL_END_GPU_FAULT_CHECK_ID = "docker.delete.rental_end_gpu_fault"
+    RENTAL_END_GPU_FAULT_REASON_CODE = "GPU_FAULT_AFTER_RENTAL_WORKLOAD"
+    RENTAL_END_GPU_FAULT_PROBE_TIMEOUT_SECONDS = 90
+
+    @staticmethod
+    def _rental_end_gpu_fault_probe_applies(payload: ContainerDeleteRequest) -> bool:
+        return (
+            settings.RENTAL_GPU_FAULT_PROBE_ENABLED
+            and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+        )
+
+    async def _read_rental_container_started_at(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> datetime | None:
+        """`State.StartedAt` of the pod's container through the Docker SDK, or None when it cannot be read.
+
+        Best effort and quick: a container that is already gone, or a host that does not answer, leaves
+        the window start unknown and the probe then attributes nothing from this rental. The SDK, not a
+        shell: the container name never reaches host shell text (test_docker_service_rental_security).
+        """
+        if not self._rental_end_gpu_fault_probe_applies(payload):
+            return None
+        try:
+            started_at = await asyncio.wait_for(
+                docker_client.container_started_at(container_name=payload.container_name),
+                timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.info("Rental container start time not read", error=str(exc))
+            return None
+        return parse_docker_started_at(started_at or "")
+
+    def _schedule_rental_end_gpu_fault_probe(
+        self,
+        payload: ContainerDeleteRequest,
+        executor_info: ExecutorSSHInfo,
+        pkey: Any,
+        known_hosts_policy: Any,
+        rental_started_at: datetime | None,
+        default_extra: dict[str, Any],
+    ) -> asyncio.Task:
+        task = asyncio.create_task(
+            self._probe_rental_end_gpu_fault(
+                payload, executor_info, pkey, known_hosts_policy, rental_started_at, default_extra
+            )
+        )
+        self.rental_end_gpu_fault_tasks.add(task)
+        task.add_done_callback(self.rental_end_gpu_fault_tasks.discard)
+        return task
+
+    async def _probe_rental_end_gpu_fault(
+        self,
+        payload: ContainerDeleteRequest,
+        executor_info: ExecutorSSHInfo,
+        pkey: Any,
+        known_hosts_policy: Any,
+        rental_started_at,
+        default_extra: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """After the container is gone: read the host's Xid lines and nvidia-smi, name who broke the card,
+        post the result to the backend, and delist a node the workload broke that still does not answer.
+
+        Never raises. Everything runs under one wall-clock cap; a probe that cannot run reports nothing
+        (a lost probe is acceptable: best effort). The verdict is `services.gpu_xid_attribution.attribute`
+        over [container start, now] with no PID filter: the renter's processes are gone with the container.
+        A "workload" verdict on a node whose `nvidia-smi` no longer lists its cards clears the verified job
+        with reason GPU_FAULT_AFTER_RENTAL_WORKLOAD: score 0 and active=false at once, no penalty (the backend
+        reads the reason). A "hardware" verdict, or a node that answers, changes nothing here.
+        """
+        log = _BoundLog({**default_extra, "check_id": self.RENTAL_END_GPU_FAULT_CHECK_ID})
+        try:
+            return await asyncio.wait_for(
+                self._probe_rental_end_gpu_fault_inner(payload, executor_info, pkey, known_hosts_policy, rental_started_at, log),
+                timeout=self.RENTAL_END_GPU_FAULT_PROBE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Rental-end GPU-fault probe did not finish", error=repr(exc))
+            return None
+
+    async def _probe_rental_end_gpu_fault_inner(
+        self,
+        payload: ContainerDeleteRequest,
+        executor_info: ExecutorSSHInfo,
+        pkey: Any,
+        known_hosts_policy: Any,
+        rental_started_at,
+        log: _BoundLog,
+    ) -> dict[str, Any]:
+        async with asyncssh.connect(
+            host=executor_info.address,
+            port=executor_info.ssh_port,
+            username=executor_info.ssh_username,
+            client_keys=[pkey],
+            known_hosts=known_hosts_policy,
+        ) as ssh_client:
+            runner = SSHCommandRunner(ssh_client, max_retries=0)
+            xid_log = await runner.run(XID_LOG_COMMAND, timeout=HOST_COMMAND_TIMEOUT_SECONDS, retryable=False)
+            gpu_query = await runner.run(ECC_QUERY_COMMAND, timeout=HOST_COMMAND_TIMEOUT_SECONDS, retryable=False)
+
+        now = datetime.now(UTC)
+        answers = node_answers(gpu_query.exit_code, gpu_query.stdout, gpu_query.stderr)
+        verdict = attribute(
+            parse_xid_lines(xid_log.stdout),
+            window_start=rental_started_at,
+            window_end=now,
+            container_pids=None,
+            ecc_uncorrected=parse_ecc_uncorrected(gpu_query.stdout) if answers else {},
+        )
+        report: dict[str, Any] = {
+            "pod_id": payload.pod_id,
+            "phase": "rental_end",
+            "probed_at": now.isoformat(),
+            "container_started_at": rental_started_at.isoformat() if rental_started_at else None,
+            "node_answers": answers,
+            "nvidia_smi_error": None if answers else (gpu_query.stderr or gpu_query.stdout or gpu_query.error_message or "")[-300:],
+            **verdict.as_report(),
+        }
+        log.info("Rental-end GPU-fault probe finished", **{k: v for k, v in report.items() if k != "pod_id"})
+
+        if self.backend_client is not None:
+            await self.backend_client.report_gpu_fault_probe(payload.executor_id, report)
+
+        if verdict.attribution == ATTRIBUTION_WORKLOAD and not answers:
+            prev_info = await self.redis_service.get_verified_job_info(payload.executor_id)
+            await self.redis_service.clear_verified_job_info(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                prev_info=prev_info,
+                reason=ResetVerifiedJobReason.GPU_FAULT_AFTER_RENTAL_WORKLOAD,
+                evidence={
+                    "reason_code": self.RENTAL_END_GPU_FAULT_REASON_CODE,
+                    "check_id": self.RENTAL_END_GPU_FAULT_CHECK_ID,
+                    "pod_id": payload.pod_id,
+                    "container_name": payload.container_name,
+                    "workload_xids": report["workload_xids"],
+                    "nvidia_smi_error": report["nvidia_smi_error"],
+                },
+            )
+            log.warning(
+                "Node delisted: the renter's workload broke a GPU and the card does not answer after the rental",
+                reason=self.RENTAL_END_GPU_FAULT_REASON_CODE,
+            )
+        return report
+
     async def delete_container(
         self,
         payload: ContainerDeleteRequest,
@@ -6670,6 +6843,10 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
+                # DAH-3490: the rental window's start, read while the container still exists; the Xid lines
+                # the rental-end probe attributes are the ones stamped after it.
+                rental_started_at = await self._read_rental_container_started_at(docker_client, payload, log)
+
                 await self._stop_container_gracefully(docker_client, payload, log)
 
                 # Fatal boundary: the forced removal is the only step whose failure fails the
@@ -6686,6 +6863,15 @@ class DockerService:
                         with _best_effort_delete_step(log, "sweep_wedged_gpus_after_failed_remove"):
                             await _sweep_wedged_gpus_after_teardown(ssh_client, log)
                     raise
+
+                # DAH-3490: who broke the card, if anyone, and does the node still answer. Its own SSH
+                # session and its own backend request, started here and not awaited: the ContainerDeleted
+                # this call returns must not wait the probe out (Rustam, 16 Sep: "the validator sends
+                # ContainerDeleted at once, then runs the GPU probe and posts the result").
+                if self._rental_end_gpu_fault_probe_applies(payload):
+                    self._schedule_rental_end_gpu_fault_probe(
+                        payload, executor_info, pkey, known_hosts_policy, rental_started_at, default_extra
+                    )
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.

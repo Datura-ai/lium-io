@@ -7,7 +7,7 @@ import re
 import time
 from datetime import datetime
 from typing import Any, ClassVar, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 import bittensor
@@ -16,6 +16,7 @@ from protocol.vc_protocol.compute_requests import (
     DefaultDockerImagesResponse,
     ExecutorHealthCheckResponse,
     FillerRunActiveResponse,
+    GpuFaultProbeReportResponse,
     NvmlReportAckResponse,
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
@@ -297,6 +298,34 @@ class BackendClient:
             json_data={"container_finished_at": container_finished_at},
             timeout=10,
         )
+
+    async def report_gpu_fault_probe(
+        self, executor_uuid: str, report: dict[str, Any]
+    ) -> GpuFaultProbeReportResponse | None:
+        """Post one GPU-fault attribution (DAH-3490) for a rented pod, as its own request.
+
+        `report` carries `pod_id`, `phase` ("mid_rental" or "rental_end"), `probed_at`, the attribution
+        ("workload" / "hardware" / "none") with the Xid lines behind it, and at rental end `node_answers`.
+        Never raises and is not retried beyond `_request`'s connection-error retries: the probe is best
+        effort (Rustam, 16 Sep: a lost probe request is acceptable). Until the backend has the route the
+        404 is a warning.
+        """
+        try:
+            return await self.post(
+                f"/internal/executors/{quote(executor_uuid, safe='')}/gpu-fault-probe",
+                GpuFaultProbeReportResponse,
+                json_data=report,
+                timeout=10,
+                non_200_log_level=logging.WARNING,
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to report the GPU fault probe",
+                    extra={"executor_uuid": executor_uuid, "pod_id": report.get("pod_id"), "error": str(exc)},
+                )
+            )
+            return None
 
     async def get_filler_run_active(
         self, filler_run_id: str, *, container_missing: bool = False

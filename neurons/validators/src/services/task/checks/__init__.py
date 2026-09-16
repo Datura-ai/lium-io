@@ -24,6 +24,7 @@ from .port_connectivity import PortConnectivityCheck
 from .provider_side_load import ProviderSideLoadCheck
 from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
+from .rental_gpu_fault import RentalGpuFaultCheck
 from .rental_verification import RentalVerificationCheck
 from .rented_machine import TenantEnforcementCheck
 from .score import ScoreCheck
@@ -62,6 +63,7 @@ __all__ = [
     "PortCountCheck",
     "ProviderSideLoadCheck",
     "RentalProbeCheck",
+    "RentalGpuFaultCheck",
     "RentalVerificationCheck",
     "TdxHostCheck",
     "TenantEnforcementCheck",

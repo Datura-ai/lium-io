@@ -54,6 +54,7 @@ from .checks import (
     PortCountCheck,
     ProviderSideLoadCheck,
     RentalProbeCheck,
+    RentalGpuFaultCheck,
     RentalVerificationCheck,
     ScoreCheck,
     SpecChangeCheck,
@@ -336,6 +337,10 @@ class PipelineFactory:
                 SysboxRequiredCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
+                # DAH-3490: on a rented node, read the host's NVRM Xid lines for each pod and name who broke a
+                # card (the renter's application Xids vs the provider's hardware Xids). Before the tenant
+                # short-circuit so it runs while the rental is on; never fatal, score untouched.
+                RentalGpuFaultCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
