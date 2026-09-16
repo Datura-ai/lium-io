@@ -325,6 +325,12 @@ class Settings(BaseSettings):
     # renews them) and are deleted when the backend says the rental closed, so a pod that left the
     # rented list leaves no key behind. 24 h ≈ 96 cycles of margin for a validator that was down.
     RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS: int = Field(env="RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS", default=86400, gt=0)
+    # The cycle-end fleet gate: when more than this share of the cycle's probed pods fail the
+    # mapped-port check, the validator's own network is the suspect and the cycle's reports are held
+    # back (logged, not posted). 0.5 is the DAH-2748 executor-SSH threshold: half the fleet losing
+    # SSH in one cycle is our side, not theirs. Fleets under SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
+    # pods are gated by the executor-SSH verdict alone.
+    RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX: float = Field(env="RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX", default=0.5, ge=0.0, le=1.0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement

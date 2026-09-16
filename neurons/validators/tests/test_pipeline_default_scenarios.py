@@ -202,6 +202,16 @@ class DummyRedisService:
     async def delete(self, key: str):
         self.store.pop(key, None)
 
+    # the per-cycle fleet and due hashes of the probe's cycle-end gate
+    async def hset(self, key: str, field: str, value: str):
+        self.store.setdefault(key, {})[field] = value
+
+    async def hgetall(self, key: str):
+        return dict(self.store.get(key) or {})
+
+    async def expire(self, key: str, seconds: int):
+        pass
+
 
 class DummyCollateralService:
     """Mock collateral contract service."""

@@ -343,6 +343,10 @@ class RedisService:
         async with self.lock:
             await self.redis.hdel(key, *fields)
 
+    async def expire(self, key: str, seconds: int):
+        async with self.lock:
+            await self.redis.expire(key, seconds)
+
     async def clear_by_pattern(self, pattern: str):
         async with self.lock:
             async for key in self.redis.scan_iter(match=pattern):

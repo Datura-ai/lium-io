@@ -22,6 +22,20 @@ outage: the POST is repeated each cycle until the backend answers 200 (``recorde
 and that answer is kept in the streak so the outage is reported once. The score is not changed by
 this module.
 
+The POST is deferred to the end of the cycle and gated by the fleet (Rustam's review, 16 Sep): a
+validator whose own network fails sees every mapped port refuse at once, and per-pod reporting
+would tell every healthy renter their pod is down. Each probe writes its mapped-port result into a
+per-cycle Redis hash; a pod at the threshold queues its report into a second one. At the cycle's
+end ``flush_rented_pod_ssh_reports`` reads both: when the share of probed pods failing the
+mapped-port check is above ``RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX`` (default 0.5, on a fleet of at
+least ``SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE`` pods), or the cycle's executor-SSH check already
+judged the validator to be the outage (DAH-2748), the queued reports are logged as
+``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` and no report is POSTed, so no renter is told. The
+streaks keep ``reported`` False, so the outage is queued again next cycle and reported once the
+fleet reads clean. The per-executor ``RENTED_POD_SSH_UNREACHABLE`` event of that cycle is still
+the validator's own record (it was rendered before the gate ran); rewriting it on a suppressed
+cycle, as DAH-2748 rewrites availability errors, is a follow-up named in the PR body.
+
 Redis is an input to this signal, never to the check's verdict: when Redis fails, the probe logs
 ``RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE`` and returns None for that pod and cycle, exactly as when
 the probe is disabled. Both keys carry a TTL (``RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS``, renewed on
@@ -42,6 +56,7 @@ from protocol.vc_protocol.compute_requests import RentedPod
 from core.config import settings
 from core.utils import _m, get_extra_info
 
+from ..availability import SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
 from ..pipeline import Context
 
 logger = logging.getLogger(__name__)
@@ -50,6 +65,15 @@ logger = logging.getLogger(__name__)
 # say whether the host rebooted in between. `fail` carries the streak.
 RENTED_POD_SSH_OK_KEY_PREFIX = "rented_pod_ssh_ok"
 RENTED_POD_SSH_FAIL_KEY_PREFIX = "rented_pod_ssh_fail"
+# Per-cycle hashes, keyed by job_batch_id. `fleet`: every probed pod's mapped-port result this
+# cycle (FLEET_MARK_OK or the fault). `due`: the reports waiting for the cycle-end fleet gate.
+# Both are deleted by the flush; the TTL covers a cycle the validator never finished.
+RENTED_POD_SSH_FLEET_KEY_PREFIX = "rented_pod_ssh_fleet"
+RENTED_POD_SSH_DUE_KEY_PREFIX = "rented_pod_ssh_due"
+FLEET_KEY_TTL_SECONDS = 3600
+FLEET_MARK_OK = "ok"
+# A cycle whose reports the gate held back: the field every suppressed log line carries.
+PROBE_SUPPRESSED_FLEET = "probe_suppressed_fleet"
 
 FAULT_TCP_REFUSED = "tcp_refused"
 FAULT_TCP_TIMEOUT = "tcp_timeout"
@@ -82,11 +106,29 @@ class RentedPodSshVerdict:
     first_failed_at: str | None = None
     boot_id_changed: bool | None = None
     # True from the cycle the streak reaches the threshold until the pod is healthy again: the
-    # cycle's event names the pod. The backend is POSTed on every such cycle until it answers 200
-    # once (FailStreak.reported); reported_to_backend says whether THIS cycle posted.
+    # cycle's event names the pod. On every such cycle until the backend answers 200 once
+    # (FailStreak.reported) the report is queued for the cycle-end fleet gate; report_queued says
+    # whether THIS cycle queued it. Whether it was posted is the flush's log line, not the verdict's.
     report: bool = False
-    reported_to_backend: bool = False
-    backend_recorded: bool | None = None
+    report_queued: bool = False
+
+
+@dataclass(frozen=True)
+class FleetGate:
+    """What the cycle-end gate saw and did with the queued reports."""
+
+    job_batch_id: str
+    probed: int
+    failed: int
+    due: list[str]
+    validator_outage: bool
+    # None when the reports went out (or there were none); else why they were held back.
+    suppressed_by: str | None = None
+    posted: list[str] = field(default_factory=list)
+
+    @property
+    def fail_share(self) -> float:
+        return self.failed / self.probed if self.probed else 0.0
 
 
 def _ok_key(pod_id: str) -> str:
@@ -95,6 +137,33 @@ def _ok_key(pod_id: str) -> str:
 
 def _fail_key(pod_id: str) -> str:
     return f"{RENTED_POD_SSH_FAIL_KEY_PREFIX}:{pod_id}"
+
+
+def _fleet_key(job_batch_id: str) -> str:
+    return f"{RENTED_POD_SSH_FLEET_KEY_PREFIX}:{job_batch_id}"
+
+
+def _due_key(job_batch_id: str) -> str:
+    return f"{RENTED_POD_SSH_DUE_KEY_PREFIX}:{job_batch_id}"
+
+
+def _cycle_id(ctx: Context) -> str:
+    # A run outside the sync cycle (the CLI's one-executor verification, the express lane's own
+    # batch id) queues under a name no cycle flushes: those entries expire and the streak asks
+    # again in the next full cycle.
+    return ctx.config.job_batch_id or "no-batch"
+
+
+def _decode_hash(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        key = key.decode() if isinstance(key, bytes) else key
+        value = value.decode() if isinstance(value, bytes) else value
+        if isinstance(key, str) and isinstance(value, str):
+            out[key] = value
+    return out
 
 
 def _decode(raw: object) -> dict | None:
@@ -241,17 +310,18 @@ async def probe_rented_pod_ssh(
 
     executor_ip = ctx.executor.address
     faults: list[str] = []
+    port_fault: str | None = None
     if pod.ssh_port is not None:
-        fault = await tcp_connect_fault(
+        port_fault = await tcp_connect_fault(
             executor_ip, pod.ssh_port, settings.RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS
         )
-        if fault:
-            faults.append(fault)
+        if port_fault:
+            faults.append(port_fault)
     if not ssh_pub_keys:
         faults.append(FAULT_AUTHORIZED_KEYS_UNREADABLE)
 
     try:
-        return await _judge_with_streak(ctx, pod, faults)
+        return await _judge_with_streak(ctx, pod, faults, port_fault)
     except REDIS_ERRORS:
         logger.warning(
             _m(
@@ -286,6 +356,7 @@ async def _judge_with_streak(
     ctx: Context,
     pod: RentedPod,
     faults: list[str],
+    port_fault: str | None,
 ) -> RentedPodSshVerdict:
     """The Redis-backed part of the probe: the ok mark, the streak, and the one report per outage."""
     store = ctx.services.redis
@@ -296,6 +367,8 @@ async def _judge_with_streak(
     if not faults:
         await store.set(_ok_key(pod.pod_id), OkMark(at=now_iso, boot_id=boot_id_now).dump(), ex=ttl)
         await store.delete(_fail_key(pod.pod_id))
+        if pod.ssh_port is not None:
+            await _mark_fleet(ctx, pod.pod_id, FLEET_MARK_OK)
         return RentedPodSshVerdict(
             pod_id=pod.pod_id,
             container_name=pod.container_name,
@@ -306,7 +379,8 @@ async def _judge_with_streak(
     ok_mark = OkMark.load(await store.get(_ok_key(pod.pod_id)))
     if ok_mark is None:
         # Never seen healthy by this validator: a template without sshd, a pod still coming up, or
-        # a deploy that never worked. Not this outage class; nothing is counted.
+        # a deploy that never worked. Not this outage class; nothing is counted, and the pod is not
+        # in the fleet share either (three no-sshd templates would otherwise read as an outage).
         return RentedPodSshVerdict(
             pod_id=pod.pod_id,
             container_name=pod.container_name,
@@ -315,6 +389,11 @@ async def _judge_with_streak(
             faults=faults,
         )
 
+    if pod.ssh_port is not None:
+        # The cycle-end gate reads every counted pod, healthy or not: the share is what tells a
+        # validator-side outage (most ports refuse at once) from one pod's. A pod whose port
+        # answered but whose authorized_keys is unreadable is a pod fault, not a port fault.
+        await _mark_fleet(ctx, pod.pod_id, port_fault or FLEET_MARK_OK)
     streak = FailStreak.load(await store.get(_fail_key(pod.pod_id)), now_iso=now_iso).next()
     consecutive = streak.count
     first_failed_at = streak.first_failed_at
@@ -340,54 +419,191 @@ async def _judge_with_streak(
     if consecutive < threshold or streak.reported or settings.DRY_RUN:
         # Under the threshold, or the backend already acknowledged this outage. DRY_RUN validates
         # without publishing: the event is logged, the backend is not told, and `reported` stays
-        # False, so the first live cycle at or past the threshold posts (a dry run consumes nothing).
+        # False, so the first live cycle at or past the threshold queues (a dry run consumes nothing).
         return verdict
 
-    recorded = await _report_to_backend(ctx, verdict, boot_id_at_ok, boot_id_now)
-    if recorded is not None:
-        # The backend answered 200 (recorded or not): this outage is reported. No answer (down,
-        # non-200 such as a 404 from a backend too old, timeout) leaves `reported` False and the
-        # next cycle posts again. A Redis error on this one write must not drop the verdict the
-        # POST already went out for: it costs one duplicate POST next cycle, which the backend dedupes.
-        try:
-            await store.set(_fail_key(pod.pod_id), replace(streak, reported=True).dump(), ex=ttl)
-        except REDIS_ERRORS:
-            logger.warning(
-                _m(
-                    "RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE",
-                    extra=get_extra_info(
-                        {**ctx.default_extra, "pod_id": pod.pod_id, "on": "reported_mark"}
-                    ),
+    # Queued, not posted: the cycle-end fleet gate (flush_rented_pod_ssh_reports) decides. No
+    # answer from the backend there, or a suppressed cycle, leaves `reported` False and the next
+    # cycle queues again.
+    await store.hset(
+        _due_key(_cycle_id(ctx)),
+        pod.pod_id,
+        json.dumps(
+            {
+                "ssh_port": verdict.ssh_port,
+                "faults": list(verdict.faults),
+                "first_failed_at": verdict.first_failed_at or "",
+                "consecutive_cycles": verdict.consecutive_cycles,
+                "boot_id_changed": verdict.boot_id_changed,
+                "boot_id_at_ok": boot_id_at_ok,
+                "boot_id_now": boot_id_now,
+            }
+        ),
+    )
+    await store.expire(_due_key(_cycle_id(ctx)), FLEET_KEY_TTL_SECONDS)
+    return replace(verdict, report_queued=True)
+
+
+async def _mark_fleet(ctx: Context, pod_id: str, mark: str) -> None:
+    key = _fleet_key(_cycle_id(ctx))
+    await ctx.services.redis.hset(key, pod_id, mark)
+    await ctx.services.redis.expire(key, FLEET_KEY_TTL_SECONDS)
+
+
+async def flush_rented_pod_ssh_reports(
+    redis,
+    backend,
+    job_batch_id: str,
+    *,
+    validator_outage: bool = False,
+) -> FleetGate | None:
+    """The cycle-end gate: post the cycle's queued reports only when the fleet says the pods are at fault.
+
+    Called once per cycle from the validator's sync loop, after every executor's task has ended.
+    ``validator_outage`` is the cycle's executor-SSH verdict (DAH-2748: most nodes refused the
+    validator's own SSH, so its egress is the suspect). The mapped-port share is this module's
+    own reading of the same question: above ``RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX`` of the probed
+    pods failing at once is our side, not theirs (a fleet smaller than
+    ``SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE`` carries no share signal and is gated by
+    ``validator_outage`` alone). Either one holds every report back, logged as
+    ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` with the pods it names; nothing is lost, because the
+    streaks still read ``reported`` False and queue again next cycle.
+
+    Returns None when the probe is off or Redis failed (logged), else what the gate saw and posted.
+    Never raises: a backend or Redis error here is one more cycle of waiting, not a failed cycle.
+    """
+    if not settings.RENTED_POD_SSH_PROBE_ENABLED:
+        return None
+    fleet_key, due_key = _fleet_key(job_batch_id), _due_key(job_batch_id)
+    extra = {"job_batch_id": job_batch_id}
+    try:
+        fleet = _decode_hash(await redis.hgetall(fleet_key))
+        due = _decode_hash(await redis.hgetall(due_key))
+        # Deleted before posting: a crash below costs one cycle (the streaks re-queue), a crash
+        # after a post would otherwise post the same outage twice.
+        await redis.delete(fleet_key)
+        await redis.delete(due_key)
+    except REDIS_ERRORS:
+        logger.warning(
+            _m(
+                "RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE",
+                extra=get_extra_info({**extra, "on": "flush"}),
+            ),
+            exc_info=True,
+        )
+        return None
+
+    probed = len(fleet)
+    failed = sum(1 for mark in fleet.values() if mark != FLEET_MARK_OK)
+    gate = FleetGate(
+        job_batch_id=job_batch_id,
+        probed=probed,
+        failed=failed,
+        due=sorted(due),
+        validator_outage=validator_outage,
+    )
+    if (
+        probed >= SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
+        and gate.fail_share > settings.RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX
+    ):
+        gate = replace(gate, suppressed_by="mapped_port_share")
+    elif validator_outage:
+        gate = replace(gate, suppressed_by="validator_outage")
+
+    fleet_fields = {
+        **extra,
+        "probed": probed,
+        "failed": failed,
+        "fail_share": round(gate.fail_share, 3),
+        "validator_outage": validator_outage,
+        "due_pods": gate.due,
+    }
+    if not due:
+        if probed:
+            logger.info(_m("RENTED_POD_SSH_PROBE_FLEET", extra=get_extra_info(fleet_fields)))
+        return gate
+    if gate.suppressed_by:
+        logger.warning(
+            _m(
+                "RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET",
+                extra=get_extra_info(
+                    {
+                        **fleet_fields,
+                        "outcome": PROBE_SUPPRESSED_FLEET,
+                        "suppressed_by": gate.suppressed_by,
+                    }
                 ),
-                exc_info=True,
             )
-    return replace(verdict, reported_to_backend=True, backend_recorded=recorded)
+        )
+        return gate
+
+    # Side by side, as the executor tasks posted them before this gate: this runs on the sync loop
+    # ahead of the specs publish, and a backend that is down would otherwise cost one timeout per pod.
+    outcomes = await asyncio.gather(
+        *(_post_one(redis, backend, pod_id, due[pod_id], extra) for pod_id in gate.due)
+    )
+    posted = [pod_id for pod_id, ok in zip(gate.due, outcomes, strict=True) if ok]
+    if posted:
+        logger.info(
+            _m(
+                "RENTED_POD_SSH_UNREACHABLE_REPORTED",
+                extra=get_extra_info({**fleet_fields, "posted_pods": posted}),
+            )
+        )
+    return replace(gate, posted=posted)
+
+
+async def _post_one(redis, backend, pod_id: str, raw: str, extra: dict[str, object]) -> bool:
+    """POST one queued report; True when the backend answered (the streak is then marked reported)."""
+    payload = _decode(raw)
+    if payload is None:
+        return False
+    recorded = await _report_to_backend(backend, pod_id, payload, extra)
+    if recorded is None:
+        return False
+    # The backend answered 200 (recorded or not): this outage is reported. A Redis error on this
+    # one write costs one duplicate POST next cycle, which the backend dedupes.
+    try:
+        stored = await redis.get(_fail_key(pod_id))
+        if stored is not None:
+            streak = FailStreak.load(stored, now_iso=datetime.now(UTC).isoformat())
+            await redis.set(
+                _fail_key(pod_id),
+                replace(streak, reported=True).dump(),
+                ex=settings.RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS,
+            )
+    except REDIS_ERRORS:
+        logger.warning(
+            _m(
+                "RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE",
+                extra=get_extra_info({**extra, "pod_id": pod_id, "on": "reported_mark"}),
+            ),
+            exc_info=True,
+        )
+    return True
 
 
 async def _report_to_backend(
-    ctx: Context,
-    verdict: RentedPodSshVerdict,
-    boot_id_at_ok: str | None,
-    boot_id_now: str | None,
+    backend, pod_id: str, payload: dict, extra: dict[str, object]
 ) -> bool | None:
     # Never fatal: the verdict is already in the cycle event; a backend that is down or too old
     # (404) must not turn a renter-facing outage report into a validator failure.
     try:
-        response = await ctx.services.backend.report_pod_ssh_unreachable(
-            verdict.pod_id,
-            ssh_port=verdict.ssh_port,
-            faults=verdict.faults,
-            first_failed_at=verdict.first_failed_at or "",
-            consecutive_cycles=verdict.consecutive_cycles,
-            boot_id_changed=verdict.boot_id_changed,
-            boot_id_at_ok=boot_id_at_ok,
-            boot_id_now=boot_id_now,
+        response = await backend.report_pod_ssh_unreachable(
+            pod_id,
+            ssh_port=payload.get("ssh_port"),
+            faults=list(payload.get("faults") or []),
+            first_failed_at=str(payload.get("first_failed_at") or ""),
+            consecutive_cycles=int(payload.get("consecutive_cycles") or 0),
+            boot_id_changed=payload.get("boot_id_changed"),
+            boot_id_at_ok=payload.get("boot_id_at_ok"),
+            boot_id_now=payload.get("boot_id_now"),
         )
     except Exception:
         logger.warning(
             _m(
                 "RENTED_POD_SSH_UNREACHABLE_REPORT_FAILED",
-                extra=get_extra_info({**ctx.default_extra, "pod_id": verdict.pod_id}),
+                extra=get_extra_info({**extra, "pod_id": pod_id}),
             ),
             exc_info=True,
         )
@@ -404,6 +620,5 @@ def verdict_log_fields(verdict: RentedPodSshVerdict) -> dict[str, object]:
         "consecutive_cycles": verdict.consecutive_cycles,
         "first_failed_at": verdict.first_failed_at,
         "boot_id_changed": verdict.boot_id_changed,
-        "reported_to_backend": verdict.reported_to_backend,
-        "backend_recorded": verdict.backend_recorded,
+        "report_queued": verdict.report_queued,
     }

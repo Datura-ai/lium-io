@@ -109,7 +109,7 @@ class DummyScoreCalc:
 
 
 class FakeRedis:
-    """Dict-backed stand-in for RedisService's get/set/delete, enough for per-pod marks.
+    """Dict-backed stand-in for RedisService's get/set/delete and the hash calls (hset/hgetall/hdel/expire).
 
     `ttl` records the `ex` of the last set per key (None when set without one), so a
     test can assert that a mark carries an expiry. `failing` makes every call raise the client's
@@ -120,6 +120,9 @@ class FakeRedis:
 
     def __init__(self, *, failing: bool = False):
         self.store: dict[str, str] = {}
+        # hset/hgetall/hdel: the per-cycle fleet and due hashes (DAH-2870), kept apart from the
+        # string keys so `store` still reads as the per-pod marks alone.
+        self.hashes: dict[str, dict[str, str]] = {}
         self.ttl: dict[str, int | None] = {}
         self.failing = failing
         self.fail_next_set_of: set[str] = set()
@@ -152,7 +155,31 @@ class FakeRedis:
     async def delete(self, key: str):
         self._touch()
         self.store.pop(key, None)
+        self.hashes.pop(key, None)
         self.ttl.pop(key, None)
+
+    async def hset(self, key: str, field: str, value: str):
+        self._touch()
+        self.hashes.setdefault(key, {})[field] = value
+
+    async def hget(self, key: str, field: str):
+        self._touch()
+        return self.hashes.get(key, {}).get(field)
+
+    async def hgetall(self, key: str):
+        self._touch()
+        # redis-py returns bytes for both sides; the module must decode them
+        return {k.encode(): v.encode() for k, v in self.hashes.get(key, {}).items()}
+
+    async def hdel(self, key: str, *fields: str):
+        self._touch()
+        for field in fields:
+            self.hashes.get(key, {}).pop(field, None)
+
+    async def expire(self, key: str, seconds: int):
+        self._touch()
+        if key in self.store or key in self.hashes:
+            self.ttl[key] = seconds
 
 
 def default_executor() -> ExecutorSSHInfo:

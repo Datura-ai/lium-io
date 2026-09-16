@@ -66,7 +66,15 @@ class Harness:
         self.ssh_port = ssh_port
         self.score_calculator = DummyScoreCalculator(actual_score=0.9, job_score=0.9)
 
-    async def cycle(self, *, tcp_fault: str | None, ssh_keys: list[str], boot_id: str = "boot-a"):
+    async def cycle(
+        self,
+        *,
+        tcp_fault: str | None,
+        ssh_keys: list[str],
+        boot_id: str = "boot-a",
+        validator_outage: bool = False,
+    ):
+        """One cycle as the validator runs it: the rented check, then the cycle-end fleet gate."""
         services = build_services(
             redis=self.redis,
             backend=self.backend,
@@ -83,6 +91,9 @@ class Harness:
         with patch(TCP_PATH, new=AsyncMock(return_value=tcp_fault)) as tcp:
             result = await TenantEnforcementCheck().run(ctx)
         self.tcp_calls = tcp.await_args_list
+        self.gate = await rented_pod_ssh.flush_rented_pod_ssh_reports(
+            self.redis, self.backend, "batch-1", validator_outage=validator_outage
+        )
         return result
 
     def streak(self) -> dict | None:
@@ -127,7 +138,7 @@ async def test_second_consecutive_refused_cycle_raises_the_event_and_tells_the_b
     assert pod["faults"] == [FAULT_TCP_REFUSED]
     assert pod["consecutive_cycles"] == 2 and pod["first_failed_at"] == first_failed_at
     assert pod["boot_id_changed"] is True
-    assert pod["reported_to_backend"] is True and pod["backend_recorded"] is True
+    assert pod["report_queued"] is True and h.streak()["reported"] is True
     h.backend.report_pod_ssh_unreachable.assert_awaited_once_with(
         POD_ID,
         ssh_port=SSH_PORT,
@@ -155,7 +166,7 @@ async def test_third_cycle_of_the_same_outage_keeps_the_event_but_does_not_post_
 
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     [pod] = result.event.what_we_saw["unreachable_pods"]
-    assert pod["consecutive_cycles"] == 3 and pod["reported_to_backend"] is False
+    assert pod["consecutive_cycles"] == 3 and pod["report_queued"] is False
     assert h.backend.report_pod_ssh_unreachable.await_count == 1
 
 
@@ -232,7 +243,7 @@ async def test_backend_error_on_the_report_does_not_fail_the_cycle(context_facto
     assert result.passed is True
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     [pod] = result.event.what_we_saw["unreachable_pods"]
-    assert pod["reported_to_backend"] is True and pod["backend_recorded"] is None
+    assert pod["report_queued"] is True
     assert h.streak()["reported"] is False
 
 
@@ -261,14 +272,14 @@ async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does
 
     [pod] = recovered.event.what_we_saw["unreachable_pods"]
     assert pod["consecutive_cycles"] == 3
-    assert pod["reported_to_backend"] is True and pod["backend_recorded"] is True
+    assert pod["report_queued"] is True and h.streak()["reported"] is True
     assert h.streak() == {
         "count": 4,
         "first_failed_at": h.streak()["first_failed_at"],
         "reported": True,
     }
     [pod] = after.event.what_we_saw["unreachable_pods"]
-    assert pod["reported_to_backend"] is False
+    assert pod["report_queued"] is False
     assert h.backend.report_pod_ssh_unreachable.await_count == 2  # the threshold cycle and the next
 
 
@@ -333,7 +344,7 @@ async def test_a_redis_error_on_either_write_of_the_threshold_cycle_still_posts_
     assert h.streak()["count"] == 2
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     [pod] = result.event.what_we_saw["unreachable_pods"]
-    assert pod["consecutive_cycles"] == 2 and pod["reported_to_backend"] is True
+    assert pod["consecutive_cycles"] == 2 and pod["report_queued"] is True
     h.backend.report_pod_ssh_unreachable.assert_awaited_once()
 
 
@@ -354,9 +365,9 @@ async def test_a_redis_blip_on_the_reported_mark_keeps_the_verdict_and_costs_one
 
     assert threshold.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     [pod] = threshold.event.what_we_saw["unreachable_pods"]
-    assert pod["reported_to_backend"] is True and pod["backend_recorded"] is True
+    assert pod["report_queued"] is True and h.streak()["reported"] is True
     [pod] = after.event.what_we_saw["unreachable_pods"]
-    assert pod["reported_to_backend"] is True
+    assert pod["report_queued"] is True
     assert h.streak()["reported"] is True
     assert h.backend.report_pod_ssh_unreachable.await_count == 2
 
@@ -505,8 +516,209 @@ async def test_dry_run_logs_the_event_but_does_not_tell_the_backend(context_fact
     # flag a validator switched live mid-outage read count 3 != threshold and never posted.
     result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
     [pod] = result.event.what_we_saw["unreachable_pods"]
-    assert pod["consecutive_cycles"] == 3 and pod["reported_to_backend"] is True
+    assert pod["consecutive_cycles"] == 3 and pod["report_queued"] is True
     h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+
+
+class Fleet:
+    """Several rented pods on one validator across cycles, each probed as its executor's task would.
+
+    Rustam's review (16 Sep, three times): a validator whose own network fails sees every mapped
+    port refuse at once, and per-pod reporting would tell every healthy renter their pod is down.
+    The reports are queued per cycle and posted at the cycle's end only when the fleet reads clean.
+    """
+
+    def __init__(self, context_factory, pod_ids: list[str]):
+        self.context_factory = context_factory
+        self.pod_ids = pod_ids
+        self.redis = FakeRedis()
+        self.backend = AsyncMock()
+        self.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(
+            recorded=True
+        )
+
+    async def cycle(self, *, failing: set[str] = frozenset(), validator_outage: bool = False):
+        services = build_services(redis=self.redis, backend=self.backend)
+        verdicts = {}
+        for index, pod_id in enumerate(self.pod_ids):
+            ctx = self.context_factory(
+                services=services,
+                config=build_context_config(),
+                state=build_state(specs={"boot_id": "boot-a"}),
+                collateral_deposited=True,
+            )
+            pod = RentedPod(pod_id=pod_id, container_name=f"pod_{index}", ssh_port=40000 + index)
+            fault = FAULT_TCP_TIMEOUT if pod_id in failing else None
+            with patch(TCP_PATH, new=AsyncMock(return_value=fault)):
+                verdicts[pod_id] = await rented_pod_ssh.probe_rented_pod_ssh(ctx, pod, KEYS)
+        gate = await rented_pod_ssh.flush_rented_pod_ssh_reports(
+            self.redis, self.backend, "batch-1", validator_outage=validator_outage
+        )
+        return verdicts, gate
+
+    def posted_pods(self) -> list[str]:
+        return [call.args[0] for call in self.backend.report_pod_ssh_unreachable.await_args_list]
+
+    def reported(self, pod_id: str) -> bool:
+        raw = self.redis.store.get(f"{rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX}:{pod_id}")
+        return json.loads(raw)["reported"] if raw else False
+
+
+SIX_PODS = [f"pod-{n}" for n in range(6)]
+
+
+@pytest.mark.asyncio
+async def test_a_fleet_wide_port_outage_holds_every_report_back_until_the_fleet_reads_clean(
+    context_factory, caplog
+):
+    # Four of six mapped ports time out for two cycles: that is the validator's network, not four
+    # hosts rebooting in the same half hour. No renter is told. When the outage clears for three
+    # of them and one pod is still down, that one is reported on the next cycle.
+    fleet = Fleet(context_factory, SIX_PODS)
+    await fleet.cycle()
+    await fleet.cycle(failing={"pod-0", "pod-1", "pod-2", "pod-3"})
+    with caplog.at_level("WARNING", logger=rented_pod_ssh.__name__):
+        verdicts, gate = await fleet.cycle(failing={"pod-0", "pod-1", "pod-2", "pod-3"})
+
+    assert [pod_id for pod_id, v in verdicts.items() if v.report] == SIX_PODS[:4]
+    assert all(verdicts[pod_id].report_queued for pod_id in SIX_PODS[:4])
+    assert gate.probed == 6 and gate.failed == 4 and gate.due == SIX_PODS[:4]
+    assert gate.suppressed_by == "mapped_port_share" and gate.posted == []
+    fleet.backend.report_pod_ssh_unreachable.assert_not_awaited()
+    [record] = [
+        r for r in caplog.records if "RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET" in r.getMessage()
+    ]
+    logged = record.msg.extra
+    assert logged["outcome"] == rented_pod_ssh.PROBE_SUPPRESSED_FLEET
+    assert logged["due_pods"] == SIX_PODS[:4] and logged["fail_share"] == 0.667
+    assert logged["suppressed_by"] == "mapped_port_share"
+    assert not any(fleet.reported(pod_id) for pod_id in SIX_PODS)
+    # the fleet keys are gone with the flush; nothing waits in Redis for a cycle that is over
+    assert fleet.redis.hashes == {}
+
+    _, gate = await fleet.cycle(failing={"pod-3"})
+    assert gate.suppressed_by is None and gate.posted == ["pod-3"]
+    assert fleet.posted_pods() == ["pod-3"]
+    assert fleet.backend.report_pod_ssh_unreachable.await_args.kwargs["consecutive_cycles"] == 3
+    assert fleet.reported("pod-3") and not fleet.reported("pod-0")
+
+
+@pytest.mark.asyncio
+async def test_pods_never_seen_healthy_are_not_in_the_fleet_share(context_factory):
+    # Fresh review of round 5: three no-sshd templates refusing from the start read as 3 of 5
+    # failing, and a real outage on one healthy pod was held back for ever. A pod this validator
+    # never saw healthy is not counted (as before) and not in the share either.
+    fleet = Fleet(context_factory, SIX_PODS)
+    never_healthy = {"pod-0", "pod-1", "pod-2"}
+    await fleet.cycle(failing=never_healthy)  # pods 3-5 healthy once; 0-2 never
+    await fleet.cycle(failing=never_healthy | {"pod-5"})
+    _, gate = await fleet.cycle(failing=never_healthy | {"pod-5"})
+
+    assert gate.probed == 3 and gate.failed == 1 and gate.suppressed_by is None
+    assert gate.due == ["pod-5"] and gate.posted == ["pod-5"]
+
+
+@pytest.mark.asyncio
+async def test_one_pod_down_in_a_healthy_fleet_is_reported_at_the_threshold(context_factory):
+    # The fleet share is what makes one pod's outage believable: five ports answer, one refuses.
+    fleet = Fleet(context_factory, SIX_PODS)
+    await fleet.cycle()
+    await fleet.cycle(failing={"pod-4"})
+    verdicts, gate = await fleet.cycle(failing={"pod-4"})
+
+    assert gate.probed == 6 and gate.failed == 1 and gate.suppressed_by is None
+    assert gate.due == ["pod-4"] and gate.posted == ["pod-4"]
+    assert verdicts["pod-4"].report_queued is True
+    assert fleet.posted_pods() == ["pod-4"] and fleet.reported("pod-4")
+    # a healthy fleet with nothing due logs the fleet line only; no report, no warning
+    _, gate = await fleet.cycle()
+    assert gate.due == [] and fleet.posted_pods() == ["pod-4"]
+
+
+@pytest.mark.asyncio
+async def test_the_cycles_executor_ssh_verdict_holds_the_reports_back_too(context_factory):
+    # DAH-2748 already judges the validator's own egress each cycle (most executors refused its
+    # SSH). That verdict gates these reports as well, on any fleet size: one pod on a validator
+    # that could not reach its executors is not a report, it is the same outage seen twice.
+    fleet = Fleet(context_factory, ["pod-a"])
+    await fleet.cycle()
+    await fleet.cycle(failing={"pod-a"})
+    _, gate = await fleet.cycle(failing={"pod-a"}, validator_outage=True)
+
+    assert gate.suppressed_by == "validator_outage" and gate.due == ["pod-a"]
+    fleet.backend.report_pod_ssh_unreachable.assert_not_awaited()
+    assert not fleet.reported("pod-a")
+
+    _, gate = await fleet.cycle(failing={"pod-a"}, validator_outage=False)
+    assert gate.posted == ["pod-a"] and fleet.reported("pod-a")
+
+
+@pytest.mark.asyncio
+async def test_a_fleet_too_small_for_a_share_reports_what_it_found(context_factory):
+    # Two pods, both refusing, is a share of 1.0, and it says nothing: under
+    # SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE pods the share rule does not apply (the executor-SSH
+    # verdict still does). A validator this small cannot notify "many" renters either way.
+    fleet = Fleet(context_factory, ["pod-a", "pod-b"])
+    await fleet.cycle()
+    await fleet.cycle(failing={"pod-a", "pod-b"})
+    _, gate = await fleet.cycle(failing={"pod-a", "pod-b"})
+
+    assert gate.probed == 2 and gate.fail_share == 1.0 and gate.suppressed_by is None
+    assert sorted(fleet.posted_pods()) == ["pod-a", "pod-b"]
+
+
+@pytest.mark.asyncio
+async def test_the_share_threshold_is_the_setting(context_factory):
+    # Exactly half the fleet failing is not above the default 0.5 (the DAH-2748 rule); a lower
+    # setting holds the same cycle back.
+    fleet = Fleet(context_factory, SIX_PODS)
+    await fleet.cycle()
+    await fleet.cycle(failing=set(SIX_PODS[:3]))
+    with patch.object(rented_pod_ssh.settings, "RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX", 0.25):
+        _, gate = await fleet.cycle(failing=set(SIX_PODS[:3]))
+    assert gate.fail_share == 0.5 and gate.suppressed_by == "mapped_port_share"
+
+    _, gate = await fleet.cycle(failing=set(SIX_PODS[:3]))
+    assert gate.suppressed_by is None and sorted(gate.posted) == SIX_PODS[:3]
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_at_the_flush_posts_nothing_and_the_streaks_ask_again(
+    context_factory,
+):
+    # The flush reads the two hashes first; Redis down there means no gate and no POST this cycle.
+    # The per-pod streaks are untouched, so the next flush with Redis back posts once.
+    fleet = Fleet(context_factory, ["pod-a"])
+    await fleet.cycle()
+    await fleet.cycle(failing={"pod-a"})
+    services = build_services(redis=fleet.redis, backend=fleet.backend)
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(specs={"boot_id": "boot-a"}),
+        collateral_deposited=True,
+    )
+    pod = RentedPod(pod_id="pod-a", container_name="pod_0", ssh_port=40000)
+    with patch(TCP_PATH, new=AsyncMock(return_value=FAULT_TCP_TIMEOUT)):
+        verdict = await rented_pod_ssh.probe_rented_pod_ssh(ctx, pod, KEYS)
+    assert verdict.report_queued is True
+    fleet.redis.failing = True
+    gate = await rented_pod_ssh.flush_rented_pod_ssh_reports(fleet.redis, fleet.backend, "batch-1")
+    fleet.redis.failing = False
+
+    assert gate is None
+    fleet.backend.report_pod_ssh_unreachable.assert_not_awaited()
+    _, gate = await fleet.cycle(failing={"pod-a"})
+    assert gate.posted == ["pod-a"] and fleet.reported("pod-a")
+
+
+@pytest.mark.asyncio
+async def test_flush_with_the_probe_off_touches_nothing():
+    redis = FakeRedis()
+    with patch(SETTINGS_PATH) as settings:
+        settings.RENTED_POD_SSH_PROBE_ENABLED = False
+        assert await rented_pod_ssh.flush_rented_pod_ssh_reports(redis, AsyncMock(), "b") is None
+    assert redis.calls == 0
 
 
 @pytest.mark.asyncio

@@ -42,6 +42,7 @@ from services.redis_service import (
     RedisService,
 )
 from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.checks.rented_pod_ssh import flush_rented_pod_ssh_reports
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import VerifyXValidationService
 
@@ -635,6 +636,25 @@ class Validator:
                                 "[sync] Most of the cycle could not be reached; reporting no availability errors",
                                 extra={"silenced_results": silenced_count},
                             )
+                        )
+
+                    # DAH-2870: the rented-pod SSH reports queued this cycle go to the backend only
+                    # when the fleet says the pods are at fault; a validator-side outage (the share
+                    # above, or most mapped ports refusing at once) notifies no renter.
+                    try:
+                        await flush_rented_pod_ssh_reports(
+                            self.redis_service,
+                            self.backend_client,
+                            job_batch_id,
+                            validator_outage=silenced_count > 0,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[sync] rented-pod SSH report flush failed; the streaks queue again next cycle",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                            exc_info=True,
                         )
 
                     # Publish machine specs
