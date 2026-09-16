@@ -8,14 +8,18 @@ unreadable (ticket-0247). The container is running, so ``TenantEnforcementCheck`
 
 This module judges what the renter sees, from outside the container, each cycle:
 
-* a TCP connect to the pod's mapped SSH port (``RentedPod.ssh_port``, sent by the backend);
+* a TCP connect to the pod's mapped SSH port (``RentedPod.ssh_port``, sent by the backend) that
+  must answer with an ``SSH-`` banner: docker-proxy accepts on the host while sshd inside is down,
+  so an accept alone says nothing (ticket-0326 is exactly that case);
 * the ``authorized_keys`` read the check already does (empty = the mount is missing).
 
 State lives in Redis, one key pair per pod. A pod is judged only after this validator has seen it
 healthy once (both signals good), so a template that ships no sshd, or a pod that never came up,
 is never reported here. ``RENTED_POD_SSH_PROBE_CYCLES`` consecutive unhealthy cycles (default 2,
 about 30 min) after that raise ``RENTED_POD_SSH_UNREACHABLE`` and one POST to the backend per
-outage. The score is not changed by this module.
+outage: the POST is repeated each cycle until the backend answers 200 (``recorded`` true or false),
+and that answer is kept in the streak so the outage is reported once. The score is not changed by
+this module.
 
 Redis is an input to this signal, never to the check's verdict: when Redis fails, the probe logs
 ``RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE`` and returns None for that pod and cycle, exactly as when
@@ -48,7 +52,11 @@ RENTED_POD_SSH_FAIL_KEY_PREFIX = "rented_pod_ssh_fail"
 
 FAULT_TCP_REFUSED = "tcp_refused"
 FAULT_TCP_TIMEOUT = "tcp_timeout"
+# The port accepted but nothing that speaks SSH is behind it: docker-proxy took the connection and
+# closed it (sshd not running in the container), or something else answered.
+FAULT_SSH_BANNER_MISSING = "ssh_banner_missing"
 FAULT_AUTHORIZED_KEYS_UNREADABLE = "authorized_keys_unreadable"
+SSH_BANNER_PREFIX = b"SSH-"
 
 # What a failing Redis raises through RedisService: the client's own errors (connection, timeout,
 # response) and the socket errors under them. Anything else is a bug in this module and propagates.
@@ -68,7 +76,8 @@ class RentedPodSshVerdict:
     first_failed_at: str | None = None
     boot_id_changed: bool | None = None
     # True from the cycle the streak reaches the threshold until the pod is healthy again: the
-    # cycle's event names the pod. The backend is told once, on the threshold cycle only.
+    # cycle's event names the pod. The backend is POSTed on every such cycle until it answers 200
+    # once (FailStreak.reported); reported_to_backend says whether THIS cycle posted.
     report: bool = False
     reported_to_backend: bool = False
     backend_recorded: bool | None = None
@@ -120,10 +129,12 @@ class OkMark:
 
 @dataclass(frozen=True)
 class FailStreak:
-    """The `fail` key: how many consecutive cycles the pod has failed, and when the first one was."""
+    """The `fail` key: how many consecutive cycles the pod has failed, when the first one was, and
+    whether the backend has acknowledged this outage's report (``reported``)."""
 
     count: int
     first_failed_at: str
+    reported: bool = False
 
     @classmethod
     def load(cls, raw: object, *, now_iso: str) -> FailStreak:
@@ -142,29 +153,51 @@ class FailStreak:
             first_failed_at=first_failed_at
             if isinstance(first_failed_at, str) and first_failed_at
             else now_iso,
+            reported=value.get("reported") is True,
         )
 
     def next(self) -> FailStreak:
         return replace(self, count=self.count + 1)
 
     def dump(self) -> str:
-        return json.dumps({"count": self.count, "first_failed_at": self.first_failed_at})
+        return json.dumps(
+            {
+                "count": self.count,
+                "first_failed_at": self.first_failed_at,
+                "reported": self.reported,
+            }
+        )
 
 
 async def tcp_connect_fault(host: str, port: int, timeout: float) -> str | None:
-    """None when the port accepts a TCP connection; else the fault name."""
+    """None when the port accepts a TCP connection AND greets with an SSH banner; else the fault name.
+
+    The banner is required because a mapped port is answered by docker-proxy on the host: it
+    accepts even when nothing listens inside the container, then closes. sshd sends
+    ``SSH-2.0-...`` first, before the client says anything, so one read tells the two apart.
+    """
     try:
-        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
     except TimeoutError:
         return FAULT_TCP_TIMEOUT
     except OSError:
         return FAULT_TCP_REFUSED
-    writer.close()
+    try:
+        # RFC 4253 caps the version line at 255 bytes; a bounded read never grows a buffer on what a
+        # peer chooses to send, and sshd sends the line first, before the client says anything.
+        banner = await asyncio.wait_for(reader.read(255), timeout=timeout)
+    except (TimeoutError, OSError):
+        banner = b""
+    finally:
+        writer.close()
+    fault = None if banner.startswith(SSH_BANNER_PREFIX) else FAULT_SSH_BANNER_MISSING
     try:
         await writer.wait_closed()
     except OSError:
         pass
-    return None
+    return fault
 
 
 async def probe_rented_pod_ssh(
@@ -262,9 +295,7 @@ async def _judge_with_streak(
     consecutive = streak.count
     first_failed_at = streak.first_failed_at
     # The ok mark is what makes the streak count; renew its TTL so an outage longer than the TTL
-    # keeps naming the pod in the event instead of silently falling back to RENTED. Renewed BEFORE
-    # the count is written: the count is the last Redis write before the report decision, so a
-    # Redis error can never leave `count == threshold` stored without the one POST that goes with it.
+    # keeps naming the pod in the event instead of silently falling back to RENTED.
     await store.set(_ok_key(pod.pod_id), ok_mark.dump(), ex=ttl)
     await store.set(_fail_key(pod.pod_id), streak.dump(), ex=ttl)
 
@@ -282,11 +313,30 @@ async def _judge_with_streak(
         boot_id_changed=boot_id_changed,
         report=consecutive >= threshold,
     )
-    if consecutive != threshold or settings.DRY_RUN:
-        # DRY_RUN validates without publishing: the event is logged, the backend is not told.
+    if consecutive < threshold or streak.reported or settings.DRY_RUN:
+        # Under the threshold, or the backend already acknowledged this outage. DRY_RUN validates
+        # without publishing: the event is logged, the backend is not told, and `reported` stays
+        # False, so the first live cycle at or past the threshold posts (a dry run consumes nothing).
         return verdict
 
     recorded = await _report_to_backend(ctx, verdict, boot_id_at_ok, boot_id_now)
+    if recorded is not None:
+        # The backend answered 200 (recorded or not): this outage is reported. No answer (down,
+        # non-200 such as a 404 from a backend too old, timeout) leaves `reported` False and the
+        # next cycle posts again. A Redis error on this one write must not drop the verdict the
+        # POST already went out for: it costs one duplicate POST next cycle, which the backend dedupes.
+        try:
+            await store.set(_fail_key(pod.pod_id), replace(streak, reported=True).dump(), ex=ttl)
+        except REDIS_ERRORS:
+            logger.warning(
+                _m(
+                    "RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE",
+                    extra=get_extra_info(
+                        {**ctx.default_extra, "pod_id": pod.pod_id, "on": "reported_mark"}
+                    ),
+                ),
+                exc_info=True,
+            )
     return replace(verdict, reported_to_backend=True, backend_recorded=recorded)
 
 

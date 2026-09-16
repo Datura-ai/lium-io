@@ -114,7 +114,7 @@ class FakeRedis:
     `ttl` records the `ex` of the last set per key (None when set without one), so a
     test can assert that a mark carries an expiry. `failing` makes every call raise the client's
     ConnectionError, the shape of a Redis outage seen through RedisService; `fail_next_set_of`
-    makes only the next `set` of those keys raise (one shot each), the shape of a blip that hits
+    makes only the next `set` of those keys raise (one shot each; `fail_set_of_after[key] = n` skips n sets first), the shape of a blip that hits
     one write in the middle of a cycle.
     """
 
@@ -123,6 +123,8 @@ class FakeRedis:
         self.ttl: dict[str, int | None] = {}
         self.failing = failing
         self.fail_next_set_of: set[str] = set()
+        # key -> how many `set`s of it to let through before the one that raises (one shot each)
+        self.fail_set_of_after: dict[str, int] = {}
         self.calls = 0
 
     def _touch(self):
@@ -139,6 +141,11 @@ class FakeRedis:
         if key in self.fail_next_set_of:
             self.fail_next_set_of.discard(key)
             raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
+        if key in self.fail_set_of_after:
+            if self.fail_set_of_after[key] == 0:
+                del self.fail_set_of_after[key]
+                raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
+            self.fail_set_of_after[key] -= 1
         self.store[key] = value
         self.ttl[key] = ex
 

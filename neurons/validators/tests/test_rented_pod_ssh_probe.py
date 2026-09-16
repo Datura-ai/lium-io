@@ -18,6 +18,7 @@ from neurons.validators.src.services.task.checks import rented_pod_ssh
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.checks.rented_pod_ssh import (
     FAULT_AUTHORIZED_KEYS_UNREADABLE,
+    FAULT_SSH_BANNER_MISSING,
     FAULT_TCP_REFUSED,
     FAULT_TCP_TIMEOUT,
     tcp_connect_fault,
@@ -231,6 +232,43 @@ async def test_backend_error_on_the_report_does_not_fail_the_cycle(context_facto
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     [pod] = result.event.what_we_saw["unreachable_pods"]
     assert pod["reported_to_backend"] is True and pod["backend_recorded"] is None
+    assert h.streak()["reported"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("no_answer", ["raises", "non_200"])
+async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does(
+    context_factory, no_answer
+):
+    # Rustam's review (16 Sep): the POST went out on the threshold cycle only, so a backend that was
+    # down (or a 404 from one too old: the client returns None on any non-200) for that one cycle
+    # never heard of the outage. The backend's 200 is now kept in the streak (`reported`); no
+    # answer means the next cycle posts again.
+    h = Harness(context_factory)
+    if no_answer == "raises":
+        h.backend.report_pod_ssh_unreachable.side_effect = RuntimeError("backend down")
+    else:
+        h.backend.report_pod_ssh_unreachable.return_value = None
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)  # threshold: POST, no answer
+    assert h.streak()["reported"] is False
+    h.backend.report_pod_ssh_unreachable.side_effect = None  # backend back, answers recorded=True
+    h.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(recorded=True)
+    recovered = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    after = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    [pod] = recovered.event.what_we_saw["unreachable_pods"]
+    assert pod["consecutive_cycles"] == 3
+    assert pod["reported_to_backend"] is True and pod["backend_recorded"] is True
+    assert h.streak() == {
+        "count": 4,
+        "first_failed_at": h.streak()["first_failed_at"],
+        "reported": True,
+    }
+    [pod] = after.event.what_we_saw["unreachable_pods"]
+    assert pod["reported_to_backend"] is False
+    assert h.backend.report_pod_ssh_unreachable.await_count == 2  # the threshold cycle and the next
 
 
 @pytest.mark.asyncio
@@ -296,6 +334,30 @@ async def test_a_redis_error_on_either_write_of_the_threshold_cycle_still_posts_
     [pod] = result.event.what_we_saw["unreachable_pods"]
     assert pod["consecutive_cycles"] == 2 and pod["reported_to_backend"] is True
     h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_redis_blip_on_the_reported_mark_keeps_the_verdict_and_costs_one_more_post(
+    context_factory,
+):
+    # Fresh review of round 3: the `reported` write comes after a 200; a Redis error there must not
+    # drop the verdict the POST already went out for. It is caught on its own, the event still says
+    # reported, `reported` stays False, and the next cycle posts once more (the backend dedupes).
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    # the threshold cycle writes the fail key twice: the streak, then the reported mark
+    h.redis.fail_set_of_after[f"{rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX}:{POD_ID}"] = 1
+    threshold = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    after = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    assert threshold.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    [pod] = threshold.event.what_we_saw["unreachable_pods"]
+    assert pod["reported_to_backend"] is True and pod["backend_recorded"] is True
+    [pod] = after.event.what_we_saw["unreachable_pods"]
+    assert pod["reported_to_backend"] is True
+    assert h.streak()["reported"] is True
+    assert h.backend.report_pod_ssh_unreachable.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -438,6 +500,13 @@ async def test_dry_run_logs_the_event_but_does_not_tell_the_backend(context_fact
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     h.backend.report_pod_ssh_unreachable.assert_not_awaited()
 
+    # Rustam's review (16 Sep): the dry-run cycle counted on the same keys, so before the `reported`
+    # flag a validator switched live mid-outage read count 3 != threshold and never posted.
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["consecutive_cycles"] == 3 and pod["reported_to_backend"] is True
+    h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+
 
 @pytest.mark.asyncio
 async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
@@ -448,13 +517,44 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
     probe.close()
     assert await tcp_connect_fault("127.0.0.1", closed_port, timeout=2.0) == FAULT_TCP_REFUSED
 
+    # Rustam's review (16 Sep): an accept-then-close is what docker-proxy does on the host while
+    # sshd inside the container is down (ticket-0326), so it is a fault, not health.
     server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
     open_port = server.sockets[0].getsockname()[1]
     try:
-        assert await tcp_connect_fault("127.0.0.1", open_port, timeout=2.0) is None
+        assert (
+            await tcp_connect_fault("127.0.0.1", open_port, timeout=2.0) == FAULT_SSH_BANNER_MISSING
+        )
     finally:
         server.close()
         await server.wait_closed()
+
+    def greet(_reader, writer):
+        writer.write(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n")
+        writer.close()
+
+    sshd = await asyncio.start_server(greet, "127.0.0.1", 0)
+    sshd_port = sshd.sockets[0].getsockname()[1]
+    try:
+        assert await tcp_connect_fault("127.0.0.1", sshd_port, timeout=2.0) is None
+    finally:
+        sshd.close()
+        await sshd.wait_closed()
+
+    def http(_reader, writer):
+        writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        writer.close()
+
+    other = await asyncio.start_server(http, "127.0.0.1", 0)
+    other_port = other.sockets[0].getsockname()[1]
+    try:
+        assert (
+            await tcp_connect_fault("127.0.0.1", other_port, timeout=2.0)
+            == FAULT_SSH_BANNER_MISSING
+        )
+    finally:
+        other.close()
+        await other.wait_closed()
 
     async def hang(*_args, **_kwargs):
         await asyncio.sleep(10)
@@ -473,7 +573,19 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
     assert loaded.next() == rented_pod_ssh.FailStreak(
         count=3, first_failed_at=stored.first_failed_at
     )
-    assert json.loads(stored.dump()) == {"count": 2, "first_failed_at": stored.first_failed_at}
+    assert json.loads(stored.dump()) == {
+        "count": 2,
+        "first_failed_at": stored.first_failed_at,
+        "reported": False,
+    }
+    reported = rented_pod_ssh.FailStreak.load(
+        b'{"count": 2, "first_failed_at": "x", "reported": true}', now_iso=now
+    )
+    assert reported.reported is True and reported.next().reported is True
+    assert (
+        rented_pod_ssh.FailStreak.load(b'{"count": 2, "reported": "yes"}', now_iso=now).reported
+        is False
+    )
 
     for raw in (None, b"not json", b"[1]", b'{"count": "2"}', b'{"count": -1}', b'{"count": true}'):
         assert rented_pod_ssh.FailStreak.load(raw, now_iso=now) == rented_pod_ssh.FailStreak(
