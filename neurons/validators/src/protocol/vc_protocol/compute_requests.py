@@ -1,8 +1,8 @@
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, RootModel, field_validator
-
 from services.const import FILLER_CONTAINER_PREFIX
 
 GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
@@ -211,8 +211,26 @@ class PodHostRebootRecoveredResponse(BaseModel):
     recorded: bool
 
 
-class GpuFaultProbeReportResponse(BaseModel):
-    # DAH-3490: False when the backend already knew this (pod, phase) report
+class GpuFaultProbeRequest(BaseModel):
+    """DAH-3490: the body of `POST /internal/executors/{uuid}/gpu-fault-probe` (lium_protocol.http, 1.1.0)."""
+
+    pod_id: UUID
+    phase: str  # "mid_rental" | "rental_end"
+    attribution: str  # "workload" | "hardware" | "none"
+    probed_at: datetime
+    container_started_at: datetime | None = None
+    node_answers: bool | None = None
+    nvidia_smi_error: str | None = None
+    workload_xids: list[str] = []
+    hardware_xids: list[str] = []
+    ecc_uncorrected: dict[str, int] = {}
+    outside_window: int = 0
+    other_container: int = 0
+    unparsed: int = 0
+
+
+class GpuFaultProbeResponse(BaseModel):
+    # DAH-3490: False when the backend already knew this (pod, phase) verdict
     recorded: bool
 
 

@@ -146,6 +146,28 @@ async def test_a_quiet_kernel_log_reports_nothing(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_an_unreadable_kernel_log_is_an_error_not_a_quiet_log(context_factory):
+    # the pipeline's exit code is tail's; the marker line is how a dmesg that cannot be read is told apart
+    runner = host("DMESG_UNAVAILABLE\n")
+    ctx, services = make_ctx(context_factory, runner)
+    with probe_flag():
+        result = await RentalGpuFaultCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_ERROR.reason
+    services.backend.report_gpu_fault_probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_host_text_that_does_not_parse_never_costs_the_cycle(context_factory):
+    # a stamp the regex accepts but strptime refuses, and a started_at that is not a date
+    runner = host("2026-13-45T25:61:61,000000+00:00 NVRM: Xid (PCI:0000:81:00): 31, pid=4242, Ch 00000008\n")
+    runner.answers[CONTAINER_STARTED_AT_COMMAND.format(name=CONTAINER)] = (0, "2026-99-99T00:00:00Z\n")
+    ctx, _ = make_ctx(context_factory, runner)
+    with probe_flag():
+        result = await RentalGpuFaultCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.NO_FAULT.reason
+
+
+@pytest.mark.asyncio
 async def test_an_idle_node_is_not_read(context_factory):
     runner = host(xid(10, 31))
     ctx, services = make_ctx(context_factory, runner, rented_data=None)
@@ -185,7 +207,13 @@ async def test_the_same_fault_is_not_reported_again_on_the_next_cycle(context_fa
     redis.hset.assert_awaited_with(REPORTED_WORKLOAD_LINES_KEY, POD, "2")
 
 
-def test_the_check_runs_before_the_tenant_short_circuit():
+def test_the_check_runs_before_every_fatal_gpu_check():
+    # a card that stopped being listed mid-rental halts the pipeline at the count / model / fingerprint / spec-change
+    # check; the attribution has to have run by then or the renter and the provider are never told
     ids = [check.check_id for check in pipeline_factory.PipelineFactory.build_checks()]
-    assert ids.index("gpu.validate.rental_fault") == ids.index("executor.validate.rented_state") - 1
+    ours = ids.index("gpu.validate.rental_fault")
+    assert ids.index("gpu.scrape.machine_spec") < ours
+    for fatal in ("gpu.validate.count", "gpu.validate.model", "gpu.validate.fingerprint", "gpu.validate.spec_change"):
+        assert fatal in ids and ids.index(fatal) > ours, fatal
+    assert ids.index("executor.validate.rented_state") > ours
     assert "gpu.validate.rental_fault" not in [check.check_id for check in pipeline_factory.PipelineFactory.build_dry_run_checks()]

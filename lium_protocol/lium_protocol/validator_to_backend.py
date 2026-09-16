@@ -69,6 +69,9 @@ class VolumeEncryptionStatus(enum.StrEnum):
 class ResetVerifiedJobReason(int, enum.Enum):
     DEFAULT = 0
     POD_NOT_RUNNING = 1  # container for pod is not running
+    # DAH-3490 (1.1.0): the renter's workload broke a GPU (Xid 13/31/43/45 inside the rental) and the card still does
+    # not answer after the rental. The backend delists the node and raises NO penalty: not the provider's fault.
+    GPU_FAULT_AFTER_RENTAL_WORKLOAD = 2
 
 
 class FailedContainerErrorCodes(enum.Enum):

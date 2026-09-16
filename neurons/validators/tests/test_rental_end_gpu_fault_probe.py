@@ -65,9 +65,9 @@ def service(ssh: FakeSSH) -> DockerService:
     return svc
 
 
-async def run_probe(svc: DockerService, started_at=STARTED, kind=WorkloadKind.CUSTOMER_RENTAL):
+async def run_probe(svc: DockerService, started_at=STARTED, kind=WorkloadKind.CUSTOMER_RENTAL, pids=None):
     with patch.object(module.asyncssh, "connect", svc._connect_for_test):
-        return await svc._probe_rental_end_gpu_fault(payload(kind), default_executor(), Mock(), Mock(), started_at, {})
+        return await svc._probe_rental_end_gpu_fault(payload(kind), default_executor(), Mock(), Mock(), started_at, pids, {})
 
 
 @pytest.mark.asyncio
@@ -83,6 +83,7 @@ async def test_a_workload_fault_on_a_node_that_no_longer_answers_delists_it_with
     assert ssh.calls == [XID_LOG_COMMAND, ECC_QUERY_COMMAND]
     assert report["phase"] == "rental_end" and report["attribution"] == "workload"
     assert report["node_answers"] is False and LOST_CARD in report["nvidia_smi_error"]
+    assert report["container_pids_known"] is False and report["dmesg_unavailable"] is False
     svc.backend_client.report_gpu_fault_probe.assert_awaited_once_with(EXECUTOR, report)
     svc.redis_service.clear_verified_job_info.assert_awaited_once()
     reset = svc.redis_service.clear_verified_job_info.await_args.kwargs
@@ -92,6 +93,25 @@ async def test_a_workload_fault_on_a_node_that_no_longer_answers_delists_it_with
     assert reset["evidence"]["reason_code"] == "GPU_FAULT_AFTER_RENTAL_WORKLOAD"
     assert reset["evidence"]["check_id"] == "docker.delete.rental_end_gpu_fault"
     assert reset["evidence"]["pod_id"] == POD and len(reset["evidence"]["workload_xids"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_another_pods_process_is_not_this_renters_when_the_pids_were_read_before_the_stop():
+    # a multi-pod node: the PID set read through the SDK before the stop places the line on the other tenant
+    ssh = FakeSSH(xid_lines=xid(30, 31, pid=9999), gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
+    svc = service(ssh)
+    report = await run_probe(svc, pids={4242, 4243})
+    assert report["attribution"] == "none" and report["other_container"] == 1 and report["container_pids_known"] is True
+    svc.redis_service.clear_verified_job_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_kernel_log_that_cannot_be_read_attributes_nothing():
+    ssh = FakeSSH(xid_lines="DMESG_UNAVAILABLE\n", gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
+    svc = service(ssh)
+    report = await run_probe(svc)
+    assert report["attribution"] == "none" and report["dmesg_unavailable"] is True
+    svc.redis_service.clear_verified_job_info.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -143,6 +163,9 @@ def test_only_a_customer_rental_is_probed_and_only_under_the_flag():
     with probe_flag():
         assert DockerService._rental_end_gpu_fault_probe_applies(payload()) is True
         assert DockerService._rental_end_gpu_fault_probe_applies(payload(WorkloadKind.FILLER)) is False
+        # the validator's own synthetic rental probe (rental_probe.py) tears down a pod the backend never saw
+        synthetic = payload().model_copy(update={"gpu_fault_probe": False})
+        assert DockerService._rental_end_gpu_fault_probe_applies(synthetic) is False
     with probe_flag(enabled=False):
         assert DockerService._rental_end_gpu_fault_probe_applies(payload()) is False
 
@@ -157,7 +180,7 @@ async def test_the_probe_is_scheduled_not_awaited_and_tracked_until_done():
         return {"attribution": "none"}
 
     with patch.object(svc, "_probe_rental_end_gpu_fault", probe):
-        task = svc._schedule_rental_end_gpu_fault_probe(payload(), default_executor(), Mock(), Mock(), STARTED, {})
+        task = svc._schedule_rental_end_gpu_fault_probe(payload(), default_executor(), Mock(), Mock(), STARTED, None, {})
         assert task in svc.rental_end_gpu_fault_tasks and started == []  # nothing ran before the caller yields
         assert await task == {"attribution": "none"}
     assert started == [POD]

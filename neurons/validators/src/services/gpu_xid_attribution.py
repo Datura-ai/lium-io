@@ -26,7 +26,8 @@ from typing import Any
 from miner_jobs.gpu_fault_probe import SOFTWARE_XIDS
 
 WORKLOAD_XIDS: frozenset[int] = frozenset(SOFTWARE_XIDS)
-# Named so the table in the event reads the same as the ticket; any Xid outside WORKLOAD_XIDS is hardware.
+# The hardware codes the ticket names (48 DBE, 62/63/64 ECC and row remap, 74 NVLink, 79 off the bus, 92/94/95 contained and
+# uncontained ECC); xid_class treats every code outside WORKLOAD_XIDS as hardware, so an unlisted code is never the renter's.
 HARDWARE_XIDS: frozenset[int] = frozenset({48, 62, 63, 64, 74, 79, 92, 94, 95})
 
 ATTRIBUTION_WORKLOAD = "workload"
@@ -35,8 +36,12 @@ ATTRIBUTION_NONE = "none"
 
 # `--time-format=iso` gives a wall-clock stamp per line (util-linux ≥ 2.29); `-T` is the fallback for older
 # hosts. Only the NVRM lines travel, the last 200 of them: dmesg is host-wide and executor-controlled.
+# The pipeline's exit code is tail's, so a dmesg that cannot be read (no CAP_SYSLOG, a missing binary) prints this
+# marker instead and the caller reports PROBE_ERROR rather than a quiet log.
+DMESG_UNAVAILABLE_MARKER = "DMESG_UNAVAILABLE"
 XID_LOG_COMMAND = (
-    "(dmesg --time-format=iso 2>/dev/null || dmesg -T 2>/dev/null) | grep -F 'NVRM: Xid' | tail -n 200"
+    "{ dmesg --time-format=iso 2>/dev/null || dmesg -T 2>/dev/null || echo " + DMESG_UNAVAILABLE_MARKER + "; }"
+    " | grep -F -e 'NVRM: Xid' -e " + DMESG_UNAVAILABLE_MARKER + " | tail -n 200"
 )
 ECC_QUERY_COMMAND = (
     "nvidia-smi --query-gpu=pci.bus_id,uuid,ecc.errors.uncorrected.volatile.total"
@@ -52,8 +57,8 @@ MAX_LINE_CHARS = 200
 # `2026-09-16T10:29:01,123456+00:00` (iso) or `[Wed Sep 16 10:29:01 2026]` (-T)
 _ISO_STAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:,(\d{1,6}))?([+-]\d{2}:?\d{2}|Z)?")
 _CTIME_STAMP = re.compile(r"^\[(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\]")
-_XID_CODE = re.compile(r"NVRM: Xid \((?:PCI:)?([0-9a-fA-F:.]+)\): (\d+)")
-_XID_PID = re.compile(r"\bpid=(\d+)")
+_XID_CODE = re.compile(r"NVRM: Xid \((?:PCI:)?([0-9a-fA-F:.]{1,32})\): (\d{1,4})\b")
+_XID_PID = re.compile(r"\bpid=(\d{1,10})\b")
 # nvidia-smi's answers when a card is gone: the query exits non-zero and says so on stdout or stderr.
 _NODE_BROKEN_MARKERS = ("Unable to determine the device handle", "GPU is lost", "Unknown Error", "has fallen off the bus")
 
@@ -90,6 +95,14 @@ class XidAttribution:
 
 
 def parse_timestamp(line: str) -> datetime | None:
+    """The line's wall-clock stamp, or None when it has none or it does not read as a date (host text, never trusted)."""
+    try:
+        return _parse_timestamp(line)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _parse_timestamp(line: str) -> datetime | None:
     iso = _ISO_STAMP.match(line)
     if iso:
         stamp = datetime.strptime(iso.group(1), "%Y-%m-%dT%H:%M:%S")
@@ -139,7 +152,14 @@ def parse_container_pids(text: str) -> set[int]:
 
 
 def parse_docker_started_at(text: str) -> datetime | None:
-    """`docker inspect -f '{{.State.StartedAt}}'`: RFC 3339 with nanoseconds, `Z` zone."""
+    """`State.StartedAt` as dockerd reports it: RFC 3339 with nanoseconds, `Z` zone; None when unreadable."""
+    try:
+        return _parse_docker_started_at(text)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _parse_docker_started_at(text: str) -> datetime | None:
     value = text.strip()
     if not value or value.startswith("0001-01-01"):
         return None
@@ -172,8 +192,20 @@ def parse_ecc_uncorrected(text: str) -> dict[str, int]:
         except ValueError:
             continue
         if count > 0:
-            counts[parts[1]] = count
+            counts[parts[1][:64]] = count
     return counts
+
+
+def dmesg_unavailable(stdout: str) -> bool:
+    """True when XID_LOG_COMMAND could not read the kernel log at all (the marker line instead of Xid lines)."""
+    return any(line.strip() == DMESG_UNAVAILABLE_MARKER for line in stdout.splitlines())
+
+
+def xid_class(code: int) -> str:
+    """workload for the renter's application Xids, hardware for everything else (HARDWARE_XIDS names the known ones)."""
+    if code in WORKLOAD_XIDS:
+        return ATTRIBUTION_WORKLOAD
+    return ATTRIBUTION_HARDWARE
 
 
 def node_answers(exit_code: int, stdout: str, stderr: str) -> bool:
@@ -195,9 +227,9 @@ def attribute(
     """Split the rental window's Xid lines into workload and hardware and name the verdict.
 
     A line without a readable timestamp, or outside [window_start, window_end], is not this rental's.
-    When the renter's container PIDs are known (mid-rental) a workload Xid that names a PID outside them is
-    another container's and is not counted; at rental end the container is gone, so the timestamp alone
-    places the line. Hardware beats workload: one hardware Xid or an uncorrected ECC count makes the
+    When the renter's container PIDs are known (mid-rental from `docker top`, at rental end the set read
+    through the Docker SDK just before the stop) a workload Xid that names a PID outside them is another
+    container's and is not counted; with no PID set the timestamp alone places the line. Hardware beats workload: one hardware Xid or an uncorrected ECC count makes the
     verdict "hardware" whatever else the renter's process logged. No window start means no verdict.
     """
     workload: list[str] = []
@@ -210,7 +242,7 @@ def attribute(
         if window_start is None or line.timestamp is None or not (window_start <= line.timestamp <= window_end):
             outside += 1
             continue
-        if line.code in WORKLOAD_XIDS:
+        if xid_class(line.code) == ATTRIBUTION_WORKLOAD:
             if container_pids is not None and line.pid is not None and line.pid not in container_pids:
                 other += 1
                 continue

@@ -11,6 +11,8 @@ either copy parses the other's output.
 
 from __future__ import annotations
 
+import enum
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -92,6 +94,44 @@ class PodHostRebootRecoveredRequest(pydantic.BaseModel):
     container_finished_at: datetime
 
 
+class GpuFaultProbePhase(enum.StrEnum):
+    MID_RENTAL = "mid_rental"
+    RENTAL_END = "rental_end"
+
+
+class GpuFaultAttribution(enum.StrEnum):
+    WORKLOAD = "workload"
+    HARDWARE = "hardware"
+    NONE = "none"
+
+
+class GpuFaultProbeRequest(pydantic.BaseModel):
+    """`POST /internal/executors/{executor_uuid}/gpu-fault-probe` (DAH-3490, 1.1.0): the validator's verdict on who
+    broke a GPU during a rental, from the host's NVRM Xid lines inside the rental window. Its own request: after
+    ContainerDeleted at rental end (with `node_answers`) and once per new fault while the rental runs. Every list
+    is bounded: the lines come from the executor's kernel log."""
+
+    pod_id: uuid.UUID
+    phase: GpuFaultProbePhase
+    attribution: GpuFaultAttribution
+    probed_at: datetime
+    container_started_at: datetime | None = None
+    # rental_end only: did `nvidia-smi` still list every card after the container was removed
+    node_answers: bool | None = None
+    nvidia_smi_error: str | None = pydantic.Field(default=None, max_length=300)
+    workload_xids: list[str] = pydantic.Field(default_factory=list, max_length=20)
+    hardware_xids: list[str] = pydantic.Field(default_factory=list, max_length=20)
+    ecc_uncorrected: dict[str, int] = pydantic.Field(default_factory=dict)
+    outside_window: int = 0
+    other_container: int = 0
+    unparsed: int = 0
+
+
+class GpuFaultProbeResponse(pydantic.BaseModel):
+    # False when this (pod, phase) verdict was already recorded
+    recorded: bool
+
+
 class PodHostRebootRecoveredResponse(pydantic.BaseModel):
     recorded: bool
 
@@ -146,6 +186,8 @@ HTTP_MODELS: dict[str, type[pydantic.BaseModel]] = {
         PodRentalActiveResponse,
         PodHostRebootRecoveredRequest,
         PodHostRebootRecoveredResponse,
+        GpuFaultProbeRequest,
+        GpuFaultProbeResponse,
         FillerRunActiveResponse,
         ExecutorUptimeResponse,
         ExecutorHealthCheckResponse,

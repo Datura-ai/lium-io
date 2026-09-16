@@ -16,7 +16,7 @@ from protocol.vc_protocol.compute_requests import (
     DefaultDockerImagesResponse,
     ExecutorHealthCheckResponse,
     FillerRunActiveResponse,
-    GpuFaultProbeReportResponse,
+    GpuFaultProbeResponse,
     NvmlReportAckResponse,
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
@@ -301,7 +301,7 @@ class BackendClient:
 
     async def report_gpu_fault_probe(
         self, executor_uuid: str, report: dict[str, Any]
-    ) -> GpuFaultProbeReportResponse | None:
+    ) -> GpuFaultProbeResponse | None:
         """Post one GPU-fault attribution (DAH-3490) for a rented pod, as its own request.
 
         `report` carries `pod_id`, `phase` ("mid_rental" or "rental_end"), `probed_at`, the attribution
@@ -313,7 +313,7 @@ class BackendClient:
         try:
             return await self.post(
                 f"/internal/executors/{quote(executor_uuid, safe='')}/gpu-fault-probe",
-                GpuFaultProbeReportResponse,
+                GpuFaultProbeResponse,
                 json_data=report,
                 timeout=10,
                 non_200_log_level=logging.WARNING,

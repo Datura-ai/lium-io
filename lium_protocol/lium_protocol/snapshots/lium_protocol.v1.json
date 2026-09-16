@@ -3138,6 +3138,141 @@
       "title": "GpuEstimatesRequest",
       "type": "object"
     },
+    "GpuFaultAttribution": {
+      "enum": [
+        "workload",
+        "hardware",
+        "none"
+      ],
+      "title": "GpuFaultAttribution",
+      "type": "string"
+    },
+    "GpuFaultProbePhase": {
+      "enum": [
+        "mid_rental",
+        "rental_end"
+      ],
+      "title": "GpuFaultProbePhase",
+      "type": "string"
+    },
+    "GpuFaultProbeRequest": {
+      "description": "`POST /internal/executors/{executor_uuid}/gpu-fault-probe` (DAH-3490, 1.1.0): the validator's verdict on who\nbroke a GPU during a rental, from the host's NVRM Xid lines inside the rental window. Its own request: after\nContainerDeleted at rental end (with `node_answers`) and once per new fault while the rental runs. Every list\nis bounded: the lines come from the executor's kernel log.",
+      "properties": {
+        "attribution": {
+          "$ref": "#/$defs/GpuFaultAttribution"
+        },
+        "container_started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Container Started At"
+        },
+        "ecc_uncorrected": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Ecc Uncorrected",
+          "type": "object"
+        },
+        "hardware_xids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Hardware Xids",
+          "type": "array"
+        },
+        "node_answers": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Node Answers"
+        },
+        "nvidia_smi_error": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Nvidia Smi Error"
+        },
+        "other_container": {
+          "default": 0,
+          "title": "Other Container",
+          "type": "integer"
+        },
+        "outside_window": {
+          "default": 0,
+          "title": "Outside Window",
+          "type": "integer"
+        },
+        "phase": {
+          "$ref": "#/$defs/GpuFaultProbePhase"
+        },
+        "pod_id": {
+          "format": "uuid",
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "probed_at": {
+          "format": "date-time",
+          "title": "Probed At",
+          "type": "string"
+        },
+        "unparsed": {
+          "default": 0,
+          "title": "Unparsed",
+          "type": "integer"
+        },
+        "workload_xids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Workload Xids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "pod_id",
+        "phase",
+        "attribution",
+        "probed_at"
+      ],
+      "title": "GpuFaultProbeRequest",
+      "type": "object"
+    },
+    "GpuFaultProbeResponse": {
+      "properties": {
+        "recorded": {
+          "title": "Recorded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recorded"
+      ],
+      "title": "GpuFaultProbeResponse",
+      "type": "object"
+    },
     "GpuPowerLimit": {
       "description": "DAH-2356: one GPU's power cap for the Lium PEARL default job; the validator rejects a non-positive\nvalue at the boundary.",
       "properties": {
@@ -4612,7 +4747,8 @@
     "ResetVerifiedJobReason": {
       "enum": [
         0,
-        1
+        1,
+        2
       ],
       "title": "ResetVerifiedJobReason",
       "type": "integer"
@@ -5260,6 +5396,12 @@
     "FillerRunActiveResponse": {
       "$ref": "#/$defs/FillerRunActiveResponse"
     },
+    "GpuFaultProbeRequest": {
+      "$ref": "#/$defs/GpuFaultProbeRequest"
+    },
+    "GpuFaultProbeResponse": {
+      "$ref": "#/$defs/GpuFaultProbeResponse"
+    },
     "NvmlReportAckResponse": {
       "$ref": "#/$defs/NvmlReportAckResponse"
     },
@@ -5276,7 +5418,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.0.0",
+  "protocol_version": "1.1.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

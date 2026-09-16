@@ -16,6 +16,7 @@ from services.gpu_xid_attribution import (
     XID_LOG_COMMAND,
     XidAttribution,
     attribute,
+    dmesg_unavailable,
     parse_container_pids,
     parse_docker_started_at,
     parse_ecc_uncorrected,
@@ -40,7 +41,8 @@ REPORTED_WORKLOAD_LINES_KEY = "rental_gpu_fault_reported"
 class RentalGpuFaultCheck:
     """DAH-3490: read the host's kernel log for every rented pod and say who broke the card.
 
-    Runs on rented nodes only, right before the tenant short-circuit; never fatal, never changes the score.
+    Runs on rented nodes only, right after the spec scrape and before every fatal GPU check, so a card that stopped
+    being listed mid-rental is attributed in the same cycle that halts on it; never fatal, never changes the score.
     The Xid lines inside [container start, now] are split by `services.gpu_xid_attribution` into the renter's
     application errors (Xid 13/31/43/45 whose PID is one of the container's) and the provider's hardware
     faults (every other Xid, or uncorrected ECC). A workload verdict is posted to the backend as its own
@@ -60,10 +62,24 @@ class RentalGpuFaultCheck:
         pods = [pod for pod in (rented_executor.pods if rented_executor else []) if pod.container_name]
         if not pods:
             return CheckResult(passed=True, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id))
+        try:
+            return await self._attribute(ctx, pods)
+        except Exception as exc:
+            # host text is never trusted to parse, and this check must never cost a rented node its cycle
+            logger.warning(
+                _m("Rental GPU-fault attribution failed", extra=get_extra_info({**ctx.default_extra, "error": repr(exc)})),
+                exc_info=True,
+            )
+            what = {"executor_uuid": ctx.executor.uuid, "error": repr(exc)[:300]}
+            return CheckResult(passed=True, event=render_message(Msg.PROBE_ERROR, ctx=ctx, check_id=self.check_id, what=what))
 
+    async def _attribute(self, ctx: Context, pods) -> CheckResult:
         xid_log = await ctx.runner.run(XID_LOG_COMMAND, timeout=HOST_COMMAND_TIMEOUT_SECONDS, retryable=False)
-        if xid_log.exit_code != 0 and not xid_log.stdout:
-            what = {"executor_uuid": ctx.executor.uuid, "error": xid_log.error_message or xid_log.stderr[-300:]}
+        if (xid_log.exit_code != 0 and not xid_log.stdout) or dmesg_unavailable(xid_log.stdout):
+            what = {
+                "executor_uuid": ctx.executor.uuid,
+                "error": xid_log.error_message or xid_log.stderr[-300:] or "the host's kernel log is not readable (dmesg)",
+            }
             return CheckResult(
                 passed=True, event=render_message(Msg.PROBE_ERROR, ctx=ctx, check_id=self.check_id, what=what)
             )
@@ -75,17 +91,16 @@ class RentalGpuFaultCheck:
         verdicts: dict[str, XidAttribution] = {}
         reported: list[str] = []
         for pod in pods:
-            started_at_result, pids_result = (
-                await ctx.runner.run(
-                    CONTAINER_STARTED_AT_COMMAND.format(name=shlex.quote(pod.container_name)),
-                    timeout=HOST_COMMAND_TIMEOUT_SECONDS,
-                    retryable=False,
-                ),
-                await ctx.runner.run(
-                    CONTAINER_PIDS_COMMAND.format(name=shlex.quote(pod.container_name)),
-                    timeout=HOST_COMMAND_TIMEOUT_SECONDS,
-                    retryable=False,
-                ),
+            # two host reads per pod, one after the other (the runner is one SSH session)
+            started_at_result = await ctx.runner.run(
+                CONTAINER_STARTED_AT_COMMAND.format(name=shlex.quote(pod.container_name)),
+                timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+                retryable=False,
+            )
+            pids_result = await ctx.runner.run(
+                CONTAINER_PIDS_COMMAND.format(name=shlex.quote(pod.container_name)),
+                timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+                retryable=False,
             )
             started_at = parse_docker_started_at(started_at_result.stdout) if started_at_result.exit_code == 0 else None
             container_pids = parse_container_pids(pids_result.stdout) if pids_result.exit_code == 0 else None

@@ -141,6 +141,32 @@
       "message": {
         "status": "recorded"
       }
+    },
+    {
+      "expect": "GpuFaultProbeRequest",
+      "message": {
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "phase": "rental_end",
+        "attribution": "workload",
+        "probed_at": "2026-09-16T10:31:12Z",
+        "container_started_at": "2026-09-16T09:00:00Z",
+        "node_answers": false,
+        "nvidia_smi_error": "Unable to determine the device handle for GPU 0000:81:00.0: Unknown Error",
+        "workload_xids": [
+          "2026-09-16T09:30:00,123456+00:00 NVRM: Xid (PCI:0000:81:00): 31, pid=4242, name=python, Ch 00000008"
+        ],
+        "hardware_xids": [],
+        "ecc_uncorrected": {},
+        "outside_window": 3,
+        "other_container": 0,
+        "unparsed": 0
+      }
+    },
+    {
+      "expect": "GpuFaultProbeResponse",
+      "message": {
+        "recorded": true
+      }
     }
   ]
 }

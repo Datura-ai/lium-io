@@ -284,6 +284,12 @@ class PipelineFactory:
                 # the published specs had no tdx_host_supported key and the backend stored false,
                 # so every rented TDX-capable host read as not capable.
                 TdxHostCheck(),
+                # DAH-3490: on a rented node, read the host's NVRM Xid lines for each pod and name who broke a
+                # card (the renter's application Xids vs the provider's hardware Xids). Right after the scrape
+                # and before the fatal GPU checks (count, model, fingerprint, spec change), so the cycle that
+                # halts on a card that stopped being listed has already told the backend whose fault it was.
+                # Never fatal, score untouched.
+                RentalGpuFaultCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 # Pure-data model<->VRAM gate. No SSH/GPU dependency, so it runs
@@ -337,10 +343,6 @@ class PipelineFactory:
                 SysboxRequiredCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
-                # DAH-3490: on a rented node, read the host's NVRM Xid lines for each pod and name who broke a
-                # card (the renter's application Xids vs the provider's hardware Xids). Before the tenant
-                # short-circuit so it runs while the rental is on; never fatal, score untouched.
-                RentalGpuFaultCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul

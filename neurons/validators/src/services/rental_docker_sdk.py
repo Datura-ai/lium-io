@@ -337,6 +337,22 @@ class RentalDockerSdkClient:
         started_at = ((state or {}).get("State") or {}).get("StartedAt") if isinstance(state, dict) else None
         return str(started_at) if started_at else None
 
+    async def container_pids(self, *, container_name: str) -> set[int]:
+        """The PIDs running in the container (`docker top`), through the SDK (DAH-3490). Empty when it reports none."""
+        try:
+            top = await _in_docker_thread(self._api_client.top, container_name)
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK top container failed", exc)
+            ) from exc
+        titles = [str(title).upper() for title in (top or {}).get("Titles") or []] if isinstance(top, dict) else []
+        pid_index = titles.index("PID") if "PID" in titles else 1
+        pids: set[int] = set()
+        for row in (top or {}).get("Processes") or []:
+            if isinstance(row, list) and len(row) > pid_index and str(row[pid_index]).isdigit():
+                pids.add(int(row[pid_index]))
+        return pids
+
     async def create_volume(
         self,
         *,

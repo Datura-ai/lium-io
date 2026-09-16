@@ -1226,6 +1226,7 @@ async def _teardown(ctx: Context, created: ContainerCreated, pod_id: str) -> str
                     pod_id=pod_id,
                     container_name=created.container_name,
                     local_volume=created.volume_name,
+                    gpu_fault_probe=False,
                 ),
                 ctx.executor,
                 ctx.config.validator_keypair,

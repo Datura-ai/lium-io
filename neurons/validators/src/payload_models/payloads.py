@@ -429,6 +429,9 @@ class ContainerDeleteRequest(ContainerBaseRequest):
     container_name: str
     local_volume: str | None = None
     external_volume: str | None = None
+    # DAH-3490: False only for the validator's own synthetic rental probe (rental_probe.py _teardown): there is no
+    # renter and the backend never saw the pod, so no rental-end GPU-fault probe. The backend never sends the field.
+    gpu_fault_probe: bool = True
 
 
 class GetPodLogsRequestFromServer(ContainerBaseRequest):

@@ -117,6 +117,9 @@ class RecordingRentalDockerClient:
         self.inspected_containers.append(container_name)
         return "2026-09-16T09:00:00.000000000Z"
 
+    async def container_pids(self, *, container_name: str) -> set[int]:
+        return {4242}
+
     async def remove_container(
         self,
         *,
@@ -1093,3 +1096,46 @@ async def test_create_local_volume_rejects_unsafe_volume_name_before_shell(
 
     assert ssh_client.commands == []
     assert docker_client.created_volumes == []
+
+
+@pytest.mark.asyncio
+async def test_delete_container_schedules_the_rental_end_gpu_fault_probe_for_a_customer_rental_only(
+    docker_service, executor_info, keypair, monkeypatch
+):
+    """DAH-3490: the window (start + PIDs) is read through the SDK before the stop, the probe is scheduled after the
+    forced removal and is not awaited; a filler schedules nothing."""
+    ssh_client = RecordingSSHClient()
+    _patch_common(monkeypatch, docker_service, ssh_client)
+    monkeypatch.setattr(docker_service, "_cleanup_custom_build_artifacts", AsyncMock())
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    scheduled = []
+    monkeypatch.setattr(
+        docker_service,
+        "_schedule_rental_end_gpu_fault_probe",
+        lambda *args: scheduled.append(args),
+    )
+    monkeypatch.setattr("services.docker_service.settings.RENTAL_GPU_FAULT_PROBE_ENABLED", True, raising=False)
+
+    for kind in (WorkloadKind.CUSTOMER_RENTAL, WorkloadKind.FILLER):
+        await docker_service.delete_container(
+            ContainerDeleteRequest(
+                miner_hotkey="miner-hotkey",
+                executor_id=str(uuid4()),
+                pod_id="pod-id",
+                workload_kind=kind,
+                container_name="pod_rental",
+            ),
+            executor_info,
+            keypair,
+            "encrypted-private-key",
+        )
+
+    docker_client = docker_service.rental_docker_client_factory.client
+    assert docker_client.inspected_containers == ["pod_rental"]  # once: the rental, not the filler
+    assert len(scheduled) == 1
+    payload, _executor, _pkey, _policy, started_at, pids, _extra = scheduled[0]
+    assert payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+    assert started_at is not None and started_at.year == 2026
+    assert pids == {4242}
+    # the read happened before the stop: the container still existed
+    assert docker_client.stopped_containers == ["pod_rental", "pod_rental"]
