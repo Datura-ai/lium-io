@@ -263,12 +263,7 @@ jobs:
         working-directory: e2e
     steps:
       - uses: actions/checkout@v4
-      # DAH-3408: the image build was the job's longest step (p50 171 s, p90 191 s, max 265 s over the 39 green runs of
-      # 15–16 Sep; every layer rebuilt on every run — the runner's daemon starts empty). `make build` with E2E_CACHE=gha
-      # (e2e/Makefile) bakes the five images with a GitHub Actions layer cache: a PR's second run, and any run after main's,
-      # rebuilds only the layers its diff touches.
-      # Two things a plain `run:` step does not have: a builder that can export cache (the daemon's own builder cannot),
-      # and the cache service URL + token in the environment (the gha backend reads ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN).
+      # the gha layer cache (E2E_CACHE, e2e/Makefile) needs a builder that exports cache and the Actions cache URL + token
       - uses: docker/setup-buildx-action@v3
       - uses: crazy-max/ghaction-github-runtime@v3
       - name: build, up, every suite, logs, down — each step under a hard timeout (gate.sh)
