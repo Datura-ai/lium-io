@@ -3161,6 +3161,11 @@
         "attribution": {
           "$ref": "#/$defs/GpuFaultAttribution"
         },
+        "container_pids_known": {
+          "default": false,
+          "title": "Container Pids Known",
+          "type": "boolean"
+        },
         "container_started_at": {
           "anyOf": [
             {
@@ -3173,6 +3178,11 @@
           ],
           "default": null,
           "title": "Container Started At"
+        },
+        "dmesg_unavailable": {
+          "default": false,
+          "title": "Dmesg Unavailable",
+          "type": "boolean"
         },
         "ecc_uncorrected": {
           "additionalProperties": {

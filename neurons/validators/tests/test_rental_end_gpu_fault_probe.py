@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 import services.docker_service as module
 from payload_models.payloads import ContainerDeleteRequest, WorkloadKind
+from protocol.vc_protocol.compute_requests import GpuFaultProbeRequest
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.docker_service import DockerService
 from services.gpu_xid_attribution import ECC_QUERY_COMMAND, XID_LOG_COMMAND
@@ -81,6 +82,7 @@ async def test_a_workload_fault_on_a_node_that_no_longer_answers_delists_it_with
     report = await run_probe(svc)
 
     assert ssh.calls == [XID_LOG_COMMAND, ECC_QUERY_COMMAND]
+    assert set(report) == set(GpuFaultProbeRequest.model_fields)  # the wire body, nothing undeclared
     assert report["phase"] == "rental_end" and report["attribution"] == "workload"
     assert report["node_answers"] is False and LOST_CARD in report["nvidia_smi_error"]
     assert report["container_pids_known"] is False and report["dmesg_unavailable"] is False
@@ -96,13 +98,25 @@ async def test_a_workload_fault_on_a_node_that_no_longer_answers_delists_it_with
 
 
 @pytest.mark.asyncio
-async def test_another_pods_process_is_not_this_renters_when_the_pids_were_read_before_the_stop():
+async def test_another_pods_process_is_not_this_renters_when_another_pod_stays_rented():
     # a multi-pod node: the PID set read through the SDK before the stop places the line on the other tenant
     ssh = FakeSSH(xid_lines=xid(30, 31, pid=9999), gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
     svc = service(ssh)
+    svc.redis_service.get_rented_machine.return_value = {"containers": ["pod_other"]}
     report = await run_probe(svc, pids={4242, 4243})
     assert report["attribution"] == "none" and report["other_container"] == 1 and report["container_pids_known"] is True
     svc.redis_service.clear_verified_job_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_a_node_with_no_other_tenant_the_timestamp_alone_places_the_renters_dead_process():
+    # the renter's process that raised the Xid exited with it, so it is not in the PID set read before the stop
+    ssh = FakeSSH(xid_lines=xid(30, 31, pid=9999), gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
+    svc = service(ssh)
+    svc.redis_service.get_rented_machine.return_value = None
+    report = await run_probe(svc, pids={4242, 4243})
+    assert report["attribution"] == "workload" and report["container_pids_known"] is False
+    svc.redis_service.clear_verified_job_info.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -160,14 +174,19 @@ async def test_a_host_that_cannot_be_reached_reports_nothing_and_raises_nothing(
 
 
 def test_only_a_customer_rental_is_probed_and_only_under_the_flag():
+    svc = service(FakeSSH(xid_lines="", gpu_exit=0, gpu_out=""))
     with probe_flag():
-        assert DockerService._rental_end_gpu_fault_probe_applies(payload()) is True
-        assert DockerService._rental_end_gpu_fault_probe_applies(payload(WorkloadKind.FILLER)) is False
+        assert svc._rental_end_gpu_fault_probe_applies(payload()) is True
+        assert svc._rental_end_gpu_fault_probe_applies(payload(WorkloadKind.FILLER)) is False
         # the validator's own synthetic rental probe (rental_probe.py) tears down a pod the backend never saw
         synthetic = payload().model_copy(update={"gpu_fault_probe": False})
-        assert DockerService._rental_end_gpu_fault_probe_applies(synthetic) is False
+        assert svc._rental_end_gpu_fault_probe_applies(synthetic) is False
+        # no backend client (tests, tools): the report is the point, so no probe
+        svc.backend_client = None
+        assert svc._rental_end_gpu_fault_probe_applies(payload()) is False
+    svc.backend_client = AsyncMock()
     with probe_flag(enabled=False):
-        assert DockerService._rental_end_gpu_fault_probe_applies(payload()) is False
+        assert svc._rental_end_gpu_fault_probe_applies(payload()) is False
 
 
 @pytest.mark.asyncio

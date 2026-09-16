@@ -113,11 +113,14 @@ class RecordingRentalDockerClient:
         self.stopped_containers.append(container_name)
 
     async def container_started_at(self, *, container_name: str) -> str | None:
-        # DAH-3490: the rental-end probe reads the window start through the SDK, never a host shell
+        # DAH-3490: the rental-end probe reads the window start through the SDK, never a host shell; a container
+        # that was already stopped has no live processes to read, so the fake refuses like dockerd would for `top`
+        assert container_name not in self.stopped_containers, "the window is read before the stop"
         self.inspected_containers.append(container_name)
         return "2026-09-16T09:00:00.000000000Z"
 
     async def container_pids(self, *, container_name: str) -> set[int]:
+        assert container_name not in self.stopped_containers, "the PIDs are read before the stop"
         return {4242}
 
     async def remove_container(
@@ -1108,6 +1111,7 @@ async def test_delete_container_schedules_the_rental_end_gpu_fault_probe_for_a_c
     _patch_common(monkeypatch, docker_service, ssh_client)
     monkeypatch.setattr(docker_service, "_cleanup_custom_build_artifacts", AsyncMock())
     docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.backend_client = AsyncMock()  # the probe exists to report; no client, no probe
     scheduled = []
     monkeypatch.setattr(
         docker_service,
@@ -1137,5 +1141,5 @@ async def test_delete_container_schedules_the_rental_end_gpu_fault_probe_for_a_c
     assert payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
     assert started_at is not None and started_at.year == 2026
     assert pids == {4242}
-    # the read happened before the stop: the container still existed
+    # both deletes stopped their container; the fake asserted the reads came before the stop
     assert docker_client.stopped_containers == ["pod_rental", "pod_rental"]

@@ -159,7 +159,9 @@
         "ecc_uncorrected": {},
         "outside_window": 3,
         "other_container": 0,
-        "unparsed": 0
+        "unparsed": 0,
+        "container_pids_known": true,
+        "dmesg_unavailable": false
       }
     },
     {

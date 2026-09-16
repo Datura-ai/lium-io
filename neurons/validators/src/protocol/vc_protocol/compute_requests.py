@@ -227,6 +227,10 @@ class GpuFaultProbeRequest(BaseModel):
     outside_window: int = 0
     other_container: int = 0
     unparsed: int = 0
+    # whether the renter's container PID set was known (a PID outside it is another tenant's) and whether the host's
+    # kernel log could be read at all (False + attribution "none" is a verdict; True + "none" is no verdict)
+    container_pids_known: bool = False
+    dmesg_unavailable: bool = False
 
 
 class GpuFaultProbeResponse(BaseModel):

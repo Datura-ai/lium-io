@@ -147,6 +147,7 @@ from tenacity import RetryError
 
 from core.config import settings
 from clients.backend_client import BackendClient
+from protocol.vc_protocol.compute_requests import GpuFaultProbeRequest
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
@@ -6623,12 +6624,13 @@ class DockerService:
     RENTAL_END_GPU_FAULT_REASON_CODE = "GPU_FAULT_AFTER_RENTAL_WORKLOAD"
     RENTAL_END_GPU_FAULT_PROBE_TIMEOUT_SECONDS = 90
 
-    @staticmethod
-    def _rental_end_gpu_fault_probe_applies(payload: ContainerDeleteRequest) -> bool:
+    def _rental_end_gpu_fault_probe_applies(self, payload: ContainerDeleteRequest) -> bool:
         # a customer's rental only: a filler has no renter, and the validator's own synthetic rental probe
-        # (rental_probe.py) sets gpu_fault_probe=False because the backend never saw its pod
+        # (rental_probe.py) sets gpu_fault_probe=False because the backend never saw its pod. The report is the
+        # point of the probe, so a service built without a backend client (tests, tools) runs none.
         return (
             settings.RENTAL_GPU_FAULT_PROBE_ENABLED
+            and self.backend_client is not None
             and payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
             and payload.gpu_fault_probe
         )
@@ -6747,6 +6749,11 @@ class DockerService:
         now = datetime.now(UTC)
         if dmesg_unavailable(xid_log.stdout):
             log.info("Rental-end GPU-fault probe: the host's kernel log is not readable; nothing attributed")
+        # The PID set read before the stop tells this pod's lines from another tenant's; the renter's process that
+        # raised the Xid has usually exited by the stop, so on a node with no other rented pod the timestamp alone
+        # places the line (Rustam's table: an application Xid inside the rental window).
+        if rental_pids is not None and not await self._has_rented_containers(executor_info):
+            rental_pids = None
         answers = node_answers(gpu_query.exit_code, gpu_query.stdout, gpu_query.stderr)
         verdict = attribute(
             parse_xid_lines(xid_log.stdout),
@@ -6755,17 +6762,17 @@ class DockerService:
             container_pids=rental_pids,
             ecc_uncorrected=parse_ecc_uncorrected(gpu_query.stdout) if answers else {},
         )
-        report: dict[str, Any] = {
-            "pod_id": payload.pod_id,
-            "phase": "rental_end",
-            "probed_at": now.isoformat(),
-            "container_started_at": rental_started_at.isoformat() if rental_started_at else None,
-            "container_pids_known": rental_pids is not None,
-            "dmesg_unavailable": dmesg_unavailable(xid_log.stdout),
-            "node_answers": answers,
-            "nvidia_smi_error": None if answers else (gpu_query.stderr or gpu_query.stdout or gpu_query.error_message or "")[-300:],
+        report: dict[str, Any] = GpuFaultProbeRequest(
+            pod_id=payload.pod_id,
+            phase="rental_end",
+            probed_at=now,
+            container_started_at=rental_started_at,
+            container_pids_known=rental_pids is not None,
+            dmesg_unavailable=dmesg_unavailable(xid_log.stdout),
+            node_answers=answers,
+            nvidia_smi_error=None if answers else (gpu_query.stderr or gpu_query.stdout or gpu_query.error_message or "")[-300:],
             **verdict.as_report(),
-        }
+        ).model_dump(mode="json")
         log.info("Rental-end GPU-fault probe finished", **{k: v for k, v in report.items() if k != "pod_id"})
 
         if self.backend_client is not None:

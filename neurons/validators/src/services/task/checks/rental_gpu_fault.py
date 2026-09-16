@@ -6,6 +6,7 @@ import shlex
 from datetime import UTC, datetime
 from typing import Any
 
+from protocol.vc_protocol.compute_requests import GpuFaultProbeRequest
 from services.gpu_xid_attribution import (
     ATTRIBUTION_HARDWARE,
     ATTRIBUTION_WORKLOAD,
@@ -103,7 +104,12 @@ class RentalGpuFaultCheck:
                 retryable=False,
             )
             started_at = parse_docker_started_at(started_at_result.stdout) if started_at_result.exit_code == 0 else None
-            container_pids = parse_container_pids(pids_result.stdout) if pids_result.exit_code == 0 else None
+            # The PID filter tells one tenant's line from another's, so it applies only when another pod shares the
+            # node: on a single-pod node the renter's process that raised the Xid has usually exited by now (Xid 45
+            # is its exit), and the timestamp alone places the line.
+            container_pids = (
+                parse_container_pids(pids_result.stdout) if pids_result.exit_code == 0 and len(pods) > 1 else None
+            )
             verdict = attribute(
                 lines,
                 window_start=started_at,
@@ -113,13 +119,14 @@ class RentalGpuFaultCheck:
             )
             verdicts[pod.pod_id] = verdict
             if verdict.attribution == ATTRIBUTION_WORKLOAD and await self._is_new(ctx, pod.pod_id, verdict):
-                report = {
-                    "pod_id": pod.pod_id,
-                    "phase": PHASE_MID_RENTAL,
-                    "probed_at": now.isoformat(),
-                    "container_started_at": started_at.isoformat() if started_at else None,
+                report = GpuFaultProbeRequest(
+                    pod_id=pod.pod_id,
+                    phase=PHASE_MID_RENTAL,
+                    probed_at=now,
+                    container_started_at=started_at,
+                    container_pids_known=container_pids is not None,
                     **verdict.as_report(),
-                }
+                ).model_dump(mode="json")
                 await ctx.services.backend.report_gpu_fault_probe(ctx.executor.uuid, report)
                 await self._remember(ctx, pod.pod_id, verdict)
                 reported.append(pod.pod_id)
