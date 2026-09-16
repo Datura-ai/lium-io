@@ -224,6 +224,15 @@ def _s3fs_plugin_alias(volume_name: str) -> str:
 # every container's root to its base. A wider range is handed out per container.
 SYSBOX_SUBUID_SLICE_SIZE = 65536
 
+# DAH-3521: the iptables comment on every DNS ACCEPT a custom build adds to the host
+# DOCKER-USER chain. One word, no spaces: `iptables -S` then prints it unquoted and
+# `_egress_filter_script` can purge every tagged rule for a DinD IP by text match,
+# whatever resolver the rule names.
+DIND_DNS_RULE_TAG = "lium-dind-dns"
+# Bound on one readiness probe (`docker exec <dind> docker info`) of the custom-build
+# DinD; the number of probes is CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS.
+DIND_READY_PROBE_MAX_SECONDS = 10
+
 # DAH-1991: tolerate concurrent health_check_* / container_* on the executor.
 # Probe TTL is short (~30s); same-command retry within a 90s budget covers the
 # documented race without regenerating port mappings.
@@ -4502,12 +4511,16 @@ class DockerService:
 
         `dns_servers` are the DinD's own resolvers inside the blocked ranges
         (see `_parse_dind_nameservers`). Each gets an ACCEPT for udp/tcp port
-        53 inserted AFTER the DROP rules, so `-I` puts it above them and only
-        DNS to that one address passes; port 80 to a metadata service on the
-        same address stays dropped. Every matching ACCEPT already in the chain
-        (left by a build whose teardown failed) is deleted first: a `-C` check
-        would find such a stale rule below the DROP just inserted and skip the
-        insert, and DNS would still be dropped.
+        53, tagged `-m comment --comment {DIND_DNS_RULE_TAG}`, inserted AFTER
+        the DROP rules, so `-I` puts it above them and only DNS to that one
+        address passes; port 80 to a metadata service on the same address stays
+        dropped. Before the inserts, every tagged rule for this `dind_ip` is
+        deleted, whatever resolver it names: a build whose teardown failed
+        leaves its ACCEPTs behind, and when the DinD IP is reused by a build
+        with a different resolver, a `-C` check or a delete of the current
+        resolvers only would keep the old resolver allowed. The teardown runs
+        the same purge, so it never depends on knowing which resolvers the
+        apply saw.
 
         `dind_ip`, `cidrs` and `dns_servers` are pre-validated via `ipaddress`,
         so they are shell-safe to interpolate.
@@ -4516,6 +4529,24 @@ class DockerService:
             "IPT=iptables-nft",
             "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
         ]
+        # Every tagged rule for this DinD IP, read back from the chain and deleted
+        # as printed: `-S` prints `-A DOCKER-USER <spec>`; `read` splits off the
+        # `-A`, the rest is the spec `-D` needs. The comment is one word, so `-S`
+        # prints it unquoted and the case pattern matches it as text. The listing
+        # is captured first and its exit status checked: a pipe would turn a
+        # failed `-S` (xtables lock) into a silent no-op. On apply that failure
+        # aborts (exit 4, the caller never runs the build with a stale ACCEPT
+        # possibly in place); on teardown it is tolerated so the DROPs below
+        # still go.
+        on_list_failure = (
+            '{ echo "DOCKER-USER listing failed" >&2; exit 4; }' if apply else 'rules=""'
+        )
+        purge_tagged = (
+            f"rules=$($IPT -S DOCKER-USER 2>/dev/null) || {on_list_failure}; "
+            f"printf '%s\\n' \"$rules\" | while read -r _a spec; do "
+            f'case "$spec" in *"-s {dind_ip}/32 "*"--comment {DIND_DNS_RULE_TAG} "*) '
+            f"$IPT -D $spec;; esac; done"
+        )
         if apply:
             # No DOCKER-USER chain => egress filtering cannot be guaranteed. Fail
             # loudly so the caller aborts rather than running the build open.
@@ -4528,19 +4559,18 @@ class DockerService:
                     f"$IPT -C DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || "
                     f"$IPT -I DOCKER-USER -s {dind_ip} -d {c} -j DROP"
                 )
+            lines.append(purge_tagged)
             for ns in dns_servers:
                 for proto in ("udp", "tcp"):
-                    rule = f"-s {dind_ip} -d {ns} -p {proto} --dport 53 -j ACCEPT"
                     # Not `-C || -I`: a stale ACCEPT below the new DROP satisfies
-                    # `-C` and the insert is skipped. Delete every copy, then
-                    # insert one at the top of the chain.
-                    lines.append(f"while $IPT -D DOCKER-USER {rule} 2>/dev/null; do :; done")
-                    lines.append(f"$IPT -I DOCKER-USER {rule}")
+                    # `-C` and the insert is skipped. The purge above removed
+                    # every copy; insert one at the top of the chain.
+                    lines.append(
+                        f"$IPT -I DOCKER-USER -s {dind_ip} -d {ns} -p {proto} --dport 53 "
+                        f"-m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT"
+                    )
         else:
-            for ns in dns_servers:
-                for proto in ("udp", "tcp"):
-                    rule = f"-s {dind_ip} -d {ns} -p {proto} --dport 53 -j ACCEPT"
-                    lines.append(f"while $IPT -D DOCKER-USER {rule} 2>/dev/null; do :; done")
+            lines.append(purge_tagged)
             for c in cidrs:
                 lines.append(
                     f"$IPT -D DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || true"
@@ -4680,24 +4710,31 @@ class DockerService:
                 )
                 return CustomBuildOutcome(False, "build_dind_start", "isolated build container failed to start")
 
-            # 3. Wait for the inner dockerd to accept connections. The loop as a
-            #    whole is bounded by `ready_timeout_s`, so a probe that hangs
-            #    costs the same as probes that keep failing.
-            async def _wait_dind_ready() -> bool:
-                for _ in range(max(1, ready_timeout_s)):
+            # 3. Wait for the inner dockerd to accept connections: up to
+            #    `ready_timeout_s` probes a second apart (the budget the loop
+            #    always had), each probe bounded by `probe_timeout_s` so a hung
+            #    `docker info` ends the wait instead of holding the build for
+            #    an hour. Worst case, probes that each take the whole bound and
+            #    answer "not ready": N * (10 + 1) s, 11 min at the default 60.
+            #    `ready_timeout_s` is `gt=0` in settings, so at least one probe
+            #    runs.
+            ready = False
+            probe_timeout_s = min(ready_timeout_s, DIND_READY_PROBE_MAX_SECONDS)
+            for _ in range(ready_timeout_s):
+                try:
                     probe = await ssh_client.run(
                         f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info",
                         check=False,
+                        timeout=probe_timeout_s,
                     )
-                    if probe.exit_status == 0:
-                        return True
-                    await asyncio.sleep(1)
-                return False
-
-            try:
-                ready = await asyncio.wait_for(_wait_dind_ready(), timeout=ready_timeout_s)
-            except asyncio.TimeoutError:
-                ready = False
+                except asyncio.TimeoutError:
+                    # A probe that does not return in its bound is a dockerd
+                    # that is not answering: stop here.
+                    break
+                if probe.exit_status == 0:
+                    ready = True
+                    break
+                await asyncio.sleep(1)
             if not ready:
                 logger.error(
                     _m(
@@ -4916,7 +4953,6 @@ class DockerService:
                 dind_ip=dind_ip if egress_applied else None,
                 cidrs=cidrs,
                 default_extra=default_extra,
-                dns_servers=dns_servers,
             )
 
     async def _teardown_dind_build(
@@ -4927,9 +4963,11 @@ class DockerService:
         dind_ip: str | None,
         cidrs: list[str],
         default_extra: dict,
-        dns_servers: list[str] | tuple[str, ...] = (),
     ) -> None:
         """Best-effort teardown of the throwaway DinD container + its egress rules.
+
+        The DNS ACCEPTs go by their tag and the DinD IP (`_egress_filter_script`),
+        so the teardown never needs to know which resolvers the apply saw.
 
         Always called from `_custom_build_image`'s finally. Failures are logged,
         never raised — the rental flow must not break on cleanup.
@@ -4939,9 +4977,7 @@ class DockerService:
         setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         if dind_ip:
             try:
-                remove_script = self._egress_filter_script(
-                    dind_ip, cidrs, apply=False, dns_servers=dns_servers
-                )
+                remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)
                 await ssh_client.run(
                     f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
                     f"--entrypoint /bin/sh {shlex.quote(dind_image)} "

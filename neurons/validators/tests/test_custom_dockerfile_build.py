@@ -23,6 +23,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shlex
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -37,7 +41,7 @@ from payload_models.payloads import (
     FailedContainerRequest,
     PayloadPortMapping,
 )
-from services.docker_service import DockerService
+from services.docker_service import DIND_DNS_RULE_TAG, DockerService
 from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
 
 # ------------------------------------------------------------------
@@ -200,7 +204,11 @@ def _make_dind_ssh(
             return _ssh_result(exit_status=dind_start_exit, stdout="dind-cid")
         if "docker exec" in cmd and cmd.rstrip().endswith("docker info"):
             if ready_hangs:
-                await asyncio.sleep(3600)
+                # asyncssh: a command that outlives `timeout=` raises TimeoutError
+                # after that long; without a bound it blocks for the hour.
+                await asyncio.sleep(kw["timeout"] if kw.get("timeout") else 3600)
+                if kw.get("timeout"):
+                    raise asyncio.TimeoutError()
             return _ssh_result(exit_status=ready_exit)
         if "docker inspect -f" in cmd:
             return _ssh_result(stdout=dind_ip)
@@ -1291,8 +1299,9 @@ def test_A20_dind_nameservers_inside_the_block_are_the_only_ones_kept():
 def test_A21_egress_script_allows_port_53_to_the_resolver_above_the_drops():
     apply = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=True, dns_servers=["10.0.0.2"])
     steps = apply.split("; ")
-    accept_udp = "$IPT -I DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p udp --dport 53 -j ACCEPT"
-    accept_tcp = "$IPT -I DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p tcp --dport 53 -j ACCEPT"
+    tag = f"-m comment --comment {DIND_DNS_RULE_TAG}"
+    accept_udp = f"$IPT -I DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p udp --dport 53 {tag} -j ACCEPT"
+    accept_tcp = f"$IPT -I DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p tcp --dport 53 {tag} -j ACCEPT"
     drop_10 = "$IPT -I DOCKER-USER -s 172.20.0.2 -d 10.0.0.0/8 -j DROP"
     assert any(accept_udp in s for s in steps) and any(accept_tcp in s for s in steps)
     # `-I` inserts at the top, so the ACCEPT lines must run AFTER the DROP lines
@@ -1305,24 +1314,87 @@ def test_A21_egress_script_allows_port_53_to_the_resolver_above_the_drops():
     assert "-p udp --dport 53" in apply and "--dport 80" not in apply
     # A stale ACCEPT from a build whose teardown failed sits BELOW the DROP just
     # inserted; `-C` finds it, the insert is skipped and DNS stays dropped. So
-    # the ACCEPT is never `-C`-guarded: every copy is deleted, then one is
-    # inserted at the top.
+    # the ACCEPT is never `-C`-guarded: every tagged rule for this DinD IP is
+    # purged from the chain first, then one copy is inserted at the top.
     assert not any("-C DOCKER-USER" in s and "-j ACCEPT" in s for s in steps)
-    for proto, insert in (("udp", accept_udp), ("tcp", accept_tcp)):
-        rule = f"-s 172.20.0.2 -d 10.0.0.2 -p {proto} --dport 53 -j ACCEPT"
-        assert f"while $IPT -D DOCKER-USER {rule} 2>/dev/null; do :; done" in apply
-        assert apply.index(f"-D DOCKER-USER {rule}") < apply.index(insert)
+    assert "-D DOCKER-USER -s 172.20.0.2 -d 10.0.0.2" not in apply
+    assert apply.index(_PURGE_TAGGED) < apply.index(accept_udp)
 
-    remove = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=False, dns_servers=["10.0.0.2"])
-    assert "while $IPT -D DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p udp --dport 53 -j ACCEPT 2>/dev/null; do :; done" in remove
-    assert "while $IPT -D DOCKER-USER -s 172.20.0.2 -d 10.0.0.2 -p tcp --dport 53 -j ACCEPT 2>/dev/null; do :; done" in remove
+    remove = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=False)
+    assert _PURGE_TAGGED_TEARDOWN in remove and "exit 4" not in remove
     assert "$IPT -D DOCKER-USER -s 172.20.0.2 -d 10.0.0.0/8 -j DROP" in remove
     assert "-I DOCKER-USER" not in remove
 
-    # No resolver inside the block: the script is exactly today's.
+    # No resolver inside the block: the script is exactly today's plus the purge.
     plain = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=True)
     assert plain == DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=True, dns_servers=[])
     assert "ACCEPT" not in plain
+
+
+# The purge `_egress_filter_script` emits for DinD IP 172.20.0.2: every rule in the
+# chain that carries this source and the DNS tag, deleted as `iptables -S` prints it.
+_PURGE_LOOP = (
+    "printf '%s\\n' \"$rules\" | while read -r _a spec; do "
+    f'case "$spec" in *"-s 172.20.0.2/32 "*"--comment {DIND_DNS_RULE_TAG} "*) '
+    "$IPT -D $spec;; esac; done"
+)
+# apply: a failed listing aborts (a pipe would make the purge a silent no-op)
+_PURGE_TAGGED = (
+    'rules=$($IPT -S DOCKER-USER 2>/dev/null) || { echo "DOCKER-USER listing failed" >&2; exit 4; }; '
+    + _PURGE_LOOP
+)
+# teardown: a failed listing is tolerated so the DROP deletes still run
+_PURGE_TAGGED_TEARDOWN = 'rules=$($IPT -S DOCKER-USER 2>/dev/null) || rules=""; ' + _PURGE_LOOP
+
+
+def test_A21b_purge_removes_an_old_resolver_the_current_list_does_not_name():
+    """Regression (taiberium, #1381): teardown failed on a build whose resolver
+    was 10.0.0.2; the DinD IP came back for a build whose resolver is 10.0.0.9.
+    Deleting the current resolvers' rules, or a `-C` check, leaves the 10.0.0.2
+    ACCEPT in place. The purge matches the tag and the source IP only, so the
+    old rule goes whatever address it names; a rule for another DinD IP stays."""
+    apply = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=True, dns_servers=["10.0.0.9"])
+    assert "10.0.0.2" not in apply
+    assert apply.index(_PURGE_TAGGED) < apply.index("-d 10.0.0.9 -p udp --dport 53")
+    # Run the purge line against a fake chain listing and record what `-D` sees.
+    chain = "\n".join(
+        [
+            "-N DOCKER-USER",
+            f"-A DOCKER-USER -s 172.20.0.2/32 -d 10.0.0.2/32 -p udp -m udp --dport 53 -m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT",
+            f"-A DOCKER-USER -s 172.20.0.2/32 -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT",
+            f"-A DOCKER-USER -s 172.20.0.7/32 -d 10.0.0.2/32 -p udp -m udp --dport 53 -m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT",
+            "-A DOCKER-USER -s 172.20.0.2/32 -d 10.0.0.0/8 -j DROP",
+            "-A DOCKER-USER -j RETURN",
+        ]
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        ipt = os.path.join(tmp, "ipt.sh")
+        with open(ipt, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'[ "$1" = -S ] && {{ printf \'%b\\n\' \'{chain}\'; exit 0; }}\n'
+                f'echo "$@" >> {shlex.quote(os.path.join(tmp, "deleted"))}\n'
+            )
+        os.chmod(ipt, 0o755)
+        script = _PURGE_TAGGED.replace("$IPT", shlex.quote(ipt))
+        subprocess.run(["sh", "-c", script], check=True, timeout=10)
+        with open(os.path.join(tmp, "deleted")) as fh:
+            deleted = fh.read().splitlines()
+    assert deleted == [
+        f"-D DOCKER-USER -s 172.20.0.2/32 -d 10.0.0.2/32 -p udp -m udp --dport 53 -m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT",
+        f"-D DOCKER-USER -s 172.20.0.2/32 -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT",
+    ]
+    # A listing that fails (xtables lock) must not pass as "nothing to purge":
+    # the apply exits 4 and deletes nothing; the teardown carries on.
+    with tempfile.TemporaryDirectory() as tmp:
+        ipt = os.path.join(tmp, "ipt.sh")
+        with open(ipt, "w") as fh:
+            fh.write("#!/bin/sh\n" '[ "$1" = -S ] && exit 4\n' f'echo "$@" >> {shlex.quote(os.path.join(tmp, "deleted"))}\n')
+        os.chmod(ipt, 0o755)
+        rc = subprocess.run(["sh", "-c", _PURGE_TAGGED.replace("$IPT", shlex.quote(ipt))], timeout=10).returncode
+        assert rc == 4 and not os.path.exists(os.path.join(tmp, "deleted"))
+        rc = subprocess.run(["sh", "-c", _PURGE_TAGGED_TEARDOWN.replace("$IPT", shlex.quote(ipt))], timeout=10).returncode
+        assert rc == 0 and not os.path.exists(os.path.join(tmp, "deleted"))
 
 
 @pytest.mark.asyncio
@@ -1352,13 +1424,14 @@ async def test_A22_build_on_a_host_with_a_private_resolver_lets_dns_through(svc,
     ), ssh_client.calls
     applied = [c for c in esl.seen if "--network=host" in c and "DOCKER-USER" in c]
     assert len(applied) == 1
-    assert "-s 172.20.0.2 -d 10.0.0.2 -p udp --dport 53 -j ACCEPT" in applied[0]
-    assert "-s 172.20.0.2 -d 10.0.0.2 -p tcp --dport 53 -j ACCEPT" in applied[0]
+    tag = f"-m comment --comment {DIND_DNS_RULE_TAG}"
+    assert f"-s 172.20.0.2 -d 10.0.0.2 -p udp --dport 53 {tag} -j ACCEPT" in applied[0]
+    assert f"-s 172.20.0.2 -d 10.0.0.2 -p tcp --dport 53 {tag} -j ACCEPT" in applied[0]
     assert "-s 172.20.0.2 -d 10.0.0.0/8 -j DROP" in applied[0]
-    # Teardown (ssh.run, not the streamer) deletes the ACCEPT with the DROPs.
+    # Teardown (ssh.run, not the streamer) purges the tagged ACCEPTs with the DROPs.
     removed = [c for c in ssh_client.calls if "--network=host" in c and "-D DOCKER-USER" in c]
     assert len(removed) == 1
-    assert "-d 10.0.0.2 -p udp --dport 53 -j ACCEPT" in removed[0]
+    assert f"--comment {DIND_DNS_RULE_TAG} " in removed[0] and "-D $spec" in removed[0]
     assert "-d 10.0.0.0/8 -j DROP" in removed[0]
 
 
@@ -1404,12 +1477,12 @@ async def test_A23_setup_commands_are_bounded_and_a_hung_dind_start_fails_the_st
         ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
     )
     assert ok is True and step is None
-    # Every ssh.run, teardown included, carries the bound, except the readiness
-    # probes (their loop is bounded as a whole, below). The DinD start also
-    # runs under the executor's own `timeout(1)`, which kills a hung pull.
+    # Every ssh.run, teardown and readiness probes included, carries a bound.
+    # The DinD start also runs under the executor's own `timeout(1)`, which
+    # kills a hung pull.
     unbounded = [
         c for c, kw in zip(ssh_client.calls, ssh_client.call_kwargs)
-        if kw.get("timeout") is None and not c.rstrip().endswith("docker info")
+        if kw.get("timeout") is None
     ]
     assert unbounded == [], unbounded
     start = next(c for c in ssh_client.calls if "run -d --runtime=sysbox-runc" in c)
@@ -1440,8 +1513,9 @@ async def test_A23b_a_hung_readiness_probe_fails_at_build_dind_unready_within_th
     monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    # Without the bound the loop waits on the first probe for an hour; the
-    # outer wait_for turns that into a failure here instead of a hung run.
+    # Without the per-probe bound the loop waits on the first probe for an
+    # hour; `timeout=ready_timeout_s` on the probe turns that into a failure
+    # here instead of a hung run, and the other 59 probes never start.
     ok, step = await asyncio.wait_for(
         svc._custom_build_image(
             ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
@@ -1449,8 +1523,33 @@ async def test_A23b_a_hung_readiness_probe_fails_at_build_dind_unready_within_th
         timeout=5,
     )
     assert ok is False and step == "build_dind_unready"
+    probes = [k for c, k in zip(ssh_client.calls, ssh_client.call_kwargs) if c.rstrip().endswith("docker info")]
+    assert len(probes) == 1 and probes[0].get("timeout") == 1
     assert not any("docker build" in c for c in esl.seen)
     assert any("docker rm -fv" in c and f"lium-dind-build-{payload.pod_id}" in c for c in ssh_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_A23c_readiness_keeps_its_probe_budget_when_probes_fail_fast(svc, monkeypatch):
+    """The nit (taiberium, #1381): an outer `wait_for(ready_timeout_s)` counted
+    probe time against the sleep budget, so a slow host got fewer probes than
+    the setting says. Now the loop runs `ready_timeout_s` probes a second apart,
+    each bounded on its own."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", 2)
+    ssh_client = _make_dind_ssh(ready_exit=1)
+    esl = _make_esl()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
+    )
+    assert ok is False and step == "build_dind_unready"
+    probes = [k for c, k in zip(ssh_client.calls, ssh_client.call_kwargs) if c.rstrip().endswith("docker info")]
+    # two probes, one second apart, each bounded by min(N, 10) = 2 s
+    assert len(probes) == 2 and all(k.get("timeout") == 2 for k in probes)
 
 
 @pytest.mark.asyncio
@@ -1475,6 +1574,19 @@ async def test_A24_egress_helper_runs_under_the_setup_bound(svc, monkeypatch):
     assert len(egress) == 1 and egress[0].get("timeout") == 11
     build = [k for k in seen_kwargs if "docker build" in k.get("command", "")]
     assert build and build[0].get("timeout") == int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_A25b_dind_ready_timeout_rejects_zero_and_negative(bad):
+    """(taiberium, #1381) `range(0)` runs no probe at all, so zero or a negative
+    value would fail every build at `build_dind_unready` without asking dockerd
+    once. The setting refuses both at load time."""
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS=bad)
 
 
 @pytest.mark.parametrize("bad", [0, -1])
