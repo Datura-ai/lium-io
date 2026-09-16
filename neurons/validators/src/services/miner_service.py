@@ -168,7 +168,7 @@ def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
     return inflight_creates.is_running(payload.pod_id)
 
 
-def _ssh_key_not_accepted_text(executors: list, extra: dict) -> _StructuredMessage:
+def _ssh_key_not_accepted_text(executors: list[ExecutorSSHInfo], default_extra: dict) -> _StructuredMessage:
     """Why the miner's answer carried no executor this validator can use (DAH-3508).
 
     An empty list is the usual case and says nothing about the id: the miner lists only the
@@ -178,13 +178,13 @@ def _ssh_key_not_accepted_text(executors: list, extra: dict) -> _StructuredMessa
     if not executors:
         return _m(
             "Error: no executor accepted the SSH key",
-            extra=get_extra_info({**extra, "executors_returned": 0}),
+            extra=get_extra_info({**default_extra, "executors_returned": 0}),
         )
     return _m(
         "Error: the miner returned a different executor id",
         extra=get_extra_info(
             {
-                **extra,
+                **default_extra,
                 "executors_returned": len(executors),
                 "returned_executor_id": str(executors[0].uuid),
             }
