@@ -1112,6 +1112,10 @@ async def test_delete_container_schedules_the_rental_end_gpu_fault_probe_for_a_c
     monkeypatch.setattr(docker_service, "_cleanup_custom_build_artifacts", AsyncMock())
     docker_service.redis_service.remove_rented_machine = AsyncMock()
     docker_service.backend_client = AsyncMock()  # the probe exists to report; no client, no probe
+    # another tenant shares the node, so the PID set is read too (by name: this pod's own entry is still listed)
+    docker_service.redis_service.get_rented_machine = AsyncMock(
+        return_value={"owner_flag": False, "containers": [{"name": "pod_rental", "pod_id": "pod-id"}, {"name": "pod_other", "pod_id": "o"}]}
+    )
     scheduled = []
     monkeypatch.setattr(
         docker_service,

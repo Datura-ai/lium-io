@@ -98,25 +98,39 @@ async def test_a_workload_fault_on_a_node_that_no_longer_answers_delists_it_with
 
 
 @pytest.mark.asyncio
-async def test_another_pods_process_is_not_this_renters_when_another_pod_stays_rented():
+async def test_another_pods_process_is_not_this_renters_when_the_pids_were_read_beside_another_tenant():
     # a multi-pod node: the PID set read through the SDK before the stop places the line on the other tenant
     ssh = FakeSSH(xid_lines=xid(30, 31, pid=9999), gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
     svc = service(ssh)
-    svc.redis_service.get_rented_machine.return_value = {"containers": ["pod_other"]}
     report = await run_probe(svc, pids={4242, 4243})
     assert report["attribution"] == "none" and report["other_container"] == 1 and report["container_pids_known"] is True
     svc.redis_service.clear_verified_job_info.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_on_a_node_with_no_other_tenant_the_timestamp_alone_places_the_renters_dead_process():
-    # the renter's process that raised the Xid exited with it, so it is not in the PID set read before the stop
-    ssh = FakeSSH(xid_lines=xid(30, 31, pid=9999), gpu_exit=15, gpu_out="", gpu_err=LOST_CARD)
-    svc = service(ssh)
-    svc.redis_service.get_rented_machine.return_value = None
-    report = await run_probe(svc, pids={4242, 4243})
-    assert report["attribution"] == "workload" and report["container_pids_known"] is False
-    svc.redis_service.clear_verified_job_info.assert_awaited_once()
+async def test_the_pids_are_read_only_beside_another_tenant_and_before_this_delete_drops_its_own_entry():
+    """The rented-machine record still lists this pod's own container when the window is read (this delete removes
+    it later), so "another tenant" is decided by name; a single-tenant node leaves the PID set None and the
+    renter's exited process is placed by its timestamp."""
+    svc = service(FakeSSH(xid_lines="", gpu_exit=0, gpu_out=""))
+    docker_client = AsyncMock()
+    docker_client.container_started_at.return_value = "2026-09-16T09:00:00.000000000Z"
+    docker_client.container_pids.return_value = {4242}
+    with probe_flag():
+        svc.redis_service.get_rented_machine.return_value = {
+            "owner_flag": False,
+            "containers": [{"name": f"pod_{POD}", "pod_id": POD}],
+        }
+        started_at, pids = await svc._read_rental_window(docker_client, payload(), default_executor(), Mock())
+        assert started_at is not None and pids is None
+        docker_client.container_pids.assert_not_awaited()
+
+        svc.redis_service.get_rented_machine.return_value = {
+            "owner_flag": False,
+            "containers": [{"name": f"pod_{POD}", "pod_id": POD}, {"name": "pod_other", "pod_id": "other"}],
+        }
+        started_at, pids = await svc._read_rental_window(docker_client, payload(), default_executor(), Mock())
+        assert pids == {4242}
 
 
 @pytest.mark.asyncio

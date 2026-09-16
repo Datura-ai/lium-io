@@ -91,8 +91,8 @@ def test_another_containers_application_xid_is_not_this_renters():
     assert verdict.other_container == 1
 
 
-def test_at_rental_end_the_timestamp_alone_places_the_line():
-    # the container is gone, so no PID filter: container_pids=None accepts the renter's dead process
+def test_without_another_tenant_the_timestamp_alone_places_the_line():
+    # no PID set (single-tenant node): the renter's process that raised the Xid has exited with it
     verdict = attribute(
         parse_xid_lines(iso(START + timedelta(minutes=10), 31, pid=9999)),
         window_start=START,

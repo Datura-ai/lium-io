@@ -6639,15 +6639,19 @@ class DockerService:
         self,
         docker_client: RentalDockerSdkClient,
         payload: ContainerDeleteRequest,
+        executor_info: ExecutorSSHInfo,
         log: _BoundLog,
     ) -> tuple[datetime | None, set[int] | None]:
-        """The rental window's start (`State.StartedAt`) and the container's PIDs, through the Docker SDK.
+        """The rental window's start (`State.StartedAt`) and, when another tenant shares the node, this
+        container's PIDs, through the Docker SDK.
 
         Read while the container still exists, right before the stop. Best effort and quick: a container
-        that is already gone leaves the start unknown and the probe attributes nothing from this rental; a
-        PID set that cannot be read (None) lets the timestamp alone place a line, an empty set means every
-        Xid that names a PID is another container's. The SDK, not a shell: the container name never reaches
-        host shell text (test_docker_service_rental_security).
+        that is already gone leaves the start unknown and the probe attributes nothing from this rental.
+        The PID set tells this pod's Xid lines from the other tenant's, so it is read only when the rented
+        machine record names another container than this one (read here, before this delete removes its
+        own entry); on a single-tenant node it stays None and the timestamp alone places a line, since the
+        renter's process that raised the Xid has usually exited with it. The SDK, not a shell: the container
+        name never reaches host shell text (test_docker_service_rental_security).
         """
         if not self._rental_end_gpu_fault_probe_applies(payload):
             return None, None
@@ -6661,15 +6665,23 @@ class DockerService:
                 )
                 or ""
             )
-            pids = await asyncio.wait_for(
-                docker_client.container_pids(container_name=payload.container_name),
-                timeout=HOST_COMMAND_TIMEOUT_SECONDS,
-            )
+            if await self._another_tenant_on_node(executor_info, payload.container_name):
+                pids = await asyncio.wait_for(
+                    docker_client.container_pids(container_name=payload.container_name),
+                    timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.info("Rental window not fully read before the stop", error=str(exc), started_at_read=started_at is not None)
         return started_at, pids
+
+    async def _another_tenant_on_node(self, executor_info: ExecutorSSHInfo, container_name: str) -> bool:
+        rented_machine = await self.redis_service.get_rented_machine(executor_info)
+        containers = (rented_machine or {}).get("containers") or []
+        return any(
+            (item.get("name") if isinstance(item, dict) else item) not in (None, container_name) for item in containers
+        )
 
     def _schedule_rental_end_gpu_fault_probe(
         self,
@@ -6705,8 +6717,8 @@ class DockerService:
 
         Never raises. Everything runs under one wall-clock cap; a probe that cannot run reports nothing
         (a lost probe is acceptable: best effort). The verdict is `services.gpu_xid_attribution.attribute`
-        over [container start, now]; the PID filter is the set read before the stop (a process that had already
-        died is not in it, so its line is "another container's" and the verdict falls back to repeats).
+        over [container start, now]; the PID filter is the set `_read_rental_window` read before the stop, and
+        only when another tenant shared the node (a single tenant's dead process is placed by its timestamp).
         A "workload" verdict on a node whose `nvidia-smi` no longer lists its cards clears the verified job
         with reason GPU_FAULT_AFTER_RENTAL_WORKLOAD: score 0 and active=false at once, no penalty (the backend
         reads the reason). A "hardware" verdict, or a node that answers, changes nothing here.
@@ -6749,11 +6761,6 @@ class DockerService:
         now = datetime.now(UTC)
         if dmesg_unavailable(xid_log.stdout):
             log.info("Rental-end GPU-fault probe: the host's kernel log is not readable; nothing attributed")
-        # The PID set read before the stop tells this pod's lines from another tenant's; the renter's process that
-        # raised the Xid has usually exited by the stop, so on a node with no other rented pod the timestamp alone
-        # places the line (Rustam's table: an application Xid inside the rental window).
-        if rental_pids is not None and not await self._has_rented_containers(executor_info):
-            rental_pids = None
         answers = node_answers(gpu_query.exit_code, gpu_query.stdout, gpu_query.stderr)
         verdict = attribute(
             parse_xid_lines(xid_log.stdout),
@@ -6775,8 +6782,7 @@ class DockerService:
         ).model_dump(mode="json")
         log.info("Rental-end GPU-fault probe finished", **{k: v for k, v in report.items() if k != "pod_id"})
 
-        if self.backend_client is not None:
-            await self.backend_client.report_gpu_fault_probe(payload.executor_id, report)
+        await self.backend_client.report_gpu_fault_probe(payload.executor_id, report)
 
         if verdict.attribution == ATTRIBUTION_WORKLOAD and not answers:
             prev_info = await self.redis_service.get_verified_job_info(payload.executor_id)
@@ -6876,7 +6882,7 @@ class DockerService:
             ):
                 # DAH-3490: the rental window's start, read while the container still exists; the Xid lines
                 # the rental-end probe attributes are the ones stamped after it.
-                rental_started_at, rental_pids = await self._read_rental_window(docker_client, payload, log)
+                rental_started_at, rental_pids = await self._read_rental_window(docker_client, payload, executor_info, log)
 
                 await self._stop_container_gracefully(docker_client, payload, log)
 
