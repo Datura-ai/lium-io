@@ -18,16 +18,28 @@ E2E_GPU ?=
 ARTIFACTS := $(CURDIR)/artifacts
 WAIT_TIMEOUT ?= 300
 ifeq ($(E2E_GPU),)
-  COMPOSE := docker compose --env-file stack.env -f docker-compose.e2e.yml
+  COMPOSE_FILES := -f docker-compose.e2e.yml
   # the executor host's dockerd (rental containers land there); the pod image is built onto it in `seed`
   EXECUTOR_DOCKER := docker -H tcp://127.0.0.1:23750
 else
   # GPU host: the executor runs on THIS machine's dockerd (docker-compose.gpu.yml) and is reached at the network gateway;
   # its sshd port is the same E2E_EXECUTOR_SSH_PORT as on the CPU path (stack.env: 2222, not the host's :22)
-  COMPOSE := docker compose --env-file stack.env -f docker-compose.e2e.yml -f docker-compose.gpu.yml
+  COMPOSE_FILES := -f docker-compose.e2e.yml -f docker-compose.gpu.yml
   EXECUTOR_DOCKER := docker
   export E2E_EXECUTOR_IP := 172.30.0.1
 endif
+COMPOSE := docker compose --env-file stack.env $(COMPOSE_FILES)
+
+# Layer cache for `build` (DAH-3408). Empty (a dev box, the GPU path): `docker compose build`, every layer built on this
+# machine, as before. Set to a buildx cache backend — CI's e2e-gate job sets `gha` — and the five images the compose file
+# builds (dind, executor, miner, validator, tester) come out of one `docker buildx bake` over the same compose file(s), each
+# image reading from and writing to its own cache scope (`e2e-<service>`: one shared scope would let the last export
+# overwrite the others' index), `mode=max` so the intermediate layers (apt, pdm install) are cached and not only the final
+# ones. `--load` puts the images on this daemon under their `image:` tags, where `up` finds them. The gha backend reads its URL
+# and token from ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN and needs a builder that can export cache (test.yml sets both up).
+E2E_CACHE ?=
+BAKE_IMAGES := dind executor miner validator tester
+BAKE_CACHE = $(foreach i,$(BAKE_IMAGES),--set '$(i).cache-from=type=$(E2E_CACHE),scope=e2e-$(i)' --set '$(i).cache-to=type=$(E2E_CACHE),scope=e2e-$(i),mode=max')
 
 .PHONY: e2e e2e-full build up seed test logs down
 
@@ -42,8 +54,12 @@ e2e-full:
 	./gate.sh
 
 build:
+ifeq ($(E2E_CACHE),)
 	$(COMPOSE) build
 	$(COMPOSE) --profile tools build tester
+else
+	docker buildx bake $(COMPOSE_FILES) --load $(BAKE_CACHE)
+endif
 
 up:
 	$(COMPOSE) up -d --wait --wait-timeout $(WAIT_TIMEOUT)
