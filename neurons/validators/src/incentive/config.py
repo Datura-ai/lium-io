@@ -26,12 +26,14 @@ DEFAULT_PRICE = DefaultPrice()
 # the Workstation Edition at 1.0. The two are the same card for a renter (DAH-3230: the source table
 # in packages/lium-core and the backend's MACHINE_PRICES move the Server Edition to 1.0), so the
 # validator pins the two editions to parity here; the override can go once the validator's lock
-# carries a lium-core release with the parity table.
+# carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
+# the pinned lium-core still has 5.10).
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
     ],
+    "NVIDIA B300 SXM6 AC": 6.4,
 }
 
 
