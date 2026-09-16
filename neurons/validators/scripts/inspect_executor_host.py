@@ -21,7 +21,10 @@ How the connect path is reused (no new protocol, no new key handling):
    ``DockerService.wait_for_port_check_containers`` makes.
 5. The read-only commands in ``COMMANDS`` run, each wrapped by ``capped()`` so the node cuts
    stdout and stderr at ``OUTPUT_CAP`` bytes each before they reach the validator, then
-   ``MinerService._remove_ssh_key_via_rest`` takes the key back, in a ``finally``.
+   ``MinerService._remove_ssh_key_via_rest`` takes the key back, in a ``finally`` that runs after
+   every submit, refused or timed out included. The miner answers 200 once it accepted the remove
+   request; it does not confirm the removal on the executor. A remove the miner did not accept is
+   a node error and the run exits 1.
 
 The sshd we reach runs inside the ``executor-executor-1`` container. That container mounts the
 host's ``/var/run/docker.sock`` and ``/etc/docker/daemon.json`` (neurons/executor/docker-compose.app.yml),
@@ -177,7 +180,7 @@ def clip(text: str, note: str | None = None) -> str:
     return f"{text}\n{note}".strip() if note else text
 
 
-def capped_output(result) -> CommandOutput:
+def capped_output(result: asyncssh.SSHCompletedProcess) -> CommandOutput:
     """The ``CommandOutput`` for one ``capped()`` run: marker off, both streams clipped."""
     stdout, exit_status = split_exit_status(result.stdout or "")
     note = None if exit_status is not None else f"[no exit status: stdout cut at {OUTPUT_CAP} bytes or the shell stopped early]"
@@ -257,7 +260,9 @@ async def resolve_axon_from_metagraph(hotkey: str) -> tuple[str, int]:
     return neuron.axon_info.ip, int(neuron.axon_info.port)
 
 
-async def run_commands(ssh_client, outputs: dict[str, CommandOutput], per_command_timeout: float) -> None:
+async def run_commands(
+    ssh_client: asyncssh.SSHClientConnection, outputs: dict[str, CommandOutput], per_command_timeout: float
+) -> None:
     """Fill ``outputs`` one command at a time, so a node budget that runs out keeps what was read.
 
     Each command runs through ``capped()``, so ``ssh_client.run()`` never buffers more than
@@ -300,7 +305,6 @@ async def inspect_executor(
     headers = miner_service._generate_auth_headers(my_key, target.miner_hotkey)
     headers["Content-Type"] = "application/json"
 
-    key_accepted = False
     try:
         status, response_data = await miner_service._make_rest_request(
             method="POST",
@@ -318,7 +322,6 @@ async def inspect_executor(
         if not isinstance(msg, AcceptSSHKeyRequest):
             report.error = f"miner answered {type(msg).__name__}: {getattr(msg, 'details', '')}"
             return report
-        key_accepted = True
         executor = next((e for e in msg.executors if e.uuid == target.executor_id), None)
         if executor is None:
             report.error = f"miner accepted the key but listed {len(msg.executors)} other executor(s), not this id"
@@ -345,16 +348,29 @@ async def inspect_executor(
     except Exception as exc:
         report.error = f"{type(exc).__name__}: {exc}"
     finally:
-        if key_accepted:
-            report.key_removed = await miner_service._remove_ssh_key_via_rest(
-                base_url=base_url,
-                my_key=my_key,
-                public_key=public_key,
-                miner_hotkey=target.miner_hotkey,
-                executor_id=target.executor_id,
-                log_extra=log_extra,
-            )
+        # Every submitted key gets a remove, whatever the submit answered: a submit that timed out
+        # after the miner already pushed the key must not leave it there. The remove is idempotent,
+        # so a refused submit costs one harmless extra request.
+        report.key_removed = await miner_service._remove_ssh_key_via_rest(
+            base_url=base_url,
+            my_key=my_key,
+            public_key=public_key,
+            miner_hotkey=target.miner_hotkey,
+            executor_id=target.executor_id,
+            log_extra=log_extra,
+        )
+        if report.key_removed is not True:
+            # `_remove_ssh_key_via_rest` logs and returns False instead of raising, so without this
+            # line the node would look clean with a key still installed. Appended, so an earlier
+            # error (a refused submit, a read that hung) is kept next to it in the table.
+            note = "key remove not accepted by miner: the key may still be installed, re-run this node"
+            report.error = f"{report.error}; {note}" if report.error else note
     return report
+
+
+def exit_code(reports: list[NodeReport]) -> int:
+    """1 when any node reported an error or its key remove was not accepted; a key left behind is a failure."""
+    return 1 if any(r.error or r.key_removed is not True for r in reports) else 0
 
 
 def running_digests_by_repo(outputs: dict[str, CommandOutput]) -> dict[str, list[tuple[str, str]]] | None:
@@ -524,7 +540,8 @@ def render_node_block(report: NodeReport) -> str:
         if output.exit_status not in (0, None):
             lines.append(f"[exit {output.exit_status}]")
         lines.append("")
-    lines.append(f"key removed from miner: {report.key_removed}")
+    # the miner answers 200 once it accepted the request; it does not confirm the removal on the executor
+    lines.append(f"key remove request accepted by miner (not confirmed on executor): {report.key_removed}")
     lines.append("```")
     return "\n".join(lines)
 
@@ -653,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
             my_key=my_key,
             hub=hub,
         )
-        return 1 if any(r.error for r in reports) else 0
+        return exit_code(reports)
 
     return asyncio.run(_main())
 

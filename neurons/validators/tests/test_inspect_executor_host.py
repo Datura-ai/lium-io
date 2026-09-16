@@ -99,18 +99,24 @@ class _FakeConn(_FakeSSHClient):
 class _FakeMinerRest:
     """Stands in for ``MinerService._make_rest_request``; answers the submit with the executors given."""
 
-    def __init__(self, executors, submit_status=200):
+    def __init__(self, executors, submit_status=200, remove_status=200, submit_times_out=False):
         self.executors = executors
         self.submit_status = submit_status
+        self.remove_status = remove_status
+        self.submit_times_out = submit_times_out  # `_make_rest_request` re-raises asyncio.TimeoutError
         self.calls: list[tuple[str, dict]] = []
 
     async def __call__(self, *, method, url, json_data, headers, timeout, log_extra, operation_name):
         self.calls.append((url, json_data))
         if url.endswith("/ssh-pubkey-submit"):
+            if self.submit_times_out:
+                raise asyncio.TimeoutError()
             if self.submit_status != 200:
                 return self.submit_status, {"message_type": "FailedRequest", "details": "no"}
             return 200, AcceptSSHKeyRequest(executors=self.executors).model_dump(mode="json")
         if url.endswith("/ssh-pubkey-remove"):
+            if self.remove_status != 200:
+                return self.remove_status, {"message_type": "FailedRequest", "details": "no"}
             return 200, {"message_type": "SSHKeyRemoved"}
         raise AssertionError(f"unexpected miner URL {url}")
 
@@ -127,11 +133,13 @@ def my_key():
 def wired(monkeypatch):
     """A fake miner + fake sshd; returns (conn, captured connect kwargs, rest, inspect coroutine factory)."""
 
-    def _wire(executors=None, submit_status=200, conn=None):
+    def _wire(executors=None, submit_status=200, conn=None, remove_status=200, submit_times_out=False):
         conn = conn or _FakeConn()
         captured: dict = {}
         monkeypatch.setattr(sct.asyncssh, "connect", _connect_returning(conn, capture=captured))
-        rest = _FakeMinerRest(executors if executors is not None else [_executor()], submit_status)
+        rest = _FakeMinerRest(
+            executors if executors is not None else [_executor()], submit_status, remove_status, submit_times_out
+        )
         monkeypatch.setattr(MinerService, "_make_rest_request", rest)
         return conn, captured, rest
 
@@ -297,15 +305,53 @@ async def test_an_executor_the_miner_did_not_list_is_not_connected(my_key, wired
 
 
 @pytest.mark.asyncio
-async def test_a_refused_key_submit_sends_no_remove(my_key, wired):
+async def test_a_refused_key_submit_still_takes_the_key_back_and_connects_nowhere(my_key, wired):
+    """The remove is idempotent; a refused submit costs one extra request and never an SSH session."""
     conn, captured, rest = wired(submit_status=403)
 
     report = await _inspect(my_key)
 
     assert report.error.startswith("miner refused the key submit: HTTP 403")
-    assert rest.urls() == ["ssh-pubkey-submit"]
-    assert report.key_removed is None
+    assert rest.urls() == ["ssh-pubkey-submit", "ssh-pubkey-remove"]
+    assert report.key_removed is True
     assert captured == {}
+
+
+@pytest.mark.asyncio
+async def test_a_submit_that_times_out_is_still_followed_by_a_remove(my_key, wired):
+    """Regression: the submit timed out after the miner had already pushed the key, and no remove was sent."""
+    conn, captured, rest = wired(submit_times_out=True)
+
+    report = await _inspect(my_key)
+
+    assert report.error.startswith("TimeoutError")
+    assert rest.urls() == ["ssh-pubkey-submit", "ssh-pubkey-remove"]
+    assert report.key_removed is True
+    assert captured == {}
+
+
+@pytest.mark.asyncio
+async def test_a_remove_the_miner_did_not_accept_is_a_node_error_and_exit_1(my_key, wired):
+    """Regression: `_remove_ssh_key_via_rest` returned False, `report.error` stayed empty and the run exited 0 with a key still installed."""
+    conn, captured, rest = wired(remove_status=500)
+
+    report = await _inspect(my_key)
+
+    assert report.key_removed is False
+    assert report.error == "key remove not accepted by miner: the key may still be installed, re-run this node"
+    assert rest.urls() == ["ssh-pubkey-submit", "ssh-pubkey-remove"]
+    assert ieh.exit_code([report]) == 1
+    # an earlier error is kept, the remove note is appended after it
+    conn, captured, rest = wired(submit_status=403, remove_status=500)
+    refused = await _inspect(my_key)
+    assert refused.error == (
+        "miner refused the key submit: HTTP 403 {'message_type': 'FailedRequest', 'details': 'no'}; "
+        "key remove not accepted by miner: the key may still be installed, re-run this node"
+    )
+    clean = ieh.NodeReport(target=report.target, key_removed=True)
+    assert ieh.exit_code([clean]) == 0
+    never_submitted = ieh.NodeReport(target=report.target, error="miner axon lookup failed: x")  # key_removed None
+    assert ieh.exit_code([never_submitted]) == 1
 
 
 @pytest.mark.asyncio
@@ -533,7 +579,9 @@ def test_node_block_shows_each_command_its_output_and_the_key_state():
     assert block.startswith(f"### {EXECUTOR_ID} (miner {MINER_HOTKEY}) — 203.0.113.10:2200 as root")
     assert "$ docker info --format '{{json .RegistryConfig}}'" in block
     assert '{"Mirrors":[]}' in block
-    assert "key removed from miner: True" in block
+    # the miner's 200 means it accepted the request; the block must not claim the executor confirmed the removal
+    assert "key remove request accepted by miner (not confirmed on executor): True" in block
+    assert "key removed from miner" not in block
 
 
 def test_parse_targets_takes_file_lines_inline_ids_and_comments():
