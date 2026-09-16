@@ -10,12 +10,12 @@ from incentive.utils import get_hourly_rate
 B300 = "NVIDIA B300 SXM6 AC"
 
 
-def test_idle_b300_hourly_rate_is_6_40_for_single_and_full_chassis():
-    config = IncentiveConfig()
+def test_idle_b300_hourly_rate_is_6_40_for_single_and_full_chassis() -> None:
+    config: IncentiveConfig = IncentiveConfig()
 
-    rates = [
+    b300_hourly_rates_for_1_and_8_gpus: list[float] = [
         get_hourly_rate(B300, gpu_count, config.gpu_count_custom_prices, config.rental_prices_per_hour)
         for gpu_count in (1, 8)
     ]
 
-    assert rates == [6.4, 6.4]
+    assert b300_hourly_rates_for_1_and_8_gpus == [6.4, 6.4]
