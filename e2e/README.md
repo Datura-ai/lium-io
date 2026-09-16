@@ -53,20 +53,23 @@ compose path (`make build`, a daemon that keeps its layers): cold build 136 s on
 4-vCPU GitHub runner, warm build ≈ 1 s; the whole gate ≈ 3 min warm (170 s on EC2) and ≈ 6 min cold (5m49s in CI). The
 `e2e-gate` job's sticky comment on the PR carries the per-stage times of the latest run.
 
-`E2E_CACHE=<buildx cache backend> make build` (CI sets `gha`) builds the five compose images with one `docker buildx bake`
-over the same compose file(s), one cache scope per image (`e2e-dind`, `e2e-executor`, `e2e-miner`, `e2e-validator`,
-`e2e-tester`, `mode=max`, `ignore-error=true` on the export), and `--load`s them onto the daemon under the same `image:`
-tags. Unset (the default here and on the GPU path), `make build` is `docker compose build` as before. A CI runner starts
-with an empty daemon, so before this every run rebuilt every layer (`gate: build` p50 171 s over the 39 green runs of
-15–16 Sep 2026); with the cache a run rebuilds only the layers its diff touches: a change under a neuron's source re-runs
-that image's `COPY . .` and what follows; a change to its `pyproject.toml`/`pdm.lock` or to `datura/` (copied before
-`pdm install` in all three Dockerfiles) re-runs `pdm install` too. The first run with an empty cache is slower than
-before, not faster: lium-io#1384's first run built in 213 s (the five cache exports, 1.63 GB, and the `--load` of five
-tarballs are inside the step); its second run, with the cache warm, is the `build` row of that PR's sticky comment.
-The gha backend needs the Actions cache URL and token in the environment and a builder that can export cache:
-`test.yml` adds `docker/setup-buildx-action` and `crazy-max/ghaction-github-runtime` before `gate.sh` for that. The
-`pod` image is not in the cache: `seed` builds it on the executor host's dockerd (dind), which has no builder of its own.
-Cache reads follow the Actions cache rules: a PR run reads its own branch's entries and main's, and writes its own.
+`E2E_CACHE=gha make build` (what CI sets; `gha` is the only value the Makefile's `scope=` attributes fit) builds the five
+compose images with one `docker buildx bake` over the same compose file(s), one GitHub Actions cache scope per image
+(`e2e-dind`, `e2e-executor`, `e2e-miner`, `e2e-validator`, `e2e-tester`; `mode=max`, `ignore-error=true` on the export),
+and `--load`s them onto the daemon under the same `image:` tags. Unset (the default here and on the GPU path), `make build`
+is `docker compose build` as before. A CI runner starts with an empty daemon, so before this every run rebuilt every layer
+(`gate: build` p50 171 s, p90 191 s over the 39 green runs of 15–16 Sep 2026); with the cache a run rebuilds only the
+layers its diff touches: a change under a neuron's source re-runs that image's `COPY . .` and what follows; a change to
+its `pyproject.toml`/`pdm.lock` or to `datura/` (copied before `pdm install` in all three Dockerfiles) re-runs
+`pdm install` too. Measured on lium-io#1384: the first run, empty cache, built in 213 s (slower than before: the five
+cache exports, 1.63 GB, and the `--load` of five tarballs are inside the step); the second run, cache warm and no
+Dockerfile input changed, built in 61 s (36 layers `CACHED`; the 61 s is the five cache-manifest imports, the blob
+downloads and the five `--load`s) and the whole `e2e-gate` job took 4 min 20 s against 6 min 57 s cold. The gha backend
+needs the Actions cache URL and token in the environment and a builder that can export cache: `test.yml` adds
+`docker/setup-buildx-action` and `crazy-max/ghaction-github-runtime` before `gate.sh` for that. The `pod` image is not in
+the cache: `seed` builds it on the executor host's dockerd (dind), which has no builder of its own. Cache reads follow the
+Actions cache rules: a `pull_request` run reads the entries of its merge ref (`refs/pull/N/merge`) and of main, and
+writes to its merge ref; a push to main writes main's, which every later PR reads.
 
 ## The merge gate (`make e2e-full` = `gate.sh`, CI job `e2e-gate`)
 
