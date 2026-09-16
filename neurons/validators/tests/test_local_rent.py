@@ -408,6 +408,7 @@ class FakeExecutor:
         self.intents: list[dict] = []
         self.seen: set[str] = set()
         self.refused_peers: list[str] = []  # `/rent` requests that did not come through a tunnel
+        self.posts = 0  # every `/rent` request, counted before any check answers it
         self.app = web.Application()
         self.app.router.add_get("/version", self.version)
         self.app.router.add_post("/rent", self.rent)
@@ -441,6 +442,7 @@ class FakeExecutor:
         return web.json_response(version)
 
     async def rent(self, request):
+        self.posts += 1
         peer = request.transport.get_extra_info("peername")
         if peer is None or peer[1] not in _TUNNELLED_SOURCE_PORTS:
             self.refused_peers.append(f"{peer[0]}:{peer[1]}" if peer else "?")
@@ -581,29 +583,57 @@ def _offline_executor(host_key: str | None = HOST_KEY) -> ExecutorSSHInfo:
     )
 
 
-def test_the_flag_ships_off_and_nothing_is_posted(svc, keypair, monkeypatch):
+def _nothing_posted(svc, keypair, *, executor_info=None, spec=None):
+    """`_create_with_local_rent` against a live fake executor that WOULD accept the intent (it
+    advertises its port and answers created): the SDK path is chosen before anything is posted,
+    which the fake's request count of zero proves (counted before the fake's own checks, so a
+    refused intent still counts). An offline executor would prove nothing — the missing
+    `/version` answer alone sends the SDK path, gate or no gate."""
+
+    async def scenario():
+        async with FakeExecutor(keypair) as executor:
+            answer = await svc._create_with_local_rent(
+                executor_info=executor_info or executor.executor_info, keypair=keypair, ssh_client=FakeSSH(),
+                docker_client=Mock(remove_container=AsyncMock()), run_spec=spec or _spec(),
+                image_ships_sshd=True, default_extra={"executor_id": EXECUTOR_UUID},
+            )
+            return answer, executor.intents, executor.posts
+
+    return asyncio.run(scenario())
+
+
+def test_the_flag_ships_off_and_nothing_is_posted(svc, keypair):
+    """Regression: the flag gate dropped (or defaulted on) — the intent reaches an executor that
+    accepts it, and a rental is created behind an operator who never turned this on."""
+    assert type(settings).model_fields["VALIDATOR_LOCAL_RENT_ENABLED"].default is False
     assert settings.VALIDATOR_LOCAL_RENT_ENABLED is False
-    posted = Mock()
-    monkeypatch.setattr(lrc.LocalRentClient, "rent", posted)
-    assert _create(svc, _offline_executor(), keypair, _spec()) is None
-    posted.assert_not_called()
+    answer, intents, posts = _nothing_posted(svc, keypair)
+    assert answer is None and intents == [] and posts == 0
 
 
 def test_a_spec_with_private_fields_never_leaves_the_tunnel(svc, keypair, monkeypatch):
     monkeypatch.setattr(settings, "VALIDATOR_LOCAL_RENT_ENABLED", True)
-    posted = Mock()
-    monkeypatch.setattr(lrc.LocalRentClient, "rent", posted)
     spec = _spec(environment={**PUBLIC_ENVIRONMENT, "HF_TOKEN": "hf_secret"})
-    assert _create(svc, _offline_executor(), keypair, spec) is None
-    posted.assert_not_called()
+    answer, intents, posts = _nothing_posted(svc, keypair, spec=spec)
+    assert answer is None and intents == [] and posts == 0
 
 
 def test_an_executor_without_a_pinned_host_key_gets_no_intent(svc, keypair, monkeypatch):
     monkeypatch.setattr(settings, "VALIDATOR_LOCAL_RENT_ENABLED", True)
-    posted = Mock()
-    monkeypatch.setattr(lrc.LocalRentClient, "rent", posted)
-    assert _create(svc, _offline_executor(host_key=None), keypair, _spec()) is None
-    posted.assert_not_called()
+
+    async def scenario():
+        async with FakeExecutor(keypair) as executor:
+            info = executor.executor_info.model_copy(update={"ssh_host_key": None})
+            answer = await svc._create_with_local_rent(
+                executor_info=info, keypair=keypair, ssh_client=FakeSSH(), docker_client=Mock(),
+                run_spec=_spec(), image_ships_sshd=True, default_extra={},
+            )
+            # `posts`, not `intents`: the fake answers an unbound intent 401 before it records it,
+            # so only the request count proves the validator never posted.
+            return answer, executor.posts
+
+    answer, posts = asyncio.run(scenario())
+    assert answer is None and posts == 0
 
 
 def test_the_intent_is_bound_to_the_executors_host_key(svc, keypair, monkeypatch):

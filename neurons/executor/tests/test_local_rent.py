@@ -829,6 +829,9 @@ def test_a_network_peer_is_403_before_the_body_is_read_and_makes_nothing(client,
 
 
 def test_flag_off_is_404(client, validator_keypair, monkeypatch):
+    """The flag ships off (the shipped default, not what the fixture set): a signed intent is a
+    404 and no docker call is made — an old image and a flag off look the same to the validator."""
+    assert type(settings).model_fields["EXECUTOR_LOCAL_RENT_ENABLED"].default is False
     monkeypatch.setattr(settings, "EXECUTOR_LOCAL_RENT_ENABLED", False)
     assert client.post("/rent", json=_signed(_body(), validator_keypair)).status_code == 404
     assert client.fake_api.calls == []
