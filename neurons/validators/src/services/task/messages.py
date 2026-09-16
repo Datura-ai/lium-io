@@ -1085,6 +1085,17 @@ class CapabilityMessages:
         category="policy",
         impact="Active filler runtime preserved; capability probe would compete for VRAM.",
     )
+    RENTED_SKIPPED = MessageTemplate(
+        event="GPU capability verification not scored: a Lium workload took the cards during this cycle",
+        reason="GPU_VERIFY_SKIPPED_RENTED",
+        severity="info",
+        category="policy",
+        impact=(
+            "Score unchanged; the probe could not get the GPU because a Lium pod or default job "
+            "started after this cycle's rental snapshot. The next cycle verifies again."
+        ),
+        remediation="No action needed.",
+    )
     VERIFY_FAILED = MessageTemplate(
         event="GPU capability verification failed",
         reason="GPU_VERIFY_FAILED",
