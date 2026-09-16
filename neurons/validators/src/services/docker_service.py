@@ -4202,9 +4202,11 @@ class DockerService:
         deleted, whatever resolver it names: a build whose teardown failed
         leaves its ACCEPTs behind, and when the DinD IP is reused by a build
         with a different resolver, a `-C` check or a delete of the current
-        resolvers only would keep the old resolver allowed. The teardown runs
-        the same purge, so it never depends on knowing which resolvers the
-        apply saw.
+        resolvers only would keep the old resolver allowed. A tagged rule the
+        apply cannot delete aborts the apply (exit 5): the caller then never
+        runs the build, so a reused DinD IP cannot build with an old resolver
+        still allowed. The teardown runs the same purge, tolerating failures,
+        so it never depends on knowing which resolvers the apply saw.
 
         `dind_ip`, `cidrs` and `dns_servers` are pre-validated via `ipaddress`,
         so they are shell-safe to interpolate.
@@ -4221,15 +4223,26 @@ class DockerService:
         # failed `-S` (xtables lock) into a silent no-op. On apply that failure
         # aborts (exit 4, the caller never runs the build with a stale ACCEPT
         # possibly in place); on teardown it is tolerated so the DROPs below
-        # still go.
+        # still go. A tagged rule whose `-D` fails aborts the apply the same
+        # way (exit 5): the loop runs in the pipe's subshell, so `exit 5` ends
+        # the loop and the pipeline's status carries it to the `|| { ...; }`
+        # after `done`; the caller's streamer fails the step on the stderr
+        # line. Without it the old resolver's ACCEPT stays in the chain and
+        # the new ACCEPTs are inserted next to it (taiberium, #1381). On apply
+        # the purge runs BEFORE the DROP inserts, so an abort leaves no
+        # half-applied DROP behind for a teardown that never runs.
         on_list_failure = (
             '{ echo "DOCKER-USER listing failed" >&2; exit 4; }' if apply else 'rules=""'
         )
+        on_delete_failure = (
+            ' || { echo "tagged DNS rule delete failed" >&2; exit 5; }' if apply else ""
+        )
+        delete_rule = "$IPT -D $spec || exit 5" if apply else "$IPT -D $spec"
         purge_tagged = (
             f"rules=$($IPT -S DOCKER-USER 2>/dev/null) || {on_list_failure}; "
             f"printf '%s\\n' \"$rules\" | while read -r _a spec; do "
             f'case "$spec" in *"-s {dind_ip}/32 "*"--comment {DIND_DNS_RULE_TAG} "*) '
-            f"$IPT -D $spec;; esac; done"
+            f"{delete_rule};; esac; done{on_delete_failure}"
         )
         if apply:
             # No DOCKER-USER chain => egress filtering cannot be guaranteed. Fail
@@ -4238,12 +4251,12 @@ class DockerService:
                 '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || '
                 '{ echo "DOCKER-USER chain not found" >&2; exit 3; }'
             )
+            lines.append(purge_tagged)
             for c in cidrs:
                 lines.append(
                     f"$IPT -C DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || "
                     f"$IPT -I DOCKER-USER -s {dind_ip} -d {c} -j DROP"
                 )
-            lines.append(purge_tagged)
             for ns in dns_servers:
                 for proto in ("udp", "tcp"):
                     # Not `-C || -I`: a stale ACCEPT below the new DROP satisfies

@@ -780,18 +780,23 @@ def test_A21_egress_script_allows_port_53_to_the_resolver_above_the_drops():
 
 # The purge `_egress_filter_script` emits for DinD IP 172.20.0.2: every rule in the
 # chain that carries this source and the DNS tag, deleted as `iptables -S` prints it.
-_PURGE_LOOP = (
-    "printf '%s\\n' \"$rules\" | while read -r _a spec; do "
-    f'case "$spec" in *"-s 172.20.0.2/32 "*"--comment {DIND_DNS_RULE_TAG} "*) '
-    "$IPT -D $spec;; esac; done"
-)
-# apply: a failed listing aborts (a pipe would make the purge a silent no-op)
+def _purge_loop(delete: str) -> str:
+    return (
+        "printf '%s\\n' \"$rules\" | while read -r _a spec; do "
+        f'case "$spec" in *"-s 172.20.0.2/32 "*"--comment {DIND_DNS_RULE_TAG} "*) '
+        f"{delete};; esac; done"
+    )
+
+
+# apply: a failed listing aborts (a pipe would make the purge a silent no-op) and a
+# failed delete aborts too (the old resolver's ACCEPT would stay in the chain)
 _PURGE_TAGGED = (
     'rules=$($IPT -S DOCKER-USER 2>/dev/null) || { echo "DOCKER-USER listing failed" >&2; exit 4; }; '
-    + _PURGE_LOOP
+    + _purge_loop("$IPT -D $spec || exit 5")
+    + ' || { echo "tagged DNS rule delete failed" >&2; exit 5; }'
 )
-# teardown: a failed listing is tolerated so the DROP deletes still run
-_PURGE_TAGGED_TEARDOWN = 'rules=$($IPT -S DOCKER-USER 2>/dev/null) || rules=""; ' + _PURGE_LOOP
+# teardown: a failed listing or delete is tolerated so the DROP deletes still run
+_PURGE_TAGGED_TEARDOWN = 'rules=$($IPT -S DOCKER-USER 2>/dev/null) || rules=""; ' + _purge_loop("$IPT -D $spec")
 
 
 def test_A21b_purge_removes_an_old_resolver_the_current_list_does_not_name():
@@ -842,6 +847,68 @@ def test_A21b_purge_removes_an_old_resolver_the_current_list_does_not_name():
         assert rc == 4 and not os.path.exists(os.path.join(tmp, "deleted"))
         rc = subprocess.run(["sh", "-c", _PURGE_TAGGED_TEARDOWN.replace("$IPT", shlex.quote(ipt))], timeout=10).returncode
         assert rc == 0 and not os.path.exists(os.path.join(tmp, "deleted"))
+
+
+def test_A21c_a_tagged_rule_the_apply_cannot_delete_aborts_the_apply():
+    """Regression (taiberium, #1381): the chain holds an old resolver's ACCEPT
+    for this DinD IP and `iptables -D` on it fails (xtables lock, a rule the
+    backend cannot parse back). The previous head exited 0 and went on to
+    insert the new ACCEPTs next to the old one, so the chain kept 10.0.0.2
+    allowed for whatever build reused the IP. Now the apply exits 5 before
+    any insert, DROPs included, so an abort leaves nothing half-applied; the
+    teardown still deletes what it can and exits 0."""
+    apply = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=True, dns_servers=["10.0.0.9"])
+    assert apply.index("tagged DNS rule delete failed") < apply.index("-d 10.0.0.9 -p udp --dport 53")
+    assert apply.index("tagged DNS rule delete failed") < apply.index("-j DROP")
+    chain = "\n".join(
+        [
+            f"-A DOCKER-USER -s 172.20.0.2/32 -d 10.0.0.2/32 -p udp -m udp --dport 53 -m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT",
+            f"-A DOCKER-USER -s 172.20.0.2/32 -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -m comment --comment {DIND_DNS_RULE_TAG} -j ACCEPT",
+        ]
+    )
+    # The fake iptables lists the chain, records every call and fails each `-D`.
+    with tempfile.TemporaryDirectory() as tmp:
+        ipt = os.path.join(tmp, "ipt.sh")
+        calls = os.path.join(tmp, "calls")
+        with open(ipt, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'[ "$1" = -S ] && {{ printf \'%b\\n\' \'{chain}\'; exit 0; }}\n'
+                f'echo "$@" >> {shlex.quote(calls)}\n'
+                '[ "$1" = -D ] && exit 1\n'
+                "exit 0\n"
+            )
+        os.chmod(ipt, 0o755)
+        # The whole apply script (chain check, DROPs, purge, ACCEPTs): it stops at the purge.
+        proc = subprocess.run(
+            ["sh", "-c", apply.replace("$IPT", shlex.quote(ipt))], capture_output=True, text=True, timeout=10
+        )
+        with open(calls) as fh:
+            seen = fh.read().splitlines()
+        assert proc.returncode == 5 and "tagged DNS rule delete failed" in proc.stderr
+        assert seen[-1].startswith("-D DOCKER-USER -s 172.20.0.2/32 -d 10.0.0.2/32 -p udp")
+        assert not any("-j ACCEPT" in c and c.startswith("-I") for c in seen), seen
+        assert not any(c.startswith(("-I", "-C")) for c in seen), seen  # no DROP inserted either
+    # Teardown: the first `-D` fails, the second tagged rule and the DROPs are still tried.
+    remove = DockerService._egress_filter_script("172.20.0.2", _BLOCK, apply=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        ipt = os.path.join(tmp, "ipt.sh")
+        calls = os.path.join(tmp, "calls")
+        with open(ipt, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'[ "$1" = -S ] && {{ printf \'%b\\n\' \'{chain}\'; exit 0; }}\n'
+                f'echo "$@" >> {shlex.quote(calls)}\n'
+                '[ "$1" = -D ] && exit 1\n'
+                "exit 0\n"
+            )
+        os.chmod(ipt, 0o755)
+        rc = subprocess.run(["sh", "-c", remove.replace("$IPT", shlex.quote(ipt))], timeout=10).returncode
+        with open(calls) as fh:
+            seen = fh.read().splitlines()
+        assert rc == 0
+        assert sum(1 for c in seen if f"--comment {DIND_DNS_RULE_TAG}" in c) == 2
+        assert sum(1 for c in seen if "-j DROP" in c) == len(_BLOCK)
 
 
 @pytest.mark.asyncio
