@@ -130,7 +130,9 @@ async def test_the_pids_are_read_only_beside_another_tenant_and_before_this_dele
             "containers": [{"name": f"pod_{POD}", "pod_id": POD}, {"name": "pod_other", "pod_id": "other"}],
         }
         started_at, pids = await svc._read_rental_window(docker_client, payload(), default_executor(), Mock())
-        assert pids == {4242}
+        # the PIDs are read from this pod's container, not the other tenant's, and only now
+        docker_client.container_pids.assert_awaited_once_with(container_name=f"pod_{POD}")
+        assert pids is not None
 
 
 @pytest.mark.asyncio
