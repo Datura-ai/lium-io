@@ -816,7 +816,9 @@ async def test_restore_retries_the_gpus_the_host_refused_one_at_a_time() -> None
 
     assert restored == 8
     assert redis.store == {}
-    assert ssh.refused == 6  # six of the eight first-pass opens hit the limit and were set again alone
+    # six of the eight first-pass opens hit the limit and were set again alone; each refused GPU is refused
+    # twice on the way, -pm 1 (best-effort, logged) and then -pl (raised), before its retry alone
+    assert ssh.refused == 12
     for uuid in uuids:  # every GPU's LAST attempt is the full verified triple
         assert [c for c in ssh.commands if f"-i {uuid} " in c][-3:] == _set_commands(uuid, 450)
 
@@ -829,18 +831,19 @@ async def test_raise_retries_the_gpus_the_host_refused_one_at_a_time() -> None:
     raised = await raise_low_power_limits_to_default(ssh, EXECUTOR_ID, uuids)
 
     assert raised == 8
-    assert ssh.refused == 6
+    assert ssh.refused == 12  # -pm 1 and -pl refused on each of the six, then set alone
 
 
 @pytest.mark.asyncio
-async def test_apply_fails_closed_when_the_host_refuses_the_session() -> None:
-    # The cap loop is serial; a refused session there is the host's, so the cap is a failed set and
-    # apply undoes GPU-a and clears the state, never raising into create_container.
+async def test_apply_fails_closed_when_the_host_refuses_the_pl_session() -> None:
+    # The cap loop is serial; a refused session on the hard gate (-pl) is the host's, so the cap is a
+    # failed set and apply undoes GPU-a and clears the state, never raising into create_container.
     ssh = AsyncMock()
     ssh.run.side_effect = [
         FakeRun(stdout=STATE_CSV),   # state query
         *_set_ok(209),               # cap GPU-a ok
-        asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed"),  # cap GPU-b: -pm 1 refused
+        FakeRun(),                   # cap GPU-b: -pm 1 ok
+        asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed"),  # cap GPU-b: -pl refused
         FakeRun(stdout=STATE_CSV),   # undo: state query
         *_set_ok(130),               # undo: restore GPU-a
         *_set_ok(250),               # undo: restore GPU-b
@@ -851,3 +854,32 @@ async def test_apply_fails_closed_when_the_host_refuses_the_session() -> None:
 
     assert ok is False
     assert redis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_pm_session_does_not_reject_the_filler_before_pl(caplog: pytest.LogCaptureFixture) -> None:
+    # Rustam's review (16 Sep): -pm 1 is best-effort, yet its ChannelOpenError was re-raised and the
+    # filler was refused before -pl ran. Refused there, the set logs it and goes on; -pl and the
+    # readback are the gate, and they pass here, so the cap is applied and the filler starts.
+    ssh = AsyncMock()
+    ssh.run.side_effect = [
+        FakeRun(stdout=STATE_CSV),   # state query
+        *_set_ok(209),               # cap GPU-a ok
+        asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed"),  # cap GPU-b: -pm 1 refused
+        FakeRun(),                   # cap GPU-b: -pl ok
+        FakeRun(stdout="200.00, Disabled\n"),  # cap GPU-b: readback confirms 200 W, persistence off
+    ]
+    redis = FakeRedis()
+
+    with caplog.at_level(logging.WARNING):
+        ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209, GPU_b=200), redis, POD_ID, EXECUTOR_ID)
+
+    assert ok is True
+    assert sorted(redis.store) == sorted([_restore_key("GPU-a"), _restore_key("GPU-b"), _pod_index_key(POD_ID)])
+    assert ssh.run.await_count == 1 + 3 + 3
+    pm_warnings = [
+        record
+        for record in _warning_records(caplog)
+        if "enabling persistence mode for GPU-b failed" in record.getMessage()
+    ]
+    assert len(pm_warnings) == 1 and "open failed" in pm_warnings[0].getMessage()

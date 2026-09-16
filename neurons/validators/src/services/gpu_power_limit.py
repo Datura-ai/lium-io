@@ -60,8 +60,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
-# _set_and_log_power_limit or _set_alone: (ssh, action, executor_id, gpu_uuid, before, after, log_extra) -> set ok
-_Setter = Callable[..., Awaitable[bool]]
+# _set_and_log_power_limit or _set_alone, the one signature both share (a mismatched setter is a type error):
+# (ssh, action, executor_id, gpu_uuid, watts_before, watts_after, log_extra) -> set ok
+_Setter = Callable[
+    [
+        asyncssh.SSHClientConnection,
+        Literal["cap", "restore", "raise"],
+        str,
+        str,
+        int | None,
+        int,
+        dict[str, object] | None,
+    ],
+    Awaitable[bool],
+]
 
 POWER_STATE_CMD = (
     "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit "
@@ -228,8 +240,10 @@ async def _enable_persistence_mode(
 ) -> None:
     """Enable persistence mode so a set limit survives the driver unloading on an idle GPU.
 
-    Best-effort: the readback verify after ``-pl`` is the hard gate, not this. Raises only
-    ``asyncssh.ChannelOpenError`` (the host refused the session: no command ran; the caller retries).
+    Best-effort: the readback verify after ``-pl`` is the hard gate, not this. Never raises: a
+    session the host refused here (``asyncssh.ChannelOpenError``) is logged like any other failure
+    of this step and the set goes on to ``-pl``, whose own refusal is what the caller retries
+    (Rustam's review, 16 Sep: a refusal here used to reject a filler before ``-pl`` even ran).
     """
     failure: str | None = None
     try:
@@ -238,8 +252,6 @@ async def _enable_persistence_mode(
         )
         if result.exit_status != 0:
             failure = f"exit={result.exit_status}, stderr={result.stderr!r}"
-    except asyncssh.ChannelOpenError:
-        raise
     except Exception as exc:
         failure = str(exc)
     if failure is not None:
@@ -319,8 +331,10 @@ async def _set_and_log_power_limit(
     log_extra: dict[str, object] | None,
 ) -> bool:
     # Reviewer contract (PR #1115): every PL change is logged with executor, GPU, before/after, status.
-    # Raises only asyncssh.ChannelOpenError: the host refused the session, so no change was made and
-    # nothing is logged here; _set_side_by_side retries the GPU alone, _set_alone logs it as failed.
+    # Raises only asyncssh.ChannelOpenError, from -pl or the readback: the host refused the session,
+    # so no change was made and nothing is logged here; _set_side_by_side retries the GPU alone,
+    # _set_alone logs it as failed. A refusal of the best-effort -pm 1 is not one: that step logs it
+    # and the set goes on.
     await _enable_persistence_mode(ssh, gpu_uuid, log_extra)
     set_outcome = await _set_power_limit(ssh, gpu_uuid, watts_after)
     failure = set_outcome.failure
