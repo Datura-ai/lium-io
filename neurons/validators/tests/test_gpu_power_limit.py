@@ -4,6 +4,7 @@ import logging
 import time
 from unittest.mock import AsyncMock
 
+import asyncssh
 import pytest
 from neurons.validators.src.payload_models.payloads import GpuPowerLimit
 from neurons.validators.src.services.gpu_power_limit import (
@@ -781,3 +782,72 @@ async def test_raise_lifts_eight_below_floor_gpus_side_by_side() -> None:
     assert ssh.peak_in_flight == 8
     for uuid in uuids:
         assert [c for c in ssh.commands if f"-i {uuid} " in c] == _set_commands(uuid, 450)
+
+
+# Rustam's review of #1379 (16 Sep 2026): a host whose sshd MaxSessions is below the bound answers
+# the extra channel opens with ChannelOpenError. Before the retry, the module caught it as a failed
+# set: on such a host a create's restore and raise left every GPU past the limit capped, and the
+# customer started on them. The two `refuses` tests fail on that head (2 == 8); the cap test pins
+# that the same error inside the serial cap loop is still a fail-closed False, not an exception
+# into create_container.
+
+
+class RefusesPastTwoSessions(SuspendingSsh):
+    """sshd MaxSessions 2: the third concurrent channel open fails before any command runs."""
+
+    def __init__(self, state_csv: str):
+        super().__init__(state_csv)
+        self.refused = 0
+
+    async def run(self, command: str, timeout: float | None = None) -> FakeRun:
+        if self.in_flight >= 2:
+            self.refused += 1
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed")
+        return await super().run(command, timeout)
+
+
+@pytest.mark.asyncio
+async def test_restore_retries_the_gpus_the_host_refused_one_at_a_time() -> None:
+    uuids, state_csv, records = _capped_gpus(8)
+    ssh = RefusesPastTwoSessions(state_csv)
+    redis = FakeRedis(records)
+
+    restored = await restore_tracked_gpu_power_limits(ssh, redis, uuids)
+
+    assert restored == 8
+    assert redis.store == {}
+    assert ssh.refused == 6  # six of the eight first-pass opens hit the limit and were set again alone
+    for uuid in uuids:  # every GPU's LAST attempt is the full verified triple
+        assert [c for c in ssh.commands if f"-i {uuid} " in c][-3:] == _set_commands(uuid, 450)
+
+
+@pytest.mark.asyncio
+async def test_raise_retries_the_gpus_the_host_refused_one_at_a_time() -> None:
+    uuids = [f"GPU-{index}" for index in range(8)]
+    ssh = RefusesPastTwoSessions("".join(f"{uuid}, 315, 450, 100, 450\n" for uuid in uuids))
+
+    raised = await raise_low_power_limits_to_default(ssh, EXECUTOR_ID, uuids)
+
+    assert raised == 8
+    assert ssh.refused == 6
+
+
+@pytest.mark.asyncio
+async def test_apply_fails_closed_when_the_host_refuses_the_session() -> None:
+    # The cap loop is serial; a refused session there is the host's, so the cap is a failed set and
+    # apply undoes GPU-a and clears the state, never raising into create_container.
+    ssh = AsyncMock()
+    ssh.run.side_effect = [
+        FakeRun(stdout=STATE_CSV),   # state query
+        *_set_ok(209),               # cap GPU-a ok
+        asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed"),  # cap GPU-b: -pm 1 refused
+        FakeRun(stdout=STATE_CSV),   # undo: state query
+        *_set_ok(130),               # undo: restore GPU-a
+        *_set_ok(250),               # undo: restore GPU-b
+    ]
+    redis = FakeRedis()
+
+    ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209, GPU_b=200), redis, POD_ID, EXECUTOR_ID)
+
+    assert ok is False
+    assert redis.store == {}
