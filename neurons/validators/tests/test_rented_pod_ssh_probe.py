@@ -21,6 +21,7 @@ from neurons.validators.src.services.task.checks.rented_pod_ssh import (
     FAULT_SSH_BANNER_MISSING,
     FAULT_TCP_REFUSED,
     FAULT_TCP_TIMEOUT,
+    is_ssh2_identification,
     tcp_connect_fault,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
@@ -529,11 +530,17 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
         server.close()
         await server.wait_closed()
 
-    def greet(_reader, writer):
-        writer.write(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n")
+    async def greet_in_two_segments(_reader, writer):
+        # Rustam's review (16 Sep): `read(255)` judged the first TCP segment. Split inside the
+        # prefix, that read saw `SSH-2` and the `SSH-2.0-` rule called a healthy sshd unreachable.
+        writer.write(b"SSH-2")
+        await writer.drain()
+        await asyncio.sleep(0.05)
+        writer.write(b".0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n")
+        await writer.drain()
         writer.close()
 
-    sshd = await asyncio.start_server(greet, "127.0.0.1", 0)
+    sshd = await asyncio.start_server(greet_in_two_segments, "127.0.0.1", 0)
     sshd_port = sshd.sockets[0].getsockname()[1]
     try:
         assert await tcp_connect_fault("127.0.0.1", sshd_port, timeout=2.0) is None
@@ -541,26 +548,61 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
         sshd.close()
         await sshd.wait_closed()
 
-    def http(_reader, writer):
-        writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-        writer.close()
-
-    other = await asyncio.start_server(http, "127.0.0.1", 0)
-    other_port = other.sockets[0].getsockname()[1]
-    try:
-        assert (
-            await tcp_connect_fault("127.0.0.1", other_port, timeout=2.0)
-            == FAULT_SSH_BANNER_MISSING
-        )
-    finally:
-        other.close()
-        await other.wait_closed()
-
     async def hang(*_args, **_kwargs):
         await asyncio.sleep(10)
 
     with patch("asyncio.open_connection", new=hang):
         assert await tcp_connect_fault("127.0.0.1", open_port, timeout=0.05) == FAULT_TCP_TIMEOUT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "greeting",
+    [
+        pytest.param(b"SSH-1.99-OpenSSH_3.9p1\r\n", id="ssh_1.99"),
+        pytest.param(b"SSH-1.5-Cisco-1.25\r\n", id="ssh_1.5"),
+        pytest.param(b"HTTP/1.1 400 Bad Request\r\n\r\n", id="http"),
+        pytest.param(b"\x00\xff\x16\x03\x01garbage\r\n", id="garbage"),
+        pytest.param(b"SSH-2.0-\r\n", id="no_softwareversion"),
+        pytest.param(b"SSH-2.0-OpenSSH_9.6p1", id="closed_before_the_line_ended"),
+        pytest.param(b"SSH-2.0-" + b"x" * 246 + b"\r\n", id="256_bytes"),
+        pytest.param(b"SSH-2.0-" + b"x" * 300 + b"\r\n", id="longer_than_255"),
+        pytest.param(b"x" * 400, id="400_bytes_and_no_lf"),
+    ],
+)
+async def test_tcp_connect_fault_rejects_a_non_2_0_or_malformed_identification(greeting):
+    # Rustam's review (16 Sep): the `SSH-` prefix accepted an SSH 1.x server or a malformed line as
+    # a healthy pod. Each greeting below is served on a real local socket and must be a fault.
+    def serve(_reader, writer):
+        writer.write(greeting)
+        writer.close()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        assert await tcp_connect_fault("127.0.0.1", port, timeout=2.0) == FAULT_SSH_BANNER_MISSING
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.parametrize(
+    ("line", "ok"),
+    [
+        (b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n", True),
+        (b"SSH-2.0-dropbear_2024.85\n", True),  # LF alone is accepted, as OpenSSH's client does
+        (b"SSH-2.0-" + b"x" * 245 + b"\r\n", True),  # exactly 255 bytes
+        (b"SSH-2.0-" + b"x" * 246 + b"\r\n", False),  # 256 bytes
+        (b"SSH-1.99-OpenSSH_3.9p1\r\n", False),
+        (b"SSH-1.5-Cisco-1.25\r\n", False),
+        (b"SSH-2.0-\r\n", False),
+        (b"SSH-2.0-OpenSSH_9.6p1", False),  # no LF: the line never completed
+        (b"ssh-2.0-OpenSSH_9.6p1\r\n", False),  # the protocol name is case-sensitive
+        (b"", False),
+    ],
+)
+def test_is_ssh2_identification(line, ok):
+    assert is_ssh2_identification(line) is ok
 
 
 def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():

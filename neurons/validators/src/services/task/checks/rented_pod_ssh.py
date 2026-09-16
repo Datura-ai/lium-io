@@ -9,8 +9,9 @@ unreadable (ticket-0247). The container is running, so ``TenantEnforcementCheck`
 This module judges what the renter sees, from outside the container, each cycle:
 
 * a TCP connect to the pod's mapped SSH port (``RentedPod.ssh_port``, sent by the backend) that
-  must answer with an ``SSH-`` banner: docker-proxy accepts on the host while sshd inside is down,
-  so an accept alone says nothing (ticket-0326 is exactly that case);
+  must answer with a complete ``SSH-2.0-`` identification line (RFC 4253 §4.2): docker-proxy
+  accepts on the host while sshd inside is down, so an accept alone says nothing (ticket-0326 is
+  exactly that case), and a 1.x or malformed line is not the sshd the renter can log in to;
 * the ``authorized_keys`` read the check already does (empty = the mount is missing).
 
 State lives in Redis, one key pair per pod. A pod is judged only after this validator has seen it
@@ -52,11 +53,16 @@ RENTED_POD_SSH_FAIL_KEY_PREFIX = "rented_pod_ssh_fail"
 
 FAULT_TCP_REFUSED = "tcp_refused"
 FAULT_TCP_TIMEOUT = "tcp_timeout"
-# The port accepted but nothing that speaks SSH is behind it: docker-proxy took the connection and
-# closed it (sshd not running in the container), or something else answered.
+# The port accepted but nothing that speaks SSH 2.0 is behind it: docker-proxy took the connection
+# and closed it (sshd not running in the container), something else answered, or the identification
+# line is SSH 1.x / malformed / never completed.
 FAULT_SSH_BANNER_MISSING = "ssh_banner_missing"
 FAULT_AUTHORIZED_KEYS_UNREADABLE = "authorized_keys_unreadable"
-SSH_BANNER_PREFIX = b"SSH-"
+# RFC 4253 §4.2: `SSH-protoversion-softwareversion SP comments CR LF`, at most 255 bytes including
+# CR LF. Rustam's review (16 Sep): only protoversion 2.0 counts. `SSH-1.5-` is a 1.x-only server;
+# `SSH-1.99-` (RFC 4253 §5.1) marks a server that also speaks 1.x, and the ask is to refuse both.
+SSH_ID_PREFIX = b"SSH-2.0-"
+SSH_ID_LINE_MAX = 255
 
 # What a failing Redis raises through RedisService: the client's own errors (connection, timeout,
 # response) and the socket errors under them. Anything else is a bug in this module and propagates.
@@ -169,30 +175,48 @@ class FailStreak:
         )
 
 
-async def tcp_connect_fault(host: str, port: int, timeout: float) -> str | None:
-    """None when the port accepts a TCP connection AND greets with an SSH banner; else the fault name.
+def is_ssh2_identification(line: bytes) -> bool:
+    """True for a complete RFC 4253 identification line of protocol version 2.0.
 
-    The banner is required because a mapped port is answered by docker-proxy on the host: it
-    accepts even when nothing listens inside the container, then closes. sshd sends
-    ``SSH-2.0-...`` first, before the client says anything, so one read tells the two apart.
+    Complete means terminated by LF (sshd sends CR LF) and no longer than 255 bytes; 2.0 means the
+    line starts with ``SSH-2.0-`` and names a software version after it. ``SSH-1.99-``, ``SSH-1.5-``,
+    a bare ``SSH-2.0-``, a line cut before its LF, or anything else is not the sshd a renter logs in to.
+    """
+    if not line.endswith(b"\n") or len(line) > SSH_ID_LINE_MAX:
+        return False
+    body = line.rstrip(b"\r\n")
+    return body.startswith(SSH_ID_PREFIX) and len(body) > len(SSH_ID_PREFIX)
+
+
+async def tcp_connect_fault(host: str, port: int, timeout: float) -> str | None:
+    """None when the port accepts AND greets with a complete ``SSH-2.0-`` line; else the fault name.
+
+    The identification line is required because a mapped port is answered by docker-proxy on the
+    host: it accepts even when nothing listens inside the container, then closes. sshd sends
+    ``SSH-2.0-...CRLF`` first, before the client says anything. The whole line is read (up to the
+    LF, under the same timeout; the stream buffer is capped at 255 bytes and a line longer than 255
+    is refused) before it is judged: a prefix compared against the first TCP segment alone could
+    call a healthy pod unreachable (Rustam's review, 16 Sep).
     """
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
+            asyncio.open_connection(host, port, limit=SSH_ID_LINE_MAX), timeout=timeout
         )
     except TimeoutError:
         return FAULT_TCP_TIMEOUT
     except OSError:
         return FAULT_TCP_REFUSED
     try:
-        # RFC 4253 caps the version line at 255 bytes; a bounded read never grows a buffer on what a
-        # peer chooses to send, and sshd sends the line first, before the client says anything.
-        banner = await asyncio.wait_for(reader.read(255), timeout=timeout)
-    except (TimeoutError, OSError):
-        banner = b""
+        # `limit=255` bounds the buffer: a peer whose LF sits past byte 255 raises LimitOverrunError
+        # instead of growing memory (an LF exactly at index 255 returns 256 bytes, which the length
+        # rule below refuses); EOF before the LF raises IncompleteReadError (docker-proxy's
+        # accept-then-close, or a line cut short). Both are "no identification line".
+        line = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=timeout)
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError, OSError):
+        line = b""
     finally:
         writer.close()
-    fault = None if banner.startswith(SSH_BANNER_PREFIX) else FAULT_SSH_BANNER_MISSING
+    fault = None if is_ssh2_identification(line) else FAULT_SSH_BANNER_MISSING
     try:
         await writer.wait_closed()
     except OSError:
