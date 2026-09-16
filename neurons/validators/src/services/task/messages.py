@@ -265,6 +265,35 @@ class GpuVramMessages:
     )
 
 
+class DiskHealthMessages:
+    NOT_WRITABLE = MessageTemplate(
+        event="Executor disk refuses writes",
+        reason="DISK_NOT_WRITABLE",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed (observation only until proven on live executors)",
+        remediation="The filesystem holding the docker root is mounted read-only or refused a write "
+        "probe (read_only, io_error, no_space or quota in write_probe_error). For no_space or quota: "
+        "free space on the docker root (docker system prune, a larger disk or quota). Otherwise: check "
+        "dmesg for I/O errors, run a filesystem check, replace the disk if it is failing, then remount "
+        "read-write and restart the executor.",
+    )
+    UNKNOWN = MessageTemplate(
+        event="Executor disk health not reported",
+        reason="DISK_HEALTH_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Executor disk health ok",
+        reason="DISK_HEALTH_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class GpuPowerLimitMessages:
     LIMIT_BELOW_DEFAULT = MessageTemplate(
         event="GPU power limit below default threshold",

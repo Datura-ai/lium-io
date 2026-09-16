@@ -1500,6 +1500,128 @@ def get_gpu_interconnect():
     return GpuInterconnectObservation(payload, "; ".join(errors))
 
 
+# DAH-2928: the host's own view of the disk that holds the containers. The scrape shares the host
+# PID namespace (see the /proc/1/root walks above), so /proc/1/mounts is the host mount table.
+HOST_MOUNTS_PATH = "/proc/1/mounts"
+HOST_ROOT_PREFIX = "/proc/1/root"
+# errno values, spelled out because the packaged scrape cannot import errno (obfuscator allowlist)
+ERRNO_EIO = 5
+ERRNO_ENOSPC = 28
+ERRNO_EROFS = 30
+ERRNO_EDQUOT = 122
+
+
+class DiskHealthObservation:
+    def __init__(
+        self,
+        docker_root_dir: str,
+        read_only_mounts: list[str],
+        write_probe: str,
+        write_probe_error: str,
+    ) -> None:
+        self.docker_root_dir = docker_root_dir
+        self.read_only_mounts = read_only_mounts
+        self.write_probe = write_probe
+        self.write_probe_error = write_probe_error
+
+    def as_payload(self) -> dict:
+        return {
+            "dh_docker_root_dir": self.docker_root_dir,
+            "dh_read_only_mounts": self.read_only_mounts,
+            "dh_write_probe_error": self.write_probe_error,
+            "dh_write_probe": self.write_probe,
+        }
+
+
+def mounts_holding(mounts_text: str, path: str) -> list[str]:
+    """The mount point a write to `path` lands on, when that filesystem is mounted read-only.
+
+    `mounts_text` is /proc/<pid>/mounts. Only the covering mount counts - the longest mount point
+    that is `path` or a parent of it, the last line winning when a point is mounted over - because
+    a mount above it says nothing about writes below: `ro /` with `rw /var/lib/docker` is a docker
+    root that takes writes, and returns []. One element or none; a list so the payload shape
+    holds."""
+    covering: tuple[str, list[str]] | None = None
+    for line in mounts_text.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        mount_point, options = fields[1], fields[3].split(",")
+        if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
+            continue
+        if covering is None or len(mount_point) >= len(covering[0]):
+            covering = (mount_point, options)
+    if covering is None or "ro" not in covering[1]:
+        return []
+    return [covering[0]]
+
+
+def write_probe_failure_reason(errno_value) -> str:
+    """The reason a write failed because of the disk itself - a container cannot start on any of
+    these - or '' when the errno says where the scrape runs from (EACCES, ENOENT), not what the disk
+    does. A function, not a module-level dict: obfuscator.py renames a name read inside a function,
+    but not one read as a key of a module-level literal."""
+    if errno_value == ERRNO_EROFS:
+        return "read_only"
+    if errno_value == ERRNO_EIO:
+        return "io_error"
+    if errno_value == ERRNO_ENOSPC:
+        return "no_space"
+    if errno_value == ERRNO_EDQUOT:
+        return "quota"
+    return ""
+
+
+def probe_write(directory: str) -> tuple[str, str]:
+    """('ok', '') when a file can be created, written, fsynced and removed under `directory`;
+    ('failed', '<reason>: <error>') when the kernel refused because of the disk - read_only (EROFS),
+    io_error (EIO), no_space (ENOSPC) or quota (EDQUOT); a container cannot start on any of them;
+    ('skipped', error) for anything else (no such directory, no permission from where the scrape runs)."""
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=".lium-disk-probe-", dir=directory) as probe:
+            probe.write(b"lium disk probe\n")
+            probe.flush()
+            os.fsync(probe.fileno())
+        return "ok", ""
+    except OSError as e:
+        reason = write_probe_failure_reason(e.errno)
+        if reason:
+            return "failed", f"{reason}: {e.__class__.__name__}: {e}"
+        return "skipped", f"{e.__class__.__name__}: {e}"
+    except Exception as e:
+        return "skipped", f"{e.__class__.__name__}: {e}"
+
+
+def get_disk_health() -> DiskHealthObservation:
+    """Whether the disk that holds the containers is still taking writes (DAH-2928).
+
+    A renter's file on a pod changed on disk after it was written, with no error reaching the
+    container. The scrape reported capacity and usage and nothing about health, so the node kept
+    being listed. Two readings: is the docker root's filesystem mounted read-only, and does a write
+    to it go through. A docker root that refuses writes is a node that cannot start a container;
+    DiskHealthCheck reports it as a warning (no score change) until the reading is proven on live
+    executors.
+    """
+    try:
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+
+    try:
+        with open(HOST_MOUNTS_PATH) as mounts_file:
+            mounts_text = mounts_file.read()
+    except Exception:
+        mounts_text = ""
+    read_only_mounts = mounts_holding(mounts_text, docker_root_dir)
+
+    host_docker_root = f"{HOST_ROOT_PREFIX}{docker_root_dir}"
+    write_probe, write_probe_error = probe_write(
+        host_docker_root if os.path.isdir(host_docker_root) else docker_root_dir
+    )
+
+    return DiskHealthObservation(docker_root_dir, read_only_mounts, write_probe, write_probe_error)
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -1691,6 +1813,11 @@ def get_machine_specs():
         # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
         # node that loses only the breakdown must keep reporting total/used/free.
         data["hard_disk_docker_scrape_error"] = repr(exc)
+
+    try:
+        data["data_disk_health"] = get_disk_health().as_payload()
+    except Exception as exc:
+        data["data_disk_health_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:
