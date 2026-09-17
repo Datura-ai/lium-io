@@ -29,19 +29,23 @@ is the hard gate — a cap that cannot be observed on the GPU does not exist.
 cap could not be fully applied, after undoing whatever it already capped or stored; the caller then
 REFUSES to start the PEARL filler (running the miner uncapped defeats the whole point).
 **Restore stays best-effort**: teardown must never be blocked by a power-limit hiccup; a record
-whose restore failed is kept and retried by the safety nets.
+whose restore failed is kept and retried by the safety nets. Restores and raises run several GPUs
+at a time (``POWER_LIMIT_SET_CONCURRENCY``): both sit between a customer's rent request and the
+container it waits for.
 Every power-limit change is logged via ``_m`` (so the fields reach the JSON/Loki output) with
 executor_id, gpu_uuid, watts before/after, and status.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shlex
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 import asyncssh
 from payload_models.payloads import GpuPowerLimit
@@ -54,6 +58,22 @@ if TYPE_CHECKING:
     from services.prerun_host_probe import PrerunHostProbe
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+# _set_and_log_power_limit or _set_alone, the one signature both share (a mismatched setter is a type error):
+# (ssh, action, executor_id, gpu_uuid, watts_before, watts_after, log_extra) -> set ok
+_Setter = Callable[
+    [
+        asyncssh.SSHClientConnection,
+        Literal["cap", "restore", "raise"],
+        str,
+        str,
+        int | None,
+        int,
+        dict[str, object] | None,
+    ],
+    Awaitable[bool],
+]
 
 POWER_STATE_CMD = (
     "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit "
@@ -70,6 +90,16 @@ STALE_CAP_GRACE_SECONDS = 30 * 60
 # Floor enforced by GpuPowerLimitCheck. Doubles as the raise trigger at rental start: a limit
 # below this can't be a legitimate miner setting (the check would zero-score it anyway).
 MIN_POWER_LIMIT_RATIO = 0.9
+# GPUs restored (or raised) at the same time. One verified set is three nvidia-smi round trips
+# (-pm 1, -pl, readback), about 1.8 s on a loaded host; done one GPU after another an 8-GPU PEARL
+# node spent ~15 s here inside the filler's delete, before the ContainerDeleted callback the
+# backend's 30 s preemption wait is for (Loki, 48 h to 15 Sep 2026: 8-GPU PEARL deletes p50
+# 27.7 s, 65 % over 25 s; 1-GPU 7.3 s). Each in-flight set holds one SSH channel; OpenSSH's
+# default MaxSessions is 10, so this stays under it with room for the caller's own channel. A host
+# whose sshd allows fewer refuses the extra channel opens (asyncssh.ChannelOpenError); those GPUs
+# are set again one at a time once the others are done (_set_side_by_side), so a low MaxSessions
+# costs time, never a GPU left capped.
+POWER_LIMIT_SET_CONCURRENCY = 8
 
 
 class GpuPowerRestoreRecord(BaseModel):
@@ -119,6 +149,16 @@ class PowerLimitSetOutcome:
 
     failure: str | None
     persistence_enabled: bool | None
+
+
+@dataclass(frozen=True)
+class _BelowFloorGpu:
+    """One GPU ``raise_low_power_limits_to_default`` lifts: its limit sits below
+    ``MIN_POWER_LIMIT_RATIO`` x the default it is raised to."""
+
+    gpu_uuid: str
+    current_watts: int
+    default_watts: int
 
 
 # nvidia-smi's own labels; anything else means the GPU did not report the field.
@@ -210,7 +250,10 @@ async def _enable_persistence_mode(
 ) -> None:
     """Enable persistence mode so a set limit survives the driver unloading on an idle GPU.
 
-    Best-effort: the readback verify after ``-pl`` is the hard gate, not this. Never raises.
+    Best-effort: the readback verify after ``-pl`` is the hard gate, not this. Never raises: a
+    session the host refused here (``asyncssh.ChannelOpenError``) is logged like any other failure
+    of this step and the set goes on to ``-pl``, whose own refusal is what the caller retries
+    (Rustam's review, 16 Sep: a refusal here used to reject a filler before ``-pl`` even ran).
     """
     failure: str | None = None
     try:
@@ -233,13 +276,16 @@ async def _enable_persistence_mode(
 
 async def _read_back_power_state(ssh: asyncssh.SSHClientConnection, uuid: str) -> GpuPowerReadback:
     """Read one GPU's power.limit and persistence mode. Both come from the same nvidia-smi query, so
-    verifying persistence costs no extra round trip. Unreadable -> all-None (never raises)."""
+    verifying persistence costs no extra round trip. Unreadable -> all-None; raises only
+    ``asyncssh.ChannelOpenError`` (a refused session, retried by the caller)."""
     readback_command = (
         f"nvidia-smi -i {shlex.quote(uuid)} --query-gpu=power.limit,persistence_mode "
         f"--format=csv,noheader,nounits"
     )
     try:
         result = await ssh.run(readback_command, timeout=NVIDIA_SMI_TIMEOUT_SECONDS)
+    except asyncssh.ChannelOpenError:
+        raise
     except Exception:
         return _UNREADABLE_READBACK
     if result.exit_status != 0:
@@ -252,13 +298,15 @@ async def _set_power_limit(
     uuid: str,
     watts: int,
 ) -> PowerLimitSetOutcome:
-    """Set one GPU's power limit and VERIFY it stuck (never raises). nvidia-smi can report success
-    while the limit silently reverts (persistence mode off, driver unloads) — only the readback
-    proves the cap exists."""
+    """Set one GPU's power limit and VERIFY it stuck. nvidia-smi can report success while the limit
+    silently reverts (persistence mode off, driver unloads) — only the readback proves the cap exists.
+    Raises only ``asyncssh.ChannelOpenError`` (the host refused the session; the caller retries)."""
     try:
         result = await ssh.run(
             f"nvidia-smi -i {shlex.quote(uuid)} -pl {watts}", timeout=NVIDIA_SMI_TIMEOUT_SECONDS
         )
+    except asyncssh.ChannelOpenError:
+        raise
     except Exception as exc:
         return PowerLimitSetOutcome(failure=f"nvidia-smi -pl errored: {exc}", persistence_enabled=None)
     if result.exit_status != 0:
@@ -293,6 +341,10 @@ async def _set_and_log_power_limit(
     log_extra: dict[str, object] | None,
 ) -> bool:
     # Reviewer contract (PR #1115): every PL change is logged with executor, GPU, before/after, status.
+    # Raises only asyncssh.ChannelOpenError, from -pl or the readback: the host refused the session,
+    # so the set may or may not have applied and nothing is logged here; _set_side_by_side retries the GPU alone,
+    # _set_alone logs it as failed. A refusal of the best-effort -pm 1 is not one: that step logs it
+    # and the set goes on.
     await _enable_persistence_mode(ssh, gpu_uuid, log_extra)
     set_outcome = await _set_power_limit(ssh, gpu_uuid, watts_after)
     failure = set_outcome.failure
@@ -328,6 +380,84 @@ async def _set_and_log_power_limit(
         log_extra,
     )
     return failure is None
+
+
+async def _set_alone(
+    ssh: asyncssh.SSHClientConnection,
+    action: Literal["cap", "restore", "raise"],
+    executor_id: str,
+    gpu_uuid: str,
+    watts_before: int | None,
+    watts_after: int,
+    log_extra: dict[str, object] | None,
+) -> bool:
+    """``_set_and_log_power_limit`` for a caller with no other set in flight: a refused session here
+    is the host's, not our concurrency's, so it is logged as a failed set (the #1115 fields) and
+    returned as False. Never raises."""
+    try:
+        return await _set_and_log_power_limit(
+            ssh, action, executor_id, gpu_uuid, watts_before, watts_after, log_extra
+        )
+    except asyncssh.ChannelOpenError as exc:
+        _log(
+            logging.ERROR,
+            f"gpu power limit {action} failed: executor={executor_id} gpu={gpu_uuid} watts {watts_before} -> "
+            f"{watts_after} (the host refused the SSH session: {exc})",
+            {
+                "gpu_power_action": action,
+                "executor_uuid": executor_id,
+                "gpu_uuid": gpu_uuid,
+                "watts_before": watts_before,
+                "watts_after": watts_after,
+                "status": "failed",
+                "persistence_enabled": None,
+            },
+            log_extra,
+        )
+        return False
+
+
+async def _set_side_by_side(
+    action: Literal["restore", "raise"],
+    targets: list[_T],
+    set_one: Callable[[_T, _Setter], Awaitable[bool]],
+    log_extra: dict[str, object] | None,
+) -> int:
+    """Run ``set_one`` for every target, ``POWER_LIMIT_SET_CONCURRENCY`` at a time; the count of True.
+
+    ``set_one(target, setter)`` sets one GPU through ``setter``. Side by side the setter is
+    ``_set_and_log_power_limit``, which raises ``asyncssh.ChannelOpenError`` when the host refused the
+    session: its sshd's MaxSessions is below the bound, so the refusal is ours, not the GPU's. Those
+    targets are set again one at a time after the first pass, the way the old loop set every GPU,
+    through ``_set_alone`` (a session refused even alone is a failed set, logged). Without the retry
+    a host with MaxSessions under 8 kept every GPU past the limit capped through the create's
+    restore and raise.
+    """
+    limit = asyncio.Semaphore(POWER_LIMIT_SET_CONCURRENCY)
+
+    async def guarded(target: _T) -> bool | None:
+        async with limit:
+            try:
+                return await set_one(target, _set_and_log_power_limit)
+            except asyncssh.ChannelOpenError:
+                return None
+
+    outcomes = await asyncio.gather(*(guarded(target) for target in targets))
+    done = sum(1 for outcome in outcomes if outcome is True)
+    refused = [target for target, outcome in zip(targets, outcomes, strict=True) if outcome is None]
+    if not refused:
+        return done
+    _log(
+        logging.WARNING,
+        f"gpu power {action}: the host refused {len(refused)} of {len(targets)} SSH sessions opened side by side "
+        f"(sshd MaxSessions below {POWER_LIMIT_SET_CONCURRENCY}?); setting those GPUs one at a time",
+        {"gpu_power_action": action, "refused": len(refused), "targets": len(targets)},
+        log_extra,
+    )
+    for target in refused:
+        if await set_one(target, _set_alone):
+            done += 1
+    return done
 
 
 async def _ensure_restore_record(
@@ -407,28 +537,34 @@ async def _restore_records(
     log_extra: dict[str, object] | None,
 ) -> int:
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
-    (a failed restore keeps it for the safety nets to retry). Returns the restored count."""
-    restored = 0
-    for record in records:
+    (a failed restore keeps it for the safety nets to retry). Returns the restored count.
+
+    The records are restored side by side (``POWER_LIMIT_SET_CONCURRENCY`` at a time; a GPU whose
+    session the host refused is retried alone): each GPU is its own device, and the delete that
+    calls this holds the customer's rent until it answers."""
+
+    async def restore_one(record: GpuPowerRestoreRecord, setter: _Setter) -> bool:
         state = state_by_uuid.get(record.gpu_uuid)
         watts_before = state.current_watts if state else None
-        changed = await _set_and_log_power_limit(
+        changed = await setter(
             ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
         )
         if not changed:
-            continue
+            return False
         try:
             await redis.delete(_restore_key(record.gpu_uuid))
-            restored += 1
+            return True
         except Exception as exc:
             _log(
                 logging.ERROR,
                 f"gpu power restore: restored {record.gpu_uuid} but could not clear its record: {exc}; "
-                f"a duplicate restore may follow",
+                "a duplicate restore may follow",
                 {"gpu_uuid": record.gpu_uuid},
                 log_extra,
             )
-    return restored
+            return False
+
+    return await _set_side_by_side("restore", records, restore_one, log_extra)
 
 
 async def restore_tracked_gpu_power_limits(
@@ -500,19 +636,36 @@ async def raise_low_power_limits_to_default(
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
     target_uuids: list[str] = gpu_uuids if gpu_uuids else list(state_by_uuid)
-    raised = 0
+    below_floor: list[_BelowFloorGpu] = []
     for gpu_uuid in target_uuids:
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None:
             continue
         if state.current_watts >= MIN_POWER_LIMIT_RATIO * state.default_watts:
             continue
-        lifted = await _set_and_log_power_limit(
-            ssh, "raise", executor_id, gpu_uuid, state.current_watts, state.default_watts, log_extra
+        below_floor.append(
+            _BelowFloorGpu(
+                gpu_uuid=gpu_uuid,
+                current_watts=state.current_watts,
+                default_watts=state.default_watts,
+            )
         )
-        if lifted:
-            raised += 1
-    return raised
+    if not below_floor:
+        return 0
+
+    # Side by side, like the restore: this runs before the customer's `docker run`.
+    async def raise_one(target: _BelowFloorGpu, setter: _Setter) -> bool:
+        return await setter(
+            ssh,
+            "raise",
+            executor_id,
+            target.gpu_uuid,
+            target.current_watts,
+            target.default_watts,
+            log_extra,
+        )
+
+    return await _set_side_by_side("raise", below_floor, raise_one, log_extra)
 
 
 async def restore_filler_pod_gpu_power_limits(
@@ -606,7 +759,8 @@ async def apply_filler_gpu_power_limits(
     for target in gpu_power_limits:
         state = state_by_uuid[target.gpu_uuid]
         target_watts = _clamp_watts(target.watts, state)
-        if not await _set_and_log_power_limit(
+        # one at a time and nothing else in flight: a refused session is a failed cap (fail-closed)
+        if not await _set_alone(
             ssh, "cap", executor_id, target.gpu_uuid, state.current_watts, target_watts, log_extra
         ):
             all_set = False

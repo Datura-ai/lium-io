@@ -1,11 +1,14 @@
+import asyncio
 import json
 import logging
 import time
 from unittest.mock import AsyncMock
 
+import asyncssh
 import pytest
 from neurons.validators.src.payload_models.payloads import GpuPowerLimit
 from neurons.validators.src.services.gpu_power_limit import (
+    POWER_LIMIT_SET_CONCURRENCY,
     GpuPowerReadback,
     GpuPowerRestoreRecord,
     GpuPowerState,
@@ -664,3 +667,219 @@ async def test_raise_counts_only_verified_sets() -> None:
     )
     raised = await raise_low_power_limits_to_default(ssh, EXECUTOR_ID, ["GPU-low"])
     assert raised == 0
+
+
+# ------------------- restore / raise run several GPUs at a time (DAH-3518) -------------------
+# Regression: `_restore_records` and `raise_low_power_limits_to_default` set one GPU after another,
+# three nvidia-smi round trips each. On an 8-GPU PEARL node that put ~15 s inside the filler's
+# delete before the ContainerDeleted callback, past the backend's 30 s preemption wait (Loki, 48 h
+# to 15 Sep 2026: 8-GPU PEARL deletes p50 27.7 s, 65 % over 25 s). The fake below yields to the
+# loop on every command and records how many were in flight at once: the old loop peaks at 1, so
+# the three `peak_in_flight` tests fail on it; the hung-GPU test pins what the old loop already did.
+
+
+class SuspendingSsh:
+    """An SSH stand-in whose every command suspends once, so concurrent sets overlap.
+
+    Answers by command text (the order is no longer fixed): the readback echoes the watts the
+    last ``-pl`` set on that GPU, so every verified set succeeds."""
+
+    def __init__(self, state_csv: str):
+        self.state_csv = state_csv
+        self.commands: list[str] = []
+        self.in_flight = 0
+        self.peak_in_flight = 0
+        self._pl_by_uuid: dict[str, str] = {}
+
+    async def run(self, command: str, timeout: float | None = None) -> FakeRun:
+        self.commands.append(command)
+        self.in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0.001)
+            if command.startswith("nvidia-smi --query-gpu=uuid"):
+                return FakeRun(stdout=self.state_csv)
+            parts = command.split()
+            uuid = parts[2]
+            if "-pl" in parts:
+                self._pl_by_uuid[uuid] = parts[parts.index("-pl") + 1]
+                return FakeRun()
+            if "--query-gpu=power.limit,persistence_mode" in command:
+                return FakeRun(stdout=f"{self._pl_by_uuid[uuid]}.00, Enabled\n")
+            return FakeRun()  # -pm 1
+        finally:
+            self.in_flight -= 1
+
+
+def _capped_gpus(count: int, watts: int = 450) -> tuple[list[str], str, dict[str, str]]:
+    """``count`` GPUs capped at 315 W with a frozen record back to ``watts``: uuids, state CSV, records."""
+    uuids = [f"GPU-{index}" for index in range(count)]
+    state_csv = "".join(f"{uuid}, 315, {watts}, 100, {watts}\n" for uuid in uuids)
+    records = {_restore_key(uuid): _record(uuid, watts) for uuid in uuids}
+    return uuids, state_csv, records
+
+
+@pytest.mark.asyncio
+async def test_restore_sets_eight_gpus_side_by_side() -> None:
+    uuids, state_csv, records = _capped_gpus(8)
+    ssh = SuspendingSsh(state_csv)
+    redis = FakeRedis(records)
+
+    restored = await restore_tracked_gpu_power_limits(ssh, redis, uuids)
+
+    assert restored == 8
+    assert redis.store == {}  # every record cleared after its verified restore
+    assert ssh.peak_in_flight == 8  # the old loop never had more than one command in flight
+    # Each GPU still gets its full verified triple: -pm 1, -pl, readback.
+    for uuid in uuids:
+        assert [c for c in ssh.commands if f"-i {uuid} " in c] == _set_commands(uuid, 450)
+
+
+@pytest.mark.asyncio
+async def test_restore_concurrency_is_bounded() -> None:
+    # Two more tracked GPUs than POWER_LIMIT_SET_CONCURRENCY: never more channels at once than the
+    # bound (OpenSSH's default MaxSessions is 10 per connection).
+    uuids, state_csv, records = _capped_gpus(POWER_LIMIT_SET_CONCURRENCY + 2)
+    ssh = SuspendingSsh(state_csv)
+    redis = FakeRedis(records)
+
+    restored = await restore_tracked_gpu_power_limits(ssh, redis, uuids)
+
+    assert restored == POWER_LIMIT_SET_CONCURRENCY + 2
+    assert ssh.peak_in_flight == POWER_LIMIT_SET_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_restore_side_by_side_keeps_only_the_failed_record() -> None:
+    # One GPU's -pl hangs while its seven neighbours restore: the seven records are cleared and the
+    # eighth is kept for the safety nets, exactly as the one-after-another loop did.
+    uuids, state_csv, records = _capped_gpus(8)
+
+    class OneHangs(SuspendingSsh):
+        async def run(self, command: str, timeout: float | None = None) -> FakeRun:
+            if command.startswith("nvidia-smi -i GPU-3 -pl"):
+                self.commands.append(command)
+                raise TimeoutError("nvidia-smi hung")
+            return await super().run(command, timeout)
+
+    ssh = OneHangs(state_csv)
+    redis = FakeRedis(records)
+
+    restored = await restore_tracked_gpu_power_limits(ssh, redis, uuids)
+
+    assert restored == 7
+    assert list(redis.store) == [_restore_key("GPU-3")]
+
+
+@pytest.mark.asyncio
+async def test_raise_lifts_eight_below_floor_gpus_side_by_side() -> None:
+    uuids = [f"GPU-{index}" for index in range(8)]
+    ssh = SuspendingSsh("".join(f"{uuid}, 315, 450, 100, 450\n" for uuid in uuids))
+
+    raised = await raise_low_power_limits_to_default(ssh, EXECUTOR_ID, uuids)
+
+    assert raised == 8
+    assert ssh.peak_in_flight == 8
+    for uuid in uuids:
+        assert [c for c in ssh.commands if f"-i {uuid} " in c] == _set_commands(uuid, 450)
+
+
+# Rustam's review of #1379 (16 Sep 2026): a host whose sshd MaxSessions is below the bound answers
+# the extra channel opens with ChannelOpenError. Before the retry, the module caught it as a failed
+# set: on such a host a create's restore and raise left every GPU past the limit capped, and the
+# customer started on them. The two `refuses` tests fail on that head (2 == 8); the cap test pins
+# that the same error inside the serial cap loop is still a fail-closed False, not an exception
+# into create_container.
+
+
+class RefusesPastTwoSessions(SuspendingSsh):
+    """sshd MaxSessions 2: the third concurrent channel open fails before any command runs."""
+
+    def __init__(self, state_csv: str):
+        super().__init__(state_csv)
+        self.refused = 0
+
+    async def run(self, command: str, timeout: float | None = None) -> FakeRun:
+        if self.in_flight >= 2:
+            self.refused += 1
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed")
+        return await super().run(command, timeout)
+
+
+@pytest.mark.asyncio
+async def test_restore_retries_the_gpus_the_host_refused_one_at_a_time() -> None:
+    uuids, state_csv, records = _capped_gpus(8)
+    ssh = RefusesPastTwoSessions(state_csv)
+    redis = FakeRedis(records)
+
+    restored = await restore_tracked_gpu_power_limits(ssh, redis, uuids)
+
+    assert restored == 8
+    assert redis.store == {}
+    # six of the eight first-pass opens hit the limit and were set again alone; each refused GPU is refused
+    # twice on the way, -pm 1 (best-effort, logged) and then -pl (raised), before its retry alone
+    assert ssh.refused == 12
+    for uuid in uuids:  # every GPU's LAST attempt is the full verified triple
+        assert [c for c in ssh.commands if f"-i {uuid} " in c][-3:] == _set_commands(uuid, 450)
+
+
+@pytest.mark.asyncio
+async def test_raise_retries_the_gpus_the_host_refused_one_at_a_time() -> None:
+    uuids = [f"GPU-{index}" for index in range(8)]
+    ssh = RefusesPastTwoSessions("".join(f"{uuid}, 315, 450, 100, 450\n" for uuid in uuids))
+
+    raised = await raise_low_power_limits_to_default(ssh, EXECUTOR_ID, uuids)
+
+    assert raised == 8
+    assert ssh.refused == 12  # -pm 1 and -pl refused on each of the six, then set alone
+
+
+@pytest.mark.asyncio
+async def test_apply_fails_closed_when_the_host_refuses_the_pl_session() -> None:
+    # The cap loop is serial; a refused session on the hard gate (-pl) is the host's, so the cap is a
+    # failed set and apply undoes GPU-a and clears the state, never raising into create_container.
+    ssh = AsyncMock()
+    ssh.run.side_effect = [
+        FakeRun(stdout=STATE_CSV),   # state query
+        *_set_ok(209),               # cap GPU-a ok
+        FakeRun(),                   # cap GPU-b: -pm 1 ok
+        asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed"),  # cap GPU-b: -pl refused
+        FakeRun(stdout=STATE_CSV),   # undo: state query
+        *_set_ok(130),               # undo: restore GPU-a
+        *_set_ok(250),               # undo: restore GPU-b
+    ]
+    redis = FakeRedis()
+
+    ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209, GPU_b=200), redis, POD_ID, EXECUTOR_ID)
+
+    assert ok is False
+    assert redis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_pm_session_does_not_reject_the_filler_before_pl(caplog: pytest.LogCaptureFixture) -> None:
+    # Rustam's review (16 Sep): -pm 1 is best-effort, yet its ChannelOpenError was re-raised and the
+    # filler was refused before -pl ran. Refused there, the set logs it and goes on; -pl and the
+    # readback are the gate, and they pass here, so the cap is applied and the filler starts.
+    ssh = AsyncMock()
+    ssh.run.side_effect = [
+        FakeRun(stdout=STATE_CSV),   # state query
+        *_set_ok(209),               # cap GPU-a ok
+        asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "open failed"),  # cap GPU-b: -pm 1 refused
+        FakeRun(),                   # cap GPU-b: -pl ok
+        FakeRun(stdout="200.00, Disabled\n"),  # cap GPU-b: readback confirms 200 W, persistence off
+    ]
+    redis = FakeRedis()
+
+    with caplog.at_level(logging.WARNING):
+        ok = await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=209, GPU_b=200), redis, POD_ID, EXECUTOR_ID)
+
+    assert ok is True
+    assert sorted(redis.store) == sorted([_restore_key("GPU-a"), _restore_key("GPU-b"), _pod_index_key(POD_ID)])
+    assert ssh.run.await_count == 1 + 3 + 3
+    pm_warnings = [
+        record
+        for record in _warning_records(caplog)
+        if "enabling persistence mode for GPU-b failed" in record.getMessage()
+    ]
+    assert len(pm_warnings) == 1 and "open failed" in pm_warnings[0].getMessage()
