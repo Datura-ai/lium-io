@@ -1,12 +1,17 @@
+import asyncio
 import logging
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncssh
 
+from core.config import settings
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
+from protocol.vc_protocol.compute_requests import RentedPod
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ...const import (
@@ -16,6 +21,7 @@ from ...const import (
 from ..messages import TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .ssh_banner import ssh_banner_error
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +106,17 @@ class TenantEnforcementCheck:
     The legacy code short-circuited out of validation in this scenario after checking pod
     health, GPU ownership, ports, and score adjustments. Keeping it as a single check
     documents that bespoke behaviour and ensures we still emit the historical log format.
+
+    DAH-2255: under RENTED_POD_SSH_CHECK_ENABLED a running pod must also answer on its SSH port.
+    `docker ps` over the management shell proves the container exists; the renter connects to the
+    host port docker publishes for container port 22, and when nothing listens behind it this check
+    returned RENTED / score 1.0 every cycle (17 Sep 2026: 3 of 431 live pods, refused or timing out
+    for hours). The check reads that port from the host (`docker port <pod> 22/tcp`), requires it to
+    be one of the ports the backend gave the renter, dials it from the validator and waits for
+    sshd's `SSH-2.0` banner until RENTED_POD_SSH_DEADLINE_SECONDS. A pod younger than
+    RENTED_POD_SSH_GRACE_MINUTES, a pod recovered this cycle and a mapping the host cannot report
+    are not judged. A failure is RENTED_POD_SSH_UNREACHABLE: score 0, verified job cleared, the
+    dialled host and port and the failure kind in the reset evidence (DAH-3386).
     """
 
     check_id = "executor.validate.rented_state"
@@ -218,6 +235,26 @@ class TenantEnforcementCheck:
                     return outcome.failure
                 ssh_pub_keys = outcome.ssh_pub_keys
                 continue
+
+            # DAH-2255: a running container is not a reachable pod. The renter connects to the host
+            # port docker publishes for container port 22; when nothing listens behind it (sshd never
+            # started, a firewall) `docker ps` still says running and this check returned RENTED.
+            if settings.RENTED_POD_SSH_CHECK_ENABLED:
+                try:
+                    ssh_failure = await _verify_pod_ssh_answers(ctx, pod)
+                except (asyncssh.Error, OSError) as exc:
+                    return _executor_transport_unreachable_result(
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        container_name=pod_container_name,
+                        pod_id=pod_id,
+                        transport_error=exc,
+                        extra=extra,
+                    )
+                if ssh_failure is not None:
+                    return _pod_ssh_unreachable_result(
+                        ctx=ctx, check_id=self.check_id, pod=pod, failure=ssh_failure, extra=extra
+                    )
 
         container_names = [pod.container_name for pod in rented_pods]
         container_names.extend(filler_containers)
@@ -360,6 +397,162 @@ class TenantEnforcementCheck:
             ),
             ssh_pub_keys=[],
         )
+
+
+@dataclass(frozen=True)
+class _PodSshFailure:
+    """Why the renter's SSH endpoint of a running pod does not answer (DAH-2255)."""
+
+    # one of the ssh_banner kinds, or SSH_PORT_NOT_RENTED
+    kind: str
+    detail: str
+    ssh_host: str
+    # the host port docker publishes for the pod's container port 22; None when the kind is about the mapping
+    ssh_port: int | None
+
+
+# the host maps container port 22 to a port the backend never gave this renter, so the renter's `ssh -p`
+# lands elsewhere whatever listens there
+SSH_PORT_NOT_RENTED = "port_not_given_to_renter"
+
+_SSH_CONNECT_TIMEOUT_SECONDS = 5.0
+_SSH_BANNER_TIMEOUT_SECONDS = 5.0
+_SSH_BANNER_POLL_SECONDS = 2.0
+# every string copied out of the host into the event or the reset evidence is bounded (PR_PROCESS §5)
+_SSH_DETAIL_MAX = 256
+
+
+def _pod_age(pod: RentedPod) -> timedelta | None:
+    if pod.created_at is None:
+        return None
+    now = datetime.now(timezone.utc) if pod.created_at.tzinfo else datetime.utcnow()
+    return now - pod.created_at
+
+
+def _published_ssh_port(stdout: str) -> int | None:
+    """The host port in `docker port <pod> 22/tcp` output (`0.0.0.0:40299`, then `[::]:40299`); None when unreadable."""
+    for line in (stdout or "").splitlines():
+        _, _, port_text = line.strip().rpartition(":")
+        if port_text.isdigit():
+            return int(port_text)
+    return None
+
+
+async def _verify_pod_ssh_answers(ctx: Context, pod: RentedPod) -> _PodSshFailure | None:
+    """None when the pod's SSH port sends sshd's banner from the validator's side of the network, or is not judged.
+
+    Not judged (None, one warning log line): a pod younger than RENTED_POD_SSH_GRACE_MINUTES or of unknown age
+    (its sshd bootstrap may still be running), and a host whose `docker port` output the validator could not
+    read (a Docker daemon error is not proof about sshd). asyncssh.Error / OSError from the management shell
+    propagate: the caller reports the transport, not the pod.
+    """
+    age = _pod_age(pod)
+    grace = timedelta(minutes=settings.RENTED_POD_SSH_GRACE_MINUTES)
+    if age is None or age < grace:
+        logger.info(
+            _m(
+                "Rented pod SSH check skipped: pod within its startup grace",
+                extra=get_extra_info({
+                    **ctx.default_extra,
+                    "pod_id": pod.pod_id,
+                    "container_name": pod.container_name,
+                    "pod_age_seconds": age.total_seconds() if age is not None else None,
+                    "grace_minutes": settings.RENTED_POD_SSH_GRACE_MINUTES,
+                }),
+            )
+        )
+        return None
+
+    port_result = await ctx.ssh.run(DockerCommand.published_port(pod.container_name, 22))
+    ssh_port = _published_ssh_port(port_result.stdout)
+    ssh_host = ctx.executor.address
+    if ssh_port is None:
+        logger.warning(
+            _m(
+                "Rented pod SSH check reached no verdict: the host did not report a port for container port 22",
+                extra=get_extra_info({
+                    **ctx.default_extra,
+                    "pod_id": pod.pod_id,
+                    "container_name": pod.container_name,
+                    "docker_port_stdout": (port_result.stdout or "")[-_SSH_DETAIL_MAX:],
+                }),
+            )
+        )
+        return None
+    if pod.rented_ports and ssh_port not in pod.rented_ports:
+        return _PodSshFailure(
+            kind=SSH_PORT_NOT_RENTED,
+            detail=f"docker publishes container port 22 on {ssh_port}; the renter was given {sorted(pod.rented_ports)}",
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+        )
+
+    deadline_at = time.monotonic() + settings.RENTED_POD_SSH_DEADLINE_SECONDS
+    while True:
+        error = await ssh_banner_error(
+            ssh_host,
+            ssh_port,
+            connect_timeout=_SSH_CONNECT_TIMEOUT_SECONDS,
+            banner_timeout=_SSH_BANNER_TIMEOUT_SECONDS,
+        )
+        if error is None:
+            return None
+        if time.monotonic() >= deadline_at:
+            kind, detail = error
+            return _PodSshFailure(kind=kind, detail=detail, ssh_host=ssh_host, ssh_port=ssh_port)
+        await asyncio.sleep(_SSH_BANNER_POLL_SECONDS)
+
+
+def _pod_ssh_unreachable_result(
+    *,
+    ctx: Context,
+    check_id: str,
+    pod: RentedPod,
+    failure: _PodSshFailure,
+    extra: dict[str, Any],
+) -> CheckResult:
+    what: dict[str, Any] = {
+        "pod_id": pod.pod_id,
+        "container_name": pod.container_name,
+        "executor_uuid": ctx.executor.uuid,
+        "ssh_host": failure.ssh_host,
+        "ssh_port": failure.ssh_port,
+        "ssh_failure": failure.kind,
+        "detail": failure.detail[-_SSH_DETAIL_MAX:],
+        "rented_ports": sorted(pod.rented_ports),
+        "deadline_seconds": settings.RENTED_POD_SSH_DEADLINE_SECONDS,
+    }
+    event = render_message(
+        Msg.POD_SSH_UNREACHABLE,
+        ctx=ctx,
+        check_id=check_id,
+        remediation=(Msg.POD_SSH_UNREACHABLE.remediation or "").format(
+            ssh_host=failure.ssh_host,
+            ssh_port=failure.ssh_port if failure.ssh_port is not None else "?",
+            ssh_failure=failure.kind,
+        ),
+        what=what,
+        extra=extra,
+    )
+    return CheckResult(
+        passed=False,
+        event=event,
+        updates={
+            "default_extra": extra,
+            "clear_verified_job_info": True,
+            # DAH-3386: the backend's penalty row carries where the validator dialled and how it failed
+            "clear_verified_job_evidence": {
+                "reason_code": event.reason_code,
+                "check_id": check_id,
+                "pod_id": pod.pod_id,
+                "container_name": pod.container_name,
+                "ssh_host": failure.ssh_host,
+                "ssh_port": failure.ssh_port,
+                "ssh_failure": failure.kind,
+                "detail": failure.detail[-_SSH_DETAIL_MAX:],
+            },
+        },
+    )
 
 
 def _executor_transport_unreachable_result(

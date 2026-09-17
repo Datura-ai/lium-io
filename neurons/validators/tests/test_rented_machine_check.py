@@ -1,13 +1,18 @@
 import json
-from unittest.mock import AsyncMock, Mock
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, Mock, patch
 
 import asyncssh
 import pytest
 from helpers import build_context_config, build_services, build_state
-from neurons.validators.src.core.docker_utils import _collect_host_context
+from neurons.validators.src.core.docker_utils import DockerCommand, _collect_host_context
+from neurons.validators.src.services.task.checks import rented_machine as rented_machine_module
 from neurons.validators.src.services.task.checks.rented_machine import (
+    SSH_PORT_NOT_RENTED,
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
+    _published_ssh_port,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from neurons.validators.src.services.task.pipeline import Context
@@ -1136,3 +1141,291 @@ def test_context_annotations_resolve_at_runtime():
     # annotation pydantic cannot resolve. A ContextServices field typed only under TYPE_CHECKING
     # leaves Context unbuildable, and then every real validation cycle raises instead of running.
     assert Context.model_rebuild(force=True) is True
+
+
+# --- DAH-2255: a running container is not a reachable pod; the renter's SSH port must answer ---------------
+
+RENTER_SSH_PORT = 40299
+RENTER_PORTS = [40299, 40300, 40301]
+POD_AGE_OLD = datetime.utcnow() - timedelta(hours=2)
+
+
+class PortAwareSSHClient(DummySSHClient):
+    """DummySSHClient that also answers `docker port <pod> 22/tcp` the way the host does."""
+
+    def __init__(self, *, docker_port_stdout: str = f"0.0.0.0:{RENTER_SSH_PORT}\n[::]:{RENTER_SSH_PORT}\n", **kwargs):
+        super().__init__(**kwargs)
+        self.docker_port_stdout = docker_port_stdout
+
+    async def run(self, command: str):
+        if "docker port" in command:
+            self.commands_called.append(command)
+            if self.raise_on_run is not None:
+                raise self.raise_on_run
+            return Mock(stdout=self.docker_port_stdout, stderr="", exit_status=0 if self.docker_port_stdout else 1)
+        return await super().run(command)
+
+
+def build_ssh_check_context(
+    context_factory,
+    *,
+    ssh: DummySSHClient,
+    pods: list[RentedPod] | None = None,
+) -> Context:
+    pods = pods or [
+        RentedPod(pod_id="pod-1", container_name="pod_pod-1", rented_ports=RENTER_PORTS, created_at=POD_AGE_OLD)
+    ]
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="test-miner", executor_ip_address="127.0.0.1", executor_ip_port="22", pods=pods
+            )
+        }
+    )
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=DummyBackendClient(active=True),
+    )
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(gpu_processes=[], gpu_details=[], gpu_model="NVIDIA RTX 4090", rented_data=rented_data),
+        ssh=ssh,
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+
+@contextmanager
+def ssh_check_settings(*, enabled: bool = True, deadline: float = 0, grace: int = 10):
+    with patch("neurons.validators.src.services.task.checks.rented_machine.settings") as s:
+        s.RENTED_POD_SSH_CHECK_ENABLED = enabled
+        s.RENTED_POD_SSH_DEADLINE_SECONDS = deadline
+        s.RENTED_POD_SSH_GRACE_MINUTES = grace
+        yield s
+
+
+@contextmanager
+def renter_ssh_port(*answers):
+    """What the validator sees when it dials the renter's port: one entry per attempt, None = sshd's banner,
+    `(kind, detail)` = the failure; the last entry repeats. Yields the mock so tests read the dial targets."""
+    answers = list(answers) or [None]
+
+    async def dial(host, port, **kwargs):
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    dialled = AsyncMock(side_effect=dial)
+    with (
+        patch("neurons.validators.src.services.task.checks.rented_machine.ssh_banner_error", dialled),
+        patch("neurons.validators.src.services.task.checks.rented_machine._SSH_BANNER_POLL_SECONDS", 0.0),
+    ):
+        yield dialled
+
+
+def test_rented_pod_ssh_check_is_off_by_default():
+    """Regression: the flag's default flipped to True, so every validator dials every renter's port on deploy."""
+    assert type(rented_machine_module.settings).model_fields["RENTED_POD_SSH_CHECK_ENABLED"].default is False
+
+
+@pytest.mark.asyncio
+async def test_rented_pod_ssh_check_off_dials_nothing(context_factory):
+    """Regression: the check ignores the flag (dials with the default settings object, no patch)."""
+    ssh = PortAwareSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."])
+    ctx = build_ssh_check_context(context_factory, ssh=ssh)
+
+    with renter_ssh_port(("refused", "Connection refused")) as dialled:
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True and result.event.reason_code == Msg.ALREADY_RENTED.reason
+    dialled.assert_not_awaited()
+    assert not any("docker port" in cmd for cmd in ssh.commands_called)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["refused", "timeout", "no_banner", "unreachable"])
+async def test_rented_pod_whose_ssh_port_does_not_answer_fails_with_a_reason_code(context_factory, kind):
+    """Regression (DAH-2255, prod 17 Sep 2026): `docker ps` says running, the renter's port refuses, the check
+    returned RENTED / score 1.0 every cycle. Now: RENTED_POD_SSH_UNREACHABLE, verified job cleared, the dialled
+    host and port and the failure kind in the reset evidence the backend's penalty row carries."""
+    ssh = PortAwareSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."])
+    ctx = build_ssh_check_context(context_factory, ssh=ssh)
+
+    with ssh_check_settings(), renter_ssh_port((kind, f"port {RENTER_SSH_PORT}: {kind}")) as dialled:
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.halt is False
+    assert result.event.reason_code == Msg.POD_SSH_UNREACHABLE.reason
+    # dialled from the validator to the executor's public address on the port docker publishes for 22
+    assert dialled.await_args.args == ("127.0.0.1", RENTER_SSH_PORT)
+    assert any("docker port" in cmd and "pod_pod-1" in cmd and "22/tcp" in cmd for cmd in ssh.commands_called)
+    saw = result.event.what_we_saw
+    assert (saw["pod_id"], saw["ssh_host"], saw["ssh_port"], saw["ssh_failure"]) == ("pod-1", "127.0.0.1", RENTER_SSH_PORT, kind)
+    assert str(RENTER_SSH_PORT) in result.event.remediation and kind in result.event.remediation
+    assert result.updates["clear_verified_job_info"] is True
+    assert "clear_verified_job_reason" not in result.updates  # not POD_NOT_RUNNING: the container runs
+    evidence = result.updates["clear_verified_job_evidence"]
+    assert evidence["reason_code"] == Msg.POD_SSH_UNREACHABLE.reason
+    assert evidence["check_id"] == TenantEnforcementCheck.check_id
+    assert (evidence["pod_id"], evidence["ssh_host"], evidence["ssh_port"], evidence["ssh_failure"]) == (
+        "pod-1", "127.0.0.1", RENTER_SSH_PORT, kind
+    )
+
+
+@pytest.mark.asyncio
+async def test_rented_pod_whose_ssh_port_answers_stays_rented(context_factory):
+    ssh = PortAwareSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."])
+    ctx = build_ssh_check_context(context_factory, ssh=ssh)
+
+    with ssh_check_settings(), renter_ssh_port(None) as dialled:
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True and result.halt is True
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert result.updates["rented"] is True
+    assert dialled.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_rented_pod_ssh_check_retries_until_the_deadline(context_factory):
+    """Regression: one dropped connection fails the pod (sshd under MaxStartups drops a connection now and then)."""
+    ssh = PortAwareSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."])
+    ctx = build_ssh_check_context(context_factory, ssh=ssh)
+
+    with (
+        ssh_check_settings(deadline=30),
+        renter_ssh_port(("unreachable", "reset"), ("no_banner", "closed"), None) as dialled,
+    ):
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True and result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert dialled.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "created_at",
+    [
+        pytest.param(datetime.utcnow() - timedelta(minutes=1), id="within_grace"),
+        pytest.param(None, id="age_unknown"),
+    ],
+)
+async def test_rented_pod_inside_its_startup_grace_is_not_dialled(context_factory, created_at):
+    """Regression: a pod created a minute ago fails while its start script is still bringing sshd up."""
+    ssh = PortAwareSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."])
+    pod = RentedPod(pod_id="pod-1", container_name="pod_pod-1", rented_ports=RENTER_PORTS, created_at=created_at)
+    ctx = build_ssh_check_context(context_factory, ssh=ssh, pods=[pod])
+
+    with ssh_check_settings(grace=10), renter_ssh_port(("refused", "refused")) as dialled:
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True and result.event.reason_code == Msg.ALREADY_RENTED.reason
+    dialled.assert_not_awaited()
+    assert not any("docker port" in cmd for cmd in ssh.commands_called)
+
+
+@pytest.mark.asyncio
+async def test_rented_pod_ssh_port_outside_the_renters_ports_fails_without_a_dial(context_factory):
+    """Regression: the host publishes container port 22 on a port the backend never gave this renter; the
+    renter's `ssh -p` goes to a port that maps nowhere, whatever answers on the host's port."""
+    ssh = PortAwareSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."], docker_port_stdout="0.0.0.0:50000\n")
+    ctx = build_ssh_check_context(context_factory, ssh=ssh)
+
+    with ssh_check_settings(), renter_ssh_port(None) as dialled:
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_SSH_UNREACHABLE.reason
+    assert result.event.what_we_saw["ssh_failure"] == SSH_PORT_NOT_RENTED
+    assert result.event.what_we_saw["ssh_port"] == 50000
+    assert result.event.what_we_saw["rented_ports"] == RENTER_PORTS
+    assert result.updates["clear_verified_job_evidence"]["ssh_failure"] == SSH_PORT_NOT_RENTED
+    dialled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rented_pod_ssh_check_reaches_no_verdict_when_the_host_reports_no_port(context_factory):
+    """A Docker daemon that cannot answer `docker port` is not proof about sshd: no dial, no penalty."""
+    ssh = PortAwareSSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."], docker_port_stdout="")
+    ctx = build_ssh_check_context(context_factory, ssh=ssh)
+
+    with ssh_check_settings(), renter_ssh_port(("refused", "refused")) as dialled:
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True and result.event.reason_code == Msg.ALREADY_RENTED.reason
+    dialled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rented_pod_ssh_check_reports_a_lost_transport_not_the_pod(context_factory):
+    """DAH-2055 holds here too: the management shell dying during `docker port` is unknown pod state."""
+
+    class LoseTransportOnDockerPort(PortAwareSSHClient):
+        async def run(self, command: str):
+            if "docker port" in command:
+                raise asyncssh.ConnectionLost("conntrack flush")
+            return await super().run(command)
+
+    ssh = LoseTransportOnDockerPort(pod_running=True, ssh_keys=["ssh-rsa AAA..."])
+    ctx = build_ssh_check_context(context_factory, ssh=ssh)
+
+    with ssh_check_settings(), renter_ssh_port(None) as dialled:
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert "clear_verified_job_info" not in result.updates
+    dialled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rented_pod_ssh_check_judges_every_pod_on_a_split_node(context_factory):
+    """Regression: only the first pod is dialled, so a GPU-split node's second renter is left unreachable."""
+
+    class PerPodPorts(PortAwareSSHClient):
+        async def run(self, command: str):
+            if "docker port" in command:
+                self.docker_port_stdout = "0.0.0.0:40299\n" if "pod_pod-1" in command else "0.0.0.0:40400\n"
+            return await super().run(command)
+
+    ssh = PerPodPorts(pod_running=True, ssh_keys=["ssh-rsa AAA..."])
+    pods = [
+        RentedPod(pod_id="pod-1", container_name="pod_pod-1", rented_ports=[40299, 40300], created_at=POD_AGE_OLD),
+        RentedPod(pod_id="pod-2", container_name="pod_pod-2", rented_ports=[40400, 40401], created_at=POD_AGE_OLD),
+    ]
+    ctx = build_ssh_check_context(context_factory, ssh=ssh, pods=pods)
+
+    async def dial(host, port, **kwargs):
+        return None if port == 40299 else ("refused", "Connection refused")
+
+    with (
+        ssh_check_settings(),
+        patch("neurons.validators.src.services.task.checks.rented_machine.ssh_banner_error", AsyncMock(side_effect=dial)) as dialled,
+    ):
+        result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_SSH_UNREACHABLE.reason
+    assert result.event.what_we_saw["pod_id"] == "pod-2"
+    assert result.event.what_we_saw["ssh_port"] == 40400
+    assert sorted(call.args[1] for call in dialled.await_args_list) == [40299, 40400]
+
+
+@pytest.mark.parametrize(
+    "stdout,expected",
+    [
+        ("0.0.0.0:40299\n[::]:40299\n", 40299),
+        ("[::]:40299\n", 40299),
+        ("", None),
+        ("Error: No public port '22/tcp' published for pod_x\n", None),
+    ],
+)
+def test_published_ssh_port_reads_docker_port_output(stdout, expected):
+    assert _published_ssh_port(stdout) == expected
+
+
+def test_docker_port_command_quotes_the_container_name():
+    command = DockerCommand.published_port("pod_x; rm -rf /", 22)
+    assert command == "/usr/bin/docker port 'pod_x; rm -rf /' 22/tcp"

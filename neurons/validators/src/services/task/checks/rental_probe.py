@@ -26,6 +26,7 @@ from ...const import MIN_PORT_COUNT, POD_CONTAINER_PREFIX
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .ssh_banner import ssh_banner_error
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +84,6 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
 }
 
 _SSHD_POLL_SECONDS = 2.0
-# the identification string sshd sends first on every connection (RFC 4253 §4.2)
-_SSH_BANNER_PREFIX = b"SSH-2.0"
 _SSHD_CONNECT_TIMEOUT_SECONDS = 5
 _SSHD_BANNER_TIMEOUT_SECONDS = 5
 _SSH_LOGIN_TIMEOUT_SECONDS = 30
@@ -1108,25 +1107,15 @@ async def _wait_for_sshd(
     """
     last_error = "never tried"
     while True:
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=_SSHD_CONNECT_TIMEOUT_SECONDS
-            )
-            try:
-                banner = await asyncio.wait_for(
-                    reader.readline(), timeout=_SSHD_BANNER_TIMEOUT_SECONDS
-                )
-            finally:
-                writer.close()
-            if banner.startswith(_SSH_BANNER_PREFIX):
-                return None
-            last_error = (
-                f"port {port} accepted the connection but sent no SSH banner "
-                f"({banner[:40]!r}; docker-proxy answers before sshd listens)"
-            )
-        except (TimeoutError, OSError, ValueError) as exc:
-            # ValueError: readline's line limit, a server that talks but not SSH
-            last_error = repr(exc)
+        error = await ssh_banner_error(
+            host,
+            port,
+            connect_timeout=_SSHD_CONNECT_TIMEOUT_SECONDS,
+            banner_timeout=_SSHD_BANNER_TIMEOUT_SECONDS,
+        )
+        if error is None:
+            return None
+        last_error = error[1]
         if time.monotonic() >= deadline_at:
             return f"sshd did not answer on port {port} within {deadline_seconds} s: {last_error}"
         await asyncio.sleep(_SSHD_POLL_SECONDS)

@@ -369,6 +369,18 @@ class Settings(BaseSettings):
     RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
+    # DAH-2255: on a rented node the rented-state check proves the pod's container runs (`docker ps` over the
+    # management shell) and nothing more; 17 Sep 2026 it returned RENTED / score 1.0 every cycle for 3 of 431
+    # live pods whose renter SSH port refused or timed out for hours. On, the check also dials the pod's port
+    # for container port 22 from the validator (`docker port <pod> 22/tcp`, which must be one of the ports the
+    # backend gave the renter) and requires sshd's `SSH-2.0` banner, retried until
+    # RENTED_POD_SSH_DEADLINE_SECONDS; a pod older than RENTED_POD_SSH_GRACE_MINUTES that never answers fails
+    # the check with RENTED_POD_SSH_UNREACHABLE (score 0, verified job cleared, the failure kind in the reset
+    # evidence). A mapping the host cannot report is logged and not judged. Off by default: it is a new
+    # money-withholding gate on the rented path, so the team turns it on after staging.
+    RENTED_POD_SSH_CHECK_ENABLED: bool = Field(env="RENTED_POD_SSH_CHECK_ENABLED", default=False)
+    RENTED_POD_SSH_DEADLINE_SECONDS: int = Field(env="RENTED_POD_SSH_DEADLINE_SECONDS", default=20, gt=0)
+    RENTED_POD_SSH_GRACE_MINUTES: int = Field(env="RENTED_POD_SSH_GRACE_MINUTES", default=10, ge=0)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")

@@ -778,6 +778,18 @@ class TenantEnforcementMessages:
         impact="Score set to 0; verification cleared",
         remediation="Start container and ensure it stays healthy.",
     )
+    POD_SSH_UNREACHABLE = MessageTemplate(
+        event="Rented pod's SSH port does not answer",
+        reason="RENTED_POD_SSH_UNREACHABLE",
+        severity="error",
+        category="runtime",
+        impact="Score set to 0; verification cleared",
+        remediation=(
+            "The pod's container runs but its SSH port {ssh_port} on {ssh_host} did not send an SSH banner "
+            "({ssh_failure}). Check that sshd runs inside the container (`docker exec <pod> service ssh status`), "
+            "then the host firewall and Docker port publishing for that port."
+        ),
+    )
     STALE_POD_NOT_RUNNING = MessageTemplate(
         event="Stale rented pod not running signal skipped",
         reason="STALE_POD_NOT_RUNNING",

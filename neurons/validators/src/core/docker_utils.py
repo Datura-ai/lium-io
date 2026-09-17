@@ -124,6 +124,16 @@ class DockerCommand:
         return f"/usr/bin/docker ps -q -f name={container_name}"
 
     @staticmethod
+    def published_port(container_name: str, container_port: int) -> str:
+        """`docker port <container> <port>/tcp`: the host port(s) docker publishes for a container port.
+
+        Prints one `<bind address>:<host port>` line per bind address (`0.0.0.0:40299`, `[::]:40299`);
+        exits 1 with "No public port" when the container port is not published. Container name and
+        port are quoted: the string runs through the host's root shell over SSH (DAH-2255).
+        """
+        return f"/usr/bin/docker port {shlex.quote(container_name)} {shlex.quote(f'{int(container_port)}/tcp')}"
+
+    @staticmethod
     def exec_command(container_name: str, command: str) -> str:
         """Build docker exec command.
 
