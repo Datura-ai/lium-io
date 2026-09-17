@@ -8,10 +8,14 @@ unreadable (ticket-0247). The container is running, so ``TenantEnforcementCheck`
 
 This module judges what the renter sees, from outside the container, each cycle:
 
-* a TCP connect to the pod's mapped SSH port (``RentedPod.ssh_port``, sent by the backend) that
-  must answer with a complete ``SSH-2.0-`` identification line (RFC 4253 §4.2): docker-proxy
-  accepts on the host while sshd inside is down, so an accept alone says nothing (ticket-0326 is
-  exactly that case), and a 1.x or malformed line is not the sshd the renter can log in to;
+* a TCP connect to the pod's mapped SSH port (``RentedPod.ssh_port``, sent by the backend) that,
+  with ``RENTED_POD_SSH_BANNER_FAULT_ENABLED`` on, must answer with a complete ``SSH-2.0-``
+  identification line (RFC 4253 §4.2): docker-proxy accepts on the host while sshd inside is down,
+  so an accept alone says nothing, and a 1.x or malformed line is not the sshd the renter can log
+  in to. The setting is off by default and is turned on after
+  lium-platform#429, which teaches the backend the ``ssh_banner_missing`` fault name, is deployed;
+  until then the connect alone decides the port fault, and a report carries only ``tcp_refused``,
+  ``tcp_timeout`` or ``authorized_keys_unreadable``;
 * the ``authorized_keys`` read the check already does (empty = the mount is missing).
 
 State lives in Redis, one key pair per pod. A pod is judged only after this validator has seen it
@@ -90,7 +94,8 @@ FAULT_TCP_TIMEOUT = "tcp_timeout"
 # and closed it (sshd not running in the container), something else answered, or the identification
 # line is SSH 1.x / malformed / never completed. The four names below are the backend's
 # `PodSshUnreachableRequest.faults` vocabulary (lium-platform#429); a name the backend does not
-# know is a 422 and the outage is never recorded, so the two lists move together.
+# know is a 422 and the outage is never recorded, so the two lists move together. This one is sent
+# only with RENTED_POD_SSH_BANNER_FAULT_ENABLED on (after lium-platform#429 is deployed).
 FAULT_SSH_BANNER_MISSING = "ssh_banner_missing"
 FAULT_AUTHORIZED_KEYS_UNREADABLE = "authorized_keys_unreadable"
 # RFC 4253 §4.2: `SSH-protoversion-softwareversion SP comments CR LF`, at most 255 bytes including
@@ -296,7 +301,9 @@ async def read_ssh_identification(reader: asyncio.StreamReader) -> bytes:
     return b""
 
 
-async def tcp_connect_fault(host: str, port: int, timeout: float) -> str | None:
+async def tcp_connect_fault(
+    host: str, port: int, timeout: float, require_ssh2_identification: bool = True
+) -> str | None:
     """None when the port accepts AND greets with a complete ``SSH-2.0-`` line; else the fault name.
 
     The identification line is required because a mapped port is answered by docker-proxy on the
@@ -310,6 +317,11 @@ async def tcp_connect_fault(host: str, port: int, timeout: float) -> str | None:
     that long (Rustam's review, 17 Sep: two separate timeouts let one probe take twice the value).
     A connect that does not complete by the deadline is ``tcp_timeout``; a peer that accepts and
     then keeps the rest of the deadline without an identification line is ``ssh_banner_missing``.
+
+    With ``require_ssh2_identification`` False (``RENTED_POD_SSH_BANNER_FAULT_ENABLED`` off, the
+    default) an accepted connect is health: nothing is read and ``ssh_banner_missing`` is never
+    returned, so a validator on this setting sends only the fault names a backend without
+    lium-platform#429 knows.
     """
     deadline = asyncio.get_running_loop().time() + timeout
     try:
@@ -319,6 +331,13 @@ async def tcp_connect_fault(host: str, port: int, timeout: float) -> str | None:
         return FAULT_TCP_TIMEOUT
     except OSError:
         return FAULT_TCP_REFUSED
+    if not require_ssh2_identification:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        return None
     try:
         async with asyncio.timeout_at(deadline):
             line = await read_ssh_identification(reader)
@@ -354,7 +373,10 @@ async def probe_rented_pod_ssh(
     port_fault: str | None = None
     if pod.ssh_port is not None:
         port_fault = await tcp_connect_fault(
-            executor_ip, pod.ssh_port, settings.RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS
+            executor_ip,
+            pod.ssh_port,
+            settings.RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS,
+            require_ssh2_identification=settings.RENTED_POD_SSH_BANNER_FAULT_ENABLED,
         )
         if port_fault:
             faults.append(port_fault)

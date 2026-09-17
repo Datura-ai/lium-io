@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from helpers import FakeRedis, build_context_config, build_services, build_state, default_executor
+from neurons.validators.src.core.config import Settings
 from neurons.validators.src.core.utils import _m
 from neurons.validators.src.services.task.checks import rented_pod_ssh
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
@@ -848,6 +849,43 @@ async def test_flush_with_the_probe_off_touches_nothing():
 
 
 @pytest.mark.asyncio
+async def test_banner_fault_off_never_sends_ssh_banner_missing(context_factory):
+    # Rustam's review (17 Sep, third time): the backend learns `ssh_banner_missing` in lium-platform#429;
+    # a validator deployed before it gets a 422 and the outage is never recorded. With
+    # RENTED_POD_SSH_BANNER_FAULT_ENABLED off (the default) an accepting port is health, so a report
+    # can only carry the names an older backend knows; on, the same port is the new fault.
+    # what docker-proxy does on the host while sshd inside the container is down
+    server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    redis = FakeRedis()
+    backend = AsyncMock()
+    backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(recorded=True)
+    services = build_services(redis=redis, backend=backend)
+
+    def ctx():
+        return context_factory(
+            services=services,
+            config=build_context_config(),
+            state=build_state(specs={"boot_id": "boot-a"}),
+            collateral_deposited=True,
+        )
+
+    pod = RentedPod(pod_id="pod-a", container_name="pod_0", ssh_port=port)
+    try:
+        assert Settings.model_fields["RENTED_POD_SSH_BANNER_FAULT_ENABLED"].default is False
+        with patch.object(rented_pod_ssh.settings, "RENTED_POD_SSH_BANNER_FAULT_ENABLED", False):
+            off = await rented_pod_ssh.probe_rented_pod_ssh(ctx(), pod, KEYS)
+        with patch.object(rented_pod_ssh.settings, "RENTED_POD_SSH_BANNER_FAULT_ENABLED", True):
+            on = await rented_pod_ssh.probe_rented_pod_ssh(ctx(), pod, KEYS)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert off.healthy is True and off.faults == []
+    assert on.healthy is False and on.faults == [FAULT_SSH_BANNER_MISSING]
+
+
+@pytest.mark.asyncio
 async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
     # A bound-then-closed local port refuses; a listening one accepts; a hang is a timeout.
     probe = socket.socket()
@@ -857,7 +895,7 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
     assert await tcp_connect_fault("127.0.0.1", closed_port, timeout=2.0) == FAULT_TCP_REFUSED
 
     # Rustam's review (16 Sep): an accept-then-close is what docker-proxy does on the host while
-    # sshd inside the container is down (ticket-0326), so it is a fault, not health.
+    # sshd inside the container is down, so it is a fault, not health.
     server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
     open_port = server.sockets[0].getsockname()[1]
     try:
