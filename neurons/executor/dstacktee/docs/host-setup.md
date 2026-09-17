@@ -106,14 +106,17 @@ Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-
    Required beyond the obvious (`MINER_HOTKEY_SS58_ADDRESS`, ports, `CVM_VCPUS/MEMORY/DISK`, `CVM_GPUS`):
 
    - `ENABLE_TDX_ATTESTATION=true`
-   - `EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<64-hex>` — copy from the release notes. `lium-cvm.sh new` pins this digest into the measured compose (the attested trust boundary) and refuses to run without it.
+   - `EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<64-hex>` — copy from the "CVM attestation" section of the release notes of the tag you checked out. `lium-cvm.sh new` pins this digest into the measured compose (the attested trust boundary) and refuses to run without it.
 
-2. Create and boot (the OS image downloads once per host, then is reused):
+2. Create, check the measurement, boot (the OS image downloads once per host, then is reused):
 
    ```bash
    sudo ./lium-cvm.sh new my-executor
+   sha256sum run/vms/my-executor/shared/app-compose.json
    sudo ./lium-cvm.sh run my-executor
    ```
+
+   The `sha256sum` line must print the "expected compose hash" from the same release-notes section (`python3 scripts/compose_hash.py` prints it for the checkout). Any other value means the digest or a measured file differs from the release: the validator does not know the hash, and the CVM scores zero. Fix `.env` or `git checkout` the release tag, `sudo rm -rf run/vms/my-executor`, and run `new` again.
 
    Everything attestation-related inside the guest — sysbox force-install, digest-pinned runner, quote generation — is baked into the measured compose; there is nothing to configure in the guest.
 
@@ -130,9 +133,10 @@ Per release:
 ```bash
 sudo ./lium-cvm.sh stop my-executor
 git pull                                   # the release tag
-# update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes
+# update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes ("CVM attestation")
 sudo rm -rf run/vms/my-executor            # see warning below
 sudo ./lium-cvm.sh new my-executor
+sha256sum run/vms/my-executor/shared/app-compose.json   # = the release's expected compose hash
 sudo ./lium-cvm.sh run my-executor
 ```
 
