@@ -22,6 +22,9 @@ class DindProbeResult:
     sysbox_runtime: bool
     port: PortPair | None
     log_text: str | None = None
+    # DAH-2856: plain-words cause when the container started but sshd never answered, read from the
+    # container's own logs before removal (None when the probe passed or never got that far).
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,8 @@ class PortVerificationResult:
     status: str
     error: str | None = None
     elapsed_sec: float | None = None
+    # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
+    dind_error: str | None = None
 
 
 @dataclass(frozen=True)

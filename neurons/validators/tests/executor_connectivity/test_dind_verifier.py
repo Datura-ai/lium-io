@@ -3,7 +3,7 @@ from typing import Any, NamedTuple
 
 import pytest
 
-from services.executor_connectivity.dind_probe import DindVerifier
+from services.executor_connectivity.dind_probe import DindVerifier, diagnose_dind_log
 from services.executor_connectivity.models import PortPair
 
 
@@ -20,18 +20,27 @@ class StartedDind(NamedTuple):
     ssh_client: Any
 
 
-def _build_started_dind(mocker) -> StartedDind:
+def _executor_host(mocker, container_log: str = ""):
+    """The executor host's ssh session: `docker run` succeeds, the DAH-2856 diagnostics read returns
+    `container_log`, everything else (the remove) succeeds silently."""
+    async def run(cmd: str):
+        if "docker run" in cmd:
+            return _run_result(mocker, exit_status=0, stdout="container_id")
+        if "docker logs" in cmd:
+            return _run_result(mocker, exit_status=0, stdout=container_log)
+        return _run_result(mocker, exit_status=0, stdout="")
+
+    ssh_client = mocker.AsyncMock()
+    ssh_client.run = mocker.AsyncMock(side_effect=run)
+    return ssh_client
+
+
+def _build_started_dind(mocker, container_log: str = "") -> StartedDind:
     # a probe whose `docker run` already succeeded, so the test starts at the SSH step
     ssh_service = mocker.Mock()
     ssh_service.generate_keypair.return_value = ("priv", "pub")
 
-    ssh_client = mocker.AsyncMock()
-    ssh_client.run = mocker.AsyncMock(
-        side_effect=[
-            _run_result(mocker, exit_status=0, stdout="container_id"),
-            _run_result(mocker, exit_status=0, stdout=""),
-        ]
-    )
+    ssh_client = _executor_host(mocker, container_log)
 
     mocker.patch(
         "services.executor_connectivity.dind_probe.asyncssh.import_private_key",
@@ -167,13 +176,7 @@ async def test_dind_verifier_hung_connect_fails_within_timeout(mocker):
     ssh_service = mocker.Mock()
     ssh_service.generate_keypair.return_value = ("priv", "pub")
 
-    ssh_client = mocker.AsyncMock()
-    ssh_client.run = mocker.AsyncMock(
-        side_effect=[
-            _run_result(mocker, exit_status=0, stdout="container_id"),
-            _run_result(mocker, exit_status=0, stdout=""),
-        ]
-    )
+    ssh_client = _executor_host(mocker)
 
     mocker.patch(
         "services.executor_connectivity.dind_probe.asyncssh.import_private_key",
@@ -392,3 +395,126 @@ async def test_dind_verifier_hung_inner_docker_run_degrades_sysbox(mocker):
     assert result.sysbox_runtime is False
     assert seen_timeouts == [30]
     connect.assert_called_once()
+
+
+# DAH-2856 — a container that started but whose sshd never answered names its real cause.
+
+# verbatim from daturaai/dind:0.0.1 on an nftables-mode host (EC2 run 20260917T180704Z-2185): 333 chars
+NFT_HOST_DOCKERD_LOG = (
+    "[INFO] [/usr/local/bin/start-docker.sh] dockerd is running\n"
+    'time="2026-09-17T18:09:34.568850375Z" level=info msg="Loading containers: start."\n'
+    "failed to start daemon: Error initializing network controller: error obtaining controller instance: "
+    'failed to register "bridge" driver: failed to create NAT chain DOCKER: iptables failed: '
+    "iptables --wait -t nat -N DOCKER: iptables v1.8.10 (legacy): can't initialize iptables table `nat': "
+    "Table does not exist (do you need to insmod?)\n"
+    "Perhaps iptables or your kernel needs to be upgraded.\n"
+    " (exit status 3)\n"
+)
+
+
+def test_diagnose_dind_log_names_the_iptables_cause_and_quotes_dockerd():
+    code, words = diagnose_dind_log(NFT_HOST_DOCKERD_LOG)
+    assert code == "DIND_INNER_DOCKERD_IPTABLES"
+    assert "nf_tables" in words and "modprobe" in words
+    # the provider sees dockerd's own line, not only the validator's reading of it
+    assert "dockerd said: failed to start daemon" in words
+    assert "Table does not exist (do you need to insmod?)" in words  # the whole 333-char line survives the cap
+    assert "\n" not in words
+
+
+def test_diagnose_dind_log_generic_when_nothing_matches():
+    code, words = diagnose_dind_log("")
+    assert code == "DIND_SSHD_NOT_READY" and "no dockerd error" in words
+    assert diagnose_dind_log(None)[0] == "DIND_SSHD_NOT_READY"
+    code, words = diagnose_dind_log("failed to start daemon: something else")
+    assert code == "DIND_INNER_DOCKERD_DOWN" and "dockerd said: failed to start daemon: something else" in words
+
+
+def test_diagnose_dind_log_caps_the_quoted_line_head_first():
+    code, words = diagnose_dind_log("failed to start daemon: " + "x" * 2000)
+    assert code == "DIND_INNER_DOCKERD_DOWN"
+    assert "dockerd said: failed to start daemon: xxx" in words
+    assert len(words) < 500
+
+
+@pytest.mark.asyncio
+async def test_dind_verifier_reads_the_container_log_before_removing_it(mocker):
+    """DAH-2856: sshd never answers → the probe reads the container's logs while it still exists,
+    the result carries the cause, and the container is removed afterwards (ticket-0309 got
+    "install sysbox" for a host whose inner dockerd could not use legacy iptables)."""
+    port = PortPair(9000, 9000)
+    verifier, ssh_client = _build_started_dind(mocker, container_log=NFT_HOST_DOCKERD_LOG)
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_READY_TIMEOUT_SECONDS", 0.05)
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_POLL_INTERVAL_SECONDS", 0.01)
+    mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect",
+        new=mocker.AsyncMock(side_effect=ConnectionRefusedError("[Errno 111] Connect call failed")),
+    )
+
+    result = await verifier.verify(
+        port, ssh_client=ssh_client, host="127.0.0.1", container_name_prefix="container_miner", sysbox=True
+    )
+
+    assert result.success is False
+    assert result.error is not None and result.error.startswith("DIND_INNER_DOCKERD_IPTABLES: ")
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    logs_index = next(i for i, c in enumerate(commands) if "docker logs" in c)
+    remove_index = next(i for i, c in enumerate(commands) if "docker rm -fv" in c)
+    assert logs_index < remove_index
+    assert "container_miner_9000" in commands[logs_index]
+    assert "/var/log/dockerd.err.log" in commands[logs_index]
+
+
+@pytest.mark.asyncio
+async def test_dind_verifier_no_diagnosis_when_docker_run_itself_failed(mocker):
+    """No container, nothing to read: the docker-run failure path stays as it was."""
+    port = PortPair(9000, 9000)
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair.return_value = ("priv", "pub")
+    ssh_client = mocker.AsyncMock()
+    ssh_client.run = mocker.AsyncMock(
+        side_effect=[
+            _run_result(mocker, exit_status=125, stderr="docker: Error response from daemon: port is already allocated"),
+            _run_result(mocker, exit_status=0, stdout=""),
+        ]
+    )
+
+    result = await DindVerifier(ssh_service).verify(
+        port, ssh_client=ssh_client, host="127.0.0.1", container_name_prefix="container_miner", sysbox=True
+    )
+
+    assert result.success is False
+    assert result.error is None
+    assert not any("docker logs" in call.args[0] for call in ssh_client.run.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_dind_verifier_diagnosis_read_failure_still_returns_a_cause(mocker):
+    """The log read is best-effort: a host that refuses it still yields the generic cause and the
+    container is still removed."""
+    port = PortPair(9000, 9000)
+    verifier, ssh_client = _build_started_dind(mocker)
+
+    async def run(cmd: str):
+        if "docker run" in cmd:
+            return _run_result(mocker, exit_status=0, stdout="container_id")
+        if "docker logs" in cmd:
+            raise OSError("ssh channel closed")
+        return _run_result(mocker, exit_status=0, stdout="")
+
+    ssh_client.run = mocker.AsyncMock(side_effect=run)
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_READY_TIMEOUT_SECONDS", 0.05)
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_POLL_INTERVAL_SECONDS", 0.01)
+    mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect",
+        new=mocker.AsyncMock(side_effect=ConnectionRefusedError("[Errno 111] Connect call failed")),
+    )
+
+    result = await verifier.verify(
+        port, ssh_client=ssh_client, host="127.0.0.1", container_name_prefix="container_miner", sysbox=True
+    )
+
+    assert result.success is False
+    assert result.error is not None and result.error.startswith("DIND_SSHD_NOT_READY: ")
+    assert "Connect call failed" in result.error  # the ssh error itself is the only fact left
+    assert any("docker rm -fv" in call.args[0] for call in ssh_client.run.await_args_list)

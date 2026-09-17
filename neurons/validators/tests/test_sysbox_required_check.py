@@ -70,3 +70,45 @@ async def test_disabled_flag_skips_enforcement(context_factory, monkeypatch):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.DISABLED.reason
+
+
+@pytest.mark.asyncio
+async def test_no_sysbox_with_dind_probe_error_names_the_cause(context_factory):
+    """DAH-2856: when the probe's container never answered on sshd, the verdict says why instead of
+    "install sysbox" (ticket-0309: three reinstalls on a host whose inner dockerd could not use
+    legacy iptables). Scoring is unchanged: still a failed check."""
+    cause = "DIND_INNER_DOCKERD_IPTABLES: the inner dockerd cannot use legacy iptables"
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
+    assert result.event.what_we_saw["dind_probe_error"] == cause
+    assert cause in result.event.remediation
+    assert "reinstalling sysbox does not change it" in result.event.remediation
+    assert "Install the sysbox runtime" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_no_sysbox_with_unknown_dind_cause_does_not_claim_sysbox_is_irrelevant(context_factory):
+    """DIND_SSHD_NOT_READY means the log showed nothing: the verdict quotes it and says no more."""
+    cause = "DIND_SSHD_NOT_READY: sshd inside the DinD container did not answer within 30s and its log shows no dockerd error"
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert cause in result.event.remediation
+    assert "reinstalling sysbox" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_no_sysbox_without_dind_probe_error_keeps_the_install_advice(context_factory):
+    ctx = context_factory(state=build_state(sysbox_runtime=False))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.remediation == Msg.SYSBOX_MISSING.remediation
+    assert "dind_probe_error" not in result.event.what_we_saw
