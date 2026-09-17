@@ -572,8 +572,9 @@ class Settings(BaseSettings):
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
         description=(
             "Readiness budget for the inner DinD dockerd: this many one-second probes; each probe is "
-            "bounded by min(this value, 10) s (a hung `docker info` ends the wait). Zero or negative "
-            "would cancel the only probe, so the setting refuses them at load time."
+            "bounded by min(this value, 10) s (a `docker info` that hangs counts as one not-ready "
+            "probe). Zero or negative would cancel the only probe, so the setting refuses them at "
+            "load time."
         ),
     )
     CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS: int = Field(
