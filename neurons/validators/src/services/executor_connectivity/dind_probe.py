@@ -26,6 +26,15 @@ DIND_SSH_READY_TIMEOUT_SECONDS = 30
 DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 
+# DAH-3593: failures that come from the node or the network between us — a connect/login timeout,
+# a refused or dropped socket, an SSH error from the container's sshd. Logged at WARNING without a
+# traceback; every other exception in the probe is ours and stays ERROR.
+_NODE_SIDE_ERRORS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    asyncssh.Error,
+    OSError,  # includes ConnectionError: refused, reset, unreachable
+)
+
 
 class DindVerifier:
     """Verifies Docker-in-Docker capability."""
@@ -57,7 +66,14 @@ class DindVerifier:
             result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+                # DAH-3593: the host's dockerd refused the run (a port already bound on the host,
+                # most of the time) — the provider's state; the verdict line scores it.
+                logger.warning(
+                    _m(
+                        "DinD creation failed",
+                        extra=get_extra_info({**log_ctx, "reason": "dind_run_refused_by_host", "error": error_msg}),
+                    )
+                )
                 await ssh_client.run(DockerCommand.remove_with_volumes(name))
                 return DindProbeResult(
                     success=False,
@@ -113,10 +129,23 @@ class DindVerifier:
             )
 
         except Exception as e:
-            logger.error(
-                _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
-                exc_info=True,
-            )
+            if isinstance(e, _NODE_SIDE_ERRORS):
+                # DAH-3593: sshd inside the DinD container never answered, or the node dropped the
+                # connection — one WARNING per executor per cycle, no traceback. Anything else is
+                # the validator's own failure and keeps ERROR with the traceback.
+                logger.warning(
+                    _m(
+                        "DinD check failed",
+                        extra=get_extra_info(
+                            {**log_ctx, "reason": "dind_node_unreachable", "error": str(e) or type(e).__name__}
+                        ),
+                    )
+                )
+            else:
+                logger.error(
+                    _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
+                    exc_info=True,
+                )
             await ssh_client.run(DockerCommand.remove_with_volumes(name))
             return DindProbeResult(
                 success=False,
@@ -185,7 +214,9 @@ class DindVerifier:
             )
             return connection
 
-        logger.warning(
+        # DAH-3593: DEBUG — the caller logs the error this raises, so this was a second line for
+        # the same outcome.
+        logger.debug(
             _m(
                 "DinD SSH not ready before deadline",
                 extra=get_extra_info(

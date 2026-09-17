@@ -968,10 +968,8 @@ async def test_exec_in_container_keeps_original_restart_conflict_after_retry_bud
     api_client.remaining_restarts = 10
     client = RentalDockerSdkClient(api_client)
 
-    with pytest.raises(
-        RentalDockerOperationError,
-        match="Container abc123 is restarting, wait until the container is running",
-    ):
+    # DAH-3593: the message names the container state; Docker's 409 text rides as the cause
+    with pytest.raises(RentalDockerOperationError, match="^container restarting, exit_code=") as raised:
         await client.exec_in_container(
             ContainerExecSpec(
                 container_name="pod_exec",
@@ -979,9 +977,13 @@ async def test_exec_in_container_keeps_original_restart_conflict_after_retry_bud
             )
         )
 
+    assert "Container abc123 is restarting, wait until the container is running" in str(
+        raised.value.__cause__
+    )
     assert len(api_client.exec_created) == 3
     assert api_client.exec_started == []
-    assert api_client.containers_inspected == ["pod_exec", "pod_exec", "pod_exec"]
+    # three readiness inspects, then one more to read the exit code for the message
+    assert api_client.containers_inspected == ["pod_exec", "pod_exec", "pod_exec", "pod_exec"]
 
 
 @pytest.mark.asyncio
