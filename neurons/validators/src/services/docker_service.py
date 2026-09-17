@@ -4721,8 +4721,11 @@ class DockerService:
             #    `ready_timeout_s` probes a second apart (the budget the loop
             #    always had), each probe bounded by `probe_timeout_s` so a hung
             #    `docker info` ends the wait instead of holding the build for
-            #    an hour. Worst case, probes that each take the whole bound and
-            #    answer "not ready": N * (10 + 1) s, 11 min at the default 60.
+            #    an hour. A probe that hits its bound is "not ready" like an
+            #    exit 1 (taiberium, #1381: aborting there rejected a DinD that
+            #    was still starting), and the next probe follows at once.
+            #    Worst case, probes that each take the whole bound and answer
+            #    "not ready": N * 10 s, 10 min at the default 60.
             #    `ready_timeout_s` is `gt=0` in settings, so at least one probe
             #    runs.
             ready = False
@@ -4735,9 +4738,9 @@ class DockerService:
                         timeout=probe_timeout_s,
                     )
                 except asyncio.TimeoutError:
-                    # A probe that does not return in its bound is a dockerd
-                    # that is not answering: stop here.
-                    break
+                    # dockerd did not answer within the bound: not ready yet.
+                    # The probe already used its bound, so no extra sleep.
+                    continue
                 if probe.exit_status == 0:
                     ready = True
                     break
