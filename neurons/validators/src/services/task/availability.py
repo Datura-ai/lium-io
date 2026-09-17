@@ -22,12 +22,15 @@ class ReachSource(StrEnum):
 
     VALIDATOR = "validator"
     CONTAINER = "container"
+    MINER = "miner"
 
 
 class ReachTarget(StrEnum):
     """What could not be reached. Add a member for every new reachability check."""
 
     EXECUTOR_SSH = "executor_ssh"
+    # The executor's HTTP API, which the miner calls to install the validator's SSH key.
+    EXECUTOR_API = "executor_api"
 
 
 # The longest peer-supplied text a reading may keep: the node writes it, the portal shows it.
@@ -44,6 +47,8 @@ class AvailabilityErrorCode(StrEnum):
     """The code the backend stores and the portal shows. One per check."""
 
     EXECUTOR_SSH_UNREACHABLE = "EXECUTOR_SSH_UNREACHABLE"
+    # DAH-3558: the backend lists the executor as rented, the miner answered the wave without it.
+    RENTED_EXECUTOR_NOT_LISTED = "RENTED_EXECUTOR_NOT_LISTED"
 
 
 def build_availability_event(
@@ -129,6 +134,38 @@ def build_ssh_unreachable_event(
             # The node's own sshd writes this text, and the provider portal renders it, so the
             # node is not allowed to store a reading of any length it likes.
             "error": error[:MAX_PEER_TEXT_LENGTH],
+        },
+    )
+
+
+def build_rented_executor_not_listed_event(
+    *, executor_uuid: str, host: str, port: int | None, miner_hotkey: str
+) -> ValidationEvent:
+    """DAH-3558: a rented node the miner left out of its answer to the wave.
+
+    The miner returns only executors that took its SSH key upload, so a node that is down (or
+    whose executor daemon is down) is simply absent and no pipeline runs for it. This event is
+    the wave's record of that: the backend lists the executor as rented, the miner does not.
+    """
+    return build_availability_event(
+        code=AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED,
+        reach_source=ReachSource.MINER,
+        reach_target=ReachTarget.EXECUTOR_API,
+        event_text="Rented node missing from the miner's answer",
+        impact=(
+            "Score 0 for this cycle; the node is hidden from the market until a cycle lists it "
+            "again. The backend's staleness sweep reads this row as the node not answering."
+        ),
+        remediation=(
+            "The miner could not install the validator's SSH key on this executor, so it left it "
+            "out. Check that the node is up, the executor container is running and its API port "
+            "answers the miner."
+        ),
+        what_we_saw={
+            "executor_uuid": executor_uuid,
+            "executor_ip_address": host,
+            "executor_port": port,
+            "miner_hotkey": miner_hotkey,
         },
     )
 
