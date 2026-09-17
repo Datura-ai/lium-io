@@ -148,6 +148,10 @@ class ContextState:
     # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
     # needs both to hand create_container the ports as the backend would.
     verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
+    # DAH-2856: why the DinD probe's container never answered on sshd this cycle ("<CODE>: <plain
+    # words>"), read from the container's logs; None when the probe passed or failed earlier.
+    # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox".
+    dind_probe_error: str | None = None
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None

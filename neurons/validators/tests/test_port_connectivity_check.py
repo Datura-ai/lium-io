@@ -52,6 +52,7 @@ class DummyConnectivityService:
         verified_port_count: int = 0,
         status: str | None = None,
         dind_ok: bool | None = None,
+        dind_error: str | None = None,
     ):
         """
         Args:
@@ -62,6 +63,7 @@ class DummyConnectivityService:
             status: Override the status field (e.g., "skipped_rental_active")
             dind_ok: Override whether the DinD probe reached its container (default: success)
         """
+        self.dind_error = dind_error
         self.success = success
         self.log_text = log_text
         self.sysbox_runtime = sysbox_runtime
@@ -117,6 +119,7 @@ class DummyConnectivityService:
             status=status,
             error=error,
             elapsed_sec=1.0,
+            dind_error=self.dind_error,
         )
 
 
@@ -407,3 +410,37 @@ def test_dind_probe_grace_ttl_rejects_zero_and_negative(bad):
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS=bad)
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_carries_the_dind_probe_cause_into_state(context_factory):
+    """DAH-2856: the probe's cause reaches ContextState.dind_probe_error (SysboxRequiredCheck reads it)
+    and the check's extra, and is None when the probe had nothing to say."""
+    cause = "DIND_INNER_DOCKERD_IPTABLES: the inner dockerd cannot use legacy iptables"
+    services = build_services(
+        redis=DummyRedis(renting_in_progress=False),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True, sysbox_runtime=False, verified_port_count=100, dind_error=cause
+        ),
+    )
+    ctx = context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=build_state(), rented=False
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].dind_probe_error == cause
+    assert result.updates["default_extra"]["dind_error"] == cause
+
+    services = build_services(
+        redis=DummyRedis(renting_in_progress=False),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(success=True, sysbox_runtime=True, verified_port_count=100),
+    )
+    ctx = context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=build_state(), rented=False
+    )
+    result = await PortConnectivityCheck().run(ctx)
+    assert result.updates["state"].dind_probe_error is None
+    assert "dind_error" not in result.updates["default_extra"]
