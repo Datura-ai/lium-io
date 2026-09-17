@@ -677,6 +677,11 @@ async def test_A13_egress_failure_aborts_before_build(svc, monkeypatch):
     # But the DinD container is still torn down.
     assert any(f"docker rm -fv" in c and f"lium-dind-build-{payload.pod_id}" in c
                for c in ssh_client.calls)
+    # And so are the egress rules (taiberium, #1381): an apply that timed out may have inserted
+    # some of them before the deadline. The remove script is idempotent, so it runs whenever the
+    # DinD IP is known, not only after a successful apply.
+    remove_runs = [c for c in ssh_client.calls if "--network=host" in c and "-D DOCKER-USER" in c]
+    assert len(remove_runs) == 1 and "172.20.0.2" in remove_runs[0]
 
 
 # ------------------------------------------------------------------
