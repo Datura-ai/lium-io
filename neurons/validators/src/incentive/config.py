@@ -52,11 +52,12 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
 # `{1: 10, 8: 64}` — 10 single-GPU machines (10 GPUs) and 8 full chassis (8×8 = 64
 # GPUs), matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
 #
-# B300 1× bucket = 7 (DAH-3601, P157, 17 Sep 2026): renters held at most 6 single
+# B300 1× bucket = 5 (DAH-3601, P157/P164, 17 Sep 2026): renters held at most 6 single
 # B300 cards at once over 3–17 Sep (p95 = 5) while 17 were listed and 12 sat idle,
-# so the bucket pays for demand p95 + 2 cards. The 8× bucket is unchanged.
+# so the bucket pays for demand p95 cards (Fish, 14:40Z: 7 "would be lower"). The
+# 8× bucket is unchanged.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
-    "B300": {1: 7, 8: 32},
+    "B300": {1: 5, 8: 32},
     "B200": {1: 10, 8: 64},
     "H200": {1: 10, 8: 64},
     "H100": {1: 10, 8: 64},
