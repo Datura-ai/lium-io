@@ -170,6 +170,7 @@ def _make_dind_ssh(
     dind_start_hangs: bool = False,
     ready_exit: int = 0,
     ready_hangs: bool = False,
+    ready_hangs_first: int = 0,
     dind_ip: str = "172.20.0.2",
     resolv_conf: str = "nameserver 8.8.8.8\n",
     resolv_exit: int = 0,
@@ -183,7 +184,9 @@ def _make_dind_ssh(
     `execute_and_stream_logs`, not `ssh.run`. `dind_start_hangs` makes the
     `run -d` raise `asyncio.TimeoutError`, what asyncssh raises when the
     command outlives its `timeout=`; `ready_hangs` makes every readiness
-    probe block for an hour (a hung host dockerd).
+    probe block for an hour (a hung host dockerd); `ready_hangs_first=n` makes
+    only the first n probes hang (a dockerd still starting), the rest answer
+    `ready_exit`.
     """
     calls: list[str] = []
     call_kwargs: list[dict] = []
@@ -202,7 +205,8 @@ def _make_dind_ssh(
                 raise asyncio.TimeoutError()
             return _ssh_result(exit_status=dind_start_exit, stdout="dind-cid")
         if "docker exec" in cmd and cmd.rstrip().endswith("docker info"):
-            if ready_hangs:
+            probes_so_far = sum(1 for c in calls if c.rstrip().endswith("docker info"))
+            if ready_hangs or probes_so_far <= ready_hangs_first:
                 # asyncssh: a command that outlives `timeout=` raises TimeoutError
                 # after that long; without a bound it blocks for the hour.
                 await asyncio.sleep(kw["timeout"] if kw.get("timeout") else 3600)
@@ -1064,6 +1068,33 @@ async def test_A23c_readiness_keeps_its_probe_budget_when_probes_fail_fast(svc, 
     probes = [k for c, k in zip(ssh_client.calls, ssh_client.call_kwargs) if c.rstrip().endswith("docker info")]
     # two probes, one second apart, each bounded by min(N, 10) = 2 s
     assert len(probes) == 2 and all(k.get("timeout") == 2 for k in probes)
+
+
+@pytest.mark.asyncio
+async def test_A23d_a_probe_that_hits_its_bound_is_not_ready_and_the_next_probe_runs(svc, monkeypatch):
+    """Regression (taiberium, #1381, 17 Sep): a probe that timed out ended the
+    loop, so a DinD whose first `docker info` was slow while dockerd started was
+    rejected at `build_dind_unready` although the next probe would have passed.
+    A timeout is now "not ready" like an exit 1, and the remaining probes run."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", 3)
+    ssh_client = _make_dind_ssh(ready_hangs_first=1)
+    esl = _make_esl()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await asyncio.wait_for(
+        svc._custom_build_image(
+            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
+        ),
+        timeout=20,
+    )
+    assert ok is True and step is None
+    probes = [c for c in ssh_client.calls if c.rstrip().endswith("docker info")]
+    # the first probe hit its 3 s bound, the second answered ready, no third
+    assert len(probes) == 2
+    assert any("docker build" in c for c in esl.seen)
 
 
 @pytest.mark.asyncio
