@@ -9,6 +9,7 @@ import asyncio
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -42,6 +43,7 @@ READ_ONLY_PROGRAMS = {"cat", "echo", "head", "test", "hostname", "printf"}
 READ_ONLY_DOCKER_VERBS = {"info", "images", "ps", "logs", "inspect"}
 READ_ONLY_DOCKER_IMAGE_VERBS = {"inspect", "ls", "history"}
 _FD_DUP = re.compile(r"^\d*>&(\d+|-)$")  # 2>&1, 1>&3, 3>&- : fd plumbing, no file written
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")  # `ids=$(…)`: a shell variable, no file written
 
 
 def _segments(command: str):
@@ -177,6 +179,10 @@ def _is_read_only(words: list[str]) -> bool:
         return True
     if ">" in " ".join(words):  # any remaining redirect writes a file
         return False
+    if "`" in " ".join(words):  # a backtick substitution is never lifted by _segments, so it is never checked: refuse it
+        return False
+    if len(words) == 1 and _ASSIGNMENT.match(words[0]):  # a plain assignment; the `$(…)` it holds was lifted and checked
+        return True
     if words[0] in READ_ONLY_PROGRAMS:
         return True
     if words[0] == "docker" and len(words) > 1:
@@ -193,7 +199,8 @@ def test_every_command_is_read_only():
             assert _is_read_only(words), f"{label}: {' '.join(words)!r} is not on the read-only allow-list"
     # the allow-list itself refuses what the ticket must never do, wrapped or not
     for bad in ("docker compose pull", "docker update --restart=no c", "docker container create x", "docker rm x",
-                "docker image prune", "cat a > /etc/docker/daemon.json", "docker ps > /tmp/x", "systemctl restart docker"):
+                "docker image prune", "cat a > /etc/docker/daemon.json", "docker ps > /tmp/x", "systemctl restart docker",
+                "ids=`docker rm x`", "ids=$(docker rm x); docker inspect $ids"):  # an assignment hides nothing
         assert not all(_is_read_only(w) for w in _segments(bad)), bad
         assert not all(_is_read_only(w) for w in _segments(ieh.capped(bad))), bad
 
@@ -491,14 +498,14 @@ def _report_with(outputs: dict[str, str]) -> "ieh.NodeReport":
     return report
 
 
-def _running(*containers: tuple[str, str, list[str] | None]) -> dict[str, str]:
-    """The two reads for running containers: ``(name, image id, RepoDigests)`` per container, as docker prints them."""
-    names = "\n".join(f"/{name} {image_id}" for name, image_id, _ in containers)
+def _running(*containers: tuple[str, str, list[str] | None], extra_container_lines: str = "") -> dict[str, str]:
+    """The one `running_containers` read: ``(name, image id, RepoDigests)`` per container, as docker prints the two halves."""
+    names = "\n".join(f"/{name} {image_id}" for name, image_id, _ in containers) + extra_container_lines
     digests = "\n".join(f"{image_id} {json.dumps(repo_digests)}" for _, image_id, repo_digests in containers)
-    return {"running_containers": names, "running_image_digests": digests}
+    return {"running_containers": f"{names}\n{ieh.RUNNING_IMAGES_SECTION}\n{digests}"}
 
 
-STANDARD_STACK = _running(
+STANDARD_CONTAINERS = (
     ("executor-executor-1", "sha256:" + "e" * 64, [f"{ieh.EXECUTOR_IMAGE}@{EXECUTOR_OLD_DIGEST}"]),
     ("executor-monitor-1", "sha256:" + "e" * 64, [f"{ieh.EXECUTOR_IMAGE}@{EXECUTOR_OLD_DIGEST}"]),
     ("executor-executor-runner-1", "sha256:" + "a" * 64, [f"{ieh.RUNNER_IMAGE}@{OLD_DIGEST}"]),
@@ -506,6 +513,7 @@ STANDARD_STACK = _running(
     ("executor-autoheal-1", "sha256:" + "d" * 64, []),  # a locally built image has no RepoDigests
     ("executor-nginx-1", "sha256:" + "f" * 64, None),  # some engines print `null` instead of `[]`
 )
+STANDARD_STACK = _running(*STANDARD_CONTAINERS)
 
 
 def test_summary_reads_mirror_daemon_json_digests_and_where_the_shell_ran():
@@ -620,16 +628,87 @@ def test_summary_reports_zero_and_several_runner_containers_instead_of_picking_o
 
 def test_summary_marks_a_daemon_json_directory_and_a_failed_container_read():
     report = _report_with({"daemon_json": ieh.DAEMON_JSON_IS_DIR, **STANDARD_STACK})
-    report.outputs["running_image_digests"] = ieh.CommandOutput(1, "", "Error: No such object:")
+    report.outputs["running_containers"] = ieh.CommandOutput(1, "", "Error: No such object:")
     row = ieh.summarise(report, HUB)
     assert row["daemon_json"] == "DIR"
     assert (row["executor_running"], row["executor_vs_hub"], row["runner_running"], row["runner_vs_hub"]) == ("?", "?", "?", "?")
 
-    # a container that started between the two `docker ps -q` has no digest line: "?", never "none"
-    skewed = _report_with(STANDARD_STACK)
-    skewed.outputs["running_containers"].stdout += "\n/executor-executor-runner-2 sha256:" + "9" * 64
+    # a container line whose image has no digest line (an inspect error on that id): "?", never "none"
+    skewed = _report_with(_running(*STANDARD_CONTAINERS, extra_container_lines="\n/executor-executor-runner-2 sha256:" + "9" * 64))
     row = ieh.summarise(skewed, HUB)
     assert (row["runner_running"], row["runner_vs_hub"]) == ("?", "?")
+
+    # the cap cut the read before the image half: no section line, "?"
+    cut = _report_with(STANDARD_STACK)
+    cut.outputs["running_containers"].stdout = cut.outputs["running_containers"].stdout.split(ieh.RUNNING_IMAGES_SECTION)[0]
+    row = ieh.summarise(cut, HUB)
+    assert (row["executor_running"], row["runner_running"]) == ("?", "?")
+
+
+_FAKE_DOCKER = r"""#!/bin/sh
+# `docker ps -q` answers one more container on every call; the inspects answer for whatever ids they are given.
+case "$1 $2" in
+  "ps -q")
+    n=$(cat "$PS_CALLS" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$PS_CALLS"
+    i=0; while [ "$i" -lt "$n" ]; do echo "c$i"; i=$((i + 1)); done ;;
+  "inspect --format")
+    fmt=$3; shift 3
+    for id in "$@"; do
+      case "$fmt" in *Name*) echo "/ctr-$id sha256:img-$id" ;; *) echo "sha256:img-$id" ;; esac
+    done ;;
+  "image inspect")
+    shift 4
+    for id in "$@"; do echo "$id [\"daturaai/compute-subnet-executor-runner@sha256:digest-${id#sha256:img-}\"]"; done ;;
+  *) echo "fake docker: $*" >&2; exit 2 ;;
+esac
+"""
+
+
+def test_running_containers_come_from_one_docker_ps_snapshot(tmp_path, monkeypatch):
+    """Regression: two `docker ps -q` calls; a container that started in between appeared only in the digest read and its image read `none running` (Rustam, #1385)."""
+    docker = tmp_path / "docker"
+    docker.write_text(_FAKE_DOCKER)
+    docker.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("PS_CALLS", str(tmp_path / "ps_calls"))
+    command = dict(ieh.COMMANDS)["running_containers"]
+    assert command.count("docker ps") == 1
+
+    done = subprocess.run(["sh", "-c", ieh.capped(command)], capture_output=True, text=True, timeout=30)
+
+    stdout, rc = ieh.split_exit_status(done.stdout)
+    assert (tmp_path / "ps_calls").read_text().strip() == "1"  # one snapshot, however many inspects follow
+    by_repo = ieh.running_digests_by_repo({"running_containers": ieh.CommandOutput(rc, stdout, done.stderr)})
+    assert by_repo == {ieh.RUNNER_IMAGE: [("ctr-c0", "sha256:digest-c0")]}  # the one container the snapshot held, with its digest
+    row = ieh.summarise(_report_with({"running_containers": stdout}), ieh.HubDigests(runner="sha256:digest-c0"))
+    assert (row["runner_running"], row["runner_vs_hub"]) == ("sha256:digest-c0", "current")
+
+
+def test_a_missing_ids_file_reads_a_piped_stdin_and_refuses_a_terminal(tmp_path, monkeypatch, capsys):
+    """Regression: `--executor-ids nodes.txt` in a clean checkout read the file name as an executor id and died on `no miner hotkey` (Rustam, #1385)."""
+    monkeypatch.chdir(tmp_path)  # a clean checkout: no nodes.txt where the runbook tells the operator to save one
+    piped = io.StringIO(f"{EXECUTOR_ID} {MINER_HOTKEY}\n")  # StringIO.isatty() is False, like a shell pipe
+    assert ieh.read_ids_argument("nodes.txt", stdin=piped) == f"{EXECUTOR_ID} {MINER_HOTKEY}\n"
+    assert "nodes.txt: no such file, reading the node list from stdin" in capsys.readouterr().err
+    assert ieh.read_ids_argument(None, stdin=io.StringIO("a b\n")) == "a b\n"  # the default is stdin
+    assert ieh.read_ids_argument("-", stdin=io.StringIO("c d\n")) == "c d\n"  # `-` is stdin, as everywhere
+
+    class _Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    with pytest.raises(SystemExit, match=r"nodes.txt: no such file; pipe the list instead"):
+        ieh.read_ids_argument("nodes.txt", stdin=_Terminal())
+    with pytest.raises(SystemExit, match="no such file"):
+        ieh.read_ids_argument("lists/nodes", stdin=_Terminal())
+
+    existing = tmp_path / "nodes.txt"
+    existing.write_text("x y\n")
+    assert ieh.read_ids_argument(str(existing), stdin=_Terminal()) == "x y\n"  # an existing file is read, terminal or not
+    # inline ids never look like a file: no `/` or `.`, or a comma list, or several words
+    assert ieh.read_ids_argument("a,b", stdin=_Terminal()) == "a,b"
+    assert ieh.read_ids_argument(f"{EXECUTOR_ID} {MINER_HOTKEY}", stdin=_Terminal()) == f"{EXECUTOR_ID} {MINER_HOTKEY}"
+    assert ieh.read_ids_argument(EXECUTOR_ID, stdin=_Terminal()) == EXECUTOR_ID
 
 
 def test_split_exit_status_refuses_a_marker_the_cap_cut_in_half():

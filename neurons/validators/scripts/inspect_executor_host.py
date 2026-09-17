@@ -47,13 +47,17 @@ several containers on different digests are listed by name instead of one being 
 what it pulled and restarted; the runner (``executor-executor-runner-1``) says whether its
 ``docker compose up --wait`` came up healthy, which is where a stale executor's failed start shows.
 
-Usage (from the validator checkout, with the validator's env loaded):
+Usage (from the validator checkout, with the validator's env loaded). The node list comes on
+stdin by default; the repo ships no ``nodes.txt`` (review, taiberium 17 Sep: the documented
+``--executor-ids nodes.txt`` failed in a clean checkout):
 
-    cd neurons/validators && pdm run python scripts/inspect_executor_host.py --executor-ids nodes.txt
+    cd neurons/validators && pdm run python scripts/inspect_executor_host.py < nodes.txt
+    echo "<executor uuid> <miner hotkey>" | pdm run python scripts/inspect_executor_host.py
 
-``nodes.txt`` holds one ``<executor uuid> <miner hotkey>`` per line (``#`` starts a comment). A
-bare uuid needs ``--miner-hotkey`` to name the one miner it belongs to. ``--dry-run`` prints the
-plan and opens nothing.
+A line is ``<executor uuid> <miner hotkey>`` (``#`` starts a comment). A bare uuid needs
+``--miner-hotkey`` to name the one miner it belongs to. ``--executor-ids FILE`` reads the file
+when it exists; when it does not, the list is read from a piped stdin instead (a terminal gets an
+error naming both forms). ``--dry-run`` prints the plan and opens nothing.
 """
 
 from __future__ import annotations
@@ -107,6 +111,8 @@ TRUNCATED_NOTE = f"[truncated at {OUTPUT_CAP} bytes]"
 KEY_REMOVE_ATTEMPTS = 3
 KEY_REMOVE_RETRY_DELAY = 2.0  # seconds between attempts
 NO_READ_COMPLETED = "no read completed: the SSH session dropped after login"
+# The `running_containers` read prints the container→image lines, this line, then the image→RepoDigests lines.
+RUNNING_IMAGES_SECTION = "__inspect_images__"
 
 # Every command reads. ``test_every_command_is_read_only`` refuses a verb that writes.
 COMMANDS: tuple[tuple[str, str], ...] = (
@@ -121,15 +127,16 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("running", "docker ps --format '{{.Names}} {{.Image}}'"),
     (
         # the image each running container RUNS (name → image id), not the newest one pulled: a
-        # Watchtower that pulled and failed to restart leaves both on the host
+        # Watchtower that pulled and failed to restart leaves both on the host; then the repository
+        # digests of those image ids, after the RUNNING_IMAGES_SECTION line. ONE `docker ps -q`
+        # snapshot (`ids=`) feeds both halves: with two snapshots a container that started in
+        # between showed in one and not the other, and its image read `none running` (review,
+        # taiberium 17 Sep). `running_digests_by_repo` joins the two halves.
         "running_containers",
-        "docker inspect --format '{{.Name}} {{.Image}}' $(docker ps -q) 2>&1",
-    ),
-    (
-        # the repository digests of those image ids; `running_digests_by_repo` joins the two reads
-        "running_image_digests",
-        "docker image inspect --format '{{.Id}} {{json .RepoDigests}}'"
-        " $(docker inspect --format '{{.Image}}' $(docker ps -q)) 2>&1",
+        "ids=$(docker ps -q); docker inspect --format '{{.Name}} {{.Image}}' $ids 2>&1;"
+        f" echo {RUNNING_IMAGES_SECTION};"
+        " docker image inspect --format '{{.Id}} {{json .RepoDigests}}'"
+        " $(docker inspect --format '{{.Image}}' $ids) 2>&1",
     ),
     (
         "watchtower_log",
@@ -240,12 +247,32 @@ def parse_targets(text: str, default_hotkey: str | None) -> list[Target]:
     return targets
 
 
-def read_ids_argument(value: str | None) -> str:
-    if value is None:
-        return sys.stdin.read()
+STDIN_HINT = "pipe the list instead: `... < nodes.txt` or `echo \"<uuid> <hotkey>\" | ...`"
+
+
+def looks_like_a_path(value: str) -> bool:
+    """A file name, not an inline list: has `/` or `.`, which no executor uuid, hotkey or comma list has."""
+    return ("/" in value or "." in value) and "," not in value and not value.split()[1:]
+
+
+def read_ids_argument(value: str | None, stdin=None) -> str:
+    """The text `parse_targets` reads: stdin by default, the file when it exists, inline ids otherwise.
+
+    A file name that does not exist (`--executor-ids nodes.txt` in a clean checkout, which ships no
+    such file) is not an executor id: when stdin is a pipe the list is read from there and stderr
+    says so; on a terminal the run stops and names both forms instead of waiting for keyboard input.
+    """
+    stdin = sys.stdin if stdin is None else stdin
+    if value is None or value == "-":
+        return stdin.read()
     path = pathlib.Path(value)
     if path.is_file():
         return path.read_text()
+    if looks_like_a_path(value):
+        if stdin.isatty():
+            raise SystemExit(f"--executor-ids {value}: no such file; {STDIN_HINT}")
+        print(f"--executor-ids {value}: no such file, reading the node list from stdin", file=sys.stderr)
+        return stdin.read()
     return value
 
 
@@ -452,23 +479,34 @@ def exit_code(reports: list[NodeReport]) -> int:
 
 
 def running_digests_by_repo(outputs: dict[str, CommandOutput]) -> dict[str, list[tuple[str, str]]] | None:
-    """``repository -> [(container name, digest)]`` for every running container; ``None`` when a read failed.
+    """``repository -> [(container name, digest)]`` for every running container; ``None`` when the read failed.
 
-    Joins ``running_containers`` (name, image id) with ``running_image_digests`` (image id,
-    RepoDigests). A container is matched by its image's repository, the way ``machine_scrape``
-    finds the executor container, never by its name.
+    Joins the two halves of the ``running_containers`` read: (name, image id) lines, the
+    ``RUNNING_IMAGES_SECTION`` line, then (image id, RepoDigests) lines, both from the one
+    ``docker ps -q`` snapshot. A container is matched by its image's repository, the way
+    ``machine_scrape`` finds the executor container, never by its name.
     """
-    containers = outputs.get("running_containers")
-    images = outputs.get("running_image_digests")
-    if containers is None or images is None or containers.exit_status != 0 or images.exit_status != 0:
+    read = outputs.get("running_containers")
+    if read is None or read.exit_status != 0:
         return None
+    container_lines: list[str] = []
+    image_lines: list[str] = []
+    section = container_lines
+    seen_marker = False
+    for line in read.stdout.splitlines():
+        if line.strip() == RUNNING_IMAGES_SECTION:
+            section, seen_marker = image_lines, True
+            continue
+        section.append(line)
+    if not seen_marker:
+        return None  # the cap cut the read before the image half; say "?" rather than "none"
     image_by_container: dict[str, str] = {}
-    for line in containers.stdout.splitlines():
+    for line in container_lines:
         parts = line.split()
         if len(parts) == 2 and parts[1].startswith("sha256:"):
             image_by_container[parts[0].lstrip("/")] = parts[1]
     repo_digests_by_image: dict[str, list[str]] = {}
-    for line in images.stdout.splitlines():
+    for line in image_lines:
         image_id, _, rest = line.partition(" ")
         if not image_id.startswith("sha256:"):
             continue
@@ -477,7 +515,7 @@ def running_digests_by_repo(outputs: dict[str, CommandOutput]) -> dict[str, list
         except (ValueError, TypeError):  # `null` for an image without RepoDigests, or a cut line
             continue
     if not set(image_by_container.values()) <= set(repo_digests_by_image):
-        return None  # a container started or stopped between the two `docker ps -q`; say "?" rather than "none"
+        return None  # an image line is missing (an inspect error, a cut); say "?" rather than "none"
     by_repo: dict[str, list[tuple[str, str]]] = {}
     for name, image_id in sorted(image_by_container.items()):
         for entry in repo_digests_by_image[image_id]:
@@ -702,7 +740,7 @@ async def run(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0], formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--executor-ids", metavar="FILE|id,id", help="file of `uuid [miner_hotkey]` lines, or ids inline; default: stdin")
+    parser.add_argument("--executor-ids", metavar="FILE|id,id", help="file of `uuid [miner_hotkey]` lines, or ids inline; default (or `-`): stdin; a missing file falls back to a piped stdin")
     parser.add_argument("--miner-hotkey", help="miner hotkey for every id that has none on its line")
     parser.add_argument("--axon", action="append", default=[], metavar="HOTKEY=IP:PORT", help="skip the metagraph lookup for this miner")
     parser.add_argument("--concurrency", type=int, default=4)
