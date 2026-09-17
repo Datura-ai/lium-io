@@ -42,7 +42,10 @@ from services.redis_service import (
     RedisService,
 )
 from services.task.availability import silence_availability_errors_on_our_own_outage
-from services.task.checks.rented_pod_ssh import flush_rented_pod_ssh_reports
+from services.task.checks.rented_pod_ssh import (
+    flush_rented_pod_ssh_reports,
+    silence_rented_pod_ssh_reports_on_our_own_outage,
+)
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import VerifyXValidationService
 
@@ -640,14 +643,34 @@ class Validator:
 
                     # DAH-2870: the rented-pod SSH reports queued this cycle go to the backend only
                     # when the fleet says the pods are at fault; a validator-side outage (the share
-                    # above, or most mapped ports refusing at once) notifies no renter.
+                    # above, or most mapped ports refusing at once) notifies no renter. The results
+                    # whose reports the gate held were rendered as RENTED_POD_SSH_UNREACHABLE before
+                    # the gate ran and say the renter was told: they are rewritten to RENTED here,
+                    # before the publish, so the stored event says what happened.
                     try:
-                        await flush_rented_pod_ssh_reports(
+                        ssh_gate = await flush_rented_pod_ssh_reports(
                             self.redis_service,
                             self.backend_client,
                             job_batch_id,
                             validator_outage=silenced_count > 0,
                         )
+                        rewritten_count = silence_rented_pod_ssh_reports_on_our_own_outage(
+                            cycle_results, ssh_gate
+                        )
+                        if rewritten_count:
+                            logger.warning(
+                                _m(
+                                    "[sync] rented-pod SSH reports held back this cycle; their events publish as RENTED",
+                                    extra=get_extra_info(
+                                        {
+                                            **self.default_extra,
+                                            "rewritten_results": rewritten_count,
+                                            "suppressed_by": ssh_gate.suppressed_by,
+                                            "held_pods": ssh_gate.due,
+                                        }
+                                    ),
+                                )
+                            )
                     except Exception as exc:
                         logger.error(
                             _m(

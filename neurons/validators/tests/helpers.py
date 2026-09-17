@@ -128,6 +128,9 @@ class FakeRedis:
         self.fail_next_set_of: set[str] = set()
         # key -> how many `set`s of it to let through before the one that raises (one shot each)
         self.fail_set_of_after: dict[str, int] = {}
+        # keys whose next DELETE fails (one shot each): a plain `delete`, or the whole batch when
+        # it sits inside write_atomically
+        self.fail_delete_of: set[str] = set()
         self.calls = 0
 
     def _touch(self):
@@ -139,8 +142,7 @@ class FakeRedis:
         self._touch()
         return self.store.get(key)
 
-    async def set(self, key: str, value: str, ex: int | None = None):
-        self._touch()
+    def _set_hook(self, key: str):
         if key in self.fail_next_set_of:
             self.fail_next_set_of.discard(key)
             raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
@@ -149,11 +151,50 @@ class FakeRedis:
                 del self.fail_set_of_after[key]
                 raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
             self.fail_set_of_after[key] -= 1
+
+    async def set(self, key: str, value: str, ex: int | None = None):
+        self._touch()
+        self._set_hook(key)
         self.store[key] = value
         self.ttl[key] = ex
 
+    async def write_atomically(self, writes):
+        """`RedisService.write_atomically`: all of `writes` or none. `fail_delete_of` names keys whose
+        DELETE fails the whole batch (the shape of a connection lost mid-transaction); the set hooks
+        above apply to every SET in the batch. A failing batch applies nothing."""
+        self._touch()
+        for name, args, _kwargs in writes.ops:
+            if name == "set":
+                self._set_hook(args[0])
+            if name == "delete" and args[0] in self.fail_delete_of:
+                self.fail_delete_of.discard(args[0])
+                raise redis.exceptions.ConnectionError(f"Connection lost deleting {args[0]}")
+        # EXEC: applied without the hooks (they were consumed above) and as one round trip
+        for name, args, kwargs in writes.ops:
+            if name == "set":
+                key, value = args
+                self.store[key] = value
+                self.ttl[key] = kwargs.get("ex")
+            elif name == "delete":
+                (key,) = args
+                self.store.pop(key, None)
+                self.hashes.pop(key, None)
+                self.ttl.pop(key, None)
+            elif name == "hset":
+                key, field, value = args
+                self.hashes.setdefault(key, {})[field] = value
+            elif name == "expire":
+                key, seconds = args
+                if key in self.store or key in self.hashes:
+                    self.ttl[key] = seconds
+            else:
+                raise AssertionError(f"FakeRedis.write_atomically: unknown write {name}")
+
     async def delete(self, key: str):
         self._touch()
+        if key in self.fail_delete_of:
+            self.fail_delete_of.discard(key)
+            raise redis.exceptions.ConnectionError(f"Connection lost deleting {key}")
         self.store.pop(key, None)
         self.hashes.pop(key, None)
         self.ttl.pop(key, None)

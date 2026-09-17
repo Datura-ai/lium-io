@@ -13,7 +13,8 @@ import socket
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from helpers import FakeRedis, build_context_config, build_services, build_state
+from helpers import FakeRedis, build_context_config, build_services, build_state, default_executor
+from neurons.validators.src.core.utils import _m
 from neurons.validators.src.services.task.checks import rented_pod_ssh
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.checks.rented_pod_ssh import (
@@ -25,6 +26,7 @@ from neurons.validators.src.services.task.checks.rented_pod_ssh import (
     tcp_connect_fault,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
+from neurons.validators.src.services.task.models import JobResult
 from protocol.vc_protocol.compute_requests import (
     PodSshUnreachableResponse,
     RentedExecutor,
@@ -349,6 +351,40 @@ async def test_a_redis_error_on_either_write_of_the_threshold_cycle_still_posts_
 
 
 @pytest.mark.asyncio
+async def test_a_healthy_cycle_whose_redis_write_is_lost_leaves_no_half_state(
+    context_factory, caplog
+):
+    # Rustam's review (17 Sep): the healthy cycle wrote the ok mark, then deleted the streak. A
+    # connection lost between the two left a fresh ok mark ("healthy now, on boot-b") next to the
+    # old streak, so the stored state contradicted itself and the next report carried a
+    # first_failed_at older than a recorded healthy sighting. Every transition is now one
+    # MULTI/EXEC: the lost write applies nothing, the ok mark still says boot-a, and the cycle is a
+    # skipped one (REDIS_UNAVAILABLE), exactly as when Redis is down for the whole cycle.
+    h = Harness(context_factory)
+    ok_key = f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"
+    fail_key = f"{rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX}:{POD_ID}"
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="boot-a")
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-a")
+    before = dict(h.redis.store)
+
+    h.redis.fail_delete_of.add(fail_key)
+    with caplog.at_level("WARNING", logger=rented_pod_ssh.__name__):
+        lost = await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="boot-b")
+
+    assert lost.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert h.redis.store == before, "a lost transaction must apply none of its writes"
+    assert json.loads(h.redis.store[ok_key])["boot_id"] == "boot-a"
+    assert any("RENTED_POD_SSH_PROBE_REDIS_UNAVAILABLE" in r.getMessage() for r in caplog.records)
+
+    # Redis back: the healthy cycle is recorded whole, and the streak starts over on the next fault.
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="boot-b")
+    assert h.streak() is None and json.loads(h.redis.store[ok_key])["boot_id"] == "boot-b"
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b")
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason and h.streak()["count"] == 1
+    h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_a_redis_blip_on_the_reported_mark_keeps_the_verdict_and_costs_one_more_post(
     context_factory,
 ):
@@ -653,6 +689,79 @@ async def test_the_cycles_executor_ssh_verdict_holds_the_reports_back_too(contex
     assert gate.posted == ["pod-a"] and fleet.reported("pod-a")
 
 
+def _job_result(check_result, pod_ids: list[str] | None = None) -> JobResult:
+    """The cycle's JobResult for one executor, as the task service builds it from the halt."""
+    event = check_result.event.model_copy(deep=True)
+    if pod_ids is not None:
+        pods = event.what_we_saw["unreachable_pods"]
+        event.what_we_saw["unreachable_pods"] = [
+            {**pods[0], "pod_id": pod_id} for pod_id in pod_ids
+        ]
+    return JobResult(
+        executor_info=default_executor(),
+        score=0.9,
+        job_score=0.9,
+        job_batch_id="batch-1",
+        log_status="info",
+        log_text=_m(event.event, extra=event.model_dump()).to_full_string(),
+        validation_event=event,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_suppressed_cycles_events_publish_as_rented_with_the_gates_verdict(context_factory):
+    # Rustam's review (17 Sep): the executor task rendered RENTED_POD_SSH_UNREACHABLE ("Reported to
+    # the backend and the renter") before the gate ran; on a suppressed cycle nobody was told, and
+    # the event published a claim that was false. The sync loop now rewrites those results to RENTED
+    # before the publish, as DAH-2748 does for availability errors, with the gate's verdict kept.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    held = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, validator_outage=True)
+    assert held.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    assert h.gate.suppressed_by == "validator_outage" and h.gate.due == [POD_ID]
+    trace_id = held.event.trace_id
+
+    result = _job_result(held)
+    other = _job_result(held, pod_ids=["pod-reported-last-cycle"])  # never due: reported before
+    rewritten = rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage(
+        [result, other], h.gate
+    )
+
+    assert rewritten == 1
+    event = result.validation_event
+    assert event.reason_code == Msg.ALREADY_RENTED.reason and event.severity == "info"
+    assert event.impact == "Reported rented score=0.9 (actual=0.9)"
+    assert event.remediation == "No action needed."
+    assert event.trace_id == trace_id and event.check_id == held.event.check_id
+    assert "unreachable_pods" not in event.what_we_saw
+    seen = event.what_we_saw[rented_pod_ssh.PROBE_SUPPRESSED_FLEET]
+    assert (
+        seen["suppressed_by"] == "validator_outage" and seen["probed"] == 1 and seen["failed"] == 1
+    )
+    assert [pod["pod_id"] for pod in seen["unreachable_pods"]] == [POD_ID]
+    assert event.what_we_saw["job_score"] == 0.9 and event.what_we_saw["actual_score"] == 0.9
+    assert result.log_text.startswith(f"{Msg.ALREADY_RENTED.event} >>> ")
+    assert json.loads(result.log_text.split(" >>> ", 1)[1])["reason_code"] == "RENTED"
+    assert result.score == 0.9  # the halt kept the rented score; the rewrite touches the event only
+    # the executor whose pod was reported in an earlier cycle keeps its event: for it the impact is true
+    assert other.validation_event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+
+    # a posted cycle rewrites nothing; neither does a flush that never ran (Redis down: gate None)
+    posted = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    assert h.gate.posted == [POD_ID]
+    assert (
+        rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage(
+            [_job_result(posted)], h.gate
+        )
+        == 0
+    )
+    assert (
+        rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage([_job_result(posted)], None)
+        == 0
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_fleet_too_small_for_a_share_reports_what_it_found(context_factory):
     # Two pods, both refusing, is a share of 1.0, and it says nothing: under
@@ -768,6 +877,81 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
 
 
 @pytest.mark.asyncio
+async def test_lines_before_the_identification_are_skipped_within_bounds():
+    # Rustam's review (17 Sep): RFC 4253 §4.2 lets a server send other lines before `SSH-`, and a
+    # client MUST skip them; the probe read the first line alone and called such a server unreachable.
+    async def serve(lines: list[bytes]):
+        def handler(_reader, writer):
+            writer.write(b"".join(lines))
+            writer.close()
+
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        return server, server.sockets[0].getsockname()[1]
+
+    banner = [b"Welcome to the box\r\n", b"\r\n", b"No unauthorised access\r\n"]
+    ssh2 = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n"
+    cases = [
+        (banner + [ssh2], None),
+        # up to SSH_PRE_BANNER_LINES_MAX lines are skipped; one more and the identification is not read
+        ([b"x\r\n"] * rented_pod_ssh.SSH_PRE_BANNER_LINES_MAX + [ssh2], None),
+        (
+            [b"x\r\n"] * (rented_pod_ssh.SSH_PRE_BANNER_LINES_MAX + 1) + [ssh2],
+            FAULT_SSH_BANNER_MISSING,
+        ),
+        # a pre-banner line is bounded like the identification: past 255 bytes the probe stops reading
+        ([b"y" * 300 + b"\r\n", ssh2], FAULT_SSH_BANNER_MISSING),
+        # the first `SSH-` line is the identification, and it is judged as before (1.99 is refused)
+        (banner + [b"SSH-1.99-OpenSSH_3.9p1\r\n", ssh2], FAULT_SSH_BANNER_MISSING),
+        # a peer that only ever sends other lines and closes has no identification
+        (banner, FAULT_SSH_BANNER_MISSING),
+    ]
+    for lines, expected in cases:
+        server, port = await serve(lines)
+        try:
+            assert await tcp_connect_fault("127.0.0.1", port, timeout=2.0) == expected, lines[:2]
+        finally:
+            server.close()
+            await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_connect_and_banner_read_share_one_deadline():
+    # Rustam's review (17 Sep): the timeout applied to the connect and again to the read, so one
+    # probe could take twice the configured value. A connect that uses 0.2 s of a 0.3 s budget
+    # leaves the read 0.1 s, and the probe ends at 0.3 s (not 0.5 s) as ssh_banner_missing.
+    accepted: list[asyncio.StreamWriter] = []
+    silent = await asyncio.start_server(lambda r, w: accepted.append(w), "127.0.0.1", 0)
+    port = silent.sockets[0].getsockname()[1]
+    real_open_connection = asyncio.open_connection
+
+    async def slow_connect(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return await real_open_connection(*args, **kwargs)
+
+    loop = asyncio.get_running_loop()
+    try:
+        with patch("asyncio.open_connection", new=slow_connect):
+            started = loop.time()
+            fault = await tcp_connect_fault("127.0.0.1", port, timeout=0.3)
+            elapsed = loop.time() - started
+    finally:
+        for writer in accepted:
+            writer.close()
+        silent.close()
+        await silent.wait_closed()
+
+    assert fault == FAULT_SSH_BANNER_MISSING
+    assert 0.25 <= elapsed < 0.45, elapsed
+
+    # a connect that does not finish inside the budget is still tcp_timeout
+    async def never_connects(*_args, **_kwargs):
+        await asyncio.sleep(10)
+
+    with patch("asyncio.open_connection", new=never_connects):
+        assert await tcp_connect_fault("127.0.0.1", port, timeout=0.05) == FAULT_TCP_TIMEOUT
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "greeting",
     [
@@ -815,6 +999,51 @@ async def test_tcp_connect_fault_rejects_a_non_2_0_or_malformed_identification(g
 )
 def test_is_ssh2_identification(line, ok):
     assert is_ssh2_identification(line) is ok
+
+
+@pytest.mark.asyncio
+async def test_redis_writes_go_through_the_client_as_one_multi_exec():
+    # The real client path FakeRedis (tests/helpers) stands in for: a RedisWrites batch is one
+    # MULTI/EXEC on redis-py's pipeline, every command lands, and a connection lost before EXEC
+    # applies none of them (the healthy transition's SET and DELETE cannot come apart).
+    import asyncio as _asyncio
+
+    from fakeredis import FakeServer
+    from fakeredis.aioredis import FakeRedis as FakeClient
+    from neurons.validators.src.services.redis_service import RedisService, RedisWrites
+
+    server = FakeServer()
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeClient(server=server)
+    service.lock = _asyncio.Lock()
+    await service.redis.set("rented_pod_ssh_fail:pod-1", '{"count": 1}')
+
+    healthy = RedisWrites()
+    healthy.set("rented_pod_ssh_ok:pod-1", '{"at": "t", "boot_id": "b"}', ex=3600)
+    healthy.delete("rented_pod_ssh_fail:pod-1").hset("rented_pod_ssh_fleet:c1", "pod-1", "ok")
+    healthy.expire("rented_pod_ssh_fleet:c1", 60)
+    await service.write_atomically(healthy)
+
+    assert await service.redis.get("rented_pod_ssh_fail:pod-1") is None
+    assert await service.redis.get("rented_pod_ssh_ok:pod-1") == b'{"at": "t", "boot_id": "b"}'
+    assert 0 < await service.redis.ttl("rented_pod_ssh_ok:pod-1") <= 3600
+    assert await service.redis.hgetall("rented_pod_ssh_fleet:c1") == {b"pod-1": b"ok"}
+    assert 0 < await service.redis.ttl("rented_pod_ssh_fleet:c1") <= 60
+
+    # the connection goes away before EXEC: the SET is not applied without its DELETE
+    await service.redis.set("rented_pod_ssh_fail:pod-1", '{"count": 1}')
+    server.connected = False
+    again = (
+        RedisWrites()
+        .set("rented_pod_ssh_ok:pod-1", "new", ex=3600)
+        .delete("rented_pod_ssh_fail:pod-1")
+    )
+    with pytest.raises(rented_pod_ssh.REDIS_ERRORS):
+        await service.write_atomically(again)
+    server.connected = True
+    assert await service.redis.get("rented_pod_ssh_ok:pod-1") == b'{"at": "t", "boot_id": "b"}'
+    assert await service.redis.get("rented_pod_ssh_fail:pod-1") == b'{"count": 1}'
+    await service.write_atomically(RedisWrites())  # nothing to send, nothing sent
 
 
 def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
