@@ -5,8 +5,9 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 from core.config import settings
+from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
-from ..messages import CapabilityMessages as Msg, render_message
+from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 
 if TYPE_CHECKING:
@@ -103,6 +104,7 @@ class CapabilityCheck:
                 "returned_uuid": result.returned_uuid,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
+                "stderr_tail": _tail(result.stderr),
                 "metrics": result.metrics,
             }
         elif failure_reason:
@@ -129,7 +131,7 @@ class CapabilityCheck:
                     updates={"state": replace(ctx.state, rented_data=lium_workload.snapshot)},
                 )
 
-        template = Msg.VERIFY_TIMEOUT if result is not None and result.timed_out else Msg.VERIFY_FAILED
+        template = _failure_template(result)
         event = render_message(
             template,
             ctx=ctx,
@@ -142,7 +144,6 @@ class CapabilityCheck:
 # What the probe answers when it never reached the UUID step: the wrapper prints "UUID:  None"
 # after a failed cudaMalloc, and the service reports that as a mismatch against 'None'.
 _NO_UUID = frozenset({"", "none", "null"})
-_UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
 
 
 def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
@@ -156,7 +157,7 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
         return False
     if result.timed_out:
         return True
-    if not (result.error_message or "").startswith(_UUID_MISMATCH_ERROR_PREFIX):
+    if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
         return False
     return (result.returned_uuid or "").strip().lower() in _NO_UUID
 
@@ -209,6 +210,51 @@ async def _lium_workload_live_now(ctx: Context) -> _LiumWorkload | None:
             snapshot=fresh,
         )
     return None
+
+
+STDERR_TAIL_CHARS = 300
+
+# What the probe prints when it cannot get GPU memory (cudaMalloc failing in the native verifier:
+# "Failed to allocate d_B: out of memory"). The executor then answers no uuid at all, which the
+# service reports as "UUID mismatch: expected '<uuid>', got 'None'" — the wrong story for the
+# provider (DAH-3264: 49 such verdicts on 31 executors in 26 h, every one an allocation failure).
+# Only the out-of-memory text counts: the verifier prints "Failed to allocate d_X: <error string>"
+# for every failed cudaMalloc, including "system not yet initialized" (CUDA error 802, the NVLink
+# fabric not ready on an HGX board — permanent, so "retry next cycle" would be the wrong advice).
+_VRAM_UNAVAILABLE_MARKERS = (
+    "out of memory",
+    "cudaErrorMemoryAllocation",
+)
+
+
+def _tail(text: str | None, limit: int = STDERR_TAIL_CHARS) -> str:
+    text = (text or "").strip()
+    return text[-limit:] if len(text) > limit else text
+
+
+def _failure_template(result: ValidationResult | None) -> MessageTemplate:
+    """Pick the reason for a failed capability probe.
+
+    A timeout keeps its own reason. An answer with no uuid whose stderr/stdout carries a CUDA
+    out-of-memory line is `VERIFY_FAILED_VRAM_UNAVAILABLE`. A returned uuid that does not match —
+    the anti-spoof case — stays `VERIFY_FAILED`, whatever stderr says; so does any other failed
+    allocation (a CUDA error other than out-of-memory) and any failure the service reported for a
+    reason other than the missing uuid (a sealed result that failed authentication).
+    """
+    if result is None:
+        return Msg.VERIFY_FAILED
+    if result.timed_out:
+        return Msg.VERIFY_TIMEOUT
+    # Only the service's "UUID mismatch" failure is the probe's own answer. Its other empty-uuid
+    # results (a sealed blob that failed authentication, a stdout that could not be parsed) are
+    # not allocation failures, and stderr is miner-controlled: they keep the generic reason.
+    if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
+        return Msg.VERIFY_FAILED
+    returned = (result.returned_uuid or "").strip().lower()
+    output = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+    if returned in _NO_UUID and any(m.lower() in output for m in _VRAM_UNAVAILABLE_MARKERS):
+        return Msg.VERIFY_FAILED_VRAM_UNAVAILABLE
+    return Msg.VERIFY_FAILED
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:
