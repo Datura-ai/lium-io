@@ -746,6 +746,23 @@ async def test_a_suppressed_cycles_events_publish_as_rented_with_the_gates_verdi
     assert result.score == 0.9  # the halt kept the rented score; the rewrite touches the event only
     # the executor whose pod was reported in an earlier cycle keeps its event: for it the impact is true
     assert other.validation_event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    assert rented_pod_ssh.PROBE_SUPPRESSED_FLEET not in other.validation_event.what_we_saw
+
+    # Rustam, round 7: a result naming both a held pod and a pod reported in an earlier cycle keeps
+    # its reason for the told renter only; the held pod moves under probe_suppressed_fleet.
+    mixed = _job_result(held, pod_ids=[POD_ID, "pod-reported-last-cycle"])
+    assert rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage([mixed], h.gate) == 1
+    event = mixed.validation_event
+    assert event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason and event.trace_id == trace_id
+    assert [pod["pod_id"] for pod in event.what_we_saw["unreachable_pods"]] == [
+        "pod-reported-last-cycle"
+    ]
+    seen = event.what_we_saw[rented_pod_ssh.PROBE_SUPPRESSED_FLEET]
+    assert [pod["pod_id"] for pod in seen["unreachable_pods"]] == [POD_ID]
+    logged = json.loads(mixed.log_text.split(" >>> ", 1)[1])
+    assert [pod["pod_id"] for pod in logged["what_we_saw"]["unreachable_pods"]] == [
+        "pod-reported-last-cycle"
+    ]
 
     # a posted cycle rewrites nothing; neither does a flush that never ran (Redis down: gate None)
     posted = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)

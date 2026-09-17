@@ -616,8 +616,11 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     ``silence_availability_errors_on_our_own_outage``. Score and halt are untouched: the rented
     halt already kept the rented score.
 
-    A result naming a pod the gate did not hold (its outage was reported in an earlier cycle, so
-    ``reported`` is set and it was never due) is left as it is: for that renter the impact is true.
+    A result can name several pods of one executor. The pods the gate held move under
+    ``probe_suppressed_fleet``; a pod the gate did not hold (its outage was reported in an earlier
+    cycle, so ``reported`` is set and it was never due) stays in ``unreachable_pods``, because for
+    that renter the impact is true. When nothing stays, the event becomes RENTED; when something
+    stays, it keeps its reason and names only the pods whose renters were told (Rustam, round 7).
     Returns how many results were rewritten, for the caller's log line.
     """
     if gate is None or not gate.suppressed_by:
@@ -633,33 +636,47 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
         pods = [
             pod for pod in event.what_we_saw.get("unreachable_pods") or [] if isinstance(pod, dict)
         ]
-        pod_ids = {pod.get("pod_id") for pod in pods}
-        if not pod_ids or not pod_ids <= held:
+        held_pods = [pod for pod in pods if pod.get("pod_id") in held]
+        if not held_pods:
             continue
+        told_pods = [pod for pod in pods if pod.get("pod_id") not in held]
         what = {key: value for key, value in event.what_we_saw.items() if key != "unreachable_pods"}
-        silenced = build_msg(
-            event=rented.event,
-            reason=rented.reason,
-            severity=rented.severity,
-            category=rented.category,
-            impact=f"Reported rented score={what.get('job_score')} (actual={what.get('actual_score')})",
-            remediation="No action needed.",
-            what={
-                **what,
-                PROBE_SUPPRESSED_FLEET: {
-                    "suppressed_by": gate.suppressed_by,
-                    "probed": gate.probed,
-                    "failed": gate.failed,
-                    "fail_share": round(gate.fail_share, 3),
-                    "unreachable_pods": pods,
-                },
-            },
-            check_id=event.check_id or "",
-            pipeline_id=event.pipeline_id,
-            ctx=event.context,
-        ).model_copy(update={"trace_id": event.trace_id, "when": event.when})
-        result.validation_event = silenced
-        result.log_text = _m(silenced.event, extra=silenced.model_dump()).to_full_string()
+        suppressed = {
+            "suppressed_by": gate.suppressed_by,
+            "probed": gate.probed,
+            "failed": gate.failed,
+            "fail_share": round(gate.fail_share, 3),
+            "unreachable_pods": held_pods,
+        }
+        if told_pods:
+            # Mixed: one pod of this executor was reported in an earlier cycle, another is held now.
+            # The event keeps its reason for the pod whose renter was told and stops naming the rest.
+            rewritten_event = event.model_copy(
+                update={
+                    "what_we_saw": {
+                        **what,
+                        "unreachable_pods": told_pods,
+                        PROBE_SUPPRESSED_FLEET: suppressed,
+                    }
+                }
+            )
+        else:
+            rewritten_event = build_msg(
+                event=rented.event,
+                reason=rented.reason,
+                severity=rented.severity,
+                category=rented.category,
+                impact=f"Reported rented score={what.get('job_score')} (actual={what.get('actual_score')})",
+                remediation="No action needed.",
+                what={**what, PROBE_SUPPRESSED_FLEET: suppressed},
+                check_id=event.check_id or "",
+                pipeline_id=event.pipeline_id,
+                ctx=event.context,
+            ).model_copy(update={"trace_id": event.trace_id, "when": event.when})
+        result.validation_event = rewritten_event
+        result.log_text = _m(
+            rewritten_event.event, extra=rewritten_event.model_dump()
+        ).to_full_string()
         rewritten += 1
     return rewritten
 
