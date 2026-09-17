@@ -31,8 +31,9 @@ DEFAULT_PRICE = DefaultPrice()
 #
 # DAH-3623: the idle rate of a model is at most 0.8 x the median price renters paid for it over the
 # trailing 7 days (owner rule, 17 Sep 2026: "idle pay should never be higher than rental rates").
-# Three models in the lium-core table pay idle above the rental price itself and are pinned at the cap;
-# the fixture in tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
+# Nine models in the lium-core table paid idle above the cap (three above the rental price itself) and
+# are pinned at 0.8 x their paid median, rounded down to the cent; the fixture in
+# tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
@@ -42,6 +43,12 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     "NVIDIA A100 80GB PCIe": 0.24,  # 0.8 x 0.30 paid median (was 0.36 = 120 % of the rental price)
     "NVIDIA H100 80GB HBM3": 1.04,  # 0.8 x 1.30 paid median (was 1.494 = 115 %)
     "NVIDIA GeForce RTX 5090": 0.48,  # 0.8 x 0.60 paid median (was 0.65 = 108 %)
+    "NVIDIA H200": 2.40,  # 0.8 x 3.00 paid median (was 2.85 = 95 %)
+    "NVIDIA GeForce RTX 3090": 0.12,  # 0.8 x 0.16 = 0.128, floor cent (was 0.16 = 100 %)
+    "NVIDIA RTX 6000 Ada Generation": 0.55,  # 0.8 x 0.69 = 0.552, floor cent (was 0.69 = 100 %)
+    "NVIDIA A100-SXM4-80GB": 0.56,  # 0.8 x 0.70 paid median (was 0.6923 = 99 %)
+    "NVIDIA GeForce RTX 4090": 0.28,  # 0.8 x 0.35 paid median (was 0.30 = 86 %)
+    "NVIDIA L40S": 0.30,  # 0.8 x 0.38 = 0.304, floor cent (was 0.35 = 92 %)
 }
 
 

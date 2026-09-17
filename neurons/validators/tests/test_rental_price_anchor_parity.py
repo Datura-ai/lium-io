@@ -44,8 +44,8 @@ def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
 def test_overrides_change_only_the_server_edition_b300_and_dah_3623_entries():
     """Guards a hand-edit of `RENTAL_PRICES_PER_HOUR` that adds, drops or re-prices another GPU — the
     algorithm asserts every key is in BASE_GPU_MAP, and any other override belongs in lium-core.
-    B300 is pinned at 6.40 by DAH-3542; A100 PCIe, H100 HBM3 and RTX 5090 are pinned at 0.8 x their
-    paid median by DAH-3623 (tests/test_idle_rate_under_paid_median.py holds the medians)."""
+    B300 is pinned at 6.40 by DAH-3542; nine models are pinned at 0.8 x their paid median by DAH-3623
+    (tests/test_idle_rate_under_paid_median.py holds the medians and the list)."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys()
@@ -56,4 +56,10 @@ def test_overrides_change_only_the_server_edition_b300_and_dah_3623_entries():
         "NVIDIA A100 80GB PCIe",
         "NVIDIA H100 80GB HBM3",
         "NVIDIA GeForce RTX 5090",
+        "NVIDIA H200",
+        "NVIDIA GeForce RTX 3090",
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA A100-SXM4-80GB",
+        "NVIDIA GeForce RTX 4090",
+        "NVIDIA L40S",
     }
