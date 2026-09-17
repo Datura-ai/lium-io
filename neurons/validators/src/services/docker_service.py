@@ -4149,21 +4149,15 @@ class DockerService:
         /etc/resolv.conf. On a host whose resolver is private (a cloud VPC
         resolver at the .2 of a 10/8 or 172.16/12 network, a datacenter
         resolver in 10/8, a router in 192.168/16) that address falls inside
-        the egress block, the
-        DROP rules eat every DNS query and `docker build --pull` fails on
-        `FROM` after the resolver timeout (12 to 15 s with one nameserver,
-        23 s with two, measured from `Building custom image` to the failure:
-        18 of 23 production `docker_build` failures in 1 to 15 Sep 2026 had
-        exactly that duration, a constant per node). Those servers get an
-        ACCEPT on port 53 only; a public resolver needs no rule and is left
-        out.
+        the egress block, the DROP rules eat every DNS query and
+        `docker build --pull` fails on `FROM` after the resolver timeout.
+        Those servers get an ACCEPT on port 53 only; a public resolver needs
+        no rule and is left out.
+
+        `cidrs` is the output of `_parse_egress_block_cidrs`, already
+        normalised through `ip_network`, so every entry parses.
         """
-        blocked = []
-        for c in cidrs:
-            try:
-                blocked.append(ipaddress.ip_network(c, strict=False))
-            except ValueError:
-                continue
+        blocked = [ipaddress.ip_network(c) for c in cidrs]
         servers: list[str] = []
         for raw_line in (resolv_conf or "").splitlines():
             parts = raw_line.split("#", 1)[0].split(";", 1)[0].split()
