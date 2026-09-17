@@ -250,7 +250,26 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            subtensor = bittensor.Subtensor(config=self.config)
+            subtensor = bittensor.Subtensor(
+                network=settings.get_subtensor_network(), config=self.config
+            )
+            logger.info(
+                _m(
+                    "Subtensor connected",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "chain_endpoint": subtensor.chain_endpoint,
+                            "network": subtensor.network,
+                            "endpoint_source": (
+                                "BITTENSOR_CHAIN_ENDPOINT"
+                                if settings.BITTENSOR_CHAIN_ENDPOINT
+                                else "BITTENSOR_NETWORK"
+                            ),
+                        }
+                    ),
+                ),
+            )
 
             # check registered
             self.check_registered(subtensor)

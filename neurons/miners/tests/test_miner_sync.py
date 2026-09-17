@@ -256,7 +256,7 @@ async def test_initialize_subtensor_closes_new_connection_when_shutdown_starts(m
     monkeypatch.setattr(
         miner_module.bittensor,
         "AsyncSubtensor",
-        lambda config: async_subtensor_factory,
+        lambda network, config: async_subtensor_factory,
     )
 
     # Act
@@ -277,12 +277,14 @@ async def test_initialize_subtensor_sets_connection_and_checks_registration(monk
     miner.config = object()
     miner.close_subtensor = AsyncMock()
     miner.check_registered = AsyncMock()
-    new_subtensor = SimpleNamespace(close=AsyncMock())
+    new_subtensor = SimpleNamespace(
+        close=AsyncMock(), chain_endpoint="ws://203.0.113.10:9944", network="unknown"
+    )
     async_subtensor_factory = SimpleNamespace(initialize=AsyncMock(return_value=new_subtensor))
     monkeypatch.setattr(
         miner_module.bittensor,
         "AsyncSubtensor",
-        lambda config: async_subtensor_factory,
+        lambda network, config: async_subtensor_factory,
     )
 
     # Act

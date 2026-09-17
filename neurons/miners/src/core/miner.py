@@ -64,12 +64,31 @@ class Miner:
             if self.should_exit:
                 return
 
-            subtensor = await bittensor.AsyncSubtensor(config=self.config).initialize()
+            subtensor = await bittensor.AsyncSubtensor(
+                network=settings.get_subtensor_network(), config=self.config
+            ).initialize()
             if self.should_exit:
                 await subtensor.close()
                 return
 
             self.subtensor = subtensor
+            logger.info(
+                _m(
+                    "Subtensor connected",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "chain_endpoint": subtensor.chain_endpoint,
+                            "network": subtensor.network,
+                            "endpoint_source": (
+                                "BITTENSOR_CHAIN_ENDPOINT"
+                                if settings.BITTENSOR_CHAIN_ENDPOINT
+                                else "BITTENSOR_NETWORK"
+                            ),
+                        }
+                    ),
+                ),
+            )
 
             # check registered
             await self.check_registered()
