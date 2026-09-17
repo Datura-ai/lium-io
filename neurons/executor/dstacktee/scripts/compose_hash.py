@@ -46,15 +46,19 @@ RELEASE_NOTES_HEADING = "## CVM attestation"
 def measured_app_compose(env: str = "prod", digest: str = APPROVED_RUNNER_IMAGE_DIGEST) -> str:
     """app-compose.json as `lium-cvm.sh new` writes it with default flags (--local-key-provider,
     no --enable-logs, no --enable-sysinfo) after stamping `digest` into the compose file."""
-    compose = (APP_DIR / COMPOSE_FILES[env]).read_text().replace(DIGEST_PLACEHOLDER, digest)
+    compose = (
+        (APP_DIR / COMPOSE_FILES[env])
+        .read_text(encoding="utf-8")
+        .replace(DIGEST_PLACEHOLDER, digest)
+    )
     return app_compose_json(
         build_app_compose(
             compose,
             local_key_provider=True,
             enable_logs=False,
             enable_sysinfo=False,
-            init_script=(APP_DIR / "init_script.sh").read_text(),
-            pre_launch_script=(APP_DIR / "pre_launch_script.sh").read_text(),
+            init_script=(APP_DIR / "init_script.sh").read_text(encoding="utf-8"),
+            pre_launch_script=(APP_DIR / "pre_launch_script.sh").read_text(encoding="utf-8"),
         )
     )
 

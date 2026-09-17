@@ -22,19 +22,17 @@ DSTACKTEE_DIR = REPO_ROOT / "neurons" / "executor" / "dstacktee"
 SCRIPTS_DIR = DSTACKTEE_DIR / "scripts"
 
 
-def _load_script(name: str):
-    # scripts/ is not a package: dstack.py runs as a script on the CVM host and imports host_api
-    # from its own directory, so that directory goes on sys.path the way the host has it
-    if str(SCRIPTS_DIR) not in sys.path:
-        sys.path.insert(0, str(SCRIPTS_DIR))
-    spec = importlib.util.spec_from_file_location(name, SCRIPTS_DIR / f"{name}.py")
+def _load_compose_hash():
+    # scripts/ is not a package: compose_hash.py puts its own directory on sys.path and imports
+    # dstack (which imports host_api) from there, the way the CVM host runs it
+    spec = importlib.util.spec_from_file_location("compose_hash", SCRIPTS_DIR / "compose_hash.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-compose_hash = _load_script("compose_hash")
-dstack = _load_script("dstack")
+compose_hash = _load_compose_hash()
+dstack = sys.modules["dstack"]
 PROD_WHITELIST: dict[str, int] = TDX_WHITELIST["COMPOSE_HASH"]["PROD"]
 
 
@@ -66,7 +64,6 @@ def test_dstack_new_writes_the_bytes_compose_hash_rebuilds(tmp_path):
         .replace(compose_hash.DIGEST_PLACEHOLDER, digest)
     )
     manager = dstack.DStackManager.__new__(dstack.DStackManager)
-    manager.run_path = str(tmp_path)
     manager.config = types.SimpleNamespace(docker_registry=None)
     manager.setup_instance(
         argparse.Namespace(
@@ -123,7 +120,10 @@ def test_lium_cvm_sh_new_passes_the_flags_the_rebuild_assumes():
 
 def test_release_notes_section_carries_digest_and_hash():
     section = compose_hash.release_notes_section("prod")
+    # the prod release workflow greps this heading to know whether a release already carries the section
+    workflow = (REPO_ROOT / ".github" / "workflows" / "executor_cd_prod.yml").read_text()
     assert section.startswith(compose_hash.RELEASE_NOTES_HEADING)
+    assert f'"{compose_hash.RELEASE_NOTES_HEADING}"' in workflow
     assert compose_hash.APPROVED_RUNNER_IMAGE_DIGEST in section
     assert compose_hash.compose_hash("prod") in section
 

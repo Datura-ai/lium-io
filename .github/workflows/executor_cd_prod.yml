@@ -60,11 +60,17 @@ jobs:
         run: |
           set -euo pipefail
           python3 neurons/executor/dstacktee/scripts/compose_hash.py --release-notes > section.md
+          hash="$(python3 neurons/executor/dstacktee/scripts/compose_hash.py)"
           if gh release view "$TAG" --json body --jq .body | tr -d '\r' > body.md; then
             # a body edited in the web UI comes back with CRLF; tr above makes the marker match
             if grep -qx "## CVM attestation" body.md; then
-              echo "release $TAG already carries the section"
-              exit 0
+              if grep -qF "$hash" body.md; then
+                echo "release $TAG already carries the section with hash $hash"
+                exit 0
+              fi
+              # the tag was moved to a tree with another hash: a stale section is worse than none
+              echo "release $TAG carries a CVM attestation section without hash $hash; fix the release body by hand" >&2
+              exit 1
             fi
             { cat body.md; echo; cat section.md; } > notes.md
             gh release edit "$TAG" --notes-file notes.md

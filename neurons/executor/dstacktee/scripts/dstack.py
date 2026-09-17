@@ -262,7 +262,7 @@ class DStackManager:
         """Read and validate compose file."""
         if not os.path.isfile(compose_file):
             raise FileNotFoundError(f"Compose file not found: {compose_file}")
-        with open(compose_file, "r") as f:
+        with open(compose_file, "r", encoding="utf-8") as f:
             return f.read()
 
     def _create_directories(self, work_dir: str) -> tuple[str, str]:
@@ -330,12 +330,18 @@ class DStackManager:
                 local_key_provider=args.local_key_provider,
                 enable_logs=args.enable_logs,
                 enable_sysinfo=args.enable_sysinfo,
-                init_script=open(args.init_script, "r").read() if args.init_script else None,
+                init_script=(
+                    open(args.init_script, "r", encoding="utf-8").read()
+                    if args.init_script
+                    else None
+                ),
                 pre_launch_script=(
-                    open(args.pre_launch_script, "r").read() if args.pre_launch_script else None
+                    open(args.pre_launch_script, "r", encoding="utf-8").read()
+                    if args.pre_launch_script
+                    else None
                 ),
             )
-            with open(os.path.join(shared_dir, "app-compose.json"), "w") as f:
+            with open(os.path.join(shared_dir, "app-compose.json"), "w", encoding="utf-8") as f:
                 f.write(app_compose_json(app_compose))
             # Read image metadata and create config.json
 
