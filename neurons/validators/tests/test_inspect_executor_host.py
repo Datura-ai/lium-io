@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 
+import asyncssh
 import bittensor
 import pytest
 
@@ -339,23 +340,26 @@ async def test_a_submit_that_times_out_is_still_followed_by_a_remove(my_key, wir
 
 
 @pytest.mark.asyncio
-async def test_a_remove_the_miner_did_not_accept_is_a_node_error_and_exit_1(my_key, wired):
+async def test_a_remove_the_miner_did_not_accept_is_a_node_error_and_exit_1(my_key, wired, monkeypatch):
     """Regression: `_remove_ssh_key_via_rest` returned False, `report.error` stayed empty and the run exited 0 with a key still installed."""
+    monkeypatch.setattr(ieh, "KEY_REMOVE_RETRY_DELAY", 0.0)
     conn, captured, rest = wired(remove_status=500)
 
     report = await _inspect(my_key)
 
     assert report.key_removed is False
-    assert report.error == "key remove not accepted by miner: the key may still be installed, re-run this node"
-    assert rest.urls() == ["ssh-pubkey-submit", "ssh-pubkey-remove"]
+    assert report.error == "key remove not accepted by miner after 3 attempts: the key is still installed, remove it by hand (public key in the node block)"
+    assert rest.urls() == ["ssh-pubkey-submit"] + ["ssh-pubkey-remove"] * ieh.KEY_REMOVE_ATTEMPTS
     assert ieh.exit_code([report]) == 1
     # an earlier error is kept, the remove note is appended after it
     conn, captured, rest = wired(submit_status=403, remove_status=500)
     refused = await _inspect(my_key)
+    # a refused submit never installed the key for sure: the note says "may", not "is"
     assert refused.error == (
         "miner refused the key submit: HTTP 403 {'message_type': 'FailedRequest', 'details': 'no'}; "
-        "key remove not accepted by miner: the key may still be installed, re-run this node"
+        "key remove not accepted by miner after 3 attempts: the key may still be installed, remove it by hand (public key in the node block)"
     )
+    assert "POSSIBLY LEFT ON THE EXECUTOR" in ieh.render_node_block(refused)
     clean = ieh.NodeReport(target=report.target, key_removed=True)
     assert ieh.exit_code([clean]) == 0
     never_submitted = ieh.NodeReport(target=report.target, error="miner axon lookup failed: x")  # key_removed None
@@ -371,17 +375,88 @@ async def test_a_remove_the_miner_did_not_accept_is_a_node_error_and_exit_1(my_k
         None,  # a JSON `null` body: `response.json()` gives None
     ],
 )
-async def test_a_200_whose_body_is_not_ssh_key_removed_is_not_a_removal(my_key, wired, body):
+async def test_a_200_whose_body_is_not_ssh_key_removed_is_not_a_removal(my_key, wired, body, monkeypatch):
     """Regression (taiberium, #1385): `/api/validator/ssh-pubkey-remove` answers HTTP 200 with a
     `FailedRequest` body when `deregister_pubkey` raised, and `_remove_ssh_key_via_rest` returned
     True on the status alone, so the node exited 0 with the key still installed."""
+    monkeypatch.setattr(ieh, "KEY_REMOVE_RETRY_DELAY", 0.0)
     conn, captured, rest = wired(remove_body=body)
 
     report = await _inspect(my_key)
 
     assert report.key_removed is False
-    assert report.error == "key remove not accepted by miner: the key may still be installed, re-run this node"
-    assert rest.urls() == ["ssh-pubkey-submit", "ssh-pubkey-remove"]
+    assert report.error == "key remove not accepted by miner after 3 attempts: the key is still installed, remove it by hand (public key in the node block)"
+    assert rest.urls() == ["ssh-pubkey-submit"] + ["ssh-pubkey-remove"] * ieh.KEY_REMOVE_ATTEMPTS
+    assert ieh.exit_code([report]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_drops_after_login_is_a_failed_node_and_exit_1(my_key, wired):
+    """Regression (taiberium, 17 Sep): sshd accepted the key and closed the channel; every read raised
+    `ConnectionLost`, `report.error` stayed None and the run exited 0 with an empty row. Fails on the
+    old code at the `error` assertion."""
+    conn = _FakeConn()
+    for _, command in ieh.COMMANDS:
+        conn.errors_by_substring[command[:20]] = asyncssh.ConnectionLost("Connection lost")
+    wired(conn=conn)
+
+    report = await _inspect(my_key)
+
+    assert len(report.outputs) == len(ieh.COMMANDS)
+    assert all(out.exit_status is None and out.stderr.startswith("ConnectionLost") for out in report.outputs.values())
+    assert report.error is not None and report.error.startswith(ieh.NO_READ_COMPLETED)
+    assert "ConnectionLost" in report.error
+    assert report.key_removed is True  # the key is still taken back
+    assert ieh.exit_code([report]) == 1
+    assert ieh.summarise(report, ieh.HubDigests())["error"].startswith(ieh.NO_READ_COMPLETED)
+    # one completed read is enough to judge the node: no failure line for it
+    conn = _FakeConn()
+    for _, command in list(ieh.COMMANDS)[1:]:
+        conn.errors_by_substring[command[:20]] = asyncssh.ConnectionLost("Connection lost")
+    wired(conn=conn)
+    partial = await _inspect(my_key)
+    assert partial.error is None and ieh.exit_code([partial]) == 0
+    assert [label for label, out in partial.outputs.items() if out.exit_status is not None] == ["registry_config"]
+
+
+@pytest.mark.asyncio
+async def test_the_key_remove_is_retried_with_the_same_public_key_and_printed_when_it_never_succeeds(
+    my_key, wired, monkeypatch
+):
+    """Regression (taiberium, 17 Sep): one failed remove left the key on the executor and the note said
+    "re-run this node" — a rerun mints a NEW key and cannot remove the first one. The remove is retried
+    with the key this run submitted; when every attempt fails, the block prints that key for manual
+    removal and the advice to rerun is gone."""
+    monkeypatch.setattr(ieh, "KEY_REMOVE_RETRY_DELAY", 0.0)
+
+    # two refusals, then the miner accepts: the retries carry the same public key, the node is clean
+    class _FlakyRest(_FakeMinerRest):
+        async def __call__(self, *, url, **kwargs):
+            removes_so_far = sum(1 for u, _ in self.calls if u.endswith("/ssh-pubkey-remove"))
+            self.remove_status = 500 if url.endswith("/ssh-pubkey-remove") and removes_so_far < 2 else 200
+            return await super().__call__(url=url, **kwargs)
+
+    wired()
+    flaky = _FlakyRest([_executor()])
+    monkeypatch.setattr(MinerService, "_make_rest_request", flaky)
+    report = await _inspect(my_key)
+    removes = [json_data for url, json_data in flaky.calls if url.endswith("/ssh-pubkey-remove")]
+    submit = next(json_data for url, json_data in flaky.calls if url.endswith("/ssh-pubkey-submit"))
+    assert len(removes) == 3
+    assert {r["public_key"] for r in removes} == {submit["public_key"]}
+    assert report.key_removed is True and report.error is None and report.public_key_left is None
+    assert "PUBLIC KEY LEFT" not in ieh.render_node_block(report)
+
+    # every attempt refused: the exact public key is printed, no advice to rerun
+    conn, captured, rest = wired(remove_status=500)
+    report = await _inspect(my_key)
+    submit = next(json_data for url, json_data in rest.calls if url.endswith("/ssh-pubkey-submit"))
+    assert rest.urls().count("ssh-pubkey-remove") == ieh.KEY_REMOVE_ATTEMPTS
+    assert report.key_removed is False
+    assert report.public_key_left == submit["public_key"].strip()
+    block = ieh.render_node_block(report)
+    assert "PUBLIC KEY LEFT ON THE EXECUTOR" in block and report.public_key_left in block
+    assert "re-run" not in block and "rerun this node" not in block.lower()
     assert ieh.exit_code([report]) == 1
 
 

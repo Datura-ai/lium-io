@@ -23,8 +23,13 @@ How the connect path is reused (no new protocol, no new key handling):
    stdout and stderr at ``OUTPUT_CAP`` bytes each before they reach the validator, then
    ``MinerService._remove_ssh_key_via_rest`` takes the key back, in a ``finally`` that runs after
    every submit, refused or timed out included. The miner answers 200 once it accepted the remove
-   request; it does not confirm the removal on the executor. A remove the miner did not accept is
-   a node error and the run exits 1.
+   request; it does not confirm the removal on the executor. The remove is tried
+   ``KEY_REMOVE_ATTEMPTS`` times with the SAME public key (review, taiberium 17 Sep: a rerun mints a
+   new key and cannot take back the one the first run left); when every attempt fails the node
+   block prints that public key for exact manual removal, the node is an error and the run exits 1.
+6. A session that drops after login makes every read fail. A node with no completed read is an
+   error (``NO_READ_COMPLETED``) and the run exits 1, whatever the key remove answered (review,
+   taiberium 17 Sep: every command failed and the script exited 0).
 
 The sshd we reach runs inside the ``executor-executor-1`` container. That container mounts the
 host's ``/var/run/docker.sock`` and ``/etc/docker/daemon.json`` (neurons/executor/docker-compose.app.yml),
@@ -98,6 +103,10 @@ OUTPUT_CAP = 65536
 # The wrapped command's exit status rides on the last stdout line, after a blank one.
 RC_MARKER = "__inspect_rc="
 TRUNCATED_NOTE = f"[truncated at {OUTPUT_CAP} bytes]"
+# The key remove is retried with the same public key: a rerun cannot remove a key it did not mint.
+KEY_REMOVE_ATTEMPTS = 3
+KEY_REMOVE_RETRY_DELAY = 2.0  # seconds between attempts
+NO_READ_COMPLETED = "no read completed: the SSH session dropped after login"
 
 # Every command reads. ``test_every_command_is_read_only`` refuses a verb that writes.
 COMMANDS: tuple[tuple[str, str], ...] = (
@@ -208,6 +217,9 @@ class NodeReport:
     outputs: dict[str, CommandOutput] = field(default_factory=dict)
     error: str | None = None
     key_removed: bool | None = None
+    # the public key this run submitted, kept only when no remove attempt was accepted: it is what
+    # a human must delete from the executor's authorized_keys, a rerun cannot do it
+    public_key_left: str | None = None
 
 
 def parse_targets(text: str, default_hotkey: str | None) -> list[Target]:
@@ -276,19 +288,55 @@ async def resolve_axon_from_metagraph(hotkey: str) -> tuple[str, int]:
 
 async def run_commands(
     ssh_client: asyncssh.SSHClientConnection, outputs: dict[str, CommandOutput], per_command_timeout: float
-) -> None:
+) -> int:
     """Fill ``outputs`` one command at a time, so a node budget that runs out keeps what was read.
 
     Each command runs through ``capped()``, so ``ssh_client.run()`` never buffers more than
     ``OUTPUT_CAP`` bytes per stream; ``errors="replace"`` keeps a multibyte character that
-    ``head -c`` split from failing the read.
+    ``head -c`` split from failing the read. Returns how many reads the node answered (a read
+    that raised — the session dropped, the channel closed — is recorded and not counted), so the
+    caller can tell a node that answered nothing from one whose reads it can judge.
     """
+    completed = 0
     for label, command in COMMANDS:
         try:
             result = await asyncio.wait_for(ssh_client.run(capped(command), errors="replace"), timeout=per_command_timeout)
             outputs[label] = capped_output(result)
+            completed += 1
         except Exception as exc:  # one failed read must not hide the others
             outputs[label] = CommandOutput(exit_status=None, stdout="", stderr=f"{type(exc).__name__}: {exc}")
+    return completed
+
+
+async def remove_key_with_retries(
+    miner_service: MinerService,
+    *,
+    base_url: str,
+    my_key: bittensor.Keypair,
+    public_key: bytes,
+    miner_hotkey: str,
+    executor_id: str,
+    log_extra: dict,
+) -> bool:
+    """``_remove_ssh_key_via_rest`` up to ``KEY_REMOVE_ATTEMPTS`` times with the same public key.
+
+    The key the miner holds is this run's; a rerun mints another and cannot take this one back,
+    so the retries happen here, now, with the key that was submitted. True on the first accepted
+    remove (a 200 with an ``SSHKeyRemoved`` body); False when every attempt failed.
+    """
+    for attempt in range(1, KEY_REMOVE_ATTEMPTS + 1):
+        if await miner_service._remove_ssh_key_via_rest(
+            base_url=base_url,
+            my_key=my_key,
+            public_key=public_key,
+            miner_hotkey=miner_hotkey,
+            executor_id=executor_id,
+            log_extra={**log_extra, "remove_attempt": attempt},
+        ):
+            return True
+        if attempt < KEY_REMOVE_ATTEMPTS:
+            await asyncio.sleep(KEY_REMOVE_RETRY_DELAY)
+    return False
 
 
 async def inspect_executor(
@@ -356,7 +404,14 @@ async def inspect_executor(
                     known_hosts=None,
                 ) as ssh_client:
                     # a quarter of the node budget per read: one hung `docker logs` costs its slice, not the node
-                    await run_commands(ssh_client, report.outputs, per_command_timeout=max(5.0, node_timeout / 4))
+                    completed = await run_commands(
+                        ssh_client, report.outputs, per_command_timeout=max(5.0, node_timeout / 4)
+                    )
+            if completed == 0 and report.outputs:
+                # login worked and then every read raised (the session dropped, sshd closed the
+                # channel): there is nothing to judge, so the node is a failure, not a clean row
+                first = next(iter(report.outputs.values())).stderr
+                report.error = f"{NO_READ_COMPLETED} ({first})"
         except TimeoutError:  # the node budget only; the key submit's own 30 s timeout is reported below
             report.error = f"node budget of {node_timeout:.0f} s ran out after {len(report.outputs)} of {len(COMMANDS)} reads"
     except Exception as exc:
@@ -364,8 +419,9 @@ async def inspect_executor(
     finally:
         # Every submitted key gets a remove, whatever the submit answered: a submit that timed out
         # after the miner already pushed the key must not leave it there. The remove is idempotent,
-        # so a refused submit costs one harmless extra request.
-        report.key_removed = await miner_service._remove_ssh_key_via_rest(
+        # so a refused submit costs one harmless extra request. Retried here with this run's key.
+        report.key_removed = await remove_key_with_retries(
+            miner_service,
             base_url=base_url,
             my_key=my_key,
             public_key=public_key,
@@ -376,8 +432,16 @@ async def inspect_executor(
         if report.key_removed is not True:
             # `_remove_ssh_key_via_rest` logs and returns False instead of raising, so without this
             # line the node would look clean with a key still installed. Appended, so an earlier
-            # error (a refused submit, a read that hung) is kept next to it in the table.
-            note = "key remove not accepted by miner: the key may still be installed, re-run this node"
+            # error (a refused submit, a read that hung) is kept next to it in the table. No advice
+            # to rerun: a rerun mints a new key and cannot remove this one — the block prints it.
+            report.public_key_left = public_key.decode("utf-8", errors="replace").strip()
+            # the miner listed the executor only when it accepted the submit, so the key is on the host
+            # for sure in that case; after a refused or timed-out submit it may or may not have landed
+            state = "is still installed" if report.executor is not None else "may still be installed"
+            note = (
+                f"key remove not accepted by miner after {KEY_REMOVE_ATTEMPTS} attempts:"
+                f" the key {state}, remove it by hand (public key in the node block)"
+            )
             report.error = f"{report.error}; {note}" if report.error else note
     return report
 
@@ -556,6 +620,13 @@ def render_node_block(report: NodeReport) -> str:
         lines.append("")
     # the miner answers 200 once it accepted the request; it does not confirm the removal on the executor
     lines.append(f"key remove request accepted by miner (not confirmed on executor): {report.key_removed}")
+    if report.public_key_left:
+        left = "LEFT ON THE EXECUTOR" if report.executor is not None else "POSSIBLY LEFT ON THE EXECUTOR (submit not accepted)"
+        lines.append(
+            f"PUBLIC KEY {left} — delete exactly this line from the executor container's"
+            " ~/.ssh/authorized_keys if present (a rerun mints a new key and cannot remove this one):"
+        )
+        lines.append(report.public_key_left)
     lines.append("```")
     return "\n".join(lines)
 
