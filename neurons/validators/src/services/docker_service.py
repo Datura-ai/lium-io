@@ -4665,7 +4665,6 @@ class DockerService:
 
         dind_ip: str | None = None
         dns_servers: list[str] = []
-        egress_applied = False
         try:
             # 2. Launch the throwaway DinD build container under sysbox-runc.
             await self.stream_log(
@@ -4854,7 +4853,6 @@ class DockerService:
                     )
                 )
                 return CustomBuildOutcome(False, "build_egress_setup", "build egress firewall could not be applied")
-            egress_applied = True
 
             # 5. Write the Dockerfile into the DinD container (stdin, not argv).
             await self.stream_log(
@@ -4962,11 +4960,14 @@ class DockerService:
         finally:
             # Always tear down the throwaway container + its egress rules. The
             # host-loaded image is removed later by _cleanup_custom_build_artifacts.
+            # `dind_ip` goes in whenever it is known: an apply that timed out may
+            # have inserted some rules before the deadline, and the remove script
+            # is idempotent (taiberium, #1381).
             await self._teardown_dind_build(
                 ssh_client=ssh_client,
                 dind_name=dind_name,
                 dind_image=dind_image,
-                dind_ip=dind_ip if egress_applied else None,
+                dind_ip=dind_ip,
                 cidrs=cidrs,
                 default_extra=default_extra,
             )
