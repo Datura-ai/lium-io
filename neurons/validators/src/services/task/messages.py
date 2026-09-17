@@ -234,8 +234,11 @@ class GpuModelMessages:
         reason="GPU_DETAILS_MISMATCH",
         severity="warning",
         category="env",
-        impact="Job skipped; score set to 0",
-        remediation="GPU count and details length don't match. Check GPU detection.",
+        impact="Verification reset; score set to 0 until the scrape lists every GPU again",
+        remediation=(
+            "The GPUs the scrape enumerated do not match the count the node reports. Check `nvidia-smi -L` and `dmesg` on the host; "
+            "the node is verified again when every card is listed."
+        ),
     )
     MODEL_OK = MessageTemplate(
         event="GPU model validated",
