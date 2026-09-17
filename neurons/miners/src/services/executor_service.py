@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Annotated, Optional, Union
 from uuid import UUID
 
@@ -37,6 +38,13 @@ logger = logging.getLogger(__name__)
 # 27,900 ERROR lines in two days came from this path, one per executor per validator request,
 # and every one had an empty error text (aiohttp's TimeoutError has no message).
 UNREACHABLE_EXECUTOR_LOG_WINDOW_SECONDS = 300.0
+# what "did not answer" means: a timeout, a refused or dropped socket. A 200 with a body the miner
+# cannot parse is the executor misbehaving and keeps its ERROR.
+_UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    aiohttp.ClientConnectionError,
+    OSError,
+)
 
 
 def _describe_error(error: BaseException) -> str:
@@ -54,7 +62,7 @@ class _UnreachableExecutorLog:
         self._folded: dict[str, int] = {}
 
     def warn(self, executor_id: str, message: str, extra: dict, error: BaseException) -> None:
-        now = asyncio.get_running_loop().time()
+        now = time.monotonic()
         last = self._last_warned_at.get(executor_id)
         fields = {**extra, "reason": "executor_unreachable", "error": _describe_error(error)}
         if last is not None and now - last < self.window_seconds:
@@ -63,6 +71,11 @@ class _UnreachableExecutorLog:
             return
         folded = self._folded.pop(executor_id, 0)
         self._last_warned_at[executor_id] = now
+        # executors that went quiet for a whole window drop out, so the map is bounded by the
+        # executors that failed recently, not by every executor ever seen
+        for stale in [k for k, t in self._last_warned_at.items() if now - t >= self.window_seconds]:
+            self._last_warned_at.pop(stale, None)
+            self._folded.pop(stale, None)
         logger.warning(
             _m(
                 message,
@@ -344,12 +357,20 @@ class ExecutorService:
                         **executor.model_dump(mode="json"),
                     }
                     return ExecutorSSHInfo.parse_obj(response_obj)
-            except Exception as e:
+            except _UNREACHABLE_ERRORS as e:
                 _unreachable_executor_log.warn(
                     str(executor.uuid),
                     "API request failed to register SSH key - executor did not answer",
                     base_log_extra,
                     e,
+                )
+                return None
+            except Exception as e:
+                logger.error(
+                    _m(
+                        "API request failed to register SSH key - request exception",
+                        extra=get_extra_info({**base_log_extra, "error": _describe_error(e)}),
+                    ),
                 )
                 return None
 
@@ -392,12 +413,19 @@ class ExecutorService:
                             ),
                         )
                         return None
-            except Exception as e:
+            except _UNREACHABLE_ERRORS as e:
                 _unreachable_executor_log.warn(
                     str(executor.uuid),
                     "API request failed to remove SSH key - executor did not answer",
                     base_log_extra,
                     e,
+                )
+            except Exception as e:
+                logger.error(
+                    _m(
+                        "API request failed to remove SSH key - request exception",
+                        extra=get_extra_info({**base_log_extra, "error": _describe_error(e)}),
+                    ),
                 )
 
     async def register_pubkey(

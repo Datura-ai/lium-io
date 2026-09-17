@@ -120,6 +120,7 @@ from services.rental_docker_sdk import (
     VolumeMount,
     build_authorized_keys_exec_spec,
     build_container_command_argv,
+    is_docker_not_found_error,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
@@ -362,15 +363,24 @@ def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterat
     try:
         yield
     except Exception as exc:
-        # DAH-3593: INFO — the step is best effort by design and the SDK line above it already
-        # said what failed; most of these are a volume or container that was already gone.
-        log.info(
-            "delete_container post-teardown step failed (non-fatal)",
-            step=step,
-            reason="post_teardown_best_effort",
-            error=str(exc),
-            **fields,
-        )
+        # DAH-3593: a volume or container that was already gone is INFO (the delete is idempotent
+        # by design, DAH-2345). Any other step failing here — Redis, the inspector stop, a GPU
+        # sweep — is still a WARNING: nothing else logs it.
+        if is_docker_not_found_error(exc):
+            log.info(
+                "delete_container post-teardown step failed (non-fatal)",
+                step=step,
+                reason="already_gone",
+                error=str(exc),
+                **fields,
+            )
+        else:
+            log.warning(
+                "delete_container post-teardown step failed (non-fatal)",
+                step=step,
+                error=str(exc),
+                **fields,
+            )
 
 
 # DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
@@ -6231,7 +6241,7 @@ class DockerService:
                             **default_extra,
                             "reason": "workload_container_restarting",
                             "failure_step": current_step,
-                            "error": str(e),
+                            "error": "; ".join(_exception_texts(e)),
                         }),
                     )
                 )

@@ -76,7 +76,7 @@ def is_docker_not_found_error(exc: BaseException) -> bool:
         seen.add(id(current))
         if isinstance(current, Exception) and _is_docker_not_found_error(current):
             return True
-        current = current.__cause__ or current.__context__
+        current = current.__cause__  # explicit `raise ... from` links only
     return False
 
 

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 from typing import Any
 
 import asyncssh
@@ -132,7 +133,9 @@ def diagnose_dind_log(log_text: str | None) -> DindLogCause:
 _NODE_SIDE_ERRORS: tuple[type[BaseException], ...] = (
     asyncio.TimeoutError,
     asyncssh.Error,
-    OSError,  # includes ConnectionError: refused, reset, unreachable
+    ConnectionError,  # refused, reset, aborted
+    socket.gaierror,
+    socket.timeout,
 )
 
 

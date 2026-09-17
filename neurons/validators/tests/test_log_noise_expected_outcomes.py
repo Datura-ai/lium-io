@@ -27,7 +27,12 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ValidationEvent
-from services.docker_service import DockerService, _CreateCancelledByDelete
+from services.docker_service import (
+    DockerService,
+    _best_effort_delete_step,
+    _BoundLog,
+    _CreateCancelledByDelete,
+)
 from services.executor_connectivity.dind_probe import DindVerifier
 from services.executor_connectivity.models import PortPair
 from services.executor_connectivity.port_probe import PortProbe
@@ -275,6 +280,24 @@ async def test_remove_that_fails_for_another_reason_still_logs_error(caplog):
     assert failed[0].levelno == logging.ERROR
 
 
+def test_best_effort_delete_step_is_info_only_for_an_already_gone_object(caplog):
+    caplog.set_level(logging.DEBUG, logger="services.docker_service")
+    log = _BoundLog({"pod_id": "p"})
+
+    with _best_effort_delete_step(log, "remove_volume_local", volume_name="v"):
+        raise RentalDockerOperationError("Docker SDK remove volume failed: 404") from _NotFound("no such volume")
+    with _best_effort_delete_step(log, "remove_rented_machine"):
+        raise ConnectionError("Redis is down")
+
+    lines = _records(caplog, "delete_container post-teardown step failed (non-fatal)")
+    assert [(r.levelno, _extra(r)["step"]) for r in lines] == [
+        (logging.INFO, "remove_volume_local"),
+        (logging.WARNING, "remove_rented_machine"),
+    ]
+    assert _extra(lines[0])["reason"] == "already_gone"
+    assert "reason" not in _extra(lines[1])
+
+
 # ---------------------------------------------------------------------------
 # 3 — an offline miner is one WARNING per miner per cycle
 # ---------------------------------------------------------------------------
@@ -471,8 +494,7 @@ async def test_provider_state_verdict_logs_at_info_and_keeps_its_severity(caplog
 
     assert [r.levelno for r in caplog.records] == [logging.INFO]
     assert _extra(caplog.records[0])["reason"] == "provider_state"
-    assert _extra(caplog.records[0])["severity"] == "warning"  # what the backend receives
-    assert event.severity == "warning"
+    assert event.severity == "warning"  # the backend and the portal still see the verdict's own severity
 
 
 @pytest.mark.asyncio
@@ -676,16 +698,37 @@ def test_inspector_node_verdict_is_a_warning(caplog):
     assert response.message is InspectorMessages.FAILED_INTERACTIVE
 
 
-def test_inspector_unclassified_exception_is_still_an_error(caplog):
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "process_open", "expected_reason", "expected_level"),
+    [
+        # a refused socket before create_process: the node's transport, WARNING
+        (ConnectionRefusedError(111, "refused"), False, "INSPECTOR_FAILED_SSH_TRANSPORT", logging.WARNING),
+        # our own library failing before create_process: same verdict code, still ERROR
+        (RuntimeError("inspector_session_new failed"), False, "INSPECTOR_FAILED_SSH_TRANSPORT", logging.ERROR),
+        # an exception nobody classified after the process is open: ERROR
+        (ValueError("Expecting value: line 1 column 1"), True, "INSPECTOR_VALIDATION_ERROR", logging.ERROR),
+        # the node's own verdicts stay WARNING
+        (TimeoutError(), True, "INSPECTOR_FAILED_TIMEOUT", logging.WARNING),
+    ],
+    ids=["transport", "own library", "unclassified", "node timeout"],
+)
+async def test_inspector_unclassified_failures_keep_error_when_they_may_be_ours(
+    caplog, exc, process_open, expected_reason, expected_level
+):
     caplog.set_level(logging.DEBUG, logger="services.inspector_validation_service")
+    service = _inspector()
+    service.command_timeout = 30
+    service._capture_stderr = AsyncMock(return_value=None)
 
-    _inspector()._failure_response(
-        error="Expecting value: line 1 column 1 (char 0)",
-        message=InspectorMessages.VALIDATION_ERROR,
+    response = await service._validation_failure(
+        Mock() if process_open else None,
+        exc,
+        Msg=InspectorMessages,
         diagnostics={"executor_uuid": "exec-1"},
         default_extra={"miner_hotkey": "m"},
-        error_type="JSONDecodeError",
     )
 
+    assert response.message.reason == expected_reason
     line = _records(caplog, "Inspector validation failed")
-    assert len(line) == 1 and line[0].levelno == logging.ERROR
+    assert len(line) == 1 and line[0].levelno == expected_level
