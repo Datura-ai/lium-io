@@ -29,10 +29,11 @@ DEFAULT_PRICE = DefaultPrice()
 # carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
 # the pinned lium-core still has 5.10).
 #
-# DAH-3623: the idle rate of a model is at most 0.8 x the median price renters paid for it over the
-# trailing 7 days (owner rule, 17 Sep 2026: "idle pay should never be higher than rental rates").
-# Nine models in the lium-core table paid idle above the cap (three above the rental price itself) and
-# are pinned at 0.8 x their paid median, rounded down to the cent; the fixture in
+# DAH-3623: the idle rate of a model is pinned at 0.8 x the median price renters paid for it over the
+# trailing 7 days (owner rule, 17 Sep 2026: "idle pay should never be higher than rental rates";
+# 21:41Z: "pin means raise too"). Nine models in the lium-core table paid idle above that mark (three
+# above the rental price itself) and three paid under it; all twelve are pinned at 0.8 x their paid
+# median, rounded down to the cent so no pin exceeds the mark. The fixture in
 # tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
@@ -49,6 +50,9 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     "NVIDIA A100-SXM4-80GB": 0.56,  # 0.8 x 0.70 paid median (was 0.6923 = 99 %)
     "NVIDIA GeForce RTX 4090": 0.28,  # 0.8 x 0.35 paid median (was 0.30 = 86 %)
     "NVIDIA L40S": 0.30,  # 0.8 x 0.38 = 0.304, floor cent (was 0.35 = 92 %)
+    "NVIDIA B200": 4.48,  # 0.8 x 5.60 paid median (was 4.25 = 76 %, raised)
+    "NVIDIA RTX A6000": 0.33,  # 0.8 x 0.42 = 0.336, floor cent (was 0.32 = 76 %, raised)
+    "NVIDIA H100 PCIe": 1.79,  # 0.8 x 2.24 = 1.792, floor cent (was 1.1988 = 54 %, raised)
 }
 
 
