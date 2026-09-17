@@ -29,7 +29,7 @@ class ReachTarget(StrEnum):
     """What could not be reached. Add a member for every new reachability check."""
 
     EXECUTOR_SSH = "executor_ssh"
-    # The executor's HTTP API, which the miner calls to install the validator's SSH key.
+    # The executor's HTTP API, the miner's side of the node.
     EXECUTOR_API = "executor_api"
 
 
@@ -143,9 +143,10 @@ def build_rented_executor_not_listed_event(
 ) -> ValidationEvent:
     """DAH-3558: a rented node the miner left out of its answer to the wave.
 
-    The miner returns only executors that took its SSH key upload, so a node that is down (or
-    whose executor daemon is down) is simply absent and no pipeline runs for it. This event is
-    the wave's record of that: the backend lists the executor as rented, the miner does not.
+    No pipeline runs for a node the miner does not list, so without this event the wave writes
+    nothing about it. This event is the wave's record: the backend lists the executor as rented,
+    the miner did not return it. Why the miner left it out is the miner's business (it may drop
+    a node before it ever tries to reach it), so the text says only that.
     """
     return build_availability_event(
         code=AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED,
@@ -157,9 +158,8 @@ def build_rented_executor_not_listed_event(
             "again. The backend's staleness sweep reads this row as the node not answering."
         ),
         remediation=(
-            "The miner could not install the validator's SSH key on this executor, so it left it "
-            "out. Check that the node is up, the executor container is running and its API port "
-            "answers the miner."
+            "The miner did not return this node in its answer to the validator. Check that the "
+            "node is up and that the miner lists it."
         ),
         what_we_saw={
             "executor_uuid": executor_uuid,

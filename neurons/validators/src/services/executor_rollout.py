@@ -68,8 +68,8 @@ MAX_ROLLOUT_GRACE_CYCLES = 2
 ROLLOUT_FAILURE_REASONS = frozenset(
     {
         AvailabilityErrorCode.EXECUTOR_SSH_UNREACHABLE.value,
-        # DAH-3558: the miner could not install its key on the restarting executor and left it
-        # out of its answer; the validator then wrote this row for the rented node.
+        # DAH-3558: the miner left the restarting executor out of its answer; the validator then
+        # wrote this row for the rented node.
         AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED.value,
         UploadFilesMessages.UPLOAD_FAILED.reason,
         TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason,

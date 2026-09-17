@@ -1,10 +1,8 @@
 """DAH-3558: a rented node the miner left out of its answer gets a failed row, not silence.
 
-The miner keeps only the executors that took its SSH key upload (neurons/miners
-ExecutorService.register_pubkey filters on a successful /upload_ssh_key), so a rented node that
-is down is missing from AcceptSSHKeyRequest.executors, no pipeline runs for it and the wave
-writes nothing about it. Prod, 14 d to 17 Sep 2026: 499 of 625 rented offline windows had zero
-validator rows. With RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED the wave writes one failed result
+A rented node the miner does not put in AcceptSSHKeyRequest.executors gets no pipeline, and
+the wave writes nothing about it (the measurement is in the PR body). With
+RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED the wave writes one failed result
 (score 0, RENTED_EXECUTOR_NOT_LISTED, availability error) per rented executor of the miner that
 the backend lists and the miner did not return. Flag off: today's behaviour, nothing is added.
 On main (no flag, no methods) every test here fails; that is the fail-old proof.

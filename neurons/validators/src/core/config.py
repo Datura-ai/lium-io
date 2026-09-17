@@ -369,14 +369,11 @@ class Settings(BaseSettings):
     RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
-    # DAH-3558: a rented node the miner could not reach is missing from the miner's answer to the
-    # wave (the miner keeps only executors that took its SSH key), so no pipeline runs for it and
-    # the wave writes nothing about it: no report row, no availability error, no evidence for the
-    # backend's staleness sweep (499 of 625 rented offline windows in 14 d had zero validator rows;
-    # 441 of them ended inside the hour the sweep waits). On, the wave writes one failed result per
-    # rented executor of that miner that the backend lists and the miner did not return
-    # (RENTED_EXECUTOR_NOT_LISTED, score 0, availability error). Manual rentals keep their forced
-    # pass. Off = today's behaviour.
+    # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
+    # wave writes nothing about it: no report row, no availability error, no evidence for the
+    # backend's staleness sweep. On, the wave writes one failed result per rented executor of that
+    # miner that the backend lists and the miner did not return (RENTED_EXECUTOR_NOT_LISTED,
+    # score 0, availability error). Manual rentals keep their forced pass. Off = today's behaviour.
     RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED: bool = Field(
         env="RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED", default=False
     )

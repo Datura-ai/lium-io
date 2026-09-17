@@ -905,13 +905,11 @@ class MinerService:
     ) -> list[JobResult]:
         """One failed result per rented executor of this miner that its answer left out (DAH-3558).
 
-        The miner keeps only the executors that took its SSH key upload (neurons/miners
-        ExecutorService.register_pubkey filters on a successful ``/upload_ssh_key``), so a rented
-        node that is down is not in ``AcceptSSHKeyRequest.executors`` and no pipeline runs for it.
-        Without this the wave writes nothing about the node: no report row, no availability error,
-        and the backend's staleness sweep (EXECUTOR_INACTIVE_MID_RENTAL, lium-platform
-        penalty_trigger.py) reads silence. In 14 d of prod, 499 of 625 rented offline windows had
-        zero validator rows; 441 of them ended inside the hour the sweep waits.
+        A node the miner does not put in ``AcceptSSHKeyRequest.executors`` gets no pipeline, and
+        the wave writes nothing about it: no report row, no availability error, and the backend's
+        staleness sweep (EXECUTOR_INACTIVE_MID_RENTAL, lium-platform penalty_trigger.py) reads
+        silence. Why the miner left the node out is not known here (providers run their own miner
+        versions), so the row says only that the miner did not return it.
 
         ``listed`` is the miner's answer before any lane filtering: an executor the express lane
         holds was still returned by the miner, and every real result is for a listed executor, so
