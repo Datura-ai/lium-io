@@ -113,6 +113,7 @@ from services.rental_docker_sdk import (
     PortBinding,
     RENTAL_NETWORK_NAME,
     RentalDockerConnectionError,
+    RentalDockerContainerRestartingError,
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
@@ -361,9 +362,12 @@ def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterat
     try:
         yield
     except Exception as exc:
-        log.error(
+        # DAH-3593: INFO — the step is best effort by design and the SDK line above it already
+        # said what failed; most of these are a volume or container that was already gone.
+        log.info(
             "delete_container post-teardown step failed (non-fatal)",
             step=step,
+            reason="post_teardown_best_effort",
             error=str(exc),
             **fields,
         )
@@ -654,6 +658,15 @@ class CustomBuildFailed(Exception):
         self.failure_step = failure_step
         self.log_tail = log_tail
         super().__init__(f"Custom dockerfile build failed (failure_step={failure_step})")
+
+
+def _last_attempt_exception(exc: Exception) -> BaseException:
+    """The exception itself, or the last attempt's when tenacity wrapped it in a RetryError."""
+    if isinstance(exc, RetryError):
+        last_exception = exc.last_attempt.exception()
+        if last_exception is not None:
+            return last_exception
+    return exc
 
 
 class _CreateCancelledByDelete(Exception):
@@ -6196,7 +6209,34 @@ class DockerService:
                     "failure_step": current_step,
                 }),
             )
-            logger.error(log_text, exc_info=True)
+            # DAH-3593: an expected outcome is one line with a reason and no traceback. The renter
+            # deleted the pod while it was being built, or the workload image exits at start on this
+            # node; neither is a validator fault. ERROR with the traceback stays for everything else.
+            if isinstance(e, _CreateCancelledByDelete):
+                logger.info(
+                    _m(
+                        "create cancelled by delete",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "reason": "cancelled_by_delete",
+                            "failure_step": current_step,
+                        }),
+                    )
+                )
+            elif isinstance(_last_attempt_exception(e), RentalDockerContainerRestartingError):
+                logger.warning(
+                    _m(
+                        "workload container keeps restarting; create failed",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "reason": "workload_container_restarting",
+                            "failure_step": current_step,
+                            "error": str(e),
+                        }),
+                    )
+                )
+            else:
+                logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)

@@ -336,12 +336,23 @@ class InspectorValidationService:
             payload["error_type"] = error_type
         if executor_stderr:
             payload["executor_stderr"] = executor_stderr
-        logger.error(
-            _m(
-                "Inspector validation failed",
-                extra=get_extra_info({**default_extra, **payload}),
-            ),
-        )
+        # DAH-3593: the node failing the check is a verdict (INSPECTOR_FAILED_*), recorded and
+        # scored — WARNING. An exception the validator did not classify (VALIDATION_ERROR) is
+        # still ERROR: that one may be ours.
+        if message.reason == "INSPECTOR_VALIDATION_ERROR":
+            logger.error(
+                _m(
+                    "Inspector validation failed",
+                    extra=get_extra_info({**default_extra, **payload}),
+                ),
+            )
+        else:
+            logger.warning(
+                _m(
+                    "Inspector validation failed",
+                    extra=get_extra_info({**default_extra, **payload, "reason_class": "node_verdict"}),
+                ),
+            )
         return InspectorValidationResponse(
             error=error,
             diagnostics=payload,
