@@ -4219,7 +4219,9 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
     assert "docker.io/library/alpine:3.19" in helper_cmd
     assert "rmdir" in helper_cmd
     assert "rm -rf" not in helper_cmd
-    assert "-v /var/lib/docker/plugins/plugin123/propagated-mount:/mnt" in helper_cmd
+    # `--mount type=bind` so a missing propagated-mount dir fails the helper instead of being created
+    assert "--mount type=bind,src=/var/lib/docker/plugins/plugin123/propagated-mount,dst=/mnt" in helper_cmd
+    assert " -v " not in helper_cmd
     assert "/mnt/volume_test" in helper_cmd
     assert all(
         call.kwargs.get("timeout") == 30
@@ -4266,7 +4268,7 @@ async def test_repair_stale_vloopback_mountpoint_uses_the_hosts_docker_root(
         ">/dev/null 2>&1"
     )
     assert (
-        "-v /mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount:/mnt "
+        "--mount type=bind,src=/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount,dst=/mnt "
         "docker.io/library/alpine:3.19 rmdir /mnt/volume_test"
     ) in commands[4]
     assert not any("/var/lib/docker" in command for command in commands)
@@ -4309,7 +4311,7 @@ async def test_repair_stale_vloopback_mountpoint_falls_back_to_the_default_root_
     assert repaired is True
     commands = _vloopback_repair_commands(ssh_client)
     assert "/usr/bin/findmnt /var/lib/docker/plugins/plugin123/propagated-mount/volume_test" in commands[3]
-    assert "-v /var/lib/docker/plugins/plugin123/propagated-mount:/mnt" in commands[4]
+    assert "--mount type=bind,src=/var/lib/docker/plugins/plugin123/propagated-mount,dst=/mnt" in commands[4]
     fallback_extra = next(
         record.msg.extra
         for record in caplog.records
@@ -4401,8 +4403,29 @@ async def test_repair_stale_vloopback_mountpoint_refuses_unexpected_mountpoint(d
     ssh_client.run.assert_awaited_once()
 
 
+@pytest.mark.parametrize(
+    "rmdir_result, absence_check_result",
+    [
+        pytest.param(
+            _make_ssh_command_result(exit_status=12, stderr="not empty"),
+            _make_ssh_command_result(exit_status=0),
+            id="target_still_present",
+        ),
+        pytest.param(
+            # the propagated-mount dir itself is missing (a guessed docker root): with
+            # `--mount type=bind` docker refuses both helpers instead of creating the dir
+            _make_ssh_command_result(exit_status=125, stderr="bind source path does not exist"),
+            _make_ssh_command_result(exit_status=125, stderr="bind source path does not exist"),
+            id="propagated_mount_dir_missing_helper_did_not_run",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker_service, caplog):
+async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(
+    docker_service, caplog, rmdir_result, absence_check_result
+):
+    # a failed rmdir counts as repaired only when the target is proven gone (`test -e` exit 1);
+    # a target that is still there, or a helper that could not answer, keeps the repair skipped
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(
         side_effect=[
@@ -4410,11 +4433,12 @@ async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker
             _VLOOPBACK_REPAIR_PLUGIN_ID,
             _make_ssh_command_result(stdout="/mnt/lium-xfs/lium-docker\n"),
             _make_ssh_command_result(exit_status=1),
-            _make_ssh_command_result(exit_status=12, stderr="not empty"),
+            rmdir_result,
+            absence_check_result,
         ]
     )
 
-    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
         repaired = await docker_service.repair_stale_vloopback_mountpoint(
             ssh_client=ssh_client,
             local_volume="volume_test",
@@ -4422,6 +4446,16 @@ async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker
         )
 
     assert repaired is False
+    commands = _vloopback_repair_commands(ssh_client)
+    assert len(commands) == 6
+    assert commands[5] == (
+        "/usr/bin/docker run --rm "
+        "--mount type=bind,src=/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount,dst=/mnt "
+        "docker.io/library/alpine:3.19 test -e /mnt/volume_test"
+    )
+    assert not any(
+        str(record.msg) == "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT" for record in caplog.records
+    )
     # the skipped-repair line names the path it tried, so the next wrong-root host is readable
     # from the log alone
     skipped_extra = next(
@@ -4432,7 +4466,62 @@ async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker
     assert skipped_extra["target"] == (
         "/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount/volume_test"
     )
-    assert skipped_extra["stderr"] == "not empty"
+    assert skipped_extra["exit_status"] == rmdir_result.exit_status
+    assert skipped_extra["stderr"] == rmdir_result.stderr
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_counts_a_hand_removed_target_as_repaired(
+    docker_service, caplog
+):
+    # DAH-3398 / ticket-0313: the provider removed the stale propagated-mount dir by hand, as our
+    # ticket replies ask. rmdir then fails on every cycle, and before this the failed rmdir was a
+    # failed repair, so recovery never reached `start_existing_container` (24 h of POD_NOT_RUNNING
+    # after the directory was gone). A target that is proven absent is already repaired.
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _VLOOPBACK_REPAIR_INSPECT,
+            _VLOOPBACK_REPAIR_PLUGIN_ID,
+            _make_ssh_command_result(stdout="/mnt/lium-xfs/lium-docker\n"),
+            _make_ssh_command_result(exit_status=1),
+            _make_ssh_command_result(
+                exit_status=1,
+                stderr="rmdir: '/mnt/volume_test': No such file or directory",
+            ),
+            _make_ssh_command_result(exit_status=1),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        repaired = await docker_service.repair_stale_vloopback_mountpoint(
+            ssh_client=ssh_client,
+            local_volume="volume_test",
+            default_extra={"executor_id": "executor-1"},
+        )
+
+    assert repaired is True
+    commands = _vloopback_repair_commands(ssh_client)
+    assert len(commands) == 6
+    # the absence check reads the same bind-mounted dir the rmdir used, from the same helper image
+    assert commands[5] == (
+        "/usr/bin/docker run --rm "
+        "--mount type=bind,src=/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount,dst=/mnt "
+        "docker.io/library/alpine:3.19 test -e /mnt/volume_test"
+    )
+    assert all(call.kwargs.get("timeout") == 30 for call in ssh_client.run.await_args_list)
+    events = [str(record.msg) for record in caplog.records]
+    assert "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED" not in events
+    assert "VLOOPBACK_STALE_MOUNTPOINT_REPAIRED" not in events
+    absent_extra = next(
+        record.msg.extra
+        for record in caplog.records
+        if str(record.msg) == "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT"
+    )
+    assert absent_extra["executor_id"] == "executor-1"
+    assert absent_extra["target"] == (
+        "/mnt/lium-xfs/lium-docker/plugins/plugin123/propagated-mount/volume_test"
+    )
 
 
 @pytest.mark.asyncio
@@ -6381,6 +6470,77 @@ async def test_recover_pod_does_not_start_when_repair_fails(docker_service, monk
 
     assert recovered is False
     start_existing_container.assert_not_awaited()
+
+
+def _hand_cleaned_host_ssh_client(absence_check_exit_status: int) -> AsyncMock:
+    # ticket-0313's host after the provider's cleanup: data-root under /mnt/lium-xfs, the container
+    # still carries its vloopback volume, nothing is mounted, and rmdir finds no directory. The last
+    # answer is the absence check: exit 1 = the directory is gone, exit 0 = it is still there.
+    async def run(command, *_args, **_kwargs):
+        if ".Destination" in command:
+            return _make_ssh_command_result(stdout="/root\n")
+        if "/usr/bin/docker inspect pod_pod-1" in command:
+            return _make_ssh_command_result(stdout="volume_pod-1\n")
+        if "/usr/bin/docker volume inspect volume_pod-1" in command:
+            return _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_pod-1\n")
+        if "/usr/bin/docker plugin inspect" in command:
+            return _make_ssh_command_result(stdout="plugin123\n")
+        if "/usr/bin/docker info" in command:
+            return _make_ssh_command_result(stdout="/mnt/lium-xfs/lium-docker\n")
+        if command.startswith("/usr/bin/findmnt "):
+            return _make_ssh_command_result(exit_status=1)
+        if command.endswith(" rmdir /mnt/volume_pod-1"):
+            return _make_ssh_command_result(
+                exit_status=1, stderr="rmdir: '/mnt/volume_pod-1': No such file or directory"
+            )
+        if command.endswith(" test -e /mnt/volume_pod-1"):
+            return _make_ssh_command_result(exit_status=absence_check_exit_status)
+        raise AssertionError(f"unexpected command on the hand-cleaned host: {command}")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    return ssh_client
+
+
+@pytest.mark.parametrize(
+    "absence_check_exit_status, expected_recovered",
+    [
+        pytest.param(1, True, id="mountpoint_dir_gone_starts_the_container"),
+        pytest.param(0, False, id="mountpoint_dir_still_there_stays_failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_starts_when_the_provider_already_removed_the_stale_dir(
+    docker_service, monkeypatch, caplog, absence_check_exit_status, expected_recovered
+):
+    # DAH-3398 / ticket-0313, through the real repair: a reboot-stranded pod whose stale dir the
+    # provider removed by hand reaches `start_existing_container`; the same host with the dir still
+    # in place (rmdir failed for another reason) keeps POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED.
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        recovered = await _attempt_stale_mount_recovery(
+            docker_service,
+            _STALE_MOUNT_ERROR,
+            _hand_cleaned_host_ssh_client(absence_check_exit_status),
+        )
+
+    assert recovered is expected_recovered
+    events = [str(record.msg) for record in caplog.records]
+    if expected_recovered:
+        start_kwargs = start_existing_container.await_args.kwargs
+        assert start_kwargs["container_name"] == "pod_pod-1"
+        assert start_kwargs["default_extra"]["local_volume"] == "volume_pod-1"
+        assert "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT" in events
+        assert "POD_STALE_MOUNT_RECOVERED" in events
+        assert "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED" not in events
+    else:
+        start_existing_container.assert_not_awaited()
+        assert "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED" in events
+        assert "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED" in events
 
 
 @pytest.mark.asyncio
