@@ -1989,13 +1989,14 @@ class MinerService:
         except Exception as e:
             # DAH-3593: a miner that does not answer is the offline-miner case the job request
             # already reported at WARNING; anything else keeps its WARNING.
-            log = logger.info if _is_miner_unreachable_error(e) else logger.warning
+            unreachable = _is_miner_unreachable_error(e)
+            log = logger.info if unreachable else logger.warning
             log(
                 _m(
                     "Failed to remove SSH key via REST API. Validator key may still be present on miner",
                     extra=get_extra_info({
                         **log_extra,
-                        "reason": "miner_unreachable" if _is_miner_unreachable_error(e) else "remove_failed",
+                        "reason": "miner_unreachable" if unreachable else "remove_failed",
                         "error": _get_error_details(e),
                         "miner_hotkey": miner_hotkey,
                         "executor_id": executor_id,

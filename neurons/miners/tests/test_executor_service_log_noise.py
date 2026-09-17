@@ -131,3 +131,20 @@ async def test_live_executor_refusing_the_key_is_still_an_error(
     assert [r.levelno for r in register] == [logging.ERROR]
     assert [r.levelno for r in remove] == [logging.ERROR]
     assert _extra(register[0])["status"] == 401
+
+
+@pytest.mark.asyncio
+async def test_live_executor_answering_garbage_is_still_an_error(executor_service, executor, caplog, fresh_window):
+    """A 200 whose body the miner cannot parse is the executor misbehaving, not "did not answer"."""
+    caplog.set_level(logging.DEBUG, logger="services.executor_service")
+    session = _make_mock_session(response_status=200)
+    response = session.post.return_value.__aenter__.return_value
+    response.json = AsyncMock(side_effect=ValueError("Expecting value: line 1 column 1"))
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session):
+        assert await executor_service.send_pubkey_to_executor(executor, _SSH_KEY, "0xsig") is None
+
+    lines = _records(caplog, "API request failed to register SSH key - request exception")
+    assert [r.levelno for r in lines] == [logging.ERROR]
+    assert _extra(lines[0])["error"].startswith("ValueError: ")
+    assert not _records(caplog, "API request failed to register SSH key - executor did not answer")

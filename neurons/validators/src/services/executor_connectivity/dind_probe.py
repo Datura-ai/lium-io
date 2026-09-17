@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 from typing import Any
 
 import asyncssh
@@ -32,7 +33,9 @@ DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 _NODE_SIDE_ERRORS: tuple[type[BaseException], ...] = (
     asyncio.TimeoutError,
     asyncssh.Error,
-    OSError,  # includes ConnectionError: refused, reset, unreachable
+    ConnectionError,  # refused, reset, aborted
+    socket.gaierror,
+    socket.timeout,
 )
 
 
