@@ -4720,27 +4720,33 @@ class DockerService:
             # 3. Wait for the inner dockerd to accept connections: up to
             #    `ready_timeout_s` probes a second apart (the budget the loop
             #    always had), each probe bounded by `probe_timeout_s` so a hung
-            #    `docker info` ends the wait instead of holding the build for
-            #    an hour. A probe that hits its bound is "not ready" like an
+            #    `docker info` is one failed probe, not a build held for an
+            #    hour. A probe that hits its bound is "not ready" like an
             #    exit 1 (taiberium, #1381: aborting there rejected a DinD that
             #    was still starting), and the next probe follows at once.
-            #    Worst case, probes that each take the whole bound and answer
-            #    "not ready": N * 10 s, 10 min at the default 60.
-            #    `ready_timeout_s` is `gt=0` in settings, so at least one probe
-            #    runs.
+            #    The bound is `timeout(1)` on the executor, as for the DinD
+            #    start: asyncssh's `timeout=` only stops waiting and would
+            #    leave the remote `docker exec` and its session channel open,
+            #    one per slow probe, until sshd's MaxSessions refused the
+            #    next one. Worst case, probes that each take the whole bound
+            #    and answer "not ready": N * (10 + 1) s, 11 min at the default
+            #    60. `ready_timeout_s` is `gt=0` in settings, so at least one
+            #    probe runs.
             ready = False
             probe_timeout_s = min(ready_timeout_s, DIND_READY_PROBE_MAX_SECONDS)
             for _ in range(ready_timeout_s):
                 try:
                     probe = await ssh_client.run(
+                        f"timeout -k 2 {probe_timeout_s} "
                         f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info",
                         check=False,
-                        timeout=probe_timeout_s,
+                        timeout=probe_timeout_s + 5,
                     )
                 except asyncio.TimeoutError:
-                    # dockerd did not answer within the bound: not ready yet.
-                    # The probe already used its bound, so no extra sleep.
+                    # Backstop for a host where even `timeout(1)` did not
+                    # return: not ready yet, and the probe used its bound.
                     continue
+                # `timeout(1)` exits 124 when it killed the probe: not ready.
                 if probe.exit_status == 0:
                     ready = True
                     break
