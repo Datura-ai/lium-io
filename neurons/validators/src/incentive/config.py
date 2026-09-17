@@ -28,12 +28,20 @@ DEFAULT_PRICE = DefaultPrice()
 # validator pins the two editions to parity here; the override can go once the validator's lock
 # carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
 # the pinned lium-core still has 5.10).
+#
+# DAH-3623: the idle rate of a model is at most 0.8 x the median price renters paid for it over the
+# trailing 7 days (owner rule, 17 Sep 2026: "idle pay should never be higher than rental rates").
+# Three models in the lium-core table pay idle above the rental price itself and are pinned at the cap;
+# the fixture in tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
+    "NVIDIA A100 80GB PCIe": 0.24,  # 0.8 x 0.30 paid median (was 0.36 = 120 % of the rental price)
+    "NVIDIA H100 80GB HBM3": 1.04,  # 0.8 x 1.30 paid median (was 1.494 = 115 %)
+    "NVIDIA GeForce RTX 5090": 0.48,  # 0.8 x 0.60 paid median (was 0.65 = 108 %)
 }
 
 
