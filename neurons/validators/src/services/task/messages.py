@@ -234,8 +234,11 @@ class GpuModelMessages:
         reason="GPU_DETAILS_MISMATCH",
         severity="warning",
         category="env",
-        impact="Job skipped; score set to 0",
-        remediation="GPU count and details length don't match. Check GPU detection.",
+        impact="Verification reset; score set to 0 until the scrape lists every GPU again",
+        remediation=(
+            "The GPUs the scrape enumerated do not match the count the node reports. Check `nvidia-smi -L` and `dmesg` on the host; "
+            "the node is verified again when every card is listed."
+        ),
     )
     MODEL_OK = MessageTemplate(
         event="GPU model validated",
@@ -1103,6 +1106,49 @@ class CapabilityMessages:
         category="env",
         impact="Score set to 0",
         remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
+    )
+    # One reason code per CUDA failure the probe can hit (DAH-3362, ticket-0318), as
+    # GPU_VERIFY_TIMEOUT and the VERIFYX_FAILED_* family already do; the full steps live in the
+    # reason-code table the default help_uri points at. Wording is provider-facing; no backticks,
+    # the portal renders it as plain text.
+    VERIFY_FAILED_CUDA_NOT_READY = MessageTemplate(
+        event="GPU capability verification failed: CUDA cannot start",
+        reason="GPU_VERIFY_CUDA_NOT_READY",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "CUDA cannot start on the GPU although nvidia-smi works (CUDA error 802, 'system not "
+            "yet initialized'); on HGX H100/H200 boards the NVLink fabric is not ready. Start "
+            "Fabric Manager, have the hosting provider activate the fabric partition, or on a "
+            "board without NVSwitch reinstall the driver; the steps per case are on the linked "
+            "page."
+        ),
+    )
+    VERIFY_FAILED_NO_CUDA_DEVICE = MessageTemplate(
+        event="GPU capability verification failed: no CUDA device in the container",
+        reason="GPU_VERIFY_NO_CUDA_DEVICE",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The probe found no usable CUDA device inside the executor container: the NVIDIA "
+            "Container Toolkit is not exposing the GPUs to it, or the host driver is older than "
+            "the probe's CUDA runtime. docker exec executor-executor-1 nvidia-smi must list every "
+            "GPU — the toolkit, nvidia_uvm and driver steps are on the linked page."
+        ),
+    )
+    VERIFY_FAILED_VRAM_UNAVAILABLE = MessageTemplate(
+        event="GPU capability verification could not allocate VRAM",
+        reason="GPU_VERIFY_VRAM_UNAVAILABLE",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The matrix-multiplication probe could not allocate GPU memory: another process held "
+            "VRAM while it ran. Check nvidia-smi for processes or leftover containers on the GPU; "
+            "the next verification cycle retries."
+        ),
     )
     VERIFY_TIMEOUT = MessageTemplate(
         event="GPU capability verification timed out",

@@ -85,6 +85,7 @@ sequenceDiagram
 | Component | Purpose |
 |-----------|---------|
 | `lium-cvm.sh` | CLI for creating and running CVMs |
+| `cvm_upgrade_guard.sh` | Host-wide CVM disk inventory, pinned key-provider image, host lock; refuses a key-provider rebuild while any CVM disk exists |
 | `scripts/dstack.py` | VM manifest generator and QEMU orchestrator |
 | `scripts/host_api.py` | HTTP API bridge between VM and key provider |
 | `key-provider/` | SGX enclave containers for sealing key derivation |
@@ -130,6 +131,13 @@ CVM_GPUS=all  # or "19:00.0,3b:00.0"
 **Check key provider status:**
 ```bash
 cd key-provider && docker compose logs -f
+```
+
+**Start or upgrade the key provider** (`docker compose build` in `key-provider/` builds nothing: the compose file has no `build:` section, the guard builds through `docker-compose.build.yaml`; a rebuild changes MRENCLAVE and locks every CVM out of its data disk):
+```bash
+sudo ./cvm_upgrade_guard.sh start      # pinned image; builds only on a host with no CVM disk
+sudo ./lium-cvm.sh inventory           # every CVM disk on the host
+sudo ./cvm_upgrade_guard.sh upgrade    # refused while any CVM disk exists; see docs/host-setup.md §6.1
 ```
 
 **List running VMs:**

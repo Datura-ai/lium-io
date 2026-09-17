@@ -1509,6 +1509,9 @@ ERRNO_EIO = 5
 ERRNO_ENOSPC = 28
 ERRNO_EROFS = 30
 ERRNO_EDQUOT = 122
+# mount options under which a write to the filesystem fails with EROFS: `ro`, and the `emergency_ro`
+# that kernels 6.6+ add (next to a kept `rw`) when ext4 honours errors=remount-ro after an error
+READ_ONLY_MOUNT_OPTIONS = frozenset({"ro", "emergency_ro"})
 
 
 class DiskHealthObservation:
@@ -1539,8 +1542,9 @@ def mounts_holding(mounts_text: str, path: str) -> list[str]:
     `mounts_text` is /proc/<pid>/mounts. Only the covering mount counts - the longest mount point
     that is `path` or a parent of it, the last line winning when a point is mounted over - because
     a mount above it says nothing about writes below: `ro /` with `rw /var/lib/docker` is a docker
-    root that takes writes, and returns []. One element or none; a list so the payload shape
-    holds."""
+    root that takes writes, and returns []. Read-only is the `ro` option, or `emergency_ro`: since
+    kernel 6.6 an ext4 error under errors=remount-ro keeps `rw` in the options and adds
+    `emergency_ro` instead. One element or none; a list so the payload shape holds."""
     covering: tuple[str, list[str]] | None = None
     for line in mounts_text.splitlines():
         fields = line.split()
@@ -1551,7 +1555,7 @@ def mounts_holding(mounts_text: str, path: str) -> list[str]:
             continue
         if covering is None or len(mount_point) >= len(covering[0]):
             covering = (mount_point, options)
-    if covering is None or "ro" not in covering[1]:
+    if covering is None or not READ_ONLY_MOUNT_OPTIONS & set(covering[1]):
         return []
     return [covering[0]]
 

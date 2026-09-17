@@ -1,5 +1,6 @@
 """DAH-3480: a GPU probe that cannot allocate because a pod or filler took the cards after the
-cycle's rental snapshot is not scored as GPU_VERIFY_FAILED.
+cycle's rental snapshot is not scored as a failure (GPU_VERIFY_FAILED, or GPU_VERIFY_VRAM_UNAVAILABLE
+since DAH-3264 for an allocation failure).
 
 Every failure result below is the prod transcript of B-175 (ticket-0324, 14 Sep 2026 12:33Z):
 the wrapper printed `UUID:  None`, stderr carried `Failed to allocate d_A: out of memory`, and the
@@ -142,7 +143,8 @@ async def test_allocation_failure_stays_failed_without_a_backend_workload(contex
     result = await pending
 
     assert result.passed is False
-    assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+    # not waived; DAH-3264 names the allocation failure (no uuid + out-of-memory text)
+    assert result.event.reason_code == Msg.VERIFY_FAILED_VRAM_UNAVAILABLE.reason
     assert result.event.what_we_saw["stderr"] == OOM_STDERR
     backend.get_rented_executors_now.assert_awaited_once()
 
@@ -157,7 +159,7 @@ async def test_a_backend_read_that_raises_keeps_the_failure(context_factory):
     result = await CapabilityCheck().run(context_factory(services=services, state=state))
 
     assert result.passed is False
-    assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+    assert result.event.reason_code == Msg.VERIFY_FAILED_VRAM_UNAVAILABLE.reason
 
 
 @pytest.mark.asyncio
