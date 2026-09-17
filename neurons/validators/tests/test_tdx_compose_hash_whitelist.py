@@ -60,8 +60,9 @@ def test_dstack_new_writes_the_bytes_compose_hash_rebuilds(tmp_path):
     resolved = tmp_path / "resolved-docker-compose.yml"
     resolved.write_text(
         (DSTACKTEE_DIR / "app" / "docker-compose.yml")
-        .read_text()
-        .replace(compose_hash.DIGEST_PLACEHOLDER, digest)
+        .read_text(encoding="utf-8")
+        .replace(compose_hash.DIGEST_PLACEHOLDER, digest),
+        encoding="utf-8",
     )
     manager = dstack.DStackManager.__new__(dstack.DStackManager)
     manager.config = types.SimpleNamespace(docker_registry=None)
@@ -93,10 +94,12 @@ def test_dstack_new_writes_the_bytes_compose_hash_rebuilds(tmp_path):
 def test_lium_cvm_sh_new_passes_the_flags_the_rebuild_assumes():
     # compose_hash.py hardcodes the flags lium-cvm.sh gives `dstack.py new`; a new default flag there
     # (say --enable-logs) moves the real hash while the rebuild stays put, so pin the contract
-    script = (DSTACKTEE_DIR / "lium-cvm.sh").read_text()
-    invocation = re.search(r"python3 \$SCRIPTS_DIR/dstack\.py new .*?(?=\n\n)", script, re.S).group(
-        0
+    script = (DSTACKTEE_DIR / "lium-cvm.sh").read_text(encoding="utf-8")
+    match = re.search(r"python3 \$SCRIPTS_DIR/dstack\.py new .*?(?=\n\n)", script, re.S)
+    assert match, (
+        "the `dstack.py new` block in lium-cvm.sh moved: update this test and compose_hash.py"
     )
+    invocation = match.group(0)
     flags = set(re.findall(r"(--[a-z-]+|\$\w+_args?)\b", invocation))
     assert flags == {
         "--init-script",
@@ -130,14 +133,15 @@ def test_release_notes_section_carries_digest_and_hash():
 
 def test_check_flags_an_app_compose_that_differs(tmp_path, capsys):
     good = tmp_path / "app-compose.json"
-    good.write_text(compose_hash.measured_app_compose("prod"))
+    good.write_text(compose_hash.measured_app_compose("prod"), encoding="utf-8")
     assert compose_hash.main(["--check", str(good)]) == 0
     assert capsys.readouterr().out.rstrip().endswith("OK")
 
     # the provider edited a measured file (host-setup.md says not to): one byte moves the hash
     edited = tmp_path / "edited-app-compose.json"
     edited.write_text(
-        compose_hash.measured_app_compose("prod").replace("secure_time", "secure_tine")
+        compose_hash.measured_app_compose("prod").replace("secure_time", "secure_tine"),
+        encoding="utf-8",
     )
     assert compose_hash.main(["--check", str(edited)]) == 1
     assert "MISMATCH" in capsys.readouterr().err
