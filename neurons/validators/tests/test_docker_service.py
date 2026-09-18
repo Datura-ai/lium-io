@@ -2190,6 +2190,126 @@ async def test_delete_container_remove_read_timeout_then_gone_other_volume_error
     assert len(client.removed_volumes) == 1
 
 
+def _container_absent_error(container_name: str) -> Exception:
+    return Exception(
+        "Docker SDK remove container failed: 404 Client Error: Not Found "
+        f'("No such container: {container_name}")'
+    )
+
+
+async def _delete(docker_service, payload, executor_info):
+    return await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+
+async def _delete_answered_in_progress(docker_service, monkeypatch, retry_ssh_mock, how: str):
+    """Round 1 of a delete that answers DeletionInProgress, either from the container path (still
+    'removing' after the read timeout) or from the volume path (confirmed gone, volume still in use).
+    Returns the fake client, the payload and the executor for the backend's re-ask."""
+    if how == "container_still_removing":
+        client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+            docker_service, monkeypatch, retry_ssh_mock, statuses=["removing"]
+        )
+    else:  # "volume_still_in_use"
+        client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+            docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
+        )
+        client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+
+    first = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(first, FailedContainerRequest)
+    assert first.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    # the re-ask: dockerd has finished with the container, only the volume may still be held
+    client.remove_error = _container_absent_error(payload.container_name)
+    client.remove_volume_error = None
+    client.container_statuses = []
+    client.inspected_containers.clear()
+    client.removed_volumes.clear()
+    return client, payload, executor_info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["container_still_removing", "volume_still_in_use"])
+async def test_delete_re_asked_after_in_progress_keeps_a_volume_still_in_use_in_progress(
+    docker_service, monkeypatch, retry_ssh_mock, how
+):
+    """Regression (review round 3): the backend's re-ask after DeletionInProgress finds the
+    container already absent, which is not the inspect-confirmed path, so "volume is in use" fell
+    back to best-effort and the pod closed over the volume left behind. The pod's in-progress
+    marker keeps the volume cleanup on the retried path across delete requests."""
+    client, payload, executor_info = await _delete_answered_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock, how
+    )
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+
+    result = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert "volume is in use" in result.msg and "still in use after 2 attempts" in result.msg
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert client.inspected_containers == []  # an absent container needs no inspect
+    assert docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["container_still_removing", "volume_still_in_use"])
+async def test_delete_re_asked_after_in_progress_completes_once_the_volume_is_gone(
+    docker_service, monkeypatch, retry_ssh_mock, how
+):
+    # the re-ask finds the container absent and the volume released: ContainerDeleted, the redis
+    # rental record goes, and the marker is cleared so a later delete for the pod starts clean
+    client, payload, executor_info = await _delete_answered_in_progress(
+        docker_service, monkeypatch, retry_ssh_mock, how
+    )
+    client.remove_volume_errors = [_volume_in_use_error(payload.local_volume), None]
+
+    result = await _delete(docker_service, payload, executor_info)
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_of_an_absent_container_without_a_pending_deletion_stays_best_effort(
+    docker_service, monkeypatch, retry_ssh_mock
+):
+    # no earlier DeletionInProgress for this pod (DAH-2345: the container was removed by failed-create
+    # cleanup): an absent container plus "volume is in use" is the one-attempt best-effort it always was
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    _arm_volume_retry_timing(monkeypatch, attempts=2)
+    client = docker_service.rental_docker_client_factory.client
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_absent",
+        local_volume="volume_absent",
+    )
+    client.remove_error = _container_absent_error(payload.container_name)
+    client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+
+    result = await _delete(docker_service, payload, _delete_container_executor_info(payload.executor_id))
+
+    assert isinstance(result, ContainerDeleted)
+    assert len(client.removed_volumes) == 1
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+
+
 def _arm_filler_delete_in_progress(
     docker_service, monkeypatch, retry_ssh_mock, how: str, kind: WorkloadKind = WorkloadKind.FILLER
 ):
