@@ -69,7 +69,9 @@ class CliService:
         Get a SubstrateInterface node connection using the current config.
         :return: SubstrateInterface instance
         """
-        self.subtensor = bt.Subtensor(config=self.config)
+        self.subtensor = bt.Subtensor(
+            network=settings.get_subtensor_network(), config=self.config
+        )
         return self.subtensor.substrate
 
     def print_extrinsic_receipt(self, receipt) -> dict:

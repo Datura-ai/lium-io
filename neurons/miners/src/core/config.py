@@ -97,6 +97,17 @@ class Settings(BaseSettings):
 
         return config
 
+    def get_subtensor_network(self) -> str:
+        """The value for `AsyncSubtensor(network=...)`: the chain endpoint when it is set,
+        else the network name. Providers set only `BITTENSOR_NETWORK`, so for them this
+        is the network name, as before.
+
+        bittensor 10.5 `setup_config` keeps the LAST set candidate from the Config and
+        `bittensor.Config()` defaults `subtensor.network` to finney, so an endpoint placed
+        only in the Config is ignored; the `network` argument outranks it (DAH-3579).
+        """
+        return self.BITTENSOR_CHAIN_ENDPOINT or self.BITTENSOR_NETWORK
+
 
 settings = Settings()
 shared_client = SharedConfigClient(
