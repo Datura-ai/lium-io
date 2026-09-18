@@ -732,7 +732,9 @@ class FailedContainerRequest(ContainerBaseResponse):
     # DAH-3505: for the volume step (volume_sizing / volume_creation) the Docker daemon's own
     # error text, bounded, so the failure says why and not only where. Renter-safe: the text names
     # the volume and the daemon's reason (a daemon path at most), never the executor's address,
-    # port or hotkey. None for every other step and from old validators.
+    # port or hotkey. For any other step, only the fixed dead-transport hint when the Docker SDK's
+    # session was gone (a template switch keeps the volume and fails at docker_run instead). None
+    # otherwise and from old validators.
     step_detail: str | None = None
 
 
