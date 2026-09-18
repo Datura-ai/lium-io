@@ -28,12 +28,28 @@ DEFAULT_PRICE = DefaultPrice()
 # validator pins the two editions to parity here; the override can go once the validator's lock
 # carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
 # the pinned lium-core still has 5.10).
+#
+# DAH-3623: a model's idle rate is pinned AT the median price renters paid for it over the trailing
+# 30 days, rounded down to the cent; the paid median is the only cap. The fixture in
+# tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
+    "NVIDIA A100 80GB PCIe": 0.30,  # paid median 30 d (was 0.36 = 120 % of it)
+    "NVIDIA H100 80GB HBM3": 1.30,  # paid median 30 d (was 1.494 = 115 %)
+    "NVIDIA GeForce RTX 5090": 0.60,  # paid median 30 d (was 0.65 = 108 %)
+    "NVIDIA A100-SXM4-80GB": 0.68,  # paid median 30 d (was 0.6923 = 102 %)
+    "NVIDIA RTX 6000 Ada Generation": 0.69,  # paid median 30 d (was 0.69 = 100 %, unchanged)
+    "NVIDIA H200": 3.25,  # paid median 30 d (was 2.85 = 88 %, raised)
+    "NVIDIA GeForce RTX 3090": 0.18,  # paid median 30 d (was 0.16 = 89 %, raised)
+    "NVIDIA GeForce RTX 4090": 0.32,  # paid median 30 d (was 0.30 = 94 %, raised)
+    "NVIDIA L40S": 0.38,  # paid median 30 d (was 0.35 = 92 %, raised)
+    "NVIDIA B200": 5.60,  # paid median 30 d (was 4.25 = 76 %, raised)
+    "NVIDIA RTX A6000": 0.42,  # paid median 30 d (was 0.32 = 76 %, raised)
+    "NVIDIA H100 PCIe": 1.50,  # paid median 30 d (was 1.1988 = 80 %, raised)
 }
 
 
