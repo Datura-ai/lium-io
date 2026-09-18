@@ -113,12 +113,14 @@ from services.rental_docker_sdk import (
     PortBinding,
     RENTAL_NETWORK_NAME,
     RentalDockerConnectionError,
+    RentalDockerContainerRestartingError,
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
     build_authorized_keys_exec_spec,
     build_container_command_argv,
+    is_docker_not_found_error,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
@@ -355,12 +357,24 @@ def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterat
     try:
         yield
     except Exception as exc:
-        log.error(
-            "delete_container post-teardown step failed (non-fatal)",
-            step=step,
-            error=str(exc),
-            **fields,
-        )
+        # DAH-3593: a volume or container that was already gone is INFO (the delete is idempotent
+        # by design, DAH-2345). Any other step failing here — Redis, the inspector stop, a GPU
+        # sweep — is still a WARNING: nothing else logs it.
+        if is_docker_not_found_error(exc):
+            log.info(
+                "delete_container post-teardown step failed (non-fatal)",
+                step=step,
+                reason="already_gone",
+                error=str(exc),
+                **fields,
+            )
+        else:
+            log.warning(
+                "delete_container post-teardown step failed (non-fatal)",
+                step=step,
+                error=str(exc),
+                **fields,
+            )
 
 
 # DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
@@ -503,6 +517,15 @@ def _exception_texts(exc: Exception) -> list[str]:
         if last_exception is not None:
             texts.append(str(last_exception))
     return texts
+
+
+def _last_attempt_exception(exc: Exception) -> BaseException:
+    """The exception itself, or the last attempt's when tenacity wrapped it in a RetryError."""
+    if isinstance(exc, RetryError):
+        last_exception = exc.last_attempt.exception()
+        if last_exception is not None:
+            return last_exception
+    return exc
 
 
 class _CreateCancelledByDelete(Exception):
@@ -5792,7 +5815,34 @@ class DockerService:
                     "failure_step": current_step,
                 }),
             )
-            logger.error(log_text, exc_info=True)
+            # DAH-3593: an expected outcome is one line with a reason and no traceback. The renter
+            # deleted the pod while it was being built, or the workload image exits at start on this
+            # node; neither is a validator fault. ERROR with the traceback stays for everything else.
+            if isinstance(e, _CreateCancelledByDelete):
+                logger.info(
+                    _m(
+                        "create cancelled by delete",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "reason": "cancelled_by_delete",
+                            "failure_step": current_step,
+                        }),
+                    )
+                )
+            elif isinstance(_last_attempt_exception(e), RentalDockerContainerRestartingError):
+                logger.warning(
+                    _m(
+                        "workload container keeps restarting; create failed",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "reason": "workload_container_restarting",
+                            "failure_step": current_step,
+                            "error": "; ".join(_exception_texts(e)),
+                        }),
+                    )
+                )
+            else:
+                logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
