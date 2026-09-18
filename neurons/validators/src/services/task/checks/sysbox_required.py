@@ -2,9 +2,25 @@ from __future__ import annotations
 
 from core.config import settings
 
+from ..messages import MessageTemplate, render_message
 from ..messages import SysboxRequiredMessages as Msg
-from ..messages import render_message
 from ..pipeline import CheckResult, Context
+
+# DAH-3634: probe causes that get their own reason code instead of SYSBOX_REQUIRED_MISSING. The
+# code is the prefix of `ContextState.dind_probe_error` ("<CODE>: <plain words>"), written by
+# dind_probe.diagnose_docker_run_error.
+_NVIDIA_HOOK_TEMPLATES = {
+    Msg.NVIDIA_RUNTIME_MISMATCH.reason: Msg.NVIDIA_RUNTIME_MISMATCH,
+    Msg.NVIDIA_CONTAINER_HOOK_FAILED.reason: Msg.NVIDIA_CONTAINER_HOOK_FAILED,
+}
+
+
+def _nvidia_hook_template(dind_probe_error: str | None) -> MessageTemplate | None:
+    """The NVIDIA_* template for a probe cause whose code is one of ours; None otherwise."""
+    if not dind_probe_error:
+        return None
+    code, _, _ = dind_probe_error.partition(":")
+    return _NVIDIA_HOOK_TEMPLATES.get(code)
 
 
 class SysboxRequiredCheck:
@@ -32,7 +48,18 @@ class SysboxRequiredCheck:
         if not ctx.state.sysbox_runtime and not is_rented:
             what: dict = {"sysbox_runtime": ctx.state.sysbox_runtime, "is_rented": is_rented}
             remediation = None
-            if ctx.state.dind_probe_error:
+            template = Msg.SYSBOX_MISSING
+            nvidia_template = _nvidia_hook_template(ctx.state.dind_probe_error)
+            if nvidia_template is not None:
+                # DAH-3634: the probe's `docker run` was refused by the NVIDIA container hook, so
+                # no sysbox verdict was measured and the node cannot start any GPU container;
+                # "install sysbox" cannot fix it. The check still fails: the score stays 0.
+                template = nvidia_template
+                what["dind_probe_error"] = ctx.state.dind_probe_error
+                remediation = (
+                    f"The sysbox check could not run: {ctx.state.dind_probe_error}. {template.remediation}"
+                )
+            elif ctx.state.dind_probe_error:
                 # DAH-2856: the probe's container came up but its sshd never answered, so no sysbox
                 # verdict was measured at all; the cause read from the container's logs replaces
                 # "install sysbox", which sent ticket-0309's provider through three reinstalls.
@@ -41,7 +68,7 @@ class SysboxRequiredCheck:
                 if ctx.state.dind_probe_error.startswith("DIND_INNER_DOCKERD_"):
                     remediation += " Fix that on the host first; reinstalling sysbox does not change it."
             event = render_message(
-                Msg.SYSBOX_MISSING,
+                template,
                 ctx=ctx,
                 check_id=self.check_id,
                 what=what,

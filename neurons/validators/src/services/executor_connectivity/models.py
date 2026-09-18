@@ -23,7 +23,8 @@ class DindProbeResult:
     port: PortPair | None
     log_text: str | None = None
     # DAH-2856: plain-words cause when the container started but sshd never answered, read from the
-    # container's own logs before removal (None when the probe passed or never got that far).
+    # container's own logs before removal. DAH-3634: also when `docker run` itself was refused by
+    # the NVIDIA container hook (docker's stderr). None when the probe passed or the cause is unknown.
     error: str | None = None
 
 
