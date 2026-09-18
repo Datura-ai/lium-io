@@ -314,6 +314,29 @@ class Settings(BaseSettings):
     # the daemon-to-classification chain is confirmed on staging against the backend side (#918).
     RENTAL_CPU_LIMIT_CHECK_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_CHECK_ENABLED", default=False)
     RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED: bool = Field(env="RENTAL_CPU_LIMIT_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2870 — a RUNNING rented pod whose SSH port refuses, or whose authorized_keys cannot be
+    # read, after this validator saw it healthy once. Judged from outside the container every cycle;
+    # CYCLES consecutive unhealthy cycles (2 ≈ 30 min) raise RENTED_POD_SSH_UNREACHABLE and one
+    # report to the backend per outage. Observation only: the score is not changed here.
+    RENTED_POD_SSH_PROBE_ENABLED: bool = Field(env="RENTED_POD_SSH_PROBE_ENABLED", default=True)
+    RENTED_POD_SSH_PROBE_CYCLES: int = Field(env="RENTED_POD_SSH_PROBE_CYCLES", default=2)
+    RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS: float = Field(env="RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", default=5.0)
+    # Off: the mapped port is judged by the TCP connect alone (refused / timeout). On: the port must
+    # also greet with an `SSH-2.0-` identification line, and a port that accepts without one is the
+    # `ssh_banner_missing` fault. The backend learns that fault name in lium-platform#429; a validator
+    # that sends it to an older backend gets a 422 and the outage is never recorded (Rustam's review,
+    # 17 Sep). Turn on only after lium-platform#429 is deployed.
+    RENTED_POD_SSH_BANNER_FAULT_ENABLED: bool = Field(env="RENTED_POD_SSH_BANNER_FAULT_ENABLED", default=False)
+    # Both per-pod Redis marks expire this long after the last cycle that probed the pod (every probe
+    # renews them) and are deleted when the backend says the rental closed, so a pod that left the
+    # rented list leaves no key behind. 24 h ≈ 96 cycles of margin for a validator that was down.
+    RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS: int = Field(env="RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS", default=86400, gt=0)
+    # The cycle-end fleet gate: when more than this share of the cycle's probed pods fail the
+    # mapped-port check, the validator's own network is the suspect and the cycle's reports are held
+    # back (logged, not posted). 0.5 is the DAH-2748 executor-SSH threshold: half the fleet losing
+    # SSH in one cycle is our side, not theirs. Fleets under SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
+    # pods are gated by the executor-SSH verdict alone.
+    RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX: float = Field(env="RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX", default=0.5, ge=0.0, le=1.0)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement

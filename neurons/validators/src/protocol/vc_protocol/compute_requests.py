@@ -41,6 +41,10 @@ class RentedPod(BaseModel):
     # GPUs this pod holds (DAH-2467). None = backend predates the field; the validator then
     # treats the whole executor as rented (no per-GPU split scoring).
     gpu_count: int | None = None
+    # DAH-2870: the external port the renter's `ssh -p` uses (container port 22 in the pod's port
+    # map). None = backend predates the field or the pod maps no port 22; the renter-side probe then
+    # judges the pod by its authorized_keys read alone.
+    ssh_port: int | None = None
 
 
 class RentedExecutor(BaseModel):
@@ -208,6 +212,11 @@ class PodRentalActiveResponse(BaseModel):
 
 
 class PodHostRebootRecoveredResponse(BaseModel):
+    recorded: bool
+
+
+class PodSshUnreachableResponse(BaseModel):
+    # DAH-2870: False when the backend already holds an event for this outage of the pod.
     recorded: bool
 
 

@@ -815,6 +815,33 @@ class TenantEnforcementMessages:
         category="policy",
         impact="Proceed",
     )
+    # DAH-2870: the container runs but the renter cannot get in (SSH port refuses, or
+    # authorized_keys is unreadable because the volume is not mounted). Detected here, not scored;
+    # the notice to the backend and the renter is the cycle-end flush's, so the impact says
+    # "queued", never "told" (Mikhail's review, 18 Sep: this renders before the flush, which can
+    # still get no answer or be suppressed). The check renders the NOT_QUEUED impact instead when
+    # no pod of the event queued one this cycle.
+    RENTED_POD_SSH_UNREACHABLE = MessageTemplate(
+        event="Rented pod refuses its renter over SSH",
+        reason="RENTED_POD_SSH_UNREACHABLE",
+        severity="error",
+        category="runtime",
+        impact=(
+            "Outage detected; the notice to the backend and the renter is queued for the "
+            "cycle-end fleet gate, not yet sent; score unchanged"
+        ),
+        remediation=(
+            "The pod container is running but its SSH port refuses or has no authorized_keys, "
+            "usually after a host reboot restarted the container without its volume. "
+            "The renter can reboot the pod from the pod page; check the host for unplanned reboots."
+        ),
+    )
+    # The same event when this cycle queued no notice for the pods it names: DRY_RUN, a streak the
+    # backend already acknowledged, or (after the fleet gate) only such pods left in the event.
+    RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT = (
+        "Outage detected; no notice queued this cycle (DRY_RUN, or the backend already "
+        "acknowledged this outage); score unchanged"
+    )
 
 
 class GpuUsageMessages:
