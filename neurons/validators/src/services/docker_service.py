@@ -3545,6 +3545,11 @@ class DockerService:
             target_path = local_volume_path if encrypted_local_volume else "/root"
             container_q = shlex.quote(container_name)
             target_q = shlex.quote(target_path)
+            # DAH-3639: `docker cp` into the container's /tmp fails with "Could not
+            # find the file /tmp in container" even after the directory exists, because
+            # the daemon resolves the destination against the container's rootfs while
+            # the container's own exec namespace sees the directory. `docker exec` runs
+            # inside that namespace, so the script is piped in from the host instead.
             command = (
                 f"/usr/bin/docker exec -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
@@ -3558,20 +3563,10 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker cp /root/app/run_jupyter.sh "
-                f"{container_q}:/tmp/run_jupyter.sh"
-            )
-            await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Copying run_jupyter.sh to container",
-                log_extra=log_extra,
-                raise_exception=True,
-            )
-            command = (
-                f"/usr/bin/docker exec -u 0 {container_q} "
-                f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
+                f"test -s /root/app/run_jupyter.sh || "
+                f"{{ echo 'run_jupyter.sh is missing on the executor host' >&2; exit 1; }}; "
+                f"cat /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
+                f"sh -c {shlex.quote(f'cat > {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
