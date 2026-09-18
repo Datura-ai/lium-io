@@ -58,6 +58,47 @@ def merge_dicts(*dicts):
     return reduce(merge2, dicts, {})
 
 
+def build_app_compose(
+    compose_content: str,
+    *,
+    local_key_provider: bool,
+    enable_logs: bool,
+    enable_sysinfo: bool,
+    init_script: Optional[str] = None,
+    pre_launch_script: Optional[str] = None,
+) -> dict:
+    """The app-compose.json document dstack measures into compose_hash (RTMR3).
+
+    Kept as one pure function so the validator's whitelist test and the release-notes step
+    (scripts/compose_hash.py) rebuild exactly what `new` writes: every key, its order and its
+    default is part of the measurement, so a change here moves the hash of every CVM.
+    """
+    app_compose = {
+        "manifest_version": 1,
+        "name": "example",
+        "version": "1.0.0",
+        "features": [],
+        "runner": "docker-compose",
+        "docker_compose_file": compose_content,
+        "local_key_provider_enabled": local_key_provider,
+        "public_logs": enable_logs,
+        "secure_time": False,
+    }
+    if enable_sysinfo:
+        app_compose["public_sysinfo"] = True
+        app_compose["public_tcbinfo"] = True
+    if init_script is not None:
+        app_compose["init_script"] = init_script
+    if pre_launch_script is not None:
+        app_compose["pre_launch_script"] = pre_launch_script
+    return app_compose
+
+
+def app_compose_json(app_compose: dict) -> str:
+    """The exact bytes written to shared/app-compose.json; compose_hash is their sha256."""
+    return json.dumps(app_compose, indent=4)
+
+
 def test_merge_dicts():
     assert merge_dicts({"a": 1}, {"b": 2}) == {"a": 1, "b": 2}
     assert merge_dicts({"a": 1}, {"a": 2}) == {"a": 2}
@@ -221,7 +262,7 @@ class DStackManager:
         """Read and validate compose file."""
         if not os.path.isfile(compose_file):
             raise FileNotFoundError(f"Compose file not found: {compose_file}")
-        with open(compose_file, "r") as f:
+        with open(compose_file, "r", encoding="utf-8") as f:
             return f.read()
 
     def _create_directories(self, work_dir: str) -> tuple[str, str]:
@@ -284,28 +325,24 @@ class DStackManager:
             compose_content = self._read_compose_file(args.compose_file)
 
             # Create app-compose.json
-            app_compose = {
-                "manifest_version": 1,
-                "name": "example",
-                "version": "1.0.0",
-                "features": [],
-                "runner": "docker-compose",
-                "docker_compose_file": compose_content,
-                "local_key_provider_enabled": args.local_key_provider,
-                "public_logs": args.enable_logs,
-                "secure_time": False,
-            }
-            if args.enable_sysinfo:
-                app_compose["public_sysinfo"] = True
-                app_compose["public_tcbinfo"] = True
-            if args.init_script:
-                app_compose["init_script"] = open(args.init_script, "r").read()
-            if args.pre_launch_script:
-                app_compose["pre_launch_script"] = open(
-                    args.pre_launch_script, "r"
-                ).read()
-            with open(os.path.join(shared_dir, "app-compose.json"), "w") as f:
-                json.dump(app_compose, f, indent=4)
+            app_compose = build_app_compose(
+                compose_content,
+                local_key_provider=args.local_key_provider,
+                enable_logs=args.enable_logs,
+                enable_sysinfo=args.enable_sysinfo,
+                init_script=(
+                    open(args.init_script, "r", encoding="utf-8").read()
+                    if args.init_script
+                    else None
+                ),
+                pre_launch_script=(
+                    open(args.pre_launch_script, "r", encoding="utf-8").read()
+                    if args.pre_launch_script
+                    else None
+                ),
+            )
+            with open(os.path.join(shared_dir, "app-compose.json"), "w", encoding="utf-8") as f:
+                f.write(app_compose_json(app_compose))
             # Read image metadata and create config.json
 
             if self.config.docker_registry:
