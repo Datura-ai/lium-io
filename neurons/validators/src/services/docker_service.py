@@ -530,15 +530,42 @@ STALE_SDK_TRANSPORT_HINT = (
 )
 
 
+def _plain_text(exc: BaseException) -> str:
+    """The exception's text on one line, whitespace collapsed."""
+    return " ".join(str(exc).split())
+
+
+def _is_stale_sdk_transport(exc: BaseException) -> bool:
+    text = _plain_text(exc)
+    return any(marker in text for marker in _STALE_SDK_TRANSPORT_MARKERS)
+
+
 def volume_step_detail(exc: BaseException) -> str | None:
     """One bounded line saying why the volume step failed, or None when the exception has no text.
     A dead Docker SDK transport gets a plain-language hint in front of the raw error."""
-    text = " ".join(str(exc).split())
+    text = _plain_text(exc)
     if not text:
         return None
-    if any(marker in text for marker in _STALE_SDK_TRANSPORT_MARKERS):
+    if _is_stale_sdk_transport(exc):
         text = f"{STALE_SDK_TRANSPORT_HINT}: {text}"
     return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
+
+
+def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
+    """The CCF `step_detail` for a failed create step. The volume steps carry the daemon's own
+    reason (`volume_step_detail`). Any other step carries STALE_SDK_TRANSPORT_HINT alone when the
+    error is docker-py's dead-transport text — on a template switch the pod keeps its volume, the
+    volume block is skipped, and the first Docker SDK call after the build is `docker_run`, so the
+    dead session surfaces there (review, taiberium 18 Sep). The raw text of those steps is not
+    forwarded: it is not proven free of executor host data. Every other case stays None — a
+    CustomBuildFailed too, whose text is the renter's own build output (it has `build_log_tail`)."""
+    if current_step in VOLUME_STEP_NAMES:
+        return volume_step_detail(exc)
+    if isinstance(exc, CustomBuildFailed):
+        return None
+    if _is_stale_sdk_transport(exc):
+        return STALE_SDK_TRANSPORT_HINT
+    return None
 
 
 class CustomBuildFailed(Exception):
@@ -5877,8 +5904,9 @@ class DockerService:
                 ),
                 # Renter-safe on its own: the output of the renter's Dockerfile, no executor host data.
                 build_log_tail=e.log_tail if isinstance(e, CustomBuildFailed) else None,
-                # The Docker daemon's reason for a volume failure; every other step stays None.
-                step_detail=volume_step_detail(e) if current_step in VOLUME_STEP_NAMES else None,
+                # The Docker daemon's reason for a volume failure; the dead-transport hint alone for
+                # any other step it surfaces at (docker_run on a template switch); else None.
+                step_detail=failure_step_detail(e, current_step),
             )
 
     async def _run_bootstrap_restore(
