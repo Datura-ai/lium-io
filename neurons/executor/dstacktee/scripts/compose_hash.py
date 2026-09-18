@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import sys
 from pathlib import Path
 
@@ -83,7 +84,9 @@ def release_notes_section(env: str = "prod", digest: str = APPROVED_RUNNER_IMAGE
             "```",
             "",
             "The output must equal the expected compose hash. Any other value means the measured files "
-            "or the digest differ from the release; the validator rejects the CVM and it scores zero.",
+            "or the digest differ from the release; the validator rejects the CVM and it scores zero. "
+            "A matching value scores only once the validator release that whitelists this hash is "
+            "deployed; until then a correct CVM scores zero as well.",
         ]
     )
 
@@ -103,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         "--check", metavar="APP_COMPOSE_JSON", help="compare a created CVM's app-compose.json"
     )
     args = parser.parse_args(argv)
-    if not args.digest.startswith("sha256:") or len(args.digest) != len("sha256:") + 64:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.digest):
         parser.error("--digest must be sha256:<64-hex>")
     expected = compose_hash(args.env, args.digest)
     if args.check:

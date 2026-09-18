@@ -10,16 +10,20 @@ whitelisting it.
 import argparse
 import hashlib
 import importlib.util
+import os
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
 
+import pytest
 from services.const import TDX_WHITELIST
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DSTACKTEE_DIR = REPO_ROOT / "neurons" / "executor" / "dstacktee"
 SCRIPTS_DIR = DSTACKTEE_DIR / "scripts"
+RELEASE_SCRIPT = SCRIPTS_DIR / "release_notes_update.sh"
 
 
 def _load_compose_hash():
@@ -49,8 +53,10 @@ def test_prod_compose_hash_of_this_checkout_is_whitelisted():
 def test_prod_compose_hash_of_this_checkout_is_the_newest_version():
     # newest-wins: the checkout is the release providers deploy next, so its hash carries the highest
     # version, or raising TDX_MINIMUM_COMPOSE_VERSION to retire an old release would retire this one
+    # strictly above every other hash: two hashes sharing the top version could not be retired apart
     measured = compose_hash.compose_hash("prod")
-    assert PROD_WHITELIST.get(measured) == max(PROD_WHITELIST.values())
+    others = max((v for h, v in PROD_WHITELIST.items() if h != measured), default=0)
+    assert PROD_WHITELIST.get(measured, 0) > others
 
 
 def test_dstack_new_writes_the_bytes_compose_hash_rebuilds(tmp_path):
@@ -123,12 +129,144 @@ def test_lium_cvm_sh_new_passes_the_flags_the_rebuild_assumes():
 
 def test_release_notes_section_carries_digest_and_hash():
     section = compose_hash.release_notes_section("prod")
-    # the prod release workflow greps this heading to know whether a release already carries the section
-    workflow = (REPO_ROOT / ".github" / "workflows" / "executor_cd_prod.yml").read_text()
+    # the release script cuts the body at this heading to find the section a release already carries
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    workflow = (REPO_ROOT / ".github" / "workflows" / "executor_cd_prod.yml").read_text(
+        encoding="utf-8"
+    )
     assert section.startswith(compose_hash.RELEASE_NOTES_HEADING)
-    assert f'"{compose_hash.RELEASE_NOTES_HEADING}"' in workflow
+    assert f'heading="{compose_hash.RELEASE_NOTES_HEADING}"' in script
+    assert RELEASE_SCRIPT.relative_to(REPO_ROOT).as_posix() in workflow
     assert compose_hash.APPROVED_RUNNER_IMAGE_DIGEST in section
     assert compose_hash.compose_hash("prod") in section
+    assert "\n## " not in section[len(compose_hash.RELEASE_NOTES_HEADING) :], (
+        "a second '## ' heading inside the section would end it early for release_notes_update.sh"
+    )
+
+
+def test_digest_must_be_64_hex():
+    # sha256: plus 64 of anything used to pass; Docker cannot pull such a digest, so refuse it (argparse exits 2)
+    with pytest.raises(SystemExit) as exc:
+        compose_hash.main(["--digest", "sha256:" + "z" * 64])
+    assert exc.value.code == 2
+    assert compose_hash.main(["--digest", compose_hash.APPROVED_RUNNER_IMAGE_DIGEST]) == 0
+
+
+TAG = "executor-v9.999"
+GENERATED_NOTES = "## What's Changed\n* something by @someone in #1\n\n**Full Changelog**: a...b"
+FAKE_GH = r"""#!/usr/bin/env bash
+# a `gh` stand-in for release_notes_update.sh: releases are files under $FAKE_RELEASES/<tag>.md;
+# every call is appended to $FAKE_GH_LOG as "<sub> <sub2> <tag>"
+set -euo pipefail
+echo "$1 $2 ${3:-}" >> "$FAKE_GH_LOG"
+case "$1 $2" in
+  "release view") [ -z "${FAKE_VIEW_ERROR:-}" ] || { echo "$FAKE_VIEW_ERROR" >&2; exit 1; }
+                  [ -f "$FAKE_RELEASES/$3.md" ] || { echo "release not found" >&2; exit 1; }; cat "$FAKE_RELEASES/$3.md" ;;
+  "release edit") [ -f "$FAKE_RELEASES/$3.md" ] || exit 1; cp "$5" "$FAKE_RELEASES/$3.md" ;;
+  "release create") [ ! -f "$FAKE_RELEASES/$3.md" ] || exit 1; [ "$4" = --verify-tag ] || exit 1; cp "$6" "$FAKE_RELEASES/$3.md" ;;
+  "api repos/{owner}/{repo}/releases/generate-notes") printf '%s\n' "$FAKE_GENERATED" ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 64 ;;
+esac
+"""
+
+
+def _run_release_script(tmp_path, body, view_error=""):
+    """Run release_notes_update.sh for TAG against the fake gh; returns (completed process, body after, gh log)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(FAKE_GH, encoding="utf-8")
+    (bin_dir / "gh").chmod(0o755)
+    # the script calls `python3`: make that this interpreter (dstack.py needs 3.10+; a box's system
+    # python3 may be older), the way the ubuntu-latest runner's python3 is 3.12
+    (bin_dir / "python3").symlink_to(sys.executable)
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    if body is not None:
+        (releases / f"{TAG}.md").write_bytes(body.encode("utf-8"))  # CRLF kept as given
+    log = tmp_path / "gh.log"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RELEASES": str(releases),
+        "FAKE_GH_LOG": str(log),
+        "FAKE_GENERATED": GENERATED_NOTES,
+        "FAKE_VIEW_ERROR": view_error,
+    }
+    proc = subprocess.run(
+        ["bash", str(RELEASE_SCRIPT), TAG],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    release = releases / f"{TAG}.md"
+    after = (
+        release.read_bytes().decode("utf-8") if release.exists() else None
+    )  # no newline translation
+    calls = log.read_text(encoding="utf-8").split("\n") if log.exists() else []
+    return proc, after, calls
+
+
+def _section_of(body: str) -> str:
+    start = body.index(compose_hash.RELEASE_NOTES_HEADING)
+    rest = body[start + len(compose_hash.RELEASE_NOTES_HEADING) :]
+    end = rest.find("\n## ")
+    if end < 0:
+        return body[start:]
+    return body[start : start + len(compose_hash.RELEASE_NOTES_HEADING) + end]
+
+
+def test_release_script_appends_the_section_to_a_release_without_one(tmp_path):
+    proc, after, calls = _run_release_script(tmp_path, GENERATED_NOTES)
+    assert proc.returncode == 0, proc.stderr
+    assert after.startswith(GENERATED_NOTES)
+    assert _section_of(after).rstrip() == compose_hash.release_notes_section("prod")
+    assert f"release edit {TAG}" in calls and not any(c.startswith("release create") for c in calls)
+
+
+def test_release_script_creates_a_missing_release_with_generated_notes_then_the_section(tmp_path):
+    proc, after, calls = _run_release_script(tmp_path, None)
+    assert proc.returncode == 0, proc.stderr
+    assert f"release create {TAG}" in calls and not any(c.startswith("release edit") for c in calls)
+    assert after.startswith(GENERATED_NOTES)
+    assert _section_of(after).rstrip() == compose_hash.release_notes_section("prod")
+
+
+def test_release_script_leaves_a_release_that_already_carries_this_hash(tmp_path):
+    body = (
+        GENERATED_NOTES
+        + "\r\n\r\n"
+        + compose_hash.release_notes_section("prod").replace("\n", "\r\n")
+    )
+    proc, after, calls = _run_release_script(tmp_path, body)
+    assert proc.returncode == 0, proc.stderr
+    assert after == body, (
+        "a release edited in the web UI (CRLF) with the right hash is not rewritten"
+    )
+    assert calls == [f"release view {TAG}", ""]
+
+
+def test_release_script_replaces_a_stale_section_even_when_the_hash_appears_elsewhere(tmp_path):
+    # the tag was moved to a tree with another hash: the old section must go, the job must not fail,
+    # and the new hash quoted in the human-written notes above the section must not make the stale
+    # section pass (the hash is searched only inside the section)
+    current = compose_hash.compose_hash("prod")
+    stale = compose_hash.release_notes_section("prod", "sha256:" + "0" * 64)
+    assert current not in stale
+    human = GENERATED_NOTES + f"\n\n## Notes\nthe new hash is {current}, see below\n"
+    trailer = "## Thanks\n* everyone\n"
+    proc, after, calls = _run_release_script(tmp_path, human + "\n" + stale + "\n\n" + trailer)
+    assert proc.returncode == 0, proc.stderr
+    assert "replacing it" in proc.stdout
+    assert f"release edit {TAG}" in calls
+    assert stale not in after
+    assert after.startswith(human)
+    assert trailer.rstrip() in after, (
+        "text a human wrote after the section survives the replacement"
+    )
+    assert _section_of(after).rstrip() == compose_hash.release_notes_section("prod")
+    assert after.count(compose_hash.RELEASE_NOTES_HEADING) == 1
 
 
 def test_check_flags_an_app_compose_that_differs(tmp_path, capsys):
@@ -145,3 +283,26 @@ def test_check_flags_an_app_compose_that_differs(tmp_path, capsys):
     )
     assert compose_hash.main(["--check", str(edited)]) == 1
     assert "MISMATCH" in capsys.readouterr().err
+
+
+def test_release_script_matches_a_heading_with_trailing_whitespace(tmp_path):
+    # a hand edit that leaves a space after the heading is still the section: replaced, not doubled
+    stale = compose_hash.release_notes_section("prod", "sha256:" + "1" * 64)
+    proc, after, calls = _run_release_script(
+        tmp_path, GENERATED_NOTES + "\n\n" + stale.replace("\n", " \n", 1)
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "replacing it" in proc.stdout
+    assert after.count(compose_hash.RELEASE_NOTES_HEADING) == 1
+    assert _section_of(after).rstrip() == compose_hash.release_notes_section("prod")
+
+
+def test_release_script_does_not_create_when_the_release_cannot_be_read(tmp_path):
+    # auth / rate limit / 5xx on `gh release view` is not "no release": creating would collide with one that exists
+    proc, after, calls = _run_release_script(
+        tmp_path, GENERATED_NOTES, view_error="HTTP 502: bad gateway"
+    )
+    assert proc.returncode == 1
+    assert "bad gateway" in proc.stderr and "re-run the job" in proc.stderr
+    assert after == GENERATED_NOTES
+    assert not any(c.startswith(("release create", "release edit", "api ")) for c in calls)

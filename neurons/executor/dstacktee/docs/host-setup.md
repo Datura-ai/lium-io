@@ -106,7 +106,7 @@ Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-
    Required beyond the obvious (`MINER_HOTKEY_SS58_ADDRESS`, ports, `CVM_VCPUS/MEMORY/DISK`, `CVM_GPUS`):
 
    - `ENABLE_TDX_ATTESTATION=true`
-   - `EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<64-hex>` — copy from the "CVM attestation" section of the release notes of the tag you checked out. `lium-cvm.sh new` pins this digest into the measured compose (the attested trust boundary) and refuses to run without it.
+   - `EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<64-hex>` — copy from the "CVM attestation" section of the release notes of the tag you checked out. While the notes of your tag do not carry that section yet (no released tag has it before the first release after this change), `python3 scripts/compose_hash.py --release-notes` prints the same section for the checkout: the digest and the expected compose hash. `lium-cvm.sh new` pins this digest into the measured compose (the attested trust boundary) and refuses to run without it.
 
 2. Create, check the measurement, boot (the OS image downloads once per host, then is reused):
 
@@ -133,7 +133,8 @@ Per release:
 ```bash
 sudo ./lium-cvm.sh stop my-executor
 git pull                                   # the release tag
-# update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes ("CVM attestation")
+# update EXECUTOR_RUNNER_IMAGE_DIGEST in .env from the release notes ("CVM attestation";
+# no section yet → python3 scripts/compose_hash.py --release-notes prints it for the checkout)
 sudo rm -rf run/vms/my-executor            # see warning below
 sudo ./lium-cvm.sh new my-executor
 sha256sum run/vms/my-executor/shared/app-compose.json   # = the release's expected compose hash

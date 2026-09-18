@@ -42,7 +42,10 @@ jobs:
   # runner digest, so one provider was about to pin a retired one, and no note said which compose hash
   # a correct CVM measures to. This job writes both into the GitHub release of the tag, after the
   # images are published: an existing release (the one a human created with generated notes) gets
-  # the section appended once; a missing release is created with generated notes plus the section.
+  # the section appended once, a section with another hash (a moved tag) is replaced, a missing release
+  # is created with generated notes plus the section. The script is
+  # neurons/executor/dstacktee/scripts/release_notes_update.sh; the validator's
+  # tests/test_tdx_compose_hash_whitelist.py runs it against a stubbed `gh` for each of those cases.
   release-notes:
     name: "Release notes: CVM attestation section"
     needs: deploy
@@ -57,25 +60,4 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Add the approved runner digest and the expected compose hash to the release
-        run: |
-          set -euo pipefail
-          python3 neurons/executor/dstacktee/scripts/compose_hash.py --release-notes > section.md
-          hash="$(python3 neurons/executor/dstacktee/scripts/compose_hash.py)"
-          if gh release view "$TAG" --json body --jq .body | tr -d '\r' > body.md; then
-            # a body edited in the web UI comes back with CRLF; tr above makes the marker match
-            if grep -qx "## CVM attestation" body.md; then
-              if grep -qF "$hash" body.md; then
-                echo "release $TAG already carries the section with hash $hash"
-                exit 0
-              fi
-              # the tag was moved to a tree with another hash: a stale section is worse than none
-              echo "release $TAG carries a CVM attestation section without hash $hash; fix the release body by hand" >&2
-              exit 1
-            fi
-            { cat body.md; echo; cat section.md; } > notes.md
-            gh release edit "$TAG" --notes-file notes.md
-          else
-            # no release yet for the tag: the section goes first, the generated notes after it
-            gh release create "$TAG" --verify-tag --generate-notes --notes-file section.md
-          fi
-          gh release view "$TAG" --json body --jq .body | grep -A1 -F "## CVM attestation"
+        run: bash neurons/executor/dstacktee/scripts/release_notes_update.sh "$TAG"
