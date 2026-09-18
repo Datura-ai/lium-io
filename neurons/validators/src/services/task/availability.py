@@ -186,13 +186,28 @@ def is_our_own_outage(unreachable_count: int, checked_count: int) -> bool:
     return unreachable_count / checked_count > FLEET_SHARE_THAT_MEANS_OUR_OWN_OUTAGE
 
 
+def _is_the_validators_own_reading(job_result: JobResult) -> bool:
+    """False for a result the validator wrote without contacting the node.
+
+    A RENTED_EXECUTOR_NOT_LISTED row (DAH-3558) is the miner's answer, not a connect the validator
+    made, so it says nothing about our egress, DNS or keys: it is left out of the outage ratio on
+    both sides, and the silencer leaves it alone. A wave-wide drop by one miner would otherwise
+    read as our outage and silence real SSH failures on the rest of the cycle.
+    """
+    errors = job_result.availability_errors
+    if errors is None:
+        return False
+    return not errors or any(error.get("reach_source") != ReachSource.MINER for error in errors)
+
+
 def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) -> int:
     """Report nothing about reachability when the cycle looks like our own outage.
 
     Returns how many results were silenced, so the caller can log it; 0 means the cycle is
-    trusted and every result keeps what it found.
+    trusted and every result keeps what it found. Only the validator's own readings count and
+    are silenced (``_is_the_validators_own_reading``).
     """
-    checked_results = [result for result in job_results if result.availability_errors is not None]
+    checked_results = [result for result in job_results if _is_the_validators_own_reading(result)]
     unreachable_results = [result for result in checked_results if result.availability_errors]
     if not is_our_own_outage(len(unreachable_results), len(checked_results)):
         return 0

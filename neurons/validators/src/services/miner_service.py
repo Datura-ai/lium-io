@@ -4,7 +4,8 @@ import logging
 import os
 import shlex
 import time
-from typing import Annotated, Iterator
+from collections.abc import Iterator
+from typing import Annotated
 from uuid import UUID
 
 import aiohttp
@@ -850,12 +851,13 @@ class MinerService:
         self,
         payload: MinerJobRequestPayload,
         rented_data: RentedExecutorsResponse | None,
-        listed: list[ExecutorSSHInfo],
+        miner_returned_executors: list[ExecutorSSHInfo],
         executor_id: str | None,
     ) -> Iterator[tuple[str, RentedExecutor]]:
         """Yield (executor_uuid, rented_executor) for this miner's rented executors missing from
-        ``listed`` (DAH-3558). Shared by the cheap ``_has_not_listed_rented_executors`` probe and
-        ``_build_not_listed_rented_results`` so the two never disagree. Flag off: yields nothing.
+        ``miner_returned_executors`` (DAH-3558). Shared by the cheap
+        ``_has_not_listed_rented_executors`` probe and ``_build_not_listed_rented_results`` so the
+        two never disagree. Flag off: yields nothing.
 
         Only the cycle's whole-miner request (``executor_id`` None) reports: the express lane and
         the rental key-submit ask for one executor and keep their own retry when the miner does
@@ -871,14 +873,16 @@ class MinerService:
         ):
             return
 
-        listed_ids = {str(executor.uuid).lower() for executor in listed}
-        manual = {str(uuid).lower() for uuid in (rented_data.manual_rental_executors or {})}
+        miner_returned_ids = {str(executor.uuid).lower() for executor in miner_returned_executors}
+        manual_rental_ids = {
+            str(uuid).lower() for uuid in (rented_data.manual_rental_executors or {})
+        }
 
         for raw_uuid, rented_executor in rented_data.executors.items():
             executor_uuid = str(raw_uuid).lower()
             if rented_executor.miner_hotkey != payload.miner_hotkey:
                 continue
-            if executor_uuid in listed_ids or executor_uuid in manual:
+            if executor_uuid in miner_returned_ids or executor_uuid in manual_rental_ids:
                 continue
             yield executor_uuid, rented_executor
 
@@ -886,97 +890,51 @@ class MinerService:
         self,
         payload: MinerJobRequestPayload,
         rented_data: RentedExecutorsResponse | None,
-        listed: list[ExecutorSSHInfo],
+        miner_returned_executors: list[ExecutorSSHInfo],
         executor_id: str | None,
     ) -> bool:
-        """Whether an empty answer from the miner still has rented executors to report on (DAH-3558).
+        """Whether an empty answer from the miner still has rented executors to report (DAH-3558).
 
         A miner whose only executors are rented and down answers with zero executors; that used to
         end as one miner-level failure row and nothing about the nodes.
         """
-        return any(self._iter_not_listed_rented(payload, rented_data, listed, executor_id))
+        return any(
+            self._iter_not_listed_rented(
+                payload, rented_data, miner_returned_executors, executor_id
+            )
+        )
 
     def _build_not_listed_rented_results(
         self,
         payload: MinerJobRequestPayload,
         rented_data: RentedExecutorsResponse | None,
-        listed: list[ExecutorSSHInfo],
+        miner_returned_executors: list[ExecutorSSHInfo],
         executor_id: str | None,
     ) -> list[JobResult]:
         """One failed result per rented executor of this miner that its answer left out (DAH-3558).
 
         A node the miner does not put in ``AcceptSSHKeyRequest.executors`` gets no pipeline, and
-        the wave writes nothing about it: no report row, no availability error, and the backend's
-        staleness sweep (EXECUTOR_INACTIVE_MID_RENTAL, lium-platform penalty_trigger.py) reads
-        silence. Why the miner left the node out is not known here (providers run their own miner
-        versions), so the row says only that the miner did not return it.
+        the wave writes nothing about it: no report row, no availability error. The backend's
+        staleness sweep (EXECUTOR_INACTIVE_MID_RENTAL, lium-platform penalty_trigger.py) reads the
+        row as the silence it replaces: ``stale_window_penalises`` drops this code before it
+        decides (lium-platform#509, the on-switch prerequisite), so a stale window's verdict is
+        what it was before the row existed. Why the miner
+        left the node out is not known here (providers run their own miner versions), so the row
+        says only that the miner did not return it.
 
-        ``listed`` is the miner's answer before any lane filtering: an executor the express lane
-        holds was still returned by the miner, and every real result is for a listed executor, so
-        a uuid gets one row at most. Manual rentals are skipped — the miner cannot install a key
-        on a node handed to the renter at root, and ``_build_manual_rental_results`` synthesises
-        their pass. The node is never contacted; address and port come from the backend's rented
-        list. Flag off: [].
+        ``miner_returned_executors`` is the miner's answer before any lane filtering: an executor
+        the express lane holds was still returned by the miner, and every real result is for a
+        returned executor, so a uuid gets one row at most. Manual rentals are skipped — the miner
+        cannot install a key on a node handed to the renter at root, and
+        ``_build_manual_rental_results`` synthesises their pass. The node is never contacted;
+        address and port come from the backend's rented list. Flag off: [].
         """
-        results: list[JobResult] = []
-        for executor_uuid, rented_executor in self._iter_not_listed_rented(
-            payload, rented_data, listed, executor_id
-        ):
-            try:
-                executor_port = int(rented_executor.executor_ip_port)
-            except (TypeError, ValueError):
-                executor_port = 0
-
-            event = build_rented_executor_not_listed_event(
-                executor_uuid=executor_uuid,
-                host=rented_executor.executor_ip_address,
-                port=executor_port,
-                miner_hotkey=payload.miner_hotkey,
+        results = [
+            self._not_listed_rented_job_result(payload, executor_uuid, rented_executor)
+            for executor_uuid, rented_executor in self._iter_not_listed_rented(
+                payload, rented_data, miner_returned_executors, executor_id
             )
-            log_text = _m(
-                event.event,
-                extra=get_extra_info({
-                    **event.model_dump(mode="json"),
-                    "job_batch_id": payload.job_batch_id,
-                    "miner_hotkey": payload.miner_hotkey,
-                    "executor_uuid": executor_uuid,
-                    "executor_ip_address": rented_executor.executor_ip_address,
-                    "executor_port": executor_port,
-                    "rented_pods": [pod.pod_id for pod in rented_executor.pods],
-                }),
-            )
-            logger.warning(log_text)
-            results.append(
-                JobResult(
-                    spec=None,
-                    executor_info=ExecutorSSHInfo(
-                        uuid=executor_uuid,
-                        address=rented_executor.executor_ip_address,
-                        port=executor_port,
-                        # The miner never handed over SSH details; these only satisfy the model.
-                        ssh_username="",
-                        ssh_port=0,
-                        python_path="",
-                        root_dir="",
-                    ),
-                    score=0,
-                    job_score=0,
-                    collateral_deposited=False,
-                    job_batch_id=payload.job_batch_id,
-                    log_status="error",
-                    log_text=log_text.to_full_string(),
-                    validation_event=event,
-                    gpu_model=None,
-                    gpu_count=0,
-                    sysbox_runtime=False,
-                    is_rented=True,
-                    availability_errors=[
-                        error.model_dump(mode="json") for error in availability_errors([event])
-                    ],
-                    failure_reason_code=event.reason_code,
-                )
-            )
-
+        ]
         if results:
             logger.info(
                 _m(
@@ -990,6 +948,64 @@ class MinerService:
                 ),
             )
         return results
+
+    def _not_listed_rented_job_result(
+        self, payload: MinerJobRequestPayload, executor_uuid: str, rented_executor: RentedExecutor
+    ) -> JobResult:
+        """The failed result for one rented executor the miner did not return (DAH-3558): the
+        event, its log line and the ``JobResult`` the cycle stores."""
+        try:
+            executor_port = int(rented_executor.executor_ip_port)
+        except (TypeError, ValueError):
+            executor_port = 0
+
+        event = build_rented_executor_not_listed_event(
+            executor_uuid=executor_uuid,
+            host=rented_executor.executor_ip_address,
+            port=executor_port,
+            miner_hotkey=payload.miner_hotkey,
+        )
+        log_text = _m(
+            event.event,
+            extra=get_extra_info({
+                **event.model_dump(mode="json"),
+                "job_batch_id": payload.job_batch_id,
+                "miner_hotkey": payload.miner_hotkey,
+                "executor_uuid": executor_uuid,
+                "executor_ip_address": rented_executor.executor_ip_address,
+                "executor_port": executor_port,
+                "rented_pods": [pod.pod_id for pod in rented_executor.pods],
+            }),
+        )
+        logger.warning(log_text)
+        return JobResult(
+            spec=None,
+            executor_info=ExecutorSSHInfo(
+                uuid=executor_uuid,
+                address=rented_executor.executor_ip_address,
+                port=executor_port,
+                # The miner never handed over SSH details; these only satisfy the model.
+                ssh_username="",
+                ssh_port=0,
+                python_path="",
+                root_dir="",
+            ),
+            score=0,
+            job_score=0,
+            collateral_deposited=False,
+            job_batch_id=payload.job_batch_id,
+            log_status="error",
+            log_text=log_text.to_full_string(),
+            validation_event=event,
+            gpu_model=None,
+            gpu_count=0,
+            sysbox_runtime=False,
+            is_rented=True,
+            availability_errors=[
+                error.model_dump(mode="json") for error in availability_errors([event])
+            ],
+            failure_reason_code=event.reason_code,
+        )
 
     def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
         executor_info = ExecutorSSHInfo(

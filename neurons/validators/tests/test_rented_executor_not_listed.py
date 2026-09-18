@@ -25,7 +25,12 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 from services.miner_service import MinerService
-from services.task.availability import AvailabilityErrorCode, ReachSource, ReachTarget
+from services.task.availability import (
+    AvailabilityErrorCode,
+    ReachSource,
+    ReachTarget,
+    silence_availability_errors_on_our_own_outage,
+)
 from tests.test_express_lane import _cycle_inputs, _executor_info, _job_result
 
 MINER_HOTKEY = "5MinerHotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -53,7 +58,7 @@ def rented(*, miner_hotkey: str = MINER_HOTKEY, address: str = "198.51.100.7", p
     )
 
 
-def listed(*executor_ids: str) -> list[ExecutorSSHInfo]:
+def miner_returned(*executor_ids: str) -> list[ExecutorSSHInfo]:
     return [_executor_info(executor_id) for executor_id in executor_ids]
 
 
@@ -71,7 +76,7 @@ def flag_on(monkeypatch):
 
 
 def build(service: MinerService, rented_data: RentedExecutorsResponse, *, listed_ids=(LISTED,), executor_id=None):
-    return service._build_not_listed_rented_results(make_payload(), rented_data, listed(*listed_ids), executor_id)
+    return service._build_not_listed_rented_results(make_payload(), rented_data, miner_returned(*listed_ids), executor_id)
 
 
 # --- the helper -----------------------------------------------------------------------------
@@ -150,9 +155,59 @@ def test_probe_agrees_with_the_builder(flag_on):
     service = make_service()
     rented_data = RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()})
 
-    assert service._has_not_listed_rented_executors(make_payload(), rented_data, listed(LISTED), None) is True
-    assert service._has_not_listed_rented_executors(make_payload(), rented_data, listed(LISTED, MISSING), None) is False
+    assert service._has_not_listed_rented_executors(make_payload(), rented_data, miner_returned(LISTED), None) is True
+    assert service._has_not_listed_rented_executors(make_payload(), rented_data, miner_returned(LISTED, MISSING), None) is False
     assert service._has_not_listed_rented_executors(make_payload(), None, [], None) is False
+
+
+# --- the DAH-2748 outage silencer ------------------------------------------------------------
+
+
+def _ssh_unreachable_result(executor_id: str):
+    result = _job_result(executor_id)
+    result.availability_errors = [{"reason_code": "EXECUTOR_SSH_UNREACHABLE", "reach_source": "validator"}]
+    return result
+
+
+def _reached_result(executor_id: str):
+    result = _job_result(executor_id)
+    result.availability_errors = []
+    return result
+
+
+def test_not_listed_rows_do_not_tip_the_outage_ratio(flag_on):
+    """Regression (review round 2): the not-listed rows carry an availability error the validator
+    never measured, and they counted on both sides of the DAH-2748 ratio. One miner dropping eight
+    rented nodes at once then read as our own outage and silenced a real SSH failure elsewhere."""
+    rented_data = RentedExecutorsResponse(executors={str(uuid4()): rented() for _ in range(8)})
+    not_listed = build(make_service(), rented_data, listed_ids=())
+    assert len(not_listed) == 8
+    ssh_failure = _ssh_unreachable_result(str(uuid4()))
+    cycle = not_listed + [ssh_failure] + [_reached_result(str(uuid4())) for _ in range(5)]
+
+    silenced = silence_availability_errors_on_our_own_outage(cycle)
+
+    assert silenced == 0
+    assert ssh_failure.availability_errors == [
+        {"reason_code": "EXECUTOR_SSH_UNREACHABLE", "reach_source": "validator"}
+    ]
+    assert all(row.availability_errors for row in not_listed)
+
+
+def test_not_listed_rows_are_not_silenced_and_do_not_pad_the_checked_count(flag_on):
+    """The other side of the ratio: eight validator connects failed out of ten, our own outage.
+    The not-listed rows neither dilute that share nor lose their error: the miner's answer is not
+    a reading our egress can explain."""
+    rented_data = RentedExecutorsResponse(executors={str(uuid4()): rented() for _ in range(20)})
+    not_listed = build(make_service(), rented_data, listed_ids=())
+    ssh_failures = [_ssh_unreachable_result(str(uuid4())) for _ in range(8)]
+    reached = [_reached_result(str(uuid4())) for _ in range(2)]
+
+    silenced = silence_availability_errors_on_our_own_outage(not_listed + ssh_failures + reached)
+
+    assert silenced == 10
+    assert all(result.availability_errors is None for result in ssh_failures + reached)
+    assert all(row.availability_errors[0]["reason_code"] == "RENTED_EXECUTOR_NOT_LISTED" for row in not_listed)
 
 
 # --- through the REST path -------------------------------------------------------------------
@@ -192,7 +247,7 @@ def rest_service(mocker, monkeypatch, tmp_path):
     def miner_returns(*executor_ids: str):
         async def _make_rest_request(method, url, json_data, headers, timeout, log_extra, operation_name):
             if url.endswith("ssh-pubkey-submit"):
-                return 200, AcceptSSHKeyRequest(executors=listed(*executor_ids)).model_dump(mode="json")
+                return 200, AcceptSSHKeyRequest(executors=miner_returned(*executor_ids)).model_dump(mode="json")
             return 200, {"message_type": "SSHKeyRemoved"}
 
         service._make_rest_request = _make_rest_request
