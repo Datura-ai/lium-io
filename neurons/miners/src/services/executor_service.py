@@ -59,17 +59,13 @@ class ExecutorService:
 
     async def create(self, executor: Executor) -> Union[ExecutorAdded, AddExecutorFailed]:
         try:
-            # Check if executor with same address:port already exists
-            try:
-                existing_executor = self.executor_dao.findOne(executor.address, executor.port)
-                if existing_executor:
-                    return AddExecutorFailed(
-                        executor_id=executor.uuid,
-                        error=f"Executor with address {executor.address}:{executor.port} already exists",
-                    )
-            except Exception:
-                # No existing executor found, proceed with creation
-                pass
+            # a database fault here used to be swallowed, which left the session in an aborted
+            # transaction and hid the real fault behind the insert's InFailedSqlTransaction
+            if self.executor_dao.find_one(executor.address, executor.port):
+                return AddExecutorFailed(
+                    executor_id=executor.uuid,
+                    error=f"Executor with address {executor.address}:{executor.port} already exists",
+                )
 
             # Test executor connectivity before saving to database
             logger.info("Testing executor connectivity at %s:%d...", executor.address, executor.port)

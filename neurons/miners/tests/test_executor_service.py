@@ -12,6 +12,7 @@ import bittensor
 import pytest
 
 from models.executor import Executor
+from protocol.miner_portal_request import AddExecutorFailed, ExecutorAdded
 from services.executor_service import ExecutorService
 
 
@@ -129,3 +130,44 @@ async def test_remove_pubkey_from_executor_includes_validator_signature(
     # Assert — validator_signature is present and unchanged in the forwarded payload
     assert "validator_signature" in sent_payload
     assert sent_payload["validator_signature"] == validator_sig
+
+
+# ---------------------------------------------------------------------------
+# DAH-3644: add-executor must name the fault it hit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_database_error_on_the_lookup_reaches_the_operator(executor_service, test_executor):
+    """The lookup before the insert used to sit in `except Exception: pass`, which swallowed a
+    database error and left the session in an aborted transaction. The operator then read
+    `InFailedSqlTransaction` from the insert and never the real fault."""
+    executor_service.executor_dao.find_one.side_effect = Exception("column executor.price_per_hour does not exist")
+
+    result = await executor_service.create(test_executor)
+
+    assert isinstance(result, AddExecutorFailed)
+    assert "price_per_hour" in result.error
+    executor_service.executor_dao.save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_absent_row_is_an_answer_not_an_error(executor_service, test_executor):
+    executor_service.executor_dao.find_one.return_value = None
+
+    with patch.object(ExecutorService, "test_executor_connectivity", AsyncMock(return_value=(True, ""))):
+        result = await executor_service.create(test_executor)
+
+    assert isinstance(result, ExecutorAdded)
+    executor_service.executor_dao.save.assert_called_once_with(test_executor)
+
+
+@pytest.mark.asyncio
+async def test_the_same_address_and_port_is_refused_once(executor_service, test_executor):
+    executor_service.executor_dao.find_one.return_value = test_executor
+
+    result = await executor_service.create(test_executor)
+
+    assert isinstance(result, AddExecutorFailed)
+    assert "already exists" in result.error
+    executor_service.executor_dao.save.assert_not_called()

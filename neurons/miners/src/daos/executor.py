@@ -4,19 +4,20 @@ from models.executor import Executor
 
 
 class ExecutorDao(BaseDao):
+    def _require_one(self, address: str, port: int) -> Executor:
+        executor = self.find_one(address, port)
+        if not executor:
+            raise Exception(f"No executor at {address}:{port}")
+        return executor
+
     def save(self, executor: Executor) -> Executor:
         self.session.add(executor)
         self.session.commit()
         self.session.refresh(executor)
         return executor
 
-    def findOne(self, address: str, port: int) -> Executor:
-        executor = self.session.query(Executor).filter_by(
-            address=address, port=port).first()
-        if not executor:
-            raise Exception('Not found executor')
-
-        return executor
+    def find_one(self, address: str, port: int) -> Executor | None:
+        return self.session.query(Executor).filter_by(address=address, port=port).first()
 
     def update(self, address: str, port: int, payload: dict) -> Executor:
         """
@@ -26,7 +27,7 @@ class ExecutorDao(BaseDao):
         :param payload: Dictionary of fields to update (e.g., {'validator': 'new_validator', 'price_per_gpu': 0.5})
         :return: Updated Executor object
         """
-        existing_executor = self.findOne(address, port)
+        existing_executor = self._require_one(address, port)
 
         # Update only the fields provided in payload
         for field, value in payload.items():
@@ -38,7 +39,7 @@ class ExecutorDao(BaseDao):
         return existing_executor
 
     def delete_by_address_port(self, address: str, port: int) -> None:
-        executor = self.findOne(address, port)
+        executor = self._require_one(address, port)
 
         self.session.delete(executor)
         self.session.commit()
