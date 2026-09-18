@@ -16,8 +16,6 @@ from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.task_service import JobResult
 
-from tests.test_rental_price_incentive_flow import _make_pcc_job
-
 B300 = "NVIDIA B300 SXM6 AC"
 IDLE_1X_NODES = 12  # 17 Sep 2026 13:28Z cycle: 12 idle 1×B300, 5 rented, 8 rented 8×
 
@@ -41,11 +39,11 @@ async def _run_with_production_config(job_results: dict[str, list[JobResult]]) -
 
 
 @pytest.mark.asyncio
-async def test_twelve_idle_1x_b300_share_four_cards_of_pay_and_8x_is_untouched():
+async def test_twelve_idle_1x_b300_share_four_cards_of_pay_and_8x_is_untouched(make_pcc_job) -> None:
     jobs = {
-        f"miner_{i}": [_make_pcc_job(f"exec-1x-{i:02d}", B300, 1)] for i in range(IDLE_1X_NODES)
+        f"miner_{i}": [make_pcc_job(f"exec-1x-{i:02d}", B300, 1)] for i in range(IDLE_1X_NODES)
     }
-    jobs["miner_8x"] = [_make_pcc_job("exec-8x", B300, 8)]
+    jobs["miner_8x"] = [make_pcc_job("exec-8x", B300, 8)]
 
     incentive = await _run_with_production_config(jobs)
 
@@ -66,11 +64,11 @@ async def test_twelve_idle_1x_b300_share_four_cards_of_pay_and_8x_is_untouched()
 
 
 @pytest.mark.asyncio
-async def test_sixth_idle_1x_b300_starts_the_dilution():
+async def test_six_idle_1x_b300_are_paid_four_sixths(make_pcc_job) -> None:
     """Six idle cards sit under the old cap of 10 (paid in full) and over the new
     cap of 4: the multiplier is 4/6. With the cap back at 10, or at the drafts'
     7 or 5, this test fails."""
-    jobs = {f"miner_{i}": [_make_pcc_job(f"exec-1x-{i:02d}", B300, 1)] for i in range(6)}
+    jobs = {f"miner_{i}": [make_pcc_job(f"exec-1x-{i:02d}", B300, 1)] for i in range(6)}
 
     incentive = await _run_with_production_config(jobs)
 
