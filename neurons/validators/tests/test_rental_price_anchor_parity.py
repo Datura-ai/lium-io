@@ -44,8 +44,9 @@ def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
 def test_overrides_change_only_the_server_edition_b300_and_dah_3623_entries():
     """Guards a hand-edit of `RENTAL_PRICES_PER_HOUR` that adds, drops or re-prices another GPU — the
     algorithm asserts every key is in BASE_GPU_MAP, and any other override belongs in lium-core.
-    B300 is pinned at 6.40 by DAH-3542; twelve models are pinned at 0.8 x their paid median by DAH-3623
-    (tests/test_idle_rate_under_paid_median.py holds the medians and the list)."""
+    B300 is pinned at 6.40 by DAH-3542; twelve models are pinned at 0.8 x the lower of their paid median
+    and their base price, and H100 NVL to H100 HBM3's rate, by DAH-3623
+    (tests/test_idle_rate_under_paid_median.py holds the medians and the lists)."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys()
@@ -65,4 +66,5 @@ def test_overrides_change_only_the_server_edition_b300_and_dah_3623_entries():
         "NVIDIA B200",
         "NVIDIA RTX A6000",
         "NVIDIA H100 PCIe",
+        "NVIDIA H100 NVL",
     }
