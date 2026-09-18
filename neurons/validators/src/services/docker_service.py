@@ -171,6 +171,13 @@ REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS = 15.0
 # dockerd's State.Status while it tears the container down (kill is bounded to ~20 s inside dockerd
 # and fails loudly with "did not receive an exit event", so a >60 s remove is in this phase)
 _DOCKER_REMOVING_STATUS = "removing"
+# The inspect 404 can arrive before dockerd has released the container's named-volume references,
+# so the volume removes that follow can fail with "volume is in use" while the backend closes the
+# pod on our success. On that path a named volume still in use is retried this many times, this far
+# apart; still in use after that, the delete answers DeletionInProgress and the backend re-asks.
+REMOVE_CONFIRM_VOLUME_ATTEMPTS = 6
+REMOVE_CONFIRM_VOLUME_RETRY_SECONDS = 5.0
+_DOCKER_VOLUME_IN_USE_PHRASE = "volume is in use"
 
 # Fillers get a shorter grace window than customer workloads. The backend preempts a filler
 # before a customer rent with a total budget of FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s in
@@ -745,6 +752,11 @@ def _is_docker_read_timeout_error(exc: Exception) -> bool:
             return True
         cause = cause.__cause__
     return any(_DOCKER_READ_TIMEOUT_PHRASE in text.lower() for text in _exception_texts(exc))
+
+
+def _is_docker_volume_in_use_error(exc: Exception) -> bool:
+    # dockerd's 409 on `volume rm`: 'remove <name>: volume is in use - [<container id>]'
+    return any(_DOCKER_VOLUME_IN_USE_PHRASE in text.lower() for text in _exception_texts(exc))
 
 
 def _is_docker_could_not_kill_error(exc: Exception) -> bool:
@@ -6497,6 +6509,19 @@ class DockerService:
             error_code=FailedContainerErrorCodes.UnknownError,
         )
 
+    @dataclass(frozen=True)
+    class _ForcedRemoval:
+        """What the forced removal established.
+
+        `failure` is the answer to return instead of going on (the container is not known to be
+        gone). `confirmed_by_inspect` (DAH-3467): the remove's reply outlived the read timeout and
+        an inspect 404 confirmed the container gone; dockerd may still hold its named-volume
+        references for a moment, so the volume removes that follow retry "volume is in use".
+        """
+
+        failure: FailedContainerRequest | None = None
+        confirmed_by_inspect: bool = False
+
     def _deletion_in_progress(
         self, payload: ContainerDeleteRequest, msg: str
     ) -> FailedContainerRequest:
@@ -6610,7 +6635,7 @@ class DockerService:
         docker_client: RentalDockerSdkClient,
         payload: ContainerDeleteRequest,
         log: _BoundLog,
-    ) -> FailedContainerRequest | None:
+    ) -> _ForcedRemoval:
         try:
             await run_logged_rental_docker_sdk_operation(
                 operation="remove_container",
@@ -6634,7 +6659,9 @@ class DockerService:
                     container_name=payload.container_name,
                     error=error_msg,
                 )
-                return self._deletion_in_progress(payload, msg=error_msg)
+                return self._ForcedRemoval(
+                    failure=self._deletion_in_progress(payload, msg=error_msg)
+                )
 
             if _is_docker_read_timeout_error(exc):
                 # DAH-3467: dockerd took the force-remove and has not answered yet. Ask it what
@@ -6646,20 +6673,24 @@ class DockerService:
                         container_name=payload.container_name,
                         error=str(exc),
                     )
-                    return None
+                    return self._ForcedRemoval(confirmed_by_inspect=True)
                 if status == _DOCKER_REMOVING_STATUS:
                     log.info(
                         "Container deletion is still in progress after the read timeout",
                         container_name=payload.container_name,
                         error=str(exc),
                     )
-                    return self._deletion_in_progress(
-                        payload,
-                        msg=f"{exc}; container still '{status}' after "
-                        f"{REMOVE_CONFIRM_TIMEOUT_SECONDS:.0f}s",
+                    return self._ForcedRemoval(
+                        failure=self._deletion_in_progress(
+                            payload,
+                            msg=f"{exc}; container still '{status}' after "
+                            f"{REMOVE_CONFIRM_TIMEOUT_SECONDS:.0f}s",
+                        )
                     )
+                # `unknown` (the inspect failed, hung or carried no state) or any other
+                # State.Status: none of them proves the container is gone
                 log.warning(
-                    "Container is still present after the remove timed out",
+                    "Container not confirmed gone after the remove timed out",
                     container_name=payload.container_name,
                     container_status=status,
                     error=str(exc),
@@ -6677,7 +6708,65 @@ class DockerService:
                 container_name=payload.container_name,
                 error=str(exc),
             )
-        return None
+        return self._ForcedRemoval()
+
+    async def _remove_named_volume(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        volume_name: str,
+        volume_role: str,
+        log: _BoundLog,
+        *,
+        retry_in_use: bool,
+    ) -> FailedContainerRequest | None:
+        """Remove one named volume after the container is gone.
+
+        With `retry_in_use` (the removal was confirmed by an inspect 404 after a timed-out remove,
+        DAH-3467) a "volume is in use" answer is retried REMOVE_CONFIRM_VOLUME_ATTEMPTS times,
+        REMOVE_CONFIRM_VOLUME_RETRY_SECONDS apart: dockerd can answer the inspect 404 before it has
+        released the container's volume references. Still in use after the last attempt returns
+        DeletionInProgress so the backend re-asks instead of closing the pod over a volume left
+        behind. Any other error, and every error without `retry_in_use`, raises for the caller's
+        best-effort step, as before.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await run_logged_rental_docker_sdk_operation(
+                    operation="remove_volume",
+                    log_extra=log.base_extra,
+                    call=lambda: docker_client.remove_volume(volume_name=volume_name),
+                    volume_name=volume_name,
+                    volume_role=volume_role,
+                    attempt=attempt,
+                )
+                return None
+            except Exception as exc:
+                if not retry_in_use or not _is_docker_volume_in_use_error(exc):
+                    raise
+                if attempt >= REMOVE_CONFIRM_VOLUME_ATTEMPTS:
+                    log.info(
+                        "Named volume still in use after the container was confirmed gone; "
+                        "deletion stays in progress",
+                        volume_name=volume_name,
+                        volume_role=volume_role,
+                        attempts=attempt,
+                        error=str(exc),
+                    )
+                    return self._deletion_in_progress(
+                        payload,
+                        msg=f"{exc}; volume {volume_name} still in use after {attempt} attempts",
+                    )
+                log.info(
+                    "Named volume still in use after the container was confirmed gone; retrying",
+                    volume_name=volume_name,
+                    volume_role=volume_role,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                await asyncio.sleep(REMOVE_CONFIRM_VOLUME_RETRY_SECONDS)
 
     async def _force_remove_or_kill(
         self,
@@ -6685,7 +6774,7 @@ class DockerService:
         payload: ContainerDeleteRequest,
         ssh_client: asyncssh.SSHClientConnection,
         log: _BoundLog,
-    ) -> FailedContainerRequest | None:
+    ) -> _ForcedRemoval:
         """_force_remove_container, escalating once when dockerd cannot kill the process (DAH-2991).
 
         Retrying the same `rm -f` every 10 min failed 4 times in ticket-0287 and left the orphan
@@ -6785,9 +6874,16 @@ class DockerService:
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.
                 try:
-                    removal_failure = await self._force_remove_or_kill(docker_client, payload, ssh_client, log)
-                    if removal_failure is not None:
-                        return removal_failure
+                    removal = await self._force_remove_or_kill(docker_client, payload, ssh_client, log)
+                    if removal.failure is not None:
+                        # DeletionInProgress: the container is not gone yet and the backend will
+                        # re-ask. A filler's wedge sweep ran here when this path raised (below);
+                        # answering early must not skip it (DAH-3467, review). No-op while the
+                        # container's processes are still alive.
+                        if payload.workload_kind == WorkloadKind.FILLER:
+                            with _best_effort_delete_step(log, "sweep_wedged_gpus_before_in_progress"):
+                                await _sweep_wedged_gpus_after_teardown(ssh_client, log)
+                        return removal.failure
                 except Exception:
                     # DAH-2427: a failed force-remove (backend FAILED / STOP_FAILED) is the
                     # classic wedge path — sweep before propagating so a wedged card does not
@@ -6826,36 +6922,43 @@ class DockerService:
                         call=docker_client.prune_images,
                     )
 
+                # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
+                # retried, then answered DeletionInProgress; every other failure stays best-effort.
                 if payload.local_volume:
+                    volume_in_progress = None
                     with _best_effort_delete_step(
                         log, "remove_volume_local", volume_name=payload.local_volume
                     ):
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="remove_volume",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.remove_volume(
-                                volume_name=payload.local_volume
-                            ),
-                            volume_name=payload.local_volume,
-                            volume_role="local",
+                        volume_in_progress = await self._remove_named_volume(
+                            docker_client,
+                            payload,
+                            payload.local_volume,
+                            "local",
+                            log,
+                            retry_in_use=removal.confirmed_by_inspect,
                         )
+                    if volume_in_progress is not None:
+                        return volume_in_progress
 
                 if payload.external_volume:
+                    volume_in_progress = None
                     with _best_effort_delete_step(
                         log, "remove_volume_external", volume_name=payload.external_volume
                     ):
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="remove_volume",
-                            log_extra=default_extra,
-                            call=lambda: docker_client.remove_volume(
-                                volume_name=payload.external_volume
-                            ),
-                            volume_name=payload.external_volume,
-                            volume_role="external",
+                        volume_in_progress = await self._remove_named_volume(
+                            docker_client,
+                            payload,
+                            payload.external_volume,
+                            "external",
+                            log,
+                            retry_in_use=removal.confirmed_by_inspect,
                         )
-                        await self.remove_s3fs_volume_plugin(
-                            ssh_client=ssh_client, volume_name=payload.external_volume
-                        )
+                        if volume_in_progress is None:
+                            await self.remove_s3fs_volume_plugin(
+                                ssh_client=ssh_client, volume_name=payload.external_volume
+                            )
+                    if volume_in_progress is not None:
+                        return volume_in_progress
 
                 log.info(
                     "Remove rented machine from redis",
