@@ -16,7 +16,15 @@ from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 
-DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
+# One rental image pull gets an hour. Over the 30 days to 18 Sep 2026 no customer rental that
+# reached RUNNING took longer than 44 min from create to ready (2,033 uncached, 24 over 15 min,
+# 5 over 30 min, 0 over 60 min), so an hour still covers every pull that has ever succeeded.
+# The deadline was 3 h, and a pull that is going nowhere ran the whole 3 h: twice in the week to
+# 18 Sep (both ghcr.io/tensorlink-ai/cascade-worker), while the renter had given up and deleted
+# after ~22 min. Each of those held a docker-sdk thread (32 in the pool, DAH-2475), the SSH
+# session and the host's download for the remaining ~2.5 h — a stuck pull from a slow or
+# flapping registry cannot be told from a live one, so the deadline is what ends it.
+DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 60 * 60
 _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
 _DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
 _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
