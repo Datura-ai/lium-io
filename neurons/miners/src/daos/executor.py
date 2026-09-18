@@ -4,12 +4,6 @@ from models.executor import Executor
 
 
 class ExecutorDao(BaseDao):
-    def _require_one(self, address: str, port: int) -> Executor:
-        executor = self.find_one(address, port)
-        if not executor:
-            raise Exception(f"No executor at {address}:{port}")
-        return executor
-
     def save(self, executor: Executor) -> Executor:
         self.session.add(executor)
         self.session.commit()
@@ -18,6 +12,12 @@ class ExecutorDao(BaseDao):
 
     def find_one(self, address: str, port: int) -> Executor | None:
         return self.session.query(Executor).filter_by(address=address, port=port).first()
+
+    def _require_one(self, address: str, port: int) -> Executor:
+        executor = self.find_one(address, port)
+        if not executor:
+            raise Exception(f"No executor at {address}:{port}")
+        return executor
 
     def update(self, address: str, port: int, payload: dict) -> Executor:
         """

@@ -132,42 +132,39 @@ async def test_remove_pubkey_from_executor_includes_validator_signature(
     assert sent_payload["validator_signature"] == validator_sig
 
 
-# ---------------------------------------------------------------------------
-# DAH-3644: add-executor must name the fault it hit
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
-async def test_a_database_error_on_the_lookup_reaches_the_operator(executor_service, test_executor):
+async def test_a_database_error_on_the_lookup_becomes_the_reported_failure_reason(
+    executor_service, test_executor
+):
     """The lookup before the insert used to sit in `except Exception: pass`, which swallowed a
-    database error and left the session in an aborted transaction. The operator then read
+    database error and left the session in an aborted transaction. The miner then read
     `InFailedSqlTransaction` from the insert and never the real fault."""
     executor_service.executor_dao.find_one.side_effect = Exception("column executor.price_per_hour does not exist")
 
-    result = await executor_service.create(test_executor)
+    create_result = await executor_service.create(test_executor)
 
-    assert isinstance(result, AddExecutorFailed)
-    assert "price_per_hour" in result.error
+    assert isinstance(create_result, AddExecutorFailed)
+    assert "price_per_hour" in create_result.error
     executor_service.executor_dao.save.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_an_absent_row_is_an_answer_not_an_error(executor_service, test_executor):
+async def test_no_existing_executor_lets_the_new_one_be_saved(executor_service, test_executor):
     executor_service.executor_dao.find_one.return_value = None
 
     with patch.object(ExecutorService, "test_executor_connectivity", AsyncMock(return_value=(True, ""))):
-        result = await executor_service.create(test_executor)
+        create_result = await executor_service.create(test_executor)
 
-    assert isinstance(result, ExecutorAdded)
+    assert isinstance(create_result, ExecutorAdded)
     executor_service.executor_dao.save.assert_called_once_with(test_executor)
 
 
 @pytest.mark.asyncio
-async def test_the_same_address_and_port_is_refused_once(executor_service, test_executor):
+async def test_an_existing_address_and_port_is_refused_as_a_duplicate(executor_service, test_executor):
     executor_service.executor_dao.find_one.return_value = test_executor
 
-    result = await executor_service.create(test_executor)
+    create_result = await executor_service.create(test_executor)
 
-    assert isinstance(result, AddExecutorFailed)
-    assert "already exists" in result.error
+    assert isinstance(create_result, AddExecutorFailed)
+    assert "already exists" in create_result.error
     executor_service.executor_dao.save.assert_not_called()

@@ -59,8 +59,8 @@ class ExecutorService:
 
     async def create(self, executor: Executor) -> Union[ExecutorAdded, AddExecutorFailed]:
         try:
-            # a database fault here used to be swallowed, which left the session in an aborted
-            # transaction and hid the real fault behind the insert's InFailedSqlTransaction
+            # no try/except around the lookup: a swallowed database fault leaves the session in an
+            # aborted transaction, and the insert below then fails with InFailedSqlTransaction
             if self.executor_dao.find_one(executor.address, executor.port):
                 return AddExecutorFailed(
                     executor_id=executor.uuid,
