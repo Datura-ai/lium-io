@@ -1787,7 +1787,17 @@ class DockerService:
         timeout: int = 0,
         raise_exception: bool = True,
         stdin_data: str | None = None,
+        check_exit_status: bool = False,
     ) -> tuple[bool, str]:
+        """Run `command` over ssh, streaming its output to the pod log.
+
+        A step fails on stderr output or on the streamer's `timeout`. With
+        `check_exit_status=True` it also fails on any non-zero exit status,
+        or none at all (the process ended on a signal): a command killed
+        silently (`timeout -k` sends SIGKILL, exit 137, nothing on stderr)
+        must not read as success. The default stays stderr-only because
+        many callers run commands whose exit status is not a verdict.
+        """
         logger.info(
             _m(
                 log_text,
@@ -1808,10 +1818,13 @@ class DockerService:
                 if stdin_data is not None:
                     process.stdin.write(stdin_data)
                     process.stdin.write_eof()
+                streamed = self._stream_process_output(
+                    process, log_tag, check_exit_status=check_exit_status
+                )
                 if timeout != 0:
-                    status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
+                    status, error = await asyncio.wait_for(streamed, timeout=timeout)
                 else:
-                    status, error = await self._stream_process_output(process, log_tag)
+                    status, error = await streamed
         except TimeoutError:
             status = False
             error = "Process timed out"
@@ -1833,7 +1846,7 @@ class DockerService:
 
         return status, error
 
-    async def _stream_process_output(self, process, log_tag):
+    async def _stream_process_output(self, process, log_tag, check_exit_status: bool = False):
         status = True
         error = ''
 
@@ -1844,6 +1857,21 @@ class DockerService:
             status = False
             error += line.strip() + "\n"
             await self.stream_log(line.strip(), "error", log_tag)
+
+        if check_exit_status:
+            # Both streams are at EOF; the exit status arrives with the
+            # channel close, so wait for it before reading.
+            await process.wait_closed()
+            exit_status = process.exit_status
+            if exit_status != 0:
+                status = False
+                if exit_status is None:
+                    signal = getattr(process, "exit_signal", None)
+                    detail = f"Process ended without an exit status (signal: {signal})"
+                else:
+                    detail = f"Process exited with status {exit_status}"
+                error += detail + "\n"
+                await self.stream_log(detail, "error", log_tag)
 
         return status, error
 
@@ -4096,10 +4124,12 @@ class DockerService:
     def _bounded_helper_command(command: str, bound_s: int, what: str) -> str:
         """`command` under executor-side `timeout -k 5 <bound_s>`, exit 124 made loud.
 
-        `execute_and_stream_logs` fails a step on stderr, and `timeout(1)`
-        prints nothing when it kills the command, so a helper that hit its
-        bound would otherwise read as success. The wrapper echoes one stderr
-        line on exit 124 and exits with the command's status either way.
+        `timeout(1)` prints nothing when it kills the command, so the wrapper
+        echoes one stderr line on exit 124 (the pod log says why the step
+        failed) and exits with the command's status either way. The apply
+        step does not rely on that line: it fails on the exit status itself
+        (`execute_and_stream_logs(check_exit_status=True)`), 124, 137 or any
+        other non-zero.
         """
         return (
             f"timeout -k 5 {int(bound_s)} {command}; rc=$?; "
@@ -4543,9 +4573,13 @@ class DockerService:
             # start does: the streamer's own `timeout=` only stops reading,
             # the remote `docker run` would go on inserting rules. It is named
             # so the teardown can force-remove it before the DinD IP is
-            # released, and exit 124 fails the step (`_bounded_helper_command`
-            # puts the stderr line the streamer keys on). The streamer's
-            # timeout stays as the backstop, past the executor-side bound.
+            # released. Any non-zero exit fails the step: the streamer checks
+            # the helper's exit status itself (`check_exit_status`), so a
+            # helper killed without a word (137 from `timeout -k`, an OOM
+            # kill, a `docker run` that never got to iptables) never starts
+            # the build; `_bounded_helper_command` adds the stderr line on 124
+            # so the pod log says why. The streamer's timeout stays as the
+            # backstop, past the executor-side bound.
             apply_helper, _ = self._dind_firewall_helper_names(dind_name)
             egress_cmd = self._bounded_helper_command(
                 f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
@@ -4563,6 +4597,7 @@ class DockerService:
                 log_extra={**default_extra, "dind_ip": dind_ip, "dns_servers": dns_servers},
                 timeout=setup_timeout_s + 15,
                 raise_exception=False,
+                check_exit_status=True,
             )
             if not ok:
                 # Cannot guarantee egress filtering -> never run the build open.
