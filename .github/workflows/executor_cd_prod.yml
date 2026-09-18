@@ -42,8 +42,9 @@ jobs:
   # runner digest, so one provider was about to pin a retired one, and no note said which compose hash
   # a correct CVM measures to. This job writes both into the GitHub release of the tag, after the
   # images are published: an existing release (the one a human created with generated notes) gets
-  # the section appended once, a section with another hash (a moved tag) is replaced, a missing release
-  # is created with generated notes plus the section. The script is
+  # the section appended once, a section that is not the generated one (a moved tag, a stale digest next
+  # to the current hash, a doubled heading) is replaced, a missing release is created with generated
+  # notes plus the section. The script is
   # neurons/executor/dstacktee/scripts/release_notes_update.sh; the validator's
   # tests/test_tdx_compose_hash_whitelist.py runs it against a stubbed `gh` for each of those cases.
   release-notes:

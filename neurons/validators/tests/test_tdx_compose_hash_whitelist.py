@@ -56,7 +56,11 @@ def test_prod_compose_hash_of_this_checkout_is_the_newest_version():
     # strictly above every other hash: two hashes sharing the top version could not be retired apart
     measured = compose_hash.compose_hash("prod")
     others = max((v for h, v in PROD_WHITELIST.items() if h != measured), default=0)
-    assert PROD_WHITELIST.get(measured, 0) > others
+    assert PROD_WHITELIST.get(measured, 0) > others, (
+        f"compose hash {measured} of this checkout is not the newest entry in "
+        'TDX_WHITELIST["COMPOSE_HASH"]["PROD"]: give it a version above every other hash '
+        "(a revert to an older tree lands here)."
+    )
 
 
 def test_dstack_new_writes_the_bytes_compose_hash_rebuilds(tmp_path):
@@ -125,6 +129,11 @@ def test_lium_cvm_sh_new_passes_the_flags_the_rebuild_assumes():
     assert 'local lkp_args="--local-key-provider"' in script
     assert 'local logs_arg=""' in script and 'local sysinfo_arg=""' in script
     assert "envsubst '${EXECUTOR_RUNNER_IMAGE_DIGEST}'" in script
+    # the paths behind the flags too: a changed INIT_SCRIPT or prod compose path moves the real hash
+    # while the rebuild (APP_DIR / "init_script.sh", COMPOSE_FILES["prod"]) stays put
+    assert 'INIT_SCRIPT="$THIS_DIR/app/init_script.sh"' in script
+    assert 'PRE_LAUNCH_SCRIPT="$THIS_DIR/app/pre_launch_script.sh"' in script
+    assert 'local compose_file="$THIS_DIR/app/docker-compose.yml"' in script
 
 
 def test_release_notes_section_carries_digest_and_hash():
@@ -142,6 +151,12 @@ def test_release_notes_section_carries_digest_and_hash():
     assert "\n## " not in section[len(compose_hash.RELEASE_NOTES_HEADING) :], (
         "a second '## ' heading inside the section would end it early for release_notes_update.sh"
     )
+    # the digest is the 2026-08-19 runner, older than any tag that ships it: the section says so, and
+    # says what an unknown hash costs under each setting of the validator's whitelist flag
+    assert f"pushed {compose_hash.APPROVED_RUNNER_IMAGE_PUSHED}" in section
+    assert "ENABLE_ATTESTATION_WHITELIST" in section
+    preview = compose_hash.release_notes_section("prod", "sha256:" + "0" * 64)
+    assert "not the approved runner" in preview and "pushed" not in preview
 
 
 def test_digest_must_be_64_hex():
@@ -267,6 +282,37 @@ def test_release_script_replaces_a_stale_section_even_when_the_hash_appears_else
     )
     assert _section_of(after).rstrip() == compose_hash.release_notes_section("prod")
     assert after.count(compose_hash.RELEASE_NOTES_HEADING) == 1
+
+
+def test_release_script_replaces_a_section_with_the_current_hash_but_a_stale_digest(tmp_path):
+    # a section that quotes the current hash next to an old digest used to pass the hash grep and stay:
+    # the provider then pins a digest the release does not ship. The whole section is compared now.
+    current = compose_hash.release_notes_section("prod")
+    stale_digest = current.replace(
+        compose_hash.APPROVED_RUNNER_IMAGE_DIGEST, "sha256:" + "2" * 64, 1
+    )
+    assert compose_hash.compose_hash("prod") in stale_digest and stale_digest != current
+    proc, after, calls = _run_release_script(tmp_path, GENERATED_NOTES + "\n\n" + stale_digest)
+    assert proc.returncode == 0, proc.stderr
+    assert "replacing it" in proc.stdout
+    assert f"release edit {TAG}" in calls
+    assert "2" * 64 not in after
+    assert _section_of(after).rstrip() == current
+
+
+def test_release_script_rewrites_a_doubled_section_to_one(tmp_path):
+    # two copies of the section (a re-run that appended after a hand edit) both carry the current hash;
+    # the provider reads two sets of instructions. One heading must come out of the job.
+    current = compose_hash.release_notes_section("prod")
+    proc, after, calls = _run_release_script(
+        tmp_path, GENERATED_NOTES + "\n\n" + current + "\n\n" + current
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "replacing it" in proc.stdout
+    assert f"release edit {TAG}" in calls
+    assert after.count(compose_hash.RELEASE_NOTES_HEADING) == 1
+    assert after.startswith(GENERATED_NOTES)
+    assert _section_of(after).rstrip() == current
 
 
 def test_check_flags_an_app_compose_that_differs(tmp_path, capsys):

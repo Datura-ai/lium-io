@@ -4,7 +4,9 @@
 The validator whitelists the sha256 of shared/app-compose.json (dstack's compose_hash, measured
 into RTMR3). That file is built from three measured inputs plus the runner digest stamped into
 the compose: app/docker-compose.yml, app/init_script.sh, app/pre_launch_script.sh. Editing any
-of them moves the hash; a hash the validator does not know scores the CVM zero (DAH-3602).
+of them moves the hash. A hash the validator does not know fails its whitelist check: with
+ENABLE_ATTESTATION_WHITELIST on the CVM scores zero, with it off (the default) the validator
+accepts the unknown hash and scores the node as before (DAH-3602).
 
     compose_hash.py                     # the prod hash for the approved runner digest
     compose_hash.py --env staging       # another compose file
@@ -34,6 +36,10 @@ APP_DIR = DSTACKTEE_DIR / "app"
 APPROVED_RUNNER_IMAGE_DIGEST = (
     "sha256:8c07d3a91f8900bd3f0e19025fb7a2c32f82577385550187b28c7769060d18b7"
 )
+# The day that runner image was pushed to Docker Hub (const.py, DAH-2861). The runner is not rebuilt
+# per executor release, so the digest is older than the tag whose notes carry it; the notes say so,
+# or a provider reads it as this release's runner.
+APPROVED_RUNNER_IMAGE_PUSHED = "2026-08-19"
 
 COMPOSE_FILES = {
     "prod": "docker-compose.yml",
@@ -70,11 +76,21 @@ def compose_hash(env: str = "prod", digest: str = APPROVED_RUNNER_IMAGE_DIGEST) 
 
 def release_notes_section(env: str = "prod", digest: str = APPROVED_RUNNER_IMAGE_DIGEST) -> str:
     """The section a provider copies from: the digest for .env and the hash to check after `new`."""
+    if digest == APPROVED_RUNNER_IMAGE_DIGEST:
+        digest_note = (
+            f"the runner image pushed {APPROVED_RUNNER_IMAGE_PUSHED}; the runner is not rebuilt per "
+            "executor release, so this digest is older than the release and still the approved one"
+        )
+    else:
+        digest_note = (
+            f"not the approved runner `{APPROVED_RUNNER_IMAGE_DIGEST[:19]}…`: a preview for a "
+            "digest under consideration"
+        )
     return "\n".join(
         [
             RELEASE_NOTES_HEADING,
             "",
-            f"- Approved executor-runner digest (`EXECUTOR_RUNNER_IMAGE_DIGEST` in `.env`): `{digest}`",
+            f"- Approved executor-runner digest (`EXECUTOR_RUNNER_IMAGE_DIGEST` in `.env`): `{digest}` ({digest_note})",
             f"- Expected compose hash of a CVM created from this release: `{compose_hash(env, digest)}`",
             "",
             "Check after `sudo ./lium-cvm.sh new <name>` and before `run`:",
@@ -83,10 +99,17 @@ def release_notes_section(env: str = "prod", digest: str = APPROVED_RUNNER_IMAGE
             "sha256sum run/vms/<name>/shared/app-compose.json",
             "```",
             "",
+            "From the checkout, `python3 scripts/compose_hash.py --check run/vms/<name>/shared/app-compose.json` "
+            "does the comparison and exits 1 on a mismatch.",
+            "",
             "The output must equal the expected compose hash. Any other value means the measured files "
-            "or the digest differ from the release; the validator rejects the CVM and it scores zero. "
-            "A matching value scores only once the validator release that whitelists this hash is "
-            "deployed; until then a correct CVM scores zero as well.",
+            "or the digest differ from the release, and the validator does not know the hash. What that "
+            "costs depends on the validator's whitelist enforcement (`ENABLE_ATTESTATION_WHITELIST`): "
+            "with it on, the validator rejects the CVM and it scores zero; with it off (the default), "
+            "the validator accepts the unknown hash and scores the node as before. Do not run a CVM that does not "
+            "match the release either way. Under enforcement a matching value scores only once the "
+            "validator release that whitelists this hash is deployed; until then a correct CVM scores "
+            "zero as well.",
         ]
     )
 

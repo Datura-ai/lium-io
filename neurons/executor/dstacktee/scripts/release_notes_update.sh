@@ -3,17 +3,20 @@
 # hash, printed by compose_hash.py --release-notes) into the GitHub release of <tag>. Run by the release-notes
 # job of .github/workflows/executor_cd_prod.yml from the tag's checkout, after the images are published (DAH-3602).
 #
-#   release exists, section carries this checkout's hash   → nothing to do (exit 0)
-#   release exists, section carries another hash           → the section is replaced (the tag was moved to a
-#                                                            tree with another hash; a stale section is worse
-#                                                            than none, and the job must not stay red on re-runs
-#                                                            after `deploy` already published the images)
-#   release exists, no section                             → the section is appended
-#   no release for the tag                                 → created with GitHub's generated notes, the section last
+#   release exists, exactly one section, equal to this checkout's → nothing to do (exit 0)
+#   release exists, section differs or the heading is doubled   → the section is replaced (the tag was moved to a
+#                                                                  tree with another hash, the digest is stale
+#                                                                  while the hash is current, or an edit doubled
+#                                                                  the heading; conflicting instructions are worse
+#                                                                  than none, and the job must not stay red on
+#                                                                  re-runs after `deploy` published the images)
+#   release exists, no section                                  → the section is appended
+#   no release for the tag                                      → created with GitHub's generated notes, the section last
 #
-# The section is the heading line up to the next "## " heading or the end of the body, so the hash is searched
-# only there (a release body that quotes the new hash somewhere else does not make a stale section pass) and
-# text a human wrote after the section survives the replacement. Needs GH_TOKEN and python3; nothing else.
+# The section is the heading line up to the next "## " heading or the end of the body. The whole generated section
+# is compared, not only the hash (a release body that quotes the new hash somewhere else, or a section with the new
+# hash and an old digest, does not pass), and text a human wrote after the section survives the replacement.
+# Needs GH_TOKEN and python3; nothing else.
 set -euo pipefail
 
 tag="${1:?usage: release_notes_update.sh <tag>}"
@@ -45,16 +48,25 @@ without_section() {
     { for (; blanks > 0; blanks--) print ""; print }' "$1"
 }
 has_heading() { grep -qxE "$heading[[:space:]]*" "$1"; }
+heading_count() { grep -cxE "$heading[[:space:]]*" "$1" || true; }
+# stdin with its trailing blank lines dropped (the section in a body ends where the next heading starts, after blanks)
+trim_trailing_blank() { awk '/^$/ { blanks++; next } { for (; blanks > 0; blanks--) print ""; print }'; }
+# exit 0 when the body carries exactly one section and it equals this checkout's, line for line: a current hash
+# next to a stale digest, or a heading an edit doubled, is not "already there"
+section_is_current() {
+  [ "$(heading_count "$1")" -eq 1 ] \
+    && cmp -s <(section_of "$1" | trim_trailing_blank) <(trim_trailing_blank < "$work/section.md")
+}
 
 # a body edited in the web UI comes back with CRLF; tr makes the heading match
 if gh release view "$tag" --json body --jq .body > "$work/raw.md" 2> "$work/view.err"; then
   tr -d '\r' < "$work/raw.md" > "$work/body.md"
-  if section_of "$work/body.md" | grep -qF "$hash"; then
-    echo "release $tag already carries the section with hash $hash"
+  if section_is_current "$work/body.md"; then
+    echo "release $tag already carries this checkout's CVM attestation section (hash $hash)"
     exit 0
   fi
   if has_heading "$work/body.md"; then
-    echo "release $tag carries a CVM attestation section without hash $hash (the tag was moved): replacing it"
+    echo "release $tag carries a CVM attestation section that is not this checkout's (another hash or digest, or a doubled heading): replacing it"
   else
     echo "release $tag has no CVM attestation section: appending it"
   fi
@@ -73,6 +85,10 @@ else
   exit 1
 fi
 
-# prove the section landed with this hash, read back from GitHub
+# prove the section landed as generated, read back from GitHub
 gh release view "$tag" --json body --jq .body | tr -d '\r' > "$work/after.md"
-section_of "$work/after.md" | grep -F "$hash"
+section_is_current "$work/after.md" || {
+  echo "the CVM attestation section read back from release $tag is not the generated one" >&2
+  exit 1
+}
+section_of "$work/after.md"

@@ -112,11 +112,11 @@ Two containers: `aesmd` (SGX architectural enclaves, host network) and `gramine-
 
    ```bash
    sudo ./lium-cvm.sh new my-executor
-   sha256sum run/vms/my-executor/shared/app-compose.json
+   python3 scripts/compose_hash.py --check run/vms/my-executor/shared/app-compose.json
    sudo ./lium-cvm.sh run my-executor
    ```
 
-   The `sha256sum` line must print the "expected compose hash" from the same release-notes section (`python3 scripts/compose_hash.py` prints it for the checkout). Any other value means the digest or a measured file differs from the release: the validator does not know the hash, and the CVM scores zero. Fix `.env` or `git checkout` the release tag, `sudo rm -rf run/vms/my-executor`, and run `new` again.
+   `--check` prints the expected compose hash (the one in the release-notes section) and the hash of the file `new` wrote, and exits 1 when they differ, so there is nothing to compare by eye. `sha256sum run/vms/my-executor/shared/app-compose.json` prints the same actual hash on its own. A mismatch means the digest or a measured file differs from the release and the validator does not know the hash. What that costs depends on the validator's `ENABLE_ATTESTATION_WHITELIST`: on, the CVM scores zero; off (the default, and production today), the validator accepts the unknown hash and scores the node as before. Do not run a CVM that does not match the release either way: fix `.env` or `git checkout` the release tag, `sudo rm -rf run/vms/my-executor`, and run `new` again.
 
    Everything attestation-related inside the guest — sysbox force-install, digest-pinned runner, quote generation — is baked into the measured compose; there is nothing to configure in the guest.
 
@@ -137,7 +137,7 @@ git pull                                   # the release tag
 # no section yet → python3 scripts/compose_hash.py --release-notes prints it for the checkout)
 sudo rm -rf run/vms/my-executor            # see warning below
 sudo ./lium-cvm.sh new my-executor
-sha256sum run/vms/my-executor/shared/app-compose.json   # = the release's expected compose hash
+python3 scripts/compose_hash.py --check run/vms/my-executor/shared/app-compose.json   # exit 1 = not the release's compose
 sudo ./lium-cvm.sh run my-executor
 ```
 
