@@ -1,10 +1,12 @@
-"""DAH-3475: a filler ends its own run; a customer pod keeps coming back.
+"""DAH-3475: a filler whose image ends its own run gets `restart: on-failure`; everything else keeps
+`unless-stopped`.
 
-The Dolphin image exits 0 once every worker has failed its spawn cap (computenet-docker-images#71).
-Under `restart: unless-stopped` dockerd restarted that container at once with fresh counters, so the
-validator never saw a stopped container and the backend's missing-container close never fired.
-A filler now gets `on-failure:5`; a customer rental keeps `unless-stopped` (DAH-2306 reboot recovery
-relies on it).
+Under `restart: unless-stopped` dockerd restarts an image's "nothing to serve" exit at once with
+fresh counters, so the validator never sees a stopped container and the backend's missing-container
+close never fires. The policy is gated on the job spec's `self_ending` flag, not on the FILLER
+class: FILLER also covers provider-owned jobs and ENGY, whose images have no exit contract, and no
+backend sends the flag until its image and its cap backoff exist. A customer rental never gets it
+(DAH-2306 reboot recovery relies on `unless-stopped`).
 """
 
 from unittest.mock import Mock
@@ -12,12 +14,12 @@ from unittest.mock import Mock
 import pytest
 from payload_models.payloads import ContainerCreateRequest, CustomOptions, WorkloadKind
 from services.docker_service import (
-    CUSTOMER_RENTAL_RESTART_POLICY,
-    FILLER_RESTART_POLICY,
+    DEFAULT_RESTART_POLICY,
+    SELF_ENDING_FILLER_RESTART_POLICY,
     DockerService,
     _restart_policy_for,
 )
-from services.rental_docker_sdk import GpuDockerConfig, _restart_policy
+from services.rental_docker_sdk import GpuDockerConfig
 
 
 @pytest.fixture
@@ -31,15 +33,18 @@ def docker_service() -> DockerService:
     )
 
 
-def _run_spec(docker_service: DockerService, workload_kind: WorkloadKind):
-    payload = ContainerCreateRequest(
+def _payload(**fields) -> ContainerCreateRequest:
+    return ContainerCreateRequest(
         miner_hotkey="hk",
         executor_id="ex",
         pod_id="pod",
         docker_image="img:tag",
         gpu_uuids=["g0"],
-        workload_kind=workload_kind,
+        **fields,
     )
+
+
+def _run_spec(docker_service: DockerService, payload: ContainerCreateRequest):
     return docker_service._build_rental_container_run_spec(
         payload=payload,
         container_name="pod",
@@ -55,51 +60,56 @@ def _run_spec(docker_service: DockerService, workload_kind: WorkloadKind):
     )
 
 
-def test_filler_run_spec_restarts_on_failure_only(docker_service):
-    run_spec = _run_spec(docker_service, WorkloadKind.FILLER)
+def test_self_ending_filler_run_spec_restarts_on_failure_without_a_cap(docker_service):
+    # No retry cap: PEARL's PID 1 re-exits its child's code, so 143 can come from inside the
+    # container; a capped policy would leave it `exited` with 143, which rental_verification reads
+    # as a host stop and withholds incentive for.
+    run_spec = _run_spec(docker_service, _payload(workload_kind=WorkloadKind.FILLER, self_ending=True))
 
-    assert run_spec.restart_policy == FILLER_RESTART_POLICY == "on-failure:5"
-
-
-def test_customer_rental_run_spec_keeps_unless_stopped(docker_service):
-    run_spec = _run_spec(docker_service, WorkloadKind.CUSTOMER_RENTAL)
-
-    assert run_spec.restart_policy == CUSTOMER_RENTAL_RESTART_POLICY == "unless-stopped"
+    assert run_spec.restart_policy == SELF_ENDING_FILLER_RESTART_POLICY == "on-failure"
 
 
-def test_default_workload_kind_is_a_customer_rental():
-    # A backend that does not send workload_kind is renting for a customer: the field defaults to
-    # CUSTOMER_RENTAL, so an old backend can never turn a pod into a self-ending filler.
-    payload = ContainerCreateRequest(
-        miner_hotkey="hk", executor_id="ex", pod_id="pod", docker_image="img:tag", gpu_uuids=["g0"]
+def test_filler_without_the_capability_keeps_unless_stopped(docker_service):
+    # The FILLER class alone is not enough: provider-owned jobs and ENGY are FILLERs too and their
+    # images never exit 0 on purpose, so `on-failure` would leave nothing for them to gain and a
+    # SIGTERM-exit-0 image down after a host reboot.
+    run_spec = _run_spec(docker_service, _payload(workload_kind=WorkloadKind.FILLER))
+
+    assert run_spec.restart_policy == DEFAULT_RESTART_POLICY == "unless-stopped"
+
+
+def test_customer_rental_never_gets_the_self_ending_policy(docker_service):
+    run_spec = _run_spec(
+        docker_service, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL, self_ending=True)
     )
 
-    assert _restart_policy_for(payload.workload_kind) == "unless-stopped"
+    assert run_spec.restart_policy == "unless-stopped"
 
 
-def test_sdk_maps_retry_cap_to_docker_host_config():
-    assert _restart_policy("on-failure:5") == {"Name": "on-failure", "MaximumRetryCount": 5}
+def test_a_backend_that_sends_neither_field_changes_nothing():
+    # An old backend sends no workload_kind and no self_ending: the defaults are CUSTOMER_RENTAL and
+    # False, so nothing it launches becomes a self-ending filler.
+    payload = _payload()
+
+    assert payload.workload_kind is WorkloadKind.CUSTOMER_RENTAL
+    assert payload.self_ending is False
+    assert _restart_policy_for(payload) == "unless-stopped"
 
 
-def test_sdk_keeps_plain_policy_names_unchanged():
-    assert _restart_policy("unless-stopped") == {"Name": "unless-stopped"}
-    assert _restart_policy(None) is None
+def test_self_ending_survives_deserialization_of_the_backend_request():
+    # Declared on the model, or pydantic drops the unknown key and the flag can never arrive.
+    payload = ContainerCreateRequest.model_validate(
+        {
+            "message_type": "ContainerCreateRequest",
+            "miner_hotkey": "hk",
+            "executor_id": "ex",
+            "pod_id": "pod",
+            "docker_image": "img:tag",
+            "gpu_uuids": ["g0"],
+            "workload_kind": "FILLER",
+            "self_ending": True,
+        }
+    )
 
-
-def test_sdk_passes_a_zero_cap_through_as_docker_no_limit():
-    # Docker reads MaximumRetryCount 0 as "no limit"; the mapping must not turn it into a rejection
-    # or a missing key, or a caller asking for unlimited retries would get a policy error.
-    assert _restart_policy("on-failure:0") == {"Name": "on-failure", "MaximumRetryCount": 0}
-
-
-@pytest.mark.parametrize("policy", ["unless-stopped:3", "always:1"])
-def test_sdk_refuses_a_retry_cap_on_a_policy_that_has_none(policy: str):
-    # Same rule as the docker CLI: "maximum retry count cannot be used with restart policy".
-    with pytest.raises(ValueError, match="only valid with on-failure"):
-        _restart_policy(policy)
-
-
-@pytest.mark.parametrize("policy", ["on-failure:", "on-failure:five", "on-failure:-1"])
-def test_sdk_refuses_a_retry_cap_that_is_not_a_count(policy: str):
-    with pytest.raises(ValueError, match="non-negative integer"):
-        _restart_policy(policy)
+    assert payload.self_ending is True
+    assert _restart_policy_for(payload) == "on-failure"
