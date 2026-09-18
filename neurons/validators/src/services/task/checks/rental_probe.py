@@ -98,7 +98,13 @@ _CREATE_DEADLINE_SECONDS = 300
 # the idleness re-read runs under the per-executor create lock; the lock's TTL (redis_service.py) covers
 # this budget plus the create deadline, so a re-read that overruns it gives the lock back instead
 _IDLENESS_REREAD_BUDGET_SECONDS = 30
-_TEARDOWN_DEADLINE_SECONDS = 120
+# the outer cap on delete_container (DAH-3467, review): a stop with its 30 s grace, a `rm -f` that
+# outlives the Docker SDK's 60 s read timeout, the 60 s inspect window plus one 15 s inspect past
+# it, and six "volume is in use" retries 5 s apart come to about 190 s on the inspect-confirmed
+# path; a stop that itself runs into the SDK's read timeout adds to that and stays under this
+# cap, which is what ends a delete that is still slower (the probe then records "did not finish",
+# and the by-name removals in _step_teardown run)
+_TEARDOWN_DEADLINE_SECONDS = 300
 # one shell command over the validation connection (the image check, the by-name removals)
 _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 # every string copied out of the host into the event is bounded (PR_PROCESS §5)

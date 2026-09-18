@@ -2078,12 +2078,15 @@ async def test_delete_container_remove_read_timeout_then_gone_retries_a_volume_s
 
 
 @pytest.mark.asyncio
-async def test_delete_container_remove_read_timeout_then_gone_with_volume_still_in_use_reports_in_progress(
+async def test_delete_container_remove_read_timeout_then_gone_with_volume_still_in_use_stays_best_effort_once_retries_run_out(
     docker_service, monkeypatch, retry_ssh_mock
 ):
-    """The retries run out while dockerd still holds the volume: the delete answers
-    DeletionInProgress (the backend re-asks) instead of ContainerDeleted over a volume left behind,
-    and the steps after the volume (the redis rental record) do not run."""
+    """Regression (review round 4): the retries run out while dockerd still holds the volume. The
+    delete used to answer DeletionInProgress here; the backend counts that answer against its three
+    delete attempts (POD_DELETE_MAX_ATTEMPTS) and, still held on the third, gives up into the penalty
+    path for a node whose container was gone. The exhausted volume is now the best-effort failure any
+    other volume error is: logged, the volume left on the host, ContainerDeleted, the redis rental
+    record removed, no marker left for a re-ask that is not coming."""
     client, payload, executor_info = _arm_delete_after_remove_read_timeout(
         docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
     )
@@ -2097,21 +2100,23 @@ async def test_delete_container_remove_read_timeout_then_gone_with_volume_still_
         private_key="encrypted",
     )
 
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
-    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
-    assert "volume is in use" in result.msg and "still in use after 2 attempts" in result.msg
-    assert len(client.removed_volumes) == 2
-    assert client.pruned_images == 1  # the container is gone; only the volume is still held
-    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
+    assert client.pruned_images == 1
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info, payload.container_name
+    )
 
 
 @pytest.mark.asyncio
-async def test_delete_container_remove_read_timeout_then_gone_with_external_volume_still_in_use_reports_in_progress(
+async def test_delete_container_remove_read_timeout_then_gone_with_external_volume_still_in_use_stays_best_effort(
     docker_service, monkeypatch, retry_ssh_mock
 ):
     # the external volume takes the same retry; its s3fs plugin is removed only after a successful
-    # `volume rm`, so an in-progress answer leaves the plugin (and the redis record) for the re-ask
+    # `volume rm`, so a volume given up leaves the plugin as the pre-DAH-3467 best-effort step did,
+    # and the delete completes
     client, payload, executor_info = _arm_delete_after_remove_read_timeout(
         docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
     )
@@ -2129,11 +2134,10 @@ async def test_delete_container_remove_read_timeout_then_gone_with_external_volu
         private_key="encrypted",
     )
 
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert isinstance(result, ContainerDeleted)
     assert client.removed_volumes == [{"volume_name": payload.external_volume, "force": False}] * 2
     plugin_removal.assert_not_awaited()
-    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2209,19 +2213,13 @@ async def _delete(docker_service, payload, executor_info):
     )
 
 
-async def _delete_answered_in_progress(docker_service, monkeypatch, retry_ssh_mock, how: str):
-    """Round 1 of a delete that answers DeletionInProgress, either from the container path (still
-    'removing' after the read timeout) or from the volume path (confirmed gone, volume still in use).
-    Returns the fake client, the payload and the executor for the backend's re-ask."""
-    if how == "container_still_removing":
-        client, payload, executor_info = _arm_delete_after_remove_read_timeout(
-            docker_service, monkeypatch, retry_ssh_mock, statuses=["removing"]
-        )
-    else:  # "volume_still_in_use"
-        client, payload, executor_info = _arm_delete_after_remove_read_timeout(
-            docker_service, monkeypatch, retry_ssh_mock, statuses=[None]
-        )
-        client.remove_volume_error = _volume_in_use_error(payload.local_volume)
+async def _delete_answered_in_progress(docker_service, monkeypatch, retry_ssh_mock):
+    """Round 1 of a delete that answers DeletionInProgress: the container is still 'removing' after
+    the read timeout (the one path that answers it since review round 4). Returns the fake client,
+    the payload and the executor for the backend's re-ask."""
+    client, payload, executor_info = _arm_delete_after_remove_read_timeout(
+        docker_service, monkeypatch, retry_ssh_mock, statuses=["removing"]
+    )
     _arm_volume_retry_timing(monkeypatch, attempts=2)
 
     first = await _delete(docker_service, payload, executor_info)
@@ -2239,39 +2237,36 @@ async def _delete_answered_in_progress(docker_service, monkeypatch, retry_ssh_mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("how", ["container_still_removing", "volume_still_in_use"])
-async def test_delete_re_asked_after_in_progress_keeps_a_volume_still_in_use_in_progress(
-    docker_service, monkeypatch, retry_ssh_mock, how
+async def test_delete_re_asked_after_in_progress_retries_a_volume_still_in_use_then_gives_it_up(
+    docker_service, monkeypatch, retry_ssh_mock
 ):
     """Regression (review round 3): the backend's re-ask after DeletionInProgress finds the
-    container already absent, which is not the inspect-confirmed path, so "volume is in use" fell
-    back to best-effort and the pod closed over the volume left behind. The pod's in-progress
-    marker keeps the volume cleanup on the retried path across delete requests."""
+    container already absent, which is not the inspect-confirmed path, so "volume is in use" got the
+    one best-effort attempt and the pod closed over a volume dockerd was about to release. The pod's
+    marker keeps the volume cleanup on the retried path across delete requests; a volume still held
+    after the retries is given up (round 4), the delete completes and the marker is cleared."""
     client, payload, executor_info = await _delete_answered_in_progress(
-        docker_service, monkeypatch, retry_ssh_mock, how
+        docker_service, monkeypatch, retry_ssh_mock
     )
     client.remove_volume_error = _volume_in_use_error(payload.local_volume)
 
     result = await _delete(docker_service, payload, executor_info)
 
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
-    assert "volume is in use" in result.msg and "still in use after 2 attempts" in result.msg
+    assert isinstance(result, ContainerDeleted)
     assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
     assert client.inspected_containers == []  # an absent container needs no inspect
-    assert docker_service_module.pending_deletions.is_pending(payload.pod_id)
-    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+    assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("how", ["container_still_removing", "volume_still_in_use"])
 async def test_delete_re_asked_after_in_progress_completes_once_the_volume_is_gone(
-    docker_service, monkeypatch, retry_ssh_mock, how
+    docker_service, monkeypatch, retry_ssh_mock
 ):
-    # the re-ask finds the container absent and the volume released: ContainerDeleted, the redis
-    # rental record goes, and the marker is cleared so a later delete for the pod starts clean
+    # the re-ask finds the container absent and the volume released on the second try:
+    # ContainerDeleted, the redis rental record goes, and the marker is cleared
     client, payload, executor_info = await _delete_answered_in_progress(
-        docker_service, monkeypatch, retry_ssh_mock, how
+        docker_service, monkeypatch, retry_ssh_mock
     )
     client.remove_volume_errors = [_volume_in_use_error(payload.local_volume), None]
 
@@ -2311,6 +2306,41 @@ async def test_delete_of_an_absent_container_without_a_pending_deletion_stays_be
     assert isinstance(result, ContainerDeleted)
     assert len(client.removed_volumes) == 1
     assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
+
+
+def test_pending_deletions_expire_after_the_ttl_and_a_new_mark_restarts_it():
+    """Regression (review round 4): the marker set never evicted, so a pod the backend gave up on, or
+    a rental-probe pod (a fresh id per run, never re-asked), stayed in it for the life of the process.
+    A marker is gone PENDING_DELETION_TTL_SECONDS after it was set; marking again restarts the clock."""
+    now = [1000.0]
+    registry = docker_service_module._PendingDeletionRegistry(clock=lambda: now[0])
+    ttl = docker_service_module.PENDING_DELETION_TTL_SECONDS
+
+    registry.mark("pod-a")
+    now[0] += ttl - 1
+    assert registry.is_pending("pod-a")
+    registry.mark("pod-a")  # the re-ask answered in progress again: a fresh marker
+    now[0] += ttl - 1
+    assert registry.is_pending("pod-a")
+    now[0] += 2
+    assert not registry.is_pending("pod-a")
+    assert len(registry) == 0
+
+
+def test_pending_deletions_do_not_accumulate_probe_pods():
+    # sixty probe runs, each answering in progress once and never re-asked: after the TTL none is left,
+    # and a clear on an expired or unknown id is a no-op
+    now = [0.0]
+    registry = docker_service_module._PendingDeletionRegistry(clock=lambda: now[0])
+    for i in range(60):
+        registry.mark(f"probe-{i}")
+        now[0] += 360.0  # one probe every 6 min
+    # 3600 s TTL over 360 s steps: only the last ten marks are younger than the TTL
+    assert len(registry) == 10
+    now[0] += docker_service_module.PENDING_DELETION_TTL_SECONDS
+    assert len(registry) == 0
+    registry.clear("probe-0")
+    assert not registry.is_pending("probe-0")
 
 
 def _arm_filler_delete_in_progress(
