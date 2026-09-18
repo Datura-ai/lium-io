@@ -4463,26 +4463,35 @@ class DockerService:
             #    exit 1 (aborting there rejected a DinD that was still
             #    starting), and the next probe follows at once.
             #    The bound is `timeout(1)` on the executor, as for the DinD
-            #    start: asyncssh's `timeout=` only stops waiting and would
-            #    leave the remote `docker exec` and its session channel open,
-            #    one per slow probe, until sshd's MaxSessions refused the
-            #    next one. Worst case, probes that each take the whole bound
-            #    and answer "not ready": N * (10 + 1) s, 11 min at the default
-            #    60. `ready_timeout_s` is `gt=0` in settings, so at least one
-            #    probe runs.
+            #    start: it kills the remote `docker exec`, so a slow probe
+            #    leaves no process behind. asyncssh's `timeout=` is the
+            #    backstop for a host where even `timeout(1)` did not return,
+            #    and it only stops waiting: `run(timeout=)` drops its process
+            #    there and the session channel stays open until the remote
+            #    command exits, one per such probe, until sshd's MaxSessions
+            #    (10) refused the next one. So the probe is `create_process`
+            #    + `wait` inside `async with`, as `execute_and_stream_logs`
+            #    runs its commands: the exit closes the channel (`close` +
+            #    `wait_closed`) before the next probe opens one, on a timeout
+            #    as on a result. Worst case, probes that each take the whole
+            #    bound and answer "not ready": N * (10 + 1) s, 11 min at the
+            #    default 60. `ready_timeout_s` is `gt=0` in settings, so at
+            #    least one probe runs.
             ready = False
             probe_timeout_s = min(ready_timeout_s, DIND_READY_PROBE_MAX_SECONDS)
+            probe_cmd = (
+                f"timeout -k 2 {probe_timeout_s} "
+                f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info"
+            )
             for _ in range(ready_timeout_s):
                 try:
-                    probe = await ssh_client.run(
-                        f"timeout -k 2 {probe_timeout_s} "
-                        f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info",
-                        check=False,
-                        timeout=probe_timeout_s + 5,
-                    )
+                    async with ssh_client.create_process(probe_cmd) as probe_process:
+                        probe = await probe_process.wait(
+                            check=False, timeout=probe_timeout_s + 5
+                        )
                 except asyncio.TimeoutError:
-                    # Backstop for a host where even `timeout(1)` did not
-                    # return: not ready yet, and the probe used its bound.
+                    # The backstop fired; the `async with` exit closed the
+                    # channel. Not ready yet, and the probe used its bound.
                     continue
                 # `timeout(1)` exits 124 when it killed the probe: not ready.
                 if probe.exit_status == 0:
@@ -4728,8 +4737,6 @@ class DockerService:
         Always called from `_custom_build_image`'s finally. Failures are logged,
         never raised — the rental flow must not break on cleanup.
         """
-        from core.config import settings
-
         setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
         apply_helper, remove_helper = self._dind_firewall_helper_names(dind_name)
         if dind_ip:

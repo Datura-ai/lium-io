@@ -166,6 +166,72 @@ def _ssh_result(exit_status: int = 0, stdout: str = "", stderr: str = ""):
     return r
 
 
+def _is_probe(command: str) -> bool:
+    return "docker exec" in command and command.rstrip().endswith("docker info")
+
+
+class _FakeProbeProcess:
+    """What `ssh_client.create_process` hands the readiness loop: an async
+    context manager whose `wait(check, timeout)` does what asyncssh's does.
+    It returns the completed process, or raises `TimeoutError` when the wait
+    outlives `timeout` and leaves the channel OPEN (asyncssh's `run()` drops
+    the process right there). `closed` records the `async with` exit (`close`
+    then `wait_closed`), which is what frees the sshd session slot.
+
+    `hangs`: a hung dockerd. With the executor-side `timeout -k 2 N` prefix
+    the probe returns exit 124 after N s (the remote `docker exec` is killed);
+    without it the wait runs to asyncssh's `timeout=` and raises, and with no
+    bound at all it blocks for the hour. `backstop`: a host where even
+    `timeout(1)` did not return, so only asyncssh's bound ends the wait; the
+    fake raises at once and records the bound it was given (`wait_timeout`),
+    the timing is asyncssh's.
+    """
+
+    def __init__(self, command: str, *, exit_status: int = 0, hangs: bool = False,
+                 backstop: bool = False, on_wait=None, on_close=None):
+        self.command = command
+        self._exit_status = exit_status
+        self._hangs, self._backstop = hangs, backstop
+        self._on_wait, self._on_close = on_wait, on_close
+        self.wait_timeout = None
+        self.closed = False
+        self.close_awaited = False
+
+    async def wait(self, check: bool = False, timeout=None):
+        self.wait_timeout = timeout
+        if self._on_wait:
+            self._on_wait(self.command, {"timeout": timeout})
+        if self._backstop:
+            if timeout is None:
+                await asyncio.sleep(3600)
+            raise asyncio.TimeoutError()
+        if self._hangs:
+            bound = re.match(r"timeout -k \d+ (\d+) ", self.command)
+            if bound:
+                await asyncio.sleep(int(bound.group(1)))
+                return _ssh_result(exit_status=124)
+            await asyncio.sleep(timeout if timeout else 3600)
+            if timeout:
+                raise asyncio.TimeoutError()
+        return _ssh_result(exit_status=self._exit_status)
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        self.close_awaited = True
+        if self._on_close:
+            self._on_close(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.close()
+        await self.wait_closed()
+        return False
+
+
 def _make_dind_ssh(
     *,
     sysbox: bool = True,
@@ -174,27 +240,36 @@ def _make_dind_ssh(
     ready_exit: int = 0,
     ready_hangs: bool = False,
     ready_hangs_first: int = 0,
+    ready_backstop_first: int = 0,
     dind_ip: str = "172.20.0.2",
     resolv_conf: str = "nameserver 8.8.8.8\n",
     resolv_exit: int = 0,
     remove_helper_exit: int = 0,
 ):
-    """An `ssh.run` router emulating the DAH-2211 DinD build control commands.
+    """An ssh client emulating the DAH-2211 DinD build control commands.
 
-    Routes by command substring: sysbox preflight, DinD `run -d`, the
-    readiness `docker exec ... docker info` probe, IP inspect, the DinD
-    `cat /etc/resolv.conf` read, and everything else (Dockerfile write,
-    teardown) → exit 0. The build / egress / export steps go through
-    `execute_and_stream_logs`, not `ssh.run`. `dind_start_hangs` makes the
-    `run -d` raise `asyncio.TimeoutError`, what asyncssh raises when the
-    command outlives its `timeout=`; `ready_hangs` makes every readiness
-    probe block for an hour (a hung host dockerd); `ready_hangs_first=n` makes
-    only the first n probes hang (a dockerd still starting), the rest answer
-    `ready_exit`. `remove_helper_exit` is the teardown's firewall remove
-    helper's exit status (124 = the executor's `timeout(1)` killed it).
+    `run` routes by command substring: sysbox preflight, DinD `run -d`, IP
+    inspect, the DinD `cat /etc/resolv.conf` read, and everything else
+    (Dockerfile write, teardown) → exit 0. `create_process` serves the
+    readiness `docker exec ... docker info` probe with a `_FakeProbeProcess`
+    (each one on `ssh.probe_processes`; its open/close order on
+    `ssh.probe_events`); the probe's command and `wait` bound are recorded on
+    `ssh.calls` / `ssh.call_kwargs` with the `run` commands. The build / egress
+    / export steps go through `execute_and_stream_logs`, stubbed by
+    `_make_esl`. `dind_start_hangs` makes the `run -d` raise
+    `asyncio.TimeoutError`, what asyncssh raises when the command outlives its
+    `timeout=`; `ready_hangs` makes every readiness probe hang (a hung host
+    dockerd); `ready_hangs_first=n` makes only the first n probes hang (a
+    dockerd still starting), the rest answer `ready_exit`;
+    `ready_backstop_first=n` makes the first n probes outlive even the
+    executor-side bound, so asyncssh's own `timeout=` ends them.
+    `remove_helper_exit` is the teardown's firewall remove helper's exit status
+    (124 = the executor's `timeout(1)` killed it).
     """
     calls: list[str] = []
     call_kwargs: list[dict] = []
+    probe_processes: list[_FakeProbeProcess] = []
+    probe_events: list[tuple[str, int]] = []
 
     async def _run(cmd, **kw):
         calls.append(cmd)
@@ -209,22 +284,6 @@ def _make_dind_ssh(
             if dind_start_hangs:
                 raise asyncio.TimeoutError()
             return _ssh_result(exit_status=dind_start_exit, stdout="dind-cid")
-        if "docker exec" in cmd and cmd.rstrip().endswith("docker info"):
-            probes_so_far = sum(1 for c in calls if c.rstrip().endswith("docker info"))
-            if ready_hangs or probes_so_far <= ready_hangs_first:
-                # A hung dockerd. With the executor-side `timeout -k 2 N` prefix
-                # the probe returns exit 124 after N s (the remote `docker exec`
-                # is killed, no channel stays open); without it asyncssh's own
-                # `timeout=` raises TimeoutError after that long, and without
-                # any bound the probe blocks for the hour.
-                bound = re.match(r"timeout -k \d+ (\d+) ", cmd)
-                if bound:
-                    await asyncio.sleep(int(bound.group(1)))
-                    return _ssh_result(exit_status=124)
-                await asyncio.sleep(kw["timeout"] if kw.get("timeout") else 3600)
-                if kw.get("timeout"):
-                    raise asyncio.TimeoutError()
-            return _ssh_result(exit_status=ready_exit)
         if "docker inspect -f" in cmd:
             return _ssh_result(stdout=dind_ip)
         if "docker exec" in cmd and cmd.rstrip().endswith("cat /etc/resolv.conf"):
@@ -233,8 +292,37 @@ def _make_dind_ssh(
             return _ssh_result(exit_status=remove_helper_exit)
         return _ssh_result(exit_status=0)
 
+    def _record(cmd, kw):
+        calls.append(cmd)
+        call_kwargs.append(kw)
+
+    def _probe_process(command: str) -> _FakeProbeProcess:
+        n = len(probe_processes) + 1
+        proc = _FakeProbeProcess(
+            command,
+            exit_status=ready_exit,
+            hangs=ready_hangs or n <= ready_hangs_first,
+            backstop=n <= ready_backstop_first,
+            on_wait=_record,
+            on_close=lambda p: probe_events.append(("closed", n)),
+        )
+        probe_processes.append(proc)
+        probe_events.append(("open", n))
+        return proc
+
+    def _create_process(command: str):
+        if _is_probe(command):
+            return _probe_process(command)
+        raise AssertionError(
+            f"unexpected create_process (the streamed steps are stubbed here): {command}"
+        )
+
     ssh = AsyncMock()
     ssh.run = _run
+    ssh.create_process = _create_process
+    ssh.probe_process = _probe_process
+    ssh.probe_processes = probe_processes
+    ssh.probe_events = probe_events
     ssh.calls = calls
     ssh.call_kwargs = call_kwargs
     return ssh
@@ -1122,6 +1210,42 @@ async def test_A23d_a_probe_that_hits_its_bound_is_not_ready_and_the_next_probe_
 
 
 @pytest.mark.asyncio
+async def test_A23e_a_probe_that_outlives_the_backstop_is_closed_before_the_next_one_opens(svc, monkeypatch):
+    """Regression: the probe ran through `ssh_client.run(timeout=)`, which drops
+    its process when the wait times out and leaves the session channel open
+    until the remote command exits. On a host where even `timeout(1)` did not
+    return, every probe that hit the backstop kept a channel, and sshd's
+    MaxSessions (10) refused the eleventh. The probe is now `create_process` +
+    `wait` inside `async with`, so a timed-out probe is closed (`close`, then
+    `wait_closed`) before the next one opens, the timeout still reads as "not
+    ready", and the next probe runs."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", 3)
+    ssh_client = _make_dind_ssh(ready_backstop_first=1)
+    esl = _make_esl()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await asyncio.wait_for(
+        svc._custom_build_image(
+            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
+        ),
+        timeout=20,
+    )
+    assert ok is True and step is None
+    first, second = ssh_client.probe_processes
+    # the backstop is asyncssh's `timeout=` on the wait: the executor bound (3) + 5
+    assert first.wait_timeout == 3 + 5 and second.wait_timeout == 3 + 5
+    assert first.command.startswith("timeout -k 2 3 /usr/bin/docker exec")
+    # the timed-out probe's channel was closed, and closed before the second probe opened;
+    # never more than one probe channel open at a time
+    assert first.closed and first.close_awaited
+    assert ssh_client.probe_events == [("open", 1), ("closed", 1), ("open", 2), ("closed", 2)]
+    assert any("docker build" in c for c in esl.seen)
+
+
+@pytest.mark.asyncio
 async def test_A24_egress_helper_runs_under_the_setup_bound(svc, monkeypatch):
     from core.config import settings
 
@@ -1219,13 +1343,16 @@ class _FakeStreamProcess:
 
 def _make_process_ssh(*, egress_exit: int | None, egress_stderr=()):
     """An `ssh_client` for the REAL `execute_and_stream_logs`: `run` is the
-    `_make_dind_ssh` router (DinD start, probes, teardown); `create_process`
-    serves the streamed steps, the egress helper with `egress_exit` and no
-    stdout, every other command (build, export) with exit 0."""
+    `_make_dind_ssh` router (DinD start, teardown), the readiness probes are
+    its `_FakeProbeProcess`es; `create_process` serves the streamed steps, the
+    egress helper with `egress_exit` and no stdout, every other command
+    (build, export) with exit 0."""
     ssh = _make_dind_ssh()
     processes: list[tuple[str, _FakeStreamProcess]] = []
 
     def _create_process(command: str):
+        if _is_probe(command):
+            return ssh.probe_process(command)
         if "--network=host" in command:
             proc = _FakeStreamProcess(egress_exit, stderr=egress_stderr)
         else:
