@@ -758,6 +758,181 @@ async def test_A16b_non_build_failures_have_no_tail(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_A20_volume_step_failure_carries_the_daemon_reason(svc, monkeypatch):
+    """Regression (DAH-3504): a `volume_creation` failure reached the backend as the bare step
+    name; `step_detail` now carries the Docker daemon's reason. The dead-transport text docker-py
+    raises after a long build gets a plain-language hint in front of it."""
+    from services.docker_service import STALE_SDK_TRANSPORT_HINT
+    from services.rental_docker_sdk import RentalDockerOperationError
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(
+        svc,
+        "create_local_volume",
+        AsyncMock(
+            side_effect=RentalDockerOperationError(
+                "Docker SDK create volume failed: 'NoneType' object has no attribute 'settimeout'"
+            )
+        ),
+    )
+
+    payload = _base_payload(dockerfile_content=None)
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "volume_creation"
+    assert result.step_detail is not None
+    assert result.step_detail.startswith(STALE_SDK_TRANSPORT_HINT)
+    assert "Docker SDK create volume failed" in result.step_detail
+    assert "127.0.0.1" not in result.step_detail and "2200" not in result.step_detail
+    assert result.build_log_tail is None
+
+
+@pytest.mark.asyncio
+async def test_A20c_volume_sizing_failure_carries_the_min_size_reason(svc, monkeypatch):
+    """`volume_sizing` is the other step a pod dies at before its volume exists; its
+    VolumeMinSizeError text is the renter's answer and travels as `step_detail` unchanged."""
+    from services.docker_service import VolumeMinSizeError
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(
+        svc,
+        "resolve_volume_sizing",
+        AsyncMock(
+            side_effect=VolumeMinSizeError(
+                "Fresh vloopback sizing produced 3GB volume, below required minimum 20GB"
+            )
+        ),
+    )
+
+    payload = _base_payload(dockerfile_content=None)
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "volume_sizing"
+    assert result.step_detail == "Fresh vloopback sizing produced 3GB volume, below required minimum 20GB"
+
+
+@pytest.mark.asyncio
+async def test_A20d_template_switch_dead_transport_at_docker_run_carries_the_hint_alone(svc, monkeypatch):
+    """Review nit (taiberium, 18 Sep): on a template switch the backend re-sends the Dockerfile with
+    the pod's existing `local_volume`, the volume block is skipped, and the first Docker SDK call
+    after the long build is `docker_run`. The dead-transport text surfaces there; `step_detail`
+    carries the fixed hint and nothing of the raw error, since that step's text is not proven
+    free of executor host data."""
+    from services.docker_service import STALE_SDK_TRANSPORT_HINT
+    from services.rental_docker_sdk import RentalDockerOperationError
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None, None)))
+    create_volume = AsyncMock()
+    monkeypatch.setattr(svc, "create_local_volume", create_volume)
+    monkeypatch.setattr(
+        svc,
+        "_run_rental_docker_create_with_port_retry",
+        AsyncMock(
+            side_effect=RentalDockerOperationError(
+                "Docker SDK create container failed: 'NoneType' object has no attribute 'settimeout' "
+                "(executor 127.0.0.1:2200)"
+            )
+        ),
+    )
+
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    payload = payload.model_copy(update={"local_volume": f"volume_{payload.pod_id}"})
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_run"
+    create_volume.assert_not_awaited()
+    assert result.step_detail == STALE_SDK_TRANSPORT_HINT
+    assert "settimeout" not in result.step_detail
+    assert "127.0.0.1" not in result.step_detail and "2200" not in result.step_detail
+    assert result.build_log_tail is None
+
+
+@pytest.mark.asyncio
+async def test_A20b_non_volume_failures_have_no_step_detail(svc, monkeypatch):
+    """`step_detail` belongs to the volume step, plus the dead-transport hint: a failure elsewhere
+    with any other text (here the custom build) leaves it None so the backend can trust it."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(False, "docker_build", "boom")))
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN false\n")
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_build"
+    assert result.step_detail is None
+
+
+def test_A21_volume_step_detail_is_bounded_and_plain():
+    from services.docker_service import (
+        STALE_SDK_TRANSPORT_HINT,
+        VOLUME_STEP_DETAIL_MAX_CHARS,
+        volume_step_detail,
+    )
+
+    assert volume_step_detail(RuntimeError("")) is None
+    assert volume_step_detail(RuntimeError("  \n ")) is None
+    plain = volume_step_detail(RuntimeError("Docker SDK create volume failed:\n  no space left on device"))
+    assert plain == "Docker SDK create volume failed: no space left on device"
+    assert not plain.startswith(STALE_SDK_TRANSPORT_HINT)
+    long = volume_step_detail(RuntimeError("x" * 1000))
+    assert len(long) == VOLUME_STEP_DETAIL_MAX_CHARS
+
+
+def test_A21b_failure_step_detail_routes_by_step():
+    from services.docker_service import STALE_SDK_TRANSPORT_HINT, CustomBuildFailed, failure_step_detail
+
+    stale = RuntimeError("Docker SDK create container failed: SSH session not active (host 10.0.0.9)")
+    # volume steps: the raw daemon text, hinted
+    assert failure_step_detail(stale, "volume_creation").startswith(STALE_SDK_TRANSPORT_HINT)
+    assert "SSH session not active" in failure_step_detail(stale, "volume_creation")
+    assert failure_step_detail(RuntimeError("no space left on device"), "volume_sizing") == "no space left on device"
+    # any other step: the hint alone for a dead transport, nothing of the raw text
+    assert failure_step_detail(stale, "docker_run") == STALE_SDK_TRANSPORT_HINT
+    assert failure_step_detail(stale, "container_health_check") == STALE_SDK_TRANSPORT_HINT
+    assert failure_step_detail(stale, None) == STALE_SDK_TRANSPORT_HINT
+    # any other step with any other text: None
+    assert failure_step_detail(RuntimeError("image not found"), "docker_run") is None
+    assert failure_step_detail(RuntimeError(""), "docker_run") is None
+    # a failed custom build: its text is the renter's build output, which may say anything
+    assert failure_step_detail(CustomBuildFailed("docker_build", "Socket is closed"), "docker_build") is None
+
+
+@pytest.mark.asyncio
 async def test_A17_build_command_puts_the_output_tail_on_stderr(svc, monkeypatch):
     """The build runs through `execute_and_stream_logs`, which returns stderr only. So the
     command run inside DinD must tee the build output to a file outside the build context and,
