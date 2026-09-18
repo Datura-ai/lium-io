@@ -36,14 +36,15 @@ def _make_ssh_mock(containers: list[str], ages_by_name: dict[str, int], current_
         # current time on host
         if cmd.strip() == "date +%s":
             return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
-        # docker inspect --format '{{json .Created}}' | xargs -I {} date -d {} +%s
+        # docker inspect … Created / StartedAt through `date +%s`, then the lium.warm_pool label
+        # (DAH-3265): a never-started container prints docker's zero time; none of these was a slot
         if "docker inspect" in cmd and "Created" in cmd:
             # match which container
             for name in ages_by_name:
                 if name in cmd:
                     age_min = ages_by_name[name]
                     created_ts = current_ts - int(age_min * 60)
-                    return MagicMock(exit_status=0, stdout=str(created_ts), stderr="")
+                    return MagicMock(exit_status=0, stdout=f"{created_ts}\n-62135596800\n\n", stderr="")
             return MagicMock(exit_status=1, stdout="", stderr="not found")
         # docker rm -f / docker rm -fv
         if "docker rm -f" in cmd:
@@ -187,6 +188,7 @@ async def test_cleanup_filter_includes_all_rental_prefixes():
     assert "filler_*" in ps_cmd
     assert "container_*" in ps_cmd
     assert "health_check_*" in ps_cmd
+    assert "warm_*" in ps_cmd  # DAH-3265: a warm-pool slot left behind with the flag off
 
 
 @pytest.mark.asyncio
@@ -478,7 +480,10 @@ def _make_unkillable_ssh_mock(name: str, rm_failures: int, current_ts: int = 1_0
         if cmd.strip() == "date +%s":
             return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
         if "docker inspect" in cmd and "Created" in cmd:
-            return MagicMock(exit_status=0, stdout=str(current_ts - 120 * 60), stderr="")
+            # Created / StartedAt / lium.warm_pool label, as inspect_created_timestamp prints them
+            # (DAH-3265): an orphan pod started once and was never a slot
+            created_ts = current_ts - 120 * 60
+            return MagicMock(exit_status=0, stdout=f"{created_ts}\n{created_ts + 5}\n\n", stderr="")
         if "docker rm -f" in cmd:
             if state["rm_left"] > 0:
                 state["rm_left"] -= 1
