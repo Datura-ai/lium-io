@@ -86,7 +86,7 @@ def test_customer_rental_never_gets_the_self_ending_policy(docker_service):
     assert run_spec.restart_policy == "unless-stopped"
 
 
-def test_a_backend_that_sends_neither_field_changes_nothing():
+def test_a_backend_that_sends_no_workload_kind_and_no_self_ending_changes_nothing():
     # An old backend sends no workload_kind and no self_ending: the defaults are CUSTOMER_RENTAL and
     # False, so nothing it launches becomes a self-ending filler.
     payload = _payload()
