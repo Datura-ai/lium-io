@@ -921,6 +921,11 @@
           "default": null,
           "title": "Restore Path"
         },
+        "self_ending": {
+          "default": false,
+          "title": "Self Ending",
+          "type": "boolean"
+        },
         "ships_sshd": {
           "anyOf": [
             {

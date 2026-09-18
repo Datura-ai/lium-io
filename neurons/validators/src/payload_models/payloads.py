@@ -382,6 +382,12 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
     # drops it on deserialization of the backend's request.
     cache_volumes: list[CacheVolume] | None = None
+    # DAH-3475: the image ends its own run (exits 0 when it has nothing to serve, non-zero on a
+    # shutdown SIGTERM), and the backend has a cap-specific backoff for the run that ended. Only a
+    # FILLER with this set runs under `restart: on-failure` (docker_service.SELF_ENDING_FILLER_RESTART_POLICY);
+    # every other container keeps `unless-stopped`. A backend that does not send it — every backend
+    # today — changes nothing. MUST be declared here or pydantic drops it on deserialization.
+    self_ending: bool = False
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):

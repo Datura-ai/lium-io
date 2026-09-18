@@ -994,24 +994,10 @@ def _binds(volumes: tuple[VolumeMount, ...]) -> list[str]:
     ]
 
 
-def _restart_policy(policy: str | None) -> dict[str, str | int] | None:
-    """Docker's `--restart` syntax to the HostConfig shape: `on-failure:5` carries a retry cap.
-
-    The daemon counts every restart it makes and zeroes the count only at daemon start or on a
-    manual `docker start`, so `on-failure:N` is a budget of N restarts between those, not a burst
-    limit; `on-failure:0` is Docker's own "no limit", the same as a bare `on-failure`. Only
-    `on-failure` accepts a count, exactly as the docker CLI refuses `unless-stopped:3`.
-    """
+def _restart_policy(policy: str | None) -> dict[str, str] | None:
     if not policy:
         return None
-    name, separator, count = policy.partition(":")
-    if not separator:
-        return {"Name": name}
-    if name != "on-failure":
-        raise ValueError(f"a restart retry count is only valid with on-failure, not {name!r}")
-    if not count.isdigit():
-        raise ValueError(f"restart retry count must be a non-negative integer, got {count!r}")
-    return {"Name": name, "MaximumRetryCount": int(count)}
+    return {"Name": policy}
 
 
 def _devices(devices: tuple[DeviceMount, ...]) -> list[str]:
