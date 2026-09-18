@@ -29,15 +29,9 @@ DEFAULT_PRICE = DefaultPrice()
 # carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
 # the pinned lium-core still has 5.10).
 #
-# DAH-3623: the idle rate of a model is pinned AT the median price renters paid for it over the
-# trailing 30 days, rounded down to the cent (owner, 17 Sep 2026: "idle pay should never be higher
-# than rental rates"; 21:41Z: "pin means raise too"; Rustam, 18 Sep 2026 06:20Z on #1401: a 7-day
-# window is too unstable, use 30 days; owner, 18 Sep 2026 09:14Z: "pin the idle to median now", the
-# earlier 0.8 factor is gone). Four models in the lium-core table paid idle above the median, one on
-# it, seven under it; all twelve are pinned to their 30-day paid median. A second cap at the model's
-# base price (lium-core `machine_prices`) was tried and withdrawn on the owner's word (18 Sep 08:53Z:
-# "no don't do that"); the base listing prices themselves move to the median under P186 instead.
-# The fixture in tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
+# DAH-3623: a model's idle rate is pinned AT the median price renters paid for it over the trailing
+# 30 days, rounded down to the cent; the paid median is the only cap. The fixture in
+# tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[

@@ -65,16 +65,24 @@ PAID_MEDIAN_30D: dict[str, PaidMedian] = {
 }
 
 # Models that can receive idle pay but have no fixture row. The 30-day read (2026-09-18 08:06Z, prod
-# replica, read-only; query and output in the loop's private folder, on request) found: H100 NVL and RTX 4090 D with zero rentals
-# and zero idle pay; H200 NVL with 20 rentals (median 3.90, rate 2.90, under the median) and L40 with
-# 169 rentals (median 0.33, rate 0.36, 14 idle-pay ledger rows in 14 days) left for Rustam's call on
-# #1401, outside DAH-3623's twelve. A model added here without a reason in this comment is a mistake.
-OUTSIDE_THE_FIXTURE: tuple[str, ...] = (
+# replica, read-only; query and output in the loop's private folder, on request) found: H100 NVL and
+# RTX 4090 D with zero rentals and zero idle pay; H200 NVL with 20 rentals (median 3.90, rate 2.90,
+# under the median, outside DAH-3623's twelve). A model added here without a reason in this comment
+# is a mistake.
+IDLE_ELIGIBLE_MODELS_WITHOUT_A_MEDIAN_ROW: tuple[str, ...] = (
     "NVIDIA H200 NVL",
     "NVIDIA H100 NVL",
     "NVIDIA GeForce RTX 4090 D",
-    "NVIDIA L40",
 )
+
+# The recorded exception: idle-eligible models whose rate sits ABOVE their 30-day paid median and are
+# not pinned by DAH-3623 (outside the twelve the ticket names). L40: 169 rentals, median 0.33, rate
+# 0.36, 14 idle-pay ledger rows in 14 days, about 0.1 USD/day of idle pay over the median. Pinning it
+# is Rustam's call on #1401; the day it is pinned the row moves to PAID_MEDIAN_30D + PINNED_AT_CAP and
+# leaves this dict, or the test below fails.
+ABOVE_THE_MEDIAN_NOT_YET_PINNED: dict[str, PaidMedian] = {
+    "NVIDIA L40": PaidMedian(median_usd_per_gpu_hour=0.33, rentals=169),
+}
 
 # Fixture models that are NOT pinned to their median and sit under it by an earlier decision (module
 # docstring): B300 6.40 (DAH-3542) and the two RTX PRO 6000 editions at Workstation parity 1.00 (DAH-3230).
@@ -112,13 +120,23 @@ def _cap_usd_per_gpu_hour(gpu_model: str) -> float:
     return CAP_SHARE_OF_PAID_MEDIAN * row.median_usd_per_gpu_hour
 
 
-def _idle_rates_for_1_and_8_gpus(gpu_model: str) -> list[float]:
+def _configured_gpu_counts(gpu_model: str, config: IncentiveConfig) -> list[int]:
+    """The GPU counts the model's price config names (its own entry, else the "*" fallback), so an
+    override added at another count is checked too; "*" itself is a count of 0 and is skipped."""
+    gpu_config = config.gpu_count_custom_prices.get(gpu_model) or config.gpu_count_custom_prices["*"]
+    counts = sorted(int(count) for count in gpu_config if count != "*")
+    assert counts, f"{gpu_model}: no GPU count in gpu_count_custom_prices"
+    return counts
+
+
+def _idle_rates_per_configured_gpu_count(gpu_model: str) -> list[float]:
+    """One rate per GPU count the model's price config names (1 and 8 today)."""
     config = IncentiveConfig()
     return [
         get_hourly_rate(
             gpu_model, gpu_count, config.gpu_count_custom_prices, config.rental_prices_per_hour
         )
-        for gpu_count in (1, 8)
+        for gpu_count in _configured_gpu_counts(gpu_model, config)
     ]
 
 
@@ -128,7 +146,7 @@ def _models_that_can_receive_idle_pay() -> list[str]:
         gpu_model
         for gpu_model, base_model in BASE_GPU_MAP.items()
         if any(cap > 0 for cap in MAX_UNRENTED_GPUS_BY_TYPE[base_model].values())
-        and all(rate > 0 for rate in _idle_rates_for_1_and_8_gpus(gpu_model))
+        and all(rate > 0 for rate in _idle_rates_per_configured_gpu_count(gpu_model))
     )
 
 
@@ -140,7 +158,7 @@ def test_idle_rate_is_at_most_the_paid_median(gpu_model: str) -> None:
     under their median."""
     cap = _cap_usd_per_gpu_hour(gpu_model)
 
-    for rate in _idle_rates_for_1_and_8_gpus(gpu_model):
+    for rate in _idle_rates_per_configured_gpu_count(gpu_model):
         assert rate <= cap + 1e-9, (
             f"{gpu_model}: idle rate {rate} USD/GPU-h is above the cap {cap:.4f} "
             f"= {CAP_SHARE_OF_PAID_MEDIAN} x paid median {PAID_MEDIAN_30D[gpu_model].median_usd_per_gpu_hour} "
@@ -157,8 +175,9 @@ def test_dah_3623_pins_sit_exactly_on_the_paid_median_rounded_down_to_the_cent(g
     legal, off the pin is not): H200 2.85 for 3.25, RTX 3090 0.16 for 0.18, RTX 4090 0.30 for 0.32,
     L40S 0.35 for 0.38, B200 4.25 for 5.60, RTX A6000 0.32 for 0.42, H100 PCIe 1.1988 for 1.50."""
     expected = math.floor(_cap_usd_per_gpu_hour(gpu_model) * 100 + 1e-9) / 100
+    rates = _idle_rates_per_configured_gpu_count(gpu_model)
 
-    assert _idle_rates_for_1_and_8_gpus(gpu_model) == [expected, expected]
+    assert rates == [expected] * len(rates), (gpu_model, rates, expected)
 
 
 @pytest.mark.parametrize("gpu_model", NOT_PINNED_UNDER_THE_MEDIAN)
@@ -169,7 +188,7 @@ def test_unpinned_fixture_models_sit_under_their_median_by_an_earlier_decision(g
     assert gpu_model not in PINNED_AT_CAP, f"{gpu_model} is pinned; drop it from this tuple"
     cap = _cap_usd_per_gpu_hour(gpu_model)
 
-    for rate in _idle_rates_for_1_and_8_gpus(gpu_model):
+    for rate in _idle_rates_per_configured_gpu_count(gpu_model):
         assert rate < cap - 1e-9, (
             f"{gpu_model}: idle rate {rate} USD/GPU-h is at or above its median {cap:.4f}; pin it or re-decide"
         )
@@ -192,21 +211,40 @@ def test_fixture_names_only_models_that_can_receive_idle_pay() -> None:
     for gpu_model in PAID_MEDIAN_30D:
         base_model = BASE_GPU_MAP[gpu_model]
         assert any(cap > 0 for cap in MAX_UNRENTED_GPUS_BY_TYPE[base_model].values()), gpu_model
-        assert all(rate > 0 for rate in _idle_rates_for_1_and_8_gpus(gpu_model)), gpu_model
+        assert all(rate > 0 for rate in _idle_rates_per_configured_gpu_count(gpu_model)), gpu_model
 
 
 def test_every_model_that_can_receive_idle_pay_is_in_the_fixture_or_named_outside_it() -> None:
     """The inverse of test_fixture_names_only_models_that_can_receive_idle_pay (Rustam's review, 18 Sep
-    2026 08:00Z): a model that takes idle pay and is
-    missing from the fixture is never cap-checked. Fails when such a model appears (a new entry in
-    BASE_GPU_MAP with a positive bucket cap), when the exclusion tuple names a model that cannot take
-    idle pay, or when an excluded model gains a fixture row and the tuple is not trimmed. With the
-    tuple emptied, the four models it names fail here."""
+    2026 08:00Z): a model that takes idle pay and is missing from the fixture is never cap-checked.
+    Fails when such a model appears (a new entry in BASE_GPU_MAP with a positive bucket cap), when
+    either exclusion names a model that cannot take idle pay, when a model is named in both, or when
+    an excluded model gains a fixture row and the exclusion is not trimmed. With both exclusions
+    emptied, the four models they name fail here."""
     can_receive = set(_models_that_can_receive_idle_pay())
-    outside = set(OUTSIDE_THE_FIXTURE)
+    without_row = set(IDLE_ELIGIBLE_MODELS_WITHOUT_A_MEDIAN_ROW)
+    above = set(ABOVE_THE_MEDIAN_NOT_YET_PINNED)
+    outside = without_row | above
 
+    assert not (without_row & above), sorted(without_row & above)
     assert outside <= can_receive, sorted(outside - can_receive)
     assert not (outside & set(PAID_MEDIAN_30D)), sorted(outside & set(PAID_MEDIAN_30D))
     assert can_receive - set(PAID_MEDIAN_30D) == outside, sorted(
         (can_receive - set(PAID_MEDIAN_30D)) ^ outside
     )
+
+
+@pytest.mark.parametrize("gpu_model", sorted(ABOVE_THE_MEDIAN_NOT_YET_PINNED))
+def test_recorded_exception_still_sits_above_its_median(gpu_model: str) -> None:
+    """The recorded exception is checked, not waived (Rustam's review, 18 Sep 2026 11:24Z): L40 is paid
+    idle at 0.36 against a 0.33 median on 169 rentals and is not one of DAH-3623's twelve. Fails the
+    day the rate is pinned (then the row belongs in PAID_MEDIAN_30D and PINNED_AT_CAP) or the median
+    read moves above the rate (then the exception is gone and the row leaves this dict)."""
+    row = ABOVE_THE_MEDIAN_NOT_YET_PINNED[gpu_model]
+    assert row.rentals >= MIN_RENTALS_FOR_A_MEDIAN, gpu_model
+
+    for rate in _idle_rates_per_configured_gpu_count(gpu_model):
+        assert rate > row.median_usd_per_gpu_hour + 1e-9, (
+            f"{gpu_model}: idle rate {rate} is no longer above its median {row.median_usd_per_gpu_hour}; "
+            "pin it or drop the exception"
+        )
