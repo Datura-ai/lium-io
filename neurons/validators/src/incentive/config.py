@@ -52,16 +52,16 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
 # `{1: 10, 8: 64}` — 10 single-GPU machines (10 GPUs) and 8 full chassis (8×8 = 64
 # GPUs), matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
 #
-# B300 1× bucket = 5 (DAH-3601, P157/P164, 17 Sep 2026): renters held at most 6 single
-# B300 cards at once over 3–17 Sep (p95 = 5) while 17 were listed and 12 sat idle,
-# so the bucket pays for demand p95 cards (Fish, 14:40Z: 7 "would be lower"). The
+# B300 1× bucket = 4 (DAH-3601, P157/P164, 17 Sep 2026): renters held at most 6 single
+# B300 cards at once over 3–17 Sep (p95 = 5) while 17 were listed and 12 sat idle.
+# The bucket pays for 4 cards, one below that p95 (Rustam, 18 Sep 2026). The
 # 8× bucket is unchanged. The 1× cap also dilutes the free GPUs of partially rented
 # split 8× nodes: their free portion is scored as a virtual result (DAH-2467) that is
 # always rated at the node's `gpu_splitting_min_count` tier (`_resolve_bucket`: a
 # remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
-# those cards share the 5 with the idle single-card nodes.
+# those cards share the 4 with the idle single-card nodes.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
-    "B300": {1: 5, 8: 32},
+    "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},
     "H200": {1: 10, 8: 64},
     "H100": {1: 10, 8: 64},
