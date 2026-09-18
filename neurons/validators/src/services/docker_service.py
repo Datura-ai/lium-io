@@ -170,6 +170,27 @@ CONTAINER_STOP_GRACE_SECONDS = 30
 # and avoid the containerd/sysbox wedge. Keep in sync with compute-app FILLER_STOP_WAIT_TIMEOUT_SECONDS.
 FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
 
+# Every container comes back after any exit, a host reboot included, until the renter or the
+# backend stops it (DAH-2306 repairs the one reboot case dockerd cannot restart on its own). This
+# is also what a filler gets unless the backend marks its job spec `self_ending`.
+DEFAULT_RESTART_POLICY = "unless-stopped"
+# DAH-3475: a filler whose image ends its own run when it has nothing to serve. Under
+# `unless-stopped` dockerd restarts that exit at once with fresh counters (the Dolphin spawn-state
+# file is the container's own /tmp), so the validator never sees a stopped container and the
+# backend's missing-container close never fires. `on-failure` restarts every non-zero exit — a
+# crash, an OOM kill, a SIGTERM the image dies on — and leaves a zero exit `exited` for
+# `rental_verification` to report. No retry cap: PEARL's PID 1 re-exits its child's code
+# (pearl-miner/entrypoint.sh), so 143 can come from inside the container, and a capped policy would
+# leave it `exited` with 143 after the cap, which `_was_deliberately_stopped_on_the_host` reads as a
+# host stop. A crash loop is the backend's self-heal ladder's job (DAH-2419), not the restart count's.
+# The backend sets `self_ending` on a job spec only when all three hold for that image: it exits 0
+# at its cap, its shutdown-SIGTERM exit is non-zero (a zero exit stays down after a host reboot:
+# the Dolphin `on_term` trap exits 0 today), and the backend has a cap-specific strategy backoff
+# for the self-ended run (lium-platform's `close_run_with_missing_container` writes STOPPED, not a
+# launch strike, so without one the node is refilled with the same strategy next cycle). Neither
+# image nor backend does yet, so no job spec carries the flag and this constant is unused in prod.
+SELF_ENDING_FILLER_RESTART_POLICY = "on-failure"
+
 # In-container port the cache-template images' start.sh hardcodes for Jupyter
 # (`jupyter lab --port=8888`). It reads no port from the environment, so the
 # image-managed Jupyter path is only safe while the mapped docker port is this one.
@@ -768,6 +789,15 @@ def _validate_cache_volume(cache_volume: CacheVolume) -> None:
         raise ValueError(f"Unsafe cache volume target: {target!r}")
 
 
+def _restart_policy_for(payload: ContainerCreateRequest) -> str:
+    # The self-ending policy needs the explicit capability on the job spec, not the FILLER class:
+    # FILLER also covers provider-owned jobs and ENGY, whose images have no exit contract. A
+    # customer's pod keeps coming back whatever the flag says.
+    if payload.workload_kind == WorkloadKind.FILLER and payload.self_ending:
+        return SELF_ENDING_FILLER_RESTART_POLICY
+    return DEFAULT_RESTART_POLICY
+
+
 def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets: set[str]) -> list[VolumeMount]:
     # Persistent named cache volumes for a FILLER container (DPHN model/runtime cache). Empty for any
     # non-FILLER workload even when the field is set — a customer rental must never receive these
@@ -1298,7 +1328,7 @@ class DockerService:
             environment=environment,
             ports=_published_ports(port_maps, cluster_udp_ports),
             volumes=tuple(volumes),
-            restart_policy="unless-stopped",
+            restart_policy=_restart_policy_for(payload),
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},

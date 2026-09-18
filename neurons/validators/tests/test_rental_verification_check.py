@@ -1290,11 +1290,32 @@ async def test_filler_that_exited_on_the_host_is_not_a_kill():
 
 
 @pytest.mark.asyncio
+async def test_filler_that_ended_its_own_run_is_reported_and_not_a_kill():
+    """DAH-3475 cap exit: a self-ending image exits 0 when it has nothing to serve, and `on-failure`
+    leaves the container in `exited`. The backend must get the container_missing evidence so its
+    reconciler closes the run, and the provider gets no penalty: the job ended itself, the host
+    removed nothing. Under `unless-stopped` dockerd restarts it with fresh counters and this path is
+    never reached."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=0)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_CONTAINER_EXITED.reason
+    assert result.event.what_we_saw["container_exit_code"] == 0
+    assert backend_client.filler_run_container_missing_flags == [True]
+
+
+@pytest.mark.asyncio
 async def test_filler_terminated_by_a_signal_is_a_kill():
-    """Exit 143 = SIGTERM, i.e. `docker stop`. Fillers carry `restart: unless-stopped`, so a
-    container that is still exited was stopped deliberately — the restart policy would have brought
-    back anything else. Prod: all 4 such runs in 7 days came from the one host with a container
-    auto-killer."""
+    """Exit 143 = SIGTERM, i.e. `docker stop` of an image that dies on the signal. Fillers carry
+    `restart: unless-stopped` (or `on-failure`, uncapped, when self-ending), so a container that is
+    still exited was stopped deliberately (a stop cancels the restart) — the policy would have
+    brought back anything else, a 143 from inside the container included. An image that traps
+    SIGTERM and exits 0 (Dolphin's on_term) lands in the exited-on-its-own path instead. Prod: all 4
+    such runs in 7 days came from the one host with a container auto-killer."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(running=False, removed_from_host=False, exit_code=143)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
@@ -1393,8 +1414,8 @@ async def test_exited_bundle_outranks_a_healthy_sibling_on_a_split_node():
 
 @pytest.mark.asyncio
 async def test_container_running_again_by_the_time_we_inspect_is_not_a_death():
-    """Filler containers run with `restart: unless-stopped`, so docker can bring one back
-    between the ps probe and the inspect. A running container is not an exit and not a kill."""
+    """A filler's restart policy lets docker bring a crashed one back between the ps probe and the
+    inspect. A running container is not an exit and not a kill."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(running=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)

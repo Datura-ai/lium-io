@@ -168,6 +168,9 @@ class ContainerCreateRequest(ContainerRequest):
     ships_sshd: bool | None = None
     gpu_power_limits: list[GpuPowerLimit] | None = None
     cache_volumes: list[CacheVolume] | None = None
+    # DAH-3475: a FILLER whose image ends its own run (exit 0 at its cap, non-zero on a shutdown
+    # SIGTERM) runs under `restart: on-failure`; unset, or on a customer rental, `unless-stopped`
+    self_ending: bool = False
 
 
 @BACKEND_MESSAGES.register
