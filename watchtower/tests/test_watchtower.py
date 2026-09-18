@@ -4,7 +4,7 @@ Tests for watchtower.py - Docker image monitoring and update service.
 
 import time
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import DEFAULT, Mock, patch
 import docker
 import requests
 
@@ -28,8 +28,10 @@ from watchtower import (
     recreate_container,
     check_and_update,
     classify_runtime_probe_error,
-    nvidia_runtime_ready,
+    probe_nvidia_runtime,
     RUNTIME_PROBE_FAILED,
+    RUNTIME_PROBE_LABEL,
+    RUNTIME_PROBE_LABEL_KEY,
     RUNTIME_PROBE_NVIDIA_MISMATCH,
 )
 from models import WatchtowerDigestResponse
@@ -329,7 +331,7 @@ def _fake_container(name="executor-executor-runner-1", cmd=None, entrypoint=None
     return container
 
 
-def _client_with(container, old_image=None, pulled_image=None):
+def _client_with(container, old_image=None, pulled_image=None, stale_probes=()):
     client = Mock()
     client.images.get.return_value = old_image or _fake_image(OLD_DIGEST)
     client.images.pull.return_value = pulled_image or _fake_image(NEW_DIGEST)
@@ -343,6 +345,16 @@ def _client_with(container, old_image=None, pulled_image=None):
 
     client.containers.get.side_effect = containers_get
     client.containers.list.return_value = [container] if container else []
+    # the probe's own listing (B-176, stale probes by label) answers `client.stale_probes`; every
+    # other listing keeps `return_value`, which the runner-lookup tests set per case
+    client.stale_probes = list(stale_probes)
+
+    def containers_list(all=False, filters=None):
+        if (filters or {}).get("label") == RUNTIME_PROBE_LABEL:
+            return list(client.stale_probes)
+        return DEFAULT
+
+    client.containers.list.side_effect = containers_list
     # the runtime probe container (B-176): starts and exits 0 unless a test says otherwise
     client.containers.create.return_value.wait.return_value = {"StatusCode": 0}
     client.api.create_container.return_value = {"Id": "newid"}
@@ -878,29 +890,47 @@ def test_classify_runtime_probe_error_names_the_driver_library_mismatch():
     assert classify_runtime_probe_error("500 Server Error: no such image") == RUNTIME_PROBE_FAILED
 
 
-def test_nvidia_runtime_ready_requests_every_gpu_and_removes_the_probe_container():
+@pytest.mark.parametrize("nvml_error", [
+    # persistence daemon stopped / device node gone: NVML initialises and fails, no version disagreement
+    "nvidia-container-cli: initialization error: nvml error: unknown error: unknown",
+    # the container toolkit cannot find the driver library at all: a toolkit or driver install problem
+    "nvidia-container-cli: initialization error: load library failed: libnvidia-ml.so.1: cannot open shared object file",
+    "nvidia-container-cli: initialization error: nvml error: driver not loaded: unknown",
+])
+def test_classify_runtime_probe_error_keeps_other_nvml_failures_generic(nvml_error):
+    """Regression (taiberium, #1369): `initialization error` and `nvml error` alone matched every
+    NVML start failure, so a stopped persistence daemon or a missing `libnvidia-ml.so.1` was
+    logged as `NVIDIA_RUNTIME_MISMATCH` and the doc sent the provider to reboot. Only the
+    phrase NVML prints for the version disagreement is the mismatch."""
+    prefix = "500 Server Error: Internal Server Error (\"failed to create task for container: "
+    assert classify_runtime_probe_error(prefix + nvml_error + "\")") == RUNTIME_PROBE_FAILED
+
+
+def test_probe_nvidia_runtime_requests_every_gpu_and_removes_the_probe_container():
     """The probe asks the daemon for all GPUs with entrypoint `true` from the runner's own image
-    (no pull), reads exit 0 as ready, and removes the container."""
+    (no pull), labels the container so a leftover is found again, reads exit 0 as ready, and
+    removes the container."""
     client = _client_with(_fake_container())
 
-    probe = nvidia_runtime_ready(client, "sha256:oldimageid")
+    probe = probe_nvidia_runtime(client, "sha256:oldimageid")
 
     assert probe.ok is True and probe.reason_code is None
     kwargs = client.containers.create.call_args.kwargs
     assert client.containers.create.call_args.args[0] == "sha256:oldimageid"
     assert kwargs["entrypoint"] == ["true"]
+    assert kwargs["labels"] == {RUNTIME_PROBE_LABEL_KEY: "nvidia-runtime"}
     assert kwargs["device_requests"][0]["Count"] == -1
     assert kwargs["device_requests"][0]["Capabilities"] == [["gpu"]]
     client.containers.create.return_value.remove.assert_called_once_with(force=True)
 
 
-def test_nvidia_runtime_ready_reads_a_failed_start_as_the_mismatch_and_still_removes_the_container():
+def test_probe_nvidia_runtime_reads_a_failed_start_as_the_mismatch_and_still_removes_the_container():
     """Regression: on the ticket-0325 host `docker run --gpus all` fails in the NVIDIA prestart
     hook. The probe reports the mismatch code with the daemon's text and cleans up."""
     client = _client_with(_fake_container())
     client.containers.create.return_value.start.side_effect = docker.errors.APIError(NVML_MISMATCH)
 
-    probe = nvidia_runtime_ready(client, "sha256:oldimageid")
+    probe = probe_nvidia_runtime(client, "sha256:oldimageid")
 
     assert probe.ok is False
     assert probe.reason_code == RUNTIME_PROBE_NVIDIA_MISMATCH
@@ -908,26 +938,143 @@ def test_nvidia_runtime_ready_reads_a_failed_start_as_the_mismatch_and_still_rem
     client.containers.create.return_value.remove.assert_called_once_with(force=True)
 
 
-def test_nvidia_runtime_ready_reads_a_nonzero_exit_as_not_ready():
+def test_probe_nvidia_runtime_reads_a_nonzero_exit_as_not_ready():
     client = _client_with(_fake_container())
     client.containers.create.return_value.wait.return_value = {"StatusCode": 125}
 
-    probe = nvidia_runtime_ready(client, "sha256:oldimageid")
+    probe = probe_nvidia_runtime(client, "sha256:oldimageid")
 
     assert probe.ok is False and probe.reason_code == RUNTIME_PROBE_FAILED
 
 
-def test_nvidia_runtime_ready_reads_a_hung_probe_as_not_ready_and_removes_it():
+def test_probe_nvidia_runtime_reads_a_hung_probe_as_not_ready_and_removes_it():
     """A container that never exits (a wedged hook) hits `wait`'s timeout: not ready, generic
     code, and the container is still force-removed."""
     client = _client_with(_fake_container())
     client.containers.create.return_value.wait.side_effect = requests.exceptions.ReadTimeout("wait timed out")
 
-    probe = nvidia_runtime_ready(client, "sha256:oldimageid")
+    probe = probe_nvidia_runtime(client, "sha256:oldimageid")
 
     assert probe.ok is False and probe.reason_code == RUNTIME_PROBE_FAILED
     assert "timed out" in probe.error
     client.containers.create.return_value.remove.assert_called_once_with(force=True)
+
+
+def _stale_probe(short_id):
+    leftover = Mock()
+    leftover.short_id, leftover.status = short_id, "exited"
+    return leftover
+
+
+def test_probe_nvidia_runtime_removes_labelled_stale_probes_before_creating_one():
+    """Regression (taiberium, #1369): a probe whose `remove` failed stayed on the host, and every
+    held cycle created another one beside it. The probe lists the containers that carry its
+    label, every state included, removes each with force, and only then creates its own."""
+    first, second = _stale_probe("stale1"), _stale_probe("stale2")
+    client = _client_with(_fake_container(), stale_probes=[first, second])
+
+    probe = probe_nvidia_runtime(client, "sha256:oldimageid")
+
+    assert probe.ok is True
+    assert client.containers.list.call_args_list[0].kwargs == {"all": True, "filters": {"label": RUNTIME_PROBE_LABEL}}
+    first.remove.assert_called_once_with(force=True)
+    second.remove.assert_called_once_with(force=True)
+    client.containers.create.assert_called_once()
+
+
+def test_probe_nvidia_runtime_aborts_when_a_stale_probe_cannot_be_removed():
+    """A leftover the daemon will not remove is a failed probe with no new container: creating
+    one more on top of it is what the cleanup exists to stop. The hold names the leftover."""
+    stuck = _stale_probe("stuck1")
+    stuck.remove.side_effect = docker.errors.APIError("removal of container stuck1 is already in progress")
+    client = _client_with(_fake_container(), stale_probes=[stuck])
+
+    probe = probe_nvidia_runtime(client, "sha256:oldimageid")
+
+    assert probe.ok is False and probe.reason_code == RUNTIME_PROBE_FAILED
+    assert "stale runtime probe container not removed" in probe.error
+    assert "stuck1" in probe.error
+    client.containers.create.assert_not_called()
+
+
+def test_probe_nvidia_runtime_aborts_when_the_stale_probe_listing_fails():
+    """Cannot list means cannot know what is left over: no new container, a failed probe."""
+    client = _client_with(_fake_container())
+    client.containers.list.side_effect = docker.errors.APIError("daemon busy")
+
+    probe = probe_nvidia_runtime(client, "sha256:oldimageid")
+
+    assert probe.ok is False and probe.reason_code == RUNTIME_PROBE_FAILED
+    client.containers.create.assert_not_called()
+
+
+@patch('watchtower.logger')
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_removes_the_probe_container_a_held_cycle_left_behind(
+    mock_settings, mock_docker, mock_fetch, mock_pull, mock_logger
+):
+    """Regression (taiberium, #1369): two held cycles on a host whose daemon refused the first
+    probe's `remove`. Before, the second cycle created a second probe container beside the
+    first and the host gained one per cycle. Now the second cycle finds the first by its label,
+    removes it, and only then runs its own probe: one container on the host at any time."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    mock_settings.WATCHTOWER_INTERVAL = 300
+    client = _client_with(_fake_container())
+    probe_container = client.containers.create.return_value
+    probe_container.short_id, probe_container.status = "probe1", "created"
+    probe_container.start.side_effect = docker.errors.APIError(NVML_MISMATCH)
+    probe_container.remove.side_effect = [docker.errors.APIError("device or resource busy"), None, None]
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
+
+    check_and_update()
+    assert client.containers.create.call_count == 1
+    assert probe_container.remove.call_count == 1
+
+    client.stale_probes = [probe_container]  # the daemon now lists the leftover under the label
+    check_and_update()
+
+    assert client.containers.create.call_count == 2
+    assert probe_container.remove.call_count == 3  # the stale removal, then the second probe's own
+    mock_pull.assert_not_called()
+    held = [str(c.args[0]) for c in mock_logger.warning.call_args_list if "Update held" in str(c.args[0])]
+    assert len(held) == 2
+    stale = [str(c.args[0]) for c in mock_logger.warning.call_args_list if "stale runtime probe" in str(c.args[0])]
+    assert len(stale) == 1 and "probe1" in stale[0]
+
+
+@patch('watchtower.logger')
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_holds_an_unrelated_nvml_error_without_the_mismatch_remedy(
+    mock_settings, mock_docker, mock_fetch, mock_pull, mock_logger
+):
+    """Regression (taiberium, #1369): a host whose NVML fails for another reason (persistence
+    daemon down) is held, but the log says `RUNTIME_PROBE_FAILED` with the daemon's text, not
+    `NVIDIA_RUNTIME_MISMATCH`, so the doc does not send the provider to reboot."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    mock_settings.WATCHTOWER_INTERVAL = 300
+    client = _client_with(_fake_container())
+    client.containers.create.return_value.start.side_effect = docker.errors.APIError(
+        "500 Server Error: Internal Server Error (\"failed to create task for container: "
+        "nvidia-container-cli: initialization error: nvml error: unknown error: unknown\")"
+    )
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
+
+    check_and_update()
+
+    mock_pull.assert_not_called()
+    held = [str(c.args[0]) for c in mock_logger.warning.call_args_list if "Update held" in str(c.args[0])]
+    assert len(held) == 1
+    assert RUNTIME_PROBE_FAILED in held[0]
+    assert RUNTIME_PROBE_NVIDIA_MISMATCH not in held[0]
+    assert "nvml error: unknown error" in held[0]
 
 
 @patch('watchtower.logger')
@@ -1007,7 +1154,7 @@ def test_check_and_update_resumes_once_the_nvidia_runtime_probe_passes(
     mock_pull.assert_called_once_with(client, IMAGE, NEW_DIGEST)
 
 
-@patch('watchtower.nvidia_runtime_ready')
+@patch('watchtower.probe_nvidia_runtime')
 @patch('watchtower.pull_and_restart_containers')
 @patch('watchtower.fetch_verified_digest')
 @patch('watchtower.docker.from_env')

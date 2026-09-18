@@ -33,12 +33,16 @@ CANONICAL_REGISTRY_HOST = "registry-1.docker.io"
 # container exits 0, or the daemon reports why it could not start.
 RUNTIME_PROBE_NVIDIA_MISMATCH = "NVIDIA_RUNTIME_MISMATCH"
 RUNTIME_PROBE_FAILED = "RUNTIME_PROBE_FAILED"
-_NVIDIA_MISMATCH_MARKERS = (
-    "driver/library version mismatch",
-    "nvidia-container-cli: initialization error",
-    "nvml error",
-)
+# The one phrase NVML prints for a driver package updated without a reboot. `initialization
+# error` and `nvml error` alone also cover a missing device node, a stopped persistence daemon
+# or a wrong container-toolkit install, whose remedy is not a reboot; those stay RUNTIME_PROBE_FAILED.
+_NVIDIA_MISMATCH_MARKER = "driver/library version mismatch"
 RUNTIME_PROBE_TIMEOUT_SECONDS = 60
+# Every probe container carries this label. A probe whose removal failed (daemon busy, the
+# process killed mid-probe) is found by it at the next probe and removed first, so a held host
+# never accumulates one exited container per cycle.
+RUNTIME_PROBE_LABEL_KEY = "io.lium.watchtower.probe"
+RUNTIME_PROBE_LABEL = f"{RUNTIME_PROBE_LABEL_KEY}=nvidia-runtime"
 
 
 class DigestMismatchError(Exception):
@@ -504,27 +508,48 @@ class RuntimeProbe(NamedTuple):
 
 def classify_runtime_probe_error(error: str) -> str:
     """`NVIDIA_RUNTIME_MISMATCH` for the driver/library disagreement, else `RUNTIME_PROBE_FAILED`."""
-    text = error.lower()
-    if any(marker in text for marker in _NVIDIA_MISMATCH_MARKERS):
+    if _NVIDIA_MISMATCH_MARKER in error.lower():
         return RUNTIME_PROBE_NVIDIA_MISMATCH
     return RUNTIME_PROBE_FAILED
 
 
-def nvidia_runtime_ready(client: docker.DockerClient, image_id: str) -> RuntimeProbe:
+def remove_stale_probe_containers(client: docker.DockerClient) -> None:
+    """
+    Remove every container that carries the probe label, whatever its state.
+
+    Raises the first removal error: the caller must not create another probe on top of one it
+    cannot remove, or a held host gains one container per cycle.
+    """
+    stale = client.containers.list(all=True, filters={"label": RUNTIME_PROBE_LABEL})
+    for leftover in stale:
+        logger.warning(_m("Removing a stale runtime probe container", {
+            "id": leftover.short_id, "status": leftover.status,
+        }))
+        leftover.remove(force=True)
+
+
+def probe_nvidia_runtime(client: docker.DockerClient, image_id: str) -> RuntimeProbe:
     """
     Start a throwaway container from `image_id` with every GPU requested and the entrypoint
     `true`, the way the executor container is started. Ready when it exits 0.
 
     Nothing is pulled: `image_id` is the image the runner already runs. The container is
-    removed whatever happens. A daemon that cannot create or start it reads as not ready,
-    with the daemon's message as the error.
+    labelled and removed whatever happens; a labelled leftover from an earlier probe is removed
+    before this one is created, and a leftover that cannot be removed is a failed probe with
+    no new container. A daemon that cannot create or start the probe reads as not ready, with
+    the daemon's message as the error.
     """
+    try:
+        remove_stale_probe_containers(client)
+    except Exception as e:
+        return RuntimeProbe(False, RUNTIME_PROBE_FAILED, f"stale runtime probe container not removed: {e}")
     container = None
     try:
         container = client.containers.create(
             image_id,
             entrypoint=["true"],
             command=[],
+            labels={RUNTIME_PROBE_LABEL_KEY: "nvidia-runtime"},
             device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
         )
         container.start()
@@ -588,7 +613,7 @@ def check_and_update() -> None:
         if container is not None:
             image_id = container.attrs.get("Image")
             probe = (
-                nvidia_runtime_ready(client, image_id)
+                probe_nvidia_runtime(client, image_id)
                 if image_id
                 else RuntimeProbe(False, RUNTIME_PROBE_FAILED, f"container {container.name} has no image id")
             )
