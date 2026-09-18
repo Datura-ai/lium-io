@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from core.config import settings
+
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -79,9 +81,31 @@ class PortConnectivityCheck:
         # known value and let the next verification cycle re-measure. Mirrors
         # the rented-executor sysbox fallback in ExecutorConnectivityService.
         sysbox_downgraded = ctx.state.sysbox_runtime and not result.sysbox_runtime
+        keep_known_sysbox = False
         if sysbox_downgraded and await ctx.services.redis.renting_in_progress(
             ctx.miner_hotkey, ctx.executor.uuid
         ):
+            keep_known_sysbox = True
+        elif settings.DIND_PROBE_FIRST_MISS_GRACE:
+            # DAH-3597: a probe that never reached its container (dind_ok False: docker run
+            # refused, sshd not up in 30 s, SSH reset) measured nothing about sysbox, so the first
+            # such miss inside the TTL window keeps the last known value and the next cycle
+            # re-measures. A second miss inside the window is recorded as before. A probe that
+            # reached its container and still says no sysbox is a verdict, never tolerated.
+            if sysbox_downgraded and not result.dind_ok:
+                first_miss = await ctx.services.redis.record_dind_probe_miss(
+                    ctx.miner_hotkey,
+                    ctx.executor.uuid,
+                    settings.DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS,
+                )
+                if first_miss:
+                    keep_known_sysbox = True
+                    extra_info["sysbox_downgrade_tolerated_reason"] = "first_dind_probe_miss"
+                else:
+                    extra_info["dind_probe_miss_repeated"] = True
+            elif result.dind_ok:
+                await ctx.services.redis.clear_dind_probe_miss(ctx.miner_hotkey, ctx.executor.uuid)
+        if keep_known_sysbox:
             extra_info["sysbox_downgrade_tolerated"] = True
             updated_state = replace(
                 updated_state,

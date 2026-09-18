@@ -140,6 +140,12 @@ class Settings(BaseSettings):
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-2313: reject unrented executors without sysbox so they never appear on the network.
     REQUIRE_SYSBOX_FOR_UNRENTED: bool = Field(env="REQUIRE_SYSBOX_FOR_UNRENTED", default=True)
+    # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
+    # in PortConnectivityCheck, the TTL bounds the window between two misses.
+    DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
+    DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS: int = Field(
+        env="DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS", default=3600, gt=0
+    )
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
     # DAH-2265: cached-template requirement. Before the cutoff the CachedTemplateVerificationCheck
