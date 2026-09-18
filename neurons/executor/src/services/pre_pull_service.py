@@ -19,7 +19,8 @@ digest-pinned, and only if
   hands in, and a pull that would not fit waits for the next sweep. The loop starts the
   sweep as its own task and never waits for it, so the default image's refresh runs on
   time even when a sweep overruns (a silent pull stream, a slow eviction); while one
-  sweep is still running the next refresh does not start another.
+  sweep is still running the next refresh does not start another, and the task is
+  cancelled when the loop ends, however it ends.
 
 One pull per sweep per node plus a random start delay keeps a fleet-wide enable from
 stampeding the registry. Every pull attempt ends in exactly one log line

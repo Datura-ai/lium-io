@@ -98,12 +98,17 @@ def _sweep(puller: PrePuller, entries: list[dict]) -> None:
 
 
 def _one_loop_iteration(
-    monkeypatch, templates: list[dict], puller: type | None = None, iterations: int = 1
+    monkeypatch,
+    templates: list[dict],
+    puller: type | None = None,
+    iterations: int = 1,
+    stop_with: type[BaseException] = asyncio.CancelledError,
 ) -> dict:
     """Run run_cache_template_prefetch through ``iterations`` refreshes and record what it did.
 
-    The loop is stopped inside its sleep after the last refresh. The sweep is a task the loop
-    does not await, so the fake sleep yields once before stopping to let it run."""
+    The loop is stopped inside its sleep after the last refresh by raising ``stop_with``. The
+    sweep is a task the loop does not await, so the fake sleep yields once before stopping to
+    let it run."""
     seen: dict = {"params": None, "ensured": [], "swept": [], "protected": [], "pullers": 0, "sleeps": []}
     seen["protected_at_ensure"] = []  # what the puller's `protected` was while the mandatory pass ran
     real_sleep = asyncio.sleep
@@ -132,7 +137,7 @@ def _one_loop_iteration(
         seen["sleeps"].append(seconds)
         await real_sleep(0)
         if len(seen["sleeps"]) >= iterations:
-            raise asyncio.CancelledError
+            raise stop_with
 
     monkeypatch.setattr(cache_template_service, "_fetch_templates", fetch)
     monkeypatch.setattr(cache_template_service, "_ensure_template", ensure)
@@ -277,6 +282,47 @@ def test_cancelling_the_loop_cancels_a_running_sweep(monkeypatch):
         [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
         puller=HangingPuller,
         iterations=10**6,  # never stops on its own
+    )
+
+
+def test_the_sweep_is_cancelled_however_the_loop_ends(monkeypatch):
+    # r149 follow-up: the cancel lived only in the CancelledError handler, so a loop that ended
+    # any other way (a BaseException the handlers let through: SystemExit, KeyboardInterrupt)
+    # left the sweep task running with nothing left to read its outcome
+    monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", True)
+    sweep_saw: list[str] = []
+
+    class Quit(BaseException):
+        pass
+
+    class HangingPuller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sweep_saw.append("cancelled")
+                raise
+
+    real_sleep = asyncio.sleep
+
+    async def main(loop_coro):
+        task = asyncio.create_task(loop_coro)
+        with pytest.raises(Quit):  # the loop's first sleep raises it, after the sweep started
+            await task
+        await real_sleep(0)  # one step for the sweep task to see its cancel
+        assert sweep_saw == ["cancelled"]
+        raise asyncio.CancelledError  # what the harness expects out of the run
+
+    real_run = asyncio.run
+    monkeypatch.setattr(asyncio, "run", lambda coro: real_run(main(coro)))
+    _one_loop_iteration(
+        monkeypatch,
+        [_entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False), _entry(REPO, CU128_TAG, DIGEST_CU128)],
+        puller=HangingPuller,
+        stop_with=Quit,
     )
 
 
