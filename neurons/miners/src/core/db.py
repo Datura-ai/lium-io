@@ -7,7 +7,7 @@ from sqlmodel import Session, create_engine
 
 from core.config import settings
 
-# A pooled connection is retired after this long, before the ~60 min idle cut of most NATs and load balancers.
+# A pooled connection is retired after this long — the value the backend and the portal use (the validator recycles hourly).
 POOL_RECYCLE_SECONDS = 1800
 
 
