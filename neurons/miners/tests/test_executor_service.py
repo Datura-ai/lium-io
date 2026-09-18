@@ -129,3 +129,56 @@ async def test_remove_pubkey_from_executor_includes_validator_signature(
     # Assert — validator_signature is present and unchanged in the forwarded payload
     assert "validator_signature" in sent_payload
     assert sent_payload["validator_signature"] == validator_sig
+
+
+# ---------------------------------------------------------------------------
+# DAH-3338: register_pubkey tells the validator which executors it KNOWS apart from
+# which ACCEPTED the key, so an unreachable node stops reading as an invalid id.
+# ---------------------------------------------------------------------------
+
+
+def _ssh_info(executor: Executor):
+    from datura.requests.miner_requests import ExecutorSSHInfo
+
+    return ExecutorSSHInfo(
+        uuid=str(executor.uuid),
+        address=executor.address,
+        port=executor.port,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+
+
+@pytest.mark.asyncio
+async def test_register_pubkey_splits_known_from_accepted(executor_service, validator_keypair):
+    reachable = Executor(uuid=uuid4(), validator="//TestValidator", address="203.0.113.10", port=8001)
+    dead = Executor(uuid=uuid4(), validator="//TestValidator", address="203.0.113.11", port=8001)
+    executor_service.executor_dao.get_executors_for_validator.return_value = [reachable, dead]
+
+    async def only_the_reachable_one_answers(executor, pubkey, signature, nonce=None):
+        return _ssh_info(executor) if executor is reachable else None
+
+    executor_service.send_pubkey_to_executor = only_the_reachable_one_answers
+
+    registration = await executor_service.register_pubkey(
+        validator_keypair.ss58_address, "miner-hotkey", _SSH_KEY.encode(), "0xsig"
+    )
+
+    assert registration.known_executor_ids == [str(reachable.uuid), str(dead.uuid)]
+    assert [info.uuid for info in registration.accepted] == [str(reachable.uuid)]
+
+
+@pytest.mark.asyncio
+async def test_register_pubkey_knows_nothing_for_an_id_the_miner_does_not_list(
+    executor_service, validator_keypair
+):
+    executor_service.executor_dao.get_executors_for_validator.return_value = []
+
+    registration = await executor_service.register_pubkey(
+        validator_keypair.ss58_address, "miner-hotkey", _SSH_KEY.encode(), "0xsig", str(uuid4())
+    )
+
+    assert registration.known_executor_ids == []
+    assert registration.accepted == []

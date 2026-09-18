@@ -24,7 +24,7 @@
     },
     {
       "expect": "ExecutorSpecRequest",
-      "note": "a scored node with the DAH-2467 incentive split and one DAH-2340 reason; specs is the scraper's object",
+      "note": "a scored node with the DAH-2467 incentive split, one DAH-2340 reason and two DAH-3338 pod states; specs is the scraper's object",
       "message": {
         "message_type": "ExecutorSpecRequest",
         "sent_at": 1757363580.125,
@@ -88,7 +88,19 @@
             }
           }
         ],
-        "batch_total": 140
+        "batch_total": 140,
+        "pod_states": [
+          {
+            "pod_id": "0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f",
+            "container_state": "running",
+            "observed_at": "2026-09-08T20:32:40Z"
+          },
+          {
+            "pod_id": "9a8b7c6d-5e4f-4302-b1a0-f9e8d7c6b5a4",
+            "container_state": "reaped",
+            "observed_at": "2026-09-08T20:31:05Z"
+          }
+        ]
       }
     },
     {
@@ -232,6 +244,39 @@
         }
       },
       "note": "the validator's model has no `snapshot`; the backend declares it and reads None"
+    },
+    {
+      "expect": "PodStatesReport",
+      "note": "DAH-3338: chunk 0 of 1 of one cycle's container states on one node; `unknown` is a pod the validator could not inspect, not an absent one",
+      "message": {
+        "message_type": "PodStatesReport",
+        "sent_at": 1757363581.5,
+        "forwarded_at": 1757363581.625,
+        "queue_depth": 1,
+        "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_uuid": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "job_batch_id": "2026-09-08T20:30:00+00:00",
+        "chunk_index": 0,
+        "chunk_total": 1,
+        "pod_states": [
+          {
+            "pod_id": "0b1c2d3e-4f50-4617-8829-3a4b5c6d7e8f",
+            "container_state": "running",
+            "observed_at": "2026-09-08T20:32:40Z"
+          },
+          {
+            "pod_id": "c1d2e3f4-0516-4728-9a3b-4c5d6e7f8091",
+            "container_state": "unknown",
+            "observed_at": "2026-09-08T20:32:41Z"
+          },
+          {
+            "pod_id": "9a8b7c6d-5e4f-4302-b1a0-f9e8d7c6b5a4",
+            "container_state": "reaped",
+            "observed_at": "2026-09-08T20:31:05Z"
+          }
+        ]
+      }
     },
     {
       "expect": "ContainerCreated",
