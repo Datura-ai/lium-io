@@ -37,7 +37,8 @@ judged the validator to be the outage (DAH-2748), the queued reports are logged 
 ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` and no report is POSTed, so no renter is told. The
 streaks keep ``reported`` False, so the outage is queued again next cycle and reported once the
 fleet reads clean. The per-executor ``RENTED_POD_SSH_UNREACHABLE`` events of a suppressed cycle
-were rendered before the gate ran and say the renter was told; the sync loop passes the gate to
+were rendered before the gate ran and name a pod outage the gate then judged to be ours; the sync
+loop passes the gate to
 ``silence_rented_pod_ssh_reports_on_our_own_outage`` before the specs publish, which rewrites them
 to RENTED with the gate's verdict under ``what_we_saw``, as DAH-2748 rewrites availability errors.
 
@@ -630,8 +631,9 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
 ) -> int:
     """Rewrite to RENTED the cycle's ``RENTED_POD_SSH_UNREACHABLE`` results whose reports the gate held.
 
-    The executor task rendered its event before the cycle-end gate ran, and that event's impact says
-    the renter was told. On a suppressed cycle nobody was (Rustam's review, 17 Sep), so before the
+    The executor task rendered its event before the cycle-end gate ran, and that event names a pod
+    outage with its notice queued. On a suppressed cycle the outage was ours and nobody is told
+    (Rustam's review, 17 Sep), so before the
     specs publish each such result becomes the RENTED halt it would have been, with the gate's
     verdict and the pods it held under ``what_we_saw[probe_suppressed_fleet]``: the record says the
     validator saw the ports fail and why it did not report them. The same pattern as DAH-2748's
@@ -640,9 +642,9 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
 
     A result can name several pods of one executor. The pods the gate held move under
     ``probe_suppressed_fleet``; a pod the gate did not hold (its outage was reported in an earlier
-    cycle, so ``reported`` is set and it was never due) stays in ``unreachable_pods``, because for
-    that renter the impact is true. When nothing stays, the event becomes RENTED; when something
-    stays, it keeps its reason and names only the pods whose renters were told (Rustam, round 7).
+    cycle, so ``reported`` is set and it was never due) stays in ``unreachable_pods``, because that
+    pod's outage is real and already on record. When nothing stays, the event becomes RENTED; when
+    something stays, it keeps its reason and names only the pods whose outage stands (Rustam, round 7).
     Returns how many results were rewritten, for the caller's log line.
     """
     if gate is None or not gate.suppressed_by:
@@ -672,14 +674,16 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
         }
         if told_pods:
             # Mixed: one pod of this executor was reported in an earlier cycle, another is held now.
-            # The event keeps its reason for the pod whose renter was told and stops naming the rest.
+            # The event keeps its reason for the pod whose outage stands and stops naming the rest;
+            # nothing was queued for that pod (it was never due), so the impact says so too.
             rewritten_event = event.model_copy(
                 update={
+                    "impact": TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT,
                     "what_we_saw": {
                         **what,
                         "unreachable_pods": told_pods,
                         PROBE_SUPPRESSED_FLEET: suppressed,
-                    }
+                    },
                 }
             )
         else:

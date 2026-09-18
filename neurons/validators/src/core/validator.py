@@ -645,8 +645,8 @@ class Validator:
                     # when the fleet says the pods are at fault; a validator-side outage (the share
                     # above, or most mapped ports refusing at once) notifies no renter. The results
                     # whose reports the gate held were rendered as RENTED_POD_SSH_UNREACHABLE before
-                    # the gate ran and say the renter was told: they are rewritten to RENTED here,
-                    # before the publish, so the stored event says what happened.
+                    # the gate ran and name a pod outage that was ours: they are rewritten to RENTED
+                    # here, before the publish, so the stored event says what happened.
                     try:
                         ssh_gate = await flush_rented_pod_ssh_reports(
                             self.redis_service,

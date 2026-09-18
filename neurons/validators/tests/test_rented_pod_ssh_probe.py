@@ -266,8 +266,13 @@ async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does
         h.backend.report_pod_ssh_unreachable.return_value = None
     await h.cycle(tcp_fault=None, ssh_keys=KEYS)
     await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
-    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)  # threshold: POST, no answer
+    unanswered = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)  # threshold: POST, no answer
     assert h.streak()["reported"] is False
+    # Mikhail's review (18 Sep): the event rendered before the flush, which got no answer here, so
+    # its impact must not claim the renter was told; it says the notice is queued and not yet sent.
+    assert unanswered.event.impact == Msg.RENTED_POD_SSH_UNREACHABLE.impact
+    assert "queued" in unanswered.event.impact and "not yet sent" in unanswered.event.impact
+    assert "told" not in unanswered.event.impact and "Reported to" not in unanswered.event.impact
     h.backend.report_pod_ssh_unreachable.side_effect = None  # backend back, answers recorded=True
     h.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(recorded=True)
     recovered = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
@@ -284,6 +289,8 @@ async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does
     [pod] = after.event.what_we_saw["unreachable_pods"]
     assert pod["report_queued"] is False
     assert h.backend.report_pod_ssh_unreachable.await_count == 2  # the threshold cycle and the next
+    # acknowledged: the outage is still the event, but this cycle queued no new notice
+    assert after.event.impact == Msg.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT
 
 
 @pytest.mark.asyncio
@@ -548,12 +555,18 @@ async def test_dry_run_logs_the_event_but_does_not_tell_the_backend(context_fact
 
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+    # Mikhail's review (18 Sep): a dry run queues nothing, so the impact must not say "queued" or
+    # "told"; it says the outage was detected and no notice went out this cycle.
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["report_queued"] is False
+    assert result.event.impact == Msg.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT
 
     # Rustam's review (16 Sep): the dry-run cycle counted on the same keys, so before the `reported`
     # flag a validator switched live mid-outage read count 3 != threshold and never posted.
     result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
     [pod] = result.event.what_we_saw["unreachable_pods"]
     assert pod["consecutive_cycles"] == 3 and pod["report_queued"] is True
+    assert result.event.impact == Msg.RENTED_POD_SSH_UNREACHABLE.impact  # live: queued, not yet sent
     h.backend.report_pod_ssh_unreachable.assert_awaited_once()
 
 
@@ -711,9 +724,9 @@ def _job_result(check_result, pod_ids: list[str] | None = None) -> JobResult:
 
 @pytest.mark.asyncio
 async def test_a_suppressed_cycles_events_publish_as_rented_with_the_gates_verdict(context_factory):
-    # Rustam's review (17 Sep): the executor task rendered RENTED_POD_SSH_UNREACHABLE ("Reported to
-    # the backend and the renter") before the gate ran; on a suppressed cycle nobody was told, and
-    # the event published a claim that was false. The sync loop now rewrites those results to RENTED
+    # Rustam's review (17 Sep): the executor task rendered RENTED_POD_SSH_UNREACHABLE before the
+    # gate ran; on a suppressed cycle the outage was ours and nobody was told, so the event named
+    # a pod outage that was not one. The sync loop now rewrites those results to RENTED
     # before the publish, as DAH-2748 does for availability errors, with the gate's verdict kept.
     h = Harness(context_factory)
     await h.cycle(tcp_fault=None, ssh_keys=KEYS)
@@ -745,7 +758,7 @@ async def test_a_suppressed_cycles_events_publish_as_rented_with_the_gates_verdi
     assert result.log_text.startswith(f"{Msg.ALREADY_RENTED.event} >>> ")
     assert json.loads(result.log_text.split(" >>> ", 1)[1])["reason_code"] == "RENTED"
     assert result.score == 0.9  # the halt kept the rented score; the rewrite touches the event only
-    # the executor whose pod was reported in an earlier cycle keeps its event: for it the impact is true
+    # the executor whose pod was reported in an earlier cycle keeps its event: its outage stands
     assert other.validation_event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     assert rented_pod_ssh.PROBE_SUPPRESSED_FLEET not in other.validation_event.what_we_saw
 
@@ -760,7 +773,10 @@ async def test_a_suppressed_cycles_events_publish_as_rented_with_the_gates_verdi
     ]
     seen = event.what_we_saw[rented_pod_ssh.PROBE_SUPPRESSED_FLEET]
     assert [pod["pod_id"] for pod in seen["unreachable_pods"]] == [POD_ID]
+    # nothing was queued this cycle for the pod that stays, so the impact must not say "queued"
+    assert event.impact == Msg.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT
     logged = json.loads(mixed.log_text.split(" >>> ", 1)[1])
+    assert logged["impact"] == Msg.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT
     assert [pod["pod_id"] for pod in logged["what_we_saw"]["unreachable_pods"]] == [
         "pod-reported-last-cycle"
     ]
