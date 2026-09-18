@@ -12,16 +12,17 @@ a cap back at 10 (or the first draft's 7) fails both multiplier assertions.
 from unittest.mock import AsyncMock
 
 import pytest
-
 from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
+from services.task_service import JobResult
+
 from tests.test_rental_price_incentive_flow import _make_pcc_job
 
 B300 = "NVIDIA B300 SXM6 AC"
 IDLE_1X_NODES = 12  # 17 Sep 2026 13:28Z cycle: 12 idle 1×B300, 5 rented, 8 rented 8×
 
 
-async def _run_with_production_config(job_results: dict) -> RentalPriceIncentive:
+async def _run_with_production_config(job_results: dict[str, list[JobResult]]) -> RentalPriceIncentive:
     redis = AsyncMock()
     redis.get_portion_per_gpu_type = AsyncMock(return_value=0.3)
     redis.get_executor_uptime = AsyncMock(return_value=9999)
