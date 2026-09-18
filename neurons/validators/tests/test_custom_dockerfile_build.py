@@ -13,8 +13,9 @@ Covers (from the plan + DAH-2211 isolated-build flow):
 - A.13 egress firewall failure → build_egress_setup (never builds)
 - A.14 DinD container always torn down (finally)
 - A.15 image export (save|load) failure → build_export
-- A.20–A.24 (DAH-3521) the egress block lets the DinD's own DNS through;
-  every setup command before the build is bounded
+- A.20–A.26 (DAH-3521) the egress block lets the DinD's own DNS through;
+  every setup command before the build is bounded, the firewall helpers
+  included (named, bounded on the executor, force-removed before the DinD)
 - B.1 SSE latency p95 ≤ 2000 ms (stubbed redis consumer)
 """
 
@@ -26,6 +27,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -176,6 +178,7 @@ def _make_dind_ssh(
     dind_ip: str = "172.20.0.2",
     resolv_conf: str = "nameserver 8.8.8.8\n",
     resolv_exit: int = 0,
+    remove_helper_exit: int = 0,
 ):
     """An `ssh.run` router emulating the DAH-2211 DinD build control commands.
 
@@ -188,7 +191,8 @@ def _make_dind_ssh(
     command outlives its `timeout=`; `ready_hangs` makes every readiness
     probe block for an hour (a hung host dockerd); `ready_hangs_first=n` makes
     only the first n probes hang (a dockerd still starting), the rest answer
-    `ready_exit`.
+    `ready_exit`. `remove_helper_exit` is the teardown's firewall remove
+    helper's exit status (124 = the executor's `timeout(1)` killed it).
     """
     calls: list[str] = []
     call_kwargs: list[dict] = []
@@ -226,6 +230,8 @@ def _make_dind_ssh(
             return _ssh_result(stdout=dind_ip)
         if "docker exec" in cmd and cmd.rstrip().endswith("cat /etc/resolv.conf"):
             return _ssh_result(exit_status=resolv_exit, stdout=resolv_conf)
+        if "--network=host" in cmd and "-D DOCKER-USER" in cmd:  # the firewall remove helper
+            return _ssh_result(exit_status=remove_helper_exit)
         return _ssh_result(exit_status=0)
 
     ssh = AsyncMock()
@@ -678,7 +684,7 @@ async def test_A13_egress_failure_aborts_before_build(svc, monkeypatch):
     # But the DinD container is still torn down.
     assert any(f"docker rm -fv" in c and f"lium-dind-build-{payload.pod_id}" in c
                for c in ssh_client.calls)
-    # And so are the egress rules (taiberium, #1381): an apply that timed out may have inserted
+    # And so are the egress rules: an apply that timed out may have inserted
     # some of them before the deadline. The remove script is idempotent, so it runs whenever the
     # DinD IP is known, not only after a successful apply.
     remove_runs = [c for c in ssh_client.calls if "--network=host" in c and "-D DOCKER-USER" in c]
@@ -1370,7 +1376,7 @@ _PURGE_TAGGED_TEARDOWN = 'rules=$($IPT -S DOCKER-USER 2>/dev/null) || rules=""; 
 
 
 def test_A21b_purge_removes_an_old_resolver_the_current_list_does_not_name():
-    """Regression (taiberium, #1381): teardown failed on a build whose resolver
+    """Regression: teardown failed on a build whose resolver
     was 10.0.0.2; the DinD IP came back for a build whose resolver is 10.0.0.9.
     Deleting the current resolvers' rules, or a `-C` check, leaves the 10.0.0.2
     ACCEPT in place. The purge matches the tag and the source IP only, so the
@@ -1420,7 +1426,7 @@ def test_A21b_purge_removes_an_old_resolver_the_current_list_does_not_name():
 
 
 def test_A21c_a_tagged_rule_the_apply_cannot_delete_aborts_the_apply():
-    """Regression (taiberium, #1381): the chain holds an old resolver's ACCEPT
+    """Regression: the chain holds an old resolver's ACCEPT
     for this DinD IP and `iptables -D` on it fails (xtables lock, a rule the
     backend cannot parse back). The previous head exited 0 and went on to
     insert the new ACCEPTs next to the old one, so the chain kept 10.0.0.2
@@ -1618,7 +1624,7 @@ async def test_A23b_a_hung_readiness_probe_fails_at_build_dind_unready_within_th
 
 @pytest.mark.asyncio
 async def test_A23c_readiness_keeps_its_probe_budget_when_probes_fail_fast(svc, monkeypatch):
-    """The nit (taiberium, #1381): an outer `wait_for(ready_timeout_s)` counted
+    """An outer `wait_for(ready_timeout_s)` counted
     probe time against the sleep budget, so a slow host got fewer probes than
     the setting says. Now the loop runs `ready_timeout_s` probes a second apart,
     each bounded on its own."""
@@ -1641,7 +1647,7 @@ async def test_A23c_readiness_keeps_its_probe_budget_when_probes_fail_fast(svc, 
 
 @pytest.mark.asyncio
 async def test_A23d_a_probe_that_hits_its_bound_is_not_ready_and_the_next_probe_runs(svc, monkeypatch):
-    """Regression (taiberium, #1381, 17 Sep): a probe that timed out ended the
+    """Regression: a probe that timed out ended the
     loop, so a DinD whose first `docker info` was slow while dockerd started was
     rejected at `build_dind_unready` although the next probe would have passed.
     A timed-out probe is now "not ready" like an exit 1 (exit 124 from the
@@ -1687,14 +1693,93 @@ async def test_A24_egress_helper_runs_under_the_setup_bound(svc, monkeypatch):
     )
     assert ok is True and step is None
     egress = [k for k in seen_kwargs if "--network=host" in k.get("command", "")]
-    assert len(egress) == 1 and egress[0].get("timeout") == 11
+    assert len(egress) == 1
+    # The bound is the executor's `timeout(1)` on the helper, named after the
+    # DinD so the teardown can force-remove it; the streamer's own timeout is
+    # the backstop past that bound (it only stops reading, the remote helper
+    # would run on).
+    cmd = egress[0]["command"]
+    assert cmd.startswith("timeout -k 5 11 /usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
+                          f"--name lium-dind-build-{payload.pod_id}-fw-apply "), cmd
+    # the wrapper's tail: exit 124 gets the stderr line the streamer fails on; a bare
+    # `timeout` prefix would leave a killed helper reading as an applied firewall
+    assert cmd.endswith("; exit $rc") and "'Build egress firewall helper timed out after 11s' >&2" in cmd, cmd
+    assert egress[0].get("timeout") == 11 + 15
     build = [k for k in seen_kwargs if "docker build" in k.get("command", "")]
     assert build and build[0].get("timeout") == int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
 
 
+@pytest.mark.skipif(shutil.which("timeout") is None, reason="needs coreutils timeout(1), as the executor has")
+def test_A24b_a_firewall_helper_that_hits_its_bound_exits_124_with_a_stderr_line():
+    """Regression: the helper ran under the streamer's `timeout=` only, which
+    stops reading and leaves the remote `docker run` inserting rules, and
+    `execute_and_stream_logs` fails a step on stderr alone, so a helper killed
+    by `timeout(1)` (exit 124, silent) would have read as an applied firewall.
+    The wrapper echoes one stderr line on 124 and keeps the exit status."""
+    slow = DockerService._bounded_helper_command("sleep 5", 1, "Build egress firewall helper")
+    proc = subprocess.run(["sh", "-c", slow], capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 124
+    assert proc.stderr.strip() == "Build egress firewall helper timed out after 1s"
+    # a helper that finishes in time: its own status, nothing on stderr
+    quick = DockerService._bounded_helper_command("true", 5, "Build egress firewall helper")
+    proc = subprocess.run(["sh", "-c", quick], capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 0 and proc.stderr == ""
+    failing = DockerService._bounded_helper_command("sh -c 'echo boom >&2; exit 5'", 5, "x")
+    proc = subprocess.run(["sh", "-c", failing], capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 5 and proc.stderr.strip() == "boom"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_helper_exit", [0, 124])
+async def test_A26_teardown_bounds_the_remove_helper_and_removes_both_helpers_before_the_dind(
+    svc, monkeypatch, remove_helper_exit
+):
+    """The teardown's remove helper runs under the executor's `timeout -k 5`,
+    exit 124 is logged as a failed teardown (not silence), and both firewall
+    helpers are `docker rm -f`'d by name before `docker rm -fv` releases the
+    DinD IP: a helper that outlived its bound is still editing rules for that
+    IP, and the next build to get the IP would inherit them."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS", 9)
+    ssh_client = _make_dind_ssh(remove_helper_exit=remove_helper_exit)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl())
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    warnings: list = []  # the _StructuredMessage objects: message + extra
+    monkeypatch.setattr("services.docker_service.logger.warning", lambda msg, *a, **k: warnings.append(msg))
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
+    )
+    assert ok is True and step is None
+    dind = f"lium-dind-build-{payload.pod_id}"
+    remove_helper = next(
+        (i, c) for i, c in enumerate(ssh_client.calls) if "--network=host" in c and "-D DOCKER-USER" in c
+    )
+    helpers_rm = next(
+        (i, c) for i, c in enumerate(ssh_client.calls)
+        if c.startswith("/usr/bin/docker rm -f ") and f"{dind}-fw-apply" in c
+    )
+    dind_rm = next((i, c) for i, c in enumerate(ssh_client.calls) if "docker rm -fv" in c and dind in c)
+    assert remove_helper[1].startswith(
+        f"timeout -k 5 9 /usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN --name {dind}-fw-remove "
+    ), remove_helper[1]
+    assert remove_helper[1].endswith("; exit $rc") and "remove helper timed out after 9s' >&2" in remove_helper[1]
+    assert ssh_client.call_kwargs[remove_helper[0]].get("timeout") == 9 + 15
+    assert f"{dind}-fw-remove" in helpers_rm[1]
+    assert remove_helper[0] < helpers_rm[0] < dind_rm[0], ssh_client.calls
+    teardown_warnings = [w for w in warnings if "egress rule teardown failed" in str(w)]
+    if remove_helper_exit == 124:
+        assert len(teardown_warnings) == 1, warnings
+        assert teardown_warnings[0].extra.get("timed_out") is True
+        assert teardown_warnings[0].extra.get("exit_status") == 124
+    else:
+        assert teardown_warnings == []
+
+
 @pytest.mark.parametrize("bad", [0, -1])
 def test_A25b_dind_ready_timeout_rejects_zero_and_negative(bad):
-    """(taiberium, #1381) `range(0)` runs no probe at all, so zero or a negative
+    """`range(0)` runs no probe at all, so zero or a negative
     value would fail every build at `build_dind_unready` without asking dockerd
     once. The setting refuses both at load time."""
     from pydantic import ValidationError

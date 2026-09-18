@@ -4397,6 +4397,32 @@ class DockerService:
     def _dind_container_name(pod_id: str) -> str:
         return f"lium-dind-build-{pod_id}"
 
+    @staticmethod
+    def _dind_firewall_helper_names(dind_name: str) -> tuple[str, str]:
+        """Names of the two `--network=host` iptables helpers (apply, remove).
+
+        Named so the teardown can `docker rm -f` a helper that outlived its
+        bound: `timeout(1)` kills the `docker run` client, not the container,
+        and a helper still inserting rules for this DinD IP after the IP is
+        released would firewall whatever build gets the IP next.
+        """
+        return f"{dind_name}-fw-apply", f"{dind_name}-fw-remove"
+
+    @staticmethod
+    def _bounded_helper_command(command: str, bound_s: int, what: str) -> str:
+        """`command` under executor-side `timeout -k 5 <bound_s>`, exit 124 made loud.
+
+        `execute_and_stream_logs` fails a step on stderr, and `timeout(1)`
+        prints nothing when it kills the command, so a helper that hit its
+        bound would otherwise read as success. The wrapper echoes one stderr
+        line on exit 124 and exits with the command's status either way.
+        """
+        return (
+            f"timeout -k 5 {int(bound_s)} {command}; rc=$?; "
+            f"[ $rc -eq 124 ] && echo {shlex.quote(f'{what} timed out after {int(bound_s)}s')} >&2; "
+            f"exit $rc"
+        )
+
     # Build context written inside the throwaway DinD container.
     _DIND_BUILD_CONTEXT = "/build"
 
@@ -4538,9 +4564,9 @@ class DockerService:
         # the loop and the pipeline's status carries it to the `|| { ...; }`
         # after `done`; the caller's streamer fails the step on the stderr
         # line. Without it the old resolver's ACCEPT stays in the chain and
-        # the new ACCEPTs are inserted next to it (taiberium, #1381). On apply
-        # the purge runs BEFORE the DROP inserts, so an abort leaves no
-        # half-applied DROP behind for a teardown that never runs.
+        # the new ACCEPTs are inserted next to it. On apply the purge runs
+        # BEFORE the DROP inserts, so an abort leaves no half-applied DROP
+        # behind for a teardown that never runs.
         on_list_failure = (
             '{ echo "DOCKER-USER listing failed" >&2; exit 4; }' if apply else 'rules=""'
         )
@@ -4721,8 +4747,8 @@ class DockerService:
             #    always had), each probe bounded by `probe_timeout_s` so a hung
             #    `docker info` is one failed probe, not a build held for an
             #    hour. A probe that hits its bound is "not ready" like an
-            #    exit 1 (taiberium, #1381: aborting there rejected a DinD that
-            #    was still starting), and the next probe follows at once.
+            #    exit 1 (aborting there rejected a DinD that was still
+            #    starting), and the next probe follows at once.
             #    The bound is `timeout(1)` on the executor, as for the DinD
             #    start: asyncssh's `timeout=` only stops waiting and would
             #    leave the remote `docker exec` and its session channel open,
@@ -4830,10 +4856,21 @@ class DockerService:
             apply_script = self._egress_filter_script(
                 dind_ip, cidrs, apply=True, dns_servers=dns_servers
             )
-            egress_cmd = (
+            # The helper runs under the executor's `timeout(1)`, as the DinD
+            # start does: the streamer's own `timeout=` only stops reading,
+            # the remote `docker run` would go on inserting rules. It is named
+            # so the teardown can force-remove it before the DinD IP is
+            # released, and exit 124 fails the step (`_bounded_helper_command`
+            # puts the stderr line the streamer keys on). The streamer's
+            # timeout stays as the backstop, past the executor-side bound.
+            apply_helper, _ = self._dind_firewall_helper_names(dind_name)
+            egress_cmd = self._bounded_helper_command(
                 f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
+                f"--name {shlex.quote(apply_helper)} "
                 f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
-                f"-c {shlex.quote(apply_script)}"
+                f"-c {shlex.quote(apply_script)}",
+                setup_timeout_s,
+                "Build egress firewall helper",
             )
             ok, err = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -4841,7 +4878,7 @@ class DockerService:
                 log_tag=log_tag,
                 log_text="Applying build egress firewall",
                 log_extra={**default_extra, "dind_ip": dind_ip, "dns_servers": dns_servers},
-                timeout=setup_timeout_s,
+                timeout=setup_timeout_s + 15,
                 raise_exception=False,
             )
             if not ok:
@@ -4962,7 +4999,7 @@ class DockerService:
             # host-loaded image is removed later by _cleanup_custom_build_artifacts.
             # `dind_ip` goes in whenever it is known: an apply that timed out may
             # have inserted some rules before the deadline, and the remove script
-            # is idempotent (taiberium, #1381).
+            # is idempotent.
             await self._teardown_dind_build(
                 ssh_client=ssh_client,
                 dind_name=dind_name,
@@ -4986,22 +5023,52 @@ class DockerService:
         The DNS ACCEPTs go by their tag and the DinD IP (`_egress_filter_script`),
         so the teardown never needs to know which resolvers the apply saw.
 
+        Order: the remove helper (bounded on the executor, exit 124 logged as a
+        failure), then `docker rm -f` of both firewall helpers by name, then
+        the DinD itself. The helpers go first because removing the DinD
+        releases its IP: an apply or remove helper that outlived its bound is
+        still editing rules for that IP, and the next build to get the IP
+        would inherit them.
+
         Always called from `_custom_build_image`'s finally. Failures are logged,
         never raised — the rental flow must not break on cleanup.
         """
         from core.config import settings
 
         setup_timeout_s = int(settings.CUSTOM_DOCKERFILE_SETUP_STEP_TIMEOUT_SECONDS)
+        apply_helper, remove_helper = self._dind_firewall_helper_names(dind_name)
         if dind_ip:
             try:
                 remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)
-                await ssh_client.run(
-                    f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
-                    f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
-                    f"-c {shlex.quote(remove_script)}",
+                remove_res = await ssh_client.run(
+                    self._bounded_helper_command(
+                        f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
+                        f"--name {shlex.quote(remove_helper)} "
+                        f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
+                        f"-c {shlex.quote(remove_script)}",
+                        setup_timeout_s,
+                        "Build egress firewall remove helper",
+                    ),
                     check=False,
-                    timeout=setup_timeout_s,
+                    timeout=setup_timeout_s + 15,
                 )
+                if remove_res.exit_status != 0:
+                    # 124: `timeout(1)` killed the helper client; the rules may
+                    # still be in the chain and the container is removed below.
+                    logger.warning(
+                        _m(
+                            "Custom build egress rule teardown failed (non-fatal)",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "exit_status": remove_res.exit_status,
+                                    "timed_out": remove_res.exit_status == 124,
+                                    "stderr": (remove_res.stderr or "").strip(),
+                                    "dind_ip": dind_ip,
+                                }
+                            ),
+                        )
+                    )
             except Exception as exc:  # noqa: BLE001 — best-effort
                 logger.warning(
                     _m(
@@ -5011,6 +5078,25 @@ class DockerService:
                         ),
                     )
                 )
+        try:
+            # Both helpers by name, before the DinD IP is released. A helper
+            # that finished is already gone (`--rm`); `rm -f` kills one that
+            # outlived its `timeout(1)`.
+            await ssh_client.run(
+                f"/usr/bin/docker rm -f {shlex.quote(apply_helper)} "
+                f"{shlex.quote(remove_helper)} 2>/dev/null || true",
+                check=False,
+                timeout=setup_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                _m(
+                    "Custom build firewall helper teardown failed (non-fatal)",
+                    extra=get_extra_info(
+                        {**default_extra, "error": str(exc), "dind_name": dind_name}
+                    ),
+                )
+            )
         try:
             await ssh_client.run(
                 f"/usr/bin/docker rm -fv {shlex.quote(dind_name)} 2>/dev/null || true",
