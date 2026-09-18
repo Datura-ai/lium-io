@@ -6125,12 +6125,12 @@ async def test_create_container_filler_skips_encrypted_volume_setup(
 
 
 @pytest.mark.asyncio
-async def test_run_jupyter_with_encrypted_volume_copies_to_plaintext_mount(
+async def test_run_jupyter_with_encrypted_volume_installs_into_plaintext_mount(
     docker_service,
 ):
     ssh_client = AsyncMock()
     docker_service.execute_and_stream_logs = AsyncMock(
-        side_effect=[None, None, None, (True, "")]
+        side_effect=[(True, ""), (True, ""), (True, "")]
     )
 
     await docker_service.run_jupyter(
@@ -6145,13 +6145,23 @@ async def test_run_jupyter_with_encrypted_volume_copies_to_plaintext_mount(
         encrypted_local_volume=True,
     )
 
-    commands = [
-        call.kwargs["command"]
-        for call in docker_service.execute_and_stream_logs.await_args_list
-    ]
-    assert any("docker cp /root/app/run_jupyter.sh pod_test:/tmp/run_jupyter.sh" in command for command in commands)
-    assert any("cp /tmp/run_jupyter.sh /root/run_jupyter.sh" in command for command in commands)
-    assert all("pod_test:/root/run_jupyter.sh" not in command for command in commands)
+    calls = docker_service.execute_and_stream_logs.await_args_list
+    commands = [call.kwargs["command"] for call in calls]
+    # DAH-3639: docker cp cannot resolve the container's destination here, so the
+    # script is piped in from the host through docker exec instead.
+    assert all("docker cp" not in command for command in commands)
+    assert any("mkdir -p /root" in command for command in commands)
+    install = [call for call in calls if "cat > /root/run_jupyter.sh" in call.kwargs["command"]]
+    assert install, commands
+    install_command = install[0].kwargs["command"]
+    assert "cat /root/app/run_jupyter.sh |" in install_command
+    assert "docker exec -i -u 0 pod_test" in install_command
+    # nothing is fed from the executor process: the host shell owns the pipe
+    assert install[0].kwargs.get("stdin_data") is None
+    assert any(
+        "/root/run_jupyter.sh --password=$JUPYTER_PASSWORD" in command
+        for command in commands
+    )
     assert all("volume_test:/mnt" not in command for command in commands)
     assert all(_LIUM_CIPHER_MOUNT not in command for command in commands)
 
