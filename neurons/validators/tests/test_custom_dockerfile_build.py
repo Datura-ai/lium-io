@@ -1705,6 +1705,9 @@ async def test_A24_egress_helper_runs_under_the_setup_bound(svc, monkeypatch):
     # `timeout` prefix would leave a killed helper reading as an applied firewall
     assert cmd.endswith("; exit $rc") and "'Build egress firewall helper timed out after 11s' >&2" in cmd, cmd
     assert egress[0].get("timeout") == 11 + 15
+    # the streamer reads the helper's exit status for this step: a silent kill
+    # (137) has no stderr line to fail on (A24c)
+    assert egress[0].get("check_exit_status") is True
     build = [k for k in seen_kwargs if "docker build" in k.get("command", "")]
     assert build and build[0].get("timeout") == int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
 
@@ -1727,6 +1730,157 @@ def test_A24b_a_firewall_helper_that_hits_its_bound_exits_124_with_a_stderr_line
     failing = DockerService._bounded_helper_command("sh -c 'echo boom >&2; exit 5'", 5, "x")
     proc = subprocess.run(["sh", "-c", failing], capture_output=True, text=True, timeout=10)
     assert proc.returncode == 5 and proc.stderr.strip() == "boom"
+
+
+class _FakeStreamProcess:
+    """What `ssh_client.create_process` hands `execute_and_stream_logs`: an
+    async context manager with `stdout` / `stderr` line iterators, whose
+    `exit_status` is known only once the channel is closed (`wait_closed`),
+    as asyncssh's is. `exit_status=None` after the close is a process that
+    ended on a signal and never reported a status."""
+
+    def __init__(self, exit_status: int | None, *, stdout=(), stderr=()):
+        self._final_exit_status = exit_status
+        self._stdout, self._stderr = list(stdout), list(stderr)
+        self.exit_status = None
+        self.exit_signal = None
+        self.closed = False
+
+    @property
+    def stdout(self):
+        return self._lines(self._stdout)
+
+    @property
+    def stderr(self):
+        return self._lines(self._stderr)
+
+    @staticmethod
+    async def _lines(lines):
+        for line in lines:
+            yield line
+
+    async def wait_closed(self):
+        self.closed = True
+        self.exit_status = self._final_exit_status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+
+def _make_process_ssh(*, egress_exit: int | None, egress_stderr=()):
+    """An `ssh_client` for the REAL `execute_and_stream_logs`: `run` is the
+    `_make_dind_ssh` router (DinD start, probes, teardown); `create_process`
+    serves the streamed steps, the egress helper with `egress_exit` and no
+    stdout, every other command (build, export) with exit 0."""
+    ssh = _make_dind_ssh()
+    processes: list[tuple[str, _FakeStreamProcess]] = []
+
+    def _create_process(command: str):
+        if "--network=host" in command:
+            proc = _FakeStreamProcess(egress_exit, stderr=egress_stderr)
+        else:
+            proc = _FakeStreamProcess(0)
+        processes.append((command, proc))
+        return proc
+
+    ssh.create_process = _create_process
+    ssh.processes = processes
+    return ssh
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper_exit", [137, 1])
+async def test_A24c_egress_helper_silent_non_zero_exit_fails_the_apply_and_never_builds(
+    svc, monkeypatch, helper_exit
+):
+    """Regression (taiberium, round 2): `execute_and_stream_logs` failed a
+    step on stderr only, so a helper that died without a word read as an
+    applied firewall and the build started open. 137 is `timeout -k`'s
+    SIGKILL after the grace period (the wrapper's 124 line never prints); 1
+    is `docker run` failing before iptables ran. Both, and any other
+    non-zero, fail the apply at `build_egress_setup` through the REAL
+    streamer, on the exit status alone."""
+    ssh_client = _make_process_ssh(egress_exit=helper_exit)
+    stream_log = AsyncMock()
+    monkeypatch.setattr(svc, "stream_log", stream_log)
+    errors: list = []
+    monkeypatch.setattr("services.docker_service.logger.error", lambda msg, *a, **k: errors.append(msg))
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
+    )
+    assert (ok, step) == (False, "build_egress_setup")
+    egress = [(c, p) for c, p in ssh_client.processes if "--network=host" in c]
+    assert len(egress) == 1 and egress[0][1].closed, "the exit status is read after the channel closed"
+    # the exit status was the only signal: the one error line in the pod log is the status line
+    error_lines = [c.args[0] for c in stream_log.call_args_list if c.args[1] == "error"]
+    assert error_lines == [f"Process exited with status {helper_exit}"], error_lines
+    assert not any("docker build" in c for c, _ in ssh_client.processes)
+    fw_errors = [e for e in errors if "egress firewall failed" in str(e)]
+    assert len(fw_errors) == 1 and f"Process exited with status {helper_exit}" in fw_errors[0].extra["error"]
+    # the DinD is still torn down and the (idempotent) remove helper still runs
+    assert any("docker rm -fv" in c and f"lium-dind-build-{payload.pod_id}" in c for c in ssh_client.calls)
+    assert any("--network=host" in c and "-D DOCKER-USER" in c for c in ssh_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_A24d_egress_helper_exit_zero_proceeds_to_the_build(svc, monkeypatch):
+    """The other half of A24c: a helper that exits 0 with nothing on stderr
+    is a confirmed firewall, and the build runs through the same real
+    streamer."""
+    ssh_client = _make_process_ssh(egress_exit=0)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await svc._custom_build_image(
+        ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
+    )
+    assert (ok, step) == (True, None)
+    commands = [c for c, _ in ssh_client.processes]
+    egress_at = next(i for i, c in enumerate(commands) if "--network=host" in c)
+    build_at = next(i for i, c in enumerate(commands) if "docker build" in c)
+    assert egress_at < build_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_status", [137, 1, None])
+async def test_A24e_execute_and_stream_logs_fails_on_the_exit_status_only_when_asked(
+    svc, monkeypatch, exit_status
+):
+    """`check_exit_status=True` fails on any non-zero exit status, or on none
+    (a signal death that reported no status), with the status in the error
+    and one error line in the pod log. Without the flag the streamer keeps its
+    stderr-only verdict, so the other callers' commands (whose exit status is
+    not a verdict) are unchanged."""
+    ssh_client = AsyncMock()
+    ssh_client.create_process = lambda command: _FakeStreamProcess(exit_status)
+    stream_log = AsyncMock()
+    monkeypatch.setattr(svc, "stream_log", stream_log)
+
+    ok, err = await svc.execute_and_stream_logs(
+        ssh_client=ssh_client, command="helper", log_tag="t", log_text="Applying",
+        raise_exception=False, check_exit_status=True,
+    )
+    assert ok is False
+    expected = (
+        f"Process exited with status {exit_status}" if exit_status is not None
+        else "Process ended without an exit status"
+    )
+    assert expected in err
+    assert any(c.args[1] == "error" and expected in c.args[0] for c in stream_log.call_args_list)
+
+    ok, err = await svc.execute_and_stream_logs(
+        ssh_client=ssh_client, command="helper", log_tag="t", log_text="Applying", raise_exception=False,
+    )
+    assert (ok, err) == (True, "")
+
+    # `raise_exception=True` (the default) raises on the exit status as it does on stderr
+    with pytest.raises(Exception, match=re.escape(expected)):
+        await svc.execute_and_stream_logs(
+            ssh_client=ssh_client, command="helper", log_tag="t", log_text="Applying", check_exit_status=True,
+        )
 
 
 @pytest.mark.asyncio
