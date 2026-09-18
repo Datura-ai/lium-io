@@ -29,41 +29,33 @@ DEFAULT_PRICE = DefaultPrice()
 # carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
 # the pinned lium-core still has 5.10).
 #
-# DAH-3623: the idle rate of a model is pinned at 0.8 x the LOWER of two prices, rounded down to the
-# cent: the median price renters paid for it over the trailing 30 days (owner rule, 17 Sep 2026: "idle
-# pay should never be higher than rental rates"; 21:41Z: "pin means raise too"; Rustam, 18 Sep 2026
-# 06:20Z on #1401: a 7-day window is too unstable, use 30 days), and the model's base price, i.e.
-# lium-core's `DEFAULT_SHARED_CONFIG.machine_prices` entry spread above. The base price is what a
-# provider who lists at the default earns per rented GPU-hour (the backend's `machine.price` is the
-# same table; a listing may sit between MIN_PRICE_RATE 0.5 x and MAX_PRICE_RATE 2.5 x of it), so a pin
-# above it would pay that provider more idle than rented (Rustam, 18 Sep 2026 08:00Z on #1401: B200
-# 4.48, RTX A6000 0.33 and H100 PCIe 1.20 sat above base). The base price binds for seven of the
-# twelve, the paid median for five. Within a cap bucket (BASE_GPU_MAP) no card is paid idle above the
-# bucket's flagship, the member with the highest base price: H100 NVL follows H100 HBM3 (it has no
-# 30-day median to pin on: zero rentals and zero idle pay in the read). The fixture in
-# tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
+# DAH-3623: the idle rate of a model is pinned AT the median price renters paid for it over the
+# trailing 30 days, rounded down to the cent (owner, 17 Sep 2026: "idle pay should never be higher
+# than rental rates"; 21:41Z: "pin means raise too"; Rustam, 18 Sep 2026 06:20Z on #1401: a 7-day
+# window is too unstable, use 30 days; owner, 18 Sep 2026 09:14Z: "pin the idle to median now", the
+# earlier 0.8 factor is gone). Four models in the lium-core table paid idle above the median, one on
+# it, seven under it; all twelve are pinned to their 30-day paid median. A second cap at the model's
+# base price (lium-core `machine_prices`) was tried and withdrawn on the owner's word (18 Sep 08:53Z:
+# "no don't do that"); the base listing prices themselves move to the median under P186 instead.
+# The fixture in tests/test_idle_rate_under_paid_median.py holds the medians the pins were derived from.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
-    # median binds (0.8 x median 30 d < 0.8 x base)
-    "NVIDIA A100 80GB PCIe": 0.24,  # 0.8 x 0.30 median (base 0.36; was 0.36 = 120 % of the median)
-    "NVIDIA H100 80GB HBM3": 1.04,  # 0.8 x 1.30 median (base 1.494; was 1.494 = 115 %)
-    "NVIDIA GeForce RTX 5090": 0.48,  # 0.8 x 0.60 median (base 0.65; was 0.65 = 108 %)
-    "NVIDIA RTX 6000 Ada Generation": 0.55,  # 0.8 x 0.69 = 0.552, floor cent (base 0.69; was 0.69 = 100 %)
-    "NVIDIA A100-SXM4-80GB": 0.54,  # 0.8 x 0.68 = 0.544, floor cent (base 0.6923; was 0.6923 = 102 %)
-    # base binds (0.8 x base < 0.8 x median 30 d)
-    "NVIDIA H200": 2.28,  # 0.8 x base 2.85 (median 3.25 would give 2.60; was 2.85 = 88 % of the median)
-    "NVIDIA GeForce RTX 3090": 0.12,  # 0.8 x base 0.16 (median 0.18 would give 0.14; was 0.16 = 89 %)
-    "NVIDIA GeForce RTX 4090": 0.24,  # 0.8 x base 0.30 (median 0.32 would give 0.25; was 0.30 = 94 %)
-    "NVIDIA L40S": 0.28,  # 0.8 x base 0.35 (median 0.38 would give 0.30; was 0.35 = 92 %)
-    "NVIDIA B200": 3.40,  # 0.8 x base 4.25 (median 5.60 would give 4.48; was 4.25 = 76 %)
-    "NVIDIA RTX A6000": 0.25,  # 0.8 x base 0.32 = 0.256, floor cent (median 0.42 would give 0.33; was 0.32 = 76 %)
-    "NVIDIA H100 PCIe": 0.95,  # 0.8 x base 1.1988 = 0.959, floor cent (median 1.50 would give 1.20; was 1.1988 = 80 %)
-    # family ceiling: never above the bucket's flagship
-    "NVIDIA H100 NVL": 1.04,  # H100 HBM3's pin (base 1.11; no 30-day median: 0 rentals, 0 idle pay)
+    "NVIDIA A100 80GB PCIe": 0.30,  # paid median 30 d (was 0.36 = 120 % of it)
+    "NVIDIA H100 80GB HBM3": 1.30,  # paid median 30 d (was 1.494 = 115 %)
+    "NVIDIA GeForce RTX 5090": 0.60,  # paid median 30 d (was 0.65 = 108 %)
+    "NVIDIA A100-SXM4-80GB": 0.68,  # paid median 30 d (was 0.6923 = 102 %)
+    "NVIDIA RTX 6000 Ada Generation": 0.69,  # paid median 30 d (was 0.69 = 100 %, unchanged)
+    "NVIDIA H200": 3.25,  # paid median 30 d (was 2.85 = 88 %, raised)
+    "NVIDIA GeForce RTX 3090": 0.18,  # paid median 30 d (was 0.16 = 89 %, raised)
+    "NVIDIA GeForce RTX 4090": 0.32,  # paid median 30 d (was 0.30 = 94 %, raised)
+    "NVIDIA L40S": 0.38,  # paid median 30 d (was 0.35 = 92 %, raised)
+    "NVIDIA B200": 5.60,  # paid median 30 d (was 4.25 = 76 %, raised)
+    "NVIDIA RTX A6000": 0.42,  # paid median 30 d (was 0.32 = 76 %, raised)
+    "NVIDIA H100 PCIe": 1.50,  # paid median 30 d (was 1.1988 = 80 %, raised)
 }
 
 
