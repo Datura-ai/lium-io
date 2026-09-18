@@ -30,11 +30,22 @@ class SysboxRequiredCheck:
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
         if not ctx.state.sysbox_runtime and not is_rented:
+            what: dict = {"sysbox_runtime": ctx.state.sysbox_runtime, "is_rented": is_rented}
+            remediation = None
+            if ctx.state.dind_probe_error:
+                # DAH-2856: the probe's container came up but its sshd never answered, so no sysbox
+                # verdict was measured at all; the cause read from the container's logs replaces
+                # "install sysbox", which sent ticket-0309's provider through three reinstalls.
+                what["dind_probe_error"] = ctx.state.dind_probe_error
+                remediation = f"The sysbox check could not run: {ctx.state.dind_probe_error}."
+                if ctx.state.dind_probe_error.startswith("DIND_INNER_DOCKERD_"):
+                    remediation += " Fix that on the host first; reinstalling sysbox does not change it."
             event = render_message(
                 Msg.SYSBOX_MISSING,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"sysbox_runtime": ctx.state.sysbox_runtime, "is_rented": is_rented},
+                what=what,
+                remediation=remediation,
             )
             # DAH-2742: the verification is deliberately kept. ConnectivityOrchestrator.verify
             # forces sysbox_runtime=False whenever the DinD probe fails at all, not only on a

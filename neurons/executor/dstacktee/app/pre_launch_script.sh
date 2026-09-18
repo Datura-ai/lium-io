@@ -14,5 +14,5 @@ docker run --rm --privileged --pid=host --net=host -v /:/host dstacktee/dstack-s
 systemctl restart docker
 # Warm the images the validator's sysbox/DinD probes run, so first-cycle
 # probes don't burn their timeout budget on multi-GB registry pulls.
-docker pull daturaai/dind:0.0.1 >/dev/null 2>&1 || true
+docker pull daturaai/dind:0.0.2 >/dev/null 2>&1 || true
 docker pull daturaai/compute-subnet-executor:latest >/dev/null 2>&1 || true
