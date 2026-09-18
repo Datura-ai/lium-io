@@ -935,6 +935,35 @@ class _InflightCreateRegistry:
 # Redis if the two ever land in different processes.
 inflight_creates = _InflightCreateRegistry()
 
+
+class _PendingDeletionRegistry:
+    """Pods whose last delete answered DeletionInProgress and has not completed since.
+
+    DAH-3467 (review): the backend re-asks a delete that answered DeletionInProgress — the container
+    still removing, or a named volume dockerd still held after the container was confirmed gone. The
+    re-ask finds the container already absent ("No such container"), which is not the inspect-confirmed
+    path, so without this marker a "volume is in use" on the retried volume remove would fall back to
+    best-effort and the pod would close over the volume left behind. A pod marked here keeps its
+    volume cleanup on the in-progress path until a delete for it completes.
+    """
+
+    def __init__(self) -> None:
+        self._pod_ids: set[str] = set()
+
+    def mark(self, pod_id: str) -> None:
+        self._pod_ids.add(pod_id)
+
+    def is_pending(self, pod_id: str) -> bool:
+        return pod_id in self._pod_ids
+
+    def clear(self, pod_id: str) -> None:
+        self._pod_ids.discard(pod_id)
+
+
+# In-process like inflight_creates: the backend re-asks the validator that owns the executor. A
+# validator restart forgets the marker, and the re-ask then runs the plain best-effort volume remove.
+pending_deletions = _PendingDeletionRegistry()
+
 # How long a delete waits for the create it just cancelled. The create reads the flag at its next
 # checkpoint, and the only checkpoint gap that can orphan a container is the short one before
 # `docker run` — a pull-length wait would hold the customer's delete for nothing.
@@ -7331,6 +7360,7 @@ class DockerService:
                         if payload.workload_kind == WorkloadKind.FILLER:
                             with _best_effort_delete_step(log, "sweep_wedged_gpus_before_in_progress"):
                                 await _sweep_wedged_gpus_after_teardown(ssh_client, log)
+                        pending_deletions.mark(payload.pod_id)
                         return removal.failure
                 except Exception:
                     # DAH-2427: a failed force-remove (backend FAILED / STOP_FAILED) is the
@@ -7372,6 +7402,16 @@ class DockerService:
 
                 # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
                 # retried, then answered DeletionInProgress; every other failure stays best-effort.
+                # A re-ask after DeletionInProgress finds the container absent, not confirmed by
+                # inspect: the pod's marker keeps its volume cleanup on the retried path (review).
+                retry_volume_in_use = removal.confirmed_by_inspect
+                if pending_deletions.is_pending(payload.pod_id):
+                    retry_volume_in_use = True
+                    log.info(
+                        "Continuing a deletion answered in progress earlier; a volume still in use is retried",
+                        container_name=payload.container_name,
+                    )
+
                 if payload.local_volume:
                     volume_in_progress = None
                     with _best_effort_delete_step(
@@ -7383,9 +7423,10 @@ class DockerService:
                             payload.local_volume,
                             "local",
                             log,
-                            retry_in_use=removal.confirmed_by_inspect,
+                            retry_in_use=retry_volume_in_use,
                         )
                     if volume_in_progress is not None:
+                        pending_deletions.mark(payload.pod_id)
                         return volume_in_progress
 
                 if payload.external_volume:
@@ -7399,14 +7440,18 @@ class DockerService:
                             payload.external_volume,
                             "external",
                             log,
-                            retry_in_use=removal.confirmed_by_inspect,
+                            retry_in_use=retry_volume_in_use,
                         )
                         if volume_in_progress is None:
                             await self.remove_s3fs_volume_plugin(
                                 ssh_client=ssh_client, volume_name=payload.external_volume
                             )
                     if volume_in_progress is not None:
+                        pending_deletions.mark(payload.pod_id)
                         return volume_in_progress
+
+                # every named volume is gone: the next delete for this pod starts clean
+                pending_deletions.clear(payload.pod_id)
 
                 log.info(
                     "Remove rented machine from redis",
