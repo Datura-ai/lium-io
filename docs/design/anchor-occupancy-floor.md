@@ -27,7 +27,7 @@ Per UTC day: `top_up = max(0, F × listed_price × gpu_count × 24 h − rental_
 
 ### 4.1 Allow-list: backend table, served in the rented feed
 
-A backend table `anchor_executor` (`executor_id`, `miner_hotkey`, `accepted_at`, `strikes`, `paused_reason`, `revoked_at`), written by an admin command (`admin-anchor-accept <executor_id>`, the shape of `admin-reserve-node` in reserved-capacity v1), and served as a new additive field on the feed the validator already reads every cycle:
+Proposed: a backend table `anchor_executor` (`executor_id`, `miner_hotkey`, `accepted_at`, `strikes`, `paused_reason`, `revoked_at`), written by an admin command (`admin-anchor-accept <executor_id>`, the shape of `admin-reserve-node` in reserved-capacity v1), and served as a new additive field on the feed the validator already reads every cycle:
 
 ```
 RentedExecutorsResponse.anchor_executors: dict[str, AnchorExecutor] = {}   # executor_id → row
@@ -54,7 +54,7 @@ The validator's primitive is the 15-min cycle: 96 per UTC day. A day's floor bud
 
 - rented → `rented_cycles += 1`; mining pool as today.
 - idle and `rented_cycles + floor_cycles < budget_cycles` → **paying cycle**: `floor_cycles += 1`; the node enters the anchor bucket at `anchor_rate`.
-- idle otherwise → incentive 0 for this cycle with a new append-only reason `ANCHOR_FLOOR_DAY_MET` (`incentive/miner_incentive_log.py:63`), so the provider's incentive log says why.
+- idle otherwise → incentive 0 for this cycle with a proposed new append-only reason `ANCHOR_FLOOR_DAY_MET` (`incentive/miner_incentive_log.py:63`), so the provider's incentive log says why.
 
 Over a day this pays `anchor_rate × gpu_count × 0.25 h × min(idle_cycles, max(0, budget − rented_cycles))` = `F × P × n × 24 − rented_h × P × n` when the node was idle long enough — the ticket's formula with `rental_revenue ≈ rented_hours × listed price`. Two deviations, both bounded by the day's rented revenue: a rental ending mid-cycle counts as a rented cycle; a node idle in the morning and rented all afternoon ends the day above the floor (weights are set, nothing is clawed back). The exact `billed_usd` version needs the backend (open question 3).
 
@@ -98,16 +98,16 @@ Base = the ceiling, not today's idle spend: idle nodes are paid ≈ $4.3k/day (v
 | Referral pool from residual burn | `incentive/default.py:282` | unchanged; it is applied after the rental share, so a bigger anchor bucket leaves less residual burn for referral, never less for miners |
 | Estimates / `/incentive-snapshot` | `incentive/rental_price.py:1199`, `:113-125` | `RentalShareState` gains `anchor: {node_count, cost_per_h, cap_per_h, cap_multiplier}`; a hypothetical executor is never an anchor, so estimates are unchanged |
 
-## 5. Config surface (validator `Settings`, next to `REFERRAL_EMISSION_SHARE`, `core/config.py:190`)
+## 5. Config surface (proposed; validator `Settings`, next to `REFERRAL_EMISSION_SHARE`, `core/config.py:190`)
 
 | Name | Default | Meaning |
 |---|---|---|
-| `ANCHOR_FLOOR_PCT` | `0` | F, percent of GPU-hours guaranteed per UTC day (0–100). 0 = off: no routing change anywhere. OD-19. |
-| `ANCHOR_FLOOR_DAYS` | `90` | window from `accepted_at` |
-| `ANCHOR_BUCKET_MAX_SHARE` | `0.0` | X, the anchor bucket's ceiling as a fraction of the unrented pool ceiling (§4.5). 0 = off. Owner's funding-share decision. |
-| allow-list | `RentedExecutorsResponse.anchor_executors`, default `{}` | backend table + admin command; no validator-side list |
+| `ANCHOR_FLOOR_PCT` (proposed) | `0` | F, percent of GPU-hours guaranteed per UTC day (0–100). 0 = off: no routing change anywhere. OD-19. |
+| `ANCHOR_FLOOR_DAYS` (proposed) | `90` | window from `accepted_at` |
+| `ANCHOR_BUCKET_MAX_SHARE` (proposed) | `0.0` | X, the anchor bucket's ceiling as a fraction of the unrented pool ceiling (§4.5). 0 = off. Owner's funding-share decision. |
+| allow-list (proposed) | `RentedExecutorsResponse.anchor_executors`, default `{}` | backend table + admin command; no validator-side list |
 
-Both `ANCHOR_FLOOR_PCT > 0` and `ANCHOR_BUCKET_MAX_SHARE > 0` are needed for any anchor pay; set on both validator hotkeys (DAH-3394) in one deploy.
+Both proposed settings `ANCHOR_FLOOR_PCT > 0` and `ANCHOR_BUCKET_MAX_SHARE > 0` are needed for any anchor pay; set on both validator hotkeys (DAH-3394) in one deploy.
 
 ## 6. Cost model (gmv-bridge §1, §3 row 1, D1)
 
@@ -120,9 +120,9 @@ Both `ANCHOR_FLOOR_PCT > 0` and `ANCHOR_BUCKET_MAX_SHARE > 0` are needed for any
 ## 7. Rollout and observability
 
 1. Backend: table, admin command, feed field (additive; deploy order with the validator is free — the default is `{}`).
-2. Validator, staging: `ANCHOR_FLOOR_PCT=0`, one test hotkey's executor accepted → identical scores to main for a full day (the routing condition is false); then `ANCHOR_FLOOR_PCT=60 ANCHOR_BUCKET_MAX_SHARE=0.25` on staging only, read the log lines and the ledger rows below.
-3. Validator, prod: `ANCHOR_FLOOR_PCT=0 ANCHOR_BUCKET_MAX_SHARE=0` — a no-op deploy. F and X are set only when OD-19 is answered.
-4. Observability: one structured log line per anchor node per cycle, `Anchor_breakdown | 8xB300 [uuid8] | day 2026-10-01 rented 11 floor 3 budget 57 | $8.06 × 1.00 × 8 = $64.48/h`, next to `Rental_breakdown` (`incentive/utils.py:132`); `incentive_source = "anchor_floor"`, `incentive_formula_version = "anchor_floor_v1"` and the anchor inputs in `incentive_formula_inputs` (`services/task/models.py:152-184`), published to the backend ledger as today (`services/miner_service.py:901-920`) → a Grafana series "Anchor floor paid — last 24h (USD, validator ledger)" plus a per-node daily table on the dashboard that shows idle pay; `ANCHOR_FLOOR_DAY_MET` in the provider's incentive log.
+2. Validator, staging (proposed sequence): `ANCHOR_FLOOR_PCT=0`, one test hotkey's executor accepted → identical scores to main for a full day (the routing condition is false); then `ANCHOR_FLOOR_PCT=60 ANCHOR_BUCKET_MAX_SHARE=0.25` on staging only, read the log lines and the ledger rows below.
+3. Validator, prod (proposed): `ANCHOR_FLOOR_PCT=0 ANCHOR_BUCKET_MAX_SHARE=0` — a no-op deploy. F and X are set only when OD-19 is answered.
+4. Observability (proposed): one structured log line per anchor node per cycle, `Anchor_breakdown | 8xB300 [uuid8] | day 2026-10-01 rented 11 floor 3 budget 57 | $8.06 × 1.00 × 8 = $64.48/h`, next to `Rental_breakdown` (`incentive/utils.py:132`); `incentive_source = "anchor_floor"`, `incentive_formula_version = "anchor_floor_v1"` and the anchor inputs in `incentive_formula_inputs` (`services/task/models.py:152-184`), published to the backend ledger as today (`services/miner_service.py:901-920`) → a Grafana series "Anchor floor paid — last 24h (USD, validator ledger)" plus a per-node daily table on the dashboard that shows idle pay; `ANCHOR_FLOOR_DAY_MET` in the provider's incentive log.
 
 ## 8. Open questions for Rustam (proposed answer after each)
 
