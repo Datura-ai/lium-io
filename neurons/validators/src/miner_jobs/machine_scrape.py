@@ -1574,6 +1574,11 @@ def covering_mount(mounts_text: str, path: str) -> list[str] | None:
 # DAH-3674: the kind of disk under docker's data root, published as `hard_disk.disk_type` on the
 # public nodes feed (lium-platform). A reading, not a verdict: nothing scores or gates on it.
 SYS_CLASS_BLOCK_PATH = "/sys/class/block"
+SYS_DEV_BLOCK_PATH = "/sys/dev/block"
+# st_mode's file-type bits and the block-device value, spelled out because the packaged scrape cannot
+# import stat (obfuscator allowlist)
+ST_MODE_TYPE_MASK = 0o170000
+ST_MODE_BLOCK_DEVICE = 0o060000
 DISK_TYPE_NVME = "nvme"
 DISK_TYPE_SSD = "ssd"
 DISK_TYPE_HDD = "hdd"
@@ -1590,19 +1595,36 @@ def block_device_holding(mounts_text: str, path: str) -> str | None:
     `path`; None when nothing covers it or the covering mount is not a /dev node (overlay, tmpfs,
     a network filesystem).
 
-    The source is resolved through PID 1's root, so a `/dev/disk/by-uuid/...` or `/dev/mapper/...`
-    link in the mount table reads as the node the kernel names it by."""
+    The source is stat'ed through PID 1's root and named by its major:minor in /sys/dev/block, so a
+    `/dev/disk/by-uuid/...` or `/dev/mapper/...` link in the mount table reads as the node the kernel
+    names it by. stat follows the /proc/1/root magic link in the kernel; a userspace walk
+    (os.path.realpath) does not - readlink answers `/` and the walk carries on in this container's
+    own /dev, which has the nodes and none of udev's links. When the stat or the sysfs read fails
+    (a scrape run outside the executor container, a node sysfs does not list) the name as mounted is
+    the reading; a by-uuid link then types as unknown downstream."""
     covering = covering_mount(mounts_text, path)
     if covering is None or not covering[0].startswith("/dev/"):
         return None
     source = covering[0]
+    kernel_name = kernel_name_of_device_node(f"{HOST_ROOT_PREFIX}{source}")
+    return kernel_name or os.path.basename(source) or None
+
+
+def kernel_name_of_device_node(node_path: str) -> str | None:
+    """The kernel name (`nvme0n1p2`, `dm-3`) of the block device node at `node_path`, or None when
+    the path is not a block device or sysfs does not list its major:minor.
+
+    /sys/dev/block/<major>:<minor> is a link into the device's sysfs directory, whose last component
+    is the kernel name - the one /sys/class/block indexes by, so `whole_disk_of` can take it from
+    here. No udev needed: the node's st_rdev is the device number whatever name it was mounted by."""
     try:
-        source = os.path.realpath(f"{HOST_ROOT_PREFIX}{source}")
+        node_stat = os.stat(node_path)
+        if node_stat.st_mode & ST_MODE_TYPE_MASK != ST_MODE_BLOCK_DEVICE:
+            return None
+        device_number = f"{os.major(node_stat.st_rdev)}:{os.minor(node_stat.st_rdev)}"
+        return os.path.basename(os.readlink(f"{SYS_DEV_BLOCK_PATH}/{device_number}")) or None
     except OSError:
-        # PID 1's root is not readable from here (a scrape run outside the executor container). The
-        # name as mounted is the reading then; a by-uuid link types as unknown downstream.
-        pass
-    return os.path.basename(source) or None
+        return None
 
 
 def whole_disk_of(device_name: str) -> str:

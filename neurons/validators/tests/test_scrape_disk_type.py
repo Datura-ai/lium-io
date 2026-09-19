@@ -1,8 +1,9 @@
 """DAH-3674 — get_disk_type() in machine_scrape.py: nvme | ssd | hdd | unknown for the disk under docker's data root.
 
 Two aggregators that list Lium (GPU Finder, rentgpu.org) filter on disk type; the specs carried the disk's size and
-health and nothing about its kind. The scrape now names the block device behind the docker root from the host mount
-table, walks a partition up to its whole disk in sysfs, and reads the kernel's `rotational` flag. A reading, not a
+health and nothing about its kind. The scrape now takes the docker root's mount source off the host mount table, names
+the block device by its major:minor (stat through /proc/1/root, then /sys/dev/block), walks a partition up to its whole
+disk in sysfs, and reads the kernel's `rotational` flag. A reading, not a
 verdict: nothing scores or gates on it, and anything the scrape cannot read is `unknown`, never a guess.
 
 machine_scrape.py is a script, not a module — importing it runs the whole scrape — so the helpers are extracted by ast
@@ -14,6 +15,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,6 +27,9 @@ DISK_TYPE_HELPERS = {
     "HOST_MOUNTS_PATH",
     "HOST_ROOT_PREFIX",
     "SYS_CLASS_BLOCK_PATH",
+    "SYS_DEV_BLOCK_PATH",
+    "ST_MODE_TYPE_MASK",
+    "ST_MODE_BLOCK_DEVICE",
     "DISK_TYPE_NVME",
     "DISK_TYPE_SSD",
     "DISK_TYPE_HDD",
@@ -32,6 +37,7 @@ DISK_TYPE_HELPERS = {
     "UNTYPED_DEVICE_PREFIXES",
     "covering_mount",
     "block_device_holding",
+    "kernel_name_of_device_node",
     "whole_disk_of",
     "disk_type_of",
     "get_disk_type",
@@ -105,33 +111,127 @@ def test_a_mount_that_is_not_a_dev_node_names_no_device(
     assert scrape["block_device_holding"](mounts, "/var/lib/docker") is None
 
 
-def test_a_by_uuid_link_resolves_to_the_kernel_name_through_pid_1s_root(
-    scrape: dict[str, Any], tmp_path: Path
+def fake_device_nodes(
+    scrape: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    sysfs_root: Path,
+    nodes: dict[str, tuple[int, int, str]],
+) -> list[str]:
+    """Device nodes under PID 1's root the way stat sees them: `nodes` maps a /dev path to its
+    (major, minor, sysfs device directory). os.stat answers a block-device st_mode and that
+    major:minor for the host-root-prefixed path and stats anything else for real (the sysfs walk
+    goes through os.path.exists); /sys/dev/block gets the real `<major>:<minor>` link the kernel
+    keeps there. Returns the paths under PID 1's root stat was asked for."""
+    stat_calls: list[str] = []
+    by_host_path = {f"{scrape['HOST_ROOT_PREFIX']}{path}": spec for path, spec in nodes.items()}
+    real_stat = os.stat
+
+    def stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if not isinstance(path, str) or not path.startswith(scrape["HOST_ROOT_PREFIX"]):
+            return real_stat(path, *args, **kwargs)
+        stat_calls.append(path)
+        if path not in by_host_path:
+            raise FileNotFoundError(2, "No such file or directory", path)
+        major, minor, _ = by_host_path[path]
+        return SimpleNamespace(st_mode=0o060660, st_rdev=os.makedev(major, minor))
+
+    monkeypatch.setattr(os, "stat", stat)
+    (sysfs_root / "dev_block").mkdir(exist_ok=True)
+    for major, minor, device_dir in nodes.values():
+        (sysfs_root / "dev_block" / f"{major}:{minor}").symlink_to(f"../../devices/{device_dir}")
+    scrape["SYS_DEV_BLOCK_PATH"] = str(sysfs_root / "dev_block")
+    return stat_calls
+
+
+def test_a_by_uuid_link_resolves_to_the_kernel_name_by_its_device_number(
+    scrape: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Arrange — the mount table names the fstab link, /dev/disk/by-uuid/…, the way systemd mounted it
-    pid1_root = Path(scrape["HOST_ROOT_PREFIX"])
-    (pid1_root / "dev" / "disk" / "by-uuid").mkdir(parents=True)
-    (pid1_root / "dev" / "nvme0n1p2").touch()
-    (pid1_root / "dev" / "disk" / "by-uuid" / "7d2c-uuid").symlink_to(
-        pid1_root / "dev" / "nvme0n1p2"
+    # Arrange — the mount table names the fstab link, /dev/disk/by-uuid/…, the way systemd mounted
+    # it. The link lives in the host's /dev (udev's), which this container's /dev has not; only a
+    # stat through /proc/1/root reaches it
+    stat_calls = fake_device_nodes(
+        scrape,
+        monkeypatch,
+        tmp_path,
+        {
+            "/dev/disk/by-uuid/7d2c-uuid": (
+                259,
+                2,
+                "pci0000:00/0000:00:1d.0/nvme/nvme0/nvme0n1/nvme0n1p2",
+            )
+        },
     )
     mounts = "/dev/disk/by-uuid/7d2c-uuid /var/lib/docker ext4 rw,relatime 0 0\n"
 
-    # Act / Assert
+    # Act / Assert — named by 259:2, not by the link; and stat'ed through PID 1's root
     assert scrape["block_device_holding"](mounts, "/var/lib/docker") == "nvme0n1p2"
+    assert stat_calls == [f"{scrape['HOST_ROOT_PREFIX']}/dev/disk/by-uuid/7d2c-uuid"]
 
 
-def test_an_unreadable_pid_1_root_keeps_the_name_as_mounted(
-    scrape: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+def test_a_mapper_link_resolves_to_its_dm_device_and_types_as_unknown(
+    scrape: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Arrange — outside the executor container /proc/1/root is another user's; realpath raises instead of resolving
-    def denied(path: str) -> str:
+    # Arrange — an LVM docker root: the mount table names /dev/mapper/vg-docker, device-mapper 253:0
+    fake_device_nodes(
+        scrape, monkeypatch, tmp_path, {"/dev/mapper/vg-docker": (253, 0, "virtual/block/dm-0")}
+    )
+    fake_disk(tmp_path, "dm-0", "0")
+    scrape["SYS_CLASS_BLOCK_PATH"] = str(tmp_path / "class_block")
+    mounts = "/dev/mapper/vg-docker /var/lib/docker ext4 rw,relatime 0 0\n"
+
+    # Act
+    device = scrape["block_device_holding"](mounts, "/var/lib/docker")
+
+    # Assert — the kernel name comes through, and a stacked device still reads as unknown
+    assert device == "dm-0"
+    assert scrape["disk_type_of"](device) == "unknown"
+
+
+def test_a_partition_named_by_device_number_walks_up_to_its_disk_type(
+    scrape: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange — by-uuid partition of a SATA SSD: the kernel name from /sys/dev/block is the one
+    # /sys/class/block indexes by, so the partition walk and the rotational read follow from it
+    fake_device_nodes(
+        scrape, monkeypatch, tmp_path, {"/dev/disk/by-uuid/9f3e-uuid": (8, 1, "sda/sda1")}
+    )
+    fake_disk(tmp_path, "sda", "0", ("sda1",))
+    scrape["SYS_CLASS_BLOCK_PATH"] = str(tmp_path / "class_block")
+    mounts = "/dev/disk/by-uuid/9f3e-uuid /var/lib/docker ext4 rw,relatime 0 0\n"
+
+    assert (
+        scrape["disk_type_of"](scrape["block_device_holding"](mounts, "/var/lib/docker")) == "ssd"
+    )
+
+
+def test_a_stat_that_fails_or_finds_no_block_device_keeps_the_name_as_mounted(
+    scrape: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange — outside the executor container /proc/1/root is another user's (EPERM); a node sysfs
+    # does not list (no /sys/dev/block entry); a source that is no block device at all
+    def denied(path: str, *args: Any, **kwargs: Any) -> SimpleNamespace:
         raise PermissionError(13, "Permission denied", path)
 
-    monkeypatch.setattr(os.path, "realpath", denied)
-
-    # Act / Assert — the reading is the mounted name, not a crash of the whole hard_disk block
+    monkeypatch.setattr(os, "stat", denied)
     assert scrape["block_device_holding"](HOST_MOUNTS, "/var/lib/docker") == "nvme1n1"
+
+    fake_device_nodes(scrape, monkeypatch, tmp_path, {})
+    monkeypatch.setattr(
+        os,
+        "stat",
+        lambda path, *a, **k: SimpleNamespace(st_mode=0o060660, st_rdev=os.makedev(259, 9)),
+    )
+    assert scrape["block_device_holding"](HOST_MOUNTS, "/var/lib/docker") == "nvme1n1"
+
+    monkeypatch.setattr(
+        os, "stat", lambda path, *a, **k: SimpleNamespace(st_mode=0o100644, st_rdev=0)
+    )
+    assert scrape["block_device_holding"](HOST_MOUNTS, "/var/lib/docker") == "nvme1n1"
+
+    # a by-uuid link on the fallback path is a name sysfs does not know: unknown downstream, never a guess
+    mounts = "/dev/disk/by-uuid/7d2c-uuid /var/lib/docker ext4 rw,relatime 0 0\n"
+    assert scrape["block_device_holding"](mounts, "/var/lib/docker") == "7d2c-uuid"
+    assert scrape["disk_type_of"]("7d2c-uuid") == "unknown"
 
 
 # --------------------------------------------------------------------------------------------------
