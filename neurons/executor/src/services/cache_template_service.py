@@ -298,7 +298,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
 
     logger.info(f"Cache template pre-pull starting (refresh every {refresh_interval}s)")
 
-    # DAH-2977: off by default. When on, the backend is asked for the top-N official
+    # DAH-2977 (on by default since DAH-3604). When on, the backend is asked for the top-N official
     # templates too (`pre_pull: true` entries) and PrePuller warms one per sweep while idle.
     pre_puller = PrePuller(client) if settings.PRE_PULL_TEMPLATES_ENABLED else None
     # The sweep in flight, if any. The loop starts it and never awaits it (review, DAH-2977):
