@@ -6,7 +6,7 @@ Status: DRAFT for Rustam's approval (PR_PROCESS §1b: incentive math needs a hum
 
 An **accepted anchor node** (8× H100 / H200 / B200 / B300 / RTX PRO 6000, whole node, secure tier) is paid, for its **first 90 days**, as if at least **F %** of its GPU-hours were rented at its **listed price**. F is the owner's OD-19; **default F = 0: the mechanism is present, the floor is off**, and every node is scored exactly as today.
 
-Per UTC day: `top_up = max(0, F × listed_price × gpu_count × 24 h − rental_revenue_that_day)`.
+Per UTC day, with F as a fraction: `top_up = max(0, F × listed_price × gpu_count × 24 h − rental_revenue_that_day)`.
 
 ## 2. Non-goals
 
@@ -17,7 +17,7 @@ Per UTC day: `top_up = max(0, F × listed_price × gpu_count × 24 h − rental_
 ## 3. How the unrented pool pays today (what the note builds on)
 
 - Every 75 blocks (15 min, `core/config.py:107`) the validator scores every executor (`core/validator.py:543-550`). A validated idle node of an eligible model leaves the mining pool for the rental-share pool (`incentive/rental_price.py:929-1016`).
-- Each idle node contributes `gpu_count × hourly_rate × sysbox × driver` USD/h to its `(base_model, gpu_count_bucket)` (`incentive/rental_price.py:644-686`); `hourly_rate` is the pinned 30-day paid median (`incentive/config.py:31`; the P184/P186 pins of lium-io#1401 and lium-core `machine_prices` of #1407, both open). A bucket over its GPU cap is diluted pro-rata (`incentive/config.py:54`, B300 8× cap = 32 GPUs = 4 nodes; `incentive/rental_price.py:763-767`).
+- Each idle node contributes `gpu_count × hourly_rate × sysbox × driver` USD/h to its `(base_model, gpu_count_bucket)` (`incentive/rental_price.py:644-686`); `hourly_rate` comes from `RENTAL_PRICES_PER_HOUR` (`incentive/config.py:31`: lium-core `machine_prices` plus two pins today; the 30-day paid median once the P184/P186 PRs lium-io#1401 and #1407, both open, land). A bucket over its GPU cap is diluted pro-rata (`incentive/config.py:54`, B300 8× cap = 32 GPUs = 4 nodes; `incentive/rental_price.py:763-767`).
 - The sum is `total_rental_cost` (USD/h, `incentive/rental_price.py:773`); `rental_share = total_rental_cost × epoch_h / FIXED_RATIO / epoch_emission_usd` (`incentive/rental_price.py:1176-1179`, `services/const.py:142-144`), capped at `total_burn_emission` (0.91, `incentive/rental_price.py:781`; `lium_core/shared_config/defaults.py:125`). What the pool does not claim is burned (`incentive/rental_price.py:797`, `incentive/default.py:264`); the mining pool is the other 9 % and nothing here touches it.
 - Per node: `incentive = rental_share × gpu_count × effective_rate / total_rental_cost` (`incentive/rental_price.py:836-848`), summed per hotkey (`:862`) into `cycle_scores` (`incentive/default.py:274`), accumulated into `miner_scores` and normalised at `set_weights` once per tempo (`core/validator.py:610-626`, `:269-273`).
 - Rental state comes from the backend feed `GET /internal/executors/rented` (`clients/backend_client.py:245-253`; `RentedExecutorsResponse` at `protocol/vc_protocol/compute_requests.py:98` and `lium_protocol/lium_protocol/http.py:54`): `is_rented` (`services/task/result_handler.py:218`), `spot_executor_ids` (`protocol/vc_protocol/compute_requests.py:119`), `new_rentals_paused_executor_ids` (`:120`). Precedent for money on a backend feed: the referral EMA feed (`clients/referral_feed_client.py:29`, `incentive/default.py:282-308`; `REFERRAL_EMISSION_SHARE` default 0, `core/config.py:190`).
@@ -60,7 +60,7 @@ Over a day this pays `anchor_rate × gpu_count × 0.25 h × min(idle_cycles, max
 
 ### 4.4 The rate: listed price, never above it
 
-`anchor_rate = min(price_per_gpu, ceiling)`, where `price_per_gpu` is the node's listed ask (`executor_info.price_per_gpu`, the same field the soft limit reads at `incentive/rental_price.py:254`) and `ceiling = machine_prices_p90[gpu_model] × soft_limit_price_rate` (`incentive/rental_price.py:40`, `lium_core/shared_config/model.py:22`, `:41`), falling back to `machine_prices[gpu_model] × machine_max_price_rate` (the listing ceiling already enforced at `services/task/score_calculator.py:55-57`). If `price_per_gpu` is None the rate is `hourly_rate` (the pinned median, `incentive/rental_price.py:650`).
+`anchor_rate = min(price_per_gpu, ceiling)`, where `price_per_gpu` is the node's listed ask (`executor_info.price_per_gpu`, the same field the soft limit reads at `incentive/rental_price.py:254`) and `ceiling = machine_prices_p90[gpu_model] × SOFT_LIMIT_PRICE_RATE` (`incentive/rental_price.py:40`, `lium_core/shared_config/model.py:22`; the shared-config twin `soft_limit_price_rate` is `model.py:41`), falling back to `machine_prices[gpu_model] × machine_max_price_rate` (the listing ceiling already enforced at `services/task/score_calculator.py:55-57`). If `price_per_gpu` is None the rate is `hourly_rate` (the pinned median, `incentive/rental_price.py:650`).
 
 The floor therefore never pays above the node's own rental rate (SO §74 / P156: idle pay ≤ rental rates — here the idle pay *is* the node's listed rate, for at most F × 24 h a day). **Price floor**: the programme requires the anchor's listed price ≥ the model's 30-day paid median, recomputed weekly. That is a listing rule the backend enforces at acceptance (`price_per_gpu ≥ machine_prices[gpu_model]`, which #1407 (open) makes the 30-day paid median; #1401 keeps `RENTAL_PRICES_PER_HOUR` on the same medians). The validator never raises a below-median listing to the median — it pays the listed price; the backend refuses the acceptance.
 
@@ -74,7 +74,7 @@ anchor_cap_per_h   = ANCHOR_BUCKET_MAX_SHARE × pool_ceiling_per_h
 anchor_cap_multiplier = min(1, anchor_cap_per_h / anchor_cost_per_h)        # applied to every anchor node's effective_rate
 ```
 
-computed in `_on_finish_pre_process` (`incentive/rental_price.py:754`) after the price fetch, as `cap_multiplier_by_bucket` is today (`:763-767`). Then `total_rental_cost += anchor_cost_per_h × anchor_cap_multiplier` (`:773`) and each paying anchor node's `incentive = rental_share × gpu_count × anchor_rate × anchor_cap_multiplier × sysbox × driver / total_rental_cost` — the formula at `incentive/rental_price.py:845` with `effective_rate` swapped. `rental_share ≤ total_burn_emission` (`:781`) still holds above everything: the bucket can only spend burn, never the mining pool. When the cap binds every anchor node is diluted by the same multiplier (pro-rata); its `floor_cycles` still count, so a diluted day is not re-paid.
+computed in `_on_finish_pre_process` (`incentive/rental_price.py:754`) the way `cap_multiplier_by_bucket` is today (`:763-767`), with one ordering change: `epoch_subnet_emission` is only known after the TAO/alpha price fetch inside `_calculate_rental_share` (`:1149-1150`), so that fetch moves ahead of the cost sum (or the anchor cap is applied and `rental_share` recomputed once after it). Then `total_rental_cost += anchor_cost_per_h × anchor_cap_multiplier` (`:773`) and each paying anchor node's `incentive = rental_share × gpu_count × anchor_rate × anchor_cap_multiplier × sysbox × driver / total_rental_cost` — the formula at `incentive/rental_price.py:845` with `effective_rate` swapped. `rental_share ≤ total_burn_emission` (`:781`) still holds above everything: the bucket can only spend burn, never the mining pool. When the cap binds every anchor node is diluted by the same multiplier (pro-rata); its `floor_cycles` still count, so a diluted day is not re-paid.
 
 Base = the ceiling, not today's idle spend: idle nodes are paid ≈ $4.3k/day (validator ledger, 18 Sep) — 25 % of that could not fund one idle 8× B300 day. The ceiling is ≈ $47k/day (§6), the "unrented pool" of the programme text.
 
@@ -82,7 +82,7 @@ Base = the ceiling, not today's idle spend: idle nodes are paid ≈ $4.3k/day (v
 
 - **Start** = `accepted_at`, stamped by the admin command, which refuses an executor that is not verified and online. Unverified cycles inside the window earn nothing (not `is_successful`); the clock still runs.
 - **Eligibility** (backend, at acceptance): provider committed ≥ 4 nodes of 8× flagship within 60 days (a row on a provider-level `anchor_provider` table); node is 8× of a model in `FLAGSHIP_CAPABILITY_BASE_MODELS ∪ {H100, RTX PRO 6000}` (`incentive/rental_price.py:51`); verified; sysbox (already required for idle pay, `core/config.py:142`); not spot; splitting not enabled (`gpu_splitting_min_count < gpu_count`, the test at `incentive/rental_price.py:365`).
-- **Exit — two provider-caused fault closes**: backend counts `rental_history.close_reason ∈ {executor_offline, broken_by_provider, rent_failed, undeploy_failed}` on the node since `accepted_at`; the second sets `revoked_at` (and `strikes = 2` for the log line). The validator only reads `revoked_at`.
+- **Exit — two provider-caused fault closes**: backend counts `rental_history.close_reason` in the fault set gmv-bridge §1 uses (`executor_offline`, `broken_by_provider`, `rent_failed`, `undeploy_failed`) on the node since `accepted_at`; the second sets `revoked_at` (and `strikes = 2` for the log line). The validator only reads `revoked_at`.
 - **Pause — reserved pin**: while `executor.reserved_for_user_id` is set (reserved-capacity v1 row 3) the backend serves `paused_reason = "reserved_pin"`; no floor pay; the clock keeps running (the contract pays). Ordinary idle treatment of a pinned node is that note's question, not this one's.
 - **End**: `accepted_at + ANCHOR_FLOOR_DAYS`; the node then scores as an ordinary node in its bucket. Nothing to migrate — the routing condition is evaluated every cycle.
 
@@ -112,9 +112,9 @@ Both proposed settings `ANCHOR_FLOOR_PCT > 0` and `ANCHOR_BUCKET_MAX_SHARE > 0` 
 ## 6. Cost model (gmv-bridge §1, §3 row 1, D1)
 
 - Pool ceiling: ≈ 5,900 α/day × $21.73 × 0.41 (`FIXED_RATIO`) × 0.91 (`total_burn_emission`) ≈ **$47k/day**; ≈ $4.3k/day of it is paid to idle nodes today, the rest is burned.
-- **Expected ≈ $0/wk** at F = 60: today's 8× B300 / B200 / H200 nodes rent 94 / 84 / 75 % of GPU-hours (bridge §1), i.e. 18–22 rented hours a day against a 14.4-hour budget, so `budget − rented_cycles ≤ 0` on almost every day.
+- **Expected ≈ $0/wk** at F = 60: B300 / B200 / H200 GPUs rent 94 / 84 / 75 % of the time today (bridge §1, type level), i.e. 18–22 rented hours a day against a 14.4-hour budget, so `budget − rented_cycles ≤ 0` on almost every day.
 - **Worst case**, 20 accepted 8× B300 nodes idle all day at $8.06: 160 GPUs × 14.4 h × $8.06 ≈ **$18.6k/day ≈ $130k/wk** (D1) = 39 % of the ceiling.
-- **What X caps it to**: X = 0.25 → ≈ $11.7k/day ≈ **$82k/wk**, the worst case pro-rates to 63 % of the floor; X = 0.40 covers the worst case in full; X = 0 pays nothing.
+- **What X caps it to**: X = 0.25 → ≈ $12k/day ≈ **$84k/wk**, the worst case pro-rates to 64 % of the floor; X = 0.40 covers the worst case in full; X = 0 pays nothing.
 - Per node the bound is `F/100 × 24 × listed × 8` a day ($928 at $8.06, $737 at the $6.40 pin), whatever the pool does.
 
 ## 7. Rollout and observability
