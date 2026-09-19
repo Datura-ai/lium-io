@@ -102,6 +102,8 @@ ORIGINAL_KEYS = {
     'hard_disk_volumes': "volumes",
     'hard_disk_scrape_error': "hard_disk_scrape_error",
     'hard_disk_docker_scrape_error': "hard_disk_docker_scrape_error",
+    # DAH-3674: nvme | ssd | hdd | unknown for the disk under docker's data root
+    'hard_disk_disk_type': "disk_type",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
@@ -300,6 +302,7 @@ class FileEncryptService:
             'hard_disk_volumes': "",
             'hard_disk_scrape_error': "",
             'hard_disk_docker_scrape_error': "",
+            'hard_disk_disk_type': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",

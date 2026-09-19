@@ -1545,19 +1545,112 @@ def mounts_holding(mounts_text: str, path: str) -> list[str]:
     root that takes writes, and returns []. Read-only is the `ro` option, or `emergency_ro`: since
     kernel 6.6 an ext4 error under errors=remount-ro keeps `rw` in the options and adds
     `emergency_ro` instead. One element or none; a list so the payload shape holds."""
-    covering: tuple[str, list[str]] | None = None
+    covering = covering_mount(mounts_text, path)
+    if covering is None or not READ_ONLY_MOUNT_OPTIONS & set(covering[3].split(",")):
+        return []
+    return [covering[1]]
+
+
+def covering_mount(mounts_text: str, path: str) -> list[str] | None:
+    """The /proc/<pid>/mounts line whose filesystem a write to `path` lands on, split into its
+    fields (source, mount point, fstype, options, ...); None when no line covers the path.
+
+    The longest mount point that is `path` or a parent of it, the last line winning when a point
+    is mounted over. One rule for both readers of the mount table (`mounts_holding`,
+    `block_device_holding`), so the disk that is judged read-only is the disk that is typed."""
+    covering: list[str] | None = None
     for line in mounts_text.splitlines():
         fields = line.split()
         if len(fields) < 4:
             continue
-        mount_point, options = fields[1], fields[3].split(",")
+        mount_point = fields[1]
         if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
             continue
-        if covering is None or len(mount_point) >= len(covering[0]):
-            covering = (mount_point, options)
-    if covering is None or not READ_ONLY_MOUNT_OPTIONS & set(covering[1]):
-        return []
-    return [covering[0]]
+        if covering is None or len(mount_point) >= len(covering[1]):
+            covering = fields
+    return covering
+
+
+# DAH-3674: the kind of disk under docker's data root, published as `hard_disk.disk_type` on the
+# public nodes feed (lium-platform). A reading, not a verdict: nothing scores or gates on it.
+SYS_CLASS_BLOCK_PATH = "/sys/class/block"
+DISK_TYPE_NVME = "nvme"
+DISK_TYPE_SSD = "ssd"
+DISK_TYPE_HDD = "hdd"
+DISK_TYPE_UNKNOWN = "unknown"
+# Devices whose `rotational` flag describes no physical disk: one stacked on other devices (LVM /
+# dm-crypt, md RAID, a loop file, a network block device) hides which disks sit underneath, and a
+# virtual disk (virtio `vd*`, Xen `xvd*` - what a CVM executor sees) reports 1 whatever backs it
+# (measured on a virtio VM, 19 Sep 2026). Reported as unknown rather than as a guess.
+UNTYPED_DEVICE_PREFIXES = ("dm-", "md", "loop", "nbd", "rbd", "drbd", "vd", "xvd")
+
+
+def block_device_holding(mounts_text: str, path: str) -> str | None:
+    """The kernel name (`nvme1n1p1`, `sda2`, `dm-0`) of the block device whose filesystem holds
+    `path`; None when nothing covers it or the covering mount is not a /dev node (overlay, tmpfs,
+    a network filesystem).
+
+    The source is resolved through PID 1's root, so a `/dev/disk/by-uuid/...` or `/dev/mapper/...`
+    link in the mount table reads as the node the kernel names it by."""
+    covering = covering_mount(mounts_text, path)
+    if covering is None or not covering[0].startswith("/dev/"):
+        return None
+    source = covering[0]
+    try:
+        source = os.path.realpath(f"{HOST_ROOT_PREFIX}{source}")
+    except OSError:
+        # PID 1's root is not readable from here (a scrape run outside the executor container). The
+        # name as mounted is the reading then; a by-uuid link types as unknown downstream.
+        pass
+    return os.path.basename(source) or None
+
+
+def whole_disk_of(device_name: str) -> str:
+    """`nvme0n1p1` -> `nvme0n1`, `sda1` -> `sda`; a whole disk comes back unchanged.
+
+    sysfs says which is which: a partition's `/sys/class/block/<name>` carries a `partition` file
+    and resolves into its disk's directory. Read from the kernel rather than parsed off the name,
+    because the naming differs per driver (`sda1`, `nvme0n1p1`, `mmcblk0p1`)."""
+    device_path = f"{SYS_CLASS_BLOCK_PATH}/{device_name}"
+    if not os.path.exists(f"{device_path}/partition"):
+        return device_name
+    return os.path.basename(os.path.dirname(os.path.realpath(device_path)))
+
+
+def disk_type_of(device_name: str | None) -> str:
+    """nvme | ssd | hdd | unknown for the whole disk behind a block device name.
+
+    `nvme*` is NVMe by name. Anything else is what the kernel's `queue/rotational` flag says: 0 is
+    a solid-state disk, 1 a spinning one. A stacked or virtual device, a missing sysfs entry or any
+    other reading is unknown - never a default of one of the three."""
+    if not device_name:
+        return DISK_TYPE_UNKNOWN
+    disk = whole_disk_of(device_name)
+    if disk.startswith(UNTYPED_DEVICE_PREFIXES):
+        return DISK_TYPE_UNKNOWN
+    if disk.startswith("nvme"):
+        return DISK_TYPE_NVME
+    try:
+        with open(f"{SYS_CLASS_BLOCK_PATH}/{disk}/queue/rotational") as rotational_file:
+            rotational = rotational_file.read().strip()
+    except Exception:
+        return DISK_TYPE_UNKNOWN
+    if rotational == "0":
+        return DISK_TYPE_SSD
+    if rotational == "1":
+        return DISK_TYPE_HDD
+    return DISK_TYPE_UNKNOWN
+
+
+def get_disk_type() -> str:
+    """The disk type under docker's data root - the filesystem get_host_disk_usage measures."""
+    try:
+        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    except Exception:
+        docker_root_dir = "/var/lib/docker"
+    with open(HOST_MOUNTS_PATH) as mounts_file:
+        mounts_text = mounts_file.read()
+    return disk_type_of(block_device_holding(mounts_text, docker_root_dir))
 
 
 def write_probe_failure_reason(errno_value) -> str:
@@ -1817,6 +1910,12 @@ def get_machine_specs():
         # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
         # node that loses only the breakdown must keep reporting total/used/free.
         data["hard_disk_docker_scrape_error"] = repr(exc)
+
+    try:
+        data["data_hard_disk"]["hard_disk_disk_type"] = get_disk_type()
+    except Exception:
+        # a mount table the scrape cannot read is an unknown disk, not a lost hard_disk block
+        data["data_hard_disk"]["hard_disk_disk_type"] = DISK_TYPE_UNKNOWN
 
     try:
         data["data_disk_health"] = get_disk_health().as_payload()
