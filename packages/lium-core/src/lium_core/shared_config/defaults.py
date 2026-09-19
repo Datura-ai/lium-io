@@ -4,8 +4,8 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
     # The base listing price per GPU model (USD per GPU-hour): a listing sits between machine_min_price_rate x and
     # machine_max_price_rate x of it. DAH-3648 (owner, 2026-09-18): every model with >= 50 paid rentals in the trailing
     # 30 days is its 30-day paid median floored to the cent (rental_history.price_per_gpu, one row per rental, rentals
-    # active in the window, percentile_cont(0.5)); models under 50 rentals or with none keep their value. The backend's
-    # MACHINE_PRICES (lium-platform core/constants.py) carries the same 15 values.
+    # active in the window, percentile_cont(0.5)); models under 50 rentals or with none keep their value.
+    # lium-platform#558 moves the backend's MACHINE_PRICES (core/constants.py) to the same 15 values.
     machine_prices={
         "NVIDIA B300 SXM6 AC": 8.00,
         "NVIDIA B200": 5.60,
