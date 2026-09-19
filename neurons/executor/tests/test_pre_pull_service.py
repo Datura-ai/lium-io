@@ -1,6 +1,6 @@
 """DAH-2977 — idle-time pre-pull of the top-N official templates.
 
-Off by default (today's behaviour byte-for-byte); on, at most one digest-pinned pull per
+On by default since DAH-3604 (off restores the pre-DAH-2977 behaviour byte-for-byte); on, at most one digest-pinned pull per
 sweep, never while a rental exists or is starting, never below the disk floor (LRU
 pre-pulled images are evicted first), its budget cut at the per-image timeout and short of
 the loop's refresh deadline; the loop starts it as a task and never waits for it.
@@ -150,6 +150,14 @@ def _one_loop_iteration(
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(cache_template_service.run_cache_template_prefetch(state_path=None))
     return seen
+
+
+def test_pre_pull_is_on_by_default():
+    # DAH-3604, rollout step 3: a node whose .env does not mention the flag pre-pulls;
+    # PRE_PULL_TEMPLATES_ENABLED=false is the opt-out.
+    from core.config import Settings
+
+    assert Settings.model_fields["PRE_PULL_TEMPLATES_ENABLED"].default is True
 
 
 def test_flag_off_does_not_ask_for_or_touch_pre_pull_entries(monkeypatch):
