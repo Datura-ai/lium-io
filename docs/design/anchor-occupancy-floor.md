@@ -1,12 +1,12 @@
 # Anchor occupancy floor — a capped bucket in the validator's unrented pool (design note, DAH-3673)
 
-Status: DRAFT for Rustam's approval (PR_PROCESS §1b: incentive math needs a human-approved note before code). No code, no config change in this PR. Code references are `path:line` at lium-io `61020313` (main, 19 Sep 2026); paths are relative to `neurons/validators/src/` unless they start with `lium_protocol/` or `lium_core/` (`packages/lium-core/src/`). Programme text: growth-strategy §5.3, supply-partnerships §2, gmv-bridge §3 row 1 / D1.
+Status: DRAFT for the ticket owner's approval (PR_PROCESS §1b: incentive math needs a human-approved note before code). No code, no config change in this PR. Code references are `path:line` at lium-io `61020313` (main, 19 Sep 2026); paths are relative to `neurons/validators/src/` unless they start with `lium_protocol/` (repo root) or `lium_core/` (`packages/lium-core/src/`). The floor percentage F is an open owner decision (OD-19); every "F = 60" below is a worked example, not the plan. Programme text: growth-strategy §5.3, supply-partnerships §2, gmv-bridge §3 row 1 / D1.
 
 ## 1. Goal
 
 An **accepted anchor node** (8× H100 / H200 / B200 / B300 / RTX PRO 6000, whole node, secure tier) is paid, for its **first 90 days**, as if at least **F %** of its GPU-hours were rented at its **listed price**. F is the owner's OD-19; **default F = 0: the mechanism is present, the floor is off**, and every node is scored exactly as today.
 
-Per UTC day, with F as a fraction: `top_up = max(0, F × listed_price × gpu_count × 24 h − rental_revenue_that_day)`.
+Per UTC day, with F in percent: `top_up = max(0, F/100 × listed_price × gpu_count × 24 h − rental_revenue_that_day)`.
 
 ## 2. Non-goals
 
@@ -50,13 +50,13 @@ So 20 anchor nodes never dilute the ordinary B300 8× bucket (cap 32 GPUs, `ince
 
 ### 4.3 The floor per UTC day, in the validator's own unit (cycles)
 
-The validator's primitive is the 15-min cycle: 96 per UTC day. A day's floor budget is `budget_cycles = floor(F/100 × 96)` (57 at F = 60). Per anchor node and UTC day the validator keeps two Redis counters, `rented_cycles` and `floor_cycles` (key `anchor_day:{executor_id}:{YYYY-MM-DD}`, TTL 48 h; Redis already holds per-executor state, `services/redis_service.py:401`, `:582`). Each cycle:
+The validator's primitive is the 15-min cycle: 96 per UTC day. A day's floor budget is `budget_cycles = floor(F/100 × 96)` (57 at F = 60). Per anchor node and UTC day the validator keeps two Redis counters, `rented_cycles` and `floor_cycles` (key `anchor_day:{executor_id}:{YYYY-MM-DD}`, TTL 48 h; Redis already holds per-executor state, `services/redis_service.py:401`, and the incentive snapshot, `:582`). Each cycle:
 
 - rented → `rented_cycles += 1`; mining pool as today.
 - idle and `rented_cycles + floor_cycles < budget_cycles` → **paying cycle**: `floor_cycles += 1`; the node enters the anchor bucket at `anchor_rate`.
 - idle otherwise → incentive 0 for this cycle with a proposed new append-only reason `ANCHOR_FLOOR_DAY_MET` (`incentive/miner_incentive_log.py:63`), so the provider's incentive log says why.
 
-Over a day this pays `anchor_rate × gpu_count × 0.25 h × min(idle_cycles, max(0, budget − rented_cycles))` = `F × P × n × 24 − rented_h × P × n` when the node was idle long enough — the ticket's formula with `rental_revenue ≈ rented_hours × listed price`. Two deviations, both bounded by the day's rented revenue: a rental ending mid-cycle counts as a rented cycle; a node idle in the morning and rented all afternoon ends the day above the floor (weights are set, nothing is clawed back). The exact `billed_usd` version needs the backend (open question 3).
+Over a day this pays `anchor_rate × gpu_count × 0.25 h × min(idle_cycles, max(0, budget − rented_cycles))` = `F/100 × P × n × 24 − rented_h × P × n` when the node was idle long enough — the ticket's formula with `rental_revenue ≈ rented_hours × listed price`. Two deviations, both bounded by the day's rented revenue: a rental ending mid-cycle counts as a rented cycle; a node idle in the morning and rented all afternoon ends the day above the floor (weights are set, nothing is clawed back). The exact `billed_usd` version needs the backend (open question 3).
 
 ### 4.4 The rate: listed price, never above it
 
@@ -112,7 +112,7 @@ Both proposed settings `ANCHOR_FLOOR_PCT > 0` and `ANCHOR_BUCKET_MAX_SHARE > 0` 
 ## 6. Cost model (gmv-bridge §1, §3 row 1, D1)
 
 - Pool ceiling: ≈ 5,900 α/day × $21.73 × 0.41 (`FIXED_RATIO`) × 0.91 (`total_burn_emission`) ≈ **$47k/day**; ≈ $4.3k/day of it is paid to idle nodes today, the rest is burned.
-- **Expected ≈ $0/wk** at F = 60: B300 / B200 / H200 GPUs rent 94 / 84 / 75 % of the time today (bridge §1, type level), i.e. 18–22 rented hours a day against a 14.4-hour budget, so `budget − rented_cycles ≤ 0` on almost every day.
+- **Expected ≈ $0/wk** at F = 60 (worked example; F is OD-19): B300 / B200 / H200 GPUs rent 94 / 84 / 75 % of the time today (bridge §1, type level), i.e. 18–22 rented hours a day against a 14.4-hour budget, so `budget − rented_cycles ≤ 0` on almost every day.
 - **Worst case**, 20 accepted 8× B300 nodes idle all day at $8.06: 160 GPUs × 14.4 h × $8.06 ≈ **$18.6k/day ≈ $130k/wk** (D1) = 39 % of the ceiling.
 - **What X caps it to**: X = 0.25 → ≈ $12k/day ≈ **$84k/wk**, the worst case pro-rates to 64 % of the floor; X = 0.40 covers the worst case in full; X = 0 pays nothing.
 - Per node the bound is `F/100 × 24 × listed × 8` a day ($928 at $8.06, $737 at the $6.40 pin), whatever the pool does.
@@ -124,13 +124,13 @@ Both proposed settings `ANCHOR_FLOOR_PCT > 0` and `ANCHOR_BUCKET_MAX_SHARE > 0` 
 3. Validator, prod (proposed): `ANCHOR_FLOOR_PCT=0 ANCHOR_BUCKET_MAX_SHARE=0` — a no-op deploy. F and X are set only when OD-19 is answered.
 4. Observability (proposed): one structured log line per anchor node per cycle, `Anchor_breakdown | 8xB300 [uuid8] | day 2026-10-01 rented 11 floor 3 budget 57 | $8.06 × 1.00 × 8 = $64.48/h`, next to `Rental_breakdown` (`incentive/utils.py:132`); `incentive_source = "anchor_floor"`, `incentive_formula_version = "anchor_floor_v1"` and the anchor inputs in `incentive_formula_inputs` (`services/task/models.py:152-184`), published to the backend ledger as today (`services/miner_service.py:901-920`) → a Grafana series "Anchor floor paid — last 24h (USD, validator ledger)" plus a per-node daily table on the dashboard that shows idle pay; `ANCHOR_FLOOR_DAY_MET` in the provider's incentive log.
 
-## 8. Open questions for Rustam (proposed answer after each)
+## 8. Open questions for the ticket owner (proposed answer after each)
 
 1. Allow-list transport: a field on `GET /internal/executors/rented` vs a list in `IncentiveConfig`? — **Feed.** The backend owns acceptance, strikes and pins; the validator stays stateless about lifecycle; fail-closed like `spot_executor_ids`.
 2. F, days, X in validator `Settings` (env, the `REFERRAL_EMISSION_SHARE` precedent) or in `SharedConfig` (the `total_burn_emission` precedent, one value for both hotkeys)? — **Settings for the first PR**; no lium-core release needed. Move to shared config if the two hotkeys ever need a change without a redeploy.
 3. Daily budget state in validator Redis (§4.3) vs a backend-computed T+1 deficit from billed USD served in the feed? — **Redis.** It uses the same `is_rented` the cycle already scores on and costs no feed round-trip; the backend ledger audits it. The T+1 version is exact but a day late and would make the feed carry money.
 4. Floor rate = listed `price_per_gpu` (capped at the p90 soft limit) or the pinned median `hourly_rate`? — **Listed, capped.** The programme says "at its listed price"; §74 holds because the listed price is the node's rental rate.
-5. Beyond the day's budget: 0 (floor-only) or fall back to ordinary idle pay? — **0.** It keeps anchors out of the ordinary buckets (20 anchors would dilute the B300 8× bucket 5×) and keeps the per-node bound at `F × 24 × listed × 8`.
+5. Beyond the day's budget: 0 (floor-only) or fall back to ordinary idle pay? — **0.** It keeps anchors out of the ordinary buckets (20 anchors would dilute the B300 8× bucket 5×) and keeps the per-node bound at `F/100 × 24 × listed × 8`.
 6. Cap base = the pool ceiling (§4.5) or today's idle spend? — **Ceiling**, X = 0.25 recommended (§6).
 7. Split-enabled anchors: excluded in v1, or per-GPU occupancy (`rented_gpu_count / gpu_count`)? — **Excluded**; the DAH-2546 capability gate is met by NCU or TDX (the flag is shadow today, `core/config.py:419`).
 8. Two validator hotkeys keep independent counters from the same feed; drift is at most one cycle. Acceptable? — **Yes**; stake-weighted consensus averages the two weight vectors.
@@ -139,7 +139,7 @@ Both proposed settings `ANCHOR_FLOOR_PCT > 0` and `ANCHOR_BUCKET_MAX_SHARE > 0` 
 
 ## 9. Owner decisions referenced
 
-- **OD-19** — F (recommended 60; offer sheet version A). **DEFAULT: 0 = no floor** (offer sheet version B goes out) until Fish answers.
+- **OD-19** — F (recommended 60; offer sheet version A). **DEFAULT: 0 = no floor** (offer sheet version B goes out) until the owner answers.
 - **Funding share cap X** (`ANCHOR_BUCKET_MAX_SHARE`; recommended 0.25). **DEFAULT: 0** until answered.
 
 Both defaults keep every score identical to today; the code that follows this note ships with them.
