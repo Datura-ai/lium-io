@@ -305,6 +305,51 @@ async def test_a_restarting_pod_still_holds_its_gpus(svc, monkeypatch, caplog):
     assert event["pod_containers"] == ["pod_cust1"]
 
 
+# A previous filler crash-looping beside the pod, holding GPUs {2,3}: never a reason to refuse.
+RESTARTING_FILLER_ON_2_3 = (
+    "/filler_9f1c2b3a-4d5e-4f60-8a7b-1c2d3e4f5a6b\t"
+    '[{"Driver":"nvidia","Count":0,"DeviceIDs":["GPU-2","GPU-3"],"Capabilities":[["gpu"]],"Options":{}}]'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("planned", "expect_refusal"),
+    [
+        (["GPU-2", "GPU-3"], False),  # overlaps only the FILLER's claim: the create proceeds
+        (["GPU-1", "GPU-2"], True),  # overlaps the POD's claim: refused, because of the pod alone
+    ],
+    ids=["filler-only-overlap-proceeds", "pod-overlap-refuses"],
+)
+async def test_a_restarting_filler_beside_the_pod_never_influences_the_decision(
+    svc, monkeypatch, caplog, planned, expect_refusal
+):
+    # Fillers restart too (unless-stopped): a crash-looping filler_* from an earlier run may sit in
+    # `restarting` beside a live pod_*. Two guards keep it out of the verdict: `docker ps` asks for
+    # `name=pod_` only, and the parser skips every non-pod_ name before reading its claim. The mock
+    # hands the filler's line back anyway (over-inclusive on purpose) so the parser's skip is what is
+    # tested here; the ps filter is pinned on the recorded command.
+    ssh = _host_with_running_pods(POD_ON_0_1, RESTARTING_FILLER_ON_2_3, restarting=True)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    with caplog.at_level(logging.WARNING):
+        result = await _run(svc, _filler_payload(planned))
+
+    [ps_cmd] = [cmd for cmd in _live_pod_read_cmds(ssh) if not _is_inspect(cmd)]
+    assert "--filter name=pod_" in ps_cmd and "filler_" not in ps_cmd
+    if expect_refusal:
+        assert isinstance(result, FailedContainerRequest), result
+        assert result.failure_step == GUARD_STEP
+        assert "filler_9f1c2b3a" not in (result.detail or "")
+        [event] = _events(caplog)
+        assert event["pod_containers"] == ["pod_cust1"]
+        assert event["gpu_overlap"] == ["GPU-1"], "the pod's GPUs only — never the filler's {2,3}"
+    else:
+        assert isinstance(result, ContainerCreated), result
+        assert _created_run_spec(svc) is not None
+        assert _events(caplog) == []
+
+
 # ---------------------------------------------------------------------------------------------------
 # unreadable host: fail closed under its OWN step, no overlap event
 # ---------------------------------------------------------------------------------------------------
