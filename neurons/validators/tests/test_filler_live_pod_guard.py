@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from unittest.mock import AsyncMock, Mock
 
+import asyncssh
 import pytest
 from payload_models.payloads import ContainerCreated, FailedContainerRequest, WorkloadKind
 from services.docker_service import DockerService
@@ -65,6 +66,8 @@ REAL_INSPECT_PINNED = (
 )
 REAL_INSPECT_WHOLE_HOST = '/pod_e187all\t[{"Driver":"","Count":-1,"DeviceIDs":null,"Capabilities":[["gpu"]],"Options":{}}]'
 REAL_INSPECT_NO_GPU = "/pod_e187nogpu\tnull"
+# docker create --device nvidia.com/gpu=0 (CDI), same template, same dockerd:
+REAL_INSPECT_CDI = '/pod_e187cdi\t[{"Driver":"cdi","Count":0,"DeviceIDs":["nvidia.com/gpu=0"],"Capabilities":null,"Options":null}]'
 REAL_INSPECT_R1_LITERAL = (
     '/pod_e187tab\\t[{"Driver":"","Count":0,"DeviceIDs":["GPU-aaaa1111-0000-0000-0000-000000000001",'
     '"GPU-bbbb2222-0000-0000-0000-000000000002"],"Capabilities":[["gpu"]],"Options":{}}]'
@@ -92,13 +95,20 @@ def _result(exit_status: int = 0, stdout: str = "", stderr: str = ""):
 
 
 def _host_with_running_pods(
-    *inspect_lines: str, ps_exit: int = 0, inspect_exit: int = 0, hang: str | None = None
+    *inspect_lines: str,
+    ps_exit: int = 0,
+    inspect_exit: int = 0,
+    hang: str | None = None,
+    ps_raises: BaseException | None = None,
+    restarting: bool = False,
 ):
     """An ssh client whose live-pod reads answer with these inspect lines.
 
     `docker ps -q` returns one fake id per line; `docker inspect <ids>` returns the lines. `ps_exit` /
     `inspect_exit` make either command fail the way dockerd does (non-zero, error on stderr, empty
-    stdout); `hang="ps"|"inspect"` makes that command raise TimeoutError.
+    stdout); `hang="ps"|"inspect"` makes that command raise TimeoutError; `ps_raises` makes the ps
+    read raise that exception (the SSH layer failing); `restarting=True` models pods in docker state
+    `restarting` — listed ONLY when the ps command asks for that status (as dockerd does).
     """
     client = _ssh_client()
     ids = [f"{index:012x}" for index in range(1, len(inspect_lines) + 1)]
@@ -107,6 +117,10 @@ def _host_with_running_pods(
         if _is_ps(cmd):
             if hang == "ps":
                 raise TimeoutError()
+            if ps_raises is not None:
+                raise ps_raises
+            if restarting and "--filter status=restarting" not in cmd:
+                return _result(0, "")
             if ps_exit:
                 return _result(
                     ps_exit,
@@ -257,7 +271,7 @@ async def test_a_customer_create_never_runs_the_filler_guard(svc, monkeypatch):
 @pytest.mark.asyncio
 async def test_a_real_docker_inspect_line_refuses_the_filler(svc, monkeypatch, caplog):
     # The line dockerd actually prints (docker 29.1.3, template with the {{"\t"}} action).
-    ssh = _host_with_running_pods(REAL_INSPECT_PINNED, REAL_INSPECT_NO_GPU)
+    ssh = _host_with_running_pods(REAL_INSPECT_PINNED)
     _patch_happy(svc, monkeypatch, ssh)
 
     with caplog.at_level(logging.WARNING):
@@ -272,9 +286,55 @@ async def test_a_real_docker_inspect_line_refuses_the_filler(svc, monkeypatch, c
     assert event["gpu_overlap"] == ["GPU-bbbb2222-0000-0000-0000-000000000002"]
 
 
+@pytest.mark.asyncio
+async def test_a_restarting_pod_still_holds_its_gpus(svc, monkeypatch, caplog):
+    # Every Lium pod runs with restart_policy unless-stopped: a crash-looping customer pod sits in
+    # docker state `restarting` most of each cycle, still holding the rental and its DeviceRequests.
+    # `docker ps --filter status=running` does not list it (verified on docker 29.1.3); the guard
+    # must ask for restarting (and paused) too, or it reads "no pod" and the sweep removes the tenant.
+    ssh = _host_with_running_pods(POD_ON_0_1, restarting=True)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    with caplog.at_level(logging.WARNING):
+        result = await _run(svc, _filler_payload(["GPU-1"]))
+
+    assert isinstance(result, FailedContainerRequest), result
+    assert result.failure_step == GUARD_STEP
+    svc.clean_existing_containers.assert_not_awaited()
+    [event] = _events(caplog)
+    assert event["pod_containers"] == ["pod_cust1"]
+
+
 # ---------------------------------------------------------------------------------------------------
 # unreadable host: fail closed under its OWN step, no overlap event
 # ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        asyncssh.ConnectionLost("Connection lost"),
+        asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "open failed"),
+        OSError(104, "Connection reset by peer"),
+    ],
+    ids=["ConnectionLost", "ChannelOpenError", "OSError"],
+)
+async def test_an_ssh_layer_failure_refuses_the_filler_as_unreadable(svc, monkeypatch, caplog, exc):
+    # The SSH read itself failing (connection lost, session refused — e.g. sshd MaxSessions on a busy
+    # host —, socket error) is a host that could not be read: the UNREADABLE step, never the
+    # confirmed-overlap step (which the platform closes STOPPED + counts as a live-pod refusal).
+    ssh = _host_with_running_pods(POD_ON_0_1, ps_raises=exc)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    with caplog.at_level(logging.WARNING):
+        result = await _run(svc, _filler_payload(["GPU-5"]))
+
+    assert isinstance(result, FailedContainerRequest), result
+    assert result.failure_step == UNREADABLE_STEP
+    assert type(exc).__name__ in (result.detail or "")
+    assert svc.rental_docker_client_factory.client.run_specs == []
+    assert _events(caplog) == []
 
 
 @pytest.mark.asyncio
@@ -373,21 +433,23 @@ def test_the_inspect_template_emits_the_tab_through_a_template_action():
     assert (
         "--filter status=running" in LIVE_POD_IDS_CMD and "--filter name=pod_" in LIVE_POD_IDS_CMD
     )
+    # a crash-looping (restarting) or paused pod still holds its GPUs; an exited / created one does
+    # not (the sweep would have removed it — listing it would refuse every filler, every cycle)
+    assert "--filter status=restarting" in LIVE_POD_IDS_CMD
+    assert "--filter status=paused" in LIVE_POD_IDS_CMD
+    assert "status=exited" not in LIVE_POD_IDS_CMD and "status=created" not in LIVE_POD_IDS_CMD
 
 
 def test_parse_live_pod_gpu_sets_reads_real_inspect_lines():
     from services.filler_live_pod_guard import parse_live_pod_gpu_sets
 
-    pods = parse_live_pod_gpu_sets(
-        "\n".join([REAL_INSPECT_PINNED, REAL_INSPECT_WHOLE_HOST, REAL_INSPECT_NO_GPU, ""])
-    )
+    pods = parse_live_pod_gpu_sets("\n".join([REAL_INSPECT_PINNED, REAL_INSPECT_WHOLE_HOST, ""]))
 
     assert pods == {
         "pod_e187tab": frozenset(
             {"GPU-aaaa1111-0000-0000-0000-000000000001", "GPU-bbbb2222-0000-0000-0000-000000000002"}
         ),
         "pod_e187all": None,  # --gpus all: Count=-1, DeviceIDs=null → the whole host
-        # pod_e187nogpu: created without --gpus (DeviceRequests null) → no GPU claim, skipped
     }
 
 
@@ -413,6 +475,14 @@ def test_parse_live_pod_gpu_sets_skips_non_pods():
         REAL_INSPECT_R1_LITERAL,  # no separator (the r1 template's literal \t)
         "/pod_broken\tnot-json",  # separator, unparseable claim
         "/pod_broken\t[42]",  # separator, a claim of the wrong shape
+        # A pod_* with NO DeviceRequest: a Lium pod never has one (build_gpu_docker_config always emits
+        # a DeviceRequest; the legacy path always passes --gpus), so on a Lium host this is a container
+        # whose GPU use we cannot see (env-only NVIDIA_VISIBLE_DEVICES) — not "no claim".
+        REAL_INSPECT_NO_GPU,  # DeviceRequests null (captured; env-only attachment reads the same)
+        "/pod_nodevreq\t[]",  # DeviceRequests []
+        # A CDI attachment: DeviceIDs that are not GPU-<uuid>s can never intersect the filler's uuids,
+        # so the claim is unreadable to this guard, not disjoint.
+        REAL_INSPECT_CDI,
     ],
 )
 def test_parse_live_pod_gpu_sets_fails_closed_on_a_line_it_cannot_trust(line):
