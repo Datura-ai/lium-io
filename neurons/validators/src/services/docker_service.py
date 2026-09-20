@@ -170,6 +170,11 @@ CONTAINER_STOP_GRACE_SECONDS = 30
 # and avoid the containerd/sysbox wedge. Keep in sync with compute-app FILLER_STOP_WAIT_TIMEOUT_SECONDS.
 FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
 
+# rel-box-34: typed event written when a `filler_*` container is still on the host after a
+# customer create's `docker rm -fv`. Same name as compute-app's FILLER_STILL_RUNNING_EVENT so one
+# log query counts both halves (fields: executor_id, pod_name, container_names, reason).
+FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
+
 # In-container port the cache-template images' start.sh hardcodes for Jupyter
 # (`jupyter lab --port=8888`). It reads no port from the environment, so the
 # image-managed Jupyter path is only safe while the mapped docker port is this one.
@@ -2030,10 +2035,17 @@ class DockerService:
         active_container_names: list[str] | None = None,
         active_volume_names: list[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
+        remove_every_filler: bool = False,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+
+        rel-box-34: ``remove_every_filler`` (a customer's create) treats every `filler_*` as stale
+        whatever ``active_container_names`` says -- a paying pod never shares the node with a
+        filler, and a backend whose stop did not confirm may still list one. The removal is then
+        re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
+        (typed fields, countable) and the create goes on.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
@@ -2048,6 +2060,8 @@ class DockerService:
                 await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
+            if remove_every_filler:
+                active_set = {name for name in active_set if not name.startswith(FILLER_CONTAINER_PREFIX)}
             # DAH-2740: a sibling create on the same host sweeps while an edit's parked container is
             # the customer's only copy; the parked twin of every active pod name is protected too
             active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
@@ -2074,12 +2088,22 @@ class DockerService:
                         **default_extra,
                         "container_names": container_names,
                         "active_containers": list(active_set),
+                        "remove_every_filler": remove_every_filler,
                     }),
                 ),
             )
 
             command = f'/usr/bin/docker rm -fv {container_names}'
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+
+            removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
+            if remove_every_filler and removed_fillers:
+                await self._confirm_fillers_removed(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    pod_name=pod_name,
+                    removed_fillers=removed_fillers,
+                )
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2098,6 +2122,51 @@ class DockerService:
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             return stale_containers
         return []
+
+    async def _confirm_fillers_removed(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        removed_fillers: list[str],
+    ) -> list[str]:
+        """Re-read `docker ps -a` after a customer create's filler removal; report any survivor.
+
+        Returns the `filler_*` names still on the host. A listing that fails is logged and
+        returns [] -- the confirmation never fails the create.
+        """
+        try:
+            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
+            names_after = [name for name in (result.stdout or "").strip().split("\n") if name]
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Unable to confirm the filler removal before the customer's create",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "pod_name": pod_name,
+                        "container_names": removed_fillers,
+                        "error": str(exc),
+                    }),
+                )
+            )
+            return []
+        survivors = [name for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)]
+        if survivors:
+            logger.warning(
+                _m(
+                    "Filler still running on a node a customer rents after docker rm -fv",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "event": FILLER_STILL_RUNNING_EVENT,
+                        "reason": "validator_rm_survived",
+                        "pod_name": pod_name,
+                        "container_names": survivors,
+                        "removed_fillers": removed_fillers,
+                    }),
+                )
+            )
+        return survivors
 
     async def clean_stale_vloopback_volumes(
         self,
@@ -5061,6 +5130,10 @@ class DockerService:
                     active_container_names=protected_container_names,
                     active_volume_names=payload.active_volume_names,
                     host_probe=docker_listing_probe,
+                    # rel-box-34: a customer's pod never shares the node with a filler, so its
+                    # create removes every filler_* whatever the backend listed; a filler create
+                    # keeps protecting its listed sibling bundle (DAH-2465).
+                    remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                 )
                 if removed_containers:
                     docker_listing_probe = None
