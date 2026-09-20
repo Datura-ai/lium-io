@@ -14,10 +14,11 @@ the pod. The parser / overlap unit tests import the fix's module inside the test
 from __future__ import annotations
 
 import logging
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from payload_models.payloads import ContainerCreated, FailedContainerRequest, WorkloadKind
+from services.docker_service import DockerService
 
 from tests.test_deploy_optimizations import (
     _created_run_spec,
@@ -26,8 +27,13 @@ from tests.test_deploy_optimizations import (
     _run,
     _ssh_client,
     _ssh_run_cmds,
-    svc,  # noqa: F401 - fixture
 )
+
+
+@pytest.fixture
+def svc():
+    return DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+
 
 EVENT = "FILLER_START_REFUSED_LIVE_POD"
 GUARD_STEP = "filler_live_pod_guard"
@@ -45,7 +51,9 @@ def _host_with_running_pods(*inspect_lines: str):
         result = AsyncMock()
         result.exit_status = 0
         result.stderr = ""
-        result.stdout = "\n".join(inspect_lines) + "\n" if "DeviceRequests" in cmd and inspect_lines else ""
+        result.stdout = (
+            "\n".join(inspect_lines) + "\n" if "DeviceRequests" in cmd and inspect_lines else ""
+        )
         return result
 
     client.run = AsyncMock(side_effect=_side)
@@ -53,7 +61,9 @@ def _host_with_running_pods(*inspect_lines: str):
 
 
 def _filler_payload(gpu_uuids: list[str]):
-    return _payload(workload_kind=WorkloadKind.FILLER, gpu_uuids=gpu_uuids, active_container_names=[])
+    return _payload(
+        workload_kind=WorkloadKind.FILLER, gpu_uuids=gpu_uuids, active_container_names=[]
+    )
 
 
 def _events(caplog) -> list[dict]:
@@ -195,8 +205,8 @@ def test_parse_live_pod_gpu_sets_reads_pinned_whole_host_and_skips_non_pods():
             POD_ON_0_1,
             POD_WHOLE_HOST,
             '/filler_abc\t[{"Driver":"nvidia","Count":0,"DeviceIDs":["GPU-7"],"Capabilities":[["gpu"]]}]',
-            '/container_health_check\t[]',
-            '/pod_nogpu\tnull',
+            "/container_health_check\t[]",
+            "/pod_nogpu\tnull",
             "",
         ]
     )

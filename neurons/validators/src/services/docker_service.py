@@ -135,6 +135,10 @@ from tenacity import RetryError
 
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
+from services.filler_live_pod_guard import (
+    FILLER_LIVE_POD_GUARD_STEP,
+    assert_no_live_pod_on_filler_gpus,
+)
 from services.ssh_service import SSHService
 from services.volume_keys import VolumeKeyDeriver
 
@@ -5042,6 +5046,23 @@ class DockerService:
                 # their own commands. The GPU, power and image-label sections are unaffected by a
                 # docker removal and stay in use.
                 docker_listing_probe: PrerunHostProbe | None = host_probe
+
+                if payload.workload_kind == WorkloadKind.FILLER:
+                    # E-187 (DAH-3706 family): host truth before anything changes on the host — a
+                    # RUNNING pod_* holding GPUs this filler would take refuses the create (event
+                    # FILLER_START_REFUSED_LIVE_POD, failure_step filler_live_pod_guard). Deliberately
+                    # BEFORE the sweep below: on a host the backend re-registered as a new executor,
+                    # the customer's container is not on active_container_names, and the sweep would
+                    # remove the paying tenant to make room for a filler. The sweep is the customer
+                    # create's tool (lium-io#1417); a filler yields.
+                    current_step = FILLER_LIVE_POD_GUARD_STEP
+                    await assert_no_live_pod_on_filler_gpus(
+                        ssh_client,
+                        filler_gpu_uuids=payload.gpu_uuids,
+                        executor_id=payload.executor_id,
+                        filler_pod_id=payload.pod_id,
+                        default_extra=default_extra,
+                    )
 
                 current_step = "container_cleanup"
                 # DAH-1524: the GC below (force-removing stale pod_/filler_
