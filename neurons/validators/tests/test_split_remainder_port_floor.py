@@ -151,15 +151,54 @@ def test_unreadable_port_count_fails_open(spec):
     assert incentive._port_limited_remainder(remainder) is None
 
 
-def test_enforcement_is_off_by_default():
-    # Rollout contract (SO §70): a money-path gate ships in shadow mode; the flag default — not
-    # the env-resolved value — stays False until the validator owner turns it on.
-    default = type(settings).model_fields["ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER"].default
-
-    assert default is False
-
-
 # ── the scoring decision ──────────────────────────────────────────────────────
+
+
+async def _score(job: JobResult, rental_share: float = 0.1) -> RentalPriceIncentive:
+    incentive = _build_incentive(job)
+    incentive._calculate_rental_share = AsyncMock(return_value=rental_share)
+    await incentive.calculate_mining_scores()
+    return incentive
+
+
+@pytest.mark.asyncio
+async def test_default_settings_pay_the_port_limited_remainder_exactly_as_before(caplog):
+    # Rollout contract (SO §70): a money-path gate ships in shadow mode. With the settings object
+    # untouched (no monkeypatch of the flag) a 2-port remainder must receive the same idle pay
+    # as the computation the gate never sees — the same node with MIN_PORT_COUNT free ports —
+    # and the scorer must say so in the shadow line. Precondition, not the assertion: the
+    # settings object as the test process resolved it carries the shipped default.
+    assert settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is False, (
+        "ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is on in this environment — "
+        "the default-off contract cannot be measured here"
+    )
+
+    # Arrange — the baseline: an identical node at the floor, which no gate touches.
+    baseline_job = _make_job(available_port_count=MIN_PORT_COUNT, gpu_count=8, rented_gpu_count=4)
+    baseline = await _score(baseline_job)
+    assert baseline_job.incentive_idle > 0  # the baseline really pays the free GPUs
+
+    # Act — the prod case under default settings.
+    job = _make_job(available_port_count=2, gpu_count=8, rented_gpu_count=4)
+    with caplog.at_level(logging.INFO):
+        incentive = await _score(job)
+
+    # Assert — every payout figure equals the unflagged computation.
+    assert job.incentive_idle == pytest.approx(baseline_job.incentive_idle)
+    assert job.incentive_rented == pytest.approx(baseline_job.incentive_rented)
+    assert job.incentive == pytest.approx(baseline_job.incentive)
+    assert job.mining_score == pytest.approx(baseline_job.mining_score)
+    assert incentive.unrented_count_by_bucket == baseline.unrented_count_by_bucket
+    assert _reason_codes(job) == _reason_codes(baseline_job)
+    assert ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value not in _reason_codes(job)
+
+    # …and the shortfall is still visible: one shadow line, not enforced, with the reason code.
+    breach = _port_floor_breach_lines(caplog)
+    assert len(breach) == 1
+    assert breach[0].extra["enforced"] is False
+    assert breach[0].extra["reason"] == ZeroIncentiveReason.PORT_LIMITED_REMAINDER
+    assert breach[0].extra["available_port_count"] == 2
+    assert "shadow only - flag off" in breach[0].message
 
 
 @pytest.mark.asyncio
