@@ -30,6 +30,8 @@ INSPECTOR_STDERR_CAPTURE_MAX_BYTES = 8192
 # how much of one response the validator will hold before calling the payload unreadable.
 INSPECTOR_RESPONSE_MAX_BYTES = 64 * 1024 * 1024
 INSPECTOR_PAYLOAD_HEAD_CHARS = 200
+# the `error` text of an `ok: false` reply is the executor's to write; this is how much of it is kept
+INSPECTOR_ERROR_TEXT_MAX_CHARS = 2048
 # the sensor is inside the executor image measured by the CVM's TDX quote
 SENSOR_INTEGRITY_MEASURED = "tdx_measured_image"
 # a sha256sum run through the provider's own shell — unattested
@@ -68,9 +70,15 @@ class InspectorUnreadableError(Exception):
         pos: int | None = None,
         lineno: int | None = None,
         colno: int | None = None,
+        payload_bytes: int | None = None,
     ) -> None:
         self.cmd = cmd
-        self.payload_bytes = len(payload.encode("utf-8", errors="replace"))
+        # the reader already counted the bytes; only re-encode when nobody did
+        self.payload_bytes = (
+            payload_bytes
+            if payload_bytes is not None
+            else len(payload.encode("utf-8", errors="replace"))
+        )
         self.payload_head = repr(payload[:INSPECTOR_PAYLOAD_HEAD_CHARS])
         self.terminated = terminated
         self.json_error = json_error
@@ -354,9 +362,9 @@ class InspectorValidationService:
 
         response = self._parse_response(line, cmd)
         if not response.get("ok"):
-            raise InspectorInteractiveError(
-                response.get("error", "inspector executor command failed")
-            )
+            # the executor's text, kept a string and bounded before it reaches the log or the row
+            error_text = str(response.get("error") or "inspector executor command failed")
+            raise InspectorInteractiveError(error_text[:INSPECTOR_ERROR_TEXT_MAX_CHARS])
         return response.get("result", "")
 
     async def _read_response_line(self, process, cmd: str) -> str:
@@ -378,18 +386,18 @@ class InspectorValidationService:
                 break  # EOF: whatever was buffered is the whole payload
             chunks.append(chunk)
             total_bytes += len(chunk.encode("utf-8", errors="replace"))
-            if chunk.endswith("\n"):
-                break
             if total_bytes >= self.response_max_bytes:
+                # the cap is checked before the newline so no line above it reaches the decoder;
+                # only the head is kept — never a copy of everything that was buffered
                 raise InspectorUnreadableError(
                     cmd=cmd,
-                    payload="".join(chunks),
+                    payload=chunks[0][:INSPECTOR_PAYLOAD_HEAD_CHARS],
+                    payload_bytes=total_bytes,
                     terminated=False,
-                    json_error=(
-                        f"response line exceeds the {self.response_max_bytes}-byte cap"
-                        " without a newline"
-                    ),
+                    json_error=f"response line exceeds the {self.response_max_bytes}-byte cap",
                 )
+            if chunk.endswith("\n"):
+                break
         return "".join(chunks)
 
     @staticmethod

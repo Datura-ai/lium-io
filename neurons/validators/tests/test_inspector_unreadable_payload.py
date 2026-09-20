@@ -2,7 +2,7 @@
 
 On 20 Sep 2026 every inspector run on one rented executor died with
 ``JSONDecodeError: Unterminated string starting at line 1 column 24`` — column 24 is the opening
-quote of ``"result"`` in ``{"ok": true, "result": "…``. asyncssh's ``SSHReader.readline()`` returns
+quote of the ``result`` value in ``{"ok": true, "result": "…``. asyncssh's ``SSHReader.readline()`` returns
 a PARTIAL line when a single line is longer than the channel receive window (2 MiB by default):
 the session pauses reading at the window and ``readuntil`` gives back what it has. The response
 cipher for a host with a large collector report crosses that window, so the validator parsed the
@@ -139,6 +139,59 @@ async def test_response_line_over_the_hard_cap_is_unreadable():
     assert diagnostics["payload_terminated"] is False
     assert diagnostics["payload_bytes"] >= 1024
     assert "cap" in diagnostics["json_error"]
+
+
+@pytest.mark.asyncio
+async def test_response_line_ending_in_a_newline_past_the_cap_is_still_unreadable():
+    # the cap is checked before the newline: a terminating chunk does not smuggle a bigger line in
+    service = InspectorValidationService(response_max_bytes=1024)
+    line = json.dumps({"ok": True, "result": "C" * 2048}) + "\n"
+    cut = 1000  # first chunk under the cap, the second ends the line and crosses it
+    ssh = FakeSSH()
+    ssh.process.stdout = FakeStdout(_stdout(line[:cut], line[cut:]))
+
+    result = await service.validate_rented_executor(
+        FakeShell(), ssh, _executor(), {"executor_uuid": "exec-1"}
+    )
+
+    diagnostics = _assert_unreadable(result)
+    assert diagnostics["payload_terminated"] is False
+    assert diagnostics["payload_bytes"] == len(line.encode())
+    assert diagnostics["payload_head"] == repr(line[:200])
+    assert "cap" in diagnostics["json_error"]
+
+
+@pytest.mark.asyncio
+async def test_error_text_of_a_failed_reply_is_bounded():
+    # the `error` of an `ok: false` reply is the executor's text: kept a string, cut at the cap
+    long_error = "E" * (ivs.INSPECTOR_ERROR_TEXT_MAX_CHARS * 4)
+    ssh = FakeSSH()
+    ssh.process.stdout = FakeStdout(
+        _stdout(json.dumps({"ok": False, "error": long_error}) + "\n")
+    )
+
+    result = await _validate(ssh)
+
+    assert result.report is None
+    assert result.message is not None
+    assert result.message.reason == Msg.FAILED_INTERACTIVE.reason
+    assert result.error == "E" * ivs.INSPECTOR_ERROR_TEXT_MAX_CHARS
+    assert (result.diagnostics or {})["error"] == "E" * ivs.INSPECTOR_ERROR_TEXT_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_error_of_a_failed_reply_that_is_not_a_string_is_made_one():
+    ssh = FakeSSH()
+    ssh.process.stdout = FakeStdout(
+        _stdout(json.dumps({"ok": False, "error": {"code": 7, "why": ["x"]}}) + "\n")
+    )
+
+    result = await _validate(ssh)
+
+    assert result.message is not None
+    assert result.message.reason == Msg.FAILED_INTERACTIVE.reason
+    assert isinstance(result.error, str)
+    assert result.error == str({"code": 7, "why": ["x"]})
 
 
 # --- the other ways a stdout line stops being one JSON document ---------------------------------

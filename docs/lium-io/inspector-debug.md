@@ -51,13 +51,16 @@ Inspector validation failed >>> {"executor_uuid": "<uuid>", "reason": "INSPECTOR
 ## Reading the shapes
 
 - **`Unterminated string starting at` at column 24, `payload_terminated: false`** — column 24 is
-  the opening quote of `"result"` in `{"ok": true, "result": "`; the line was cut inside the
+  the opening quote of the `result` value in `{"ok": true, "result": "`; the line was cut inside the
   response cipher. Before this fix the cut came from asyncssh's `readline()`, which returns a
   partial line once one line outgrows the 2 MiB channel receive window (the 20 Sep 2026 case: a
   host whose collector report cipher crossed 2 MiB was unreadable on every run). The validator
   now reassembles a line across those partial reads, so this shape today means the executor
   process ended mid-line (`executor_stderr` may say why) or the line passed the 64 MiB cap
-  (`json_error` says `cap`).
+  (`json_error` says `cap`; the cap is checked before the newline, and only the first 200 chars
+  of such a line are kept).
+- **`INSPECTOR_FAILED_INTERACTIVE`** — the executor answered `ok: false`; its `error` text is the
+  row's `error`, kept as a string and cut at 2,048 chars.
 - **`Expecting value` at column 1, `payload_terminated: true`** — a non-JSON line on stdout: an
   executor image whose `inspector_executor.py` predates the fd-1 claim, or a shell rc file that
   prints on a non-interactive login. `payload_head` is the line.

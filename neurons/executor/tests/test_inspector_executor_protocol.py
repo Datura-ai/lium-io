@@ -57,6 +57,7 @@ def test_run_interactive_emits_one_escaped_json_line_per_command():
                 json.dumps({"cmd": "start-collector"}),
                 json.dumps({"cmd": "handshake-reply", "open_json": '{"hello": "validator"}'}),
                 "not json at all",
+                "42",
                 json.dumps({"cmd": "execute", "request_cipher": "cipher"}),
                 json.dumps({"cmd": "quit"}),
                 json.dumps({"cmd": "execute", "request_cipher": "after quit, never read"}),
@@ -73,11 +74,12 @@ def test_run_interactive_emits_one_escaped_json_line_per_command():
         {"ok": True, "result": ""},
         {"ok": True, "result": json.dumps({"hello": "executor", "open": '{"hello": "validator"}'})},
         {"ok": False, "error": "invalid json: Expecting value: line 1 column 1 (char 0)"},
+        {"ok": False, "error": "invalid request: expected a JSON object, got int"},
         {"ok": True, "result": RESULT_WITH_HAZARDS},
         {"ok": True, "result": ""},
     ]
     raw_lines = protocol_out.getvalue().split("\n")[:-1]
-    assert len(raw_lines) == 5, "one physical line per command, whatever the result contains"
+    assert len(raw_lines) == 6, "one physical line per command, whatever the result contains"
     assert all(line.isascii() for line in raw_lines), "the wire is ASCII: every non-ASCII char is escaped"
 
 
