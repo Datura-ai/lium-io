@@ -2220,7 +2220,10 @@ class DockerService:
                 DOCKER_PS_ALL_NAMES_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
             )
         except Exception as exc:
-            logger.warning(_m("docker ps -a listing failed", extra={"error": str(exc)}))
+            # typed fields only: an asyncssh error's text can carry the host's banner
+            logger.warning(
+                _m("docker ps -a listing failed", extra={"error_type": exc.__class__.__name__, "timeout_s": _PRERUN_HOST_PROBE_TIMEOUT_SECONDS})
+            )
             return None
         if result.exit_status != 0:
             logger.warning(
