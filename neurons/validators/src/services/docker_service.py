@@ -137,6 +137,8 @@ from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
 from services.filler_live_pod_guard import (
     FILLER_LIVE_POD_GUARD_STEP,
+    FILLER_LIVE_POD_GUARD_UNREADABLE_STEP,
+    FillerLivePodListingUnreadableError,
     assert_no_live_pod_on_filler_gpus,
 )
 from services.ssh_service import SSHService
@@ -5054,15 +5056,21 @@ class DockerService:
                     # BEFORE the sweep below: on a host the backend re-registered as a new executor,
                     # the customer's container is not on active_container_names, and the sweep would
                     # remove the paying tenant to make room for a filler. The sweep is the customer
-                    # create's tool (lium-io#1417); a filler yields.
+                    # create's tool (lium-io#1417); a filler yields. A host that could not be read
+                    # refuses too, under its OWN step, so the backend keeps its FAILED + backoff path
+                    # for it instead of the STOPPED close it gives a confirmed overlap.
                     current_step = FILLER_LIVE_POD_GUARD_STEP
-                    await assert_no_live_pod_on_filler_gpus(
-                        ssh_client,
-                        filler_gpu_uuids=payload.gpu_uuids,
-                        executor_id=payload.executor_id,
-                        filler_pod_id=payload.pod_id,
-                        default_extra=default_extra,
-                    )
+                    try:
+                        await assert_no_live_pod_on_filler_gpus(
+                            ssh_client,
+                            filler_gpu_uuids=payload.gpu_uuids,
+                            executor_id=payload.executor_id,
+                            filler_pod_id=payload.pod_id,
+                            default_extra=default_extra,
+                        )
+                    except FillerLivePodListingUnreadableError:
+                        current_step = FILLER_LIVE_POD_GUARD_UNREADABLE_STEP
+                        raise
 
                 current_step = "container_cleanup"
                 # DAH-1524: the GC below (force-removing stale pod_/filler_

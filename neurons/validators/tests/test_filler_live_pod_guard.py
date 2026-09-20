@@ -23,7 +23,6 @@ parser saw no separator. The fixtures below are REAL lines captured from `docker
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from unittest.mock import AsyncMock, Mock
 
@@ -49,7 +48,9 @@ def svc():
 EVENT = "FILLER_START_REFUSED_LIVE_POD"
 GUARD_STEP = "filler_live_pod_guard"
 UNREADABLE_STEP = "filler_live_pod_guard_unreadable"
-HOST_READ_TIMEOUT_SECONDS = 30  # the same bound every neighbouring host read on the create path uses
+HOST_READ_TIMEOUT_SECONDS = (
+    30  # the same bound every neighbouring host read on the create path uses
+)
 
 # Captured verbatim on docker 29.1.3 (Server 29.1.3, this lane's VM, 20 Sep 2026):
 #   docker create --name pod_e187tab --gpus '"device=GPU-aaaa…,GPU-bbbb…"' alpine:3.19 sleep 60
@@ -90,12 +91,14 @@ def _result(exit_status: int = 0, stdout: str = "", stderr: str = ""):
     return result
 
 
-def _host_with_running_pods(*inspect_lines: str, ps_exit: int = 0, inspect_exit: int = 0, hang: str | None = None):
+def _host_with_running_pods(
+    *inspect_lines: str, ps_exit: int = 0, inspect_exit: int = 0, hang: str | None = None
+):
     """An ssh client whose live-pod reads answer with these inspect lines.
 
     `docker ps -q` returns one fake id per line; `docker inspect <ids>` returns the lines. `ps_exit` /
     `inspect_exit` make either command fail the way dockerd does (non-zero, error on stderr, empty
-    stdout); `hang="ps"|"inspect"` makes that command raise asyncio.TimeoutError.
+    stdout); `hang="ps"|"inspect"` makes that command raise TimeoutError.
     """
     client = _ssh_client()
     ids = [f"{index:012x}" for index in range(1, len(inspect_lines) + 1)]
@@ -103,13 +106,17 @@ def _host_with_running_pods(*inspect_lines: str, ps_exit: int = 0, inspect_exit:
     def _side(cmd, *args, **kwargs):
         if _is_ps(cmd):
             if hang == "ps":
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
             if ps_exit:
-                return _result(ps_exit, "", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+                return _result(
+                    ps_exit,
+                    "",
+                    "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+                )
             return _result(0, "\n".join(ids) + ("\n" if ids else ""))
         if _is_inspect(cmd):
             if hang == "inspect":
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
             if inspect_exit:
                 return _result(inspect_exit, "", "error: no such object: deadbeef")
             return _result(0, "\n".join(inspect_lines) + "\n" if inspect_lines else "")
@@ -120,7 +127,9 @@ def _host_with_running_pods(*inspect_lines: str, ps_exit: int = 0, inspect_exit:
 
 
 def _filler_payload(gpu_uuids: list[str]):
-    return _payload(workload_kind=WorkloadKind.FILLER, gpu_uuids=gpu_uuids, active_container_names=[])
+    return _payload(
+        workload_kind=WorkloadKind.FILLER, gpu_uuids=gpu_uuids, active_container_names=[]
+    )
 
 
 def _events(caplog) -> list[dict]:
@@ -136,7 +145,11 @@ def _live_pod_read_cmds(ssh_client) -> list[str]:
 
 
 def _live_pod_read_calls(ssh_client) -> list:
-    return [call for call in ssh_client.run.await_args_list if _is_ps(call.args[0]) or _is_inspect(call.args[0])]
+    return [
+        call
+        for call in ssh_client.run.await_args_list
+        if _is_ps(call.args[0]) or _is_inspect(call.args[0])
+    ]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -183,7 +196,9 @@ async def test_filler_starts_on_the_gpus_no_running_pod_holds(svc, monkeypatch, 
     assert _created_run_spec(svc) is not None
     assert _events(caplog) == []
     cmds = _live_pod_read_cmds(ssh)
-    assert len(cmds) == 2 and _is_ps(cmds[0]) and _is_inspect(cmds[1]), "one ps, one inspect of its ids"
+    assert len(cmds) == 2 and _is_ps(cmds[0]) and _is_inspect(cmds[1]), (
+        "one ps, one inspect of its ids"
+    )
     assert "000000000001" in cmds[1], "inspect is given the ids ps returned"
 
 
@@ -221,7 +236,9 @@ async def test_a_host_with_no_running_pod_lets_the_filler_through(svc, monkeypat
 
     assert isinstance(result, ContainerCreated), result
     cmds = _live_pod_read_cmds(ssh)
-    assert len(cmds) == 1 and _is_ps(cmds[0]), "an empty ps (exit 0) is 'no pod'; nothing to inspect"
+    assert len(cmds) == 1 and _is_ps(cmds[0]), (
+        "an empty ps (exit 0) is 'no pod'; nothing to inspect"
+    )
 
 
 @pytest.mark.asyncio
@@ -244,7 +261,9 @@ async def test_a_real_docker_inspect_line_refuses_the_filler(svc, monkeypatch, c
     _patch_happy(svc, monkeypatch, ssh)
 
     with caplog.at_level(logging.WARNING):
-        result = await _run(svc, _filler_payload(["GPU-bbbb2222-0000-0000-0000-000000000002", "GPU-cccc"]))
+        result = await _run(
+            svc, _filler_payload(["GPU-bbbb2222-0000-0000-0000-000000000002", "GPU-cccc"])
+        )
 
     assert isinstance(result, FailedContainerRequest), result
     assert result.failure_step == GUARD_STEP
@@ -317,7 +336,9 @@ async def test_every_host_read_of_the_guard_is_bounded_by_a_timeout(svc, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_line_without_the_separator_refuses_the_filler_as_unreadable(svc, monkeypatch, caplog):
+async def test_a_line_without_the_separator_refuses_the_filler_as_unreadable(
+    svc, monkeypatch, caplog
+):
     # The r1 template's output: a literal backslash-t. Whatever printed it, the listing cannot be
     # trusted — refuse under the unreadable step, never "no GPU claim".
     ssh = _host_with_running_pods(REAL_INSPECT_R1_LITERAL)
@@ -343,15 +364,23 @@ def test_the_inspect_template_emits_the_tab_through_a_template_action():
     from services.filler_live_pod_guard import LIVE_POD_GPU_SETS_CMD_PREFIX, LIVE_POD_IDS_CMD
 
     assert '{{.Name}}{{"\\t"}}{{json .HostConfig.DeviceRequests}}' in LIVE_POD_GPU_SETS_CMD_PREFIX
-    assert "\\t{{json" not in LIVE_POD_GPU_SETS_CMD_PREFIX, "a bare \\t outside an action is printed literally"
-    assert "|" not in LIVE_POD_IDS_CMD and "xargs" not in LIVE_POD_IDS_CMD, "ps runs alone so its exit is seen"
-    assert "--filter status=running" in LIVE_POD_IDS_CMD and "--filter name=pod_" in LIVE_POD_IDS_CMD
+    assert "\\t{{json" not in LIVE_POD_GPU_SETS_CMD_PREFIX, (
+        "a bare \\t outside an action is printed literally"
+    )
+    assert "|" not in LIVE_POD_IDS_CMD and "xargs" not in LIVE_POD_IDS_CMD, (
+        "ps runs alone so its exit is seen"
+    )
+    assert (
+        "--filter status=running" in LIVE_POD_IDS_CMD and "--filter name=pod_" in LIVE_POD_IDS_CMD
+    )
 
 
 def test_parse_live_pod_gpu_sets_reads_real_inspect_lines():
     from services.filler_live_pod_guard import parse_live_pod_gpu_sets
 
-    pods = parse_live_pod_gpu_sets("\n".join([REAL_INSPECT_PINNED, REAL_INSPECT_WHOLE_HOST, REAL_INSPECT_NO_GPU, ""]))
+    pods = parse_live_pod_gpu_sets(
+        "\n".join([REAL_INSPECT_PINNED, REAL_INSPECT_WHOLE_HOST, REAL_INSPECT_NO_GPU, ""])
+    )
 
     assert pods == {
         "pod_e187tab": frozenset(
@@ -387,7 +416,10 @@ def test_parse_live_pod_gpu_sets_skips_non_pods():
     ],
 )
 def test_parse_live_pod_gpu_sets_fails_closed_on_a_line_it_cannot_trust(line):
-    from services.filler_live_pod_guard import FillerLivePodListingUnreadableError, parse_live_pod_gpu_sets
+    from services.filler_live_pod_guard import (
+        FillerLivePodListingUnreadableError,
+        parse_live_pod_gpu_sets,
+    )
 
     with pytest.raises(FillerLivePodListingUnreadableError):
         parse_live_pod_gpu_sets(line + "\n" + POD_ON_0_1)
