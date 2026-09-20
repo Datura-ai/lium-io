@@ -172,8 +172,8 @@ FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
 
 # rel-box-34: typed event written when a `filler_*` container is still on the host after a
 # customer create's `docker rm -fv`. Same name as compute-app's FILLER_STILL_RUNNING_EVENT so one
-# log query counts both halves (fields: executor_uuid here / executor_id in compute-app -- the same
-# value, the executor's uuid -- plus pod_name, container_names, reason).
+# log query counts both halves. Join key: `executor_uuid` (the validator-side id; compute-app's rent
+# path writes it too -- its `executor_id` is the backend's DB row id), plus pod_name, container_names, reason.
 FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 
 # In-container port the cache-template images' start.sh hardcodes for Jupyter
@@ -2094,24 +2094,11 @@ class DockerService:
                 ),
             )
 
-            command = f'/usr/bin/docker rm -fv {container_names}'
-            try:
+            if remove_every_filler:
+                await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
+            else:
+                command = f'/usr/bin/docker rm -fv {container_names}'
                 await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
-            except Exception:
-                if not remove_every_filler:
-                    raise
-                # rel-box-34: a filler whose backend delete landed between the listing and this rm makes
-                # `docker rm -f` exit non-zero for a name that is already gone. What decides is the host:
-                # raise only when one of the names is still there.
-                still_present = await self._names_still_on_host(ssh_client, stale_containers)
-                if still_present is None or still_present:
-                    raise
-                logger.info(
-                    _m(
-                        "docker rm -fv reported an error but every stale container is gone; continuing",
-                        extra=get_extra_info({**default_extra, "container_names": stale_containers}),
-                    ),
-                )
 
             removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
             if remove_every_filler and removed_fillers:
@@ -2181,6 +2168,47 @@ class DockerService:
                 )
             )
         return survivors
+
+    async def _remove_stale_containers_tolerantly(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        stale_containers: list[str],
+    ) -> None:
+        """`docker rm -fv` for a customer create (rel-box-34): one attempt, then the host decides.
+
+        A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
+        non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
+        for nothing. So: one attempt; on an error re-read `docker ps -a`; names already gone are not an
+        error; names still there get retry_ssh_command's full budget (and raise as before). A re-read
+        that cannot be made re-raises the rm error.
+        """
+        names = " ".join(shlex.quote(name) for name in stale_containers)
+        try:
+            await retry_ssh_command(
+                ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers', max_attempts=1
+            )
+            return
+        except Exception:
+            still_present = await self._names_still_on_host(ssh_client, stale_containers)
+            if still_present is None:
+                raise
+        if not still_present:
+            logger.info(
+                _m(
+                    "docker rm -fv reported an error but every stale container is gone; continuing",
+                    extra=get_extra_info({**default_extra, "container_names": stale_containers}),
+                ),
+            )
+            return
+        logger.info(
+            _m(
+                "docker rm -fv failed with containers still on the host; retrying those",
+                extra=get_extra_info({**default_extra, "container_names": still_present}),
+            ),
+        )
+        names = " ".join(shlex.quote(name) for name in still_present)
+        await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
 
     @staticmethod
     async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:

@@ -132,8 +132,8 @@ async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_runn
     # the create goes on (no raise) and the survivor is reported with typed fields
     assert "filler_stuck" in removed
     [event] = _events(caplog)
-    # the create path's default_extra keys the executor as `executor_uuid` (create_container); compute-app
-    # writes the same value as `executor_id` — one Loki query joins on the value
+    # the create path's default_extra keys the executor as `executor_uuid` (create_container); compute-app's
+    # rent-path event carries `executor_uuid` too (its `executor_id` is the DB row id) — one Loki query joins on it
     assert event.msg.extra["executor_uuid"] == "exec-1"
     assert event.msg.extra["pod_name"] == "pod_target"
     assert event.msg.extra["container_names"] == ["filler_stuck"]
@@ -216,12 +216,12 @@ async def test_rm_that_fails_because_the_filler_is_already_gone_does_not_fail_th
     docker_service, retry_ssh_mock
 ):
     # the backend's delete landed between the listing and the rm: `docker rm -f` exits non-zero for
-    # the vanished name; the host says it is gone, so the create goes on
+    # the vanished name; one attempt, the host says it is gone, the create goes on
     retry_ssh_mock.side_effect = [
         Exception(
             "[clean_existing_containers] exit_code 1, stderr: No such container: filler_racing"
         ),
-        None,
+        None,  # the volume rm
     ]
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(
@@ -241,6 +241,48 @@ async def test_rm_that_fails_because_the_filler_is_already_gone_does_not_fail_th
     )
 
     assert sorted(removed) == ["filler_racing", "pod_target"]
+    # the first rm is a single attempt: a vanished name must not cost the create the 5x10 s budget
+    first_rm = retry_ssh_mock.call_args_list[0]
+    assert "filler_racing" in first_rm[0][1]
+    assert first_rm.kwargs["max_attempts"] == 1
+    # no second rm: only the volume rm follows
+    assert retry_ssh_mock.call_count == 2
+    assert "volume rm" in retry_ssh_mock.call_args_list[1][0][1]
+
+
+@pytest.mark.asyncio
+async def test_rm_retry_budget_goes_only_to_the_names_still_on_the_host(
+    docker_service, retry_ssh_mock
+):
+    # two stale fillers, one vanished, one still there: the full retry budget is spent on the second only
+    retry_ssh_mock.side_effect = [
+        Exception(
+            "[clean_existing_containers] exit_code 1, stderr: No such container: filler_gone"
+        ),
+        None,  # the retried rm of the survivor
+        None,  # the volume rm
+    ]
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _listing("pod_target\nfiller_gone\nfiller_busy\n"),
+            _listing("filler_busy\n"),  # the re-read: filler_gone left, filler_busy still there
+            _listing(""),  # the confirmation
+        ]
+    )
+
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={"executor_uuid": "exec-1"},
+        pod_name="pod_target",
+        active_container_names=[],
+        remove_every_filler=True,
+    )
+
+    second_rm = retry_ssh_mock.call_args_list[1]
+    assert "filler_busy" in second_rm[0][1]
+    assert "filler_gone" not in second_rm[0][1]
+    assert "max_attempts" not in second_rm.kwargs  # the full budget, as before this PR
 
 
 @pytest.mark.asyncio
@@ -252,6 +294,31 @@ async def test_rm_that_fails_with_the_container_still_there_raises(docker_servic
     )
 
     with pytest.raises(Exception, match="busy"):
+        await docker_service.clean_existing_containers(
+            ssh_client=ssh_client,
+            default_extra={"executor_uuid": "exec-1"},
+            pod_name="pod_target",
+            active_container_names=[],
+            remove_every_filler=True,
+        )
+    # one attempt, the re-read, then the full-budget retry of the name still there
+    assert retry_ssh_mock.call_count == 2
+    assert retry_ssh_mock.call_args_list[0].kwargs["max_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rm_that_fails_and_cannot_be_re_read_raises_the_rm_error(
+    docker_service, retry_ssh_mock
+):
+    retry_ssh_mock.side_effect = Exception(
+        "[clean_existing_containers] exit_code 1, stderr: rm failed"
+    )
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[_listing("pod_target\nfiller_x\n"), OSError("ssh dropped")]
+    )
+
+    with pytest.raises(Exception, match="rm failed"):
         await docker_service.clean_existing_containers(
             ssh_client=ssh_client,
             default_extra={"executor_uuid": "exec-1"},
