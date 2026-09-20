@@ -260,7 +260,9 @@ async def test_unreadable_payload_is_logged_with_typed_fields(caplog):
     ssh.process.stdout = FakeStdout(_stdout(partial, ""))
     ssh.process.stderr = FakeStderr(["Killed\n"])
 
-    with caplog.at_level(logging.ERROR, logger=ivs.__name__):
+    # WARNING and above: the fields are what this pins, not the level (lium-io#1397 moves node
+    # verdicts, INSPECTOR_UNREADABLE among them, from error to warning)
+    with caplog.at_level(logging.WARNING, logger=ivs.__name__):
         await _validate(ssh, uuid="exec-252f0496")
 
     records = [r for r in caplog.records if str(r.msg) == "Inspector validation failed"]

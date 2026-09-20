@@ -29,7 +29,7 @@ Every unreadable event carries, in `what_we_saw` (the check event) and in `error
 
 | field | meaning |
 |---|---|
-| `payload_cmd` | the command whose answer broke: `start-collector`, `handshake-reply`, `execute`, `quit` |
+| `payload_cmd` | the command whose answer broke: `handshake-reply` or `execute` (an unreadable `start-collector` reply is swallowed into the row's `collector_ensure_error` and the run goes on; an unreadable `quit` reply only makes the validator terminate the process) |
 | `payload_bytes` | how many bytes of the line the validator held |
 | `payload_terminated` | `true` = the line ended in `\n`; `false` = it was cut at EOF (executor died, channel closed) or at `INSPECTOR_RESPONSE_MAX_BYTES` (64 MiB) |
 | `payload_head` | the first 200 characters, `repr()`-escaped — never the whole payload |
