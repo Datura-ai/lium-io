@@ -436,11 +436,10 @@ class Settings(BaseSettings):
     # platform lists a node and the rent path creates a pod only with at least MIN_PORT_COUNT
     # free verified ports, while PortCountCheck exempts a rented node from that floor (the
     # tenant holds the ports). When True, a remainder below the floor forfeits the unrented
-    # incentive; the rented GPUs keep earning in the mining pool. Ships ENFORCED: the shortfall
-    # is the tenant's ports, nothing the provider can fix, and a shadow window would only keep
-    # paying idle for GPUs nobody can rent. Set to False to log the breach without withholding.
+    # incentive; the rented GPUs keep earning in the mining pool. When False, the shortfall is
+    # only logged (shadow mode) so the affected idle pay can be read before it is withheld.
     ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
-        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=True
+        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(

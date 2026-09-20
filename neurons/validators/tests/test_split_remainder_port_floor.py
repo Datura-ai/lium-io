@@ -6,8 +6,8 @@ ports), so a part-rented split node with 2 free ports still reaches scoring, and
 pays its free GPUs from the unrented pool. The platform lists a node only with
 `available_port_count >= MIN_PORT_COUNT` and the rent path refuses a pod below it, so nobody
 can rent that remainder. The remainder is still expanded (the rented portion keeps earning in
-the mining pool) but forfeits the unrented incentive with a named reason. Enforcement is ON by
-default; with ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER off the shortfall is only logged.
+the mining pool) but forfeits the unrented incentive with a named reason once
+ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is on; off (the default) only logs the shortfall.
 """
 
 import logging
@@ -15,13 +15,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
-
-from core.config import settings
 from incentive.config import IncentiveConfig
 from incentive.miner_incentive_log import ZeroIncentiveReason
 from incentive.rental_price import RentalPriceIncentive
 from services.const import MIN_PORT_COUNT
 from services.task_service import JobResult
+
+from core.config import settings
 
 H200 = "NVIDIA H200"  # base model H200 is rental-eligible by default
 MINER_HOTKEY = "miner-hotkey-1"
@@ -149,6 +149,14 @@ def test_unreadable_port_count_fails_open(spec):
 
     # Act / Assert — nobody loses incentive over telemetry
     assert incentive._port_limited_remainder(remainder) is None
+
+
+def test_enforcement_is_off_by_default():
+    # Rollout contract (SO §70): a money-path gate ships in shadow mode; the flag default — not
+    # the env-resolved value — stays False until the validator owner turns it on.
+    default = type(settings).model_fields["ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER"].default
+
+    assert default is False
 
 
 # ── the scoring decision ──────────────────────────────────────────────────────
