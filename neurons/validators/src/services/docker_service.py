@@ -5051,7 +5051,8 @@ class DockerService:
 
                 if payload.workload_kind == WorkloadKind.FILLER:
                     # E-187 (DAH-3706 family): host truth before anything changes on the host — a
-                    # RUNNING pod_* holding GPUs this filler would take refuses the create (event
+                    # LIVE (running / restarting / paused) pod_* holding GPUs this filler would take
+                    # refuses the create (event
                     # FILLER_START_REFUSED_LIVE_POD, failure_step filler_live_pod_guard). Deliberately
                     # BEFORE the sweep below: on a host the backend re-registered as a new executor,
                     # the customer's container is not on active_container_names, and the sweep would

@@ -1,9 +1,11 @@
-"""E-187 (DAH-3706 family): a filler never starts on GPUs a RUNNING customer pod holds — host truth.
+"""E-187 (DAH-3706 family): a filler never starts on GPUs a LIVE customer pod holds — host truth.
 
 The platform judges a filler launch against its own rows (lium-platform LivePodGuard). This is the
-last check, on the host, right before the filler's `docker run`: every RUNNING `pod_*` container is
-inspected for the GPUs it was given (HostConfig.DeviceRequests: pinned DeviceIDs, or Count=-1 for the
-whole host) and the filler is refused when its GPU set intersects. It runs BEFORE the create's
+last check, on the host, right before the filler's `docker run`: every LIVE `pod_*` container —
+docker state running, restarting or paused; every Lium pod runs with restart_policy unless-stopped,
+so a crash-looping customer pod is `restarting` most of each cycle while still holding the rental
+and its devices — is inspected for the GPUs it was given (HostConfig.DeviceRequests: pinned
+DeviceIDs, or Count=-1 for the whole host) and the filler is refused when its GPU set intersects. It runs BEFORE the create's
 container sweep, so a customer's container is never the thing removed to make room for a filler —
 the case the platform cannot see is exactly a pod it has no row for (a host re-registered as a new
 executor row, a row the platform lost).
@@ -14,10 +16,16 @@ them differently and either repo may deploy first:
   FILLER_START_REFUSED_LIVE_POD is written; the platform closes the run STOPPED — a lost race, no
   FAILED row, no backoff — and counts `validator_refused`.
 - FILLER_LIVE_POD_GUARD_UNREADABLE_STEP ("filler_live_pod_guard_unreadable"): the host could not be
-  read — `docker ps` or `docker inspect` failed (non-zero exit), hung past the timeout, or printed a
-  line the parser cannot trust. Still no filler this cycle (fail closed), but NO overlap event: the
-  platform keeps today's FAILED + backoff path for it and counts `unreadable`, so a dockerd outage is
-  neither a per-cycle retry loop nor a hit on the live-pod alert.
+  read — `docker ps` or `docker inspect` failed (non-zero exit), hung past the timeout, the SSH read
+  itself raised (connection lost, session refused, socket error — anything that is not a verdict),
+  or printed a line the parser cannot trust: no separator, an unparseable claim, or a `pod_*` whose
+  GPU claim this guard cannot see (DeviceRequests null / [], or DeviceIDs that are not GPU-<uuid>s,
+  e.g. a CDI `nvidia.com/gpu=0`). Lium's own create paths ALWAYS emit one DeviceRequest with GPU
+  uuids or Count=-1 (rental_docker_sdk.build_gpu_docker_config; the legacy `--gpus` flag), so on a
+  Lium host such a `pod_*` is a container whose GPU use is invisible to us, not a pod with no GPUs —
+  fail closed. Still no filler this cycle, but NO overlap event: the platform keeps today's FAILED +
+  backoff path for it and counts `unreadable`, so a dockerd / SSH outage is neither a per-cycle retry
+  loop nor a hit on the live-pod alert.
 
 Two commands, not a pipeline: `docker ps -q … | xargs -r docker inspect …` reports xargs's exit (0)
 when `docker ps` itself fails, and an empty stdout would read as "no pod" — fail OPEN. Each command
@@ -57,9 +65,15 @@ FILLER_LIVE_POD_GUARD_UNREADABLE_STEP = "filler_live_pod_guard_unreadable"
 # The bound every neighbouring host read on the create path uses (the prerun probe's timeout).
 LIVE_POD_READ_TIMEOUT_SECONDS = NVIDIA_SMI_TIMEOUT_SECONDS
 
-# Step 1: the ids of the RUNNING pod_* containers. The name filter is a substring match, so the
-# prefix is re-checked on the parsed name after inspect. Runs ALONE so its exit status is seen.
-LIVE_POD_IDS_CMD = "/usr/bin/docker ps -q --filter status=running --filter name=pod_"
+# Step 1: the ids of the LIVE pod_* containers: running, restarting (a crash-looping pod under
+# unless-stopped takes its GPUs back within seconds) or paused — same-key filters OR. NOT exited /
+# created: a stale exited pod_* the sweep would remove must not refuse the filler every cycle. The
+# name filter is a substring match, so the prefix is re-checked on the parsed name after inspect.
+# Runs ALONE so its exit status is seen.
+LIVE_POD_IDS_CMD = (
+    "/usr/bin/docker ps -q --filter status=running --filter status=restarting --filter status=paused"
+    " --filter name=pod_"
+)
 # Step 2: one line per container: name, a TAB emitted by the template action, the device requests.
 LIVE_POD_GPU_SETS_CMD_PREFIX = (
     "/usr/bin/docker inspect --format '{{.Name}}{{\"\\t\"}}{{json .HostConfig.DeviceRequests}}'"
@@ -68,7 +82,7 @@ _SEPARATOR = "\t"
 
 
 class FillerRefusedLivePodError(RuntimeError):
-    """A running pod_* holds GPUs the filler would take (a confirmed overlap)."""
+    """A live pod_* holds GPUs the filler would take (a confirmed overlap)."""
 
 
 class FillerLivePodListingUnreadableError(RuntimeError):
@@ -92,9 +106,10 @@ def live_pod_gpu_sets_cmd(container_ids: list[str]) -> str:
 def parse_live_pod_gpu_sets(stdout: str) -> dict[str, frozenset[str] | None]:
     """`pod_*` name -> the GPU uuids it holds, or None when it holds the whole host.
 
-    Non-pod names and pods created without `--gpus` (DeviceRequests null / []) are skipped. A `pod_*`
-    line without the separator, or with a device set that cannot be parsed, is not "no claim" — it is a
-    listing this guard cannot trust: FillerLivePodListingUnreadableError (fail closed).
+    Non-pod names are skipped. A `pod_*` line without the separator, with a device set that cannot be
+    parsed, with NO device request (null / []: a Lium pod always has one), or with device ids that are
+    not GPU-<uuid>s (CDI) is not "no claim" — it is a claim this guard cannot read:
+    FillerLivePodListingUnreadableError (fail closed).
     """
     pods: dict[str, frozenset[str] | None] = {}
     for raw_line in (stdout or "").splitlines():
@@ -106,7 +121,7 @@ def parse_live_pod_gpu_sets(stdout: str) -> dict[str, frozenset[str] | None]:
         if not separator:
             if name.startswith(POD_CONTAINER_PREFIX):
                 raise FillerLivePodListingUnreadableError(
-                    f"Filler refused: the running pod listing has no separator on {line[:120]!r}"
+                    f"Filler refused: the live pod listing has no separator on {line[:120]!r}"
                 )
             continue  # not a pod, whatever the shape
         if not name.startswith(POD_CONTAINER_PREFIX):
@@ -116,8 +131,6 @@ def parse_live_pod_gpu_sets(stdout: str) -> dict[str, frozenset[str] | None]:
             raise FillerLivePodListingUnreadableError(
                 f"Filler refused: the device requests of {name} could not be read: {requests_json[:120]!r}"
             )
-        if held is not None and not held:
-            continue  # created without --gpus: no GPU claim, nothing a filler could collide with
         pods[name] = held
     return pods
 
@@ -125,15 +138,19 @@ def parse_live_pod_gpu_sets(stdout: str) -> dict[str, frozenset[str] | None]:
 _UNPARSEABLE = object()
 
 
+_GPU_UUID_PREFIX = "GPU-"
+
+
 def _gpu_set(requests_json: str):
-    """frozenset of uuids; None = the whole host; frozenset() = no GPU claim; _UNPARSEABLE."""
+    """frozenset of GPU uuids; None = the whole host; _UNPARSEABLE when the claim cannot be read."""
     try:
         requests = json.loads(requests_json or "null")
     except ValueError:
         return _UNPARSEABLE
     if requests is None or requests == []:
-        # `null` / `[]`: created without --gpus — no GPU claim at all, not a whole-host one
-        return frozenset()
+        # `null` / `[]`: no DeviceRequest at all. A Lium pod always carries one (uuids or Count=-1),
+        # so this is a pod_* whose GPU use we cannot see (env-only attachment) — not "no GPUs".
+        return _UNPARSEABLE
     if not isinstance(requests, list):
         return _UNPARSEABLE
     uuids: set[str] = set()
@@ -142,6 +159,9 @@ def _gpu_set(requests_json: str):
             return _UNPARSEABLE
         device_ids = request.get("DeviceIDs") or []
         if device_ids:
+            if not all(str(device_id).startswith(_GPU_UUID_PREFIX) for device_id in device_ids):
+                # CDI names / indices can never intersect the filler's GPU uuids: unreadable, not disjoint
+                return _UNPARSEABLE
             uuids.update(str(device_id) for device_id in device_ids)
         else:
             # Count=-1 (--gpus all) is every GPU on the host; a positive Count without ids means
@@ -154,10 +174,10 @@ def find_live_pod_gpu_overlap(
     filler_gpu_uuids: list[str] | None,
     live_pods: dict[str, frozenset[str] | None],
 ) -> LivePodGpuOverlap | None:
-    """Which running pods hold GPUs the filler would take; None when the launch is clean.
+    """Which live pods hold GPUs the filler would take; None when the launch is clean.
 
-    An empty / None filler set means the filler takes the whole host, so ANY pod with a GPU claim
-    overlaps it; a whole-host pod (None) overlaps any filler.
+    An empty / None filler set means the filler takes the whole host, so ANY live pod overlaps it;
+    a whole-host pod (None) overlaps any filler.
     """
     planned: set[str] | None = set(filler_gpu_uuids) if filler_gpu_uuids else None
     pod_containers: list[str] = []
@@ -183,12 +203,22 @@ def find_live_pod_gpu_overlap(
 
 
 async def _read(ssh_client: asyncssh.SSHClientConnection, command: str, what: str) -> str:
-    """Run one host read, bounded; a non-zero exit or a timeout is an unreadable listing."""
+    """Run one host read, bounded; a non-zero exit, a timeout or a raising SSH read is unreadable.
+
+    Anything the read raises is a host that could not be read (asyncssh.ConnectionLost /
+    ChannelOpenError / DisconnectError, OSError, …) — the same rule as the prerun probe next door. It
+    must never surface under the confirmed-overlap step, which the platform closes STOPPED and counts
+    as a live-pod refusal.
+    """
     try:
         result = await ssh_client.run(command, timeout=LIVE_POD_READ_TIMEOUT_SECONDS)
     except TimeoutError as exc:
         raise FillerLivePodListingUnreadableError(
             f"Filler refused: {what} timed out after {LIVE_POD_READ_TIMEOUT_SECONDS}s"
+        ) from exc
+    except Exception as exc:
+        raise FillerLivePodListingUnreadableError(
+            f"Filler refused: {what} could not be read ({type(exc).__name__}: {str(exc)[:200]})"
         ) from exc
     if result.exit_status != 0:
         raise FillerLivePodListingUnreadableError(
@@ -201,13 +231,13 @@ async def _read(ssh_client: asyncssh.SSHClientConnection, command: str, what: st
 async def read_live_pod_gpu_sets(
     ssh_client: asyncssh.SSHClientConnection,
 ) -> dict[str, frozenset[str] | None]:
-    """The RUNNING pod_* containers and their GPU sets, or FillerLivePodListingUnreadableError."""
-    ids_stdout = await _read(ssh_client, LIVE_POD_IDS_CMD, "the running pod listing (docker ps)")
+    """The LIVE (running / restarting / paused) pod_* containers and their GPU sets, or unreadable."""
+    ids_stdout = await _read(ssh_client, LIVE_POD_IDS_CMD, "the live pod listing (docker ps)")
     container_ids = [line.strip() for line in ids_stdout.splitlines() if line.strip()]
     if not container_ids:
-        return {}  # docker ps answered (exit 0) with no running pod_*: nothing to inspect
+        return {}  # docker ps answered (exit 0) with no live pod_*: nothing to inspect
     inspect_stdout = await _read(
-        ssh_client, live_pod_gpu_sets_cmd(container_ids), "the running pod inspect"
+        ssh_client, live_pod_gpu_sets_cmd(container_ids), "the live pod inspect"
     )
     return parse_live_pod_gpu_sets(inspect_stdout)
 
@@ -220,7 +250,7 @@ async def assert_no_live_pod_on_filler_gpus(
     filler_pod_id: str,
     default_extra: dict,
 ) -> None:
-    """Refuse the filler when a running pod_* holds its GPUs (event + FillerRefusedLivePodError).
+    """Refuse the filler when a live pod_* holds its GPUs (event + FillerRefusedLivePodError).
 
     An unreadable host raises FillerLivePodListingUnreadableError instead — logged, no event.
     """
@@ -229,7 +259,7 @@ async def assert_no_live_pod_on_filler_gpus(
     except FillerLivePodListingUnreadableError as exc:
         logger.warning(
             _m(
-                "Filler refused: the host's running pods could not be read",
+                "Filler refused: the host's live pods could not be read",
                 extra=get_extra_info(
                     {
                         **default_extra,
@@ -247,7 +277,7 @@ async def assert_no_live_pod_on_filler_gpus(
         return
     logger.warning(
         _m(
-            "Filler start refused: a running customer pod holds its GPUs",
+            "Filler start refused: a live customer pod holds its GPUs",
             extra=get_extra_info(
                 {
                     **default_extra,
@@ -264,6 +294,6 @@ async def assert_no_live_pod_on_filler_gpus(
         )
     )
     raise FillerRefusedLivePodError(
-        f"Filler refused: running {', '.join(overlap.pod_containers)} hold(s) GPU(s) "
+        f"Filler refused: live {', '.join(overlap.pod_containers)} hold(s) GPU(s) "
         f"{', '.join(overlap.gpu_overlap) or 'the whole host'} the filler would take."
     )
