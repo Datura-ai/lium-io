@@ -4,17 +4,20 @@ sits on that median, rounded down to the cent.
 Owner rule, 17 Sep 2026: "idle pay should never be higher than rental rates"; 21:41Z: "pin means raise
 too"; 18 Sep 2026 09:14Z: "pin the idle to median now" (the pin was 0.8 x the median until then).
 Window: 30 days (Rustam, 18 Sep 2026 06:20Z on #1401: "fixed rates from a 7-day window are too
-unstable"). The fixture below is the 30-day paid median per GPU model read from prod `rental_history`
-(per-rental `price_per_gpu`, all gpu_count tiers, rentals active 19 Aug to 18 Sep 2026, i.e.
-`coalesce(rental_end_time, now()) > now() - 30 days and rental_start_time < now()`, read
-2026-09-18 09:16Z; the same 15 medians as the 06:24Z read) for every model that received idle pay in
-the 24 h before the read and had at least 5 rentals in the window (fewer than 5 rentals is not a
-median to pin on).
+unstable"). Definition: the GPU-hour-weighted median the platform publishes as
+`gpu_price_stat.lium_median_30d` (DAH-2250's anchor; PRICE-MEDIAN-DEFINITION default (B), 20 Sep 2026
+12:00Z, P144): `rental_history.price_per_gpu` over the rentals started in the trailing 30 days, each
+row weighted `gpu_count x rental_hours`, lower weighted median. The fixture below is the prod-replica
+read of 2026-09-19 03:24Z (lium-io#1407, review thread r4052066252) for every model that received idle
+pay in the 24 h before the 18 Sep read and had at least 5 rentals in the window (fewer than 5 rentals
+is not a median to pin on). A per-rental (unweighted) median is a different number for nine of the
+twelve pinned models (RTX 5090 0.60 per rental against 0.40 per GPU-hour; A100 PCIe 0.30 against 0.45).
 
-Three fixture models are not pinned and sit UNDER their median by an earlier decision: B300 (6.40
-against an 8.00 median, DAH-3542) and the two RTX PRO 6000 editions (1.00 against 1.25 Workstation /
-1.20 Server, held at parity by DAH-3230, test_rental_price_anchor_parity.py). They pass the cap and are
-named in NOT_PINNED_UNDER_THE_MEDIAN so a new fixture row has to be classified one way or the other.
+Three fixture models are not pinned and sit at or under their median by an earlier decision: B300
+(6.40 against an 8.00 median, DAH-3542) and the two RTX PRO 6000 editions (1.00 against 1.19 Server /
+1.00 Workstation -- the Workstation Edition sits exactly on its own median -- held at parity by
+DAH-3230, test_rental_price_anchor_parity.py). They pass the cap and are named in
+NOT_PINNED_UNDER_THE_MEDIAN so a new fixture row has to be classified one way or the other.
 
 The paid median is the only cap. A second cap at the model's base price (lium-core `machine_prices`)
 was tried in commit 5 and withdrawn in commit 6 on the owner's word (Fish, 18 Sep 2026 08:53Z: "no
@@ -34,7 +37,7 @@ from incentive.utils import get_hourly_rate
 
 CAP_SHARE_OF_PAID_MEDIAN: float = 1.0  # owner, 18 Sep 2026 09:14Z: the pin IS the median (was 0.8)
 MIN_RENTALS_FOR_A_MEDIAN: int = 5
-PAID_MEDIAN_AS_OF: str = "2026-09-18T09:16Z"
+PAID_MEDIAN_AS_OF: str = "2026-09-19T03:24Z"
 
 
 class PaidMedian(NamedTuple):
@@ -45,30 +48,46 @@ class PaidMedian(NamedTuple):
     rentals: int
 
 
-# gpu_model -> the median USD per GPU-hour renters paid over 30 days and the rentals active in the window
+# gpu_model -> the GPU-hour-weighted median USD per GPU-hour renters paid over 30 days
+# (gpu_price_stat.lium_median_30d) and the rentals started in the window
 PAID_MEDIAN_30D: dict[str, PaidMedian] = {
-    "NVIDIA A100 80GB PCIe": PaidMedian(median_usd_per_gpu_hour=0.30, rentals=399),
-    "NVIDIA H100 80GB HBM3": PaidMedian(median_usd_per_gpu_hour=1.30, rentals=699),
-    "NVIDIA GeForce RTX 5090": PaidMedian(median_usd_per_gpu_hour=0.60, rentals=1950),
-    "NVIDIA RTX 6000 Ada Generation": PaidMedian(median_usd_per_gpu_hour=0.69, rentals=401),
-    "NVIDIA GeForce RTX 3090": PaidMedian(median_usd_per_gpu_hour=0.18, rentals=1235),
-    "NVIDIA A100-SXM4-80GB": PaidMedian(median_usd_per_gpu_hour=0.68, rentals=127),
-    "NVIDIA H200": PaidMedian(median_usd_per_gpu_hour=3.25, rentals=912),
-    "NVIDIA L40S": PaidMedian(median_usd_per_gpu_hour=0.38, rentals=676),
-    "NVIDIA GeForce RTX 4090": PaidMedian(median_usd_per_gpu_hour=0.32, rentals=2679),
-    "NVIDIA B300 SXM6 AC": PaidMedian(median_usd_per_gpu_hour=8.00, rentals=345),
-    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": PaidMedian(median_usd_per_gpu_hour=1.25, rentals=103),
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": PaidMedian(median_usd_per_gpu_hour=1.20, rentals=1002),
-    "NVIDIA B200": PaidMedian(median_usd_per_gpu_hour=5.60, rentals=634),
-    "NVIDIA RTX A6000": PaidMedian(median_usd_per_gpu_hour=0.42, rentals=369),
-    "NVIDIA H100 PCIe": PaidMedian(median_usd_per_gpu_hour=1.50, rentals=333),
+    "NVIDIA A100 80GB PCIe": PaidMedian(median_usd_per_gpu_hour=0.45, rentals=384),
+    "NVIDIA H100 80GB HBM3": PaidMedian(median_usd_per_gpu_hour=1.39, rentals=679),
+    "NVIDIA GeForce RTX 5090": PaidMedian(median_usd_per_gpu_hour=0.40, rentals=1953),
+    "NVIDIA RTX 6000 Ada Generation": PaidMedian(median_usd_per_gpu_hour=0.75, rentals=371),
+    "NVIDIA GeForce RTX 3090": PaidMedian(median_usd_per_gpu_hour=0.16, rentals=1212),
+    "NVIDIA A100-SXM4-80GB": PaidMedian(median_usd_per_gpu_hour=0.70, rentals=91),
+    "NVIDIA H200": PaidMedian(median_usd_per_gpu_hour=3.65, rentals=881),
+    "NVIDIA L40S": PaidMedian(median_usd_per_gpu_hour=0.38, rentals=648),
+    "NVIDIA GeForce RTX 4090": PaidMedian(median_usd_per_gpu_hour=0.30, rentals=2647),
+    "NVIDIA B300 SXM6 AC": PaidMedian(median_usd_per_gpu_hour=8.00, rentals=335),
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": PaidMedian(median_usd_per_gpu_hour=1.00, rentals=99),
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": PaidMedian(median_usd_per_gpu_hour=1.19, rentals=942),
+    "NVIDIA B200": PaidMedian(median_usd_per_gpu_hour=5.60, rentals=615),
+    "NVIDIA RTX A6000": PaidMedian(median_usd_per_gpu_hour=0.42, rentals=329),
+    "NVIDIA H100 PCIe": PaidMedian(median_usd_per_gpu_hour=1.30, rentals=328),
+}
+
+# The per-rental (unweighted) medians of the 2026-09-18 read where they differ from the weighted ones:
+# a pin set from them fails test_dah_3623_pins_are_not_the_per_rental_median (the definition is the
+# claim, not only the numbers).
+UNWEIGHTED_MEDIAN_WHERE_IT_DIFFERS: dict[str, float] = {
+    "NVIDIA A100 80GB PCIe": 0.30,
+    "NVIDIA H100 80GB HBM3": 1.30,
+    "NVIDIA GeForce RTX 5090": 0.60,
+    "NVIDIA RTX 6000 Ada Generation": 0.69,
+    "NVIDIA GeForce RTX 3090": 0.18,
+    "NVIDIA A100-SXM4-80GB": 0.68,
+    "NVIDIA H200": 3.25,
+    "NVIDIA GeForce RTX 4090": 0.32,
+    "NVIDIA H100 PCIe": 1.50,
 }
 
 # Models that can receive idle pay but have no fixture row. The 30-day read (2026-09-18 08:06Z, prod
 # replica, read-only; query and output in the loop's private folder, on request) found: H100 NVL and
-# RTX 4090 D with zero rentals and zero idle pay; H200 NVL with 20 rentals (median 3.90, rate 2.90,
-# under the median, outside DAH-3623's twelve). A model added here without a reason in this comment
-# is a mistake.
+# RTX 4090 D with zero rentals and zero idle pay; H200 NVL with 20 rentals (per-rental median 3.90,
+# rate 2.90, under the median, outside DAH-3623's twelve; the 19 Sep weighted read covered the 16
+# anchored models only). A model added here without a reason in this comment is a mistake.
 IDLE_ELIGIBLE_MODELS_WITHOUT_A_MEDIAN_ROW: tuple[str, ...] = (
     "NVIDIA H200 NVL",
     "NVIDIA H100 NVL",
@@ -76,16 +95,18 @@ IDLE_ELIGIBLE_MODELS_WITHOUT_A_MEDIAN_ROW: tuple[str, ...] = (
 )
 
 # The recorded exception: idle-eligible models whose rate sits ABOVE their 30-day paid median and are
-# not pinned by DAH-3623 (outside the twelve the ticket names). L40: 169 rentals, median 0.33, rate
-# 0.36, 14 idle-pay ledger rows in 14 days, about 0.1 USD/day of idle pay over the median. Pinning it
+# not pinned by DAH-3623 (outside the twelve the ticket names). L40: 151 rentals, weighted median 0.33
+# (0.33 per rental too), rate 0.36, 14 idle-pay ledger rows in 14 days, about 0.1 USD/day of idle pay
+# over the median. Pinning it
 # is Rustam's call on #1401; the day it is pinned the row moves to PAID_MEDIAN_30D + PINNED_AT_CAP and
 # leaves this dict, or the test below fails.
 ABOVE_THE_MEDIAN_NOT_YET_PINNED: dict[str, PaidMedian] = {
-    "NVIDIA L40": PaidMedian(median_usd_per_gpu_hour=0.33, rentals=169),
+    "NVIDIA L40": PaidMedian(median_usd_per_gpu_hour=0.33, rentals=151),
 }
 
-# Fixture models that are NOT pinned to their median and sit under it by an earlier decision (module
-# docstring): B300 6.40 (DAH-3542) and the two RTX PRO 6000 editions at Workstation parity 1.00 (DAH-3230).
+# Fixture models that are NOT pinned to their median and sit at or under it by an earlier decision
+# (module docstring): B300 6.40 (DAH-3542) and the two RTX PRO 6000 editions at Workstation parity 1.00
+# (DAH-3230; the Workstation Edition's own median is 1.00).
 NOT_PINNED_UNDER_THE_MEDIAN: tuple[str, ...] = (
     "NVIDIA B300 SXM6 AC",
     "NVIDIA RTX PRO 6000 Blackwell Server Edition",
@@ -95,7 +116,8 @@ NOT_PINNED_UNDER_THE_MEDIAN: tuple[str, ...] = (
 # Pinned at the median by DAH-3623: commit 1 the three models whose lium-core rate was above the rental
 # price itself, commit 2 (owner, 17 Sep 2026 16:56Z) the six that sat between 88 % and 102 % of it
 # on the 30-day medians (A100 SXM 102 %), commit 3 (owner, 21:41Z: "pin means raise too") the three
-# that sat under 80 % of it; commit 6 (owner, 18 Sep 09:14Z) moves all twelve from 0.8 x to 1.0 x.
+# that sat under 80 % of it; commit 6 (owner, 18 Sep 09:14Z) moves all twelve from 0.8 x to 1.0 x;
+# commit 8 (PRICE-MEDIAN-DEFINITION default (B), 20 Sep 12:00Z) re-reads the twelve GPU-hour-weighted.
 PINNED_AT_CAP: tuple[str, ...] = (
     "NVIDIA A100 80GB PCIe",
     "NVIDIA H100 80GB HBM3",
@@ -153,9 +175,9 @@ def _models_that_can_receive_idle_pay() -> list[str]:
 @pytest.mark.parametrize("gpu_model", sorted(PAID_MEDIAN_30D))
 def test_idle_rate_is_at_most_the_paid_median(gpu_model: str) -> None:
     """Fails when a configured idle rate (in either count bucket) is above the 30-day paid median.
-    On main before DAH-3623 it failed for four models: A100 PCIe (0.36 > 0.30), H100 HBM3 (1.494 > 1.30),
-    RTX 5090 (0.65 > 0.60) and A100 SXM (0.6923 > 0.68); the other eleven fixture models were on or
-    under their median."""
+    On main before DAH-3623 it fails for two models: H100 HBM3 (1.494 > 1.39) and RTX 5090 (0.65 > 0.40);
+    the other thirteen fixture models are on or under their weighted median (A100 PCIe 0.36 < 0.45 and
+    A100 SXM 0.6923 < 0.70 were above the per-rental median, not this one)."""
     cap = _cap_usd_per_gpu_hour(gpu_model)
 
     for rate in _idle_rates_per_configured_gpu_count(gpu_model):
@@ -170,27 +192,43 @@ def test_idle_rate_is_at_most_the_paid_median(gpu_model: str) -> None:
 def test_dah_3623_pins_sit_exactly_on_the_paid_median_rounded_down_to_the_cent(gpu_model: str) -> None:
     """Fails when a pin is mistyped (1.3 for 1.30 is fine, 1.03 is not) or drifts from the fixture it
     was derived from: the pinned rate must equal the paid median, rounded down to the cent, in both
-    buckets. With main's config.py eleven of the twelve fail this case (RTX 6000 Ada's 0.69 already is
-    its median); the seven under their median fail this case and only this case (under the median is
-    legal, off the pin is not): H200 2.85 for 3.25, RTX 3090 0.16 for 0.18, RTX 4090 0.30 for 0.32,
-    L40S 0.35 for 0.38, B200 4.25 for 5.60, RTX A6000 0.32 for 0.42, H100 PCIe 1.1988 for 1.50."""
+    buckets. With main's config.py ten of the twelve fail this case (RTX 3090 0.16 and RTX 4090 0.30
+    already are their weighted medians); the eight under their median fail this case and only this case
+    (under the median is legal, off the pin is not): A100 PCIe 0.36 for 0.45, A100 SXM 0.6923 for 0.70,
+    RTX 6000 Ada 0.69 for 0.75, H200 2.85 for 3.65, L40S 0.35 for 0.38, B200 4.25 for 5.60,
+    RTX A6000 0.32 for 0.42, H100 PCIe 1.1988 for 1.30."""
     expected = math.floor(_cap_usd_per_gpu_hour(gpu_model) * 100 + 1e-9) / 100
     rates = _idle_rates_per_configured_gpu_count(gpu_model)
 
     assert rates == [expected] * len(rates), (gpu_model, rates, expected)
 
 
+@pytest.mark.parametrize("gpu_model", sorted(UNWEIGHTED_MEDIAN_WHERE_IT_DIFFERS))
+def test_dah_3623_pins_are_not_the_per_rental_median(gpu_model: str) -> None:
+    """The pin is the GPU-hour-weighted median; a config.py set from the per-rental median of the same
+    window (the 18 Sep read: RTX 5090 0.60, A100 PCIe 0.30, H200 3.25, ...) fails here for all nine."""
+    assert gpu_model in PINNED_AT_CAP, gpu_model
+    per_rental = UNWEIGHTED_MEDIAN_WHERE_IT_DIFFERS[gpu_model]
+    assert per_rental != pytest.approx(PAID_MEDIAN_30D[gpu_model].median_usd_per_gpu_hour), gpu_model
+
+    for rate in _idle_rates_per_configured_gpu_count(gpu_model):
+        assert rate != pytest.approx(per_rental), (
+            f"{gpu_model}: idle rate {rate} is the per-rental median, not the GPU-hour-weighted one"
+        )
+
+
 @pytest.mark.parametrize("gpu_model", NOT_PINNED_UNDER_THE_MEDIAN)
-def test_unpinned_fixture_models_sit_under_their_median_by_an_earlier_decision(gpu_model: str) -> None:
-    """Fails the day one of the three unpinned fixture models reaches or passes its median (the market
-    fell, or someone raised the rate): at that point it is either pinned (moved to PINNED_AT_CAP with
-    its rate on the median) or the earlier decision is re-made, and this tuple loses the row."""
+def test_unpinned_fixture_models_sit_at_or_under_their_median_by_an_earlier_decision(gpu_model: str) -> None:
+    """Fails the day one of the three unpinned fixture models passes its median (the market fell, or
+    someone raised the rate): at that point it is either pinned (moved to PINNED_AT_CAP with its rate on
+    the median) or the earlier decision is re-made, and this tuple loses the row. At the median is legal
+    (the RTX PRO 6000 Workstation Edition's parity rate 1.00 is its own weighted median)."""
     assert gpu_model not in PINNED_AT_CAP, f"{gpu_model} is pinned; drop it from this tuple"
     cap = _cap_usd_per_gpu_hour(gpu_model)
 
     for rate in _idle_rates_per_configured_gpu_count(gpu_model):
-        assert rate < cap - 1e-9, (
-            f"{gpu_model}: idle rate {rate} USD/GPU-h is at or above its median {cap:.4f}; pin it or re-decide"
+        assert rate <= cap + 1e-9, (
+            f"{gpu_model}: idle rate {rate} USD/GPU-h is above its median {cap:.4f}; pin it or re-decide"
         )
 
 
@@ -237,7 +275,7 @@ def test_every_model_that_can_receive_idle_pay_is_in_the_fixture_or_named_outsid
 @pytest.mark.parametrize("gpu_model", sorted(ABOVE_THE_MEDIAN_NOT_YET_PINNED))
 def test_recorded_exception_still_sits_above_its_median(gpu_model: str) -> None:
     """The recorded exception is checked, not waived (Rustam's review, 18 Sep 2026 11:24Z): L40 is paid
-    idle at 0.36 against a 0.33 median on 169 rentals and is not one of DAH-3623's twelve. Fails the
+    idle at 0.36 against a 0.33 median on 151 rentals and is not one of DAH-3623's twelve. Fails the
     day the rate is pinned (then the row belongs in PAID_MEDIAN_30D and PINNED_AT_CAP) or the median
     read moves above the rate (then the exception is gone and the row leaves this dict)."""
     row = ABOVE_THE_MEDIAN_NOT_YET_PINNED[gpu_model]
