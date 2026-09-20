@@ -27,6 +27,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
        attestation (offer any of the three to earn),
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
+     free remainder of a partially rented split node with fewer free ports than the
+       marketplace floor (nobody can rent it; the rented GPUs keep earning),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -56,7 +58,12 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from services.executor_image_policy import outdated_image_remediation
 
 if TYPE_CHECKING:
-    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, PowerCapIncapable
+    from incentive.rental_price import (
+        InsufficientDisk,
+        MissingFlagshipCapability,
+        PortLimitedRemainder,
+        PowerCapIncapable,
+    )
     from services.task_service import JobResult
 
 
@@ -83,6 +90,7 @@ class ZeroIncentiveReason(StrEnum):
     FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
+    PORT_LIMITED_REMAINDER = "port_limited_remainder"
 
 
 class IncentiveReason(BaseModel):
@@ -404,6 +412,27 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "container_cap_eff": incapable.container_cap_eff,
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_port_limited_remainder(
+        result: JobResult, limited: PortLimitedRemainder
+    ) -> MinerLogLine:
+        # `result` is the free portion: gpu_count is the number of free GPUs the message names.
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+            message=(
+                f"No unrented incentive for the {result.gpu_count} free GPU(s) on this partially "
+                f"rented node: it has {limited.available_port_count} free port(s) and the "
+                f"marketplace needs at least {limited.required} to list and rent them, so nobody "
+                "can rent these GPUs right now. The rented GPUs keep earning. Idle pay resumes "
+                "when the rental ends or the node gets more open ports."
+            ),
+            extra_fields={
+                "available_port_count": limited.available_port_count,
+                "required_port_count": limited.required,
             },
         )
 

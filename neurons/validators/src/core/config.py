@@ -432,6 +432,17 @@ class Settings(BaseSettings):
     # scoring the whole box as rented.
     ENABLE_SPLIT_PARTIAL_RENTAL_SCORING: bool = Field(env="ENABLE_SPLIT_PARTIAL_RENTAL_SCORING", default=True)
 
+    # DAH-3698 — port floor for the free remainder of a partially rented split node. The
+    # platform lists a node and the rent path creates a pod only with at least MIN_PORT_COUNT
+    # free verified ports, while PortCountCheck exempts a rented node from that floor (the
+    # tenant holds the ports). When True, a remainder below the floor forfeits the unrented
+    # incentive; the rented GPUs keep earning in the mining pool. Ships ENFORCED: the shortfall
+    # is the tenant's ports, nothing the provider can fix, and a shadow window would only keep
+    # paying idle for GPUs nobody can rent. Set to False to log the breach without withholding.
+    ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
+        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=True
+    )
+
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )
