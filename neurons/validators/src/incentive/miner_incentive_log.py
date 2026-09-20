@@ -191,8 +191,14 @@ class MinerLogLine(BaseModel):
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.SPOT_TIER,
+            # The validator only knows the executor is on the backend's spot list
+            # (rented_data.spot_executor_ids), not why: the node's own setting, a demoted or
+            # banned account, an operator pin, or an open rental contracted under the spot tier
+            # (self-rent, untrusted renter) all land there. Name every way, never "its tier".
             message=(
-                "No subnet incentive: this executor is on the spot tier, and spot-tier "
+                "No subnet incentive: this executor is rated as spot for this cycle (the node "
+                "is set to Spot, its account is demoted or banned, the machine is pinned, or an "
+                "open rental on it was contracted under the spot tier), and spot-rated "
                 "executors do not earn subnet incentive."
             ),
             internal_message="Executor excluded from both pools - spot tier",
