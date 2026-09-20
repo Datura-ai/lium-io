@@ -172,7 +172,8 @@ FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
 
 # rel-box-34: typed event written when a `filler_*` container is still on the host after a
 # customer create's `docker rm -fv`. Same name as compute-app's FILLER_STILL_RUNNING_EVENT so one
-# log query counts both halves (fields: executor_id, pod_name, container_names, reason).
+# log query counts both halves (fields: executor_uuid here / executor_id in compute-app -- the same
+# value, the executor's uuid -- plus pod_name, container_names, reason).
 FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 
 # In-container port the cache-template images' start.sh hardcodes for Jupyter
@@ -2094,7 +2095,23 @@ class DockerService:
             )
 
             command = f'/usr/bin/docker rm -fv {container_names}'
-            await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            try:
+                await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            except Exception:
+                if not remove_every_filler:
+                    raise
+                # rel-box-34: a filler whose backend delete landed between the listing and this rm makes
+                # `docker rm -f` exit non-zero for a name that is already gone. What decides is the host:
+                # raise only when one of the names is still there.
+                still_present = await self._names_still_on_host(ssh_client, stale_containers)
+                if still_present is None or still_present:
+                    raise
+                logger.info(
+                    _m(
+                        "docker rm -fv reported an error but every stale container is gone; continuing",
+                        extra=get_extra_info({**default_extra, "container_names": stale_containers}),
+                    ),
+                )
 
             removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
             if remove_every_filler and removed_fillers:
@@ -2132,13 +2149,11 @@ class DockerService:
     ) -> list[str]:
         """Re-read `docker ps -a` after a customer create's filler removal; report any survivor.
 
-        Returns the `filler_*` names still on the host. A listing that fails is logged and
-        returns [] -- the confirmation never fails the create.
+        Returns the `filler_*` names still on the host. A listing that fails, times out or exits
+        non-zero is logged and returns [] -- the confirmation never fails the create.
         """
-        try:
-            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
-            names_after = [name for name in (result.stdout or "").strip().split("\n") if name]
-        except Exception as exc:
+        names_after = await self._list_all_container_names(ssh_client)
+        if names_after is None:
             logger.warning(
                 _m(
                     "Unable to confirm the filler removal before the customer's create",
@@ -2146,7 +2161,6 @@ class DockerService:
                         **default_extra,
                         "pod_name": pod_name,
                         "container_names": removed_fillers,
-                        "error": str(exc),
                     }),
                 )
             )
@@ -2167,6 +2181,38 @@ class DockerService:
                 )
             )
         return survivors
+
+    @staticmethod
+    async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
+        """`docker ps -a` names with the prerun probe's timeout; None when the listing raised, timed out
+        or exited non-zero (a wedged dockerd is the very condition a survivor lives under -- the
+        caller must not hang or read an empty listing as 'confirmed')."""
+        try:
+            result = await ssh_client.run(
+                DOCKER_PS_ALL_NAMES_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            logger.warning(_m("docker ps -a listing failed", extra={"error": str(exc)}))
+            return None
+        if result.exit_status != 0:
+            logger.warning(
+                _m(
+                    "docker ps -a listing exited non-zero",
+                    extra={"exit_status": result.exit_status, "stderr": (result.stderr or "").strip()[:500]},
+                )
+            )
+            return None
+        return [name for name in (result.stdout or "").strip().split("\n") if name]
+
+    async def _names_still_on_host(
+        self, ssh_client: asyncssh.SSHClientConnection, names: list[str]
+    ) -> list[str] | None:
+        """Which of ``names`` `docker ps -a` still lists; None when the listing could not be read."""
+        all_names = await self._list_all_container_names(ssh_client)
+        if all_names is None:
+            return None
+        wanted = set(names)
+        return [name for name in all_names if name in wanted]
 
     async def clean_stale_vloopback_volumes(
         self,
