@@ -7131,6 +7131,51 @@ class DockerService:
             duration_ms=int((time.monotonic() - stop_started) * 1000),
         )
 
+    async def _removal_after_read_timeout(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+        exc: Exception,
+    ) -> _ForcedRemoval | None:
+        """The forced removal's outcome once its reply outlived the SDK read timeout.
+
+        DAH-3467: dockerd took the force-remove and has not answered yet, so the container is
+        asked about instead of failing a delete that is most likely completing. Returns the
+        removal confirmed by inspect, DeletionInProgress while dockerd is still removing it, or
+        None when nothing proves the container gone (the caller re-raises the timeout).
+        """
+        status = await self._container_status_after_removal_timeout(docker_client, payload, log)
+        if status is None:
+            log.info(
+                "Container removal outlived the read timeout; inspect confirms it is gone",
+                container_name=payload.container_name,
+                error=str(exc),
+            )
+            return self._ForcedRemoval(confirmed_by_inspect=True)
+        if status == _DOCKER_REMOVING_STATUS:
+            log.info(
+                "Container deletion is still in progress after the read timeout",
+                container_name=payload.container_name,
+                error=str(exc),
+            )
+            return self._ForcedRemoval(
+                failure=self._deletion_in_progress(
+                    payload,
+                    msg=f"{exc}; container still '{status}' after "
+                    f"{REMOVE_CONFIRM_TIMEOUT_SECONDS:.0f}s",
+                )
+            )
+        # `unknown` (the inspect failed, hung or carried no state) or any other State.Status:
+        # none of them proves the container is gone
+        log.warning(
+            "Container not confirmed gone after the remove timed out",
+            container_name=payload.container_name,
+            container_status=status,
+            error=str(exc),
+        )
+        return None
+
     async def _force_remove_container(
         self,
         docker_client: RentalDockerSdkClient,
@@ -7165,38 +7210,10 @@ class DockerService:
                 )
 
             if _is_docker_read_timeout_error(exc):
-                # DAH-3467: dockerd took the force-remove and has not answered yet. Ask it what
-                # happened instead of failing a delete that is most likely completing.
-                status = await self._container_status_after_removal_timeout(docker_client, payload, log)
-                if status is None:
-                    log.info(
-                        "Container removal outlived the read timeout; inspect confirms it is gone",
-                        container_name=payload.container_name,
-                        error=str(exc),
-                    )
-                    return self._ForcedRemoval(confirmed_by_inspect=True)
-                if status == _DOCKER_REMOVING_STATUS:
-                    log.info(
-                        "Container deletion is still in progress after the read timeout",
-                        container_name=payload.container_name,
-                        error=str(exc),
-                    )
-                    return self._ForcedRemoval(
-                        failure=self._deletion_in_progress(
-                            payload,
-                            msg=f"{exc}; container still '{status}' after "
-                            f"{REMOVE_CONFIRM_TIMEOUT_SECONDS:.0f}s",
-                        )
-                    )
-                # `unknown` (the inspect failed, hung or carried no state) or any other
-                # State.Status: none of them proves the container is gone
-                log.warning(
-                    "Container not confirmed gone after the remove timed out",
-                    container_name=payload.container_name,
-                    container_status=status,
-                    error=str(exc),
-                )
-                raise
+                removal = await self._removal_after_read_timeout(docker_client, payload, log, exc)
+                if removal is None:
+                    raise
+                return removal
 
             # DAH-2345: deletion is idempotent for every workload kind — a container
             # that is already gone (e.g. removed by failed-create cleanup) must not
