@@ -237,6 +237,12 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # On a rent, a Docker SDK call whose SSH channel dropped under it (paramiko EOFError, a 60 s
+    # read timeout, the adapter's typed dropped-transport error) is retried ONCE after the SSH
+    # session is re-opened; `containers/create` and `volumes/create` first check by name and adopt
+    # what the lost first attempt made. Off: the call fails the rent as before. Either way the
+    # failure event carries `error_class: transport`.
+    DOCKER_TRANSPORT_RETRY_ENABLED: bool = Field(env="DOCKER_TRANSPORT_RETRY_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
