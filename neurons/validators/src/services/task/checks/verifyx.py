@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.verifyx_validation_service import _is_speed_reading
 
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -173,22 +174,27 @@ class VerifyXCheck:
             )
 
             # Always compute verifyx network EMA — use 0.0 when network measurement failed
-            # so EMA decays toward 0 on repeated failures, eventually triggering exclusion
+            # so EMA decays toward 0 on repeated failures, eventually triggering exclusion.
+            # A malformed reading never reaches compute_ema: the previous EMA stands.
             if "network" not in updated_specs:
                 updated_specs["network"] = {}
             download_speed = verifyx_network.get("download_speed")
-            if download_speed is not None:
-                updated_specs["network"]["verifyx_download_speed"] = download_speed
-            updated_specs["network"]["ema_verifyx_download_speed"] = compute_ema(
+            unavailable_readings: list[str] = []
+            ema_download = _feed_ema(
+                ctx,
+                updated_specs["network"],
+                "download",
+                download_speed,
                 prev_ema.ema_verifyx_download_speed if prev_ema else None,
-                download_speed if download_speed is not None else 0.0,
+                unavailable_readings,
             )
-            upload_speed = verifyx_network.get("upload_speed")
-            if upload_speed is not None:
-                updated_specs["network"]["verifyx_upload_speed"] = upload_speed
-            updated_specs["network"]["ema_verifyx_upload_speed"] = compute_ema(
+            _feed_ema(
+                ctx,
+                updated_specs["network"],
+                "upload",
+                verifyx_network.get("upload_speed"),
                 prev_ema.ema_verifyx_upload_speed if prev_ema else None,
-                upload_speed if upload_speed is not None else 0.0,
+                unavailable_readings,
             )
 
             # Update storage specs if storage is present. Merged rather than replaced: VerifyX
@@ -221,11 +227,16 @@ class VerifyXCheck:
                 ]
             if cold_sample_retry is not None:
                 event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
+            if unavailable_readings:
+                event.what_we_saw["unavailable_speed_readings"] = unavailable_readings
 
             updated_state = replace(ctx.state, specs=updated_specs)
 
-            ema_download = updated_specs["network"]["ema_verifyx_download_speed"]
             never_measured = prev_ema is None or prev_ema.ema_verifyx_download_speed is None
+            if ema_download is None:
+                # A malformed download reading on a never-measured host: there is no EMA to keep
+                # and none to gate on. The event says why; the next sample seeds it.
+                return CheckResult(passed=True, event=event, updates={"state": updated_state})
             if (
                 ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
                 and ctx.config.first_pass
@@ -307,7 +318,48 @@ def _first_pass_challenge_config() -> dict[str, int]:
 def _download_speed(result) -> float | None:
     if not result.data:
         return None
-    return (result.data.get("network") or {}).get("download_speed")
+    speed = (result.data.get("network") or {}).get("download_speed")
+    return speed if _is_speed_reading(speed) else None
+
+
+def _feed_ema(
+    ctx: Context,
+    network: dict,
+    direction: Literal["download", "upload"],
+    reading: object,
+    prev: float | None,
+    unavailable: list[str],
+) -> float | None:
+    """Publish one VerifyX speed reading and its EMA into `network`; return the EMA.
+
+    None is a failed measurement: the EMA takes 0.0 so repeated failures decay it toward
+    exclusion. A reading `_is_speed_reading` rejects (a string, a bool, NaN, ±inf, a negative)
+    is malformed: it never reaches `compute_ema`, is not published as the raw speed, the
+    previous EMA stands (None when there was none) and the sample is logged as unavailable.
+    """
+    if reading is not None and not _is_speed_reading(reading):
+        unavailable.append(direction)
+        logger.warning(
+            _m(
+                f"VerifyX {direction} speed reading unavailable, previous EMA kept",
+                extra=get_extra_info(
+                    {
+                        **ctx.default_extra,
+                        "direction": direction,
+                        "reading_type": type(reading).__name__,
+                        f"ema_verifyx_{direction}_speed": prev,
+                    }
+                ),
+            )
+        )
+        if prev is not None:
+            network[f"ema_verifyx_{direction}_speed"] = prev
+        return prev
+    if reading is not None:
+        network[f"verifyx_{direction}_speed"] = reading
+    ema = compute_ema(prev, reading if reading is not None else 0.0)
+    network[f"ema_verifyx_{direction}_speed"] = ema
+    return ema
 
 
 def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:

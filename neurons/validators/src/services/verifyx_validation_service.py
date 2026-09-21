@@ -1,5 +1,6 @@
 import ctypes
 import json
+import math
 import random
 import os
 import logging
@@ -428,9 +429,12 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
         speedtest = network_execution.get("speedtest") or {}
         download_speed = speedtest.get("download_mbps")
         package_speed = (network_execution.get("download") or {}).get("speed_mbps")
+        upload_speed = speedtest.get("upload_mbps")
         return {
             "download_speed": download_speed if _is_positive_number(download_speed) else None,
-            "upload_speed": speedtest.get("upload_mbps"),
+            # 0.0 is how the probe reports the failed direction; anything that is not a number is
+            # a malformed payload and reads as "no upload measurement" like the download above.
+            "upload_speed": upload_speed if _is_speed_reading(upload_speed) else None,
             "package_download_speed": package_speed if _is_positive_number(package_speed) else None,
             "success": False,
             "execution_time_ms": network_execution.get("execution_time_ms"),
@@ -576,6 +580,17 @@ def _verify_xet_test(challenge_data: dict, response_data: dict) -> Tuple[dict, L
 
 def _is_positive_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _is_speed_reading(value: object) -> bool:
+    """A usable Mbps reading: a finite positive number, or 0 (how a failed direction reads).
+
+    A bool, a string, NaN, ±inf or a negative number is not one — the paired libverifyx.so only
+    serializes f64, so any such value is a malformed payload and must never reach EMA arithmetic.
+    """
+    if _is_positive_number(value):
+        return math.isfinite(value)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
 
 
 def _format_mbps(value: object) -> str:

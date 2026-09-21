@@ -491,6 +491,134 @@ async def test_verifyx_repeated_upload_failures_keep_the_download_ema_above_the_
     assert ema > 100.0
 
 
+async def _run_ema_cycle(
+    context_factory, *, download, upload=60.0, prev_download=2000.0, prev_upload=900.0
+):
+    """One real VerifyXCheck.run over a passing probe whose network block carries `download` and
+    `upload` exactly as the service hands them over (no coercion in the double)."""
+    network = {"download_speed": download, "upload_speed": upload, "package_download_speed": 700.0}
+    verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": network})
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema(
+            "executor-123", download=prev_download, upload=prev_upload
+        ),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+    return await VerifyXCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "download,expected_ema,published",
+    [
+        # a real reading → compute_ema(2000, 2100) = 2050 and the raw sample is published
+        (2100.0, 2050.0, True),
+        # a failed measurement → the pre-existing rule: compute_ema(2000, 0.0) = 1000 decays
+        (None, 1000.0, False),
+        # malformed readings never reach compute_ema: the previous EMA stands, nothing published
+        ("fast", 2000.0, False),
+        (float("nan"), 2000.0, False),
+        (float("inf"), 2000.0, False),
+        (-25.0, 2000.0, False),
+        (True, 2000.0, False),
+    ],
+    ids=["float", "none", "str", "nan", "inf", "negative", "bool"],
+)
+async def test_verifyx_download_reading_feeds_the_ema_only_when_it_is_a_number(
+    context_factory, caplog, download, expected_ema, published
+):
+    with caplog.at_level(logging.WARNING):
+        result = await _run_ema_cycle(context_factory, download=download)
+
+    assert result.passed is True
+    net = result.updates["state"].specs["network"]
+    assert net["ema_verifyx_download_speed"] == pytest.approx(expected_ema)
+    assert ("verifyx_download_speed" in net) is published
+    # the upload direction is untouched by the download reading: compute_ema(900, 60) = 480
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(480.0)
+    unavailable = result.event.what_we_saw.get("unavailable_speed_readings")
+    unavailable_logs = [
+        rec for rec in caplog.records if "speed reading unavailable" in rec.getMessage()
+    ]
+    if download is not None and expected_ema == 2000.0:
+        assert unavailable == ["download"]
+        assert len(unavailable_logs) == 1
+        # the log names the type, never the value (a malformed payload is not ours to echo)
+        logged = unavailable_logs[0].msg.to_full_string()
+        assert type(download).__name__ in logged
+        assert "fast" not in logged
+    else:
+        assert unavailable is None
+        assert unavailable_logs == []
+
+
+@pytest.mark.asyncio
+async def test_verifyx_ema_over_a_sequence_of_good_missing_and_malformed_readings(
+    context_factory,
+):
+    """Five consecutive cycles through the real EMA path; the EMA after each is asserted."""
+    ema = 2000.0
+    expected_after = [
+        ("fast", 2000.0),  # stands
+        (None, 1000.0),  # decays: 0.5 × 2000
+        (float("nan"), 1000.0),  # stands
+        (float("inf"), 1000.0),  # stands
+        (2100.0, 1550.0),  # 0.5 × 2100 + 0.5 × 1000
+    ]
+    for reading, expected in expected_after:
+        result = await _run_ema_cycle(context_factory, download=reading, prev_download=ema)
+        ema = result.updates["state"].specs["network"]["ema_verifyx_download_speed"]
+        assert ema == pytest.approx(expected), reading
+
+
+@pytest.mark.asyncio
+async def test_verifyx_malformed_upload_keeps_the_upload_ema_and_updates_the_download(
+    context_factory,
+):
+    result = await _run_ema_cycle(context_factory, download=2100.0, upload="fast")
+
+    assert result.passed is True
+    net = result.updates["state"].specs["network"]
+    assert net["ema_verifyx_download_speed"] == pytest.approx(2050.0)
+    assert net["verifyx_download_speed"] == pytest.approx(2100.0)
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(900.0)
+    assert "verifyx_upload_speed" not in net
+    assert result.event.what_we_saw["unavailable_speed_readings"] == ["upload"]
+
+
+@pytest.mark.asyncio
+async def test_verifyx_malformed_download_on_a_never_measured_host_leaves_the_ema_unseeded(
+    context_factory,
+):
+    """No previous EMA to keep: the check passes without an EMA (like the DAH-3011 deferral) and
+    the event says why, instead of a TypeError inside compute_ema."""
+    result = await _run_ema_cycle(
+        context_factory, download="fast", prev_download=None, prev_upload=None
+    )
+
+    assert result.passed is True
+    net = result.updates["state"].specs["network"]
+    assert "ema_verifyx_download_speed" not in net
+    assert "verifyx_download_speed" not in net
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(60.0)
+    assert result.event.what_we_saw["unavailable_speed_readings"] == ["download"]
+
+
+@pytest.mark.parametrize("reading", ["fast", True, float("nan"), float("inf"), -1.0])
+def test_download_speed_helper_reads_a_malformed_reading_as_none(reading):
+    from neurons.validators.src.services.task.checks.verifyx import _download_speed
+
+    result = MockVerifyXResponse(data={"success": True, "network": {"download_speed": reading}})
+
+    assert _download_speed(result) is None
+    assert _download_speed(
+        MockVerifyXResponse(data={"success": True, "network": {"download_speed": 0.0}})
+    ) == 0.0
+
+
 @pytest.mark.asyncio
 async def test_verifyx_keeps_the_scrapes_disk_breakdown(context_factory):
     """VerifyX measures only total/used/free, so its dict must not evict the scrape's own

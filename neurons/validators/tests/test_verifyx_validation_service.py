@@ -21,6 +21,7 @@ from neurons.validators.src.services.verifyx_validation_service import (
     VerifyXFailureClass,
     VerifyXValidationService,
     _format_mbps,
+    _is_speed_reading,
     _log_verifyx_network_speeds,
     _perform_verification_checks,
     _verify_network_test,
@@ -148,6 +149,43 @@ def test_upload_timeout_keeps_the_download_reading():
     assert errors == [
         "Network execution failed: Cloudflare up speedtest timeout after 120 seconds"
     ]
+
+
+@pytest.mark.parametrize("upload_mbps", ["fast", True, float("nan"), float("inf"), -1.0])
+def test_upload_failure_reports_a_malformed_upload_as_none(upload_mbps):
+    # Same filter as the download on the probe-failed path: a value that is not a number never
+    # reaches the check's EMA arithmetic; 0.0 (the failed direction's reading) still passes.
+    challenge_data, response_data = _network_payload(cloudflare_download_speed=2100.0)
+    response_data["network_execution"]["success"] = False
+    response_data["network_execution"]["speedtest"]["upload_mbps"] = upload_mbps
+    response_data["network_execution"]["error"] = "Cloudflare up speedtest failed"
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["upload_speed"] is None
+    assert stats["download_speed"] == 2100.0
+    assert errors == ["Network execution failed: Cloudflare up speedtest failed"]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (2100.0, True),
+        (1, True),
+        (0, True),
+        (0.0, True),
+        (None, False),
+        ("fast", False),
+        (True, False),
+        (False, False),
+        (float("nan"), False),
+        (float("inf"), False),
+        (-0.5, False),
+    ],
+)
+def test_is_speed_reading(value, expected):
+    assert _is_speed_reading(value) is expected
 
 
 def test_download_failure_reports_no_download_reading():
