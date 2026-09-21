@@ -277,6 +277,16 @@ _DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
 # (uninterruptible I/O). `docker rm -f` fails the same way on every retry; only a direct kill of the
 # init and its shim over SSH gets past it (ticket-0287: 4 backend deletes, 5 h at score 0).
 _DOCKER_COULD_NOT_KILL_PHRASES = ("could not kill", "did not receive an exit event")
+# A stale `pod_*`/`filler_*` container caught in that wedge keeps its name, so the rent that needs
+# the name fails: here after the `rm -fv` attempts, or at `containers/create` with 409 "name already
+# in use" (4 rents on 4 nodes, 16–21 Sep). `docker rename` needs no exit event, so with
+# STUCK_CONTAINER_RENAME_ENABLED the container is moved aside as `stuck_<name>_<unix time>` — not a
+# rental prefix, so neither sweeper spends a `rm -f` on it every cycle — and the create goes on. The
+# container still holds its GPUs and ports until the node is restarted; the STUCK_CONTAINER event
+# (typed fields: node, container, new name, count in the window, repeat) is what tells the provider.
+STUCK_CONTAINER_PREFIX = "stuck_"
+STUCK_CONTAINER_EVENT = "STUCK_CONTAINER"
+STUCK_CONTAINER_REPEAT_WINDOW_SECONDS = 24 * 60 * 60
 HOST_KEY_REQUIRED_EXTRA = {
     "ssh_host_key_missing": True,
     "docker_sdk_host_key_required": True,
@@ -2130,7 +2140,14 @@ class DockerService:
             )
 
             command = f'/usr/bin/docker rm -fv {container_names}'
-            await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            try:
+                await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            except Exception as exc:
+                renamed_aside = await self._rename_stuck_containers_aside(
+                    ssh_client, default_extra, stale_containers, pod_name=pod_name, cause=exc
+                )
+                if renamed_aside is None:
+                    raise
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2149,6 +2166,99 @@ class DockerService:
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             return stale_containers
         return []
+
+    async def _rename_stuck_containers_aside(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        stale_containers: list[str],
+        *,
+        pod_name: str,
+        cause: Exception,
+    ) -> list[str] | None:
+        """Move aside the stale containers `docker rm -fv` could not kill; returns their new names.
+
+        None means "not handled" and the caller raises ``cause`` as before: the flag is off, the
+        error is not dockerd's could-not-kill class, the host could not be listed, or a rename
+        failed. An empty list means every stale name is already gone (the `rm` reported an error
+        for a container that left meanwhile) — the name is free, which is all this step is for.
+        Each renamed container is one STUCK_CONTAINER event for the node; a Redis counter per node
+        marks the second inside STUCK_CONTAINER_REPEAT_WINDOW_SECONDS as ``repeat``.
+        """
+        if not settings.STUCK_CONTAINER_RENAME_ENABLED or not _is_docker_could_not_kill_error(cause):
+            return None
+        listed = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
+        if listed.exit_status != 0:
+            return None
+        on_host = set((listed.stdout or "").split())
+        still_there = [name for name in stale_containers if name in on_host]
+        renamed: list[str] = []
+        for name in still_there:
+            stuck_name = f"{STUCK_CONTAINER_PREFIX}{name}_{int(time.time())}"
+            result = await ssh_client.run(
+                f"/usr/bin/docker rename {shlex.quote(name)} {shlex.quote(stuck_name)}"
+            )
+            if result.exit_status != 0:
+                logger.error(
+                    _m(
+                        "A stale container dockerd cannot kill could not be renamed aside either",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "pod_name": pod_name,
+                            "container_name": name,
+                            "stuck_name": stuck_name,
+                            "error": (result.stderr or "").strip(),
+                        }),
+                    )
+                )
+                return None
+            renamed.append(stuck_name)
+            await self._record_stuck_container(
+                default_extra, pod_name=pod_name, container_name=name, stuck_name=stuck_name, cause=cause
+            )
+        return renamed
+
+    async def _record_stuck_container(
+        self,
+        default_extra: dict,
+        *,
+        pod_name: str,
+        container_name: str,
+        stuck_name: str,
+        cause: Exception,
+    ) -> None:
+        """One STUCK_CONTAINER event: the node, the container, its new name, and whether it repeats."""
+        miner_hotkey = default_extra.get("miner_hotkey")
+        executor_id = default_extra.get("executor_uuid")
+        count: int | None = None
+        if miner_hotkey and executor_id:
+            try:
+                count = await self.redis_service.count_stuck_container(
+                    miner_hotkey, executor_id, STUCK_CONTAINER_REPEAT_WINDOW_SECONDS
+                )
+            except Exception as redis_exc:  # noqa: BLE001 — the count is bookkeeping; the create goes on
+                logger.warning(
+                    _m(
+                        "Could not count the stuck container for its node",
+                        extra=get_extra_info({**default_extra, "error": str(redis_exc)}),
+                    )
+                )
+        logger.warning(
+            _m(
+                "Stale container dockerd cannot kill renamed aside so the pod's name is free",
+                extra=get_extra_info({
+                    **default_extra,
+                    "event": STUCK_CONTAINER_EVENT,
+                    "pod_name": pod_name,
+                    "container_name": container_name,
+                    "stuck_name": stuck_name,
+                    "window_seconds": STUCK_CONTAINER_REPEAT_WINDOW_SECONDS,
+                    "count_in_window": count,
+                    "repeat": count is not None and count > 1,
+                    "error": "; ".join(_exception_texts(cause)),
+                }),
+            )
+        )
 
     async def clean_stale_vloopback_volumes(
         self,

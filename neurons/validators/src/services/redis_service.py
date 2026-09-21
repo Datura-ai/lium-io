@@ -45,6 +45,9 @@ CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 # DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
+# One counter per node of the stale containers a create had to rename aside because dockerd could
+# not kill them; expires a window after the first one, so the second inside it reads as a repeat.
+STUCK_CONTAINER_COUNT_PREFIX = "stuck_container_count"
 # One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
 # ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
 FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
@@ -284,6 +287,23 @@ class RedisService:
     async def clear_dind_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
         """Forget the recorded miss: the probe reached its container again."""
         await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
+
+    @staticmethod
+    def _stuck_container_count_key(miner_hotkey: str, executor_id: str) -> str:
+        return f"{STUCK_CONTAINER_COUNT_PREFIX}:{miner_hotkey}:{executor_id}"
+
+    async def count_stuck_container(self, miner_hotkey: str, executor_id: str, window_seconds: int) -> int:
+        """One more container on this node that had to be renamed aside; returns the count so far.
+
+        The window starts at the first one (the expiry is set only then), so the count is "stuck
+        containers on this node since the first inside the last ``window_seconds``".
+        """
+        key = self._stuck_container_count_key(miner_hotkey, executor_id)
+        async with self.lock:
+            count = int(await self.redis.incr(key))
+            if count == 1:
+                await self.redis.expire(key, window_seconds)
+        return count
 
     async def set(self, key: str, value: str, ex: int | None = None):
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
