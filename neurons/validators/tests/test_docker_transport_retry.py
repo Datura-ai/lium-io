@@ -5,6 +5,7 @@ dropped under a Docker SDK call — `run container failed: EOFError`, `SSHConnec
 timed out (60 s)`, `create volume failed: 'NoneType' object has no attribute 'settimeout'`. The
 last one is docker-py/urllib3 dereferencing a channel that is `None`.
 """
+
 from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
@@ -45,11 +46,13 @@ READ_TIMEOUT_TEXT = (
 )
 # Answers from the daemon are not transport errors.
 NAME_CONFLICT_TEXT = (
-    'Docker SDK run container failed: 409 Client Error for http+docker://ssh/v1.45/containers/create'
+    "Docker SDK run container failed: 409 Client Error for http+docker://ssh/v1.45/containers/create"
     '?name=pod_x: Conflict ("Conflict. The container name "/pod_x" is already in use by container '
     '"abc123". You have to remove (or rename) that container to be able to reuse that name.")'
 )
-NO_SUCH_IMAGE_TEXT = "Docker SDK run container failed: 404 Client Error: No such image: bogus:latest"
+NO_SUCH_IMAGE_TEXT = (
+    "Docker SDK run container failed: 404 Client Error: No such image: bogus:latest"
+)
 PORT_ALLOCATED_TEXT = (
     "Docker SDK run container failed: 500 Server Error: driver failed programming external "
     "connectivity on endpoint pod_x: Bind for 0.0.0.0:9101 failed: port is already allocated"
@@ -94,7 +97,11 @@ class _FakeApiClient:
             raise errors.pop(0)
 
     def inspect_network(self, name):
-        return {"Name": name, "Driver": "bridge", "Options": {"com.docker.network.bridge.enable_icc": "false"}}
+        return {
+            "Name": name,
+            "Driver": "bridge",
+            "Options": {"com.docker.network.bridge.enable_icc": "false"},
+        }
 
     def create_host_config(self, **kwargs):
         return {"HostConfig": kwargs}
@@ -194,7 +201,9 @@ async def test_create_volume_retries_once_after_reopening_on_none_channel():
     api = _FakeApiClient(adapter=adapter)
     api.create_volume_errors = [AttributeError("'NoneType' object has no attribute 'settimeout'")]
 
-    await _client(api).create_volume(volume_name="volume_p1", driver="vloopback", driver_opts={"size": "10g"})
+    await _client(api).create_volume(
+        volume_name="volume_p1", driver="vloopback", driver_opts={"size": "10g"}
+    )
 
     assert adapter.reopen_calls == 1
     # retry checks by name first (nothing there), then creates once more
@@ -213,7 +222,9 @@ async def test_create_volume_retry_adopts_the_volume_the_lost_first_attempt_made
 
     api.create_volume = create_then_drop
 
-    await _client(api).create_volume(volume_name="volume_p1", driver="vloopback", driver_opts={"size": "10g"})
+    await _client(api).create_volume(
+        volume_name="volume_p1", driver="vloopback", driver_opts={"size": "10g"}
+    )
 
     assert adapter.reopen_calls == 1
     assert api.calls == ["create_volume", "inspect_volume"]
@@ -226,7 +237,9 @@ async def test_create_volume_retry_refuses_a_same_name_volume_on_another_driver(
     api.existing_volumes["volume_p1"] = {"Name": "volume_p1", "Driver": "local"}
 
     with pytest.raises(RentalDockerOperationError, match="already exists on driver 'local'"):
-        await _client(api).create_volume(volume_name="volume_p1", driver="vloopback", driver_opts=None)
+        await _client(api).create_volume(
+            volume_name="volume_p1", driver="vloopback", driver_opts=None
+        )
 
     assert api.calls == ["create_volume", "inspect_volume"]
 
@@ -238,7 +251,9 @@ async def test_create_volume_flag_off_fails_the_first_time_and_never_reopens():
     api.create_volume_errors = [AttributeError("'NoneType' object has no attribute 'settimeout'")]
 
     with pytest.raises(RentalDockerOperationError) as exc:
-        await _client(api, enabled=False).create_volume(volume_name="volume_p1", driver=None, driver_opts=None)
+        await _client(api, enabled=False).create_volume(
+            volume_name="volume_p1", driver=None, driver_opts=None
+        )
 
     assert str(exc.value) == VOLUME_NONE_CHANNEL_TEXT
     assert adapter.reopen_calls == 0
@@ -316,7 +331,9 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
     api.create_container_errors = [EOFError()]
     api.existing_containers["pod_test"] = {"Config": {"Image": "someone/else:latest"}}
 
-    with pytest.raises(RentalDockerOperationError, match="already exists with image 'someone/else:latest'"):
+    with pytest.raises(
+        RentalDockerOperationError, match="already exists with image 'someone/else:latest'"
+    ):
         await _client(api).run_container(_run_spec())
 
     assert api.calls == ["create_container", "inspect_container"]
@@ -327,7 +344,9 @@ async def test_run_container_daemon_error_is_not_retried():
     """Negative control: the port-collision text is a daemon answer — no re-open, one create."""
     adapter = _FakeAdapter()
     api = _FakeApiClient(adapter=adapter)
-    api.create_container_errors = [_server_error("Bind for 0.0.0.0:9101 failed: port is already allocated")]
+    api.create_container_errors = [
+        _server_error("Bind for 0.0.0.0:9101 failed: port is already allocated")
+    ]
 
     with pytest.raises(RentalDockerOperationError, match="port is already allocated"):
         await _client(api).run_container(_run_spec())
@@ -359,7 +378,9 @@ async def test_reopen_failure_ends_the_call_without_a_second_attempt():
     api = _FakeApiClient(adapter=adapter)
     api.create_container_errors = [EOFError()]
 
-    with pytest.raises(RentalDockerTransportError, match="could not be re-opened.*connection refused"):
+    with pytest.raises(
+        RentalDockerTransportError, match="could not be re-opened.*connection refused"
+    ):
         await _client(api).run_container(_run_spec())
 
     assert adapter.reopen_calls == 1
@@ -375,9 +396,14 @@ async def test_reopen_failure_ends_the_call_without_a_second_attempt():
 async def test_exec_that_appends_is_not_retried_on_a_dropped_transport():
     adapter = _FakeAdapter()
     api = _FakeApiClient(adapter=adapter)
-    api.existing_containers["pod_test"] = {"Config": {"Image": "lium/pod:1"}, "State": {"Running": True}}
+    api.existing_containers["pod_test"] = {
+        "Config": {"Image": "lium/pod:1"},
+        "State": {"Running": True},
+    }
     api.exec_create_errors = [EOFError()]
-    spec = ContainerExecSpec(container_name="pod_test", argv=("sh", "-c", "cat >> /etc/environment"), stdin="A=1\n")
+    spec = ContainerExecSpec(
+        container_name="pod_test", argv=("sh", "-c", "cat >> /etc/environment"), stdin="A=1\n"
+    )
     assert spec.idempotent is False
 
     with pytest.raises(RentalDockerOperationError, match="Docker SDK exec failed: EOFError"):
@@ -391,9 +417,14 @@ async def test_exec_that_appends_is_not_retried_on_a_dropped_transport():
 async def test_idempotent_exec_is_retried_once_after_reopening():
     adapter = _FakeAdapter()
     api = _FakeApiClient(adapter=adapter)
-    api.existing_containers["pod_test"] = {"Config": {"Image": "lium/pod:1"}, "State": {"Running": True}}
+    api.existing_containers["pod_test"] = {
+        "Config": {"Image": "lium/pod:1"},
+        "State": {"Running": True},
+    }
     api.exec_create_errors = [EOFError()]
-    spec = ContainerExecSpec(container_name="pod_test", argv=("sh", "/tmp/bootstrap.sh"), idempotent=True)
+    spec = ContainerExecSpec(
+        container_name="pod_test", argv=("sh", "/tmp/bootstrap.sh"), idempotent=True
+    )
 
     result = await _client(api).exec_in_container(spec)
 
@@ -412,7 +443,9 @@ def _adapter_class(tmp_path):
     known_hosts_path = tmp_path / "known_hosts"
     key_path.write_text("PRIVATE KEY")
     known_hosts_path.write_text("[203.0.113.10]:2222 ssh-ed25519 AAAATESTKEY\n")
-    return _build_rental_ssh_http_adapter_class(key_path=key_path, known_hosts_path=known_hosts_path)
+    return _build_rental_ssh_http_adapter_class(
+        key_path=key_path, known_hosts_path=known_hosts_path
+    )
 
 
 def _adapter(tmp_path, *, transport, pool_size: int = 4):
@@ -536,7 +569,9 @@ def test_get_connection_reconnects_when_the_transport_is_dead(tmp_path):
 
 @pytest.mark.asyncio
 async def test_factory_reads_the_flag_callable_per_connect(monkeypatch):
-    monkeypatch.setattr("services.rental_docker_sdk._validate_paramiko_known_hosts", lambda path: None)
+    monkeypatch.setattr(
+        "services.rental_docker_sdk._validate_paramiko_known_hosts", lambda path: None
+    )
     flag = {"on": False}
     api_client_factory = Mock(return_value=_FakeApiClient())
     factory = RentalDockerSdkClientFactory(
@@ -544,7 +579,10 @@ async def test_factory_reads_the_flag_callable_per_connect(monkeypatch):
         transport_retry_enabled=lambda: flag["on"],
     )
     info = SimpleNamespace(
-        address="203.0.113.10", ssh_port=2222, ssh_username="root", ssh_host_key="ssh-ed25519 AAAATESTKEY"
+        address="203.0.113.10",
+        ssh_port=2222,
+        ssh_username="root",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
     )
 
     async with factory.connect(executor_info=info, private_key="PRIVATE KEY") as client:
@@ -588,7 +626,9 @@ def executor() -> ExecutorSSHInfo:
     )
 
 
-async def _failed_create(service, executor, monkeypatch, run_error: Exception) -> FailedContainerRequest:
+async def _failed_create(
+    service, executor, monkeypatch, run_error: Exception
+) -> FailedContainerRequest:
     _patch_create_harness(monkeypatch, service, RecordingSSHClient())
     service.rental_docker_client_factory.client.run_container_error = run_error
     result = await service.create_container(
@@ -602,8 +642,12 @@ async def _failed_create(service, executor, monkeypatch, run_error: Exception) -
 
 
 @pytest.mark.asyncio
-async def test_create_failure_event_carries_the_stage_and_the_transport_class(service, executor, monkeypatch):
-    result = await _failed_create(service, executor, monkeypatch, RentalDockerOperationError(RUN_EOF_TEXT))
+async def test_create_failure_event_carries_the_stage_and_the_transport_class(
+    service, executor, monkeypatch
+):
+    result = await _failed_create(
+        service, executor, monkeypatch, RentalDockerOperationError(RUN_EOF_TEXT)
+    )
 
     assert result.failure_step == "docker_run"
     assert '"error_class": "transport"' in result.detail
@@ -613,8 +657,12 @@ async def test_create_failure_event_carries_the_stage_and_the_transport_class(se
 
 
 @pytest.mark.asyncio
-async def test_create_failure_event_has_no_class_for_a_daemon_answer(service, executor, monkeypatch):
-    result = await _failed_create(service, executor, monkeypatch, RentalDockerOperationError(NO_SUCH_IMAGE_TEXT))
+async def test_create_failure_event_has_no_class_for_a_daemon_answer(
+    service, executor, monkeypatch
+):
+    result = await _failed_create(
+        service, executor, monkeypatch, RentalDockerOperationError(NO_SUCH_IMAGE_TEXT)
+    )
 
     assert result.failure_step == "docker_run"
     assert "error_class" not in result.detail
