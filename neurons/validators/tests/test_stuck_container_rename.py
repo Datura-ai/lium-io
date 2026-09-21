@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from payload_models.payloads import ContainerCreated, FailedContainerRequest
 from services.docker_service import (
+    _PRERUN_HOST_PROBE_TIMEOUT_SECONDS,
     STUCK_CONTAINER_EVENT,
     STUCK_CONTAINER_PREFIX,
     STUCK_CONTAINER_REPEAT_WINDOW_SECONDS,
@@ -54,6 +55,7 @@ class _Host:
         self.names = list(stale)
         self.rename_exit = rename_exit
         self.commands: list[str] = []
+        self.timeouts: list[float | None] = []
         self.client = AsyncMock()
         self.client.image_exists_result = True
         self.client.image_exists_error = None
@@ -61,6 +63,7 @@ class _Host:
 
     async def _run(self, cmd, *args, **kwargs):
         self.commands.append(cmd)
+        self.timeouts.append(kwargs.get("timeout"))
         if cmd.startswith("/usr/bin/docker ps -a"):
             return _ssh_result(stdout="".join(f"{n}\n" for n in self.names))
         if cmd.startswith("/usr/bin/docker rename"):
@@ -134,6 +137,9 @@ async def test_unkillable_stale_container_is_renamed_aside_and_the_create_succee
     ).isdigit()
     assert "filler_old" not in host.names and new in host.names
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    # the re-listing and the rename are bounded: dockerd just failed a kill on this host
+    bounded = [t for c, t in zip(host.commands, host.timeouts) if c.startswith(("/usr/bin/docker ps -a", "/usr/bin/docker rename"))]
+    assert bounded[-2:] == [_PRERUN_HOST_PROBE_TIMEOUT_SECONDS] * 2
 
     (event,) = _events(caplog)
     assert event["container_name"] == "filler_old"
@@ -206,6 +212,28 @@ async def test_a_rename_that_fails_raises_the_original_rm_error(svc, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_a_listing_that_raises_leaves_the_original_rm_error_to_the_caller(svc, monkeypatch, rename_flag, caplog):
+    host = _Host(["filler_old"])
+    real_run = host._run
+
+    async def run(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker ps -a") and len(host.commands) >= 1:
+            raise TimeoutError("docker ps hung")
+        return await real_run(cmd, *args, **kwargs)
+
+    host.client.run = AsyncMock(side_effect=run)
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "container_cleanup"
+    assert "did not receive an exit event" in result.detail and "docker ps hung" not in result.detail
+    assert host.renames == [] and _events(caplog) == []
+
+
+@pytest.mark.asyncio
 async def test_only_the_containers_still_on_the_host_are_renamed(svc, monkeypatch, rename_flag, caplog):
     """`docker rm -fv a b` removed `pod_gone` and wedged on `filler_old`: one rename, one event."""
     host = _Host(["filler_old"])  # pod_gone left with the rm; the sweep's first listing had both
@@ -258,22 +286,23 @@ async def test_second_stuck_container_on_the_node_inside_the_window_is_a_repeat(
     svc = DockerService(ssh_service=Mock(), redis_service=_redis_service_with_fake_store(), attestation_service=Mock())
     caplog.set_level(logging.WARNING)
 
-    async def stuck_create(executor: str, stale: str, pod_name: str) -> list[str]:
+    async def stuck_create(executor: str, stale: str, pod_name: str) -> _Host:
         host = _Host([stale])
-        return await svc._rename_stuck_containers_aside(
+        assert await svc._rename_stuck_containers_aside(
             host.client,
             {"miner_hotkey": "miner", "executor_uuid": executor, "pod_id": pod_name.removeprefix("pod_")},
             [stale],
             pod_name=pod_name,
             cause=Exception(COULD_NOT_KILL),
         )
+        return host
 
     first = await stuck_create("executor-1", "filler_a", "pod_1")
     second = await stuck_create("executor-1", "pod_1", "pod_2")
     other_node = await stuck_create("executor-2", "filler_b", "pod_3")
 
-    assert first[0].startswith(f"{STUCK_CONTAINER_PREFIX}filler_a_")
-    assert second[0].startswith(f"{STUCK_CONTAINER_PREFIX}pod_1_")
+    assert first.names[0].startswith(f"{STUCK_CONTAINER_PREFIX}filler_a_")
+    assert second.names[0].startswith(f"{STUCK_CONTAINER_PREFIX}pod_1_")
     events = _events(caplog)
     assert [(e["executor_uuid"], e["container_name"], e["count_in_window"], e["repeat"]) for e in events] == [
         ("executor-1", "filler_a", 1, False),
@@ -283,7 +312,7 @@ async def test_second_stuck_container_on_the_node_inside_the_window_is_a_repeat(
     assert all(e["window_seconds"] == STUCK_CONTAINER_REPEAT_WINDOW_SECONDS for e in events)
     # the window is set once per node, at the first stuck container
     assert [seconds for _, seconds in svc.redis_service.redis.expires] == [STUCK_CONTAINER_REPEAT_WINDOW_SECONDS] * 2
-    assert other_node[0].startswith(f"{STUCK_CONTAINER_PREFIX}filler_b_")
+    assert other_node.names[0].startswith(f"{STUCK_CONTAINER_PREFIX}filler_b_")
 
 
 @pytest.mark.asyncio
@@ -292,7 +321,7 @@ async def test_a_redis_error_leaves_the_event_without_a_count_and_the_create_goe
     svc.redis_service.count_stuck_container = AsyncMock(side_effect=ConnectionError("redis down"))
     caplog.set_level(logging.WARNING)
 
-    renamed = await svc._rename_stuck_containers_aside(
+    handled = await svc._rename_stuck_containers_aside(
         host.client,
         {"miner_hotkey": "miner", "executor_uuid": "executor-1"},
         ["pod_old"],
@@ -300,7 +329,7 @@ async def test_a_redis_error_leaves_the_event_without_a_count_and_the_create_goe
         cause=Exception(COULD_NOT_KILL),
     )
 
-    assert len(renamed) == 1
+    assert handled and len(host.renames) == 1
     (event,) = _events(caplog)
     assert event["count_in_window"] is None and event["repeat"] is False
 

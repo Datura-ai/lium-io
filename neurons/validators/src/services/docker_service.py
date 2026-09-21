@@ -2143,10 +2143,9 @@ class DockerService:
             try:
                 await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             except Exception as exc:
-                renamed_aside = await self._rename_stuck_containers_aside(
+                if not await self._rename_stuck_containers_aside(
                     ssh_client, default_extra, stale_containers, pod_name=pod_name, cause=exc
-                )
-                if renamed_aside is None:
+                ):
                     raise
 
             if clear_volume:
@@ -2175,30 +2174,44 @@ class DockerService:
         *,
         pod_name: str,
         cause: Exception,
-    ) -> list[str] | None:
-        """Move aside the stale containers `docker rm -fv` could not kill; returns their new names.
+    ) -> bool:
+        """Move aside the stale containers `docker rm -fv` could not kill; True when the names are free.
 
-        None means "not handled" and the caller raises ``cause`` as before: the flag is off, the
+        False means "not handled" and the caller raises ``cause`` as before: the flag is off, the
         error is not dockerd's could-not-kill class, the host could not be listed, or a rename
-        failed. An empty list means every stale name is already gone (the `rm` reported an error
-        for a container that left meanwhile) — the name is free, which is all this step is for.
-        Each renamed container is one STUCK_CONTAINER event for the node; a Redis counter per node
-        marks the second inside STUCK_CONTAINER_REPEAT_WINDOW_SECONDS as ``repeat``.
+        failed. True with nothing renamed means every stale name is already gone (the `rm` reported
+        an error for a container that left meanwhile) — the name is free, which is all this step is
+        for. Each renamed container is one STUCK_CONTAINER event for the node; a Redis counter per
+        node marks the second inside STUCK_CONTAINER_REPEAT_WINDOW_SECONDS as ``repeat``. The
+        listing and each rename are bounded like the pre-run probe: dockerd just failed a kill, and
+        a hang here must not outlive the create's own budget.
         """
         if not settings.STUCK_CONTAINER_RENAME_ENABLED or not _is_docker_could_not_kill_error(cause):
-            return None
-        listed = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
-        if listed.exit_status != 0:
-            return None
-        on_host = set((listed.stdout or "").split())
-        still_there = [name for name in stale_containers if name in on_host]
-        renamed: list[str] = []
-        for name in still_there:
-            stuck_name = f"{STUCK_CONTAINER_PREFIX}{name}_{int(time.time())}"
-            result = await ssh_client.run(
-                f"/usr/bin/docker rename {shlex.quote(name)} {shlex.quote(stuck_name)}"
+            return False
+        try:
+            listed = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+        except Exception as listing_exc:  # noqa: BLE001 — the caller raises the rm error, not this one
+            logger.warning(
+                _m(
+                    "Could not list the host's containers after a failed docker rm",
+                    extra=get_extra_info({**default_extra, "pod_name": pod_name, "error": str(listing_exc)}),
+                )
             )
-            if result.exit_status != 0:
+            return False
+        if listed.exit_status != 0:
+            return False
+        on_host = set((listed.stdout or "").split())
+        for name in (name for name in stale_containers if name in on_host):
+            stuck_name = f"{STUCK_CONTAINER_PREFIX}{name}_{int(time.time())}"
+            try:
+                result = await ssh_client.run(
+                    f"/usr/bin/docker rename {shlex.quote(name)} {shlex.quote(stuck_name)}",
+                    timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS,
+                )
+                error = (result.stderr or "").strip() if result.exit_status != 0 else None
+            except Exception as rename_exc:  # noqa: BLE001 — same: the rm error is the one to raise
+                error = str(rename_exc)
+            if error is not None:
                 logger.error(
                     _m(
                         "A stale container dockerd cannot kill could not be renamed aside either",
@@ -2207,16 +2220,15 @@ class DockerService:
                             "pod_name": pod_name,
                             "container_name": name,
                             "stuck_name": stuck_name,
-                            "error": (result.stderr or "").strip(),
+                            "error": error,
                         }),
                     )
                 )
-                return None
-            renamed.append(stuck_name)
+                return False
             await self._record_stuck_container(
                 default_extra, pod_name=pod_name, container_name=name, stuck_name=stuck_name, cause=cause
             )
-        return renamed
+        return True
 
     async def _record_stuck_container(
         self,
