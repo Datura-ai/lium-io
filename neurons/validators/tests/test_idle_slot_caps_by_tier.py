@@ -16,7 +16,7 @@ from incentive.config import MAX_UNRENTED_GPUS_BY_TYPE, IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.task import JobResult
 
-from tests.test_rental_price_incentive_flow import _make_pcc_job
+from tests.test_rental_price_incentive_flow import _make_pcc_job, _total_gpu_counts
 
 A100 = "NVIDIA A100-SXM4-80GB"
 L40S = "NVIDIA L40S"
@@ -29,12 +29,11 @@ async def _run_with_production_config(
     redis.get_portion_per_gpu_type = AsyncMock(return_value=0.3)
     redis.get_executor_uptime = AsyncMock(return_value=9999)
 
-    counts: dict[str, int] = {}
-    for jobs in job_results.values():
-        for j in jobs:
-            counts[j.gpu_model] = counts.get(j.gpu_model, 0) + j.gpu_count
     incentive = RentalPriceIncentive(
-        IncentiveConfig(), redis, job_results, total_gpu_model_count_map=counts
+        IncentiveConfig(),
+        redis,
+        job_results,
+        total_gpu_model_count_map=_total_gpu_counts(job_results),
     )
     price_provider = AsyncMock()
     price_provider.get_tao_price.return_value = 500.0
