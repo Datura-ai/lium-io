@@ -265,7 +265,7 @@ async def test_backend_error_on_the_report_does_not_fail_the_cycle(context_facto
 async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does(
     context_factory, no_answer
 ):
-    # Rustam's review (16 Sep): the POST went out on the threshold cycle only, so a backend that was
+    # Regression: the POST went out on the threshold cycle only, so a backend that was
     # down (or a 404 from one too old: the client returns None on any non-200) for that one cycle
     # never heard of the outage. The backend's 200 is now kept in the streak (`reported`); no
     # answer means the next cycle posts again.
@@ -278,7 +278,7 @@ async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does
     await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
     unanswered = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)  # threshold: POST, no answer
     assert h.streak()["reported"] is False
-    # Mikhail's review (18 Sep): the event rendered before the flush, which got no answer here, so
+    # The event rendered before the flush, which got no answer here, so
     # its impact must not claim the renter was told; it says the notice is queued and not yet sent.
     assert unanswered.event.impact == Msg.RENTED_POD_SSH_UNREACHABLE.impact
     assert "queued" in unanswered.event.impact and "not yet sent" in unanswered.event.impact
@@ -305,7 +305,7 @@ async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does
 
 @pytest.mark.asyncio
 async def test_redis_down_skips_the_probe_and_leaves_the_rented_verdict_alone(context_factory):
-    # Regression (Rustam, #1372): the first Redis call in a fatal check was unguarded, so a Redis
+    # Regression: the first Redis call in a fatal check was unguarded, so a Redis
     # outage raised out of the check and failed validation on every rented node. Redis is an input
     # to the signal, not to the verdict: with Redis down the cycle is RENTED at the rented score,
     # nothing is counted, and the backend is never told.
@@ -372,7 +372,7 @@ async def test_a_redis_error_on_either_write_of_the_threshold_cycle_still_posts_
 async def test_a_healthy_cycle_whose_redis_write_is_lost_leaves_no_half_state(
     context_factory, caplog
 ):
-    # Rustam's review (17 Sep): the healthy cycle wrote the ok mark, then deleted the streak. A
+    # Regression: the healthy cycle wrote the ok mark, then deleted the streak. A
     # connection lost between the two left a fresh ok mark ("healthy now, on boot-b") next to the
     # old streak, so the stored state contradicted itself and the next report carried a
     # first_failed_at older than a recorded healthy sighting. Every transition is now one
@@ -461,7 +461,7 @@ async def test_a_redis_blip_on_the_reported_mark_keeps_the_verdict_and_costs_one
 
 @pytest.mark.asyncio
 async def test_both_marks_carry_the_ttl_and_every_probe_renews_it(context_factory):
-    # Regression (Rustam, #1372): the marks were set without an expiry, so Redis kept one key pair
+    # Regression: the marks were set without an expiry, so Redis kept one key pair
     # per pod for ever. Every write now carries RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS, and an
     # unhealthy cycle renews the ok mark too, so a long outage keeps naming the pod.
     h = Harness(context_factory)
@@ -598,13 +598,13 @@ async def test_dry_run_logs_the_event_but_does_not_tell_the_backend(context_fact
 
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     h.backend.report_pod_ssh_unreachable.assert_not_awaited()
-    # Mikhail's review (18 Sep): a dry run queues nothing, so the impact must not say "queued" or
+    # A dry run queues nothing, so the impact must not say "queued" or
     # "told"; it says the outage was detected and no notice went out this cycle.
     [pod] = result.event.what_we_saw["unreachable_pods"]
     assert pod["report_queued"] is False
     assert result.event.impact == Msg.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT
 
-    # Rustam's review (16 Sep): the dry-run cycle counted on the same keys, so before the `reported`
+    # Regression: the dry-run cycle counted on the same keys, so before the `reported`
     # flag a validator switched live mid-outage read count 3 != threshold and never posted.
     result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
     [pod] = result.event.what_we_saw["unreachable_pods"]
@@ -616,7 +616,7 @@ async def test_dry_run_logs_the_event_but_does_not_tell_the_backend(context_fact
 class Fleet:
     """Several rented pods on one validator across cycles, each probed as its executor's task would.
 
-    Rustam's review (16 Sep, three times): a validator whose own network fails sees every mapped
+    A validator whose own network fails sees every mapped
     port refuse at once, and per-pod reporting would tell every healthy renter their pod is down.
     The reports are queued per cycle and posted at the cycle's end only when the fleet reads clean.
     """
@@ -767,7 +767,7 @@ def _job_result(check_result, pod_ids: list[str] | None = None) -> JobResult:
 
 @pytest.mark.asyncio
 async def test_a_suppressed_cycles_events_publish_as_rented_with_the_gates_verdict(context_factory):
-    # Rustam's review (17 Sep): the executor task rendered RENTED_POD_SSH_UNREACHABLE before the
+    # The executor task rendered RENTED_POD_SSH_UNREACHABLE before the
     # gate ran; on a suppressed cycle the outage was ours and nobody was told, so the event named
     # a pod outage that was not one. The sync loop now rewrites those results to RENTED
     # before the publish, as DAH-2748 does for availability errors, with the gate's verdict kept.
@@ -805,7 +805,7 @@ async def test_a_suppressed_cycles_events_publish_as_rented_with_the_gates_verdi
     assert other.validation_event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     assert rented_pod_ssh.PROBE_SUPPRESSED_FLEET not in other.validation_event.what_we_saw
 
-    # Rustam, round 7: a result naming both a held pod and a pod reported in an earlier cycle keeps
+    # A result naming both a held pod and a pod reported in an earlier cycle keeps
     # its reason for the told renter only; the held pod moves under probe_suppressed_fleet.
     mixed = _job_result(held, pod_ids=[POD_ID, "pod-reported-last-cycle"])
     assert rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage([mixed], h.gate) == 1
@@ -898,6 +898,22 @@ async def test_a_redis_outage_at_the_flush_posts_nothing_and_the_streaks_ask_aga
     assert gate.posted == ["pod-a"] and fleet.reported("pod-a")
 
 
+def test_judge_fleet_gate_holds_on_the_share_first_and_the_validator_verdict_second():
+    ok, bad = rented_pod_ssh.FLEET_MARK_OK, FAULT_TCP_REFUSED
+    due = {"pod-b": "{}", "pod-a": "{}"}
+    with patch.object(rented_pod_ssh.settings, "RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX", 0.5):
+        wide = {f"pod-{i}": bad if i < 4 else ok for i in range(6)}
+        gate = rented_pod_ssh.judge_fleet_gate(wide, due, "b", validator_outage=False)
+        assert (gate.probed, gate.failed, gate.due) == (6, 4, ["pod-a", "pod-b"])
+        assert gate.suppressed_by == "mapped_port_share"
+        # Four pods: under SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE, only the validator verdict holds.
+        small = {f"pod-{i}": bad for i in range(4)}
+        clean = rented_pod_ssh.judge_fleet_gate(small, due, "b", validator_outage=False)
+        assert clean.suppressed_by is None
+        held = rented_pod_ssh.judge_fleet_gate(small, due, "b", validator_outage=True)
+        assert held.suppressed_by == "validator_outage" and held.posted == []
+
+
 @pytest.mark.asyncio
 async def test_flush_with_the_probe_off_touches_nothing():
     redis = FakeRedis()
@@ -909,7 +925,7 @@ async def test_flush_with_the_probe_off_touches_nothing():
 
 @pytest.mark.asyncio
 async def test_banner_fault_off_never_sends_ssh_banner_missing(context_factory):
-    # Rustam's review (17 Sep, third time): the backend learns `ssh_banner_missing` in lium-platform#429;
+    # The backend learns `ssh_banner_missing` in lium-platform#429;
     # a validator deployed before it gets a 422 and the outage is never recorded. With
     # RENTED_POD_SSH_BANNER_FAULT_ENABLED off (the default) an accepting port is health, so a report
     # can only carry the names an older backend knows; on, the same port is the new fault.
@@ -953,7 +969,7 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
     probe.close()
     assert await tcp_connect_fault("127.0.0.1", closed_port, timeout=2.0) == FAULT_TCP_REFUSED
 
-    # Rustam's review (16 Sep): an accept-then-close is what docker-proxy does on the host while
+    # An accept-then-close is what docker-proxy does on the host while
     # sshd inside the container is down, so it is a fault, not health.
     server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
     open_port = server.sockets[0].getsockname()[1]
@@ -966,7 +982,7 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
         await server.wait_closed()
 
     async def greet_in_two_segments(_reader, writer):
-        # Rustam's review (16 Sep): `read(255)` judged the first TCP segment. Split inside the
+        # Regression: `read(255)` judged the first TCP segment. Split inside the
         # prefix, that read saw `SSH-2` and the `SSH-2.0-` rule called a healthy sshd unreachable.
         writer.write(b"SSH-2")
         await writer.drain()
@@ -992,7 +1008,7 @@ async def test_tcp_connect_fault_tells_refused_from_timeout_from_open():
 
 @pytest.mark.asyncio
 async def test_lines_before_the_identification_are_skipped_within_bounds():
-    # Rustam's review (17 Sep): RFC 4253 §4.2 lets a server send other lines before `SSH-`, and a
+    # RFC 4253 §4.2 lets a server send other lines before `SSH-`, and a
     # client MUST skip them; the probe read the first line alone and called such a server unreachable.
     async def serve(lines: list[bytes]):
         def handler(_reader, writer):
@@ -1030,7 +1046,7 @@ async def test_lines_before_the_identification_are_skipped_within_bounds():
 
 @pytest.mark.asyncio
 async def test_connect_and_banner_read_share_one_deadline():
-    # Rustam's review (17 Sep): the timeout applied to the connect and again to the read, so one
+    # Regression: the timeout applied to the connect and again to the read, so one
     # probe could take twice the configured value. A connect that uses 0.2 s of a 0.3 s budget
     # leaves the read 0.1 s, and the probe ends at 0.3 s (not 0.5 s) as ssh_banner_missing.
     accepted: list[asyncio.StreamWriter] = []
@@ -1081,7 +1097,7 @@ async def test_connect_and_banner_read_share_one_deadline():
     ],
 )
 async def test_tcp_connect_fault_rejects_a_non_2_0_or_malformed_identification(greeting):
-    # Rustam's review (16 Sep): the `SSH-` prefix accepted an SSH 1.x server or a malformed line as
+    # Regression: the `SSH-` prefix accepted an SSH 1.x server or a malformed line as
     # a healthy pod. Each greeting below is served on a real local socket and must be a fault.
     def serve(_reader, writer):
         writer.write(greeting)
@@ -1196,7 +1212,7 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
     assert rented_pod_ssh.OkMark.load(b"garbage") is None
 
 
-# ----------------------------------------------------------------------------- round 10 (21 Sep, Rustam)
+# ----------------------------------------------------------------------------- port range, pod status, bounded boot_id
 
 
 @pytest.mark.parametrize("port", [0, -1, 65536, 70000])

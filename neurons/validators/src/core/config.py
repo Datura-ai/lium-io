@@ -320,14 +320,14 @@ class Settings(BaseSettings):
     # report to the backend per outage. Observation only: the score is not changed here.
     RENTED_POD_SSH_PROBE_ENABLED: bool = Field(env="RENTED_POD_SSH_PROBE_ENABLED", default=True)
     # CYCLES 0 would report on the first unhealthy cycle and a timeout of 0 would time every connect
-    # out (Rustam's review, 21 Sep): both are refused at startup, like the TTL below.
+    # out: both are refused at startup, like the TTL below.
     RENTED_POD_SSH_PROBE_CYCLES: int = Field(env="RENTED_POD_SSH_PROBE_CYCLES", default=2, ge=1)
     RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS: float = Field(env="RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", default=5.0, gt=0)
     # Off: the mapped port is judged by the TCP connect alone (refused / timeout). On: the port must
     # also greet with an `SSH-2.0-` identification line, and a port that accepts without one is the
     # `ssh_banner_missing` fault. The backend learns that fault name in lium-platform#429; a validator
-    # that sends it to an older backend gets a 422 and the outage is never recorded (Rustam's review,
-    # 17 Sep). Turn on only after lium-platform#429 is deployed.
+    # that sends it to an older backend gets a 422 and the outage is never recorded. Turn on only
+    # after lium-platform#429 is deployed.
     RENTED_POD_SSH_BANNER_FAULT_ENABLED: bool = Field(env="RENTED_POD_SSH_BANNER_FAULT_ENABLED", default=False)
     # Both per-pod Redis marks expire this long after the last cycle that probed the pod (every probe
     # renews them) and are deleted when the backend says the rental closed, so a pod that left the

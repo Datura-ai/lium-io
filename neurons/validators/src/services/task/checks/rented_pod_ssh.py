@@ -29,9 +29,9 @@ outage is reported once. The score is not changed by this module: with
 ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on (DAH-2255, off by default) the check reads ``is_enforced``
 and fails the cycle itself once the streak reaches ``enforce_after_cycles()``.
 
-The POST is deferred to the end of the cycle and gated by the fleet (Rustam's review, 16 Sep): a
-validator whose own network fails sees every mapped port refuse at once, and per-pod reporting
-would tell every healthy renter their pod is down. Each probe writes its mapped-port result into a
+The POST is deferred to the end of the cycle and gated by the fleet: a validator whose own network
+fails sees every mapped port refuse at once, and per-pod reporting would tell every healthy renter
+their pod is down. Each probe writes its mapped-port result into a
 per-cycle Redis hash; a pod at the threshold queues its report into a second one. At the cycle's
 end ``flush_rented_pod_ssh_reports`` reads both: when the share of probed pods failing the
 mapped-port check is above ``RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX`` (default 0.5, on a fleet of at
@@ -63,6 +63,7 @@ import json
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import redis.exceptions
 from protocol.vc_protocol.compute_requests import (
@@ -79,6 +80,11 @@ from ..availability import SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
 from ..messages import TenantEnforcementMessages
 from ..models import JobResult, build_msg
 from ..pipeline import Context
+
+if TYPE_CHECKING:
+    from clients.backend_client import BackendClient
+
+    from ...redis_service import RedisService
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +113,8 @@ FAULT_TCP_TIMEOUT = "tcp_timeout"
 FAULT_SSH_BANNER_MISSING = "ssh_banner_missing"
 FAULT_AUTHORIZED_KEYS_UNREADABLE = "authorized_keys_unreadable"
 # RFC 4253 §4.2: `SSH-protoversion-softwareversion SP comments CR LF`, at most 255 bytes including
-# CR LF. Rustam's review (16 Sep): only protoversion 2.0 counts. `SSH-1.5-` is a 1.x-only server;
-# `SSH-1.99-` (RFC 4253 §5.1) marks a server that also speaks 1.x, and the ask is to refuse both.
+# CR LF. Only protoversion 2.0 counts: `SSH-1.5-` is a 1.x-only server; `SSH-1.99-` (RFC 4253
+# §5.1) marks a server that also speaks 1.x, and both are refused.
 SSH_ID_PREFIX = b"SSH-2.0-"
 SSH_ID_LINE_MAX = 255
 # The same section lets the server send other lines before its identification (each ending in CR LF,
@@ -328,12 +334,12 @@ async def read_ssh_identification(reader: asyncio.StreamReader) -> bytes:
     """The server's identification line, or b"" when none arrives within the bounds.
 
     RFC 4253 §4.2 lets a server send other lines before ``SSH-...``; they are skipped, up to
-    ``SSH_PRE_BANNER_LINES_MAX`` of them (Rustam's review, 17 Sep: reading the first line alone
-    flagged compliant servers). The reader's ``limit`` bounds every line: a peer whose LF sits past
-    byte 255 raises LimitOverrunError instead of growing memory (an LF exactly at index 255 returns
-    256 bytes, which ``is_ssh2_identification`` refuses); EOF before the LF raises
-    IncompleteReadError (docker-proxy's accept-then-close, or a line cut short). Both are "no
-    identification line". The caller holds the deadline.
+    ``SSH_PRE_BANNER_LINES_MAX`` of them (reading the first line alone flagged compliant servers).
+    The reader's ``limit`` bounds every line: a peer whose LF sits past byte 255 raises
+    LimitOverrunError instead of growing memory (an LF exactly at index 255 returns 256 bytes, which
+    ``is_ssh2_identification`` refuses); EOF before the LF raises IncompleteReadError (docker-proxy's
+    accept-then-close, or a line cut short). Both are "no identification line". The caller holds
+    the deadline.
     """
     for _ in range(SSH_PRE_BANNER_LINES_MAX + 1):
         try:
@@ -355,10 +361,10 @@ async def tcp_connect_fault(
     ``SSH-2.0-...CRLF`` first, before the client says anything. The whole line is read (up to the
     LF; the stream buffer is capped at 255 bytes and a line longer than 255 is refused) before it
     is judged: a prefix compared against the first TCP segment alone could call a healthy pod
-    unreachable (Rustam's review, 16 Sep).
+    unreachable.
 
     ``timeout`` is one deadline for the connect and the read together, so a probe takes at most
-    that long (Rustam's review, 17 Sep: two separate timeouts let one probe take twice the value).
+    that long (two separate timeouts would let one probe take twice the value).
     A connect that does not complete by the deadline is ``tcp_timeout``; a peer that accepts and
     then keeps the rest of the deadline without an identification line is ``ssh_banner_missing``.
 
@@ -412,9 +418,9 @@ async def probe_rented_pod_ssh(
     if not settings.RENTED_POD_SSH_PROBE_ENABLED:
         return None
     if pod.status is not None and pod.status != POD_STATUS_RUNNING:
-        # Rebooting, failed or pending as the backend records it (Rustam's review, 21 Sep): not this
-        # outage class, and a report for it is a 409. Nothing is counted or marked this cycle; the
-        # streak, if any, resumes when the pod is RUNNING again.
+        # Rebooting, failed or pending as the backend records it: not this outage class, and a
+        # report for it is a 409. Nothing is counted or marked this cycle; the streak, if any,
+        # resumes when the pod is RUNNING again.
         return None
 
     executor_ip = ctx.executor.address
@@ -476,10 +482,10 @@ async def _judge_with_streak(
     boot_id_now = bounded_boot_id((ctx.state.specs or {}).get("boot_id"))
     now_iso = datetime.now(UTC).isoformat()
 
-    # Every transition below is one MULTI/EXEC (Rustam's review, 17 Sep): the ok mark, the streak
-    # and the cycle's fleet mark move together or not at all. A connection lost mid-way leaves the
-    # previous state whole and the probe skips the cycle (REDIS_UNAVAILABLE, below) instead of
-    # leaving a fresh ok mark next to the old streak, or a counted streak next to a stale ok mark.
+    # Every transition below is one MULTI/EXEC: the ok mark, the streak and the cycle's fleet mark
+    # move together or not at all. A connection lost mid-way leaves the previous state whole and
+    # the probe skips the cycle (REDIS_UNAVAILABLE, below) instead of leaving a fresh ok mark next
+    # to the old streak, or a counted streak next to a stale ok mark.
     if not faults:
         healthy = RedisWrites()
         healthy.set(_ok_key(pod.pod_id), OkMark(at=now_iso, boot_id=boot_id_now).dump(), ex=ttl)
@@ -583,9 +589,38 @@ def _mark_fleet(ctx: Context, writes: RedisWrites, pod_id: str, mark: str) -> No
     writes.hset(key, pod_id, mark).expire(key, FLEET_KEY_TTL_SECONDS)
 
 
+def judge_fleet_gate(
+    fleet: dict[str, str], due: dict[str, str], job_batch_id: str, *, validator_outage: bool
+) -> FleetGate:
+    """The gate's verdict on one cycle: who was probed, who failed, and whether the reports are held.
+
+    ``fleet`` is the cycle's per-pod mapped-port marks, ``due`` its queued reports. The share of
+    probed pods failing above ``RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX`` is our side, not theirs
+    (a fleet under ``SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE`` carries no share signal); else the
+    cycle's executor-SSH verdict decides. Pure: no Redis, no backend.
+    """
+    probed = len(fleet)
+    failed = sum(1 for mark in fleet.values() if mark != FLEET_MARK_OK)
+    gate = FleetGate(
+        job_batch_id=job_batch_id,
+        probed=probed,
+        failed=failed,
+        due=sorted(due),
+        validator_outage=validator_outage,
+    )
+    if (
+        probed >= SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
+        and gate.fail_share > settings.RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX
+    ):
+        return replace(gate, suppressed_by="mapped_port_share")
+    if validator_outage:
+        return replace(gate, suppressed_by="validator_outage")
+    return gate
+
+
 async def flush_rented_pod_ssh_reports(
-    redis,
-    backend,
+    redis: RedisService,
+    backend: BackendClient,
     job_batch_id: str,
     *,
     validator_outage: bool = False,
@@ -626,33 +661,17 @@ async def flush_rented_pod_ssh_reports(
         )
         return None
 
-    probed = len(fleet)
-    failed = sum(1 for mark in fleet.values() if mark != FLEET_MARK_OK)
-    gate = FleetGate(
-        job_batch_id=job_batch_id,
-        probed=probed,
-        failed=failed,
-        due=sorted(due),
-        validator_outage=validator_outage,
-    )
-    if (
-        probed >= SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
-        and gate.fail_share > settings.RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX
-    ):
-        gate = replace(gate, suppressed_by="mapped_port_share")
-    elif validator_outage:
-        gate = replace(gate, suppressed_by="validator_outage")
-
+    gate = judge_fleet_gate(fleet, due, job_batch_id, validator_outage=validator_outage)
     gate_log_fields = {
         **extra,
-        "probed": probed,
-        "failed": failed,
+        "probed": gate.probed,
+        "failed": gate.failed,
         "fail_share": round(gate.fail_share, 3),
         "validator_outage": validator_outage,
         "due_pods": gate.due,
     }
     if not due:
-        if probed:
+        if gate.probed:
             logger.info(_m("RENTED_POD_SSH_PROBE_FLEET", extra=get_extra_info(gate_log_fields)))
         return gate
     if gate.suppressed_by:
@@ -692,9 +711,8 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     """Rewrite to RENTED the cycle's ``RENTED_POD_SSH_UNREACHABLE`` results whose reports the gate held.
 
     The executor task rendered its event before the cycle-end gate ran, and that event names a pod
-    outage with its notice queued. On a suppressed cycle the outage was ours and nobody is told
-    (Rustam's review, 17 Sep), so before the
-    specs publish each such result becomes the RENTED halt it would have been, with the gate's
+    outage with its notice queued. On a suppressed cycle the outage was ours and nobody is told,
+    so before the specs publish each such result becomes the RENTED halt it would have been, with the gate's
     verdict and the pods it held under ``what_we_saw[probe_suppressed_fleet]``: the record says the
     validator saw the ports fail and why it did not report them. The same pattern as DAH-2748's
     ``silence_availability_errors_on_our_own_outage``. Score and halt are untouched: the rented
@@ -704,7 +722,7 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     ``probe_suppressed_fleet``; a pod the gate did not hold (its outage was reported in an earlier
     cycle, so ``reported`` is set and it was never due) stays in ``unreachable_pods``, because that
     pod's outage is real and already on record. When nothing stays, the event becomes RENTED; when
-    something stays, it keeps its reason and names only the pods whose outage stands (Rustam, round 7).
+    something stays, it keeps its reason and names only the pods whose outage stands.
     An enforced event (DAH-2255, ``what_we_saw.enforced``) failed its cycle at score 0 and is never
     rewritten to RENTED: it keeps reason, impact and pods and gains the gate's verdict under
     ``probe_suppressed_fleet``. Returns how many results were rewritten, for the caller's log line.
@@ -776,7 +794,9 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     return rewritten
 
 
-async def _post_one(redis, backend, pod_id: str, raw: str, extra: dict[str, object]) -> bool:
+async def _post_one(
+    redis: RedisService, backend: BackendClient, pod_id: str, raw: str, extra: dict[str, object]
+) -> bool:
     """POST one queued report; True when the backend answered and the renter was told (or nothing
     was due) — the streak is then marked reported. A ``notify_failed`` answer (lium-platform#429:
     the mail was refused) leaves ``reported`` False so the next cycle posts again and the mail is
@@ -819,7 +839,7 @@ async def _post_one(redis, backend, pod_id: str, raw: str, extra: dict[str, obje
 
 
 async def _report_to_backend(
-    backend, pod_id: str, payload: dict, extra: dict[str, object]
+    backend: BackendClient, pod_id: str, payload: dict, extra: dict[str, object]
 ) -> PodSshUnreachableResponse | None:
     # Never fatal: the verdict is already in the cycle event; a backend that is down or too old
     # (404) must not turn a renter-facing outage report into a validator failure.
