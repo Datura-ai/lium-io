@@ -61,13 +61,8 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
 # remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
 # those cards share the 4 with the idle single-card nodes.
 #
-# Demand-based caps (DAH-3620, P163, 17 Sep 2026): a bucket pays for the GPUs renters
-# held at once at the 95th percentile over 3–17 Sep plus one spare node, when the tier
-# is under 90 % utilised and fillers return under half the idle rate; a cap is never
-# raised by that rule. A100 8×: p95 32 GPUs (4 nodes) → 40; L40S 8×: p95 8 (1 node)
-# → 16; B300 1× is DAH-3601. Every other tier keeps its cap because it fills above
-# 90 %, or fillers recoup half the rate, or p95 demand plus one spare node already
-# reaches the cap.
+# Demand-based caps (DAH-3620): an under-used tier's 8× bucket pays for renter p95 demand plus
+# one spare node; the measurements are in the ticket.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},
