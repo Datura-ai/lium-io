@@ -177,6 +177,13 @@ class _ContainerExecReadiness:
 _CONTAINER_GONE_STATUSES = frozenset({"removing", "exited", "dead"})
 
 
+# Exit codes a signal from the host leaves (128 + signal): what `docker kill` (SIGKILL), `docker stop`
+# (SIGTERM, or the image's STOPSIGNAL — SIGINT/SIGQUIT/SIGHUP on some images) and the kernel's OOM
+# killer produce. A CMD that itself exits with one of these cannot be told apart from a stop; the
+# classification fails toward "killed by the host" so a renter is never blamed for a kill.
+HOST_KILL_EXIT_CODES: dict[int, str] = {129: "SIGHUP", 130: "SIGINT", 131: "SIGQUIT", 137: "SIGKILL", 143: "SIGTERM"}
+
+
 @dataclass(slots=True)
 class ContainerStateSnapshot:
     """`docker inspect` State plus RestartCount, read once at a moment of interest."""
@@ -191,8 +198,14 @@ class ContainerStateSnapshot:
 
     @property
     def killed_by_host(self) -> bool:
-        """The kernel OOM killer or a SIGKILL (exit 137) ended it, not the image's own command."""
-        return self.oom_killed or self.exit_code == 137
+        """The kernel OOM killer or a host signal (HOST_KILL_EXIT_CODES: `docker kill` 137, `docker
+        stop` 143 …) ended it, not the image's own command."""
+        return self.oom_killed or self.exit_code in HOST_KILL_EXIT_CODES
+
+    @property
+    def kill_signal(self) -> str | None:
+        """The signal name the exit code implies (`SIGKILL`, `SIGTERM` …), or None."""
+        return HOST_KILL_EXIT_CODES.get(self.exit_code) if self.exit_code is not None else None
 
     @property
     def exited_since_start(self) -> bool:

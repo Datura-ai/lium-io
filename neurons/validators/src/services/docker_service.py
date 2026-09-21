@@ -106,6 +106,7 @@ from services.rental_docker_observability import (
 )
 from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
+    HOST_KILL_EXIT_CODES,
     ContainerExecSpec,
     ContainerGoneBeforeExec,
     ContainerRunSpec,
@@ -544,14 +545,17 @@ CONTAINER_GONE_KILL_CAUSES = frozenset({"oom", "killed", "removed"})
 
 def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
     """Why a container the bootstrap found gone is gone, from the State read when it was first seen so:
-    `oom` (State.OOMKilled), `killed` (exit 137 without OOM: a SIGKILL — `docker rm -f` / `docker kill`
-    on the node), `removed` (already gone, or `removing` without an exit code we can name) — the three
-    kills — or `exited`: its own command ended, which is the image's doing and not a kill."""
+    `oom` (State.OOMKilled), `killed` (a host signal's exit code, HOST_KILL_EXIT_CODES: 137 is `docker
+    kill` / `docker rm -f`, 143 is `docker stop` — a CMD that handles SIGTERM dies 143, only a PID 1
+    that ignores it reaches 137), `removed` (already gone, or `removing` without an exit code we can
+    name) — the three kills — or `exited`: any other exit code, its own command ended, which is the
+    image's doing and not a kill. A CMD that itself exits 143 reads as a stop: the boundary fails
+    toward the kill, never toward blaming the renter's image."""
     if state is None or (state.status == "removing" and not state.killed_by_host):
         return "removed"
     if state.oom_killed:
         return "oom"
-    if state.exit_code == 137:
+    if state.exit_code in HOST_KILL_EXIT_CODES:
         return "killed"
     return "exited"
 
@@ -580,13 +584,14 @@ class ContainerKilledDuringBootstrap(Exception):
         self.status = state.status if state else None
         self.exit_code = state.exit_code if state else None
         self.oom_killed = bool(state.oom_killed) if state else False
+        self.signal = state.kill_signal if state else None
         self.cause = container_gone_cause(state)
         if self.cause not in CONTAINER_GONE_KILL_CAUSES:
             raise ValueError(f"not a kill: cause={self.cause!r} ({state.describe() if state else None})")
         super().__init__(
             f"{KILLED_DURING_BOOTSTRAP_STEP}: {self._sentence()} during {bootstrap_step} "
             f"(cause={self.cause} oom_killed={str(self.oom_killed).lower()} exit_code={self.exit_code!r} "
-            f"status={self.status!r}). {detail}"
+            f"signal={self.signal!r} status={self.status!r}). {detail}"
         )
 
     def _sentence(self) -> str:
@@ -595,7 +600,9 @@ class ContainerKilledDuringBootstrap(Exception):
         if self.cause == "oom":
             return "the container was stopped by the node before it was ready: it ran out of memory"
         if self.cause == "killed":
-            return "the container was stopped by the node before it was ready: it was killed"
+            if self.signal == "SIGKILL":
+                return "the container was stopped by the node before it was ready: it was killed (SIGKILL)"
+            return f"the container was stopped by the node before it was ready: it was stopped ({self.signal})"
         return "the container was stopped by the node before it was ready: it was removed"
 
 
@@ -4665,6 +4672,7 @@ class DockerService:
                     "cause": killed.cause,
                     "oom_killed": killed.oom_killed,
                     "exit_code": killed.exit_code,
+                    "signal": killed.signal,
                     "status": killed.status,
                 }),
             )

@@ -31,6 +31,7 @@ from services.docker_service import (
     inflight_creates,
 )
 from services.rental_docker_sdk import (
+    HOST_KILL_EXIT_CODES,
     ContainerExecSpec,
     ContainerGoneBeforeExec,
     ContainerStateSnapshot,
@@ -59,6 +60,11 @@ def _oom_killed_state() -> dict:
 
 def _sigkilled_state() -> dict:
     return _container_state(status="removing", running=False, exit_code=137)
+
+
+def _stopped_state() -> dict:
+    # `docker stop` on the node: SIGTERM, a CMD that handles it (sshd, python, tini) exits 143
+    return _container_state(status="exited", running=False, exit_code=143)
 
 
 def _not_running_conflict(*, with_response: bool = False) -> APIError:
@@ -267,7 +273,7 @@ async def test_oom_killed_during_the_ssh_bootstrap_is_killed_during_bootstrap_oo
     assert "killed_during_bootstrap" in detail
     assert "the container was stopped by the node before it was ready: it ran out of memory" in detail
     assert "during ssh_bootstrap" in detail
-    assert "cause=oom oom_killed=true exit_code=137 status='removing'" in detail
+    assert "cause=oom oom_killed=true exit_code=137 signal='SIGKILL' status='removing'" in detail
     assert "Failed to set environment variables" not in detail
     assert _failure_extra(caplog)["failure_step"] == "killed_during_bootstrap"
 
@@ -292,6 +298,24 @@ async def test_a_sigkill_without_oom_is_killed_not_oom(svc, monkeypatch, caplog)
     assert "it was killed" in result.detail and "oom_killed=false exit_code=137" in result.detail
     (event,) = _events(caplog)
     assert (event["cause"], event["oom_killed"]) == ("killed", False)
+
+
+@pytest.mark.asyncio
+async def test_a_docker_stop_on_the_node_exit_143_is_a_kill_not_the_renters_image(svc, monkeypatch, caplog):
+    api = FakeApiClient()
+    api.container_states = [_container_state(), _stopped_state()]
+    _bootstrapping_create(svc, monkeypatch, api)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == KILLED_DURING_BOOTSTRAP_STEP
+    assert "it was stopped (SIGTERM)" in result.detail and "cause=killed" in result.detail
+    assert "exit_code=143" in result.detail and "has no long-running command" not in result.detail
+    (event,) = _events(caplog)
+    assert (event["cause"], event["exit_code"], event["signal"], event["oom_killed"]) == ("killed", 143, "SIGTERM", False)
+    assert event["bootstrap_step"] == "ssh_bootstrap"
 
 
 @pytest.mark.asyncio
@@ -496,8 +520,11 @@ def _snapshot(status: str, exit_code: int | None, oom_killed: bool) -> Container
     [
         (_snapshot("removing", 137, True), "oom", "it ran out of memory"),
         (_snapshot("exited", 137, True), "oom", "it ran out of memory"),
-        (_snapshot("removing", 137, False), "killed", "it was killed"),
-        (_snapshot("dead", 137, False), "killed", "it was killed"),
+        (_snapshot("removing", 137, False), "killed", "it was killed (SIGKILL)"),
+        (_snapshot("dead", 137, False), "killed", "it was killed (SIGKILL)"),
+        (_snapshot("exited", 143, False), "killed", "it was stopped (SIGTERM)"),
+        (_snapshot("removing", 143, False), "killed", "it was stopped (SIGTERM)"),
+        (_snapshot("exited", 130, False), "killed", "it was stopped (SIGINT)"),
         (None, "removed", "it was removed"),
         (_snapshot("removing", 0, False), "removed", "it was removed"),
     ],
@@ -517,10 +544,21 @@ def test_the_cause_and_the_renter_sentence_follow_the_state(state, cause, senten
     assert text.endswith("Docker container is not ready for exec")
 
 
-@pytest.mark.parametrize("state", [_snapshot("exited", 1, False), _snapshot("exited", 0, False), _snapshot("dead", 2, False)])
+@pytest.mark.parametrize(
+    "state",
+    [_snapshot("exited", 1, False), _snapshot("exited", 0, False), _snapshot("dead", 2, False), _snapshot("exited", 127, False), _snapshot("exited", 255, False)],
+)
 def test_an_own_exit_is_not_a_kill_cause_and_cannot_be_filed_as_one(state):
     assert container_gone_cause(state) == "exited"
     assert "exited" not in CONTAINER_GONE_KILL_CAUSES
     with pytest.raises(ValueError, match="not a kill"):
         ContainerKilledDuringBootstrap(container_name="pod_x", bootstrap_step="ssh_bootstrap", state=state, detail="")
     assert issubclass(ImageExitedDuringBootstrap, Exception) and not issubclass(ImageExitedDuringBootstrap, ContainerKilledDuringBootstrap)
+
+
+def test_the_host_kill_exit_codes_are_the_signals_a_stop_or_kill_leaves():
+    assert HOST_KILL_EXIT_CODES == {129: "SIGHUP", 130: "SIGINT", 131: "SIGQUIT", 137: "SIGKILL", 143: "SIGTERM"}
+    assert _snapshot("exited", 143, False).killed_by_host and _snapshot("exited", 143, False).kill_signal == "SIGTERM"
+    assert not _snapshot("exited", 1, False).killed_by_host and _snapshot("exited", 1, False).kill_signal is None
+    # the key step shares the boundary: a stop seen there is the kill, not the DAH-3678 image text
+    assert _snapshot("exited", 143, False).exited_since_start
