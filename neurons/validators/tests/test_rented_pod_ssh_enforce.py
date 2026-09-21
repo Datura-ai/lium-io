@@ -15,7 +15,9 @@ from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
+from helpers import default_executor
 from neurons.validators.src.core.config import Settings
+from neurons.validators.src.core.utils import _m
 from neurons.validators.src.services.task.checks import rented_machine, rented_pod_ssh
 from neurons.validators.src.services.task.checks.rented_pod_ssh import (
     FAULT_AUTHORIZED_KEYS_UNREADABLE,
@@ -23,6 +25,7 @@ from neurons.validators.src.services.task.checks.rented_pod_ssh import (
     RentedPodSshVerdict,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
+from neurons.validators.src.services.task.models import JobResult
 from neurons.validators.src.services.task.pipeline import (
     updates_with_clear_verified_job_evidence,
 )
@@ -227,6 +230,52 @@ async def test_the_ticket_0247_fault_is_enforced_the_same_way(context_factory):
     assert result.updates["clear_verified_job_evidence"]["faults"] == [
         FAULT_AUTHORIZED_KEYS_UNREADABLE
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_suppressed_cycle_keeps_an_enforced_events_reason_and_records_the_gate(
+    context_factory,
+):
+    # The cycle-end fleet gate held the renter notice (validator-side outage). #1372 rewrites a
+    # held event to RENTED because the halt kept the rented score; an enforced result scored 0 and cleared the verified job, so
+    # rewriting its event to "Executor already rented" would put a rented halt on the record over a
+    # failed cycle. The event keeps its reason, impact and pods, and the gate's verdict rides under
+    # `probe_suppressed_fleet` so the record says the zero fell in a cycle the gate held.
+    h = Harness(context_factory)
+    with enforcement(enabled=True):
+        await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+        await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+        held = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, validator_outage=True)
+    assert held.passed is False and held.updates["score"] == 0.0
+    assert h.gate.suppressed_by == "validator_outage" and h.gate.due == [POD_ID]
+    h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+
+    result = JobResult(
+        executor_info=default_executor(),
+        score=0.0,
+        job_score=0.0,
+        job_batch_id="batch-1",
+        log_status="warning",
+        log_text=_m(held.event.event, extra=held.event.model_dump()).to_full_string(),
+        validation_event=held.event.model_copy(deep=True),
+    )
+    rewritten = rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage([result], h.gate)
+
+    assert rewritten == 1
+    event = result.validation_event
+    assert event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    assert event.severity == "error"
+    assert event.impact == Msg.RENTED_POD_SSH_UNREACHABLE_ENFORCED_IMPACT
+    assert event.trace_id == held.event.trace_id
+    assert event.what_we_saw["enforced"] is True
+    assert [pod["pod_id"] for pod in event.what_we_saw["unreachable_pods"]] == [POD_ID]
+    seen = event.what_we_saw[rented_pod_ssh.PROBE_SUPPRESSED_FLEET]
+    assert seen["suppressed_by"] == "validator_outage" and seen["probed"] == 1
+    assert [pod["pod_id"] for pod in seen["unreachable_pods"]] == [POD_ID]
+    logged = json.loads(result.log_text.split(" >>> ", 1)[1])
+    assert logged["reason_code"] == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    assert logged["what_we_saw"]["enforced"] is True
+    assert result.score == 0.0  # the rewrite touches the event only; the cycle's score stands
 
 
 def test_enforcement_settings_default_off_and_the_threshold_is_never_below_notify(

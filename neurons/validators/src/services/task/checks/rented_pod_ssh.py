@@ -705,7 +705,9 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     cycle, so ``reported`` is set and it was never due) stays in ``unreachable_pods``, because that
     pod's outage is real and already on record. When nothing stays, the event becomes RENTED; when
     something stays, it keeps its reason and names only the pods whose outage stands (Rustam, round 7).
-    Returns how many results were rewritten, for the caller's log line.
+    An enforced event (DAH-2255, ``what_we_saw.enforced``) failed its cycle at score 0 and is never
+    rewritten to RENTED: it keeps reason, impact and pods and gains the gate's verdict under
+    ``probe_suppressed_fleet``. Returns how many results were rewritten, for the caller's log line.
     """
     if gate is None or not gate.suppressed_by:
         return 0
@@ -732,7 +734,14 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
             "fail_share": round(gate.fail_share, 3),
             "unreachable_pods": held_pods,
         }
-        if already_reported_pods:
+        if event.what_we_saw.get("enforced") is True:
+            # DAH-2255: the check failed this cycle (score 0, verified job cleared) — that is not the
+            # rented halt, so the event keeps its reason, impact and pods; the gate's verdict rides
+            # along so the record says the zero fell in a cycle whose renter notice was held.
+            rewritten_event = event.model_copy(
+                update={"what_we_saw": {**event.what_we_saw, PROBE_SUPPRESSED_FLEET: suppressed}}
+            )
+        elif already_reported_pods:
             # Mixed: one pod of this executor was reported in an earlier cycle, another is held now.
             # The event keeps its reason for the pod whose outage stands and stops naming the rest;
             # nothing was queued for that pod (it was never due), so the impact says so too.
