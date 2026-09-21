@@ -94,7 +94,7 @@ fi
 IMAGE_NAME="daturaai/lium-watchtower:$IMAGE_TAG"
 
 # The executor compose files (neurons/executor/docker-compose*.yml) pull the updater by
-# this version tag, never by a moving tag: `1.1.0` for prod, `1.1.0-staging` for the dev stack.
+# this version tag, never by a moving tag: `1.1.1` for prod, `1.1.1-staging` for the dev stack.
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/pyproject.toml")"
 if [ -z "$VERSION" ]; then
     log_error "No version in $SCRIPT_DIR/pyproject.toml"
