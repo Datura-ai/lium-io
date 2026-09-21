@@ -24,6 +24,7 @@ from neurons.validators.src.services.verifyx_validation_service import (
     _log_verifyx_network_speeds,
     _perform_verification_checks,
     _verify_network_test,
+    settings,
 )
 
 
@@ -86,6 +87,24 @@ def test_network_fails_when_package_download_is_too_slow():
 
     assert stats["success"] is False
     assert any("Package download speed inadequate" in error for error in errors)
+
+
+def test_package_floor_is_its_own_setting():
+    # A package floor lowered to 20 Mbps lets a 30 Mbps CDN object through while the 50 Mbps
+    # Cloudflare capacity floor still applies.
+    challenge_data, response_data = _network_payload(
+        package_download_speed=30.0, cloudflare_download_speed=49.0
+    )
+
+    with patch.object(
+        settings.verifyx, "NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS", 20.0
+    ):
+        stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert errors == [
+        "Cloudflare download speed inadequate: 49.00 Mbps achieved, 50 Mbps required"
+    ]
 
 
 def test_network_fails_when_cloudflare_download_is_too_slow():

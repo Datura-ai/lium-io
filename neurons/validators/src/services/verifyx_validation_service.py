@@ -466,9 +466,9 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
         )
         success = False
 
-    if package_download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
+    if package_download_speed < settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:
         errors.append(
-            f"Package download speed inadequate: {package_download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+            f"Package download speed inadequate: {package_download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
         )
         success = False
 
