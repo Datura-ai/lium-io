@@ -29,6 +29,13 @@ class DindLogCause:
         return f"{self.code}: {self.message}"
 
 
+# DAH-2856: the cause codes read from the inner dockerd's own log. The fix for these is on the
+# host, sysbox is not the cause; the sysbox check reads the set to word its remediation.
+DIND_INNER_DOCKERD_IPTABLES = "DIND_INNER_DOCKERD_IPTABLES"
+DIND_INNER_DOCKERD_DOWN = "DIND_INNER_DOCKERD_DOWN"
+DIND_INNER_DOCKERD_CODES = frozenset({DIND_INNER_DOCKERD_IPTABLES, DIND_INNER_DOCKERD_DOWN})
+
+
 @dataclass(frozen=True)
 class DindProbeResult:
     success: bool

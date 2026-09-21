@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from core.config import settings
-from services.executor_connectivity.dind_probe import DIND_INNER_DOCKERD_CODES
+from services.executor_connectivity.models import DIND_INNER_DOCKERD_CODES
 
 from ..messages import SysboxRequiredMessages as Msg
 from ..messages import render_message

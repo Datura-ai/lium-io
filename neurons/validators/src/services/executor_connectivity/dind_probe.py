@@ -7,7 +7,13 @@ from asyncssh import SSHClientConnection, SSHKey
 
 from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
-from services.executor_connectivity.models import DindLogCause, DindProbeResult, PortPair
+from services.executor_connectivity.models import (
+    DIND_INNER_DOCKERD_DOWN,
+    DIND_INNER_DOCKERD_IPTABLES,
+    DindLogCause,
+    DindProbeResult,
+    PortPair,
+)
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -32,11 +38,7 @@ DIND_DIAGNOSTICS_TIMEOUT_SECONDS = 15
 # "connection refused" and the node was scored as having no sysbox — with "install sysbox" as
 # the advice. The image's entrypoint waits for the inner dockerd before sshd starts, so the
 # container's own logs hold the real cause. Read before removal; the first matching pattern wins.
-
-DIND_INNER_DOCKERD_IPTABLES = "DIND_INNER_DOCKERD_IPTABLES"
-DIND_INNER_DOCKERD_DOWN = "DIND_INNER_DOCKERD_DOWN"
-# the codes read from dockerd's own log: the fix is on the host, sysbox is not the cause
-DIND_INNER_DOCKERD_CODES = frozenset({DIND_INNER_DOCKERD_IPTABLES, DIND_INNER_DOCKERD_DOWN})
+# The cause codes live in models.py next to DindLogCause, so the task checks read them from there.
 
 # (pattern in the log, the cause it names); the first matching pattern wins
 DIND_LOG_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
