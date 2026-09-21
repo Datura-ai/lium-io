@@ -2133,11 +2133,11 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         removed_fillers: list[str],
-    ) -> list[str]:
-        """Re-read `docker ps -a` after a customer create's filler removal; report any survivor.
+    ) -> None:
+        """Re-read `docker ps -a` after a customer create's filler removal; log any survivor.
 
-        Returns the `filler_*` names still on the host. A listing that fails, times out or exits
-        non-zero is logged and returns [] -- the confirmation never fails the create.
+        A listing that fails, times out or exits non-zero is logged as well -- the confirmation
+        never fails the create.
         """
         names_after = await self._list_all_container_names(ssh_client)
         if names_after is None:
@@ -2151,7 +2151,7 @@ class DockerService:
                     }),
                 )
             )
-            return []
+            return
         survivors = [name for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)]
         if survivors:
             logger.warning(
@@ -2167,7 +2167,6 @@ class DockerService:
                     }),
                 )
             )
-        return survivors
 
     async def _remove_stale_containers_tolerantly(
         self,
