@@ -1,10 +1,10 @@
 """MinerMiddleware: a GET route is reachable only when it is on the allowlist.
 
 The miner signature travels in the request body, which a GET does not have, so
-the middleware used to wave every GET through. Both GET routes that exist today
-are safe (`/version` is public; `/containers/{name}/logs` checks a validator
-signature in headers), but the next GET route must not ship unauthenticated
-because its author forgot — unknown GET paths now answer 401.
+the middleware used to wave every GET through. The GET routes that exist today
+are safe (`/version` and `/update-status` are public; `/containers/{name}/logs`
+checks a validator signature in headers), but the next GET route must not ship
+unauthenticated because its author forgot — unknown GET paths now answer 401.
 """
 
 import logging
@@ -31,7 +31,7 @@ def test_version_is_public():
 
 
 def test_update_status_is_public():
-    # The release check polls it without a signature; the middleware must not answer 401.
+    # The post-release check calls it without a signature.
     assert _client().get("/update-status").status_code != 401
 
 
