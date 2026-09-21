@@ -22,9 +22,10 @@ State lives in Redis, one key pair per pod. A pod is judged only after this vali
 healthy once (both signals good), so a template that ships no sshd, or a pod that never came up,
 is never reported here. ``RENTED_POD_SSH_PROBE_CYCLES`` consecutive unhealthy cycles (default 2,
 about 30 min) after that raise ``RENTED_POD_SSH_UNREACHABLE`` and one POST to the backend per
-outage: the POST is repeated each cycle until the backend answers 200 (``recorded`` true or false),
-and that answer is kept in the streak so the outage is reported once. The score is not changed by
-this module.
+outage: the POST is repeated each cycle until the backend answers 200 (``recorded`` true or false)
+with a ``delivery`` other than ``notify_failed`` (lium-platform#429: the renter's mail was refused,
+so the next cycle posts again and it is re-sent), and that answer is kept in the streak so the
+outage is reported once. The score is not changed by this module.
 
 The POST is deferred to the end of the cycle and gated by the fleet (Rustam's review, 16 Sep): a
 validator whose own network fails sees every mapped port refuse at once, and per-pod reporting
@@ -62,7 +63,11 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 import redis.exceptions
-from protocol.vc_protocol.compute_requests import RentedPod
+from protocol.vc_protocol.compute_requests import (
+    SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED,
+    PodSshUnreachableResponse,
+    RentedPod,
+)
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -511,14 +516,28 @@ async def _judge_with_streak(
         await store.write_atomically(unhealthy)
         return verdict
 
-    # Queued, not posted: the cycle-end fleet gate (flush_rented_pod_ssh_reports) decides. No
-    # answer from the backend there, or a suppressed cycle, leaves `reported` False and the next
-    # cycle queues again. Queued in the same step as the count, so a streak at the threshold is
-    # never stored without its report waiting for the gate.
+    _queue_report_for_fleet_gate(ctx, unhealthy, verdict, boot_id_at_ok, boot_id_now)
+    await store.write_atomically(unhealthy)
+    return replace(verdict, report_queued=True)
+
+
+def _queue_report_for_fleet_gate(
+    ctx: Context,
+    writes: RedisWrites,
+    verdict: RentedPodSshVerdict,
+    boot_id_at_ok: str | None,
+    boot_id_now: str | None,
+) -> None:
+    """Queue the outage report for the cycle-end fleet gate (flush_rented_pod_ssh_reports).
+
+    Queued, not posted: the gate decides. No answer from the backend there, or a suppressed cycle,
+    leaves ``reported`` False and the next cycle queues again. Queued in the same step as the
+    count, so a streak at the threshold is never stored without its report waiting for the gate.
+    """
     due_key = _due_key(_cycle_id(ctx))
-    unhealthy.hset(
+    writes.hset(
         due_key,
-        pod.pod_id,
+        verdict.pod_id,
         json.dumps(
             {
                 "ssh_port": verdict.ssh_port,
@@ -531,8 +550,6 @@ async def _judge_with_streak(
             }
         ),
     ).expire(due_key, FLEET_KEY_TTL_SECONDS)
-    await store.write_atomically(unhealthy)
-    return replace(verdict, report_queued=True)
 
 
 def _mark_fleet(ctx: Context, writes: RedisWrites, pod_id: str, mark: str) -> None:
@@ -600,7 +617,7 @@ async def flush_rented_pod_ssh_reports(
     elif validator_outage:
         gate = replace(gate, suppressed_by="validator_outage")
 
-    fleet_fields = {
+    gate_log_fields = {
         **extra,
         "probed": probed,
         "failed": failed,
@@ -610,7 +627,7 @@ async def flush_rented_pod_ssh_reports(
     }
     if not due:
         if probed:
-            logger.info(_m("RENTED_POD_SSH_PROBE_FLEET", extra=get_extra_info(fleet_fields)))
+            logger.info(_m("RENTED_POD_SSH_PROBE_FLEET", extra=get_extra_info(gate_log_fields)))
         return gate
     if gate.suppressed_by:
         logger.warning(
@@ -618,7 +635,7 @@ async def flush_rented_pod_ssh_reports(
                 "RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET",
                 extra=get_extra_info(
                     {
-                        **fleet_fields,
+                        **gate_log_fields,
                         "outcome": PROBE_SUPPRESSED_FLEET,
                         "suppressed_by": gate.suppressed_by,
                     }
@@ -637,7 +654,7 @@ async def flush_rented_pod_ssh_reports(
         logger.info(
             _m(
                 "RENTED_POD_SSH_UNREACHABLE_REPORTED",
-                extra=get_extra_info({**fleet_fields, "posted_pods": posted}),
+                extra=get_extra_info({**gate_log_fields, "posted_pods": posted}),
             )
         )
     return replace(gate, posted=posted)
@@ -680,7 +697,7 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
         held_pods = [pod for pod in pods if pod.get("pod_id") in held]
         if not held_pods:
             continue
-        told_pods = [pod for pod in pods if pod.get("pod_id") not in held]
+        already_reported_pods = [pod for pod in pods if pod.get("pod_id") not in held]
         what = {key: value for key, value in event.what_we_saw.items() if key != "unreachable_pods"}
         suppressed = {
             "suppressed_by": gate.suppressed_by,
@@ -689,7 +706,7 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
             "fail_share": round(gate.fail_share, 3),
             "unreachable_pods": held_pods,
         }
-        if told_pods:
+        if already_reported_pods:
             # Mixed: one pod of this executor was reported in an earlier cycle, another is held now.
             # The event keeps its reason for the pod whose outage stands and stops naming the rest;
             # nothing was queued for that pod (it was never due), so the impact says so too.
@@ -698,7 +715,7 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
                     "impact": TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT,
                     "what_we_saw": {
                         **what,
-                        "unreachable_pods": told_pods,
+                        "unreachable_pods": already_reported_pods,
                         PROBE_SUPPRESSED_FLEET: suppressed,
                     },
                 }
@@ -725,15 +742,27 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
 
 
 async def _post_one(redis, backend, pod_id: str, raw: str, extra: dict[str, object]) -> bool:
-    """POST one queued report; True when the backend answered (the streak is then marked reported)."""
+    """POST one queued report; True when the backend answered and the renter was told (or nothing
+    was due) — the streak is then marked reported. A ``notify_failed`` answer (lium-platform#429:
+    the mail was refused) leaves ``reported`` False so the next cycle posts again and the mail is
+    re-sent."""
     payload = _decode(raw)
     if payload is None:
         return False
-    recorded = await _report_to_backend(backend, pod_id, payload, extra)
-    if recorded is None:
+    response = await _report_to_backend(backend, pod_id, payload, extra)
+    if response is None:
         return False
-    # The backend answered 200 (recorded or not): this outage is reported. A Redis error on this
-    # one write costs one duplicate POST next cycle, which the backend dedupes.
+    if response.delivery == SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED:
+        logger.warning(
+            _m(
+                "RENTED_POD_SSH_UNREACHABLE_NOTIFY_FAILED",
+                extra=get_extra_info({**extra, "pod_id": pod_id, "recorded": response.recorded}),
+            )
+        )
+        return False
+    # The backend answered 200 and the renter was told (or had the mail off): this outage is
+    # reported. A Redis error on this one write costs one duplicate POST next cycle, which the
+    # backend dedupes.
     try:
         stored = await redis.get(_fail_key(pod_id))
         if stored is not None:
@@ -756,7 +785,7 @@ async def _post_one(redis, backend, pod_id: str, raw: str, extra: dict[str, obje
 
 async def _report_to_backend(
     backend, pod_id: str, payload: dict, extra: dict[str, object]
-) -> bool | None:
+) -> PodSshUnreachableResponse | None:
     # Never fatal: the verdict is already in the cycle event; a backend that is down or too old
     # (404) must not turn a renter-facing outage report into a validator failure.
     try:
@@ -779,7 +808,7 @@ async def _report_to_backend(
             exc_info=True,
         )
         return None
-    return response.recorded if response is not None else None
+    return response
 
 
 def verdict_log_fields(verdict: RentedPodSshVerdict) -> dict[str, object]:

@@ -403,6 +403,39 @@ async def test_a_healthy_cycle_whose_redis_write_is_lost_leaves_no_half_state(
 
 
 @pytest.mark.asyncio
+async def test_a_notify_failed_answer_keeps_the_outage_unacknowledged_and_posts_again(
+    context_factory,
+):
+    # taiberium's review (21 Sep): lium-platform#429 answers `delivery`; a 200 whose mail was refused
+    # (`notify_failed`) must not mark the streak reported, so the next cycle posts once more and the
+    # renter's mail is re-sent. Once the mail is accepted the streak is marked and the posting stops.
+    h = Harness(context_factory)
+    h.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(
+        recorded=True, delivery="notify_failed"
+    )
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    refused = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    [pod] = refused.event.what_we_saw["unreachable_pods"]
+    assert pod["report_queued"] is True
+    assert h.streak()["reported"] is False
+    assert h.backend.report_pod_ssh_unreachable.await_count == 1
+
+    h.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(
+        recorded=False, delivery="notified"
+    )
+    accepted = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    after = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    [pod] = accepted.event.what_we_saw["unreachable_pods"]
+    assert pod["report_queued"] is True and h.streak()["reported"] is True
+    [pod] = after.event.what_we_saw["unreachable_pods"]
+    assert pod["report_queued"] is False
+    assert h.backend.report_pod_ssh_unreachable.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_a_redis_blip_on_the_reported_mark_keeps_the_verdict_and_costs_one_more_post(
     context_factory,
 ):

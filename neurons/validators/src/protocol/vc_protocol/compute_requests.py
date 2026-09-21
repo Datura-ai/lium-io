@@ -233,6 +233,13 @@ class PodHostRebootRecoveredResponse(BaseModel):
 class PodSshUnreachableResponse(BaseModel):
     # DAH-2870: False when the backend already holds an event for this outage of the pod.
     recorded: bool
+    # lium-platform#429: was the renter told — "notified", "recorded" (nothing was due) or
+    # "notify_failed" (the mail was refused; the outage stays unacknowledged and is reported again
+    # next cycle so the mail is re-sent). None from a backend older than #429: treated as delivered.
+    delivery: str | None = None
+
+
+SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED = "notify_failed"
 
 
 class VerificationStartedResponse(BaseModel):
