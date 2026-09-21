@@ -62,7 +62,6 @@ VRAM_CEIL_RATIO = 1.05
 GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Blackwell data-center
     "NVIDIA B300 SXM6 AC":                                [294912],        # 288 GB; observed: 275040
-    "NVIDIA B300 SXM6 PC":                                [294912],        # 288 GB; the AC module under its second driver name
     "NVIDIA B200":                                        [196608],        # 192 GB; observed: 183359 (49140 ~48GB outlier rejected)
     # Hopper data-center
     "NVIDIA H200":                                        [144384],        # 141 GB; observed: 143771
@@ -163,6 +162,11 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Maxwell
     "NVIDIA Tesla M40":                                   [12288, 24576],  # 12/24 GB multi-variant
 }
+# `NVIDIA B300 SXM6 PC` (the name two providers report for their B300 SXM6 cards, 21 Sep 2026; not in
+# NVIDIA's public name table) takes the AC card's sizes until a PC card's own NVML reading is recorded.
+# Derived, never a row of its own: a corrected AC size moves both names. The precheck fails closed on
+# a reading outside the window, so a wrong assumption refuses the card rather than mis-sizing it.
+GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
 
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not

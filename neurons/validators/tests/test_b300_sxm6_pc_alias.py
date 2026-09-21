@@ -1,13 +1,16 @@
-"""`NVIDIA B300 SXM6 PC` is the B300 SXM6 AC module under the second name its driver reports.
+"""`NVIDIA B300 SXM6 PC` is listed as the B300 SXM6 AC card's alias: same price, family, rate and sizes.
 
-Two providers asked for the name on 21 Sep 2026, one of them onboarding an 8-card host: a card that
-reports `NVIDIA B300 SXM6 PC` failed `GpuModelValidCheck` and the VRAM precheck because only the AC
-spelling was in the tables. Same 288 GB HBM3e module, same class for a renter, so every table that
-carries the AC name carries the PC name with the same value. These tests keep the two in step: a
-future price, rate, cap or size change on one name fails here until the other name follows.
+Two providers reported the name on 21 Sep 2026, one of them onboarding an 8-card host: a card that
+reports `NVIDIA B300 SXM6 PC` fails `GpuModelValidCheck` and the VRAM precheck because only the AC
+spelling is in the tables (NVIDIA's public name table lists only the AC spelling too). The tables
+derive the PC entry from the AC entry, so the two cannot diverge; these tests hold that shape: the
+PC value equals the AC value in every table, the PC name is never a literal row of its own, and a
+spelling nobody added still fails.
 """
 from __future__ import annotations
 
+import inspect
+import re
 from types import ModuleType
 from unittest.mock import AsyncMock
 
@@ -68,6 +71,17 @@ def test_the_guard_reads_the_four_tables_the_validator_decides_from() -> None:
     assert {"GPU_VRAM_SIZES_MB"} <= set(_tables_naming_the_ac_card(gpu_spec_table))
 
 
+@pytest.mark.parametrize("module", TABLE_MODULES, ids=lambda module: module.__name__)
+def test_the_pc_name_is_derived_from_the_ac_row_never_a_literal_of_its_own(module: ModuleType) -> None:
+    """A re-price of the AC card has to move the PC name with it, so no table may spell the PC name
+    as a key with a value of its own — the alias is an assignment from the AC entry."""
+    source = inspect.getsource(module)
+    assert not re.search(r'"NVIDIA B300 SXM6 PC"\s*:', source), (
+        f"{module.__name__} spells {PC!r} as a literal row; derive it from {AC!r} instead"
+    )
+    assert re.search(r'\["NVIDIA B300 SXM6 PC"\]\s*=.*\["NVIDIA B300 SXM6 AC"\]', source)
+
+
 def test_the_pc_name_is_not_normalised_into_the_ac_name() -> None:
     """The executor's native verifier rebuilds `machine_info` from the name NVML reports, so the
     validator must send the driver's own spelling: an alias to the AC name in NORMALIZATION_MAP would
@@ -83,7 +97,7 @@ def test_pc_and_ac_resolve_to_the_same_hourly_rate(gpu_count: int) -> None:
     pc_rate = get_hourly_rate(PC, gpu_count, config.gpu_count_custom_prices, config.rental_prices_per_hour)
     ac_rate = get_hourly_rate(AC, gpu_count, config.gpu_count_custom_prices, config.rental_prices_per_hour)
 
-    assert pc_rate == ac_rate == 6.4
+    assert pc_rate == ac_rate == incentive_config.RENTAL_PRICES_PER_HOUR[AC]
 
 
 def test_pc_maps_to_the_b300_family_and_its_buckets() -> None:
@@ -129,8 +143,8 @@ async def test_idle_pc_and_ac_single_cards_share_one_b300_bucket(make_pcc_job) -
         result = jobs_of_miner[0]
         assert result.count_bucket == 1
         assert result.max_cap == 4
-        assert result.hourly_rate == 6.4
-        assert result.effective_rate == pytest.approx(6.4 * 4 / 12)
+        assert result.hourly_rate == incentive_config.RENTAL_PRICES_PER_HOUR[AC]
+        assert result.effective_rate == pytest.approx(result.hourly_rate * 4 / 12)
 
 
 # --- Verification: the PC name passes the two gates the AC name passes; a third spelling fails ------
