@@ -8,7 +8,7 @@ node until the 1.0 table in this PR is released and picked up by the pin.
 
 from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
-from incentive.config import RENTAL_PRICES_PER_HOUR, IncentiveConfig
+from incentive.config import BASE_GPU_MAP, RENTAL_PRICES_PER_HOUR, IncentiveConfig
 from incentive.utils import get_hourly_rate
 
 SERVER = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
@@ -50,5 +50,7 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC"}
+    assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
+    assert BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] == BASE_GPU_MAP["NVIDIA B300 SXM6 AC"] == "B300"
     differing = {gpu for gpu in upstream if RENTAL_PRICES_PER_HOUR[gpu] != upstream[gpu]}
     assert differing <= {SERVER, "NVIDIA B300 SXM6 AC", "NVIDIA B300 SXM6 PC"}

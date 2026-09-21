@@ -162,10 +162,10 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Maxwell
     "NVIDIA Tesla M40":                                   [12288, 24576],  # 12/24 GB multi-variant
 }
-# `NVIDIA B300 SXM6 PC` (the name two providers report for their B300 SXM6 cards, 21 Sep 2026; not in
-# NVIDIA's public name table) takes the AC card's sizes until a PC card's own NVML reading is recorded.
-# Derived, never a row of its own: a corrected AC size moves both names. The precheck fails closed on
-# a reading outside the window, so a wrong assumption refuses the card rather than mis-sizing it.
+# `NVIDIA B300 SXM6 PC` (provider-observed on real hardware, 21 Sep 2026: memory.total 275040 MiB on all
+# 8 GPUs — the AC row's observed total, inside the [0.90, 1.05] band for both names; not in NVIDIA's
+# public chip list) takes the AC card's sizes. Derived, never a row of its own: a corrected AC size moves
+# both names. The precheck fails closed on a reading outside the window.
 GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"])
 
 # --- Intentionally unranged models (passthrough) -----------------------------

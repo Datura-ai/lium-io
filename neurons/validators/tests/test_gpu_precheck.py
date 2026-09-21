@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from services import gpu_spec_table
+from incentive import config as incentive_config
+from services import const, gpu_spec_table
 from services.const import GPU_MODEL_RATES
 from services.gpu_precheck import (
     GpuPrecheckError,
@@ -113,6 +114,25 @@ def test_normalize_passthrough_unmapped():
 
 
 # --- CI parity --------------------------------------------------------------
+B300_AC, B300_PC = "NVIDIA B300 SXM6 AC", "NVIDIA B300 SXM6 PC"
+
+
+def test_b300_sxm6_pc_passes_the_precheck_at_the_observed_total():
+    # provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300 SXM6 PC, memory.total 275040 MiB,
+    # all 8 GPUs); the AC row records the same observed total, and the [0.90, 1.05] band admits it for both names
+    assert precheck_gpu_spec(B300_PC, 275040) is None
+    assert gpu_spec_table.get_expected_vram_windows(B300_PC) == gpu_spec_table.get_expected_vram_windows(B300_AC)
+
+
+@pytest.mark.parametrize("module", [incentive_config, const, gpu_spec_table], ids=lambda m: m.__name__)
+def test_every_table_naming_the_b300_ac_card_carries_the_pc_alias_at_the_same_value(module):
+    # the PC name is the AC card's alias, derived from the AC entry; a table added later that names AC joins by existing
+    tables = {name: t for name, t in vars(module).items() if isinstance(t, dict) and B300_AC in t}
+    assert tables, module.__name__
+    for name, table in tables.items():
+        assert table.get(B300_PC) == table[B300_AC], f"{module.__name__}.{name}"
+
+
 def test_gpu_model_rates_parity():
     """Every active key in const.GPU_MODEL_RATES MUST be covered by either
     GPU_VRAM_SIZES_MB or KNOWN_UNRANGED.

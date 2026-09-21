@@ -1,9 +1,10 @@
 from lium_core.shared_config.model import SharedConfig
 
 B300_SXM6_AC = "NVIDIA B300 SXM6 AC"
-# The name two providers report for their B300 SXM6 cards (21 Sep 2026). It is not in NVIDIA's public
-# name table (only the AC spelling is), so it is never a row of its own: each table below derives it
-# from the AC entry, and a re-price of the AC card moves both names.
+# Provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300 SXM6 PC, 275040 MiB, all
+# 8 GPUs of the host); not in NVIDIA's public chip list, which has only the AC spelling. Listed as the AC
+# card's alias and never a row of its own: each table below derives it from the AC entry, so a re-price
+# of the AC card moves both names.
 B300_SXM6_PC = "NVIDIA B300 SXM6 PC"
 
 

@@ -35,9 +35,10 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
 }
-# `NVIDIA B300 SXM6 PC`: the name two providers report for their B300 SXM6 cards (21 Sep 2026). It is
-# not in NVIDIA's public name table (only the AC spelling is), so it is not a row of its own anywhere:
-# every table derives it from the AC entry, and a re-price of the AC card moves both names.
+# `NVIDIA B300 SXM6 PC`: provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300
+# SXM6 PC, memory.total 275040 MiB, all 8 GPUs of the host); not in NVIDIA's public chip list, which has
+# only the AC spelling. Listed as the AC card's alias and never a row of its own: every table derives it
+# from the AC entry, so a re-price of the AC card moves both names.
 RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
 
 
