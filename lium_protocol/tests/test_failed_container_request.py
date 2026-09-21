@@ -42,7 +42,7 @@ def test_the_fields_arrived_with_a_minor_bump() -> None:
     ],
     ids=["build_log_tail", "step_detail"],
 )
-def test_round_trip_keeps_the_fields(extra: dict) -> None:
+def test_round_trip_keeps_the_fields(extra: dict[str, str | None]) -> None:
     message = VALIDATOR_MESSAGES.parse(json.dumps({**OLD_VALIDATOR_FAILURE, **extra}))
     assert isinstance(message, FailedContainerRequest)
     assert message.build_log_tail == extra["build_log_tail"]
