@@ -4581,22 +4581,9 @@ class DockerService:
             "IPT=iptables-nft",
             "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
         ]
-        # Every tagged rule for this DinD IP, read back from the chain and deleted
-        # as printed: `-S` prints `-A DOCKER-USER <spec>`; `read` splits off the
-        # `-A`, the rest is the spec `-D` needs. The comment is one word, so `-S`
-        # prints it unquoted and the case pattern matches it as text. The listing
-        # is captured first and its exit status checked: a pipe would turn a
-        # failed `-S` (xtables lock) into a silent no-op. On apply that failure
-        # aborts (exit 4, the caller never runs the build with a stale ACCEPT
-        # possibly in place); on teardown it is tolerated so the DROPs below
-        # still go. A tagged rule whose `-D` fails aborts the apply the same
-        # way (exit 5): the loop runs in the pipe's subshell, so `exit 5` ends
-        # the loop and the pipeline's status carries it to the `|| { ...; }`
-        # after `done`; the caller's streamer fails the step on the stderr
-        # line. Without it the old resolver's ACCEPT stays in the chain and
-        # the new ACCEPTs are inserted next to it. On apply the purge runs
-        # BEFORE the DROP inserts, so an abort leaves no half-applied DROP
-        # behind for a teardown that never runs.
+        # Purge every rule tagged for this DinD IP before adding new ones, so an old
+        # resolver's ACCEPT never survives an IP reuse. On apply a failed listing or
+        # delete aborts (exit 4 / 5) before any DROP is inserted; teardown tolerates both.
         on_list_failure = (
             '{ echo "DOCKER-USER listing failed" >&2; exit 4; }' if apply else 'rules=""'
         )
@@ -4772,28 +4759,9 @@ class DockerService:
                 )
                 return CustomBuildOutcome(False, "build_dind_start", "isolated build container failed to start")
 
-            # 3. Wait for the inner dockerd to accept connections: up to
-            #    `ready_timeout_s` probes a second apart (the budget the loop
-            #    always had), each probe bounded by `probe_timeout_s` so a hung
-            #    `docker info` is one failed probe, not a build held for an
-            #    hour. A probe that hits its bound is "not ready" like an
-            #    exit 1 (aborting there rejected a DinD that was still
-            #    starting), and the next probe follows at once.
-            #    The bound is `timeout(1)` on the executor, as for the DinD
-            #    start: it kills the remote `docker exec`, so a slow probe
-            #    leaves no process behind. asyncssh's `timeout=` is the
-            #    backstop for a host where even `timeout(1)` did not return,
-            #    and it only stops waiting: `run(timeout=)` drops its process
-            #    there and the session channel stays open until the remote
-            #    command exits, one per such probe, until sshd's MaxSessions
-            #    (10) refused the next one. So the probe is `create_process`
-            #    + `wait` inside `async with`, as `execute_and_stream_logs`
-            #    runs its commands: the exit closes the channel (`close` +
-            #    `wait_closed`) before the next probe opens one, on a timeout
-            #    as on a result. Worst case, probes that each take the whole
-            #    bound and answer "not ready": N * (10 + 1) s, 11 min at the
-            #    default 60. `ready_timeout_s` is `gt=0` in settings, so at
-            #    least one probe runs.
+            # 3. Wait for the inner dockerd: up to `ready_timeout_s` probes a second apart,
+            #    each bounded by `timeout(1)` on the executor so a hung `docker info` is one
+            #    "not ready" probe, and each closing its session channel before the next.
             ready = False
             probe_timeout_s = min(ready_timeout_s, DIND_READY_PROBE_MAX_SECONDS)
             probe_cmd = (
