@@ -231,24 +231,59 @@ async def test_only_the_containers_still_on_the_host_are_renamed(svc, monkeypatc
     assert [e["container_name"] for e in _events(caplog)] == ["filler_old"]
 
 
+class _FakeRedis:
+    def __init__(self):
+        self.values: dict[str, int] = {}
+        self.expires: list[tuple[str, int]] = []
+
+    async def incr(self, key):
+        self.values[key] = self.values.get(key, 0) + 1
+        return self.values[key]
+
+    async def expire(self, key, seconds):
+        self.expires.append((key, seconds))
+        return True
+
+
+def _redis_service_with_fake_store() -> RedisService:
+    service = RedisService()
+    service.redis = _FakeRedis()
+    return service
+
+
 @pytest.mark.asyncio
-async def test_second_stuck_container_on_the_node_inside_the_window_is_a_repeat(svc, monkeypatch, rename_flag, caplog):
-    host = _Host(["pod_old"])
-    svc.redis_service.count_stuck_container = AsyncMock(return_value=2)
+async def test_second_stuck_container_on_the_node_inside_the_window_is_a_repeat(monkeypatch, rename_flag, caplog):
+    """Two creates on one node each hit a wedged container: the first event is not a repeat, the
+    second is; a wedged container on another node starts its own count."""
+    svc = DockerService(ssh_service=Mock(), redis_service=_redis_service_with_fake_store(), attestation_service=Mock())
     caplog.set_level(logging.WARNING)
 
-    renamed = await svc._rename_stuck_containers_aside(
-        host.client,
-        {"miner_hotkey": "miner", "executor_uuid": "executor-1", "pod_id": "p"},
-        ["pod_old"],
-        pod_name="pod_new",
-        cause=Exception(COULD_NOT_KILL),
-    )
+    async def stuck_create(executor: str, stale: str, pod_name: str) -> list[str]:
+        host = _Host([stale])
+        return await svc._rename_stuck_containers_aside(
+            host.client,
+            {"miner_hotkey": "miner", "executor_uuid": executor, "pod_id": pod_name.removeprefix("pod_")},
+            [stale],
+            pod_name=pod_name,
+            cause=Exception(COULD_NOT_KILL),
+        )
 
-    assert renamed == host.names and renamed[0].startswith(f"{STUCK_CONTAINER_PREFIX}pod_old_")
-    (event,) = _events(caplog)
-    assert event["repeat"] is True and event["count_in_window"] == 2
-    assert event["executor_uuid"] == "executor-1" and event["miner_hotkey"] == "miner"
+    first = await stuck_create("executor-1", "filler_a", "pod_1")
+    second = await stuck_create("executor-1", "pod_1", "pod_2")
+    other_node = await stuck_create("executor-2", "filler_b", "pod_3")
+
+    assert first[0].startswith(f"{STUCK_CONTAINER_PREFIX}filler_a_")
+    assert second[0].startswith(f"{STUCK_CONTAINER_PREFIX}pod_1_")
+    events = _events(caplog)
+    assert [(e["executor_uuid"], e["container_name"], e["count_in_window"], e["repeat"]) for e in events] == [
+        ("executor-1", "filler_a", 1, False),
+        ("executor-1", "pod_1", 2, True),
+        ("executor-2", "filler_b", 1, False),
+    ]
+    assert all(e["window_seconds"] == STUCK_CONTAINER_REPEAT_WINDOW_SECONDS for e in events)
+    # the window is set once per node, at the first stuck container
+    assert [seconds for _, seconds in svc.redis_service.redis.expires] == [STUCK_CONTAINER_REPEAT_WINDOW_SECONDS] * 2
+    assert other_node[0].startswith(f"{STUCK_CONTAINER_PREFIX}filler_b_")
 
 
 @pytest.mark.asyncio
@@ -270,24 +305,9 @@ async def test_a_redis_error_leaves_the_event_without_a_count_and_the_create_goe
     assert event["count_in_window"] is None and event["repeat"] is False
 
 
-class _FakeRedis:
-    def __init__(self):
-        self.values: dict[str, int] = {}
-        self.expires: list[tuple[str, int]] = []
-
-    async def incr(self, key):
-        self.values[key] = self.values.get(key, 0) + 1
-        return self.values[key]
-
-    async def expire(self, key, seconds):
-        self.expires.append((key, seconds))
-        return True
-
-
 @pytest.mark.asyncio
 async def test_count_stuck_container_starts_the_window_at_the_first_one_only():
-    service = RedisService()
-    service.redis = _FakeRedis()
+    service = _redis_service_with_fake_store()
 
     first = await service.count_stuck_container("miner", "executor-1", 100)
     second = await service.count_stuck_container("miner", "executor-1", 100)
