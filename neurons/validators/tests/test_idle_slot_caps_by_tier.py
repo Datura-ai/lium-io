@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 from incentive.config import MAX_UNRENTED_GPUS_BY_TYPE, IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
+from services.task import JobResult
 
 from tests.test_rental_price_incentive_flow import _make_pcc_job
 
@@ -21,7 +22,9 @@ A100 = "NVIDIA A100-SXM4-80GB"
 L40S = "NVIDIA L40S"
 
 
-async def _run_with_production_config(job_results: dict) -> RentalPriceIncentive:
+async def _run_with_production_config(
+    job_results: dict[str, list[JobResult]],
+) -> RentalPriceIncentive:
     redis = AsyncMock()
     redis.get_portion_per_gpu_type = AsyncMock(return_value=0.3)
     redis.get_executor_uptime = AsyncMock(return_value=9999)
