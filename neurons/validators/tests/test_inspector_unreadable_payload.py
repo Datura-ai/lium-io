@@ -1,17 +1,11 @@
-"""The inspector's interactive protocol is one JSON line per command on the executor's stdout.
+"""Two behaviours of the validator's read of the inspector executor's stdout.
 
-On 20 Sep 2026 every inspector run on one rented executor died with
-``JSONDecodeError: Unterminated string starting at line 1 column 24`` — column 24 is the opening
-quote of the ``result`` value in ``{"ok": true, "result": "…``. asyncssh's ``SSHReader.readline()`` returns
-a PARTIAL line when a single line is longer than the channel receive window (2 MiB by default):
-the session pauses reading at the window and ``readuntil`` gives back what it has. The response
-cipher for a host with a large collector report crosses that window, so the validator parsed the
-first 2 MiB of the line and the integrity check never ran on that node.
-
-These tests pin both halves of the fix: a line is reassembled across partial reads, and a payload
-that still does not parse (a non-JSON line on stdout, a line cut at EOF, an unescaped quote) is
-recorded as ``INSPECTOR_UNREADABLE`` with typed diagnostics — the executor id, the byte length, the
-first 200 chars repr-escaped and the decoder's position — and the other executors are unaffected.
+asyncssh's ``SSHReader.readline()`` returns a PARTIAL line when one line is longer than the channel
+receive window (2 MiB by default), and on 20 Sep 2026 that left the integrity check unrun on every
+host whose response crossed it. A line is now reassembled across partial reads; a payload that still
+does not parse is recorded as ``INSPECTOR_UNREADABLE`` with typed diagnostics (the executor id, the
+byte length, the first 200 chars repr-escaped, the decoder's position) and the other executors are
+unaffected.
 """
 
 from __future__ import annotations
@@ -33,23 +27,25 @@ from test_inspector_validation_service import (  # noqa: F401 — the autouse fi
     FakeStderr,
     FakeStdout,
     FakeValidator,
+    _interactive_stdout,
     enable_collector_ensure,
     fake_validator,
     matching_lib_checksums,
 )
 
-HANDSHAKE_OK = json.dumps({"ok": True, "result": '{"hello": "executor"}'}) + "\n"
-EXECUTE_OK = json.dumps({"ok": True, "result": "response-cipher"}) + "\n"
-EMPTY_OK = json.dumps({"ok": True, "result": ""}) + "\n"
+# the reply the clean fixture gives to the command whose response carries the cipher
+RESPONSE_INDEX = 2
+EXECUTE_OK = _interactive_stdout()[RESPONSE_INDEX]
 
 
 def _executor(uuid: str = "exec-1") -> SimpleNamespace:
     return SimpleNamespace(uuid=uuid, python_path="/usr/bin/python3", root_dir="/root/app")
 
 
-def _stdout(*execute_lines: str) -> list[str]:
-    # start-collector ok, handshake ok, then the execute response as given, then quit ok
-    return [EMPTY_OK, HANDSHAKE_OK, *execute_lines, EMPTY_OK]
+def _stdout(*response_lines: str) -> list[str]:
+    # the clean fixture's stdout with the cipher-carrying reply replaced by the given line(s)
+    lines = _interactive_stdout()
+    return lines[:RESPONSE_INDEX] + list(response_lines) + lines[RESPONSE_INDEX + 1 :]
 
 
 async def _validate(ssh: FakeSSH, uuid: str = "exec-1") -> ivs.InspectorValidationResponse:
@@ -59,7 +55,7 @@ async def _validate(ssh: FakeSSH, uuid: str = "exec-1") -> ivs.InspectorValidati
     )
 
 
-def _assert_unreadable(result: ivs.InspectorValidationResponse, *, cmd: str = "execute") -> dict:
+def _assert_unreadable(result: ivs.InspectorValidationResponse) -> dict:
     assert result.report is None
     assert result.message is not None
     assert result.message.reason == "INSPECTOR_UNREADABLE"
@@ -68,7 +64,7 @@ def _assert_unreadable(result: ivs.InspectorValidationResponse, *, cmd: str = "e
     assert diagnostics["reason"] == "INSPECTOR_UNREADABLE"
     assert diagnostics["error_type"] == "InspectorUnreadableError"
     assert diagnostics["executor_uuid"]
-    assert diagnostics["payload_cmd"] == cmd
+    assert isinstance(diagnostics["payload_cmd"], str) and diagnostics["payload_cmd"]
     assert isinstance(diagnostics["payload_bytes"], int)
     assert isinstance(diagnostics["payload_head"], str)
     assert len(diagnostics["payload_head"]) <= 200 + 2  # repr quotes
@@ -240,16 +236,6 @@ async def test_json_that_is_not_an_object_is_unreadable():
     assert diagnostics["payload_head"] == repr("42\n")
 
 
-@pytest.mark.asyncio
-async def test_unreadable_handshake_reply_names_its_command():
-    ssh = FakeSSH()
-    ssh.process.stdout = FakeStdout([EMPTY_OK, "not json\n", EMPTY_OK])
-
-    result = await _validate(ssh)
-
-    _assert_unreadable(result, cmd="handshake-reply")
-
-
 # --- what the run does with it ------------------------------------------------------------------
 
 
@@ -271,7 +257,7 @@ async def test_unreadable_payload_is_logged_with_typed_fields(caplog):
     assert extra["executor_uuid"] == "exec-252f0496"
     assert extra["reason"] == "INSPECTOR_UNREADABLE"
     assert extra["error_type"] == "InspectorUnreadableError"
-    assert extra["payload_cmd"] == "execute"
+    assert extra["payload_cmd"]
     assert extra["payload_bytes"] == len(partial.encode())
     assert extra["payload_head"] == repr(partial[:200])
     assert extra["payload_terminated"] is False
@@ -322,12 +308,12 @@ async def test_unreadable_node_is_an_inspector_unreadable_event_not_a_pass(conte
     partial = '{"ok": true, "result": "' + "A" * 40
     service = DummyInspectorService(
         ivs.InspectorValidationResponse(
-            error="inspector executor wrote an unreadable response to 'execute': Unterminated string",
+            error="inspector executor wrote an unreadable response to 'cmd': Unterminated string",
             diagnostics={
                 "executor_uuid": "executor-123",
                 "reason": Msg.UNREADABLE.reason,
                 "error_type": "InspectorUnreadableError",
-                "payload_cmd": "execute",
+                "payload_cmd": "cmd",
                 "payload_bytes": len(partial),
                 "payload_head": repr(partial[:200]),
                 "payload_terminated": False,

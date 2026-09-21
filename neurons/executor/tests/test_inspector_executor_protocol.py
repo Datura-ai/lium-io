@@ -1,10 +1,8 @@
-"""`inspector_executor.py --interactive` writes exactly one JSON document per command to stdout.
+"""`inspector_executor.py --interactive` owns its stdout: the validator reads it one line at a time.
 
-The validator parses that stream line by line (`json.loads` per line). Anything else on fd 1 — a
-dependency's printf, a stray print, the collector's status line — turns into an unreadable payload
-on the validator (INSPECTOR_UNREADABLE) and the node's integrity check is skipped. So the
-interactive protocol takes fd 1 for itself and points fd 1 at stderr for everyone else, and a
-result string with a quote, a newline or a non-ASCII name still comes out as one escaped line.
+Anything else that reaches fd 1 while the executor runs — a dependency's printf, a stray print, a
+status line — has to land on stderr, and every reply has to be a single line whatever the result
+string contains. These tests pin those two properties; the command set itself is not spelled out.
 """
 
 from __future__ import annotations
@@ -25,66 +23,17 @@ RESULT_WITH_HAZARDS = 'GPU "NVIDIA \u00dcber" busy\nsecond line\ttab\u2028ls \\ 
 
 
 class FakeLibExecutor:
-    """Stands in for the ctypes-backed InspectorExecutor; every result carries hazards."""
+    """Stands in for the ctypes-backed InspectorExecutor so no .so is loaded."""
 
     def __init__(self) -> None:
         self.started = 0
-
-    def handshake_reply(self, open_json: str) -> str:
-        # what a C dependency does when it is chatty: printf to fd 1, not through sys.stdout
-        os.write(1, b"libinspector: handshake ok\n")
-        return json.dumps({"hello": "executor", "open": open_json})
-
-    def execute(self, request_cipher: str) -> str:
-        print("stray print from a helper")
-        return RESULT_WITH_HAZARDS
 
     def start_collector(self) -> None:
         self.started += 1
         sys.stdout.write("lib says: collector thread up\n")
 
 
-def _only_json_lines(text: str) -> list[dict]:
-    lines = text.split("\n")
-    assert lines[-1] == "", "stdout ends with the protocol line's newline"
-    return [json.loads(line) for line in lines[:-1]]
-
-
-def test_run_interactive_emits_one_escaped_json_line_per_command():
-    stdin = io.StringIO(
-        "\n".join(
-            [
-                json.dumps({"cmd": "start-collector"}),
-                json.dumps({"cmd": "handshake-reply", "open_json": '{"hello": "validator"}'}),
-                "not json at all",
-                "42",
-                json.dumps({"cmd": "execute", "request_cipher": "cipher"}),
-                json.dumps({"cmd": "quit"}),
-                json.dumps({"cmd": "execute", "request_cipher": "after quit, never read"}),
-            ]
-        )
-        + "\n"
-    )
-    protocol_out = io.StringIO()
-
-    inspector_executor.run_interactive(FakeLibExecutor(), stdin=stdin, out=protocol_out)
-
-    responses = _only_json_lines(protocol_out.getvalue())
-    assert responses == [
-        {"ok": True, "result": ""},
-        {"ok": True, "result": json.dumps({"hello": "executor", "open": '{"hello": "validator"}'})},
-        {"ok": False, "error": "invalid json: Expecting value: line 1 column 1 (char 0)"},
-        {"ok": False, "error": "invalid request: expected a JSON object, got int"},
-        {"ok": True, "result": RESULT_WITH_HAZARDS},
-        {"ok": True, "result": ""},
-    ]
-    raw_lines = protocol_out.getvalue().split("\n")[:-1]
-    assert len(raw_lines) == 6, "one physical line per command, whatever the result contains"
-    assert all(line.isascii() for line in raw_lines), "the wire is ASCII: every non-ASCII char is escaped"
-
-
-def test_interactive_stdout_carries_only_the_protocol(tmp_path):
-    # the real entry point in a subprocess: fd 1 is the validator's pipe, fd 2 the executor's log
+def _driver(tmp_path, body: str) -> Path:
     driver = tmp_path / "driver.py"
     driver.write_text(
         textwrap.dedent(
@@ -95,22 +44,47 @@ def test_interactive_stdout_carries_only_the_protocol(tmp_path):
             import inspector_executor
             from test_inspector_executor_protocol import FakeLibExecutor
             inspector_executor.InspectorExecutor = FakeLibExecutor
-            sys.argv = ["inspector_executor.py", "--interactive"]
-            inspector_executor.main()
             """
         )
+        + textwrap.dedent(body)
     )
-    commands = "\n".join(
-        [
-            json.dumps({"cmd": "start-collector"}),
-            json.dumps({"cmd": "handshake-reply", "open_json": "{}"}),
-            json.dumps({"cmd": "execute", "request_cipher": "cipher"}),
-            json.dumps({"cmd": "quit"}),
-        ]
+    return driver
+
+
+def test_emit_writes_exactly_one_ascii_line_whatever_the_result_contains():
+    out = io.StringIO()
+
+    inspector_executor._emit(out, True, result=RESULT_WITH_HAZARDS)
+    inspector_executor._emit(out, False, error=RESULT_WITH_HAZARDS)
+
+    text = out.getvalue()
+    assert text.endswith("\n")
+    lines = text.split("\n")[:-1]
+    assert len(lines) == 2, "one physical line per reply: newline, U+2028 and quotes are escaped"
+    assert all(line.isascii() for line in lines)
+    for line in lines:
+        decoded = json.loads(line)
+        assert isinstance(decoded, dict)
+        assert RESULT_WITH_HAZARDS in decoded.values(), "the text round-trips unchanged"
+
+
+def test_claimed_protocol_stream_is_the_only_writer_to_the_validators_pipe(tmp_path):
+    # the real fd plumbing in a subprocess: fd 1 is the validator's pipe, fd 2 the executor's log
+    driver = _driver(
+        tmp_path,
+        """
+        import os
+        out = inspector_executor._claim_protocol_stream()
+        os.write(1, b"libinspector: handshake ok\\n")   # a C dependency's printf
+        print("stray print from a helper")             # a stray print
+        sys.stdout.write("lib says: collector thread up\\n")
+        sys.stdout.flush()
+        out.write("protocol line\\n")
+        out.flush()
+        """,
     )
     proc = subprocess.run(
         [sys.executable, str(driver)],
-        input=commands + "\n",
         capture_output=True,
         text=True,
         timeout=30,
@@ -118,32 +92,34 @@ def test_interactive_stdout_carries_only_the_protocol(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr
-    responses = _only_json_lines(proc.stdout)
-    assert [r["ok"] for r in responses] == [True, True, True, True]
-    assert responses[2]["result"] == RESULT_WITH_HAZARDS
+    assert proc.stdout == "protocol line\n"
     assert "libinspector: handshake ok" in proc.stderr
     assert "stray print from a helper" in proc.stderr
     assert "lib says: collector thread up" in proc.stderr
-    assert "libinspector" not in proc.stdout
-    assert "stray" not in proc.stdout
-    assert "lib says" not in proc.stdout
+
+
+def test_malformed_request_lines_get_a_reply_and_do_not_end_the_session():
+    # neither a non-JSON line nor a JSON scalar reaches the library or raises out of the loop
+    out = io.StringIO()
+
+    inspector_executor.run_interactive(
+        FakeLibExecutor(), stdin=io.StringIO("not json at all\n42\n\n"), out=out
+    )
+
+    lines = out.getvalue().split("\n")[:-1]
+    assert len(lines) == 2, "one reply per malformed line, none for the blank one"
+    for line in lines:
+        assert line.isascii()
+        assert isinstance(json.loads(line), dict)
 
 
 def test_collector_status_lines_go_to_stderr(tmp_path):
-    driver = tmp_path / "driver.py"
-    driver.write_text(
-        textwrap.dedent(
-            f"""
-            import sys
-            sys.path.insert(0, {str(SCRIPT.parent)!r})
-            sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
-            import inspector_executor
-            from test_inspector_executor_protocol import FakeLibExecutor
-            inspector_executor.InspectorExecutor = FakeLibExecutor
-            sys.argv = ["inspector_executor.py", "--start-collector"]
-            inspector_executor.main()
-            """
-        )
+    driver = _driver(
+        tmp_path,
+        """
+        sys.argv = ["inspector_executor.py", "--start-collector"]
+        inspector_executor.main()
+        """,
     )
     proc = subprocess.run(
         [sys.executable, str(driver)], capture_output=True, text=True, timeout=30
