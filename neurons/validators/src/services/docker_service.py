@@ -5050,16 +5050,7 @@ class DockerService:
                 docker_listing_probe: PrerunHostProbe | None = host_probe
 
                 if payload.workload_kind == WorkloadKind.FILLER:
-                    # E-187 (DAH-3706 family): host truth before anything changes on the host — a
-                    # LIVE (running / restarting / paused) pod_* holding GPUs this filler would take
-                    # refuses the create (event
-                    # FILLER_START_REFUSED_LIVE_POD, failure_step filler_live_pod_guard). Deliberately
-                    # BEFORE the sweep below: on a host the backend re-registered as a new executor,
-                    # the customer's container is not on active_container_names, and the sweep would
-                    # remove the paying tenant to make room for a filler. The sweep is the customer
-                    # create's tool (lium-io#1417); a filler yields. A host that could not be read
-                    # refuses too, under its OWN step, so the backend keeps its FAILED + backoff path
-                    # for it instead of the STOPPED close it gives a confirmed overlap.
+                    # Before the sweep: a filler must never remove a live customer pod_*.
                     current_step = FILLER_LIVE_POD_GUARD_STEP
                     try:
                         await assert_no_live_pod_on_filler_gpus(

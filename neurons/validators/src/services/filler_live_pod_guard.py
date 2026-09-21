@@ -34,8 +34,7 @@ its own exit status is checked.
 
 The separator is emitted by a Go template ACTION, `{{"\\t"}}`: `docker inspect --format` copies text
 outside actions verbatim, so a bare `\\t` in the template prints a backslash and a t (only `docker ps
---format` pre-processes `\\t`). Verified on docker 29.1.3: the r1 template printed `\\t` literally and
-the parser saw no separator; a `pod_*` line WITHOUT the separator is therefore unreadable, never
+--format` pre-processes `\\t`). A `pod_*` line WITHOUT the separator is therefore unreadable, never
 "no GPU claim".
 """
 
@@ -126,42 +125,40 @@ def parse_live_pod_gpu_sets(stdout: str) -> dict[str, frozenset[str] | None]:
             continue  # not a pod, whatever the shape
         if not name.startswith(POD_CONTAINER_PREFIX):
             continue
-        held = _gpu_set(requests_json.strip())
-        if held is _UNPARSEABLE:
-            raise FillerLivePodListingUnreadableError(
-                f"Filler refused: the device requests of {name} could not be read: {requests_json[:120]!r}"
-            )
-        pods[name] = held
+        pods[name] = _gpu_set(name, requests_json.strip())
     return pods
-
-
-_UNPARSEABLE = object()
 
 
 _GPU_UUID_PREFIX = "GPU-"
 
 
-def _gpu_set(requests_json: str):
-    """frozenset of GPU uuids; None = the whole host; _UNPARSEABLE when the claim cannot be read."""
+def _gpu_set(name: str, requests_json: str) -> frozenset[str] | None:
+    """frozenset of GPU uuids; None = the whole host; raises FillerLivePodListingUnreadableError when the claim cannot be read."""
+
+    def unreadable() -> FillerLivePodListingUnreadableError:
+        return FillerLivePodListingUnreadableError(
+            f"Filler refused: the device requests of {name} could not be read: {requests_json[:120]!r}"
+        )
+
     try:
         requests = json.loads(requests_json or "null")
     except ValueError:
-        return _UNPARSEABLE
+        raise unreadable() from None
     if requests is None or requests == []:
         # `null` / `[]`: no DeviceRequest at all. A Lium pod always carries one (uuids or Count=-1),
         # so this is a pod_* whose GPU use we cannot see (env-only attachment) — not "no GPUs".
-        return _UNPARSEABLE
+        raise unreadable()
     if not isinstance(requests, list):
-        return _UNPARSEABLE
+        raise unreadable()
     uuids: set[str] = set()
     for request in requests:
         if not isinstance(request, dict):
-            return _UNPARSEABLE
+            raise unreadable()
         device_ids = request.get("DeviceIDs") or []
         if device_ids:
             if not all(str(device_id).startswith(_GPU_UUID_PREFIX) for device_id in device_ids):
                 # CDI names / indices can never intersect the filler's GPU uuids: unreadable, not disjoint
-                return _UNPARSEABLE
+                raise unreadable()
             uuids.update(str(device_id) for device_id in device_ids)
         else:
             # Count=-1 (--gpus all) is every GPU on the host; a positive Count without ids means
