@@ -21,11 +21,14 @@ from payload_models.payloads import ContainerCreated, FailedContainerRequest
 from services.docker_service import (
     _PRERUN_HOST_PROBE_TIMEOUT_SECONDS,
     STUCK_CONTAINER_EVENT,
+    STUCK_CONTAINER_HOLDS_GPU_EVENT,
     STUCK_CONTAINER_HOLDS_GPU_STEP,
     STUCK_CONTAINER_PREFIX,
     STUCK_CONTAINER_REPEAT_WINDOW_SECONDS,
     DockerService,
+    _gpu_uuids_on_host,
     _gpu_uuids_with_compute_apps,
+    _NvidiaSmiUnreadable,
 )
 from services.redis_service import RedisService
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
@@ -63,6 +66,7 @@ class _Host:
         compute_apps: str = "",
         gpu_query: str = "GPU-test, 0, 0\n",
         nvidia_smi_exit: int = 0,
+        gpu_query_exit: int = 0,
     ):
         self.names = list(stale)
         self.rename_exit = rename_exit
@@ -71,6 +75,7 @@ class _Host:
         self.compute_apps = compute_apps
         self.gpu_query = gpu_query
         self.nvidia_smi_exit = nvidia_smi_exit
+        self.gpu_query_exit = gpu_query_exit
         self.commands: list[str] = []
         self.timeouts: list[float | None] = []
         self.client = AsyncMock()
@@ -83,10 +88,8 @@ class _Host:
         self.timeouts.append(kwargs.get("timeout"))
         if cmd.startswith("nvidia-smi --query-compute-apps=gpu_uuid"):
             return _ssh_result(exit_status=self.nvidia_smi_exit, stdout=self.compute_apps, stderr="nvidia-smi failed" if self.nvidia_smi_exit else "")
-        if cmd.startswith("nvidia-smi --query-compute-apps=pid"):
-            return _ssh_result(stdout="".join(f"{line.split(',')[1].strip()}\n" for line in self.compute_apps.strip().splitlines()))
         if cmd.startswith("nvidia-smi --query-gpu"):
-            return _ssh_result(stdout=self.gpu_query)
+            return _ssh_result(exit_status=self.gpu_query_exit, stdout=self.gpu_query, stderr="nvidia-smi failed" if self.gpu_query_exit else "")
         if cmd.startswith("/usr/bin/docker ps -a"):
             return _ssh_result(stdout="".join(f"{n}\n" for n in self.names))
         if cmd.startswith("/usr/bin/docker rename"):
@@ -123,16 +126,24 @@ def _events(caplog) -> list[dict]:
     ]
 
 
+def _hold_events(caplog) -> list[dict]:
+    return [
+        record.msg.extra
+        for record in caplog.records
+        if getattr(getattr(record, "msg", None), "extra", {}).get("event") == STUCK_CONTAINER_HOLDS_GPU_EVENT
+    ]
+
+
 def _use_real_cleanup(svc, monkeypatch):
     # _patch_happy stubs the sweep away; this file is about the sweep, so put the real one back.
     monkeypatch.setattr(svc, "clean_existing_containers", DockerService.clean_existing_containers.__get__(svc))
 
 
-async def _create(svc, host: _Host, monkeypatch):
+async def _create(svc, host: _Host, monkeypatch, **payload_over):
     _patch_happy(svc, monkeypatch, host.client)
     _use_real_cleanup(svc, monkeypatch)
     svc.redis_service.count_stuck_container = AsyncMock(return_value=1)
-    payload = _payload()
+    payload = _payload(**payload_over)
     return payload, await svc.create_container(
         payload=payload,
         executor_info=_executor_info(payload),
@@ -193,9 +204,10 @@ async def test_a_renamed_container_that_still_holds_a_pod_gpu_fails_the_rent_bef
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
     # the name is still freed and the node still gets its event: the rename is what happened
     assert len(host.renames) == 1 and "filler_old" not in host.names
-    (event, hold) = _events(caplog)
+    (event,) = _events(caplog)  # one STUCK_CONTAINER event: the hold has its own name, no double count
     assert event["container_name"] == "filler_old"
-    assert hold["held_gpu_uuids"] == ["GPU-test"] and hold["nvidia_smi_read"] is True
+    (hold,) = _hold_events(caplog)
+    assert hold["held_gpu_uuids"] == ["GPU-test"] and hold["nvidia_smi_read"] is True and hold["whole_node"] is False
     assert hold["stuck_names"] == [event["stuck_name"]]
 
 
@@ -224,7 +236,7 @@ async def test_a_live_process_on_another_card_lets_the_rent_go_on(svc, monkeypat
 
     assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
-    assert len(_events(caplog)) == 1  # the rename; no hold
+    assert len(_events(caplog)) == 1 and _hold_events(caplog) == []  # the rename; no hold
 
 
 @pytest.mark.asyncio
@@ -237,15 +249,88 @@ async def test_an_nvidia_smi_that_cannot_be_read_fails_the_rent_closed(svc, monk
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "stuck_container_holds_gpu"
-    assert "nvidia-smi could not be read" in result.detail
+    assert "nvidia-smi could not be read" in result.detail and "compute-apps query exit 1" in result.detail
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
-    (_, hold) = _events(caplog)
+    (hold,) = _hold_events(caplog)
     assert hold["held_gpu_uuids"] == [] and hold["nvidia_smi_read"] is False
 
 
-def test_the_gpu_uuid_column_of_the_compute_apps_query_is_read():
-    assert _gpu_uuids_with_compute_apps("GPU-a, 11\nGPU-a, 12\nGPU-b, 13\n\n[N/A], 14\n") == {"GPU-a", "GPU-b"}
-    assert _gpu_uuids_with_compute_apps("") == set()
+@pytest.mark.asyncio
+async def test_a_whole_node_rent_checks_every_card_and_fails_on_the_held_one(svc, monkeypatch, rename_flag, caplog):
+    # gpu_uuids == [] is the whole-node rent (--gpus all): it lands on every card, the held one included
+    host = _Host(
+        ["filler_old"],
+        compute_apps="GPU-b, 4242\n",
+        gpu_query="GPU-a, 0, 0\nGPU-b, 0, 0\nGPU-c, 0, 0\n",
+    )
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch, gpu_uuids=[])
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "stuck_container_holds_gpu"
+    assert "GPU-b" in result.detail and "whole-node rent, every card checked" in result.detail
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    (hold,) = _hold_events(caplog)
+    assert hold["whole_node"] is True and hold["pod_gpu_uuids"] == [] and hold["held_gpu_uuids"] == ["GPU-b"]
+
+
+@pytest.mark.asyncio
+async def test_a_whole_node_rent_with_no_card_held_goes_on(svc, monkeypatch, rename_flag, caplog):
+    host = _Host(["filler_old"], gpu_query="GPU-a, 0, 0\nGPU-b, 3, 512\n")
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch, gpu_uuids=[])
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    assert len(_events(caplog)) == 1 and _hold_events(caplog) == []
+    # both reads ran (the check does not skip the whole-node rent)
+    assert any(c.startswith("nvidia-smi --query-compute-apps=gpu_uuid") for c in host.commands)
+    assert any(c.startswith("nvidia-smi --query-gpu") for c in host.commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_kwargs", "expected"),
+    [
+        ({"compute_apps": "Failed to initialize NVML: Driver/library version mismatch\n"}, "compute-apps line not"),
+        ({"gpu_query": "No devices were found\n"}, "gpu line not"),
+        ({"gpu_query": ""}, "listed no GPU"),
+        ({"gpu_query_exit": 1}, "gpu query exit 1"),
+    ],
+    ids=["exit-0-garbage-compute-apps", "exit-0-garbage-gpu-query", "no-gpu-listed", "gpu-query-failed"],
+)
+async def test_an_unparsable_or_failed_nvidia_smi_read_fails_closed(svc, monkeypatch, rename_flag, caplog, host_kwargs, expected):
+    host = _Host(["filler_old"], **host_kwargs)
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "stuck_container_holds_gpu"
+    assert "nvidia-smi could not be read" in result.detail and expected in result.detail
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    (hold,) = _hold_events(caplog)
+    assert hold["nvidia_smi_read"] is False and hold["held_gpu_uuids"] == []
+
+
+def test_the_compute_apps_csv_is_parsed_strictly():
+    assert _gpu_uuids_with_compute_apps("GPU-a, 11\nGPU-a, 12\nGPU-b, 13\n\n") == ({"GPU-a", "GPU-b"}, ["11", "12", "13"])
+    assert _gpu_uuids_with_compute_apps("") == (set(), [])
+    for garbage in ("[N/A], 14\n", "GPU-a\n", "GPU-a, x\n", "Failed to initialize NVML\n"):
+        with pytest.raises(_NvidiaSmiUnreadable):
+            _gpu_uuids_with_compute_apps(garbage)
+
+
+def test_the_gpu_csv_is_parsed_strictly():
+    assert _gpu_uuids_on_host("GPU-a, 0, 0\nGPU-b, 100, 0\n") == ["GPU-a", "GPU-b"]
+    for garbage in ("", "No devices were found\n", "GPU-a, 0\n", "GPU-a, x, 0\n", "0, 0, 0\n"):
+        with pytest.raises(_NvidiaSmiUnreadable):
+            _gpu_uuids_on_host(garbage)
 
 
 @pytest.mark.asyncio

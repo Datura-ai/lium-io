@@ -92,7 +92,13 @@ from services.prerun_host_probe import (
     parse_prerun_host_probe,
     prerun_host_probe_command,
 )
-from services.gpu_wedge import NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, cure_wedged_gpus, query_wedged_gpu_uuids
+from services.gpu_wedge import (
+    GPU_QUERY_COMMAND,
+    NVIDIA_SMI_QUERY_TIMEOUT_SECONDS,
+    cure_wedged_gpus,
+    parse_wedged_gpu_uuids,
+    query_wedged_gpu_uuids,
+)
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
@@ -283,23 +289,24 @@ _DOCKER_COULD_NOT_KILL_PHRASES = ("could not kill", "did not receive an exit eve
 # STUCK_CONTAINER_RENAME_ENABLED the container is moved aside as `stuck_<name>_<unix time>` — not a
 # rental prefix, so neither sweeper spends a `rm -f` on it every cycle — and the create goes on
 # ONLY if the pod's GPUs are free: the wedged process usually sits inside the driver and keeps its
-# CUDA context, so nvidia-smi is read before `docker run` and the rent fails as
-# `stuck_container_holds_gpu` when one of the pod's cards has a live process or the DAH-2427 wedge
-# signature. Nothing here reaches a provider or reclaims the `stuck_*` container (it keeps its GPUs,
+# CUDA context, so nvidia-smi is read (strictly; unreadable = not free) before `docker run` and the
+# rent fails as `stuck_container_holds_gpu` when one of the pod's cards — every card for a whole-node
+# rent — has a live process or the DAH-2427 wedge signature. Nothing here reaches a provider or reclaims the `stuck_*` container (it keeps its GPUs,
 # host ports and volume until someone removes it): the STUCK_CONTAINER event (typed fields: node,
 # container, new name, count in the window, repeat) is a validator log line for the loop to read.
 STUCK_CONTAINER_PREFIX = "stuck_"
 STUCK_CONTAINER_EVENT = "STUCK_CONTAINER"
 STUCK_CONTAINER_REPEAT_WINDOW_SECONDS = 24 * 60 * 60
 STUCK_CONTAINER_HOLDS_GPU_STEP = "stuck_container_holds_gpu"
-# Which card each live CUDA process sits on; `query_wedged_gpu_uuids` (DAH-2427) covers the
-# orphaned-load signature a dead process leaves, this covers the process that is still there.
+STUCK_CONTAINER_HOLDS_GPU_EVENT = "STUCK_CONTAINER_HOLDS_GPU"
+# Which card each live CUDA process sits on; the DAH-2427 wedge signature (GPU_QUERY_COMMAND) covers
+# the orphaned load a dead process leaves, this covers the process that is still there.
 COMPUTE_APPS_BY_GPU_QUERY_COMMAND = "nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader"
 
 
 class StuckContainerHoldsGpu(Exception):
-    """After a stuck container was renamed aside, one of the pod's GPUs is not free — a live
-    process on it, the wedge signature, or nvidia-smi could not be read (fail closed: with the
+    """After a stuck container was renamed aside, a GPU the rent needs is not free — a live process
+    on it, the wedge signature, or nvidia-smi could not be read or parsed (fail closed: with the
     flag off this rent would have failed at `container_cleanup` anyway)."""
 
     def __init__(self, *, stuck_names: list[str], held_gpu_uuids: list[str], detail: str):
@@ -312,14 +319,43 @@ class StuckContainerHoldsGpu(Exception):
         )
 
 
-def _gpu_uuids_with_compute_apps(compute_apps_csv: str) -> set[str]:
-    """The `gpu_uuid` column of COMPUTE_APPS_BY_GPU_QUERY_COMMAND: cards with a live process."""
+class _NvidiaSmiUnreadable(ValueError):
+    """A nvidia-smi read the hold check cannot trust: non-zero exit, or a line that is not the
+    csv the query asked for. The caller fails closed."""
+
+
+def _gpu_uuids_with_compute_apps(compute_apps_csv: str) -> tuple[set[str], list[str]]:
+    """COMPUTE_APPS_BY_GPU_QUERY_COMMAND, strictly: `GPU-<uuid>, <pid>` per line, nothing else.
+    Returns the cards with a live process and the pid column (the input parse_wedged_gpu_uuids
+    takes). An empty output is "no process"; any other shape raises — exit 0 with garbage
+    stdout must not read as "free"."""
     busy: set[str] = set()
+    pids: list[str] = []
     for line in compute_apps_csv.strip().splitlines():
-        gpu_uuid = line.split(",")[0].strip()
-        if gpu_uuid.startswith("GPU-"):
-            busy.add(gpu_uuid)
-    return busy
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2 or not parts[0].startswith("GPU-") or not parts[1].isdigit():
+            raise _NvidiaSmiUnreadable(f"compute-apps line not `GPU-<uuid>, <pid>`: {line.strip()[:80]!r}")
+        busy.add(parts[0])
+        pids.append(parts[1])
+    return busy, pids
+
+
+def _gpu_uuids_on_host(gpu_query_csv: str) -> list[str]:
+    """GPU_QUERY_COMMAND, strictly: `GPU-<uuid>, <utilization>, <memory MiB>` per line, at least
+    one line (a GPU node with no card listed is a read to distrust, not an empty node)."""
+    uuids: list[str] = []
+    for line in gpu_query_csv.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        try:
+            ok = len(parts) == 3 and parts[0].startswith("GPU-") and float(parts[1]) >= 0 and float(parts[2]) >= 0
+        except ValueError:
+            ok = False
+        if not ok:
+            raise _NvidiaSmiUnreadable(f"gpu line not `GPU-<uuid>, <util>, <mem>`: {line.strip()[:80]!r}")
+        uuids.append(parts[0])
+    if not uuids:
+        raise _NvidiaSmiUnreadable("nvidia-smi listed no GPU")
+    return uuids
 HOST_KEY_REQUIRED_EXTRA = {
     "ssh_host_key_missing": True,
     "docker_sdk_host_key_required": True,
@@ -2276,9 +2312,9 @@ class DockerService:
                 default_extra, pod_name=pod_name, container_name=name, stuck_name=stuck_name, cause=cause
             )
             renamed.append(stuck_name)
-        if renamed and pod_gpu_uuids:
+        if renamed:
             await self._fail_if_stuck_containers_hold_gpus(
-                ssh_client, default_extra, stuck_names=renamed, pod_gpu_uuids=list(pod_gpu_uuids)
+                ssh_client, default_extra, stuck_names=renamed, pod_gpu_uuids=list(pod_gpu_uuids or ())
             )
         return True
 
@@ -2290,41 +2326,55 @@ class DockerService:
         stuck_names: list[str],
         pod_gpu_uuids: list[str],
     ) -> None:
-        """Read nvidia-smi once, before `docker run`: a pod GPU with a live process or the DAH-2427
-        wedge signature fails the rent as StuckContainerHoldsGpu, naming the cards. A read that
-        fails is the same failure with no card named (fail closed)."""
+        """Read nvidia-smi once, before `docker run`: a GPU the rent needs with a live process or the
+        DAH-2427 wedge signature fails the rent as StuckContainerHoldsGpu, naming the cards. An
+        empty ``pod_gpu_uuids`` is the whole-node rent (`--gpus all`, see the power-limit restore in
+        create_container), which lands on every card: every card on the node is checked. A read
+        that fails, or one whose output is not the csv asked for, is the same failure with no card
+        named (fail closed) — `query_wedged_gpu_uuids` is not used here because it answers `[]` when
+        its own reads fail, which is the one answer this check must not take on trust."""
         runner = SSHCommandRunner(ssh_client, max_retries=0)
-        compute_apps, wedged = await asyncio.gather(
+        compute_apps, gpu_query = await asyncio.gather(
             runner.run(
                 COMPUTE_APPS_BY_GPU_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False
             ),
-            query_wedged_gpu_uuids(runner),
+            runner.run(GPU_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False),
         )
-        if compute_apps.exit_code != 0:
+        whole_node = not pod_gpu_uuids
+        held: list[str] = []
+        read_ok = False
+        try:
+            for name, result in (("compute-apps", compute_apps), ("gpu", gpu_query)):
+                if result.exit_code != 0:
+                    raise _NvidiaSmiUnreadable(
+                        f"nvidia-smi {name} query exit {result.exit_code}: "
+                        f"{result.error_message or (result.stderr or '').strip()}"
+                    )
+            busy, pids = _gpu_uuids_with_compute_apps(compute_apps.stdout or "")
+            on_host = set(_gpu_uuids_on_host(gpu_query.stdout or ""))
+            wedged = set(parse_wedged_gpu_uuids(gpu_query.stdout or "", "\n".join(pids)))
+            wanted = on_host if whole_node else set(pod_gpu_uuids)
+            held = sorted((busy | wedged) & wanted)
+            read_ok = True
             detail = (
-                f"nvidia-smi exit {compute_apps.exit_code}: "
-                f"{compute_apps.error_message or (compute_apps.stderr or '').strip()}"
-            )
-            held: list[str] = []
-        else:
-            busy = _gpu_uuids_with_compute_apps(compute_apps.stdout or "")
-            held = sorted((busy | set(wedged)) & set(pod_gpu_uuids))
-            detail = (
-                f"live process on {sorted(busy & set(pod_gpu_uuids))}, wedge signature on "
-                f"{sorted(set(wedged) & set(pod_gpu_uuids))}"
+                f"{'whole-node rent, every card checked' if whole_node else 'pod cards checked'}: "
+                f"live process on {sorted(busy & wanted)}, wedge signature on {sorted(wedged & wanted)}"
             )
             if not held:
                 return
+        except _NvidiaSmiUnreadable as unreadable:
+            detail = str(unreadable)
         logger.error(
             _m(
                 "Stuck container renamed aside but the pod's GPUs are not free; the rent fails",
                 extra=get_extra_info({
                     **default_extra,
-                    "event": STUCK_CONTAINER_EVENT,
+                    "event": STUCK_CONTAINER_HOLDS_GPU_EVENT,
                     "stuck_names": stuck_names,
                     "pod_gpu_uuids": pod_gpu_uuids,
+                    "whole_node": whole_node,
                     "held_gpu_uuids": held,
-                    "nvidia_smi_read": compute_apps.exit_code == 0,
+                    "nvidia_smi_read": read_ok,
                 }),
             )
         )
