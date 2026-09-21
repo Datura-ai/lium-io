@@ -13,7 +13,7 @@ Monitors a Docker image for validator-signed updates and automatically pulls and
 
 ### Pull by digest, and the mirror bypass
 
-A pull by tag goes through the host's Docker daemon, and the daemon asks a registry mirror first when `/etc/docker/daemon.json` has `registry-mirrors`. A mirror can keep serving an old copy of a tag (DAH-3419: 99 of 493 nodes stayed on an old runner that way). A pull by digest is content-addressed: the daemon checks the hash of the manifest it receives, so a mirror can return the right image or an error, never an old image. When that pull fails or returns an image without the digest, the same digest is pulled as `registry-1.docker.io/<image>@<digest>`. The daemon applies `registry-mirrors` to `docker.io` names only, so this reference reaches Docker Hub directly. The container is then created from whichever reference succeeded.
+A pull by tag goes through the host's Docker daemon, and the daemon asks a registry mirror first when `/etc/docker/daemon.json` has `registry-mirrors`. A mirror can keep serving an old copy of a tag (99 of 493 nodes stayed on an old runner that way). A pull by digest is content-addressed: the daemon checks the hash of the manifest it receives, so a mirror can return the right image or an error, never an old image. When that pull fails or returns an image without the digest, the same digest is pulled as `registry-1.docker.io/<image>@<digest>`. The daemon applies `registry-mirrors` to `docker.io` names only, so this reference reaches Docker Hub directly. The container is then created from whichever reference succeeded.
 
 ### Recreating the container
 
