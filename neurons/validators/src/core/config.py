@@ -339,6 +339,16 @@ class Settings(BaseSettings):
     # SSH in one cycle is our side, not theirs. Fleets under SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
     # pods are gated by the executor-SSH verdict alone.
     RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX: float = Field(env="RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX", default=0.5, ge=0.0, le=1.0)
+    # DAH-2255 — the enforcement half of the probe above. Off (the default): RENTED_POD_SSH_UNREACHABLE
+    # is recorded and reported and the rented score stands (DAH-2870's behaviour). On: a pod whose
+    # streak reaches ENFORCE_AFTER_CYCLES makes the rented-state check FAIL for the cycle — score 0,
+    # verified job cleared — the way the rental probe fails an unreachable unrented node; the next
+    # healthy cycle scores as rented again. ENFORCE_AFTER_CYCLES unset means RENTED_POD_SSH_PROBE_CYCLES
+    # (the notify threshold); a value below it is refused at startup, so a provider is never zeroed
+    # for an outage no renter was told about and one blip (a streak of 1 under the default 2) never
+    # costs a cycle. Enforcement adds no report: the one POST per outage stays the probe's.
+    RENTED_POD_SSH_ENFORCEMENT_ENABLED: bool = Field(env="RENTED_POD_SSH_ENFORCEMENT_ENABLED", default=False)
+    RENTED_POD_SSH_ENFORCE_AFTER_CYCLES: int | None = Field(env="RENTED_POD_SSH_ENFORCE_AFTER_CYCLES", default=None, ge=1)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's
     # rental idling on the card (Nodexo/SN106) passes every percentage gate. CHECK_ENABLED
     # observes and logs the verdict; ENFORCEMENT additionally zeroes the score. Enforcement
@@ -632,6 +642,18 @@ class Settings(BaseSettings):
                     "ENABLE_VOLUME_ENCRYPTION requires VOLUME_MASTER_SECRET "
                     "of at least 32 characters"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_rented_pod_ssh_enforce_threshold(self) -> "Settings":
+        # DAH-2255: enforcing before notifying would zero a provider for an outage no renter was
+        # told about; the enforce threshold is the notify threshold or later.
+        after = self.RENTED_POD_SSH_ENFORCE_AFTER_CYCLES
+        if after is not None and after < self.RENTED_POD_SSH_PROBE_CYCLES:
+            raise ValueError(
+                f"RENTED_POD_SSH_ENFORCE_AFTER_CYCLES ({after}) must not be below "
+                f"RENTED_POD_SSH_PROBE_CYCLES ({self.RENTED_POD_SSH_PROBE_CYCLES})"
+            )
         return self
 
     def get_bittensor_wallet(self) -> "Wallet":

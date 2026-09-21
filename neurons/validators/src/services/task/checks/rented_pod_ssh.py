@@ -25,7 +25,9 @@ about 30 min) after that raise ``RENTED_POD_SSH_UNREACHABLE`` and one POST to th
 outage: the POST is repeated each cycle until the backend answers 200 (``recorded`` true or false)
 with a ``delivery`` other than ``notify_failed`` (lium-platform#429: the renter's mail was refused,
 so the next cycle posts again and it is re-sent), and that answer is kept in the streak so the
-outage is reported once. The score is not changed by this module.
+outage is reported once. The score is not changed by this module: with
+``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on (DAH-2255, off by default) the check reads ``is_enforced``
+and fails the cycle itself once the streak reaches ``enforce_after_cycles()``.
 
 The POST is deferred to the end of the cycle and gated by the fleet (Rustam's review, 16 Sep): a
 validator whose own network fails sees every mapped port refuse at once, and per-pod reporting
@@ -167,6 +169,29 @@ class FleetGate:
     @property
     def fail_share(self) -> float:
         return self.failed / self.probed if self.probed else 0.0
+
+
+def enforce_after_cycles() -> int:
+    """The streak at which ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` fails the rented-state check (DAH-2255).
+
+    ``RENTED_POD_SSH_ENFORCE_AFTER_CYCLES`` when set, else the notify threshold
+    ``RENTED_POD_SSH_PROBE_CYCLES``; the settings refuse a value below the notify threshold at startup.
+    """
+    configured = settings.RENTED_POD_SSH_ENFORCE_AFTER_CYCLES
+    return settings.RENTED_POD_SSH_PROBE_CYCLES if configured is None else configured
+
+
+def is_enforced(verdict: RentedPodSshVerdict) -> bool:
+    """True when this verdict fails the rented-state check for the cycle (DAH-2255).
+
+    Only with ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on, only for an unhealthy pod, and only once its
+    streak has reached ``enforce_after_cycles()``. A pod never seen healthy carries no streak
+    (``consecutive_cycles`` 0), a Redis outage yields no verdict at all, and the flag off leaves the
+    check with DAH-2870's record-and-report behaviour: none of those is enforced.
+    """
+    if not settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED or verdict.healthy:
+        return False
+    return verdict.consecutive_cycles >= enforce_after_cycles()
 
 
 def _ok_key(pod_id: str) -> str:
