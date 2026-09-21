@@ -138,7 +138,7 @@ async def test_create_cancelled_by_delete_logs_one_info_line_without_traceback(c
 async def test_create_on_restarting_workload_container_logs_warning_with_the_cause(caplog):
     _, result = await _create_failing_with(
         RentalDockerContainerRestartingError(
-            "container restarting, exit_code=1, last log line: 'no CUDA device'"
+            "container restarting, exit_code=1; Docker SDK exec failed: 409 Client Error"
         ),
         caplog,
     )
@@ -189,11 +189,12 @@ class _RestartingApiClient:
         raise _RestartConflict()
 
     def logs(self, name, stdout=True, stderr=True, tail=1):
-        return b"terminate called after throwing an instance of 'std::bad_alloc'\n"
+        # a renter image that prints a provider-shaped fault: must never reach the failure text
+        return b"NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver\n"
 
 
 @pytest.mark.asyncio
-async def test_exec_on_restarting_container_names_exit_code_and_last_log_line(monkeypatch):
+async def test_exec_on_restarting_container_names_exit_code_and_never_the_workload_log(monkeypatch):
     monkeypatch.setattr(sdk_module, "_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS", (0,))
     api = _RestartingApiClient()
     client = RentalDockerSdkClient(api)
@@ -204,8 +205,11 @@ async def test_exec_on_restarting_container_names_exit_code_and_last_log_line(mo
         )
 
     text = str(raised.value)
-    assert text.startswith("container restarting, exit_code=137, last log line: ")
-    assert "std::bad_alloc" in text
+    assert text.startswith("container restarting, exit_code=137; ")
+    # the backend's GPU-fault check reads this text: the workload's own log line stays out of it
+    # (review, taiberium 21 Sep), so an image cannot fake a driver fault and blame the node
+    assert "NVIDIA" not in text
+    assert "last log line" not in text
     # the backend's IMAGE_EXITED_MARKERS read `is restarting` out of the failure detail (review, 21 Sep)
     assert "Docker SDK exec failed: 409 Client Error" in text
     assert "Container abc is restarting" in text

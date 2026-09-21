@@ -62,9 +62,11 @@ class RentalDockerContainerRestartingError(RentalDockerOperationError):
     """The workload container kept restarting for the whole exec retry budget (DAH-3593).
 
     Docker answers every exec on a restarting container with the same 409, which says nothing
-    about why the workload keeps exiting. The message here names the container state, its last
-    exit code and its last log line instead, so the reader sees the cause (a workload image that
-    crashes at start on this node) rather than the daemon's conflict text.
+    about why the workload keeps exiting. The message here names the container state and its last
+    exit code instead, so the reader sees the cause (a workload image that crashes at start on this
+    node) rather than the daemon's conflict text. The container's own log line is NOT included: the
+    text lands in the create failure the backend's GPU-fault check reads, and a renter image must
+    not be able to print its way into a provider fault (review, taiberium 21 Sep).
     """
 
 
@@ -341,18 +343,15 @@ class RentalDockerSdkClient:
         ) from last_restart_error
 
     def _describe_restarting_container_sync(self, container_name: str) -> str:
-        """`exit_code=N, last log line: ...` for a container Docker keeps restarting; best effort."""
+        """`exit_code=N` for a container Docker keeps restarting; best effort. Only the daemon's
+        exit code, never the container's log output: the message reaches the backend's failure
+        detail, which the GPU-fault check reads."""
         try:
             state = self._api_client.inspect_container(container_name).get("State") or {}
             exit_code = state.get("ExitCode")
         except Exception:
             exit_code = None
-        try:
-            raw = self._api_client.logs(container_name, stdout=True, stderr=True, tail=1)
-            last_line = raw.decode(errors="replace").strip() if isinstance(raw, bytes) else str(raw).strip()
-        except Exception:
-            last_line = ""
-        return f"exit_code={exit_code}, last log line: {last_line[:500]!r}"
+        return f"exit_code={exit_code}"
 
     async def start(self, *, container_name: str) -> None:
         await self._call_api(
