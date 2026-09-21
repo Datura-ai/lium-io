@@ -4,6 +4,7 @@ import logging
 import os
 import shlex
 import time
+from collections.abc import Iterator
 from typing import Annotated
 from uuid import UUID
 
@@ -57,13 +58,17 @@ from tenacity import RetryError
 
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
+from services.task.availability import (
+    availability_errors,
+    build_rented_executor_not_listed_event,
+)
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 from services.storage_operations import cancel_storage_operation, start_storage_operation
@@ -455,13 +460,19 @@ class MinerService:
                             ),
                         ),
                     )
-                    if len(msg.executors) == 0 and not self._has_manual_rental_executors(
-                        payload, rented_data
+                    if (
+                        len(msg.executors) == 0
+                        and not self._has_manual_rental_executors(payload, rented_data)
+                        and not self._has_not_listed_rented_executors(
+                            payload, rented_data, msg.executors, executor_id
+                        )
                     ):
                         # Zero executors is normally a miner failure. It is the *expected* shape when
                         # every executor this miner has is under a manual rental, though -- the miner
                         # drops each one because it can no longer install our key. Only fail when
                         # there is genuinely nothing to score; otherwise fall through to synthesis.
+                        # DAH-3558 (flag): a miner whose rented nodes are all down answers the same
+                        # way; fall through so each node gets its own failed row.
                         return self._build_failed_job_result(
                             payload,
                             "Miner returned zero executors in AcceptSSHKeyRequest",
@@ -502,6 +513,13 @@ class MinerService:
                     results = self._filter_task_results(executors, raw_results, default_extra)
                     results.extend(
                         self._build_manual_rental_results(payload, rented_data, existing=results)
+                    )
+                    # DAH-3558: a rented node the miner left out of msg.executors gets a failed
+                    # result, so the wave records the outage instead of nothing (flag).
+                    results.extend(
+                        self._build_not_listed_rented_results(
+                            payload, rented_data, msg.executors, executor_id
+                        )
                     )
 
                     # DAH-2667: while the miner's key is still installed and its idle hosts are
@@ -828,6 +846,166 @@ class MinerService:
             )
 
         return results
+
+    def _iter_not_listed_rented(
+        self,
+        payload: MinerJobRequestPayload,
+        rented_data: RentedExecutorsResponse | None,
+        miner_returned_executors: list[ExecutorSSHInfo],
+        executor_id: str | None,
+    ) -> Iterator[tuple[str, RentedExecutor]]:
+        """Yield (executor_uuid, rented_executor) for this miner's rented executors missing from
+        ``miner_returned_executors`` (DAH-3558). Shared by the cheap
+        ``_has_not_listed_rented_executors`` probe and ``_build_not_listed_rented_results`` so the
+        two never disagree. Flag off: yields nothing.
+
+        Only the cycle's whole-miner request (``executor_id`` None) reports: the express lane and
+        the rental key-submit ask for one executor and keep their own retry when the miner does
+        not return it (DAH-2958). The rented list is the backend's, subnet-wide, with no validator
+        assignment on it; like the manual-rental synthesis this assumes the one-validator
+        deployment prod runs (every ``miner_executor.validator_hotkey`` row is ours) — a second
+        validator would need the portal's assignment here before turning the flag on.
+        """
+        if (
+            not settings.RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED
+            or not rented_data
+            or executor_id is not None
+        ):
+            return
+
+        miner_returned_ids = {str(executor.uuid).lower() for executor in miner_returned_executors}
+        manual_rental_ids = {
+            str(uuid).lower() for uuid in (rented_data.manual_rental_executors or {})
+        }
+
+        for raw_uuid, rented_executor in rented_data.executors.items():
+            executor_uuid = str(raw_uuid).lower()
+            if rented_executor.miner_hotkey != payload.miner_hotkey:
+                continue
+            if executor_uuid in miner_returned_ids or executor_uuid in manual_rental_ids:
+                continue
+            yield executor_uuid, rented_executor
+
+    def _has_not_listed_rented_executors(
+        self,
+        payload: MinerJobRequestPayload,
+        rented_data: RentedExecutorsResponse | None,
+        miner_returned_executors: list[ExecutorSSHInfo],
+        executor_id: str | None,
+    ) -> bool:
+        """Whether an empty answer from the miner still has rented executors to report (DAH-3558).
+
+        A miner whose only executors are rented and down answers with zero executors; that used to
+        end as one miner-level failure row and nothing about the nodes.
+        """
+        return any(
+            self._iter_not_listed_rented(
+                payload, rented_data, miner_returned_executors, executor_id
+            )
+        )
+
+    def _build_not_listed_rented_results(
+        self,
+        payload: MinerJobRequestPayload,
+        rented_data: RentedExecutorsResponse | None,
+        miner_returned_executors: list[ExecutorSSHInfo],
+        executor_id: str | None,
+    ) -> list[JobResult]:
+        """One failed result per rented executor of this miner that its answer left out (DAH-3558).
+
+        A node the miner does not put in ``AcceptSSHKeyRequest.executors`` gets no pipeline, and
+        the wave writes nothing about it: no report row, no availability error. The backend's
+        staleness sweep (EXECUTOR_INACTIVE_MID_RENTAL, lium-platform penalty_trigger.py) reads the
+        row as the silence it replaces: ``stale_window_penalises`` drops this code before it
+        decides (lium-platform#509, the on-switch prerequisite), so a stale window's verdict is
+        what it was before the row existed. Why the miner
+        left the node out is not known here (providers run their own miner versions), so the row
+        says only that the miner did not return it.
+
+        ``miner_returned_executors`` is the miner's answer before any lane filtering: an executor
+        the express lane holds was still returned by the miner, and every real result is for a
+        returned executor, so a uuid gets one row at most. Manual rentals are skipped — the miner
+        cannot install a key on a node handed to the renter at root, and
+        ``_build_manual_rental_results`` synthesises their pass. The node is never contacted;
+        address and port come from the backend's rented list. Flag off: [].
+        """
+        results = [
+            self._not_listed_rented_job_result(payload, executor_uuid, rented_executor)
+            for executor_uuid, rented_executor in self._iter_not_listed_rented(
+                payload, rented_data, miner_returned_executors, executor_id
+            )
+        ]
+        if results:
+            logger.info(
+                _m(
+                    "Rented executors missing from the miner's answer reported",
+                    extra=get_extra_info({
+                        "job_batch_id": payload.job_batch_id,
+                        "miner_hotkey": payload.miner_hotkey,
+                        "executor_uuids": [result.executor_info.uuid for result in results],
+                        "count": len(results),
+                    }),
+                ),
+            )
+        return results
+
+    def _not_listed_rented_job_result(
+        self, payload: MinerJobRequestPayload, executor_uuid: str, rented_executor: RentedExecutor
+    ) -> JobResult:
+        """The failed result for one rented executor the miner did not return (DAH-3558): the
+        event, its log line and the ``JobResult`` the cycle stores."""
+        try:
+            executor_port = int(rented_executor.executor_ip_port)
+        except (TypeError, ValueError):
+            executor_port = 0
+
+        event = build_rented_executor_not_listed_event(
+            executor_uuid=executor_uuid,
+            host=rented_executor.executor_ip_address,
+            port=executor_port,
+            miner_hotkey=payload.miner_hotkey,
+        )
+        log_text = _m(
+            event.event,
+            extra=get_extra_info({
+                **event.model_dump(mode="json"),
+                "job_batch_id": payload.job_batch_id,
+                "miner_hotkey": payload.miner_hotkey,
+                "executor_uuid": executor_uuid,
+                "executor_ip_address": rented_executor.executor_ip_address,
+                "executor_port": executor_port,
+                "rented_pods": [pod.pod_id for pod in rented_executor.pods],
+            }),
+        )
+        logger.warning(log_text)
+        return JobResult(
+            spec=None,
+            executor_info=ExecutorSSHInfo(
+                uuid=executor_uuid,
+                address=rented_executor.executor_ip_address,
+                port=executor_port,
+                # The miner never handed over SSH details; these only satisfy the model.
+                ssh_username="",
+                ssh_port=0,
+                python_path="",
+                root_dir="",
+            ),
+            score=0,
+            job_score=0,
+            collateral_deposited=False,
+            job_batch_id=payload.job_batch_id,
+            log_status="error",
+            log_text=log_text.to_full_string(),
+            validation_event=event,
+            gpu_model=None,
+            gpu_count=0,
+            sysbox_runtime=False,
+            is_rented=True,
+            availability_errors=[
+                error.model_dump(mode="json") for error in availability_errors([event])
+            ],
+            failure_reason_code=event.reason_code,
+        )
 
     def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
         executor_info = ExecutorSSHInfo(
@@ -2078,11 +2256,16 @@ class MinerService:
                         ),
                     ),
                 )
-                if len(msg.executors) == 0 and not self._has_manual_rental_executors(
-                    payload, rented_data
+                if (
+                    len(msg.executors) == 0
+                    and not self._has_manual_rental_executors(payload, rented_data)
+                    and not self._has_not_listed_rented_executors(
+                        payload, rented_data, msg.executors, executor_id
+                    )
                 ):
                     # See the WebSocket path: zero executors is the expected shape when every
-                    # executor is under a manual rental, so only fail when nothing can be scored.
+                    # executor is under a manual rental (or, DAH-3558, every rented node is down),
+                    # so only fail when nothing can be scored.
                     return self._build_failed_job_result(
                         payload,
                         "Miner returned zero executors in AcceptSSHKeyRequest",
@@ -2123,6 +2306,12 @@ class MinerService:
                 results = self._filter_task_results(executors, raw_results, default_extra)
                 results.extend(
                     self._build_manual_rental_results(payload, rented_data, existing=results)
+                )
+                # DAH-3558: see the WebSocket path.
+                results.extend(
+                    self._build_not_listed_rented_results(
+                        payload, rented_data, msg.executors, executor_id
+                    )
                 )
 
                 # DAH-2667: while the miner's key is still installed and its idle hosts are free,

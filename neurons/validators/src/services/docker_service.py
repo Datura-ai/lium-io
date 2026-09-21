@@ -509,6 +509,57 @@ class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
 
 
+class ImageExitedDuringKeyInjection(Exception):
+    """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
+
+
+async def _explain_add_public_keys_failure(
+    docker_client: RentalDockerSdkClient,
+    *,
+    container_name: str,
+    image: str,
+    cause: Exception,
+    log_extra: dict,
+) -> Exception:
+    """The exception to raise for a failed `add_public_keys` step: the DAH-2624 explanation when the
+    container has exited or restarted since `docker run`, otherwise `cause` unchanged.
+
+    DAH-3678: the backend picks the renter-facing "image has no long-running process" text from
+    markers in this failure text (`is not running`, `is restarting`, `status='exited'` …). Only the
+    failures whose exec happened to hit Docker's 409 or the readiness poll carried one; an exec that
+    the exit itself killed (non-zero exit_status, empty stderr) read as the generic step failure —
+    6 of 8 on 19 Sep for one renter's `nvidia/cuda` templates. Every failure of the step now looks
+    at the container, which cleanup has not removed yet.
+    """
+    try:
+        state = await docker_client.inspect_container_state(container_name=container_name)
+    except Exception as inspect_exc:
+        logger.warning(
+            _m(
+                "Could not inspect the container after a failed SSH-key injection",
+                extra=get_extra_info({
+                    **log_extra,
+                    "container_name": container_name,
+                    "error": str(inspect_exc),
+                }),
+            )
+        )
+        return cause
+    if not state.exited_since_start or state.killed_by_host:
+        return cause
+    if state.running:
+        # Docker's restart policy already brought it back; the exec landed in the gap.
+        situation = f"Docker is restarting it ({state.describe()})"
+    else:
+        situation = f"the container is not running ({state.describe()})"
+    return ImageExitedDuringKeyInjection(
+        f"Failed to add SSH public keys: image {image!r} has no long-running command — its default "
+        f"command exited right after start (exit_code={state.exit_code!r}) and {situation} while the "
+        "SSH keys were being installed; a pod needs a long-running process, for example a start "
+        f"command such as `sleep infinity`. Exec error: {cause}"
+    )
+
+
 class _EditSwap:
     """DAH-2740: keep the customer's container until its replacement runs, so a failed edit can be undone.
 
@@ -3545,6 +3596,11 @@ class DockerService:
             target_path = local_volume_path if encrypted_local_volume else "/root"
             container_q = shlex.quote(container_name)
             target_q = shlex.quote(target_path)
+            # DAH-3639: `docker cp` into the container's /tmp fails with "Could not
+            # find the file /tmp in container" even after the directory exists, because
+            # the daemon resolves the destination against the container's rootfs while
+            # the container's own exec namespace sees the directory. `docker exec` runs
+            # inside that namespace, so the script is piped in from the host instead.
             command = (
                 f"/usr/bin/docker exec -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
@@ -3558,20 +3614,10 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker cp /root/app/run_jupyter.sh "
-                f"{container_q}:/tmp/run_jupyter.sh"
-            )
-            await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Copying run_jupyter.sh to container",
-                log_extra=log_extra,
-                raise_exception=True,
-            )
-            command = (
-                f"/usr/bin/docker exec -u 0 {container_q} "
-                f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
+                f"test -s /root/app/run_jupyter.sh || "
+                f"{{ echo 'run_jupyter.sh is missing on the executor host' >&2; exit 1; }}; "
+                f"cat /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
+                f"sh -c {shlex.quote(f'cat > {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -5578,13 +5624,27 @@ class DockerService:
                     # a grace period waiting for an image-provided sshd — whichever
                     # sshd comes up first must already find the keys in place.
                     current_step = "add_public_keys"
-                    await self.add_ssh_public_keys_with_rental_docker(
-                        docker_client=docker_client,
-                        container_name=container_name,
-                        public_keys=payload.user_public_keys,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                    )
+                    try:
+                        await self.add_ssh_public_keys_with_rental_docker(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            public_keys=payload.user_public_keys,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                    except Exception as keys_exc:
+                        # DAH-3678: name the exiting image (DAH-2624) whatever form the exec
+                        # failure took; the step and the cleanup below stay as they are.
+                        explained = await _explain_add_public_keys_failure(
+                            docker_client,
+                            container_name=container_name,
+                            image=payload.docker_image,
+                            cause=keys_exc,
+                            log_extra=default_extra,
+                        )
+                        if explained is keys_exc:
+                            raise
+                        raise explained from keys_exc
 
                     current_step = "ssh_bootstrap"
                     if image_manages_services:
