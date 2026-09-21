@@ -9,7 +9,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -92,7 +92,7 @@ from services.prerun_host_probe import (
     parse_prerun_host_probe,
     prerun_host_probe_command,
 )
-from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.gpu_wedge import NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
@@ -281,12 +281,45 @@ _DOCKER_COULD_NOT_KILL_PHRASES = ("could not kill", "did not receive an exit eve
 # the name fails: here after the `rm -fv` attempts, or at `containers/create` with 409 "name already
 # in use" (4 rents on 4 nodes, 16–21 Sep). `docker rename` needs no exit event, so with
 # STUCK_CONTAINER_RENAME_ENABLED the container is moved aside as `stuck_<name>_<unix time>` — not a
-# rental prefix, so neither sweeper spends a `rm -f` on it every cycle — and the create goes on. The
-# container still holds its GPUs and ports until the node is restarted; the STUCK_CONTAINER event
-# (typed fields: node, container, new name, count in the window, repeat) is what tells the provider.
+# rental prefix, so neither sweeper spends a `rm -f` on it every cycle — and the create goes on
+# ONLY if the pod's GPUs are free: the wedged process usually sits inside the driver and keeps its
+# CUDA context, so nvidia-smi is read before `docker run` and the rent fails as
+# `stuck_container_holds_gpu` when one of the pod's cards has a live process or the DAH-2427 wedge
+# signature. Nothing here reaches a provider or reclaims the `stuck_*` container (it keeps its GPUs,
+# host ports and volume until someone removes it): the STUCK_CONTAINER event (typed fields: node,
+# container, new name, count in the window, repeat) is a validator log line for the loop to read.
 STUCK_CONTAINER_PREFIX = "stuck_"
 STUCK_CONTAINER_EVENT = "STUCK_CONTAINER"
 STUCK_CONTAINER_REPEAT_WINDOW_SECONDS = 24 * 60 * 60
+STUCK_CONTAINER_HOLDS_GPU_STEP = "stuck_container_holds_gpu"
+# Which card each live CUDA process sits on; `query_wedged_gpu_uuids` (DAH-2427) covers the
+# orphaned-load signature a dead process leaves, this covers the process that is still there.
+COMPUTE_APPS_BY_GPU_QUERY_COMMAND = "nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader"
+
+
+class StuckContainerHoldsGpu(Exception):
+    """After a stuck container was renamed aside, one of the pod's GPUs is not free — a live
+    process on it, the wedge signature, or nvidia-smi could not be read (fail closed: with the
+    flag off this rent would have failed at `container_cleanup` anyway)."""
+
+    def __init__(self, *, stuck_names: list[str], held_gpu_uuids: list[str], detail: str):
+        self.stuck_names = stuck_names
+        self.held_gpu_uuids = held_gpu_uuids
+        held = ", ".join(held_gpu_uuids) if held_gpu_uuids else "unknown (nvidia-smi could not be read)"
+        super().__init__(
+            f"{STUCK_CONTAINER_HOLDS_GPU_STEP}: a container this node cannot kill was renamed aside "
+            f"({', '.join(stuck_names)}) but the pod's GPUs are not free — held: {held}. {detail}"
+        )
+
+
+def _gpu_uuids_with_compute_apps(compute_apps_csv: str) -> set[str]:
+    """The `gpu_uuid` column of COMPUTE_APPS_BY_GPU_QUERY_COMMAND: cards with a live process."""
+    busy: set[str] = set()
+    for line in compute_apps_csv.strip().splitlines():
+        gpu_uuid = line.split(",")[0].strip()
+        if gpu_uuid.startswith("GPU-"):
+            busy.add(gpu_uuid)
+    return busy
 HOST_KEY_REQUIRED_EXTRA = {
     "ssh_host_key_missing": True,
     "docker_sdk_host_key_required": True,
@@ -2091,10 +2124,13 @@ class DockerService:
         active_container_names: list[str] | None = None,
         active_volume_names: list[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
+        pod_gpu_uuids: Sequence[str] | None = None,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+        ``pod_gpu_uuids``: the cards the pod is about to run on; read by the stuck-container
+        fallback, which refuses to go on when a renamed container still holds one of them.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
@@ -2144,7 +2180,12 @@ class DockerService:
                 await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             except Exception as exc:
                 if not await self._rename_stuck_containers_aside(
-                    ssh_client, default_extra, stale_containers, pod_name=pod_name, cause=exc
+                    ssh_client,
+                    default_extra,
+                    stale_containers,
+                    pod_name=pod_name,
+                    cause=exc,
+                    pod_gpu_uuids=pod_gpu_uuids,
                 ):
                     raise
 
@@ -2174,6 +2215,7 @@ class DockerService:
         *,
         pod_name: str,
         cause: Exception,
+        pod_gpu_uuids: Sequence[str] | None = None,
     ) -> bool:
         """Move aside the stale containers `docker rm -fv` could not kill; True when the names are free.
 
@@ -2185,6 +2227,10 @@ class DockerService:
         node marks the second inside STUCK_CONTAINER_REPEAT_WINDOW_SECONDS as ``repeat``. The
         listing and each rename are bounded like the pre-run probe: dockerd just failed a kill, and
         a hang here must not outlive the create's own budget.
+
+        Raises StuckContainerHoldsGpu after the renames when ``pod_gpu_uuids`` is given and one of
+        those cards is not free: the wedged process keeps its CUDA context, and a rent placed on
+        that card would be created and then fail in the renter's hands.
         """
         if not settings.STUCK_CONTAINER_RENAME_ENABLED or not _is_docker_could_not_kill_error(cause):
             return False
@@ -2201,6 +2247,7 @@ class DockerService:
         if listed.exit_status != 0:
             return False
         on_host = set((listed.stdout or "").split())
+        renamed: list[str] = []
         for name in (name for name in stale_containers if name in on_host):
             stuck_name = f"{STUCK_CONTAINER_PREFIX}{name}_{int(time.time())}"
             try:
@@ -2228,7 +2275,60 @@ class DockerService:
             await self._record_stuck_container(
                 default_extra, pod_name=pod_name, container_name=name, stuck_name=stuck_name, cause=cause
             )
+            renamed.append(stuck_name)
+        if renamed and pod_gpu_uuids:
+            await self._fail_if_stuck_containers_hold_gpus(
+                ssh_client, default_extra, stuck_names=renamed, pod_gpu_uuids=list(pod_gpu_uuids)
+            )
         return True
+
+    async def _fail_if_stuck_containers_hold_gpus(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        *,
+        stuck_names: list[str],
+        pod_gpu_uuids: list[str],
+    ) -> None:
+        """Read nvidia-smi once, before `docker run`: a pod GPU with a live process or the DAH-2427
+        wedge signature fails the rent as StuckContainerHoldsGpu, naming the cards. A read that
+        fails is the same failure with no card named (fail closed)."""
+        runner = SSHCommandRunner(ssh_client, max_retries=0)
+        compute_apps, wedged = await asyncio.gather(
+            runner.run(
+                COMPUTE_APPS_BY_GPU_QUERY_COMMAND, timeout=NVIDIA_SMI_QUERY_TIMEOUT_SECONDS, retryable=False
+            ),
+            query_wedged_gpu_uuids(runner),
+        )
+        if compute_apps.exit_code != 0:
+            detail = (
+                f"nvidia-smi exit {compute_apps.exit_code}: "
+                f"{compute_apps.error_message or (compute_apps.stderr or '').strip()}"
+            )
+            held: list[str] = []
+        else:
+            busy = _gpu_uuids_with_compute_apps(compute_apps.stdout or "")
+            held = sorted((busy | set(wedged)) & set(pod_gpu_uuids))
+            detail = (
+                f"live process on {sorted(busy & set(pod_gpu_uuids))}, wedge signature on "
+                f"{sorted(set(wedged) & set(pod_gpu_uuids))}"
+            )
+            if not held:
+                return
+        logger.error(
+            _m(
+                "Stuck container renamed aside but the pod's GPUs are not free; the rent fails",
+                extra=get_extra_info({
+                    **default_extra,
+                    "event": STUCK_CONTAINER_EVENT,
+                    "stuck_names": stuck_names,
+                    "pod_gpu_uuids": pod_gpu_uuids,
+                    "held_gpu_uuids": held,
+                    "nvidia_smi_read": compute_apps.exit_code == 0,
+                }),
+            )
+        )
+        raise StuckContainerHoldsGpu(stuck_names=stuck_names, held_gpu_uuids=held, detail=detail)
 
     async def _record_stuck_container(
         self,
@@ -5234,6 +5334,7 @@ class DockerService:
                     active_container_names=protected_container_names,
                     active_volume_names=payload.active_volume_names,
                     host_probe=docker_listing_probe,
+                    pod_gpu_uuids=payload.gpu_uuids,
                 )
                 if removed_containers:
                     docker_listing_probe = None
@@ -5965,6 +6066,9 @@ class DockerService:
         except Exception as e:
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
+            elif isinstance(e, StuckContainerHoldsGpu):
+                # the name was freed at container_cleanup; the rent stops because the card is not free
+                current_step = STUCK_CONTAINER_HOLDS_GPU_STEP
             log_text = _m(
                 "Failed create_container",
                 extra=get_extra_info({

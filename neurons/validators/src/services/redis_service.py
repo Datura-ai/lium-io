@@ -295,14 +295,15 @@ class RedisService:
     async def count_stuck_container(self, miner_hotkey: str, executor_id: str, window_seconds: int) -> int:
         """One more container on this node that had to be renamed aside; returns the count so far.
 
-        The window starts at the first one (the expiry is set only then), so the count is "stuck
-        containers on this node since the first inside the last ``window_seconds``".
+        The window starts at the first one, so the count is "stuck containers on this node since
+        the first inside the last ``window_seconds``". `SET NX EX` creates the key with its expiry
+        in one command before the `INCR`: a crash between an `INCR` and a later `EXPIRE` would
+        have left a key with no TTL, and the node would read `repeat` for ever.
         """
         key = self._stuck_container_count_key(miner_hotkey, executor_id)
         async with self.lock:
+            await self.redis.set(key, 0, ex=window_seconds, nx=True)
             count = int(await self.redis.incr(key))
-            if count == 1:
-                await self.redis.expire(key, window_seconds)
         return count
 
     async def set(self, key: str, value: str, ex: int | None = None):

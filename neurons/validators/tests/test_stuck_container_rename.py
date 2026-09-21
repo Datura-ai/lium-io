@@ -15,13 +15,17 @@ import logging
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeRedis
 from payload_models.payloads import ContainerCreated, FailedContainerRequest
 from services.docker_service import (
     _PRERUN_HOST_PROBE_TIMEOUT_SECONDS,
     STUCK_CONTAINER_EVENT,
+    STUCK_CONTAINER_HOLDS_GPU_STEP,
     STUCK_CONTAINER_PREFIX,
     STUCK_CONTAINER_REPEAT_WINDOW_SECONDS,
     DockerService,
+    _gpu_uuids_with_compute_apps,
 )
 from services.redis_service import RedisService
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
@@ -51,9 +55,22 @@ def rename_flag(monkeypatch):
 class _Host:
     """An ssh mock answering `docker ps -a` and `docker rename` like a node holding ``stale``."""
 
-    def __init__(self, stale: list[str], *, rename_exit: int = 0):
+    def __init__(
+        self,
+        stale: list[str],
+        *,
+        rename_exit: int = 0,
+        compute_apps: str = "",
+        gpu_query: str = "GPU-test, 0, 0\n",
+        nvidia_smi_exit: int = 0,
+    ):
         self.names = list(stale)
         self.rename_exit = rename_exit
+        # nvidia-smi as the node answers it after the rename: `--query-compute-apps=gpu_uuid,pid`
+        # (a live CUDA process per card) and `--query-gpu=uuid,utilization.gpu,memory.used`
+        self.compute_apps = compute_apps
+        self.gpu_query = gpu_query
+        self.nvidia_smi_exit = nvidia_smi_exit
         self.commands: list[str] = []
         self.timeouts: list[float | None] = []
         self.client = AsyncMock()
@@ -64,6 +81,12 @@ class _Host:
     async def _run(self, cmd, *args, **kwargs):
         self.commands.append(cmd)
         self.timeouts.append(kwargs.get("timeout"))
+        if cmd.startswith("nvidia-smi --query-compute-apps=gpu_uuid"):
+            return _ssh_result(exit_status=self.nvidia_smi_exit, stdout=self.compute_apps, stderr="nvidia-smi failed" if self.nvidia_smi_exit else "")
+        if cmd.startswith("nvidia-smi --query-compute-apps=pid"):
+            return _ssh_result(stdout="".join(f"{line.split(',')[1].strip()}\n" for line in self.compute_apps.strip().splitlines()))
+        if cmd.startswith("nvidia-smi --query-gpu"):
+            return _ssh_result(stdout=self.gpu_query)
         if cmd.startswith("/usr/bin/docker ps -a"):
             return _ssh_result(stdout="".join(f"{n}\n" for n in self.names))
         if cmd.startswith("/usr/bin/docker rename"):
@@ -150,6 +173,79 @@ async def test_unkillable_stale_container_is_renamed_aside_and_the_create_succee
     svc.redis_service.count_stuck_container.assert_awaited_once_with(
         payload.miner_hotkey, payload.executor_id, STUCK_CONTAINER_REPEAT_WINDOW_SECONDS
     )
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_container_that_still_holds_a_pod_gpu_fails_the_rent_before_docker_run(
+    svc, monkeypatch, rename_flag, caplog
+):
+    # the wedged process keeps its CUDA context: nvidia-smi still lists it on the pod's card
+    host = _Host(["filler_old"], compute_apps="GPU-test, 4242\n")
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    payload, result = await _create(svc, host, monkeypatch)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == STUCK_CONTAINER_HOLDS_GPU_STEP == "stuck_container_holds_gpu"
+    assert "GPU-test" in result.detail and "stuck_filler_old_" in result.detail
+    assert "the pod's GPUs are not free" in result.detail
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    # the name is still freed and the node still gets its event: the rename is what happened
+    assert len(host.renames) == 1 and "filler_old" not in host.names
+    (event, hold) = _events(caplog)
+    assert event["container_name"] == "filler_old"
+    assert hold["held_gpu_uuids"] == ["GPU-test"] and hold["nvidia_smi_read"] is True
+    assert hold["stuck_names"] == [event["stuck_name"]]
+
+
+@pytest.mark.asyncio
+async def test_the_wedge_signature_on_a_pod_gpu_fails_the_rent_too(svc, monkeypatch, rename_flag, caplog):
+    # no process left, but the DAH-2427 latch: 100 % utilization, no memory
+    host = _Host(["filler_old"], gpu_query="GPU-test, 100, 0\n")
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "stuck_container_holds_gpu"
+    assert "GPU-test" in result.detail
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_live_process_on_another_card_lets_the_rent_go_on(svc, monkeypatch, rename_flag, caplog):
+    host = _Host(["filler_old"], compute_apps="GPU-other, 4242\n", gpu_query="GPU-test, 0, 0\nGPU-other, 100, 0\n")
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch)
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    assert len(_events(caplog)) == 1  # the rename; no hold
+
+
+@pytest.mark.asyncio
+async def test_an_nvidia_smi_that_cannot_be_read_fails_the_rent_closed(svc, monkeypatch, rename_flag, caplog):
+    host = _Host(["filler_old"], nvidia_smi_exit=1)
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "stuck_container_holds_gpu"
+    assert "nvidia-smi could not be read" in result.detail
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    (_, hold) = _events(caplog)
+    assert hold["held_gpu_uuids"] == [] and hold["nvidia_smi_read"] is False
+
+
+def test_the_gpu_uuid_column_of_the_compute_apps_query_is_read():
+    assert _gpu_uuids_with_compute_apps("GPU-a, 11\nGPU-a, 12\nGPU-b, 13\n\n[N/A], 14\n") == {"GPU-a", "GPU-b"}
+    assert _gpu_uuids_with_compute_apps("") == set()
 
 
 @pytest.mark.asyncio
@@ -259,24 +355,15 @@ async def test_only_the_containers_still_on_the_host_are_renamed(svc, monkeypatc
     assert [e["container_name"] for e in _events(caplog)] == ["filler_old"]
 
 
-class _FakeRedis:
-    def __init__(self):
-        self.values: dict[str, int] = {}
-        self.expires: list[tuple[str, int]] = []
-
-    async def incr(self, key):
-        self.values[key] = self.values.get(key, 0) + 1
-        return self.values[key]
-
-    async def expire(self, key, seconds):
-        self.expires.append((key, seconds))
-        return True
-
-
 def _redis_service_with_fake_store() -> RedisService:
+    # a real Redis semantics stand-in: `SET NX EX` + `INCR` + `TTL` behave as on the server
     service = RedisService()
-    service.redis = _FakeRedis()
+    service.redis = FakeRedis(server=FakeServer())
     return service
+
+
+async def _ttls(redis: FakeRedis) -> dict[str, int]:
+    return {key.decode(): await redis.ttl(key) for key in await redis.keys("*")}
 
 
 @pytest.mark.asyncio
@@ -310,8 +397,9 @@ async def test_second_stuck_container_on_the_node_inside_the_window_is_a_repeat(
         ("executor-2", "filler_b", 1, False),
     ]
     assert all(e["window_seconds"] == STUCK_CONTAINER_REPEAT_WINDOW_SECONDS for e in events)
-    # the window is set once per node, at the first stuck container
-    assert [seconds for _, seconds in svc.redis_service.redis.expires] == [STUCK_CONTAINER_REPEAT_WINDOW_SECONDS] * 2
+    # one key per node, each carrying the window it was created with (SET NX EX, then INCR)
+    ttls = await _ttls(svc.redis_service.redis)
+    assert len(ttls) == 2 and all(0 < ttl <= STUCK_CONTAINER_REPEAT_WINDOW_SECONDS for ttl in ttls.values())
     assert other_node.names[0].startswith(f"{STUCK_CONTAINER_PREFIX}filler_b_")
 
 
@@ -343,5 +431,7 @@ async def test_count_stuck_container_starts_the_window_at_the_first_one_only():
     other_node = await service.count_stuck_container("miner", "executor-2", 100)
 
     assert (first, second, other_node) == (1, 2, 1)
-    assert [seconds for _, seconds in service.redis.expires] == [100, 100]
-    assert len({key for key, _ in service.redis.expires}) == 2
+    ttls = await _ttls(service.redis)
+    assert len(ttls) == 2 and all(0 < ttl <= 100 for ttl in ttls.values())
+    # the key is created with its expiry in one command, so no INCR can leave it without a TTL
+    assert all(ttl != -1 for ttl in ttls.values())
