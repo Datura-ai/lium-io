@@ -30,7 +30,10 @@ class SysboxRequiredCheck:
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
         if not ctx.state.sysbox_runtime and not is_rented:
-            what: dict = {"sysbox_runtime": ctx.state.sysbox_runtime, "is_rented": is_rented}
+            what: dict[str, bool | str] = {
+                "sysbox_runtime": ctx.state.sysbox_runtime,
+                "is_rented": is_rented,
+            }
             remediation = None
             if ctx.state.dind_probe_error:
                 # DAH-2856: the probe's container came up but its sshd never answered, so no sysbox

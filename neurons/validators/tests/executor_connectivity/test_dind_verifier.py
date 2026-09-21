@@ -413,7 +413,8 @@ NFT_HOST_DOCKERD_LOG = (
 
 
 def test_diagnose_dind_log_names_the_iptables_cause_and_quotes_dockerd():
-    code, words = diagnose_dind_log(NFT_HOST_DOCKERD_LOG)
+    cause = diagnose_dind_log(NFT_HOST_DOCKERD_LOG)
+    code, words = cause.code, cause.message
     assert code == "DIND_INNER_DOCKERD_IPTABLES"
     assert "nf_tables" in words and "modprobe" in words
     # the provider sees dockerd's own line, not only the validator's reading of it
@@ -423,18 +424,19 @@ def test_diagnose_dind_log_names_the_iptables_cause_and_quotes_dockerd():
 
 
 def test_diagnose_dind_log_generic_when_nothing_matches():
-    code, words = diagnose_dind_log("")
-    assert code == "DIND_SSHD_NOT_READY" and "no dockerd error" in words
-    assert diagnose_dind_log(None)[0] == "DIND_SSHD_NOT_READY"
-    code, words = diagnose_dind_log("failed to start daemon: something else")
-    assert code == "DIND_INNER_DOCKERD_DOWN" and "dockerd said: failed to start daemon: something else" in words
+    cause = diagnose_dind_log("")
+    assert cause.code == "DIND_SSHD_NOT_READY" and "no dockerd error" in cause.message
+    assert diagnose_dind_log(None).code == "DIND_SSHD_NOT_READY"
+    cause = diagnose_dind_log("failed to start daemon: something else")
+    assert cause.code == "DIND_INNER_DOCKERD_DOWN"
+    assert "dockerd said: failed to start daemon: something else" in cause.message
 
 
 def test_diagnose_dind_log_caps_the_quoted_line_head_first():
-    code, words = diagnose_dind_log("failed to start daemon: " + "x" * 2000)
-    assert code == "DIND_INNER_DOCKERD_DOWN"
-    assert "dockerd said: failed to start daemon: xxx" in words
-    assert len(words) < 500
+    cause = diagnose_dind_log("failed to start daemon: " + "x" * 2000)
+    assert cause.code == "DIND_INNER_DOCKERD_DOWN"
+    assert "dockerd said: failed to start daemon: xxx" in cause.message
+    assert len(cause.message) < 500
 
 
 @pytest.mark.asyncio
@@ -463,6 +465,31 @@ async def test_dind_verifier_reads_the_container_log_before_removing_it(mocker):
     assert logs_index < remove_index
     assert "container_miner_9000" in commands[logs_index]
     assert "/var/log/dockerd.err.log" in commands[logs_index]
+
+
+@pytest.mark.asyncio
+async def test_dind_verifier_no_diagnosis_when_sysbox_was_not_requested(mocker):
+    """Rustam's review (21 Sep): without sysbox the probe runs plain runc, where the inner dockerd
+    fails by design, so its log names no host fault. The cause is read only when sysbox was
+    requested; otherwise the result carries no error and nothing tells the provider to fix a host."""
+    port = PortPair(9000, 9000)
+    verifier, ssh_client = _build_started_dind(mocker, container_log=NFT_HOST_DOCKERD_LOG)
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_READY_TIMEOUT_SECONDS", 0.05)
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_POLL_INTERVAL_SECONDS", 0.01)
+    mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect",
+        new=mocker.AsyncMock(side_effect=ConnectionRefusedError("[Errno 111] Connect call failed")),
+    )
+
+    result = await verifier.verify(
+        port, ssh_client=ssh_client, host="127.0.0.1", container_name_prefix="container_miner", sysbox=False
+    )
+
+    assert result.success is False
+    assert result.error is None
+    commands = [call.args[0] for call in ssh_client.run.await_args_list]
+    assert not any("docker logs" in c for c in commands)
+    assert any("docker rm -fv" in c for c in commands)
 
 
 @pytest.mark.asyncio
