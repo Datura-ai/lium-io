@@ -12,7 +12,6 @@ import threading
 
 import pytest
 from services.rental_docker_sdk import (
-    DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
@@ -38,10 +37,6 @@ class HangingPullApiClient(PullApiClient):
 
     def close(self):
         self.closed = True
-
-
-def test_default_pull_deadline_is_one_hour():
-    assert DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS == ONE_HOUR_SECONDS
 
 
 def test_client_factory_and_docker_service_use_the_one_hour_deadline():
