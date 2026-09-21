@@ -36,8 +36,8 @@ APP_DIR = DSTACKTEE_DIR / "app"
 APPROVED_RUNNER_IMAGE_DIGEST = (
     "sha256:8c07d3a91f8900bd3f0e19025fb7a2c32f82577385550187b28c7769060d18b7"
 )
-# The day that runner image was pushed to Docker Hub (const.py, DAH-2861). The runner is not rebuilt
-# per executor release, so the digest is older than the tag whose notes carry it; the notes say so,
+# The day that runner image was pushed to Docker Hub (const.py, DAH-2861). The approved digest does
+# not change per release, so the digest is older than the tag whose notes carry it; the notes say so,
 # or a provider reads it as this release's runner.
 APPROVED_RUNNER_IMAGE_PUSHED = "2026-08-19"
 
@@ -53,14 +53,14 @@ RELEASE_NOTES_HEADING = "## CVM attestation"
 def measured_app_compose(env: str = "prod", digest: str = APPROVED_RUNNER_IMAGE_DIGEST) -> str:
     """app-compose.json as `lium-cvm.sh new` writes it with default flags (--local-key-provider,
     no --enable-logs, no --enable-sysinfo) after stamping `digest` into the compose file."""
-    compose = (
+    compose_with_runner_digest = (
         (APP_DIR / COMPOSE_FILES[env])
         .read_text(encoding="utf-8")
         .replace(DIGEST_PLACEHOLDER, digest)
     )
     return app_compose_json(
         build_app_compose(
-            compose,
+            compose_with_runner_digest,
             local_key_provider=True,
             enable_logs=False,
             enable_sysinfo=False,
@@ -78,8 +78,8 @@ def release_notes_section(env: str = "prod", digest: str = APPROVED_RUNNER_IMAGE
     """The section a provider copies from: the digest for .env and the hash to check after `new`."""
     if digest == APPROVED_RUNNER_IMAGE_DIGEST:
         digest_note = (
-            f"the runner image pushed {APPROVED_RUNNER_IMAGE_PUSHED}; the runner is not rebuilt per "
-            "executor release, so this digest is older than the release and still the approved one"
+            f"the runner image pushed {APPROVED_RUNNER_IMAGE_PUSHED}; the approved digest does not change "
+            "per release, so this digest is older than the release and still the approved one"
         )
     else:
         digest_note = (

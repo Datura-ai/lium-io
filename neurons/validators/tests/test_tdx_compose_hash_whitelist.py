@@ -2,7 +2,7 @@
 
 Regression (DAH-3602): lium-io#1339 edited app/init_script.sh, one of the three files dstack measures
 into compose_hash, without adding the new hash to TDX_WHITELIST. CI stayed green and every CVM created
-from executor-v1.128 to v1.130 scored zero. These tests rebuild the hash the way `lium-cvm.sh new`
+from executor-v1.128 to v1.130 would score zero with the whitelist on. These tests rebuild the hash the way `lium-cvm.sh new`
 does (scripts/compose_hash.py, same builder as dstack.py) and fail the PR that moves it without
 whitelisting it.
 """

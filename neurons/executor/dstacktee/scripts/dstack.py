@@ -16,7 +16,7 @@ import host_api
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, TypedDict
 from functools import reduce
 
 logging.basicConfig(
@@ -58,6 +58,24 @@ def merge_dicts(*dicts):
     return reduce(merge2, dicts, {})
 
 
+class AppCompose(TypedDict, total=False):
+    """The keys of app-compose.json; dstack measures the whole file into compose_hash."""
+
+    manifest_version: int
+    name: str
+    version: str
+    features: list[str]
+    runner: str
+    docker_compose_file: str
+    local_key_provider_enabled: bool
+    public_logs: bool
+    secure_time: bool
+    public_sysinfo: bool
+    public_tcbinfo: bool
+    init_script: str
+    pre_launch_script: str
+
+
 def build_app_compose(
     compose_content: str,
     *,
@@ -66,14 +84,14 @@ def build_app_compose(
     enable_sysinfo: bool,
     init_script: Optional[str] = None,
     pre_launch_script: Optional[str] = None,
-) -> dict:
+) -> AppCompose:
     """The app-compose.json document dstack measures into compose_hash (RTMR3).
 
     Kept as one pure function so the validator's whitelist test and the release-notes step
     (scripts/compose_hash.py) rebuild exactly what `new` writes: every key, its order and its
     default is part of the measurement, so a change here moves the hash of every CVM.
     """
-    app_compose = {
+    app_compose: AppCompose = {
         "manifest_version": 1,
         "name": "example",
         "version": "1.0.0",
@@ -94,7 +112,7 @@ def build_app_compose(
     return app_compose
 
 
-def app_compose_json(app_compose: dict) -> str:
+def app_compose_json(app_compose: AppCompose) -> str:
     """The exact bytes written to shared/app-compose.json; compose_hash is their sha256."""
     return json.dumps(app_compose, indent=4)
 
