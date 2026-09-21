@@ -12,7 +12,7 @@ synthesis next to it); the last tests drive the REST path end to end, so the emp
 and the result list are checked where the cycle reads them.
 """
 
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
@@ -32,6 +32,7 @@ from services.task.availability import (
     silence_availability_errors_on_our_own_outage,
 )
 from tests.test_express_lane import _cycle_inputs, _executor_info, _job_result
+from tests.test_verification_started_report import _accepted, _FakeMinerClient
 
 MINER_HOTKEY = "5MinerHotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 OTHER_MINER_HOTKEY = "5OtherMinerHotkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
@@ -288,6 +289,23 @@ async def test_a_miner_whose_only_rented_node_is_down_gets_a_row_for_the_node_no
     rented_data = RentedExecutorsResponse(executors={MISSING: rented()})
 
     out = await request(rest_service, rented_data)
+
+    assert [r.executor_info.uuid for r in out["results"]] == [MISSING]
+    assert out["results"][0].failure_reason_code == "RENTED_EXECUTOR_NOT_LISTED"
+
+
+@pytest.mark.asyncio
+async def test_websocket_path_zero_executors_falls_through_to_the_rented_node_row(
+    rest_service, flag_on, monkeypatch
+):
+    """The same fall-through on the WebSocket path, the default transport."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "USE_REST_API", False)
+    rented_data = RentedExecutorsResponse(executors={MISSING: rented()})
+
+    with patch("services.miner_service.MinerClient", return_value=_FakeMinerClient(_accepted())):
+        out = await request(rest_service, rented_data)
 
     assert [r.executor_info.uuid for r in out["results"]] == [MISSING]
     assert out["results"][0].failure_reason_code == "RENTED_EXECUTOR_NOT_LISTED"
