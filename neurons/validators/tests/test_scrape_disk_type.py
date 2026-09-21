@@ -451,8 +451,16 @@ def test_a_bare_metal_host_keeps_reading_its_rotational_flag(
     assert scrape["disk_type_of"]("sda1") == expected
 
 
-def test_an_unreadable_dmi_directory_reads_as_bare_metal(scrape: dict[str, Any]) -> None:
-    # the fixture points the DMI and hypervisor paths at nothing: no tell, no VM verdict
+def test_an_unreadable_dmi_directory_reads_as_bare_metal(
+    scrape: dict[str, Any], tmp_path: Path
+) -> None:
+    # Arrange — the firmware names a hypervisor, so the host reads as a VM; then the DMI directory
+    # is pointed at a path that does not exist (a container without /sys/class/dmi): the tell is
+    # gone, the verdict drops to bare metal and nothing raises
+    fake_dmi(tmp_path, "QEMU", "Standard PC (Q35 + ICH9, 2009)")
+    assert scrape["host_is_a_virtual_machine"]() is True
+
+    scrape["SYS_DMI_ID_PATH"] = str(tmp_path / "no-such-dmi")
     assert scrape["host_is_a_virtual_machine"]() is False
 
 
