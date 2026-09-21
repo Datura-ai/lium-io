@@ -27,13 +27,17 @@ DEFAULT_PRICE = DefaultPrice()
 # in packages/lium-core and the backend's MACHINE_PRICES move the Server Edition to 1.0), so the
 # validator pins the two editions to parity here; the override can go once the validator's lock
 # carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
-# the pinned lium-core still has 5.10).
+# the pinned lium-core still has 5.10). `NVIDIA B300 SXM6 PC` is the same module under the second
+# name its driver reports (288 GB HBM3e, the same class for a renter and for the caps below); it is
+# pinned to the AC entry so the two names are one price, and the row goes once the pinned lium-core
+# carries it.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
+    "NVIDIA B300 SXM6 PC": 6.4,
 }
 
 
@@ -169,6 +173,7 @@ GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
 
 BASE_GPU_MAP = {
     "NVIDIA B300 SXM6 AC": "B300",
+    "NVIDIA B300 SXM6 PC": "B300",
     "NVIDIA B200": "B200",
     "NVIDIA H200": "H200",
     "NVIDIA H200 NVL": "H200",

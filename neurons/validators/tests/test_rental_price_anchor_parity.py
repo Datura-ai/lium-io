@@ -44,9 +44,11 @@ def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
 def test_overrides_change_only_the_server_edition_and_b300_entries():
     """Guards a hand-edit of `RENTAL_PRICES_PER_HOUR` that adds, drops or re-prices another GPU — the
     algorithm asserts every key is in BASE_GPU_MAP, and any other override belongs in lium-core.
-    B300 is pinned at 6.40 by DAH-3542."""
+    B300 is pinned at 6.40 by DAH-3542. `NVIDIA B300 SXM6 PC` is the one key the pin may ADD: the
+    same card's second driver name, in the lium-core source table but not yet in the release the
+    lock installs — the union is a no-op once the lock carries a release with the row."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
-    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys()
+    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC"}
     differing = {gpu for gpu in upstream if RENTAL_PRICES_PER_HOUR[gpu] != upstream[gpu]}
-    assert differing <= {SERVER, "NVIDIA B300 SXM6 AC"}
+    assert differing <= {SERVER, "NVIDIA B300 SXM6 AC", "NVIDIA B300 SXM6 PC"}

@@ -2,6 +2,8 @@ MIN_JOB_TAKEN_TIME = 20
 
 GPU_MODEL_RATES = {
     "NVIDIA B300 SXM6 AC": .05,
+    # the same module under the second name its driver reports; one class, one rate
+    "NVIDIA B300 SXM6 PC": .05,
     "NVIDIA B200": .05,
     "NVIDIA H200": .56,
     "NVIDIA H200 NVL": .49,

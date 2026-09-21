@@ -3,6 +3,8 @@ from lium_core.shared_config.model import SharedConfig
 DEFAULT_SHARED_CONFIG = SharedConfig(
     machine_prices={
         "NVIDIA B300 SXM6 AC": 6.4,
+        # the same module under the second name its driver reports; one class, one price
+        "NVIDIA B300 SXM6 PC": 6.4,
         "NVIDIA B200": 4.25,
         "NVIDIA H200": 2.85,
         "NVIDIA H200 NVL": 2.90,
@@ -36,6 +38,7 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
     },
     required_deposit_amount={
         "NVIDIA B300 SXM6 AC": 0.274,
+        "NVIDIA B300 SXM6 PC": 0.274,
         "NVIDIA B200": 0.223,
         "NVIDIA H200": 0.158,
         "NVIDIA H200 NVL": 0.131,

@@ -62,6 +62,7 @@ VRAM_CEIL_RATIO = 1.05
 GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Blackwell data-center
     "NVIDIA B300 SXM6 AC":                                [294912],        # 288 GB; observed: 275040
+    "NVIDIA B300 SXM6 PC":                                [294912],        # 288 GB; the AC module under its second driver name
     "NVIDIA B200":                                        [196608],        # 192 GB; observed: 183359 (49140 ~48GB outlier rejected)
     # Hopper data-center
     "NVIDIA H200":                                        [144384],        # 141 GB; observed: 143771

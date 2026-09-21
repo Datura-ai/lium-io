@@ -233,6 +233,7 @@ def test_get_expected_vram_windows_from_sizes():
 # exact values for every model, proving no pre-check value or range changed.
 _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA B300 SXM6 AC": [(265421, 309658)],
+    "NVIDIA B300 SXM6 PC": [(265421, 309658)],
     "NVIDIA B200": [(176947, 206438)],
     "NVIDIA H200": [(129946, 151603)],
     "NVIDIA H200 NVL": [(129946, 151603)],
