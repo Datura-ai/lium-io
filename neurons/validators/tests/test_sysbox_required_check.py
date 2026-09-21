@@ -78,7 +78,11 @@ async def test_no_sysbox_with_dind_probe_error_names_the_cause(context_factory):
     """DAH-2856: when the probe's container never answered on sshd, the verdict says why instead of
     "install sysbox" (ticket-0309: three reinstalls on a host whose inner dockerd could not use
     legacy iptables). Scoring is unchanged: still a failed check."""
-    cause = DindLogCause("DIND_INNER_DOCKERD_IPTABLES", "the inner dockerd cannot use legacy iptables")
+    cause = DindLogCause(
+        "DIND_INNER_DOCKERD_IPTABLES",
+        "the inner dockerd cannot use legacy iptables. dockerd said: can't initialize iptables table `nat'",
+        dockerd_line="can't initialize iptables table `nat'",
+    )
     ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
 
     result = await SysboxRequiredCheck().run(ctx)
@@ -89,6 +93,38 @@ async def test_no_sysbox_with_dind_probe_error_names_the_cause(context_factory):
     assert cause.text in result.event.remediation
     assert "reinstalling sysbox does not change it" in result.event.remediation
     assert "Install the sysbox runtime" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_inner_dockerd_down_with_dockerd_line_says_sysbox_is_not_the_fix(context_factory):
+    """DIND_INNER_DOCKERD_DOWN with dockerd's own line read from the log: the fix is on the host."""
+    cause = DindLogCause(
+        "DIND_INNER_DOCKERD_DOWN",
+        "the inner dockerd did not start. dockerd said: failed to start daemon: no space left on device",
+        dockerd_line="failed to start daemon: no space left on device",
+    )
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert cause.text in result.event.remediation
+    assert "reinstalling sysbox does not change it" in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_inner_dockerd_down_without_dockerd_line_keeps_the_generic_guidance(context_factory):
+    """DIND_INNER_DOCKERD_DOWN with no line read names the symptom only: the verdict must not claim
+    sysbox is irrelevant, because an inner dockerd that never started can be a sysbox fault too."""
+    cause = DindLogCause("DIND_INNER_DOCKERD_DOWN", "the inner dockerd did not start")
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["dind_probe_error"] == cause.text
+    assert cause.text in result.event.remediation
+    assert "reinstalling sysbox" not in result.event.remediation
 
 
 @pytest.mark.asyncio

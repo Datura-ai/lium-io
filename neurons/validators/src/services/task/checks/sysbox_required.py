@@ -43,7 +43,9 @@ class SysboxRequiredCheck:
                 # "install sysbox", which sent ticket-0309's provider through three reinstalls.
                 what["dind_probe_error"] = cause.text
                 remediation = f"The sysbox check could not run: {cause.text}."
-                if cause.code in DIND_INNER_DOCKERD_CODES:
+                # "not sysbox" is said only when dockerd's own line was read: an inner-dockerd code
+                # with no line names the symptom, not the cause, so the generic guidance stays.
+                if cause.code in DIND_INNER_DOCKERD_CODES and cause.dockerd_line:
                     remediation += " Fix that on the host first; reinstalling sysbox does not change it."
             event = render_message(
                 Msg.SYSBOX_MISSING,

@@ -22,6 +22,9 @@ class DindLogCause:
 
     code: str
     message: str
+    # dockerd's own line when the cause was read from the container log. None when the code was
+    # named without one, so the event must not claim the fix is on the host and not in sysbox.
+    dockerd_line: str | None = None
 
     @property
     def text(self) -> str:

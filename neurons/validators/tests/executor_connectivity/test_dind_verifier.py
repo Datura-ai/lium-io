@@ -426,15 +426,19 @@ def test_diagnose_dind_log_names_the_iptables_cause_and_quotes_dockerd():
     assert "dockerd said: failed to start daemon" in words
     assert "Table does not exist (do you need to insmod?)" in words  # the whole 333-char line survives the cap
     assert "\n" not in words
+    # the read line travels on its own too, so the sysbox verdict knows the cause was measured
+    assert cause.dockerd_line and cause.dockerd_line.startswith("failed to start daemon")
 
 
 def test_diagnose_dind_log_generic_when_nothing_matches():
     cause = diagnose_dind_log("")
     assert cause.code == "DIND_SSHD_NOT_READY" and "no dockerd error" in cause.message
+    assert cause.dockerd_line is None
     assert diagnose_dind_log(None).code == "DIND_SSHD_NOT_READY"
     cause = diagnose_dind_log("failed to start daemon: something else")
     assert cause.code == "DIND_INNER_DOCKERD_DOWN"
     assert "dockerd said: failed to start daemon: something else" in cause.message
+    assert cause.dockerd_line == "failed to start daemon: something else"
 
 
 def test_diagnose_dind_log_caps_the_quoted_line_head_first():

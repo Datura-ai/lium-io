@@ -80,7 +80,7 @@ def diagnose_dind_log(log_text: str | None) -> DindLogCause:
             line = next((ln for ln in text.splitlines() if pattern in ln), "")
             line = line.strip()[:DIND_LOG_LINE_MAX_CHARS]
             if line:
-                return DindLogCause(cause.code, f"{cause.message}. dockerd said: {line}")
+                return DindLogCause(cause.code, f"{cause.message}. dockerd said: {line}", dockerd_line=line)
             return cause
     return DIND_SSHD_NOT_READY
 
