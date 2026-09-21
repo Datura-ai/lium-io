@@ -515,21 +515,56 @@ class ImageExitedDuringKeyInjection(Exception):
     """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
 
 
+class ImageExitedDuringBootstrap(Exception):
+    """A later bootstrap step (`ssh_bootstrap`, `set_environment`) found the container gone because
+    the image's own command ended — not a kill, so not `killed_during_bootstrap`: the step keeps its
+    name and no KILLED_DURING_BOOTSTRAP event is written. Same DAH-3678 text as the key step."""
+
+
+def _image_exited_explanation(*, image: str, state: ContainerStateSnapshot, during: str, cause: Exception) -> str:
+    """The renter-facing DAH-2624/3678 text: the image has no long-running command. The backend
+    picks its "no long-running process" message from the `is not running` / `is restarting` /
+    `status='…'` markers in here, so both bootstrap steps must say it the same way."""
+    if state.running:
+        # Docker's restart policy already brought it back; the exec landed in the gap.
+        situation = f"Docker is restarting it ({state.describe()})"
+    else:
+        situation = f"the container is not running ({state.describe()})"
+    return (
+        f"image {image!r} has no long-running command — its default command exited right after start "
+        f"(exit_code={state.exit_code!r}) and {situation} while {during}; a pod needs a long-running "
+        f"process, for example a start command such as `sleep infinity`. Exec error: {cause}"
+    )
+
+
 KILLED_DURING_BOOTSTRAP_STEP = "killed_during_bootstrap"
 KILLED_DURING_BOOTSTRAP_EVENT = "KILLED_DURING_BOOTSTRAP"
+CONTAINER_GONE_KILL_CAUSES = frozenset({"oom", "killed", "removed"})
+
+
+def container_gone_cause(state: ContainerStateSnapshot | None) -> str:
+    """Why a container the bootstrap found gone is gone, from the State read when it was first seen so:
+    `oom` (State.OOMKilled), `killed` (exit 137 without OOM: a SIGKILL — `docker rm -f` / `docker kill`
+    on the node), `removed` (already gone, or `removing` without an exit code we can name) — the three
+    kills — or `exited`: its own command ended, which is the image's doing and not a kill."""
+    if state is None or (state.status == "removing" and not state.killed_by_host):
+        return "removed"
+    if state.oom_killed:
+        return "oom"
+    if state.exit_code == 137:
+        return "killed"
+    return "exited"
 
 
 class ContainerKilledDuringBootstrap(Exception):
-    """The container `docker run` started was gone before the bootstrap finished, and no delete of
+    """The container `docker run` started was killed before the bootstrap finished, and no delete of
     ours was in flight (that case is _CreateCancelledByDelete).
 
     19 Sep, one node, one hour, 3 rents: `Docker container is not ready for exec: status='removing'
     exit_code=137`, then `exec start: Conflict ("container is not running")` and `inspect: No such
     container` — each read as a generic `ssh_bootstrap` / `set_environment` failure, so the renter
-    saw an exec error and nothing counted the kill. The State is read at the moment the container is
-    first seen gone (the next inspect may find nothing): ``cause`` is `oom` (State.OOMKilled), `killed`
-    (exit 137 without OOM: a SIGKILL — `docker rm -f` / `docker kill` on the node), `removed` (already
-    gone, or `removing` without an exit code we can name), or `exited` (its own command ended).
+    saw an exec error and nothing counted the kill. ``cause`` is one of CONTAINER_GONE_KILL_CAUSES
+    (see container_gone_cause); an image's own exit is ImageExitedDuringBootstrap, never this.
     """
 
     def __init__(
@@ -545,14 +580,9 @@ class ContainerKilledDuringBootstrap(Exception):
         self.status = state.status if state else None
         self.exit_code = state.exit_code if state else None
         self.oom_killed = bool(state.oom_killed) if state else False
-        if state is None or (state.status == "removing" and not state.killed_by_host):
-            self.cause = "removed"
-        elif state.oom_killed:
-            self.cause = "oom"
-        elif state.exit_code == 137:
-            self.cause = "killed"
-        else:
-            self.cause = "exited"
+        self.cause = container_gone_cause(state)
+        if self.cause not in CONTAINER_GONE_KILL_CAUSES:
+            raise ValueError(f"not a kill: cause={self.cause!r} ({state.describe() if state else None})")
         super().__init__(
             f"{KILLED_DURING_BOOTSTRAP_STEP}: {self._sentence()} during {bootstrap_step} "
             f"(cause={self.cause} oom_killed={str(self.oom_killed).lower()} exit_code={self.exit_code!r} "
@@ -560,14 +590,13 @@ class ContainerKilledDuringBootstrap(Exception):
         )
 
     def _sentence(self) -> str:
-        # Renter-facing text: the backend shows the sentence before the parenthesis.
+        # Renter-facing text once the backend shows failure_step first; until then the renter's text
+        # is unchanged (the backend picks its message from `detail`).
         if self.cause == "oom":
             return "the container was stopped by the node before it was ready: it ran out of memory"
         if self.cause == "killed":
             return "the container was stopped by the node before it was ready: it was killed"
-        if self.cause == "removed":
-            return "the container was stopped by the node before it was ready: it was removed"
-        return "the container stopped before it was ready: its command exited"
+        return "the container was stopped by the node before it was ready: it was removed"
 
 
 async def _explain_add_public_keys_failure(
@@ -586,34 +615,34 @@ async def _explain_add_public_keys_failure(
     failures whose exec happened to hit Docker's 409 or the readiness poll carried one; an exec that
     the exit itself killed (non-zero exit_status, empty stderr) read as the generic step failure —
     6 of 8 on 19 Sep for one renter's `nvidia/cuda` templates. Every failure of the step now looks
-    at the container, which cleanup has not removed yet.
+    at the container, which cleanup has not removed yet — through the State a ContainerGoneBeforeExec
+    already carries when it has one (a second inspect can 404 on a container being removed and would
+    turn an own-exit at the key step into a kill).
     """
-    try:
-        state = await docker_client.inspect_container_state(container_name=container_name)
-    except Exception as inspect_exc:
-        logger.warning(
-            _m(
-                "Could not inspect the container after a failed SSH-key injection",
-                extra=get_extra_info({
-                    **log_extra,
-                    "container_name": container_name,
-                    "error": str(inspect_exc),
-                }),
+    if isinstance(cause, ContainerGoneBeforeExec) and cause.state is not None:
+        state = cause.state
+    else:
+        try:
+            state = await docker_client.inspect_container_state(container_name=container_name)
+        except Exception as inspect_exc:
+            logger.warning(
+                _m(
+                    "Could not inspect the container after a failed SSH-key injection",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "error": str(inspect_exc),
+                    }),
+                )
             )
-        )
-        return cause
+            return cause
     if not state.exited_since_start or state.killed_by_host:
         return cause
-    if state.running:
-        # Docker's restart policy already brought it back; the exec landed in the gap.
-        situation = f"Docker is restarting it ({state.describe()})"
-    else:
-        situation = f"the container is not running ({state.describe()})"
     return ImageExitedDuringKeyInjection(
-        f"Failed to add SSH public keys: image {image!r} has no long-running command — its default "
-        f"command exited right after start (exit_code={state.exit_code!r}) and {situation} while the "
-        "SSH keys were being installed; a pod needs a long-running process, for example a start "
-        f"command such as `sleep infinity`. Exec error: {cause}"
+        "Failed to add SSH public keys: "
+        + _image_exited_explanation(
+            image=image, state=state, during="the SSH keys were being installed", cause=cause
+        )
     )
 
 
@@ -4642,6 +4671,39 @@ class DockerService:
         )
         return killed
 
+    def _explain_image_exited_during_bootstrap(
+        self,
+        gone: ContainerGoneBeforeExec,
+        *,
+        image: str,
+        container_name: str,
+        bootstrap_step: str,
+        default_extra: dict,
+    ) -> ImageExitedDuringBootstrap:
+        """The DAH-3678 explanation for an image whose own command ended while a bootstrap step ran;
+        logged as the step's failure, not as a KILLED_DURING_BOOTSTRAP event."""
+        state = gone.state
+        assert state is not None  # container_gone_cause reads None as `removed`, a kill
+        logger.warning(
+            _m(
+                "Image's own command exited during bootstrap",
+                extra=get_extra_info({
+                    **default_extra,
+                    "container_name": container_name,
+                    "bootstrap_step": bootstrap_step,
+                    "cause": "exited",
+                    "exit_code": state.exit_code,
+                    "status": state.status,
+                }),
+            )
+        )
+        return ImageExitedDuringBootstrap(
+            f"Failed {bootstrap_step}: "
+            + _image_exited_explanation(
+                image=image, state=state, during=f"{bootstrap_step} ran", cause=gone
+            )
+        )
+
     @staticmethod
     async def _connect_ssh_and_docker(
         connections: AsyncExitStack,
@@ -5872,6 +5934,16 @@ class DockerService:
                         # _CreateCancelledByDelete here; otherwise the failure names the kill
                         # it was, not the exec it broke.
                         await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                        if container_gone_cause(post_run_exc.state) not in CONTAINER_GONE_KILL_CAUSES:
+                            # The image's own command ended (no OOM, not 137, not being removed):
+                            # the renter's image, not a kill — the step keeps its name, no event.
+                            raise self._explain_image_exited_during_bootstrap(
+                                post_run_exc,
+                                image=payload.docker_image,
+                                container_name=container_name,
+                                bootstrap_step=current_step,
+                                default_extra=default_extra,
+                            ) from post_run_exc
                         killed = self._explain_container_killed_during_bootstrap(
                             post_run_exc,
                             container_name=container_name,

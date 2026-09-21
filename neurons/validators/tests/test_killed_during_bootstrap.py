@@ -17,13 +17,17 @@ import logging
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import requests
 from docker.errors import APIError, NotFound
 from payload_models.payloads import ContainerCreated, CustomOptions, FailedContainerRequest
 from services.docker_service import (
+    CONTAINER_GONE_KILL_CAUSES,
     KILLED_DURING_BOOTSTRAP_EVENT,
     KILLED_DURING_BOOTSTRAP_STEP,
     ContainerKilledDuringBootstrap,
     DockerService,
+    ImageExitedDuringBootstrap,
+    container_gone_cause,
     inflight_creates,
 )
 from services.rental_docker_sdk import (
@@ -57,11 +61,20 @@ def _sigkilled_state() -> dict:
     return _container_state(status="removing", running=False, exit_code=137)
 
 
-def _not_running_conflict() -> APIError:
-    return APIError(
+def _not_running_conflict(*, with_response: bool = False) -> APIError:
+    """docker-py's 409 for `exec start` on a stopped container. ``with_response`` builds it as
+    docker-py does, with the HTTP response attached, so the status-code branch (not the text
+    fallback) decides."""
+    message = (
         '409 Client Error for http+docker://ssh/v1.52/exec/exec-id/start: '
         'Conflict ("container is not running")'
     )
+    if not with_response:
+        return APIError(message)
+    response = requests.Response()
+    response.status_code = 409
+    response._content = b'{"message":"container is not running"}'
+    return APIError(message, response=response, explanation="container is not running")
 
 
 def _exec_spec() -> ContainerExecSpec:
@@ -121,7 +134,7 @@ async def test_an_exec_refused_because_the_container_stopped_reads_its_state_the
     # inspect said running, the exec lost the race: Docker answers 409 "container is not running"
     api = FakeApiClient()
     api.container_states = [_container_state(), _sigkilled_state()]
-    api.exec_start = Mock(side_effect=_not_running_conflict())
+    api.exec_start = Mock(side_effect=_not_running_conflict(with_response=True))
 
     with pytest.raises(ContainerGoneBeforeExec) as info:
         await RentalDockerSdkClient(api).exec_in_container(_exec_spec())
@@ -333,13 +346,27 @@ async def test_an_image_whose_command_exits_at_the_key_injection_keeps_its_own_e
     api = FakeApiClient()
     api.container_states = [_container_state(status="exited", running=False, exit_code=0)]
     _bootstrapping_create(svc, monkeypatch, api)
-    caplog.set_level(logging.WARNING)
+    real_inspect = api.inspect_container
+    looks: list[str] = []
 
-    result = await _create(svc, _payload())
+    def inspect(container_name):
+        # the readiness inspect sees `exited`; Docker's autoremove takes the container right after,
+        # so a second inspect (the 19 Sep sequence) finds nothing
+        looks.append(container_name)
+        if len(looks) > 1:
+            raise NotFound("No such container: " + container_name)
+        return real_inspect(container_name)
+
+    api.inspect_container = inspect
+    caplog.set_level(logging.WARNING)
+    payload = _payload()
+
+    result = await _create(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "add_public_keys"
-    assert "has no long-running command" in result.detail
+    assert "has no long-running command" in result.detail and "exit_code=0" in result.detail
+    assert looks == ["pod_" + payload.pod_id]  # the State the gone error carried was reused
     assert _events(caplog) == []
 
 
@@ -413,6 +440,45 @@ async def test_the_kill_seen_at_set_environment_names_that_step(svc, monkeypatch
     assert (event["bootstrap_step"], event["cause"], event["exit_code"]) == ("set_environment", "removed", None)
 
 
+@pytest.mark.asyncio
+async def test_an_image_whose_command_exits_at_set_environment_is_not_a_kill(svc, monkeypatch, caplog):
+    # a CMD that ends after the key step: `exited`, exit 1, no OOM — the renter's image, not the node
+    api = FakeApiClient()
+    api.container_states = [_container_state(), _container_state(status="exited", running=False, exit_code=1)]
+    _bootstrapping_create(svc, monkeypatch, api)
+    monkeypatch.setattr(
+        svc, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", AsyncMock(return_value=True)
+    )
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload(custom_options=CustomOptions(environment={"APP_MODE": "prod"})))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "set_environment"  # the step keeps its name
+    assert "Failed set_environment: image " in result.detail
+    assert "has no long-running command" in result.detail and "exit_code=1" in result.detail
+    assert "status='exited'" in result.detail and "is not running" in result.detail  # the DAH-3678 markers
+    assert "killed_during_bootstrap" not in result.detail
+    assert _events(caplog) == []  # no KILLED_DURING_BOOTSTRAP event: nothing on the node killed it
+    own_exit = next(r.msg.extra for r in caplog.records if str(r.msg) == "Image's own command exited during bootstrap")
+    assert (own_exit["bootstrap_step"], own_exit["cause"], own_exit["exit_code"]) == ("set_environment", "exited", 1)
+
+
+@pytest.mark.asyncio
+async def test_an_image_whose_command_exits_during_the_ssh_bootstrap_is_not_a_kill_either(svc, monkeypatch, caplog):
+    api = FakeApiClient()
+    api.container_states = [_container_state(), _container_state(status="exited", running=False, exit_code=0)]
+    _bootstrapping_create(svc, monkeypatch, api)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "ssh_bootstrap"
+    assert "has no long-running command" in result.detail and "while ssh_bootstrap ran" in result.detail
+    assert _events(caplog) == []
+
+
 # ------------------------------------------------------------------
 # The classification
 # ------------------------------------------------------------------
@@ -434,10 +500,10 @@ def _snapshot(status: str, exit_code: int | None, oom_killed: bool) -> Container
         (_snapshot("dead", 137, False), "killed", "it was killed"),
         (None, "removed", "it was removed"),
         (_snapshot("removing", 0, False), "removed", "it was removed"),
-        (_snapshot("exited", 1, False), "exited", "its command exited"),
     ],
 )
 def test_the_cause_and_the_renter_sentence_follow_the_state(state, cause, sentence):
+    assert container_gone_cause(state) == cause in CONTAINER_GONE_KILL_CAUSES
     killed = ContainerKilledDuringBootstrap(
         container_name="pod_x", bootstrap_step="ssh_bootstrap", state=state, detail="Docker container is not ready for exec"
     )
@@ -449,3 +515,12 @@ def test_the_cause_and_the_renter_sentence_follow_the_state(state, cause, senten
     assert f"cause={cause} oom_killed={str(bool(state and state.oom_killed)).lower()}" in text
     assert killed.exit_code == (state.exit_code if state else None)
     assert text.endswith("Docker container is not ready for exec")
+
+
+@pytest.mark.parametrize("state", [_snapshot("exited", 1, False), _snapshot("exited", 0, False), _snapshot("dead", 2, False)])
+def test_an_own_exit_is_not_a_kill_cause_and_cannot_be_filed_as_one(state):
+    assert container_gone_cause(state) == "exited"
+    assert "exited" not in CONTAINER_GONE_KILL_CAUSES
+    with pytest.raises(ValueError, match="not a kill"):
+        ContainerKilledDuringBootstrap(container_name="pod_x", bootstrap_step="ssh_bootstrap", state=state, detail="")
+    assert issubclass(ImageExitedDuringBootstrap, Exception) and not issubclass(ImageExitedDuringBootstrap, ContainerKilledDuringBootstrap)
