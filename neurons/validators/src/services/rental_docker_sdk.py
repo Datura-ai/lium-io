@@ -795,7 +795,7 @@ class RentalDockerSdkClient:
         if existing_image == spec.image:
             return True
         raise RentalDockerOperationError(
-            f"Docker SDK run container refused after a transport retry: a container named "
+            "Docker SDK run container refused after a transport retry: a container named "
             f"{spec.name} already exists with image {existing_image!r}, not {spec.image!r}"
         )
 
@@ -882,7 +882,7 @@ class RentalDockerSdkClient:
         if isinstance(existing_driver, str) and existing_driver.split(":", 1)[0] == wanted_driver.split(":", 1)[0]:
             return True
         raise RentalDockerOperationError(
-            f"Docker SDK create volume refused after a transport retry: a volume named "
+            "Docker SDK create volume refused after a transport retry: a volume named "
             f"{volume_name} already exists on driver {existing_driver!r}, not {wanted_driver!r}"
         )
 
