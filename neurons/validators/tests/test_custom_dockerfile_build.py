@@ -1401,10 +1401,10 @@ def test_A20_dind_nameservers_inside_the_block_are_the_only_ones_kept():
         "search ec2.internal\n"
         "options ndots:0\n"
     )
-    assert DockerService._parse_dind_nameservers(resolv, _BLOCK) == ["172.31.0.2", "10.0.0.2"]
+    assert DockerService._dind_nameservers_inside_blocked_cidrs(resolv, _BLOCK) == ["172.31.0.2", "10.0.0.2"]
     # A public resolver is reachable already: nothing to allow, no rule.
-    assert DockerService._parse_dind_nameservers("nameserver 1.1.1.1\n", _BLOCK) == []
-    assert DockerService._parse_dind_nameservers("", _BLOCK) == []
+    assert DockerService._dind_nameservers_inside_blocked_cidrs("nameserver 1.1.1.1\n", _BLOCK) == []
+    assert DockerService._dind_nameservers_inside_blocked_cidrs("", _BLOCK) == []
 
 
 def test_A21_egress_script_allows_port_53_to_the_resolver_above_the_drops():

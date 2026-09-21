@@ -4514,7 +4514,7 @@ class DockerService:
         return cidrs
 
     @staticmethod
-    def _parse_dind_nameservers(resolv_conf: str, cidrs: list[str]) -> list[str]:
+    def _dind_nameservers_inside_blocked_cidrs(resolv_conf: str, cidrs: list[str]) -> list[str]:
         """The DinD container's IPv4 nameservers that sit inside a blocked CIDR.
 
         Docker copies the host's upstream resolvers into the container's
@@ -4560,7 +4560,7 @@ class DockerService:
         DinD-internal docker networking (172.x bridges) is never affected.
 
         `dns_servers` are the DinD's own resolvers inside the blocked ranges
-        (see `_parse_dind_nameservers`). Each gets an ACCEPT for udp/tcp port
+        (see `_dind_nameservers_inside_blocked_cidrs`). Each gets an ACCEPT for udp/tcp port
         53, tagged `-m comment --comment {DIND_DNS_RULE_TAG}`, inserted AFTER
         the DROP rules, so `-I` puts it above them and only DNS to that one
         address passes; port 80 to a metadata service on the same address stays
@@ -4875,7 +4875,7 @@ class DockerService:
                 )
                 return False, "build_egress_setup"
             if resolv_res.exit_status == 0:
-                dns_servers = self._parse_dind_nameservers(resolv_res.stdout or "", cidrs)
+                dns_servers = self._dind_nameservers_inside_blocked_cidrs(resolv_res.stdout or "", cidrs)
             else:
                 logger.warning(
                     _m(
