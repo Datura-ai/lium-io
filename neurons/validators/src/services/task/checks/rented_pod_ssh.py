@@ -111,6 +111,14 @@ SSH_ID_LINE_MAX = 255
 # before it can hold the probe. Each skipped line is bounded to SSH_ID_LINE_MAX bytes as well.
 SSH_PRE_BANNER_LINES_MAX = 64
 SSH_ID_ANY_VERSION_PREFIX = b"SSH-"
+# The one pod status the probe judges: the backend lists rebooting, failed and pending pods too, and
+# its ssh-unreachable route answers 409 for any of them (lium-platform#429). A backend that predates
+# the field sends no status, and every listed pod is judged as before.
+POD_STATUS_RUNNING = "RUNNING"
+# A host `boot_id` is a 36-char UUID read off the executor's specs (provider-controlled input); the
+# backend bounds both boot_id fields to 64 chars and answers 422 above that, so the bound is applied
+# here before the value is stored or sent (PR_PROCESS §5 bounded input).
+BOOT_ID_MAX = 64
 
 # What a failing Redis raises through RedisService: the client's own errors (connection, timeout,
 # response) and the socket errors under them. Anything else is a bug in this module and propagates.
@@ -204,6 +212,13 @@ def _decode(raw: object) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def bounded_boot_id(value: object) -> str | None:
+    """The boot_id as a string of at most BOOT_ID_MAX chars, or None for anything that is not a string."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:BOOT_ID_MAX]
+
+
 @dataclass(frozen=True)
 class OkMark:
     """The `ok` key: when this validator last saw the pod healthy, and the host's boot_id then."""
@@ -217,10 +232,7 @@ class OkMark:
         value = _decode(raw)
         if value is None:
             return None
-        boot_id = value.get("boot_id")
-        return cls(
-            at=str(value.get("at") or ""), boot_id=boot_id if isinstance(boot_id, str) else None
-        )
+        return cls(at=str(value.get("at") or ""), boot_id=bounded_boot_id(value.get("boot_id")))
 
     def dump(self) -> str:
         return json.dumps({"at": self.at, "boot_id": self.boot_id})
@@ -368,6 +380,11 @@ async def probe_rented_pod_ssh(
     """
     if not settings.RENTED_POD_SSH_PROBE_ENABLED:
         return None
+    if pod.status is not None and pod.status != POD_STATUS_RUNNING:
+        # Rebooting, failed or pending as the backend records it (Rustam's review, 21 Sep): not this
+        # outage class, and a report for it is a 409. Nothing is counted or marked this cycle; the
+        # streak, if any, resumes when the pod is RUNNING again.
+        return None
 
     executor_ip = ctx.executor.address
     faults: list[str] = []
@@ -425,7 +442,7 @@ async def _judge_with_streak(
     """The Redis-backed part of the probe: the ok mark, the streak, and the one report per outage."""
     store = ctx.services.redis
     ttl = settings.RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS
-    boot_id_now = (ctx.state.specs or {}).get("boot_id")
+    boot_id_now = bounded_boot_id((ctx.state.specs or {}).get("boot_id"))
     now_iso = datetime.now(UTC).isoformat()
 
     # Every transition below is one MULTI/EXEC (Rustam's review, 17 Sep): the ok mark, the streak

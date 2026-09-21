@@ -45,6 +45,21 @@ class RentedPod(BaseModel):
     # map). None = backend predates the field or the pod maps no port 22; the renter-side probe then
     # judges the pod by its authorized_keys read alone.
     ssh_port: int | None = None
+    # DAH-2870: the pod's status as the backend records it (`RUNNING`, `REBOOT_PENDING`, ...). The
+    # rented list carries every status but BROKEN and DELETING, and the renter-side probe judges
+    # RUNNING pods only (the backend's ssh-unreachable route answers 409 for any other). None =
+    # backend predates the field; the probe then judges every listed pod.
+    status: str | None = None
+
+    @field_validator("ssh_port")
+    @classmethod
+    def _ssh_port_in_range(cls, value: int | None) -> int | None:
+        # A port outside 1-65535 is not one a renter can `ssh -p` to, and `asyncio.open_connection`
+        # raises OverflowError (not OSError) on it, which would end the executor's whole run with
+        # no verdict. Read as "no mapped port": the probe judges the pod by authorized_keys alone.
+        if value is not None and not 1 <= value <= 65535:
+            return None
+        return value
 
 
 class RentedExecutor(BaseModel):

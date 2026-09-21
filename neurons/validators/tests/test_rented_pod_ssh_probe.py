@@ -34,6 +34,7 @@ from protocol.vc_protocol.compute_requests import (
     RentedExecutorsResponse,
     RentedPod,
 )
+from pydantic import ValidationError
 from test_rented_machine_check import DummyScoreCalculator, DummySSHClient, MockContainerCleanup
 
 EXECUTOR_UUID = "executor-123"
@@ -43,14 +44,20 @@ SETTINGS_PATH = "neurons.validators.src.services.task.checks.rented_pod_ssh.sett
 TCP_PATH = "neurons.validators.src.services.task.checks.rented_pod_ssh.tcp_connect_fault"
 
 
-def rented_data(ssh_port: int | None = SSH_PORT) -> RentedExecutorsResponse:
+def rented_data(
+    ssh_port: int | None = SSH_PORT, status: str | None = None
+) -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
             EXECUTOR_UUID: RentedExecutor(
                 miner_hotkey="test-miner",
                 executor_ip_address="127.0.0.1",
                 executor_ip_port="9001",
-                pods=[RentedPod(pod_id=POD_ID, container_name="pod_1", ssh_port=ssh_port)],
+                pods=[
+                    RentedPod(
+                        pod_id=POD_ID, container_name="pod_1", ssh_port=ssh_port, status=status
+                    )
+                ],
             )
         }
     )
@@ -74,8 +81,9 @@ class Harness:
         *,
         tcp_fault: str | None,
         ssh_keys: list[str],
-        boot_id: str = "boot-a",
+        boot_id: object = "boot-a",
         validator_outage: bool = False,
+        status: str | None = None,
     ):
         """One cycle as the validator runs it: the rented check, then the cycle-end fleet gate."""
         services = build_services(
@@ -87,7 +95,9 @@ class Harness:
         ctx = self.context_factory(
             services=services,
             config=build_context_config(),
-            state=build_state(rented_data=rented_data(self.ssh_port), specs={"boot_id": boot_id}),
+            state=build_state(
+                rented_data=rented_data(self.ssh_port, status), specs={"boot_id": boot_id}
+            ),
             ssh=DummySSHClient(pod_running=True, ssh_keys=ssh_keys),
             collateral_deposited=True,
         )
@@ -1151,3 +1161,147 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
     assert rented_pod_ssh.OkMark.load(b'{"at": "x"}') == rented_pod_ssh.OkMark(at="x", boot_id=None)
     assert rented_pod_ssh.OkMark.load(None) is None
     assert rented_pod_ssh.OkMark.load(b"garbage") is None
+
+
+# ----------------------------------------------------------------------------- round 10 (21 Sep, Rustam)
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536, 70000])
+def test_a_mapped_port_outside_1_65535_is_read_as_no_mapped_port(port):
+    # `asyncio.open_connection` raises OverflowError (not OSError) on a port over 65535 or under 0,
+    # which escaped the probe and ended the executor's run with no verdict; port 0 connects to
+    # nothing and read as tcp_refused. Either is "not a port the renter can ssh -p to".
+    assert RentedPod(pod_id=POD_ID, container_name="pod_1", ssh_port=port).ssh_port is None
+    assert RentedPod(pod_id=POD_ID, container_name="pod_1", ssh_port=65535).ssh_port == 65535
+    assert RentedPod(pod_id=POD_ID, container_name="pod_1", ssh_port=1).ssh_port == 1
+
+
+@pytest.mark.asyncio
+async def test_a_pod_with_an_out_of_range_port_is_not_connected_to_and_the_keys_decide(
+    context_factory,
+):
+    h = Harness(context_factory, ssh_port=70000)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=None, ssh_keys=[])
+    result = await h.cycle(tcp_fault=None, ssh_keys=[])
+
+    assert h.tcp_calls == []
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["ssh_port"] is None and pod["faults"] == [FAULT_AUTHORIZED_KEYS_UNREADABLE]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_the_backend_lists_as_not_running_is_not_probed(context_factory):
+    # The rented list carries REBOOT_PENDING / REBOOT_FAILED / FAILED / PENDING pods too, and the
+    # backend's ssh-unreachable route answers 409 for every status but RUNNING. Such a pod is not
+    # judged, counted or marked this cycle; the streak resumes once it is RUNNING again.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS, status="RUNNING")
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, status="RUNNING")
+    assert h.streak()["count"] == 1
+
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=[], status="REBOOT_PENDING")
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert h.tcp_calls == []
+    assert h.streak()["count"] == 1  # untouched, not bumped to the threshold
+    assert h.gate is not None and h.gate.probed == 0 and h.gate.due == []
+    h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+
+    # RUNNING again and still refusing: the streak counts on and reports at the threshold.
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, status="RUNNING")
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+
+    # A backend that predates the field sends no status: every listed pod is judged as before.
+    h2 = Harness(context_factory)
+    await h2.cycle(tcp_fault=None, ssh_keys=KEYS, status=None)
+    assert h2.tcp_calls[0].args[:2] == ("127.0.0.1", SSH_PORT)
+
+
+def test_probe_cycles_and_timeout_settings_refuse_zero(monkeypatch: pytest.MonkeyPatch):
+    # CYCLES=0 would report on the first unhealthy cycle; TIMEOUT=0 times every connect out.
+    for name in (
+        "RENTED_POD_SSH_PROBE_CYCLES",
+        "RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS",
+        "RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    shipped = Settings(_env_file=None)
+    assert shipped.RENTED_POD_SSH_PROBE_CYCLES == 2
+    assert shipped.RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS == 5.0
+
+    for name, value in (
+        ("RENTED_POD_SSH_PROBE_CYCLES", "0"),
+        ("RENTED_POD_SSH_PROBE_CYCLES", "-1"),
+        ("RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", "0"),
+        ("RENTED_POD_SSH_PROBE_TIMEOUT_SECONDS", "-0.5"),
+    ):
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("RENTED_POD_SSH_PROBE_CYCLES", "1")
+    assert Settings(_env_file=None).RENTED_POD_SSH_PROBE_CYCLES == 1
+
+
+@pytest.mark.asyncio
+async def test_the_score_warning_rides_on_the_unreachable_events_remediation(context_factory):
+    # While a pod is unreachable the event is RENTED_POD_SSH_UNREACHABLE, not ALREADY_RENTED; the
+    # provider must still hear about an outdated image or missing collateral, the way ALREADY_RENTED
+    # appends the score warning to its remediation.
+    h = Harness(context_factory)
+    h.score_calculator = DummyScoreCalculator(
+        actual_score=0.9, job_score=0.9, warning=" WARNING: executor image outdated"
+    )
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    assert result.event.remediation == (
+        f"{Msg.RENTED_POD_SSH_UNREACHABLE.remediation} WARNING: executor image outdated"
+    )
+    assert result.updates["score_warning"] == " WARNING: executor image outdated"
+
+    # Without a warning the template's remediation stands, nothing appended.
+    h2 = Harness(context_factory)
+    await h2.cycle(tcp_fault=None, ssh_keys=KEYS)
+    await h2.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    result = await h2.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+    assert result.event.remediation == Msg.RENTED_POD_SSH_UNREACHABLE.remediation
+
+
+@pytest.mark.asyncio
+async def test_boot_ids_are_strings_cut_to_the_backends_64_chars(context_factory):
+    # `boot_id` comes off the executor's specs (provider input). The backend bounds both boot_id
+    # fields to 64 chars and answers 422 above that, which would leave the outage unrecorded for
+    # ever; a non-string is dropped rather than sent.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="a" * 100)
+    await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="b" * 100)
+    result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="b" * 100)
+
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["boot_id_changed"] is True
+    kwargs = h.backend.report_pod_ssh_unreachable.await_args.kwargs
+    assert kwargs["boot_id_at_ok"] == "a" * 64 and kwargs["boot_id_now"] == "b" * 64
+    ok_mark = rented_pod_ssh.OkMark.load(
+        h.redis.store[f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"]
+    )
+    assert ok_mark.boot_id == "a" * 64
+
+    h2 = Harness(context_factory)
+    await h2.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id=12345)
+    await h2.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id={"nested": True})
+    result = await h2.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id=None)
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["boot_id_changed"] is None
+    kwargs = h2.backend.report_pod_ssh_unreachable.await_args.kwargs
+    assert kwargs["boot_id_at_ok"] is None and kwargs["boot_id_now"] is None
+
+    # A stored ok mark that predates the bound is cut on read as well.
+    long_mark = rented_pod_ssh.OkMark.load(json.dumps({"at": "x", "boot_id": "c" * 80}))
+    assert long_mark.boot_id == "c" * 64
+    assert rented_pod_ssh.bounded_boot_id("") is None
+    assert rented_pod_ssh.bounded_boot_id(b"bytes") is None
