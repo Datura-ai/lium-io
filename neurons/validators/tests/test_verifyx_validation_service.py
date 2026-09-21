@@ -125,6 +125,46 @@ def test_network_fails_without_positive_upload_speed():
     assert "Network performance data unavailable" in errors
 
 
+def test_upload_timeout_keeps_the_download_reading():
+    # celium-gpu-verifier#25: an upload that timed out leaves the probe with success=False but a
+    # real download reading. The validator must keep that download (the fatal EMA gate reads it)
+    # and only carry the failure on success/upload_speed, not zero the download.
+    challenge_data, response_data = _network_payload(
+        cloudflare_download_speed=2100.0,
+        package_download_speed=700.0,
+    )
+    response_data["network_execution"]["success"] = False
+    response_data["network_execution"]["speedtest"]["upload_mbps"] = 0.0
+    response_data["network_execution"]["error"] = (
+        "Cloudflare up speedtest timeout after 120 seconds"
+    )
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["download_speed"] == 2100.0
+    assert stats["package_download_speed"] == 700.0
+    assert stats["upload_speed"] == 0.0
+    assert errors == [
+        "Network execution failed: Cloudflare up speedtest timeout after 120 seconds"
+    ]
+
+
+def test_download_failure_reports_no_download_reading():
+    # When the probe fails with no positive download (a package-download or download-direction
+    # failure), the download stays None so the EMA gate keeps its today behaviour (fed 0.0).
+    challenge_data, response_data = _network_payload()
+    response_data["network_execution"]["success"] = False
+    response_data["network_execution"]["speedtest"]["download_mbps"] = 0.0
+    response_data["network_execution"]["download"]["speed_mbps"] = 0.0
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["download_speed"] is None
+    assert stats["package_download_speed"] is None
+
+
 def test_network_reports_unavailable_when_probe_has_no_speedtest_block():
     # An executor whose Cloudflare probe never ran returns no `speedtest` block at all.
     challenge_data, response_data = _network_payload()

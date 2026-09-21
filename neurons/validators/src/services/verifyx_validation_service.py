@@ -420,7 +420,21 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
     network_execution = response_data["network_execution"]
 
     if not network_execution["success"]:
-        return {"success": False}, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
+        # The probe fails as a whole when either direction fails, but the directions are
+        # independent (celium-gpu-verifier#25): an upload that could not move its payload still
+        # leaves a real Cloudflare download reading from the same run. Keep that download so the
+        # fatal download EMA (checks/verifyx.py) is fed the measured value, not a 0; success and
+        # upload_speed carry the failure.
+        speedtest = network_execution.get("speedtest") or {}
+        download_speed = speedtest.get("download_mbps")
+        package_speed = (network_execution.get("download") or {}).get("speed_mbps")
+        return {
+            "download_speed": download_speed if _is_positive_number(download_speed) else None,
+            "upload_speed": speedtest.get("upload_mbps"),
+            "package_download_speed": package_speed if _is_positive_number(package_speed) else None,
+            "success": False,
+            "execution_time_ms": network_execution.get("execution_time_ms"),
+        }, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
 
     errors = []
     success = True
