@@ -6,10 +6,10 @@ pins the two editions to parity so an idle Server node earns the same subsidy as
 node until the 1.0 table in this PR is released and picked up by the pin.
 """
 
-from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
-
 from incentive.config import RENTAL_PRICES_PER_HOUR, IncentiveConfig
 from incentive.utils import get_hourly_rate
+from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
+from test_idle_rate_under_paid_median import PINNED_AT_CAP
 
 SERVER = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 WORKSTATION = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
@@ -50,19 +50,4 @@ def test_overrides_change_only_the_server_edition_b300_and_dah_3623_entries():
 
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys()
     differing = {gpu for gpu in upstream if RENTAL_PRICES_PER_HOUR[gpu] != upstream[gpu]}
-    assert differing <= {
-        SERVER,
-        "NVIDIA B300 SXM6 AC",
-        "NVIDIA A100 80GB PCIe",
-        "NVIDIA H100 80GB HBM3",
-        "NVIDIA GeForce RTX 5090",
-        "NVIDIA H200",
-        "NVIDIA GeForce RTX 3090",
-        "NVIDIA RTX 6000 Ada Generation",
-        "NVIDIA A100-SXM4-80GB",
-        "NVIDIA GeForce RTX 4090",
-        "NVIDIA L40S",
-        "NVIDIA B200",
-        "NVIDIA RTX A6000",
-        "NVIDIA H100 PCIe",
-    }
+    assert differing <= {SERVER, "NVIDIA B300 SXM6 AC", *PINNED_AT_CAP}

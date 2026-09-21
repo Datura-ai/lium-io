@@ -41,18 +41,18 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
-    "NVIDIA A100 80GB PCIe": 0.45,  # paid median 30 d (was 0.36 = 80 % of it, raised)
-    "NVIDIA H100 80GB HBM3": 1.39,  # paid median 30 d (was 1.494 = 107 %)
-    "NVIDIA GeForce RTX 5090": 0.40,  # paid median 30 d (was 0.65 = 163 %)
-    "NVIDIA A100-SXM4-80GB": 0.70,  # paid median 30 d (was 0.6923 = 99 %, raised)
-    "NVIDIA RTX 6000 Ada Generation": 0.75,  # paid median 30 d (was 0.69 = 92 %, raised)
-    "NVIDIA H200": 3.65,  # paid median 30 d (was 2.85 = 78 %, raised)
-    "NVIDIA GeForce RTX 3090": 0.16,  # paid median 30 d (was 0.16 = 100 %, unchanged)
-    "NVIDIA GeForce RTX 4090": 0.30,  # paid median 30 d (was 0.30 = 100 %, unchanged)
-    "NVIDIA L40S": 0.38,  # paid median 30 d (was 0.35 = 92 %, raised)
-    "NVIDIA B200": 5.60,  # paid median 30 d (was 4.25 = 76 %, raised)
-    "NVIDIA RTX A6000": 0.42,  # paid median 30 d (was 0.32 = 76 %, raised)
-    "NVIDIA H100 PCIe": 1.30,  # paid median 30 d (was 1.1988 = 92 %, raised)
+    "NVIDIA A100 80GB PCIe": 0.45,  # paid median 30 d
+    "NVIDIA H100 80GB HBM3": 1.39,  # paid median 30 d
+    "NVIDIA GeForce RTX 5090": 0.40,  # paid median 30 d
+    "NVIDIA A100-SXM4-80GB": 0.70,  # paid median 30 d
+    "NVIDIA RTX 6000 Ada Generation": 0.75,  # paid median 30 d
+    "NVIDIA H200": 3.65,  # paid median 30 d
+    "NVIDIA GeForce RTX 3090": 0.16,  # paid median 30 d
+    "NVIDIA GeForce RTX 4090": 0.30,  # paid median 30 d
+    "NVIDIA L40S": 0.38,  # paid median 30 d
+    "NVIDIA B200": 5.60,  # paid median 30 d
+    "NVIDIA RTX A6000": 0.42,  # paid median 30 d
+    "NVIDIA H100 PCIe": 1.30,  # paid median 30 d
 }
 
 

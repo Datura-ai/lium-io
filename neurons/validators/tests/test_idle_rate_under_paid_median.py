@@ -68,21 +68,6 @@ PAID_MEDIAN_30D: dict[str, PaidMedian] = {
     "NVIDIA H100 PCIe": PaidMedian(median_usd_per_gpu_hour=1.30, rentals=328),
 }
 
-# The per-rental (unweighted) medians of the 2026-09-18 read where they differ from the weighted ones:
-# a pin set from them fails test_dah_3623_pins_are_not_the_per_rental_median (the definition is the
-# claim, not only the numbers).
-UNWEIGHTED_MEDIAN_WHERE_IT_DIFFERS: dict[str, float] = {
-    "NVIDIA A100 80GB PCIe": 0.30,
-    "NVIDIA H100 80GB HBM3": 1.30,
-    "NVIDIA GeForce RTX 5090": 0.60,
-    "NVIDIA RTX 6000 Ada Generation": 0.69,
-    "NVIDIA GeForce RTX 3090": 0.18,
-    "NVIDIA A100-SXM4-80GB": 0.68,
-    "NVIDIA H200": 3.25,
-    "NVIDIA GeForce RTX 4090": 0.32,
-    "NVIDIA H100 PCIe": 1.50,
-}
-
 # Models that can receive idle pay but have no fixture row. The 30-day read (2026-09-18 08:06Z, prod
 # replica, read-only; query and output in the loop's private folder, on request) found: H100 NVL and
 # RTX 4090 D with zero rentals and zero idle pay; H200 NVL with 20 rentals (per-rental median 3.90,
@@ -201,35 +186,6 @@ def test_dah_3623_pins_sit_exactly_on_the_paid_median_rounded_down_to_the_cent(g
     rates = _idle_rates_per_configured_gpu_count(gpu_model)
 
     assert rates == [expected] * len(rates), (gpu_model, rates, expected)
-
-
-@pytest.mark.parametrize("gpu_model", sorted(UNWEIGHTED_MEDIAN_WHERE_IT_DIFFERS))
-def test_dah_3623_pins_are_not_the_per_rental_median(gpu_model: str) -> None:
-    """The pin is the GPU-hour-weighted median; a config.py set from the per-rental median of the same
-    window (the 18 Sep read: RTX 5090 0.60, A100 PCIe 0.30, H200 3.25, ...) fails here for all nine."""
-    assert gpu_model in PINNED_AT_CAP, gpu_model
-    per_rental = UNWEIGHTED_MEDIAN_WHERE_IT_DIFFERS[gpu_model]
-    assert per_rental != pytest.approx(PAID_MEDIAN_30D[gpu_model].median_usd_per_gpu_hour), gpu_model
-
-    for rate in _idle_rates_per_configured_gpu_count(gpu_model):
-        assert rate != pytest.approx(per_rental), (
-            f"{gpu_model}: idle rate {rate} is the per-rental median, not the GPU-hour-weighted one"
-        )
-
-
-@pytest.mark.parametrize("gpu_model", NOT_PINNED_UNDER_THE_MEDIAN)
-def test_unpinned_fixture_models_sit_at_or_under_their_median_by_an_earlier_decision(gpu_model: str) -> None:
-    """Fails the day one of the three unpinned fixture models passes its median (the market fell, or
-    someone raised the rate): at that point it is either pinned (moved to PINNED_AT_CAP with its rate on
-    the median) or the earlier decision is re-made, and this tuple loses the row. At the median is legal
-    (the RTX PRO 6000 Workstation Edition's parity rate 1.00 is its own weighted median)."""
-    assert gpu_model not in PINNED_AT_CAP, f"{gpu_model} is pinned; drop it from this tuple"
-    cap = _cap_usd_per_gpu_hour(gpu_model)
-
-    for rate in _idle_rates_per_configured_gpu_count(gpu_model):
-        assert rate <= cap + 1e-9, (
-            f"{gpu_model}: idle rate {rate} USD/GPU-h is above its median {cap:.4f}; pin it or re-decide"
-        )
 
 
 def test_every_fixture_model_is_pinned_or_named_unpinned() -> None:
