@@ -11,6 +11,7 @@ import aiohttp
 import bittensor
 import numpy as np
 from bittensor.utils.weight_utils import process_weights_for_netuid
+from datura.chain import ChainConnection, EndpointSource
 from pydantic import BaseModel, Field, ValidationError
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
@@ -242,13 +243,13 @@ class SubtensorClient:
     def subtensor(self):
         return SubtensorClient._subtensor
 
-    def _connect_subtensor(self) -> tuple[bittensor.Subtensor, str]:
+    def _connect_subtensor(self) -> ChainConnection[bittensor.Subtensor]:
         """Dial our own chain endpoint when one is set; when that fails, the public
         `BITTENSOR_NETWORK` node, so a proxy outage never leaves the validator without a chain
         client (metagraph sync and set_weights would stop). Returns the client and which setting
         chose the endpoint."""
         try:
-            return (
+            return ChainConnection(
                 bittensor.Subtensor(
                     network=settings.get_chain_endpoint_or_network_name(), config=self.config
                 ),
@@ -270,12 +271,14 @@ class SubtensorClient:
                     ),
                 ),
             )
-            return (
+            return ChainConnection(
                 bittensor.Subtensor(network=settings.BITTENSOR_NETWORK, config=self.config),
                 "BITTENSOR_NETWORK (own endpoint failed)",
             )
 
-    def _log_subtensor_connected(self, subtensor: bittensor.Subtensor, endpoint_source: str) -> None:
+    def _log_subtensor_connected(
+        self, subtensor: bittensor.Subtensor, endpoint_source: EndpointSource
+    ) -> None:
         logger.info(
             _m(
                 "Subtensor connected",

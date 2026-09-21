@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import bittensor
+from datura.chain import ChainConnection, EndpointSource
 from sqlmodel import Session, select
 
 from core.config import settings
@@ -49,13 +50,13 @@ class Miner:
         self.should_exit = False
         self.bootstrap_complete = False
 
-    async def _connect_subtensor(self) -> tuple[bittensor.AsyncSubtensor, str]:
+    async def _connect_subtensor(self) -> ChainConnection[bittensor.AsyncSubtensor]:
         """Dial our own chain endpoint when one is set; when that fails, the public
         `BITTENSOR_NETWORK` node, so a proxy outage never leaves the central miner without a
         chain client. Providers set no endpoint and dial the network name as before. Returns
         the client and which setting chose the endpoint."""
         try:
-            return (
+            return ChainConnection(
                 await bittensor.AsyncSubtensor(
                     network=settings.get_chain_endpoint_or_network_name(), config=self.config
                 ).initialize(),
@@ -77,7 +78,7 @@ class Miner:
                     ),
                 ),
             )
-            return (
+            return ChainConnection(
                 await bittensor.AsyncSubtensor(
                     network=settings.BITTENSOR_NETWORK, config=self.config
                 ).initialize(),
@@ -85,7 +86,7 @@ class Miner:
             )
 
     def _log_subtensor_connected(
-        self, subtensor: bittensor.AsyncSubtensor, endpoint_source: str
+        self, subtensor: bittensor.AsyncSubtensor, endpoint_source: EndpointSource
     ) -> None:
         logger.info(
             _m(
