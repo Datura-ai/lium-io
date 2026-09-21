@@ -107,7 +107,9 @@ from services.rental_docker_observability import (
 from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     ContainerExecSpec,
+    ContainerGoneBeforeExec,
     ContainerRunSpec,
+    ContainerStateSnapshot,
     ContainerUlimit,
     DeviceMount,
     PortBinding,
@@ -511,6 +513,61 @@ class _CreateCancelledByDelete(Exception):
 
 class ImageExitedDuringKeyInjection(Exception):
     """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
+
+
+KILLED_DURING_BOOTSTRAP_STEP = "killed_during_bootstrap"
+KILLED_DURING_BOOTSTRAP_EVENT = "KILLED_DURING_BOOTSTRAP"
+
+
+class ContainerKilledDuringBootstrap(Exception):
+    """The container `docker run` started was gone before the bootstrap finished, and no delete of
+    ours was in flight (that case is _CreateCancelledByDelete).
+
+    19 Sep, one node, one hour, 3 rents: `Docker container is not ready for exec: status='removing'
+    exit_code=137`, then `exec start: Conflict ("container is not running")` and `inspect: No such
+    container` — each read as a generic `ssh_bootstrap` / `set_environment` failure, so the renter
+    saw an exec error and nothing counted the kill. The State is read at the moment the container is
+    first seen gone (the next inspect may find nothing): ``cause`` is `oom` (State.OOMKilled), `killed`
+    (exit 137 without OOM: a SIGKILL — `docker rm -f` / `docker kill` on the node), `removed` (already
+    gone, or `removing` without an exit code we can name), or `exited` (its own command ended).
+    """
+
+    def __init__(
+        self,
+        *,
+        container_name: str,
+        bootstrap_step: str,
+        state: ContainerStateSnapshot | None,
+        detail: str,
+    ):
+        self.container_name = container_name
+        self.bootstrap_step = bootstrap_step
+        self.status = state.status if state else None
+        self.exit_code = state.exit_code if state else None
+        self.oom_killed = bool(state.oom_killed) if state else False
+        if state is None or (state.status == "removing" and not state.killed_by_host):
+            self.cause = "removed"
+        elif state.oom_killed:
+            self.cause = "oom"
+        elif state.exit_code == 137:
+            self.cause = "killed"
+        else:
+            self.cause = "exited"
+        super().__init__(
+            f"{KILLED_DURING_BOOTSTRAP_STEP}: {self._sentence()} during {bootstrap_step} "
+            f"(cause={self.cause} oom_killed={str(self.oom_killed).lower()} exit_code={self.exit_code!r} "
+            f"status={self.status!r}). {detail}"
+        )
+
+    def _sentence(self) -> str:
+        # Renter-facing text: the backend shows the sentence before the parenthesis.
+        if self.cause == "oom":
+            return "the container was stopped by the node before it was ready: it ran out of memory"
+        if self.cause == "killed":
+            return "the container was stopped by the node before it was ready: it was killed"
+        if self.cause == "removed":
+            return "the container was stopped by the node before it was ready: it was removed"
+        return "the container stopped before it was ready: its command exited"
 
 
 async def _explain_add_public_keys_failure(
@@ -3150,6 +3207,9 @@ class DockerService:
                 exec_spec=create_spec,
                 log_extra=log_extra,
             )
+        except ContainerGoneBeforeExec:
+            # The container has left: nothing below can run, and the create explains the exit.
+            raise
         except Exception as exc:
             await self.stream_log(
                 "Failed to create SSH bootstrap script in container",
@@ -3329,6 +3389,9 @@ class DockerService:
                 exec_spec=exec_spec,
                 log_extra=log_extra,
             )
+        except ContainerGoneBeforeExec:
+            # Not a failure of this step: the container has left, and the create explains the exit.
+            raise
         except Exception as exc:
             await self.stream_log("Failed to set environment variables", "error", log_tag)
             logger.warning(
@@ -4542,6 +4605,39 @@ class DockerService:
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
 
+    def _explain_container_killed_during_bootstrap(
+        self,
+        gone: ContainerGoneBeforeExec,
+        *,
+        container_name: str,
+        bootstrap_step: str,
+        default_extra: dict,
+    ) -> ContainerKilledDuringBootstrap:
+        """Name the kill a ContainerGoneBeforeExec found, and record it as one typed event so the
+        kills on a node can be counted (the backend counts `failure_step == killed_during_bootstrap`)."""
+        killed = ContainerKilledDuringBootstrap(
+            container_name=container_name,
+            bootstrap_step=bootstrap_step,
+            state=gone.state,
+            detail=str(gone),
+        )
+        logger.warning(
+            _m(
+                "Container killed during bootstrap",
+                extra=get_extra_info({
+                    **default_extra,
+                    "event": KILLED_DURING_BOOTSTRAP_EVENT,
+                    "container_name": container_name,
+                    "bootstrap_step": bootstrap_step,
+                    "cause": killed.cause,
+                    "oom_killed": killed.oom_killed,
+                    "exit_code": killed.exit_code,
+                    "status": killed.status,
+                }),
+            )
+        )
+        return killed
+
     @staticmethod
     async def _connect_ssh_and_docker(
         connections: AsyncExitStack,
@@ -5749,7 +5845,7 @@ class DockerService:
                         )
                     )
                     prev_timestamp = now_ms()
-                except Exception:
+                except Exception as post_run_exc:
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -5765,6 +5861,20 @@ class DockerService:
                             pod_id=payload.pod_id,
                             default_extra=default_extra,
                         )
+                    if isinstance(post_run_exc, ContainerGoneBeforeExec):
+                        # The container left between `docker run` and the end of the bootstrap.
+                        # Our own delete (DAH-2728) is the first suspect and raises
+                        # _CreateCancelledByDelete here; otherwise the failure names the kill
+                        # it was, not the exec it broke.
+                        await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                        killed = self._explain_container_killed_during_bootstrap(
+                            post_run_exc,
+                            container_name=container_name,
+                            bootstrap_step=current_step,
+                            default_extra=default_extra,
+                        )
+                        current_step = KILLED_DURING_BOOTSTRAP_STEP
+                        raise killed from post_run_exc
                     raise
 
                 # DAH-2458: final step. Stamp the subnet's wall-clock finish time onto it (in

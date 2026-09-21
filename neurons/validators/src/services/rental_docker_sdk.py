@@ -56,6 +56,20 @@ class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
 
+class ContainerGoneBeforeExec(RentalDockerOperationError):
+    """The exec target has left the running state for good — `removing`, `exited`, `dead`, or
+    already "No such container" — so no exec was attempted (a `restarting` container is waited
+    for, a `paused` one is the plain error). ``state`` is the last inspect read while the
+    container still answered, None once it is gone: OOMKilled and ExitCode are read from here,
+    because the next inspect may find nothing (19 Sep, one node: `status='removing'
+    exit_code=137`, then `No such container`)."""
+
+    def __init__(self, message: str, *, container_name: str, state: ContainerStateSnapshot | None):
+        super().__init__(message)
+        self.container_name = container_name
+        self.state = state
+
+
 def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
     """Return the host key required by rental Docker SDK SSH connections."""
     # ExecutorSSHInfo keeps this optional for non-connectable placeholder/error
@@ -153,6 +167,14 @@ class _ContainerExecReadiness:
     ready: bool
     terminal: bool
     detail: str
+    # terminal because the container is gone for good (removing / exited / dead), with the State
+    # read at that moment; a paused container is terminal without being gone
+    gone: bool = False
+    state: ContainerStateSnapshot | None = None
+
+
+# `docker inspect` State.Status values after which the container will not run again by itself.
+_CONTAINER_GONE_STATUSES = frozenset({"removing", "exited", "dead"})
 
 
 @dataclass(slots=True)
@@ -272,9 +294,12 @@ class RentalDockerSdkClient:
                 result = await _in_docker_thread(self._exec_in_container_sync, spec)
             except Exception as exc:
                 if not _is_docker_container_restarting_error(exc):
-                    raise RentalDockerOperationError(
-                        _wrap_error_message("Docker SDK exec failed", exc)
-                    ) from exc
+                    message = _wrap_error_message("Docker SDK exec failed", exc)
+                    if _is_docker_container_not_running_error(exc):
+                        # The container left between the readiness inspect and the exec:
+                        # read its State now, while `inspect` may still answer.
+                        await self._raise_if_container_gone(spec.container_name, message)
+                    raise RentalDockerOperationError(message) from exc
                 last_restart_error = exc
                 retry_reason = "container_restarting"
                 retry_error = str(exc)
@@ -436,9 +461,12 @@ class RentalDockerSdkClient:
             if readiness.ready:
                 return
             if readiness.terminal:
-                raise RentalDockerOperationError(
-                    f"Docker container is not ready for exec: {readiness.detail}"
-                )
+                message = f"Docker container is not ready for exec: {readiness.detail}"
+                if readiness.gone:
+                    raise ContainerGoneBeforeExec(
+                        message, container_name=container_name, state=readiness.state
+                    )
+                raise RentalDockerOperationError(message)
 
             remaining_seconds = deadline - loop.time()
             if remaining_seconds <= 0:
@@ -449,6 +477,25 @@ class RentalDockerSdkClient:
 
             await asyncio.sleep(
                 min(_DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS, remaining_seconds)
+            )
+
+    async def _raise_if_container_gone(self, container_name: str, message: str) -> None:
+        """After an exec was refused with "is not running": raise ContainerGoneBeforeExec carrying
+        the State read now if the container has left for good; return when it is merely paused,
+        restarting, or the inspect itself failed (the caller raises its own error then)."""
+        try:
+            readiness = await _in_docker_thread(self._inspect_container_exec_readiness, container_name)
+        except ContainerGoneBeforeExec as gone:
+            raise ContainerGoneBeforeExec(
+                f"{message}; {gone}", container_name=container_name, state=None
+            ) from gone
+        except Exception:  # noqa: BLE001 — the exec error is the one to report
+            return
+        if readiness.gone:
+            raise ContainerGoneBeforeExec(
+                f"{message}; container state after the refused exec: {readiness.detail}",
+                container_name=container_name,
+                state=readiness.state,
             )
 
     def _inspect_container_exec_readiness(
@@ -464,9 +511,11 @@ class RentalDockerSdkClient:
         try:
             inspect_result = inspect_container(container_name)
         except Exception as exc:
-            raise RentalDockerOperationError(
-                _wrap_error_message("Docker SDK inspect container failed", exc)
-            ) from exc
+            message = _wrap_error_message("Docker SDK inspect container failed", exc)
+            if _is_docker_not_found_error(exc):
+                # Already removed: nothing left to read, and no exec to attempt.
+                raise ContainerGoneBeforeExec(message, container_name=container_name, state=None) from exc
+            raise RentalDockerOperationError(message) from exc
 
         state = inspect_result.get("State") if isinstance(inspect_result, dict) else None
         if not isinstance(state, dict):
@@ -480,16 +529,16 @@ class RentalDockerSdkClient:
         restarting = bool(state.get("Restarting"))
         paused = bool(state.get("Paused"))
         dead = bool(state.get("Dead"))
-        ready = running and not restarting and not paused and not dead
-        terminal = paused or dead or (
-            not running
-            and not restarting
-            and str(state.get("Status") or "").lower() != "created"
-        )
+        status = str(state.get("Status") or "").lower()
+        gone = dead or status in _CONTAINER_GONE_STATUSES
+        ready = running and not restarting and not paused and not gone
+        terminal = gone or paused or (not running and not restarting and status != "created")
         return _ContainerExecReadiness(
             ready=ready,
             terminal=terminal,
             detail=_format_container_state_detail(state),
+            gone=gone,
+            state=_state_snapshot(inspect_result, state) if gone else None,
         )
 
     def _inspect_container_state_sync(self, container_name: str) -> ContainerStateSnapshot:
@@ -497,17 +546,7 @@ class RentalDockerSdkClient:
         state = info.get("State") if isinstance(info, dict) else None
         if not isinstance(state, dict):
             raise RentalDockerOperationError("Docker inspect did not include container State")
-        exit_code = state.get("ExitCode")
-        restart_count = info.get("RestartCount")
-        return ContainerStateSnapshot(
-            status=state.get("Status"),
-            running=bool(state.get("Running")),
-            restarting=bool(state.get("Restarting")),
-            exit_code=int(exit_code) if isinstance(exit_code, int) else None,
-            restart_count=int(restart_count) if isinstance(restart_count, int) else 0,
-            error=state.get("Error") or None,
-            oom_killed=bool(state.get("OOMKilled")),
-        )
+        return _state_snapshot(info, state)
 
     def _mount_source_for_destination_sync(
         self, container_name: str, destination: str
@@ -1152,6 +1191,20 @@ def _is_docker_container_restarting_error(exc: Exception) -> bool:
     return "409" in message and "conflict" in message and is_restart_conflict
 
 
+def _is_docker_container_not_running_error(exc: Exception) -> bool:
+    """Docker's 409 for an exec on a container that has stopped: `Container <id> is not running`
+    (exec create) or `container is not running` (exec start); a restarting one is the other 409."""
+    if _is_docker_container_restarting_error(exc):
+        return False
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    message = str(exc).lower()
+    is_not_running = "is not running" in message
+    if status_code is not None:
+        return status_code == 409 and is_not_running
+    return "409" in message and "conflict" in message and is_not_running
+
+
 def _is_transient_oci_exec_result(result: ContainerExecResult) -> bool:
     if result.exit_status == 0:
         return False
@@ -1174,6 +1227,20 @@ def _format_exec_result_failure(result: ContainerExecResult) -> str:
     return (
         f"exit_status={result.exit_status}; "
         f"stderr={result.stderr}; stdout={result.stdout}"
+    )
+
+
+def _state_snapshot(info: dict, state: dict) -> ContainerStateSnapshot:
+    exit_code = state.get("ExitCode")
+    restart_count = info.get("RestartCount")
+    return ContainerStateSnapshot(
+        status=state.get("Status"),
+        running=bool(state.get("Running")),
+        restarting=bool(state.get("Restarting")),
+        exit_code=int(exit_code) if isinstance(exit_code, int) else None,
+        restart_count=int(restart_count) if isinstance(restart_count, int) else 0,
+        error=state.get("Error") or None,
+        oom_killed=bool(state.get("OOMKilled")),
     )
 
 
