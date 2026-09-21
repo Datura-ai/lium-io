@@ -439,14 +439,26 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
         errors.append(f"Integrity check failed for {download_result['pkg']}")
         success = False
 
-    speedtest = network_execution["speedtest"]
+    speedtest = network_execution.get("speedtest") or {}
     upload_speed = speedtest.get("upload_mbps")
-    download_speed = speedtest["download_mbps"]
-    package_download_speed = download_result["speed_mbps"]
+    download_speed = speedtest.get("download_mbps")
+    package_download_speed = download_result.get("speed_mbps")
 
-    if upload_speed is None or upload_speed <= 0:
+    # A probe that could not reach Cloudflare (no `speedtest` block, a null or zero reading) is a
+    # failed measurement, never an exception: an exception here is caught upstream as "challenge
+    # verification failed" and rejects the machine even while VERIFYX_NETWORK_VALIDATION is off.
+    if not all(
+        _is_positive_number(value)
+        for value in (upload_speed, download_speed, package_download_speed)
+    ):
         errors.append("Network performance data unavailable")
-        success = False
+        return {
+            "download_speed": download_speed,
+            "upload_speed": upload_speed,
+            "package_download_speed": package_download_speed,
+            "success": False,
+            "execution_time_ms": network_execution.get("execution_time_ms"),
+        }, errors
 
     if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
         errors.append(
@@ -546,6 +558,10 @@ def _verify_xet_test(challenge_data: dict, response_data: dict) -> Tuple[dict, L
         "hash": xet_execution.get("hash", ""),
         "error": xet_execution.get("error"),
     }, errors
+
+
+def _is_positive_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
 
 def _format_mbps(value: object) -> str:

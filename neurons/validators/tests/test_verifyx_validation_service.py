@@ -106,6 +106,92 @@ def test_network_fails_without_positive_upload_speed():
     assert "Network performance data unavailable" in errors
 
 
+def test_network_reports_unavailable_when_probe_has_no_speedtest_block():
+    # An executor whose Cloudflare probe never ran returns no `speedtest` block at all.
+    challenge_data, response_data = _network_payload()
+    del response_data["network_execution"]["speedtest"]
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats == {
+        "download_speed": None,
+        "upload_speed": None,
+        "package_download_speed": 100.0,
+        "success": False,
+        "execution_time_ms": 250,
+    }
+    assert errors == ["Network performance data unavailable"]
+
+
+@pytest.mark.parametrize("download_mbps", [None, 0, 0.0, "fast", True])
+def test_network_reports_unavailable_for_a_missing_or_zero_cloudflare_download(download_mbps):
+    challenge_data, response_data = _network_payload()
+    response_data["network_execution"]["speedtest"]["download_mbps"] = download_mbps
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["download_speed"] == download_mbps
+    assert errors == ["Network performance data unavailable"]
+
+
+def test_network_reports_unavailable_when_package_speed_is_missing():
+    challenge_data, response_data = _network_payload()
+    del response_data["network_execution"]["download"]["speed_mbps"]
+
+    stats, errors = _verify_network_test(challenge_data, response_data)
+
+    assert stats["success"] is False
+    assert stats["package_download_speed"] is None
+    assert errors == ["Network performance data unavailable"]
+
+
+def test_missing_speedtest_block_does_not_reject_while_network_flag_is_off():
+    # The whole verification, not a mocked network step: the probe's `speedtest` block is missing
+    # and VERIFYX_NETWORK_VALIDATION is off, so the machine still passes with the error recorded.
+    challenge_data, response_data = _network_payload()
+    del response_data["network_execution"]["speedtest"]
+    payload = {"challenge_data": challenge_data, "response_data": response_data}
+
+    with patch.dict(
+        "neurons.validators.src.services.verifyx_validation_service.settings.FEATURE_FLAGS",
+        {"verifyx_network_validation": False},
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_memory_test",
+        return_value=({"success": True}, []),
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_storage_test",
+        return_value=({"success": True}, []),
+    ):
+        result = _perform_verification_checks(payload)
+
+    assert result["success"] is True
+    assert result["network"]["success"] is False
+    assert result["network"]["download_speed"] is None
+    assert result["errors"] == ["Network performance data unavailable"]
+
+
+def test_missing_speedtest_block_rejects_when_network_flag_is_on():
+    challenge_data, response_data = _network_payload()
+    del response_data["network_execution"]["speedtest"]
+    payload = {"challenge_data": challenge_data, "response_data": response_data}
+
+    with patch.dict(
+        "neurons.validators.src.services.verifyx_validation_service.settings.FEATURE_FLAGS",
+        {"verifyx_network_validation": True},
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_memory_test",
+        return_value=({"success": True}, []),
+    ), patch(
+        "neurons.validators.src.services.verifyx_validation_service._verify_storage_test",
+        return_value=({"success": True}, []),
+    ):
+        result = _perform_verification_checks(payload)
+
+    assert result["success"] is False
+    assert result["errors"] == ["Network performance data unavailable"]
+
+
 def test_network_failure_does_not_reject_when_flag_is_off():
     payload = {"challenge_data": {}, "response_data": {}}
 
