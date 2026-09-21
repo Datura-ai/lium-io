@@ -981,6 +981,8 @@ async def test_exec_in_container_keeps_original_restart_conflict_after_retry_bud
     assert "Container abc123 is restarting, wait until the container is running" in str(
         raised.value.__cause__
     )
+    # and in the message itself: the backend's IMAGE_EXITED_MARKERS match `is restarting` there
+    assert "Container abc123 is restarting" in str(raised.value)
     assert len(api_client.exec_created) == 3
     assert api_client.exec_started == []
     # three readiness inspects, then one more to read the exit code for the message

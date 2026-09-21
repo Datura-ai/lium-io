@@ -329,12 +329,15 @@ class RentalDockerSdkClient:
                 await asyncio.sleep(delay_seconds)
 
         assert last_restart_error is not None
-        # DAH-3593: the 409 text hides the cause; say what the container is doing instead.
+        # DAH-3593: the 409 text hides the cause, so the container's state leads. Docker's own text
+        # stays in the message: the backend recognises a renter image that exits at start by its
+        # `is restarting` (IMAGE_EXITED_MARKERS) and must not blame the provider for it.
         detail = await _in_docker_thread(
             self._describe_restarting_container_sync, spec.container_name
         )
         raise RentalDockerContainerRestartingError(
-            f"container restarting, {detail}"
+            f"container restarting, {detail}; "
+            f"{_wrap_error_message('Docker SDK exec failed', last_restart_error)}"
         ) from last_restart_error
 
     def _describe_restarting_container_sync(self, container_name: str) -> str:

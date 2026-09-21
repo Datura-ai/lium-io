@@ -165,7 +165,7 @@ async def test_create_real_failure_still_logs_error_with_traceback(caplog):
 
 
 # ---------------------------------------------------------------------------
-# 2 — the SDK names the container state instead of Docker's 409 text
+# 2 — the SDK names the container state first, then Docker's 409 text
 # ---------------------------------------------------------------------------
 
 
@@ -206,7 +206,9 @@ async def test_exec_on_restarting_container_names_exit_code_and_last_log_line(mo
     text = str(raised.value)
     assert text.startswith("container restarting, exit_code=137, last log line: ")
     assert "std::bad_alloc" in text
-    assert "409" not in text
+    # the backend's IMAGE_EXITED_MARKERS read `is restarting` out of the failure detail (review, 21 Sep)
+    assert "Docker SDK exec failed: 409 Client Error" in text
+    assert "Container abc is restarting" in text
     assert api.exec_create_calls == 2  # the retry budget was spent before the cause was read
     assert isinstance(raised.value.__cause__, _RestartConflict)
 
