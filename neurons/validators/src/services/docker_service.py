@@ -807,7 +807,7 @@ def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
 
-def _vloopback_repair_helper_cmd(propagated_mount_dir: str, argv: str) -> str:
+def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str) -> str:
     # the plugin's propagated-mount dir is root-only on the host, so the repair looks at it from a
     # throwaway helper container that bind-mounts the dir at /mnt. `--mount type=bind` refuses a
     # source that does not exist (exit 125) where `-v` would create it: a propagated-mount dir
@@ -815,7 +815,7 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, argv: str) -> str:
     return (
         "/usr/bin/docker run --rm "
         f"--mount {shlex.quote(f'type=bind,src={propagated_mount_dir},dst=/mnt')} "
-        f"{_VLOOPBACK_REPAIR_IMAGE} {argv}"
+        f"{_VLOOPBACK_REPAIR_IMAGE} {helper_command}"
     )
 
 
