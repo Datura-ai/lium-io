@@ -417,7 +417,7 @@ class MinerLogLine(BaseModel):
 
     @staticmethod
     def no_payout_because_port_limited_remainder(
-        result: JobResult, limited: PortLimitedRemainder
+        result: JobResult, port_limited: PortLimitedRemainder
     ) -> MinerLogLine:
         # `result` is the free portion: gpu_count is the number of free GPUs the message names.
         return MinerLogLine._no_payout(
@@ -425,14 +425,14 @@ class MinerLogLine(BaseModel):
             reason=ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
             message=(
                 f"No unrented incentive for the {result.gpu_count} free GPU(s) on this partially "
-                f"rented node: it has {limited.available_port_count} free port(s) and the "
-                f"marketplace needs at least {limited.required} to list and rent them, so nobody "
+                f"rented node: it has {port_limited.available_port_count} free port(s) and the "
+                f"marketplace needs at least {port_limited.required} to list and rent them, so nobody "
                 "can rent these GPUs right now. The rented GPUs keep earning. Idle pay resumes "
                 "when the rental ends or the node gets more open ports."
             ),
             extra_fields={
-                "available_port_count": limited.available_port_count,
-                "required_port_count": limited.required,
+                "available_port_count": port_limited.available_port_count,
+                "required_port_count": port_limited.required,
             },
         )
 

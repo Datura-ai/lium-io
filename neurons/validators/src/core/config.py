@@ -432,12 +432,8 @@ class Settings(BaseSettings):
     # scoring the whole box as rented.
     ENABLE_SPLIT_PARTIAL_RENTAL_SCORING: bool = Field(env="ENABLE_SPLIT_PARTIAL_RENTAL_SCORING", default=True)
 
-    # DAH-3698 — port floor for the free remainder of a partially rented split node. The
-    # platform lists a node and the rent path creates a pod only with at least MIN_PORT_COUNT
-    # free verified ports, while PortCountCheck exempts a rented node from that floor (the
-    # tenant holds the ports). When True, a remainder below the floor forfeits the unrented
-    # incentive; the rented GPUs keep earning in the mining pool. When False, the shortfall is
-    # only logged (shadow mode) so the affected idle pay can be read before it is withheld.
+    # DAH-3698 — True withholds the unrented incentive from a split remainder below the
+    # marketplace port floor (the rented GPUs keep earning); False only logs it (shadow mode).
     ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
         env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )

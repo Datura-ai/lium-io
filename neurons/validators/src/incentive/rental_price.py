@@ -29,6 +29,7 @@ from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
 from services.const import (
+    DEFAULT_JOB_OWNER_LIUM,
     DEFAULT_JOB_OWNER_MINER,
     FIXED_RATIO,
     MIN_PORT_COUNT,
@@ -495,13 +496,12 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _port_limited_remainder(result: JobResult) -> PortLimitedRemainder | None:
-        # DAH-3698: only the free portion of a partially rented split node can reach scoring
-        # below the floor — PortCountCheck fails a whole idle node there, and exempts a rented
-        # one because the tenant holds the ports. The platform lists a node and the rent path
-        # creates a pod only with >= MIN_PORT_COUNT free ports, so a remainder under it is
-        # capacity nobody can rent. None whenever the spec does not carry a readable count:
-        # a synthetic result or an older validator must never cost a miner the incentive.
+        # None whenever the spec does not carry a readable count: a synthetic result or an
+        # older validator must never cost a miner the incentive.
         if not result.is_split_remainder or result.spec is None:
+            return None
+        # a Lium filler runs on the free GPUs and holds their ports: filler revenue, not idle pay
+        if result.default_job_owner == DEFAULT_JOB_OWNER_LIUM:
             return None
         available: Any = result.spec.get("available_port_count")
         # bool is excluded explicitly - it passes isinstance(int) and would read True as 1
@@ -511,7 +511,9 @@ class RentalPriceIncentive(DefaultIncentive):
             return None
         return PortLimitedRemainder(available_port_count=available, required=MIN_PORT_COUNT)
 
-    def _log_port_limited_remainder(self, result: JobResult, limited: PortLimitedRemainder) -> None:
+    def _log_port_limited_remainder(
+        self, result: JobResult, port_limited: PortLimitedRemainder
+    ) -> None:
         # structured log for every split remainder under the marketplace port floor; the reason
         # code is what Loki and the provider dashboard (DAH-3699) key off
         enforced: bool = settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER
@@ -523,14 +525,30 @@ class RentalPriceIncentive(DefaultIncentive):
                     "executor_id": str(result.executor_info.uuid),
                     "gpu_model": result.gpu_model,
                     "gpu_count": result.gpu_count,
-                    "available_port_count": limited.available_port_count,
-                    "required_port_count": limited.required,
+                    "available_port_count": port_limited.available_port_count,
+                    "required_port_count": port_limited.required,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
         )
+
+    def _withhold_idle_pay_if_port_limited(self, job_result: JobResult) -> bool:
+        """Log a port-limited split remainder; True when the flag withholds its unrented incentive.
+
+        While ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is off the shortfall is only logged.
+        """
+        port_limited: PortLimitedRemainder | None = self._port_limited_remainder(job_result)
+        if port_limited is None:
+            return False
+        self._log_port_limited_remainder(job_result, port_limited)
+        if not settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER:
+            return False
+        job_result.record_incentive_log(
+            MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited)
+        )
+        return True
 
     def _reason_excluded_from_both_pools(self, job_result: JobResult) -> MinerLogLine | None:
         """First reason (if any) the executor is excluded from BOTH incentive pools.
@@ -987,22 +1005,10 @@ class RentalPriceIncentive(DefaultIncentive):
             and (job_result.score > 0 or job_result.job_score > 0)
         )
 
-        # DAH-3698 port floor: the free remainder of a partially rented split node whose free
-        # ports are under the marketplace floor cannot be listed or rented, so it forfeits the
-        # unrented incentive; the rented portion is a separate result and keeps its mining
-        # score. First in the chain: capacity nobody can rent has no place in the shadow
-        # numbers of the gates below. While the flag is off we only log the would-be exclusion.
-        port_limited: PortLimitedRemainder | None = (
-            self._port_limited_remainder(job_result) if eligible_for_rental_share else None
-        )
-        if port_limited is not None:
-            self._log_port_limited_remainder(job_result, port_limited)
-            if settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER:
-                eligible_for_rental_share = False
-                reason: MinerLogLine = MinerLogLine.no_payout_because_port_limited_remainder(
-                    job_result, port_limited
-                )
-                job_result.record_incentive_log(reason)
+        # DAH-3698: a split remainder under the marketplace port floor is capacity nobody can
+        # rent, so it earns no idle pay; first in the chain so it never reaches the shadow numbers.
+        if eligible_for_rental_share and self._withhold_idle_pay_if_port_limited(job_result):
+            eligible_for_rental_share = False
 
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays
