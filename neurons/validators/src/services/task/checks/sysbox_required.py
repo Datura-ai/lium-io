@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from core.config import settings
+from services.executor_connectivity.dind_probe import DIND_INNER_DOCKERD_CODES
 
 from ..messages import SysboxRequiredMessages as Msg
 from ..messages import render_message
@@ -35,13 +36,14 @@ class SysboxRequiredCheck:
                 "is_rented": is_rented,
             }
             remediation = None
-            if ctx.state.dind_probe_error:
+            cause = ctx.state.dind_probe_error
+            if cause is not None:
                 # DAH-2856: the probe's container came up but its sshd never answered, so no sysbox
                 # verdict was measured at all; the cause read from the container's logs replaces
                 # "install sysbox", which sent ticket-0309's provider through three reinstalls.
-                what["dind_probe_error"] = ctx.state.dind_probe_error
-                remediation = f"The sysbox check could not run: {ctx.state.dind_probe_error}."
-                if ctx.state.dind_probe_error.startswith("DIND_INNER_DOCKERD_"):
+                what["dind_probe_error"] = cause.text
+                remediation = f"The sysbox check could not run: {cause.text}."
+                if cause.code in DIND_INNER_DOCKERD_CODES:
                     remediation += " Fix that on the host first; reinstalling sysbox does not change it."
             event = render_message(
                 Msg.SYSBOX_MISSING,

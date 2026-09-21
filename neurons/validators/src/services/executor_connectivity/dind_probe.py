@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from dataclasses import dataclass
 from typing import Any
 
 import asyncssh
@@ -8,7 +7,7 @@ from asyncssh import SSHClientConnection, SSHKey
 
 from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
-from services.executor_connectivity.models import DindProbeResult, PortPair
+from services.executor_connectivity.models import DindLogCause, DindProbeResult, PortPair
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -32,21 +31,17 @@ DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 # the advice. The image's entrypoint waits for the inner dockerd before sshd starts, so the
 # container's own logs hold the real cause. Read before removal; the first matching pattern wins.
 
-
-@dataclass(frozen=True)
-class DindLogCause:
-    """Why the DinD container's sshd never answered: a stable code and the words the provider reads."""
-
-    code: str
-    message: str
-
+DIND_INNER_DOCKERD_IPTABLES = "DIND_INNER_DOCKERD_IPTABLES"
+DIND_INNER_DOCKERD_DOWN = "DIND_INNER_DOCKERD_DOWN"
+# the codes read from dockerd's own log: the fix is on the host, sysbox is not the cause
+DIND_INNER_DOCKERD_CODES = frozenset({DIND_INNER_DOCKERD_IPTABLES, DIND_INNER_DOCKERD_DOWN})
 
 # (pattern in the log, the cause it names); the first matching pattern wins
 DIND_LOG_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
     (
         "can't initialize iptables table",
         DindLogCause(
-            "DIND_INNER_DOCKERD_IPTABLES",
+            DIND_INNER_DOCKERD_IPTABLES,
             "the inner dockerd cannot use legacy iptables: the host runs iptables in nf_tables mode and "
             "the ip_tables/iptable_nat kernel modules are not loaded. Fix on the host: "
             "`sudo modprobe -a ip_tables iptable_nat iptable_filter` (nvidia_docker_sysbox_setup.sh "
@@ -55,7 +50,7 @@ DIND_LOG_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
     ),
     (
         "failed to start daemon",
-        DindLogCause("DIND_INNER_DOCKERD_DOWN", "the inner dockerd did not start"),
+        DindLogCause(DIND_INNER_DOCKERD_DOWN, "the inner dockerd did not start"),
     ),
 )
 # the validator log gets this much of the container log; the provider-facing error gets the one matching
@@ -180,7 +175,7 @@ class DindVerifier:
                 _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
                 exc_info=True,
             )
-            error: str | None = None
+            error: DindLogCause | None = None
             if created and not sshd_answered and sysbox:
                 error = await self._diagnose_unanswered_container(ssh_client, name, e, log_ctx)
             await ssh_client.run(DockerCommand.remove_with_volumes(name))
@@ -198,7 +193,7 @@ class DindVerifier:
         name: str,
         ssh_error: Exception,
         log_ctx: dict[str, Any],
-    ) -> str:
+    ) -> DindLogCause:
         """Read the container's logs while it still exists and name the cause (DAH-2856).
 
         Best-effort: a failed read still yields the generic cause, never an exception — the
@@ -213,9 +208,9 @@ class DindVerifier:
             # diagnosis must not mask the probe result
             stdout = f"(could not read the container log: {read_error})"
         cause = diagnose_dind_log(stdout)
-        message = cause.message
         if cause.code == DIND_SSHD_NOT_READY.code:
-            message = f"{message} (ssh: {str(ssh_error)[:120]})"
+            # the log said nothing, so the ssh error is the only fact left for the provider
+            cause = DindLogCause(cause.code, f"{cause.message} (ssh: {str(ssh_error)[:120]})")
         logger.warning(
             _m(
                 "DinD container started but sshd never answered",
@@ -229,7 +224,7 @@ class DindVerifier:
                 ),
             )
         )
-        return f"{cause.code}: {message}"
+        return cause
 
     async def _connect_retrying_until_sshd_answers(
         self,

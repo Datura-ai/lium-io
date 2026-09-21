@@ -3,7 +3,12 @@ from typing import Any, NamedTuple
 
 import pytest
 
-from services.executor_connectivity.dind_probe import DindVerifier, diagnose_dind_log
+from services.executor_connectivity.dind_probe import (
+    DIND_INNER_DOCKERD_IPTABLES,
+    DindVerifier,
+    diagnose_dind_log,
+)
+from services.executor_connectivity.models import DindLogCause
 from services.executor_connectivity.models import PortPair
 
 
@@ -458,7 +463,9 @@ async def test_dind_verifier_reads_the_container_log_before_removing_it(mocker):
     )
 
     assert result.success is False
-    assert result.error is not None and result.error.startswith("DIND_INNER_DOCKERD_IPTABLES: ")
+    assert isinstance(result.error, DindLogCause)
+    assert result.error.code == DIND_INNER_DOCKERD_IPTABLES
+    assert result.error.text.startswith("DIND_INNER_DOCKERD_IPTABLES: ")
     commands = [call.args[0] for call in ssh_client.run.await_args_list]
     logs_index = next(i for i, c in enumerate(commands) if "docker logs" in c)
     remove_index = next(i for i, c in enumerate(commands) if "docker rm -fv" in c)
@@ -542,6 +549,6 @@ async def test_dind_verifier_diagnosis_read_failure_still_returns_a_cause(mocker
     )
 
     assert result.success is False
-    assert result.error is not None and result.error.startswith("DIND_SSHD_NOT_READY: ")
-    assert "Connect call failed" in result.error  # the ssh error itself is the only fact left
+    assert isinstance(result.error, DindLogCause) and result.error.code == "DIND_SSHD_NOT_READY"
+    assert "Connect call failed" in result.error.message  # the ssh error itself is the only fact left
     assert any("docker rm -fv" in call.args[0] for call in ssh_client.run.await_args_list)

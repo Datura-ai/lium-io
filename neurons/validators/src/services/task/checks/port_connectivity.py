@@ -63,7 +63,7 @@ class PortConnectivityCheck:
             "verified_port_count": verified_port_count,
         }
         if result.dind_error:
-            extra_info["dind_error"] = result.dind_error
+            extra_info["dind_error"] = result.dind_error.text
         updated_state = replace(
             ctx.state,
             specs={

@@ -2,7 +2,11 @@ import pytest
 from core.config import settings
 
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from neurons.validators.src.services.executor_connectivity.models import PortPair, PortVerificationResult
+from neurons.validators.src.services.executor_connectivity.models import (
+    DindLogCause,
+    PortPair,
+    PortVerificationResult,
+)
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
@@ -52,7 +56,7 @@ class DummyConnectivityService:
         verified_port_count: int = 0,
         status: str | None = None,
         dind_ok: bool | None = None,
-        dind_error: str | None = None,
+        dind_error: DindLogCause | None = None,
     ):
         """
         Args:
@@ -416,7 +420,7 @@ def test_dind_probe_grace_ttl_rejects_zero_and_negative(bad):
 async def test_port_connectivity_carries_the_dind_probe_cause_into_state(context_factory):
     """DAH-2856: the probe's cause reaches ContextState.dind_probe_error (SysboxRequiredCheck reads it)
     and the check's extra, and is None when the probe had nothing to say."""
-    cause = "DIND_INNER_DOCKERD_IPTABLES: the inner dockerd cannot use legacy iptables"
+    cause = DindLogCause("DIND_INNER_DOCKERD_IPTABLES", "the inner dockerd cannot use legacy iptables")
     services = build_services(
         redis=DummyRedis(renting_in_progress=False),
         backend=DummyBackendService(),
@@ -431,7 +435,7 @@ async def test_port_connectivity_carries_the_dind_probe_cause_into_state(context
     result = await PortConnectivityCheck().run(ctx)
 
     assert result.updates["state"].dind_probe_error == cause
-    assert result.updates["default_extra"]["dind_error"] == cause
+    assert result.updates["default_extra"]["dind_error"] == cause.text
 
     services = build_services(
         redis=DummyRedis(renting_in_progress=False),

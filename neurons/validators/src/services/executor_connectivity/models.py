@@ -17,14 +17,27 @@ class PortProbeResult:
 
 
 @dataclass(frozen=True)
+class DindLogCause:
+    """Why the DinD container's sshd never answered: a stable code and the words the provider reads."""
+
+    code: str
+    message: str
+
+    @property
+    def text(self) -> str:
+        """`CODE: message`, the one-line form for logs and the event's what-we-saw."""
+        return f"{self.code}: {self.message}"
+
+
+@dataclass(frozen=True)
 class DindProbeResult:
     success: bool
     sysbox_runtime: bool
     port: PortPair | None
     log_text: str | None = None
-    # DAH-2856: plain-words cause when the container started but sshd never answered, read from the
+    # DAH-2856: the cause when the container started but sshd never answered, read from the
     # container's own logs before removal (None when the probe passed or never got that far).
-    error: str | None = None
+    error: DindLogCause | None = None
 
 
 @dataclass(frozen=True)
@@ -39,7 +52,7 @@ class PortVerificationResult:
     error: str | None = None
     elapsed_sec: float | None = None
     # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
-    dind_error: str | None = None
+    dind_error: DindLogCause | None = None
 
 
 @dataclass(frozen=True)
