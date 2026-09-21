@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -779,6 +780,71 @@ async def test_A16c_renter_output_never_reaches_detail(svc, monkeypatch):
     assert "nvidia-container-cli" not in result.msg
 
 
+def _log_record_texts(caplog) -> list[str]:
+    """Everything a log handler could format from each record: the message, the structured extra
+    (`_StructuredMessage.to_full_string`) and the exception text — what Loki would receive."""
+    texts = []
+    for record in caplog.records:
+        parts = [record.getMessage()]
+        if hasattr(record.msg, "to_full_string"):
+            parts.append(record.msg.to_full_string())
+        if record.exc_info:
+            parts.append(repr(record.exc_info[1]))
+        texts.append("\n".join(parts))
+    return texts
+
+
+@pytest.mark.asyncio
+async def test_A16d_a_credential_in_the_build_tail_never_reaches_a_log_record(svc, monkeypatch, caplog):
+    """BuildKit's `--progress=plain` echoes `ARG HF_TOKEN=…` and `user:TOKEN@host` lines as the renter
+    wrote them. The tail goes to the renter (the secret's owner) in `build_log_tail`; the validator's
+    own log line (`Custom build failed`, Loki) carries the step and the tail's size, never its text."""
+    ssh_client = _make_dind_ssh()
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
+    # the values are resolved at build time (`--build-arg`, an `.env` in the context): they are in
+    # the build output, not in the Dockerfile text the payload carries
+    leaked = (
+        "#3 [2/4] ARG HF_TOKEN=abc\n"
+        "#4 [3/4] RUN pip install --extra-index-url https://user:abc@pypi.example.invalid/simple torch\n"
+        "#4 1.201 ERROR: Could not find a version that satisfies the requirement torch\n"
+        '#4 ERROR: process "/bin/sh -c pip install …" did not complete successfully: exit code: 1\n'
+        "BUILD_FAILED_RC=1\n"
+    )
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, leaked)))
+
+    payload = _base_payload(
+        dockerfile_content=(
+            "FROM python:3.11\nARG HF_TOKEN\nARG PYPI_TOKEN\n"
+            "RUN pip install --extra-index-url https://user:${PYPI_TOKEN}@pypi.example.invalid/simple torch\n"
+        )
+    )
+    with caplog.at_level(logging.DEBUG):
+        result = await svc.create_container(
+            payload=payload,
+            executor_info=_executor_info_for(payload),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_build"
+    # the renter gets their own output back
+    assert "HF_TOKEN=abc" in result.build_log_tail and "user:abc@" in result.build_log_tail
+    # no log record anywhere carries a byte of the tail
+    texts = _log_record_texts(caplog)
+    for text in texts:
+        assert "HF_TOKEN=abc" not in text
+        assert "user:abc@" not in text
+        assert "Could not find a version" not in text
+    # the ops log line exists and says how much was sent, not what
+    failed_lines = [t for t in texts if t.startswith("Custom build failed")]
+    assert len(failed_lines) == 1
+    assert '"failure_step": "docker_build"' in failed_lines[0]
+    assert '"build_log_tail_lines": 4' in failed_lines[0]
+    assert f'"build_log_tail_chars": {len(result.build_log_tail)}' in failed_lines[0]
+
+
 @pytest.mark.asyncio
 async def test_A16b_non_build_failures_have_no_tail(svc, monkeypatch):
     """`build_log_tail` is None for a template pod whose creation fails: the field belongs to
@@ -871,6 +937,47 @@ def test_A17b_rendered_build_command_runs_under_sh(tmp_path, monkeypatch):
     assert stderr_lines[-1] == "BUILD_FAILED_RC=7"
     assert stderr_lines[:-1] == [f"line {i}" for i in range(6, 31)]
     assert "" not in stderr_lines
+
+
+def test_A17c_an_unwritable_rc_file_is_a_failure_with_a_reason(tmp_path):
+    """The exit code round-trips through `rc_file` in the DinD container's /tmp. When that file
+    cannot be written (the overlay is full or read-only) the build is not reported as a success by
+    a bare `exit`: rc is 1, the tail is printed and ends with the fixed reason, then the marker."""
+    import subprocess
+
+    from services.docker_service import (
+        CUSTOM_BUILD_RC_UNREADABLE_REASON,
+        custom_build_inner_command,
+        custom_build_log_tail,
+    )
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "docker"
+    stub.write_text("#!/bin/sh\necho step one\necho step two\nexit 0\n")
+    stub.chmod(0o755)
+    inner = custom_build_inner_command(
+        "lium-custom-test:latest",
+        "/build",
+        log_file=str(tmp_path / "lium-build.log"),
+        rc_file=str(tmp_path / "no-such-dir" / "lium-build.rc"),
+    )
+    run = subprocess.run(
+        ["sh", "-c", inner],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bindir}:/usr/bin:/bin"},
+    )
+    assert run.returncode == 1
+    stderr_lines = run.stderr.splitlines()
+    assert stderr_lines[-1] == "BUILD_FAILED_RC=1"
+    assert stderr_lines[-2] == CUSTOM_BUILD_RC_UNREADABLE_REASON
+    assert stderr_lines[-4:-2] == ["step one", "step two"]
+    assert "Illegal number" not in run.stderr
+    # what the renter reads: the build lines, then why it counts as failed
+    tail = custom_build_log_tail(run.stderr)
+    assert tail.endswith(CUSTOM_BUILD_RC_UNREADABLE_REASON)
+    assert "BUILD_FAILED_RC" not in tail
 
 
 @pytest.mark.asyncio

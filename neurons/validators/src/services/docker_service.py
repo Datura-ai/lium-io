@@ -511,6 +511,13 @@ STREAM_TIMEOUT_STDERR = "Process timed out"
 # `docker save | docker load` fails on the HOST daemon's side (its paths, its disk); that stderr is
 # for ops, the renter's tail gets this fixed line.
 CUSTOM_BUILD_EXPORT_FAILED_REASON = "built image could not be loaded onto the executor"
+# The build's exit code round-trips through a file in the DinD container's /tmp. When that file
+# cannot be written or read (the overlay is full or read-only) the build is treated as failed and
+# this line ends its tail, so the renter and the tests see WHY rather than `[: Illegal number:`.
+CUSTOM_BUILD_RC_UNREADABLE_REASON = (
+    "build exit code could not be read back (the build container could not write to /tmp); "
+    "the build is treated as failed"
+)
 
 
 def custom_build_log_tail(output: str | None) -> str | None:
@@ -544,13 +551,17 @@ def custom_build_inner_command(
     stdout (the streamer's success lines) and to `log_file`; on a non-zero exit the last
     CUSTOM_BUILD_LOG_TAIL_LINES non-blank lines of that file go to stderr, then the
     BUILD_FAILED_RC=<rc> marker; the exit code is the build's (no pipefail needed: it is read
-    back from `rc_file`). No single quotes, so the caller's shlex.quote keeps the text verbatim."""
+    back from `rc_file`). An `rc_file` that cannot be written or read makes the build a failure
+    (rc 1) whose tail ends with CUSTOM_BUILD_RC_UNREADABLE_REASON — never a bare `exit` that
+    reads as success. No single quotes, so the caller's shlex.quote keeps the text verbatim."""
     return (
         f"{{ docker build --progress=plain --pull "
         f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; echo $? > {rc_file}; }} "
-        f"| tee {log_file}; rc=$(cat {rc_file}); "
+        f"| tee {log_file}; rc=$(cat {rc_file} 2>/dev/null); "
+        'if [ -z "$rc" ]; then rc=1; rc_lost=1; fi; '
         f'if [ "$rc" -ne 0 ]; then grep -v "^[[:space:]]*$" {log_file} '
         f"| tail -n {CUSTOM_BUILD_LOG_TAIL_LINES} >&2; "
+        f'if [ -n "$rc_lost" ]; then echo "{CUSTOM_BUILD_RC_UNREADABLE_REASON}" >&2; fi; '
         f"echo {CUSTOM_BUILD_FAILED_MARKER}$rc >&2; fi; exit $rc"
     )
 
@@ -562,7 +573,8 @@ class CustomBuildFailed(Exception):
 
     `str()` carries the step only. The tail is renter-controlled output and the backend classifies
     the CCF `detail` for GPU quarantine (`classify_gpu_runtime_error(msg.detail or msg.msg)`), so it
-    travels in `build_log_tail` alone and reaches ops through its own log line."""
+    travels in `build_log_tail` alone; the validator's own log line carries its size, not its text
+    (a build line can hold a credential the renter wrote)."""
 
     def __init__(self, failure_step: str, log_tail: str | None):
         self.failure_step = failure_step
@@ -4250,8 +4262,8 @@ class DockerService:
         built image tag is `_custom_build_image_tag(pod_id)`. On failure returns
         (False, failure_step, log_tail) — the caller raises CustomBuildFailed so the CCF
         `UnknownError` path used by today's pull-failure carries the step and the reason.
-        `log_tail` is the last lines the build printed (docker_build / build_export), the
-        timeout in seconds (build_timeout), or a one-line reason for the setup steps.
+        `log_tail` is the last lines the build printed (docker_build), the timeout in seconds
+        (build_timeout), or a one-line fixed reason for build_export and the setup steps.
         """
         from core.config import settings
 
@@ -4975,8 +4987,10 @@ class DockerService:
                         # docker_build failures in the 14 d to 15 Sep 2026
                         # reached the backend as the bare step. It is kept out
                         # of `detail` (the backend runs the GPU-quarantine
-                        # classifier over that field) and logged here so Loki
-                        # has the reason.
+                        # classifier over that field) and out of this log line:
+                        # BuildKit echoes `ARG HF_TOKEN=…` and `user:TOKEN@` lines
+                        # as the renter wrote them, so Loki gets the step and the
+                        # tail's size, never its text.
                         current_step = build_failure_step or "docker_build"
                         logger.error(
                             _m(
@@ -4984,7 +4998,8 @@ class DockerService:
                                 extra=get_extra_info({
                                     **default_extra,
                                     "failure_step": current_step,
-                                    "build_log_tail": build_log_tail,
+                                    "build_log_tail_lines": len((build_log_tail or "").splitlines()),
+                                    "build_log_tail_chars": len(build_log_tail or ""),
                                 }),
                             )
                         )
