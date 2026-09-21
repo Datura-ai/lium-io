@@ -26,9 +26,10 @@ from services.docker_service import (
     STUCK_CONTAINER_PREFIX,
     STUCK_CONTAINER_REPEAT_WINDOW_SECONDS,
     DockerService,
-    _gpu_uuids_on_host,
+    _gpu_rows_on_host,
     _gpu_uuids_with_compute_apps,
     _NvidiaSmiUnreadable,
+    _wedged_gpu_uuids_per_card,
 )
 from services.redis_service import RedisService
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
@@ -327,10 +328,59 @@ def test_the_compute_apps_csv_is_parsed_strictly():
 
 
 def test_the_gpu_csv_is_parsed_strictly():
-    assert _gpu_uuids_on_host("GPU-a, 0, 0\nGPU-b, 100, 0\n") == ["GPU-a", "GPU-b"]
+    assert _gpu_rows_on_host("GPU-a, 0, 0\nGPU-b, 100, 0\n") == [("GPU-a", 0.0, 0.0), ("GPU-b", 100.0, 0.0)]
     for garbage in ("", "No devices were found\n", "GPU-a, 0\n", "GPU-a, x, 0\n", "0, 0, 0\n"):
         with pytest.raises(_NvidiaSmiUnreadable):
-            _gpu_uuids_on_host(garbage)
+            _gpu_rows_on_host(garbage)
+
+
+def test_the_wedge_signature_is_judged_card_by_card():
+    rows = [("GPU-pod", 100.0, 0.0), ("GPU-neighbour", 97.0, 40000.0), ("GPU-idle", 0.0, 0.0), ("GPU-hot", 100.0, 0.0)]
+    # a neighbour's live job does not hide the wedge on another card
+    assert _wedged_gpu_uuids_per_card(rows, busy={"GPU-neighbour"}) == {"GPU-pod", "GPU-hot"}
+    # a card with its own live process is busy, not wedged, whatever its utilization
+    assert _wedged_gpu_uuids_per_card(rows, busy={"GPU-pod", "GPU-neighbour"}) == {"GPU-hot"}
+    # busy memory or idle utilization is not the signature
+    assert _wedged_gpu_uuids_per_card([("GPU-a", 100.0, 512.0), ("GPU-b", 50.0, 0.0)], busy=set()) == set()
+
+
+@pytest.mark.asyncio
+async def test_on_a_shared_node_the_wedge_on_the_pods_own_card_is_not_hidden_by_a_busy_neighbour(
+    svc, monkeypatch, rename_flag, caplog
+):
+    host = _Host(
+        ["filler_old"],
+        compute_apps="GPU-neighbour, 4242\n",
+        gpu_query="GPU-test, 100, 0\nGPU-neighbour, 98, 40000\n",
+    )
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "stuck_container_holds_gpu"
+    assert "GPU-test" in result.detail and "wedge signature on ['GPU-test']" in result.detail
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    (hold,) = _hold_events(caplog)
+    assert hold["held_gpu_uuids"] == ["GPU-test"]
+
+
+@pytest.mark.asyncio
+async def test_a_busy_neighbour_alone_does_not_hold_the_pods_card(svc, monkeypatch, rename_flag, caplog):
+    host = _Host(
+        ["filler_old"],
+        compute_apps="GPU-neighbour, 4242\n",
+        gpu_query="GPU-test, 0, 0\nGPU-neighbour, 98, 40000\n",
+    )
+    _rm_fails_with(monkeypatch, COULD_NOT_KILL)
+    caplog.set_level(logging.WARNING)
+
+    _, result = await _create(svc, host, monkeypatch)
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    assert _hold_events(caplog) == []
 
 
 @pytest.mark.asyncio

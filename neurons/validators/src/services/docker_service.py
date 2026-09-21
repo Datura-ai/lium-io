@@ -69,6 +69,7 @@ from services.const import (
     DPHN_CACHE_SIZE_GB,
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
+    GPU_WEDGE_SWEEP_MEMORY_MAX_MIB,
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
     MIN_PORT_COUNT,
     POD_CONTAINER_PREFIX,
@@ -96,7 +97,7 @@ from services.gpu_wedge import (
     GPU_QUERY_COMMAND,
     NVIDIA_SMI_QUERY_TIMEOUT_SECONDS,
     cure_wedged_gpus,
-    parse_wedged_gpu_uuids,
+    matches_wedge_utilization,
     query_wedged_gpu_uuids,
 )
 from services.nvidia_devices import build_gpu_docker_config_for_executor
@@ -326,8 +327,7 @@ class _NvidiaSmiUnreadable(ValueError):
 
 def _gpu_uuids_with_compute_apps(compute_apps_csv: str) -> tuple[set[str], list[str]]:
     """COMPUTE_APPS_BY_GPU_QUERY_COMMAND, strictly: `GPU-<uuid>, <pid>` per line, nothing else.
-    Returns the cards with a live process and the pid column (the input parse_wedged_gpu_uuids
-    takes). An empty output is "no process"; any other shape raises — exit 0 with garbage
+    Returns the cards with a live process and the pid column. An empty output is "no process"; any other shape raises — exit 0 with garbage
     stdout must not read as "free"."""
     busy: set[str] = set()
     pids: list[str] = []
@@ -340,22 +340,39 @@ def _gpu_uuids_with_compute_apps(compute_apps_csv: str) -> tuple[set[str], list[
     return busy, pids
 
 
-def _gpu_uuids_on_host(gpu_query_csv: str) -> list[str]:
-    """GPU_QUERY_COMMAND, strictly: `GPU-<uuid>, <utilization>, <memory MiB>` per line, at least
-    one line (a GPU node with no card listed is a read to distrust, not an empty node)."""
-    uuids: list[str] = []
+def _gpu_rows_on_host(gpu_query_csv: str) -> list[tuple[str, float, float]]:
+    """GPU_QUERY_COMMAND, strictly: `GPU-<uuid>, <utilization %>, <memory.used MiB>` per line, at
+    least one line (a GPU node with no card listed is a read to distrust, not an empty node)."""
+    rows: list[tuple[str, float, float]] = []
     for line in gpu_query_csv.strip().splitlines():
         parts = [part.strip() for part in line.split(",")]
         try:
-            ok = len(parts) == 3 and parts[0].startswith("GPU-") and float(parts[1]) >= 0 and float(parts[2]) >= 0
-        except ValueError:
+            utilization, memory_mib = float(parts[1]), float(parts[2])
+            ok = len(parts) == 3 and parts[0].startswith("GPU-") and utilization >= 0 and memory_mib >= 0
+        except (ValueError, IndexError):
             ok = False
         if not ok:
             raise _NvidiaSmiUnreadable(f"gpu line not `GPU-<uuid>, <util>, <mem>`: {line.strip()[:80]!r}")
-        uuids.append(parts[0])
-    if not uuids:
+        rows.append((parts[0], utilization, memory_mib))
+    if not rows:
         raise _NvidiaSmiUnreadable("nvidia-smi listed no GPU")
-    return uuids
+    return rows
+
+
+def _wedged_gpu_uuids_per_card(rows: list[tuple[str, float, float]], busy: set[str]) -> set[str]:
+    """The DAH-2427 wedge signature card by card: full utilization, (almost) no memory, and no live
+    process on THAT card. `parse_wedged_gpu_uuids` (the teardown sweep) answers `[]` for the whole
+    host as soon as any card has a live process; on a shared node that would hide the wedge on the
+    pod's own card behind a neighbour's job, so here each card is judged on its own signature."""
+    return {
+        gpu_uuid
+        for gpu_uuid, utilization, memory_mib in rows
+        if gpu_uuid not in busy
+        and matches_wedge_utilization(utilization)
+        and memory_mib <= GPU_WEDGE_SWEEP_MEMORY_MAX_MIB
+    }
+
+
 HOST_KEY_REQUIRED_EXTRA = {
     "ssh_host_key_missing": True,
     "docker_sdk_host_key_required": True,
@@ -2350,10 +2367,10 @@ class DockerService:
                         f"nvidia-smi {name} query exit {result.exit_code}: "
                         f"{result.error_message or (result.stderr or '').strip()}"
                     )
-            busy, pids = _gpu_uuids_with_compute_apps(compute_apps.stdout or "")
-            on_host = set(_gpu_uuids_on_host(gpu_query.stdout or ""))
-            wedged = set(parse_wedged_gpu_uuids(gpu_query.stdout or "", "\n".join(pids)))
-            wanted = on_host if whole_node else set(pod_gpu_uuids)
+            busy, _pids = _gpu_uuids_with_compute_apps(compute_apps.stdout or "")
+            rows = _gpu_rows_on_host(gpu_query.stdout or "")
+            wedged = _wedged_gpu_uuids_per_card(rows, busy)
+            wanted = {gpu_uuid for gpu_uuid, _, _ in rows} if whole_node else set(pod_gpu_uuids)
             held = sorted((busy | wedged) & wanted)
             read_ok = True
             detail = (
