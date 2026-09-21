@@ -7037,7 +7037,7 @@ class DockerService:
             error_code=FailedContainerErrorCodes.DeletionInProgress,
         )
 
-    async def _confirm_removal_after_timeout(
+    async def _container_status_after_removal_timeout(
         self,
         docker_client: RentalDockerSdkClient,
         payload: ContainerDeleteRequest,
@@ -7167,7 +7167,7 @@ class DockerService:
             if _is_docker_read_timeout_error(exc):
                 # DAH-3467: dockerd took the force-remove and has not answered yet. Ask it what
                 # happened instead of failing a delete that is most likely completing.
-                status = await self._confirm_removal_after_timeout(docker_client, payload, log)
+                status = await self._container_status_after_removal_timeout(docker_client, payload, log)
                 if status is None:
                     log.info(
                         "Container removal outlived the read timeout; inspect confirms it is gone",
