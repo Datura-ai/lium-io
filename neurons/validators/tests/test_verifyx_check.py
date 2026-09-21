@@ -421,6 +421,76 @@ async def test_verifyx_success_null_network_repeated_decays_below_threshold(cont
     assert ema < 100.0
 
 
+def _upload_failed_network_stats(download: float = 2100.0) -> dict:
+    """What `_verify_network_test` returns when the probe's upload direction failed but the
+    Cloudflare download was measured (celium-gpu-verifier#25 keeps the two directions apart)."""
+    return {
+        "download_speed": download,
+        "upload_speed": 0.0,
+        "package_download_speed": 700.0,
+        "success": False,
+        "execution_time_ms": 130_000,
+    }
+
+
+@pytest.mark.asyncio
+async def test_verifyx_upload_failure_feeds_the_download_ema_the_measured_download(context_factory):
+    """Upload direction failed, download real (flag off, so the probe still passes): the download
+    EMA takes the measured Cloudflare reading, not 0.0; the upload EMA only carries the failed
+    direction's 0.0 sample and never the download figure."""
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": _upload_failed_network_stats(2100.0)}
+    )
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", download=2000.0, upload=900.0),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFY_SUCCESS.reason
+    assert result.event.what_we_saw["verifyx_network_success"] is False
+    net = result.updates["state"].specs["network"]
+    # compute_ema(2000.0, 2100.0) = 2050.0 — the real download, not compute_ema(2000.0, 0.0)
+    assert net["verifyx_download_speed"] == pytest.approx(2100.0)
+    assert net["ema_verifyx_download_speed"] == pytest.approx(2050.0)
+    # compute_ema(900.0, 0.0) = 450.0 — the failed direction decays on its own sample
+    assert net["verifyx_upload_speed"] == pytest.approx(0.0)
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(450.0)
+
+
+@pytest.mark.asyncio
+async def test_verifyx_repeated_upload_failures_keep_the_download_ema_above_the_gate(
+    context_factory,
+):
+    """Five cycles of a host whose upload never finishes: before 5e4616e each cycle fed the download
+    EMA a 0 (2000 × 0.5⁵ = 62.5 < 100 → fatal). Now every cycle feeds the measured download."""
+    ema = 2000.0
+    for _ in range(5):
+        verifyx_service = DummyVerifyXService(
+            success=True, updated_specs={"network": _upload_failed_network_stats(2100.0)}
+        )
+        services = build_services(verifyx=verifyx_service)
+        config = build_context_config(verifyx_enabled=True)
+        state = build_state(
+            specs={"gpu": {"count": 1}},
+            rented_data=_rented_data_with_ema("executor-123", download=ema, upload=900.0),
+        )
+        ctx = context_factory(services=services, config=config, state=state)
+
+        result = await VerifyXCheck().run(ctx)
+
+        assert result.passed is True
+        ema = result.updates["state"].specs["network"]["ema_verifyx_download_speed"]
+
+    assert ema == pytest.approx(2000.0 + 100.0 * (1 - 0.5**5))
+    assert ema > 100.0
+
+
 @pytest.mark.asyncio
 async def test_verifyx_keeps_the_scrapes_disk_breakdown(context_factory):
     """VerifyX measures only total/used/free, so its dict must not evict the scrape's own
