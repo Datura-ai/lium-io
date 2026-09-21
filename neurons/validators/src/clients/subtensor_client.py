@@ -242,6 +242,54 @@ class SubtensorClient:
     def subtensor(self):
         return SubtensorClient._subtensor
 
+    def _connect_subtensor(self) -> tuple[bittensor.Subtensor, str]:
+        """Dial our own chain endpoint when one is set; when that fails, the public
+        `BITTENSOR_NETWORK` node, so a proxy outage never leaves the validator without a chain
+        client (metagraph sync and set_weights would stop). Returns the client and which setting
+        chose the endpoint."""
+        try:
+            return (
+                bittensor.Subtensor(
+                    network=settings.get_chain_endpoint_or_network_name(), config=self.config
+                ),
+                "BITTENSOR_CHAIN_ENDPOINT" if settings.BITTENSOR_CHAIN_ENDPOINT else "BITTENSOR_NETWORK",
+            )
+        except Exception as e:
+            if not settings.BITTENSOR_CHAIN_ENDPOINT:
+                raise
+            logger.warning(
+                _m(
+                    "Own chain endpoint failed, dialling the public network node",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "chain_endpoint": settings.BITTENSOR_CHAIN_ENDPOINT,
+                            "network": settings.BITTENSOR_NETWORK,
+                            "error": str(e),
+                        }
+                    ),
+                ),
+            )
+            return (
+                bittensor.Subtensor(network=settings.BITTENSOR_NETWORK, config=self.config),
+                "BITTENSOR_NETWORK (own endpoint failed)",
+            )
+
+    def _log_subtensor_connected(self, subtensor: bittensor.Subtensor, endpoint_source: str) -> None:
+        logger.info(
+            _m(
+                "Subtensor connected",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "chain_endpoint": subtensor.chain_endpoint,
+                        "network": subtensor.network,
+                        "endpoint_source": endpoint_source,
+                    }
+                ),
+            ),
+        )
+
     def initialize_subtensor(self):
         try:
             logger.info(
@@ -250,26 +298,8 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            subtensor = bittensor.Subtensor(
-                network=settings.get_subtensor_network(), config=self.config
-            )
-            logger.info(
-                _m(
-                    "Subtensor connected",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "chain_endpoint": subtensor.chain_endpoint,
-                            "network": subtensor.network,
-                            "endpoint_source": (
-                                "BITTENSOR_CHAIN_ENDPOINT"
-                                if settings.BITTENSOR_CHAIN_ENDPOINT
-                                else "BITTENSOR_NETWORK"
-                            ),
-                        }
-                    ),
-                ),
-            )
+            subtensor, endpoint_source = self._connect_subtensor()
+            self._log_subtensor_connected(subtensor, endpoint_source)
 
             # check registered
             self.check_registered(subtensor)

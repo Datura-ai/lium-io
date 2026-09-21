@@ -49,6 +49,58 @@ class Miner:
         self.should_exit = False
         self.bootstrap_complete = False
 
+    async def _connect_subtensor(self) -> tuple[bittensor.AsyncSubtensor, str]:
+        """Dial our own chain endpoint when one is set; when that fails, the public
+        `BITTENSOR_NETWORK` node, so a proxy outage never leaves the central miner without a
+        chain client. Providers set no endpoint and dial the network name as before. Returns
+        the client and which setting chose the endpoint."""
+        try:
+            return (
+                await bittensor.AsyncSubtensor(
+                    network=settings.get_chain_endpoint_or_network_name(), config=self.config
+                ).initialize(),
+                "BITTENSOR_CHAIN_ENDPOINT" if settings.BITTENSOR_CHAIN_ENDPOINT else "BITTENSOR_NETWORK",
+            )
+        except Exception as e:
+            if not settings.BITTENSOR_CHAIN_ENDPOINT:
+                raise
+            logger.warning(
+                _m(
+                    "Own chain endpoint failed, dialling the public network node",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "chain_endpoint": settings.BITTENSOR_CHAIN_ENDPOINT,
+                            "network": settings.BITTENSOR_NETWORK,
+                            "error": str(e),
+                        }
+                    ),
+                ),
+            )
+            return (
+                await bittensor.AsyncSubtensor(
+                    network=settings.BITTENSOR_NETWORK, config=self.config
+                ).initialize(),
+                "BITTENSOR_NETWORK (own endpoint failed)",
+            )
+
+    def _log_subtensor_connected(
+        self, subtensor: bittensor.AsyncSubtensor, endpoint_source: str
+    ) -> None:
+        logger.info(
+            _m(
+                "Subtensor connected",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "chain_endpoint": subtensor.chain_endpoint,
+                        "network": subtensor.network,
+                        "endpoint_source": endpoint_source,
+                    }
+                ),
+            ),
+        )
+
     async def initialize_subtensor(self):
         self.bootstrap_complete = False
         subtensor = None
@@ -64,31 +116,13 @@ class Miner:
             if self.should_exit:
                 return
 
-            subtensor = await bittensor.AsyncSubtensor(
-                network=settings.get_subtensor_network(), config=self.config
-            ).initialize()
+            subtensor, endpoint_source = await self._connect_subtensor()
             if self.should_exit:
                 await subtensor.close()
                 return
 
             self.subtensor = subtensor
-            logger.info(
-                _m(
-                    "Subtensor connected",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "chain_endpoint": subtensor.chain_endpoint,
-                            "network": subtensor.network,
-                            "endpoint_source": (
-                                "BITTENSOR_CHAIN_ENDPOINT"
-                                if settings.BITTENSOR_CHAIN_ENDPOINT
-                                else "BITTENSOR_NETWORK"
-                            ),
-                        }
-                    ),
-                ),
-            )
+            self._log_subtensor_connected(subtensor, endpoint_source)
 
             # check registered
             await self.check_registered()

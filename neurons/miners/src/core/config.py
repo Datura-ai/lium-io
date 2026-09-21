@@ -97,7 +97,7 @@ class Settings(BaseSettings):
 
         return config
 
-    def get_subtensor_network(self) -> str:
+    def get_chain_endpoint_or_network_name(self) -> str:
         """The value for `AsyncSubtensor(network=...)`: the chain endpoint when it is set,
         else the network name. Providers set only `BITTENSOR_NETWORK`, so for them this
         is the network name, as before.

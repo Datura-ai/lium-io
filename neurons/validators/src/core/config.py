@@ -655,7 +655,7 @@ class Settings(BaseSettings):
 
         return config
 
-    def get_subtensor_network(self) -> str:
+    def get_chain_endpoint_or_network_name(self) -> str:
         """The value for `Subtensor(network=...)`: our own chain endpoint when it is set,
         else the network name.
 

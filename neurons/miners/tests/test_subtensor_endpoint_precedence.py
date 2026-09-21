@@ -24,14 +24,14 @@ PUBLIC_FINNEY = "wss://entrypoint-finney.opentensor.ai:443"
 
 def _resolve(settings: Settings) -> tuple[str, str]:
     return AsyncSubtensor.setup_config(
-        settings.get_subtensor_network(), settings.get_bittensor_config()
+        settings.get_chain_endpoint_or_network_name(), settings.get_bittensor_config()
     )
 
 
 def test_provider_shape_network_name_only_stays_on_the_public_node():
     settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=None)
 
-    assert settings.get_subtensor_network() == "finney"
+    assert settings.get_chain_endpoint_or_network_name() == "finney"
     assert _resolve(settings) == (PUBLIC_FINNEY, "finney")
 
 
@@ -116,3 +116,47 @@ async def test_initialize_subtensor_provider_shape_is_unchanged(recording_subten
     assert (miner.subtensor.chain_endpoint, miner.subtensor.network) == (PUBLIC_FINNEY, "finney")
     extra = _connected_extra(caplog)
     assert extra["endpoint_source"] == "BITTENSOR_NETWORK"
+
+
+class _RefusingThenRecordingAsyncSubtensor(_RecordingAsyncSubtensor):
+    """The first dial (our own endpoint) refuses the way a proxy outage does; later dials record."""
+
+    refused: list[str] = []
+
+    def __init__(self, network=None, config=None, **kwargs):
+        self._refuse = network == OWN_ENDPOINT
+        if self._refuse:
+            _RefusingThenRecordingAsyncSubtensor.refused.append(network)
+            return
+        super().__init__(network=network, config=config, **kwargs)
+
+    async def initialize(self):
+        if self._refuse:
+            raise ConnectionRefusedError("[Errno 111] Connect call failed")
+        return self
+
+
+@pytest.mark.asyncio
+async def test_initialize_subtensor_falls_back_to_the_public_node_when_our_endpoint_fails(
+    monkeypatch, caplog
+):
+    """Rustam's review (21 Sep): the central miner depends on the proxy too. The own endpoint is
+    tried first; when it fails and one is configured, the public `BITTENSOR_NETWORK` node is
+    dialled and the log says why. Providers set no endpoint, so nothing changes for them."""
+    _RecordingAsyncSubtensor.calls = []
+    _RefusingThenRecordingAsyncSubtensor.refused = []
+    monkeypatch.setattr(
+        miner_module.bittensor, "AsyncSubtensor", _RefusingThenRecordingAsyncSubtensor
+    )
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    miner = _make_miner(settings)
+
+    with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
+        await miner.initialize_subtensor()
+
+    assert _RefusingThenRecordingAsyncSubtensor.refused == [OWN_ENDPOINT]
+    assert (miner.subtensor.chain_endpoint, miner.subtensor.network) == (PUBLIC_FINNEY, "finney")
+    assert _RecordingAsyncSubtensor.calls[-1]["network"] == "finney"
+    extra = _connected_extra(caplog)
+    assert extra["chain_endpoint"] == PUBLIC_FINNEY
+    assert extra["endpoint_source"] == "BITTENSOR_NETWORK (own endpoint failed)"

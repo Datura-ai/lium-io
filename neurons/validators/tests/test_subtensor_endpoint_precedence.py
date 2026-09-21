@@ -26,7 +26,7 @@ PUBLIC_TEST = "wss://test.finney.opentensor.ai:443"
 def _resolve(settings: Settings) -> tuple[str, str]:
     """What `bittensor.Subtensor(network=..., config=...)` connects to for these settings."""
     return Subtensor.setup_config(
-        settings.get_subtensor_network(), settings.get_bittensor_config()
+        settings.get_chain_endpoint_or_network_name(), settings.get_bittensor_config()
     )
 
 
@@ -114,3 +114,65 @@ def test_initialize_subtensor_without_endpoint_dials_the_named_network(recording
     extra = _connected_extra(caplog)
     assert extra["chain_endpoint"] == PUBLIC_FINNEY
     assert extra["endpoint_source"] == "BITTENSOR_NETWORK"
+
+
+class _RefusingThenRecordingSubtensor(_RecordingSubtensor):
+    """The first dial (our own endpoint) refuses the way a proxy outage does; later dials record."""
+
+    refused: list[str] = []
+
+    def __init__(self, network=None, config=None, **kwargs):
+        if network == OWN_ENDPOINT:
+            _RefusingThenRecordingSubtensor.refused.append(network)
+            raise ConnectionRefusedError("[Errno 111] Connect call failed")
+        super().__init__(network=network, config=config, **kwargs)
+
+
+def test_initialize_subtensor_falls_back_to_the_public_node_when_our_endpoint_fails(
+    monkeypatch, caplog
+):
+    """Rustam's review (21 Sep): with the proxy down the validator had no chain client, so
+    metagraph sync and set_weights stopped. The own endpoint is tried first; when it fails and
+    one is configured, the public `BITTENSOR_NETWORK` node is dialled and the log says why."""
+    _RecordingSubtensor.calls = []
+    _RefusingThenRecordingSubtensor.refused = []
+    monkeypatch.setattr(subtensor_client_module.bittensor, "Subtensor", _RefusingThenRecordingSubtensor)
+    monkeypatch.setattr(SubtensorClient, "_subtensor", None)
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    client = _bare_client(settings)
+
+    with patch.object(subtensor_client_module, "settings", settings), caplog.at_level(logging.INFO):
+        client.initialize_subtensor()
+
+    assert _RefusingThenRecordingSubtensor.refused == [OWN_ENDPOINT]
+    assert (client.subtensor.chain_endpoint, client.subtensor.network) == (PUBLIC_FINNEY, "finney")
+    assert _RecordingSubtensor.calls[-1]["network"] == "finney"
+    extra = _connected_extra(caplog)
+    assert extra["chain_endpoint"] == PUBLIC_FINNEY
+    assert extra["endpoint_source"] == "BITTENSOR_NETWORK (own endpoint failed)"
+    assert any(
+        getattr(r.msg, "message", None) == "Own chain endpoint failed, dialling the public network node"
+        for r in caplog.records
+    )
+
+
+def test_initialize_subtensor_without_endpoint_does_not_retry_on_failure(monkeypatch, caplog):
+    """No own endpoint configured: a failure is the failure it always was (logged by
+    initialize_subtensor, no client), not a second dial of the same public node."""
+    calls: list[str] = []
+
+    class _Refusing:
+        def __init__(self, network=None, config=None, **_kwargs):
+            calls.append(network)
+            raise ConnectionRefusedError("[Errno 111] Connect call failed")
+
+    monkeypatch.setattr(subtensor_client_module.bittensor, "Subtensor", _Refusing)
+    monkeypatch.setattr(SubtensorClient, "_subtensor", None)
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=None)
+    client = _bare_client(settings)
+
+    with patch.object(subtensor_client_module, "settings", settings), caplog.at_level(logging.INFO):
+        client.initialize_subtensor()
+
+    assert calls == ["finney"]
+    assert client.subtensor is None

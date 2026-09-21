@@ -70,7 +70,7 @@ class CliService:
         :return: SubstrateInterface instance
         """
         self.subtensor = bt.Subtensor(
-            network=settings.get_subtensor_network(), config=self.config
+            network=settings.get_chain_endpoint_or_network_name(), config=self.config
         )
         return self.subtensor.substrate
 
