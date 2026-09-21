@@ -377,11 +377,15 @@ async def test_measured_no_sysbox_verdict_is_never_tolerated_and_clears_the_miss
 
 
 @pytest.mark.asyncio
-async def test_dind_probe_miss_grace_is_off_by_default(context_factory):
+async def test_dind_probe_miss_grace_is_off_by_default(context_factory, monkeypatch):
     """Flag off (the default): a probe that never reached its container records the downgrade at
     once and the miss record is never read or written. Regression: the grace applied with the flag
     off, which would change scoring before the flag's owner turned it on."""
-    assert settings.DIND_PROBE_FIRST_MISS_GRACE is False
+    from core.config import Settings
+
+    monkeypatch.delenv("DIND_PROBE_FIRST_MISS_GRACE", raising=False)
+    assert Settings(_env_file=None).DIND_PROBE_FIRST_MISS_GRACE is False  # no developer .env
+    monkeypatch.setattr(settings, "DIND_PROBE_FIRST_MISS_GRACE", False)
     redis_service = DummyRedis()
     ctx = _grace_ctx(context_factory, redis_service=redis_service, dind_ok=False)
 
