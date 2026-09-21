@@ -1,5 +1,6 @@
-"""FailedContainerRequest since protocol 1.1.0: `build_log_tail` (DAH-3504) and `step_detail` (DAH-3505)
-ride the wire and survive a round trip; a message from an older validator, which omits them, reads as None.
+"""FailedContainerRequest since protocol 1.1.0: `build_log_tail` (DAH-3504, declared by lium-io#1376) and
+`step_detail` (DAH-3505, declared here) ride the wire and survive a round trip; a message from an older
+validator, which omits them, reads as None.
 
 Regression: on protocol 1.0.0 the mirror had neither field, so a backend reading the wire through it
 dropped both silently (pydantic ignores unknown keys) and the renter never saw the build's last lines."""
