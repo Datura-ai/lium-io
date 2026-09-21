@@ -300,10 +300,13 @@ class BackendClient:
     ) -> PodSshUnreachableResponse | None:
         """Tell the backend a RUNNING rented pod refuses its renter (DAH-2870).
 
-        Sent on every cycle at or past the threshold until the backend answers 200 once (the caller
-        keeps that answer in the pod's streak). The backend records the event against the pod and
-        the provider and tells the renter; it does not change the pod's state. Older backends 404,
-        which is no answer: the caller posts again next cycle, so the outage is not lost.
+        Sent on every cycle at or past the threshold until the backend answers 200 with a
+        ``delivery`` other than ``notify_failed`` (the caller keeps that answer in the pod's streak;
+        a ``notify_failed`` answer means the renter's mail was refused, so the caller posts again
+        next cycle and the mail is re-sent — lium-platform#429). The backend records the event
+        against the pod and the provider and tells the renter; it does not change the pod's state.
+        Older backends 404, which is no answer: the caller posts again next cycle, so the outage is
+        not lost.
         """
         return await self.post(
             f"/internal/pods/{quote(str(pod_id), safe='')}/ssh-unreachable",

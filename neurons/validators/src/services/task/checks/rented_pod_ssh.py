@@ -143,9 +143,10 @@ class RentedPodSshVerdict:
     first_failed_at: str | None = None
     boot_id_changed: bool | None = None
     # True from the cycle the streak reaches the threshold until the pod is healthy again: the
-    # cycle's event names the pod. On every such cycle until the backend answers 200 once
-    # (FailStreak.reported) the report is queued for the cycle-end fleet gate; report_queued says
-    # whether THIS cycle queued it. Whether it was posted is the flush's log line, not the verdict's.
+    # cycle's event names the pod. On every such cycle until the backend answers 200 with a
+    # delivery other than notify_failed (FailStreak.reported) the report is queued for the
+    # cycle-end fleet gate; report_queued says whether THIS cycle queued it. Whether it was posted
+    # is the flush's log line, not the verdict's.
     report: bool = False
     report_queued: bool = False
 
