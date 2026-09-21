@@ -1508,13 +1508,13 @@ class DockerService:
             # 24 h and every cycle still counted the failed rmdir as a failed repair, so the
             # container was never started). Only `test -e` exit 1 means absent; a helper that did
             # not run (125+) stays a skipped repair.
-            absent_result = await ssh_client.run(
+            absence_check_result = await ssh_client.run(
                 _vloopback_repair_helper_cmd(
                     propagated_mount_dir, f"test -e /mnt/{shlex.quote(local_volume)}"
                 ),
                 timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
             )
-            if getattr(absent_result, "exit_status", 0) == 1:
+            if getattr(absence_check_result, "exit_status", 0) == 1:
                 logger.info(
                     _m(
                         "VLOOPBACK_STALE_MOUNTPOINT_ALREADY_ABSENT",
