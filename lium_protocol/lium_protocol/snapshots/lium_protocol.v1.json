@@ -2706,6 +2706,18 @@
     },
     "FailedContainerRequest": {
       "properties": {
+        "build_log_tail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Log Tail"
+        },
         "detail": {
           "anyOf": [
             {
@@ -5276,7 +5288,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.0.0",
+  "protocol_version": "1.1.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

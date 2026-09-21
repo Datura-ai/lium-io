@@ -501,28 +501,73 @@ def _exception_texts(exc: Exception) -> list[str]:
 # wrote the Dockerfile, so its build output is theirs to see; the cap keeps the wire message small.
 CUSTOM_BUILD_LOG_TAIL_LINES = 25
 CUSTOM_BUILD_LOG_TAIL_MAX_CHARS = 2000
+# The build command's own exit-code marker on stderr (`echo BUILD_FAILED_RC=$rc >&2`): the streamer's
+# failure signal, not a build line, so it never counts toward the renter's tail.
+CUSTOM_BUILD_FAILED_MARKER = "BUILD_FAILED_RC="
+# What execute_and_stream_logs returns as stderr when asyncio.wait_for fires — that text alone: the
+# process's own stderr is dropped with the cancelled stream. A failed build that PRINTED "process timed
+# out" comes back with its tail and the BUILD_FAILED_RC= marker around it, so it is not a timeout.
+STREAM_TIMEOUT_STDERR = "Process timed out"
+# `docker save | docker load` fails on the HOST daemon's side (its paths, its disk); that stderr is
+# for ops, the renter's tail gets this fixed line.
+CUSTOM_BUILD_EXPORT_FAILED_REASON = "built image could not be loaded onto the executor"
 
 
 def custom_build_log_tail(output: str | None) -> str | None:
     """The last CUSTOM_BUILD_LOG_TAIL_LINES non-empty lines of a build's output, cut to
-    CUSTOM_BUILD_LOG_TAIL_MAX_CHARS from the end (the error is at the bottom). None when there is nothing."""
-    lines = [line.rstrip() for line in (output or "").splitlines() if line.strip()]
+    CUSTOM_BUILD_LOG_TAIL_MAX_CHARS from the end (the error is at the bottom). The BUILD_FAILED_RC=
+    marker line is dropped before the cap, so a failed build yields 25 build lines, not 24 and the
+    marker. None when there is nothing."""
+    lines = [
+        line.rstrip()
+        for line in (output or "").splitlines()
+        if line.strip() and not line.lstrip().startswith(CUSTOM_BUILD_FAILED_MARKER)
+    ]
     if not lines:
         return None
     tail = "\n".join(lines[-CUSTOM_BUILD_LOG_TAIL_LINES:])
     return tail[-CUSTOM_BUILD_LOG_TAIL_MAX_CHARS:]
 
 
+def stream_timed_out(err: str | None) -> bool:
+    """True only when stderr is the streamer's own timeout sentinel and nothing else."""
+    return (err or "").strip().lower() == STREAM_TIMEOUT_STDERR.lower()
+
+
+def custom_build_inner_command(
+    image_tag: str,
+    ctx: str,
+    log_file: str = "/tmp/lium-build.log",
+    rc_file: str = "/tmp/lium-build.rc",
+) -> str:
+    """The `sh -c` body that runs `docker build` inside the DinD container. Build output goes to
+    stdout (the streamer's success lines) and to `log_file`; on a non-zero exit the last
+    CUSTOM_BUILD_LOG_TAIL_LINES non-blank lines of that file go to stderr, then the
+    BUILD_FAILED_RC=<rc> marker; the exit code is the build's (no pipefail needed: it is read
+    back from `rc_file`). No single quotes, so the caller's shlex.quote keeps the text verbatim."""
+    return (
+        f"{{ docker build --progress=plain --pull "
+        f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; echo $? > {rc_file}; }} "
+        f"| tee {log_file}; rc=$(cat {rc_file}); "
+        f'if [ "$rc" -ne 0 ]; then grep -v "^[[:space:]]*$" {log_file} '
+        f"| tail -n {CUSTOM_BUILD_LOG_TAIL_LINES} >&2; "
+        f"echo {CUSTOM_BUILD_FAILED_MARKER}$rc >&2; fi; exit $rc"
+    )
+
+
 class CustomBuildFailed(Exception):
     """A custom-Dockerfile build did not produce an image. `failure_step` is the CCF step
     (docker_build, build_timeout, build_dind_start, ...); `log_tail` is what the build printed last,
-    or a one-line reason for the setup steps, so the failure says WHY and not only WHERE."""
+    or a one-line reason for the setup steps, so the failure says WHY and not only WHERE.
+
+    `str()` carries the step only. The tail is renter-controlled output and the backend classifies
+    the CCF `detail` for GPU quarantine (`classify_gpu_runtime_error(msg.detail or msg.msg)`), so it
+    travels in `build_log_tail` alone and reaches ops through its own log line."""
 
     def __init__(self, failure_step: str, log_tail: str | None):
         self.failure_step = failure_step
         self.log_tail = log_tail
-        text = f"Custom dockerfile build failed (failure_step={failure_step})"
-        super().__init__(f"{text}: {log_tail}" if log_tail else text)
+        super().__init__(f"Custom dockerfile build failed (failure_step={failure_step})")
 
 
 class _CreateCancelledByDelete(Exception):
@@ -4377,21 +4422,15 @@ class DockerService:
             #    --network=none). BuildKit streams progress to stderr and
             #    `execute_and_stream_logs` treats any stderr as failure, so we
             #    redirect build output to stdout (streamed as success logs, and
-            #    kept in a log file next to the Dockerfile) and emit to stderr
-            #    ONLY on non-zero exit — the streamer's signal. The stderr then
-            #    carries the last lines of the build output, which is the only
-            #    place the reason for the failure exists once the DinD container
-            #    is torn down: the streamer returns stderr, not stdout. The log
-            #    and rc files live outside the build context so a `COPY .`
-            #    in the renter's Dockerfile never picks them up.
-            build_log = "/tmp/lium-build.log"
-            inner_build = (
-                f"{{ docker build --progress=plain --pull "
-                f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; echo $? > /tmp/lium-build.rc; }} "
-                f"| tee {build_log}; rc=$(cat /tmp/lium-build.rc); "
-                f"if [ \"$rc\" -ne 0 ]; then tail -n {CUSTOM_BUILD_LOG_TAIL_LINES} {build_log} >&2; "
-                f"echo BUILD_FAILED_RC=$rc >&2; fi; exit $rc"
-            )
+            #    kept in a log file under /tmp inside the DinD container) and
+            #    emit to stderr ONLY on non-zero exit — the streamer's signal.
+            #    The stderr then carries the last non-blank lines of the build
+            #    output, which is the only place the reason for the failure
+            #    exists once the DinD container is torn down: the streamer
+            #    returns stderr, not stdout. The log and rc files live outside
+            #    the build context (/build) so a `COPY .` in the renter's
+            #    Dockerfile never picks them up.
+            inner_build = custom_build_inner_command(image_tag, ctx)
             build_cmd = (
                 f"/usr/bin/docker exec {shlex.quote(dind_name)} "
                 f"sh -c {shlex.quote(inner_build)}"
@@ -4416,7 +4455,9 @@ class DockerService:
                 )
                 return False, "docker_build", "build command could not be run on the executor"
             if not ok:
-                if "process timed out" in (err or "").lower():
+                # A build that printed "process timed out" and failed carries BUILD_FAILED_RC= too;
+                # only the streamer's bare sentinel is a timeout.
+                if stream_timed_out(err):
                     return False, "build_timeout", f"docker build exceeded {timeout_s} s"
                 return False, "docker_build", custom_build_log_tail(err)
 
@@ -4439,9 +4480,19 @@ class DockerService:
                 raise_exception=False,
             )
             if not ok:
-                if "process timed out" in (err or "").lower():
+                if stream_timed_out(err):
                     return False, "build_timeout", f"image export exceeded {timeout_s} s"
-                return False, "build_export", custom_build_log_tail(err)
+                # The stderr here is the HOST daemon's `docker load` (paths, disk state), not the
+                # renter's build: it goes to ops, the renter gets a fixed reason.
+                logger.error(
+                    _m(
+                        "Custom build export failed",
+                        extra=get_extra_info(
+                            {**default_extra, "build_image_tag": image_tag, "error": err}
+                        ),
+                    )
+                )
+                return False, "build_export", CUSTOM_BUILD_EXPORT_FAILED_REASON
 
             return True, None, None
         finally:
@@ -4920,9 +4971,23 @@ class DockerService:
                         # Raise so the existing except-Exception block in
                         # create_container emits the CCF FailedContainerRequest
                         # via the same path as today's pull failure. The tail
-                        # rides along: 22 of 22 docker_build failures in the 14 d
-                        # to 15 Sep 2026 reached the backend as the bare step.
+                        # rides along in `build_log_tail` only: 22 of 22
+                        # docker_build failures in the 14 d to 15 Sep 2026
+                        # reached the backend as the bare step. It is kept out
+                        # of `detail` (the backend runs the GPU-quarantine
+                        # classifier over that field) and logged here so Loki
+                        # has the reason.
                         current_step = build_failure_step or "docker_build"
+                        logger.error(
+                            _m(
+                                "Custom build failed",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "failure_step": current_step,
+                                    "build_log_tail": build_log_tail,
+                                }),
+                            )
+                        )
                         raise CustomBuildFailed(current_step, build_log_tail)
                     # Override docker_image so the downstream `docker run` uses
                     # the locally built tag for this branch only.

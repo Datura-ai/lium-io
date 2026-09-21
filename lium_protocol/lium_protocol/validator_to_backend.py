@@ -343,6 +343,9 @@ class FailedContainerRequest(PodContainerResponse):
     detail: str | None = None
     failure_step: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # 1.1.0 (DAH-3504): the last lines a failed custom-Dockerfile build printed — the renter's own output,
+    # never executor host data; None for every other failure and from validators before it
+    build_log_tail: str | None = None
 
 
 class PodLog(pydantic.BaseModel):
