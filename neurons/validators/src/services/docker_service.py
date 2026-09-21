@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import enum
 import ipaddress
 import logging
@@ -224,6 +225,101 @@ SYSBOX_SUBUID_SLICE_SIZE = 65536
 _PORT_ALLOCATED_PHRASES = ("port is already allocated", "address already in use", "failed to bind host port")
 _PORT_ALLOCATED_RETRY_BUDGET_SEC = 90
 _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
+
+# A host port the backend handed the pod is bound by something the 90 s wait above never
+# outlives (a stale container of another rental, a provider process): with
+# PORT_COLLISION_RETRY_ENABLED the pod moves to the next free pair of the executor's advertised
+# range — at most this many candidates are considered, the host's listening sockets are read once
+# over the create's own SSH session, and `docker run` is retried ONCE with the new mapping.
+PORT_COLLISION_ERROR_CLASS = "port_collision"
+_PORT_COLLISION_CANDIDATE_CAP = 3
+_PORT_COLLISION_PROBE_TIMEOUT_SEC = 10
+# `ss -Hltn` (iproute2) first, `netstat -ltn` where only net-tools is installed; either prints one
+# listening socket per line with the local address in one column.
+_LISTENING_PORTS_COMMAND = "ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null"
+# dockerd's two bind refusals name the host address the bind was for:
+#   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
+#   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
+#   `Bind for 0.0.0.0:9101 failed: port is already allocated`
+_BOUND_HOST_PORT_RE = re.compile(
+    r"(?:Bind for|failed to bind host port(?: for)?) (?:\[[0-9a-fA-F:.]{0,45}\]|[0-9.]{1,15}):(\d{1,5})(?![0-9])"
+)
+
+
+class RentalPortCollisionError(RuntimeError):
+    """`docker run` could not bind a host port and no free mapped port of the executor's range took
+    the pod: the create fails as the `port_collision` class."""
+
+    error_class = PORT_COLLISION_ERROR_CLASS
+
+
+def _port_allocated_phrase(exc: BaseException) -> str | None:
+    """The `_PORT_ALLOCATED_PHRASES` entry the daemon's refusal carries, or None."""
+    text = str(exc)
+    return next((phrase for phrase in _PORT_ALLOCATED_PHRASES if phrase in text), None)
+
+
+def port_collision_error_class(exc: BaseException) -> str | None:
+    """`port_collision` when the create died on a host port bind, for the failure event's counter.
+
+    Flag or no flag: a typed `RentalPortCollisionError`, or any refusal text in the exception's
+    cause chain that names an already-bound host port.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RentalPortCollisionError) or _port_allocated_phrase(current):
+            return PORT_COLLISION_ERROR_CLASS
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _bound_host_port_from_error(exc: BaseException) -> int | None:
+    """The host port dockerd could not bind, read from its refusal text; None when the text has none."""
+    match = _BOUND_HOST_PORT_RE.search(str(exc))
+    if match is None:
+        return None
+    port = int(match.group(1))
+    return port if 0 < port <= 65535 else None
+
+
+def _spare_port_pairs(
+    advertised: list[PayloadPortMapping] | None,
+    port_maps: list[tuple[int, int, int]],
+) -> list[PayloadPortMapping]:
+    """The executor's advertised (internal, external) pairs the pod is not using, by host port."""
+    used_internal = {internal for _, internal, _ in port_maps}
+    used_external = {external for _, _, external in port_maps}
+    spare = [
+        pair
+        for pair in advertised or ()
+        if pair.internal_port not in used_internal and pair.external_port not in used_external
+    ]
+    spare.sort(key=lambda pair: pair.internal_port)
+    return spare
+
+
+def _port_collision_candidates(
+    spare: list[PayloadPortMapping], *, after_host_port: int, cap: int = _PORT_COLLISION_CANDIDATE_CAP
+) -> list[PayloadPortMapping]:
+    """The next free pairs after the colliding host port, wrapping to the range's start; at most `cap`."""
+    later = [pair for pair in spare if pair.internal_port > after_host_port]
+    earlier = [pair for pair in spare if pair.internal_port <= after_host_port]
+    return (later + earlier)[:cap]
+
+
+def _parse_listening_ports(output: str) -> set[int]:
+    """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`)."""
+    ports: set[int] = set()
+    for line in output.splitlines():
+        for column in line.split():
+            if column.endswith("*") or ":" not in column:
+                continue
+            _, _, port_text = column.rpartition(":")
+            if port_text.isdigit() and 0 < int(port_text) <= 65535:
+                ports.add(int(port_text))
+    return ports
 
 _VLOOPBACK_MOUNT_ERROR_PHRASES = (
     "VolumeDriver.Mount",
@@ -1170,10 +1266,23 @@ class DockerService:
         default_extra: dict,
         local_volume: str | None = None,
         log_tag: str = "container_creation",
+        port_maps: list[tuple[int, int, int]] | None = None,
+        spare_port_pairs: list[PayloadPortMapping] | None = None,
     ) -> None:
+        """`docker run` through the SDK with the same-command retry on known Docker races.
+
+        Port collision (PORT_COLLISION_RETRY_ENABLED): when dockerd refuses the bind of a host port
+        and `port_maps` / `spare_port_pairs` are given, the colliding mapping moves to the next
+        free pair of the executor's advertised range (at most `_PORT_COLLISION_CANDIDATE_CAP`
+        candidates, the host's listening sockets read once over `ssh_client`) and the run is
+        retried ONCE with the new mapping; `port_maps` is updated in place so the create's answer
+        carries the port the pod really got. No free candidate, or a second bind refusal, fails the
+        create as `RentalPortCollisionError`. Flag off: the DAH-1991 same-command wait as before.
+        """
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
         vloopback_mount_repair_attempted = False
+        remapped = False
         while True:
             try:
                 await run_logged_rental_docker_sdk_operation(
@@ -1206,10 +1315,37 @@ class DockerService:
                         )
                         continue
 
-                port_allocation_phrase = next(
-                    (phrase for phrase in _PORT_ALLOCATED_PHRASES if phrase in str(exc)),
-                    None,
-                )
+                port_allocation_phrase = _port_allocated_phrase(exc)
+                if port_allocation_phrase and remapped:
+                    # the one retry on the new mapping was refused too: no third candidate
+                    raise RentalPortCollisionError(
+                        f"docker run could not bind a host port on the remapped port either: {exc}"
+                    ) from exc
+                if (
+                    port_allocation_phrase
+                    and settings.PORT_COLLISION_RETRY_ENABLED
+                    and port_maps is not None
+                    and spare_port_pairs
+                ):
+                    remapped_spec = await self._remap_colliding_port(
+                        exc=exc,
+                        ssh_client=ssh_client,
+                        run_spec=run_spec,
+                        port_maps=port_maps,
+                        spare_port_pairs=spare_port_pairs,
+                        default_extra=default_extra,
+                    )
+                    if remapped_spec is not None:
+                        run_spec = remapped_spec
+                        remapped = True
+                        attempt += 1
+                        await self._remove_failed_rental_container_for_retry(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            warning_event="PORT_COLLISION_STALE_RM_FAILED",
+                        )
+                        continue
                 port_retry_deadline_expired = time.monotonic() >= deadline
                 port_retry_needed = bool(port_allocation_phrase) and not port_retry_deadline_expired
                 if port_retry_needed:
@@ -1286,6 +1422,105 @@ class DockerService:
                     }),
                 )
             )
+
+    async def _remap_colliding_port(
+        self,
+        *,
+        exc: Exception,
+        ssh_client: asyncssh.SSHClientConnection,
+        run_spec: ContainerRunSpec,
+        port_maps: list[tuple[int, int, int]],
+        spare_port_pairs: list[PayloadPortMapping],
+        default_extra: dict,
+    ) -> ContainerRunSpec | None:
+        """Move the mapping dockerd could not bind to the next free advertised pair.
+
+        Returns the run spec with the new host port, having rewritten `port_maps` in place and
+        taken the pair out of `spare_port_pairs`. Returns None when the refusal names no host port
+        of this pod (the caller keeps the same-command wait). Raises `RentalPortCollisionError`
+        when every candidate (≤ `_PORT_COLLISION_CANDIDATE_CAP`) is already listening on the host.
+        """
+        bound_port = _bound_host_port_from_error(exc)
+        index = next(
+            (i for i, (_, internal, _) in enumerate(port_maps) if internal == bound_port),
+            None,
+        )
+        if bound_port is None or index is None:
+            logger.warning(
+                _m(
+                    "PORT_COLLISION_UNMAPPED",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "bound_host_port": bound_port,
+                        "host_ports": [internal for _, internal, _ in port_maps],
+                    }),
+                )
+            )
+            return None
+        docker_port, old_internal, old_external = port_maps[index]
+        candidates = _port_collision_candidates(spare_port_pairs, after_host_port=bound_port)
+        listening = await self._listening_host_ports(ssh_client, default_extra)
+        chosen = next(
+            (pair for pair in candidates if listening is None or pair.internal_port not in listening),
+            None,
+        )
+        if chosen is None:
+            raise RentalPortCollisionError(
+                f"docker run could not bind host port {bound_port} and the next "
+                f"{len(candidates)} advertised port(s) "
+                f"{[pair.internal_port for pair in candidates]} are listening too: {exc}"
+            ) from exc
+        spare_port_pairs.remove(chosen)
+        port_maps[index] = (docker_port, chosen.internal_port, chosen.external_port)
+        logger.warning(
+            _m(
+                "PORT_COLLISION_REMAPPED",
+                extra=get_extra_info({
+                    **default_extra,
+                    "error_class": PORT_COLLISION_ERROR_CLASS,
+                    "docker_port": docker_port,
+                    "old_host_port": old_internal,
+                    "old_external_port": old_external,
+                    "new_host_port": chosen.internal_port,
+                    "new_external_port": chosen.external_port,
+                    "candidates": [pair.internal_port for pair in candidates],
+                    "probe": "listening" if listening is not None else "inconclusive",
+                }),
+            )
+        )
+        return dataclasses.replace(
+            run_spec,
+            ports=tuple(
+                dataclasses.replace(binding, host_port=chosen.internal_port)
+                if binding.protocol == "tcp" and binding.host_port == old_internal
+                else binding
+                for binding in run_spec.ports
+            ),
+        )
+
+    async def _listening_host_ports(
+        self, ssh_client: asyncssh.SSHClientConnection, default_extra: dict
+    ) -> set[int] | None:
+        """The host's listening TCP ports over the create's SSH session; None when unreadable
+        (then `docker run` itself is the probe of the first candidate)."""
+        try:
+            result = await asyncio.wait_for(
+                ssh_client.run(_LISTENING_PORTS_COMMAND, check=False),
+                timeout=_PORT_COLLISION_PROBE_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as probe_exc:
+            logger.warning(
+                _m(
+                    "PORT_COLLISION_PROBE_FAILED",
+                    extra=get_extra_info({**default_extra, "error": str(probe_exc)}),
+                )
+            )
+            return None
+        if result.exit_status != 0 or not (result.stdout or "").strip():
+            return None
+        return _parse_listening_ports(str(result.stdout))
 
     def _build_rental_container_run_spec(
         self,
@@ -5493,7 +5728,15 @@ class DockerService:
                         default_extra=default_extra,
                         local_volume=local_volume,
                         log_tag=log_tag,
+                        port_maps=port_maps,
+                        spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
                     )
+                    if jupyter_port_map:
+                        # a port collision may have moved the Jupyter mapping: the URL below
+                        # and the answer to the backend read the port the pod really got
+                        moved = self._find_mapping_by_docker_port(port_maps, jupyter_port_map[0])
+                        if moved is not None:
+                            jupyter_port_map = (moved[0], moved[2])
 
                     container_created = True
                     logger.info("Container creation step finished")
@@ -5843,6 +6086,9 @@ class DockerService:
         except Exception as e:
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
+            # `error_class` (e.g. `port_collision`: dockerd could not bind the pod's host port)
+            # rides in the event's detail next to the stage so the backend can count the class
+            error_class = port_collision_error_class(e)
             log_text = _m(
                 "Failed create_container",
                 extra=get_extra_info({
@@ -5850,6 +6096,7 @@ class DockerService:
                     # DAH-2740: a tenacity RetryError says nothing; the last attempt's text is the cause
                     "error": "; ".join(_exception_texts(e)),
                     "failure_step": current_step,
+                    **({"error_class": error_class} if error_class else {}),
                 }),
             )
             logger.error(log_text, exc_info=True)
