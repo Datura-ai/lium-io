@@ -776,8 +776,8 @@ class TenantEnforcementMessages:
     # DAH-2870: the container runs but the renter cannot get in (SSH port refuses, or
     # authorized_keys is unreadable because the volume is not mounted). Detected here, not scored;
     # the notice to the backend and the renter is the cycle-end flush's, so the impact says
-    # "queued", never "told" (Mikhail's review, 18 Sep: this renders before the flush, which can
-    # still get no answer or be suppressed). The check renders the NOT_QUEUED impact instead when
+    # "queued", never "told": this renders before the flush, which can still get no answer or be
+    # suppressed. The check renders the NOT_QUEUED impact instead when
     # no pod of the event queued one this cycle.
     RENTED_POD_SSH_UNREACHABLE = MessageTemplate(
         event="Rented pod refuses its renter over SSH",

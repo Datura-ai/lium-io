@@ -114,8 +114,8 @@ class _PassThroughLock:
 class RedisWrites:
     """Writes that apply together or not at all: `RedisService.write_atomically` runs them as one
     MULTI/EXEC. A state kept in several keys (a mark and a streak, a hash and its TTL) is moved in one
-    step, so a connection lost between two writes cannot leave half of it behind (DAH-2870, Rustam's
-    review: a healthy SET followed by a failed DELETE kept the old streak next to a fresh ok mark).
+    step, so a connection lost between two writes cannot leave half of it behind (DAH-2870: a
+    healthy SET followed by a failed DELETE kept the old streak next to a fresh ok mark).
     Only the write commands the validator uses are offered; the methods chain."""
 
     def __init__(self):
