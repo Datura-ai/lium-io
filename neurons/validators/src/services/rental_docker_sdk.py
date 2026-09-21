@@ -165,6 +165,12 @@ class ContainerStateSnapshot:
     exit_code: int | None
     restart_count: int
     error: str | None
+    oom_killed: bool
+
+    @property
+    def killed_by_host(self) -> bool:
+        """The kernel OOM killer or a SIGKILL (exit 137) ended it, not the image's own command."""
+        return self.oom_killed or self.exit_code == 137
 
     @property
     def exited_since_start(self) -> bool:
@@ -500,6 +506,7 @@ class RentalDockerSdkClient:
             exit_code=int(exit_code) if isinstance(exit_code, int) else None,
             restart_count=int(restart_count) if isinstance(restart_count, int) else 0,
             error=state.get("Error") or None,
+            oom_killed=bool(state.get("OOMKilled")),
         )
 
     def _mount_source_for_destination_sync(

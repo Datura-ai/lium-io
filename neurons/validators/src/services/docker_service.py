@@ -545,7 +545,7 @@ async def _explain_add_public_keys_failure(
             )
         )
         return cause
-    if not state.exited_since_start:
+    if not state.exited_since_start or state.killed_by_host:
         return cause
     if state.running:
         # Docker's restart policy already brought it back; the exec landed in the gap.

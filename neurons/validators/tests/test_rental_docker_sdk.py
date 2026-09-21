@@ -1336,7 +1336,29 @@ async def test_inspect_container_state_reads_state_and_restart_count():
 
 
 @pytest.mark.parametrize(
-    "inspect_result,exited",
+    "oom_killed,exit_code,expected_killed_by_host",
+    [
+        pytest.param(True, 137, True, id="oom-killed"),
+        pytest.param(False, 137, True, id="sigkill"),
+        pytest.param(False, 1, False, id="own-exit"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inspect_container_state_tells_a_host_kill(oom_killed, exit_code, expected_killed_by_host):
+    inspect_result = _container_state(status="exited", running=False, exit_code=exit_code)
+    inspect_result["State"]["OOMKilled"] = oom_killed
+    api_client = FakeApiClient()
+    api_client.container_states = [inspect_result]
+    client = RentalDockerSdkClient(api_client)
+
+    state = await client.inspect_container_state(container_name="pod_exec")
+
+    assert state.oom_killed is oom_killed
+    assert state.killed_by_host is expected_killed_by_host
+
+
+@pytest.mark.parametrize(
+    "inspect_result,expected_exited_since_start",
     [
         pytest.param(_container_state(), False, id="running-never-restarted"),
         pytest.param({**_container_state(), "RestartCount": 1}, True, id="running-again-after-a-restart"),
@@ -1350,14 +1372,14 @@ async def test_inspect_container_state_reads_state_and_restart_count():
     ],
 )
 @pytest.mark.asyncio
-async def test_inspect_container_state_tells_an_exit_since_start(inspect_result, exited):
+async def test_inspect_container_state_tells_an_exit_since_start(inspect_result, expected_exited_since_start):
     api_client = FakeApiClient()
     api_client.container_states = [inspect_result]
     client = RentalDockerSdkClient(api_client)
 
     state = await client.inspect_container_state(container_name="pod_exec")
 
-    assert state.exited_since_start is exited
+    assert state.exited_since_start is expected_exited_since_start
 
 
 @pytest.mark.asyncio

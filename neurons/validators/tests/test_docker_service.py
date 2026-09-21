@@ -6862,7 +6862,9 @@ _EXEC_KILLED_BY_EXIT = RuntimeError("Failed to add SSH public keys: exit_status=
 
 
 def _state(**overrides) -> ContainerStateSnapshot:
-    base = dict(status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None)
+    base = dict(
+        status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None, oom_killed=False
+    )
     return ContainerStateSnapshot(**{**base, **overrides})
 
 
@@ -6899,7 +6901,7 @@ def _failure_error_field(result: FailedContainerRequest) -> str:
 
 
 @pytest.mark.parametrize(
-    "state,marker",
+    "state,expected_backend_marker",
     [
         pytest.param(
             _state(status="exited", running=False, exit_code=0, restart_count=3),
@@ -6917,7 +6919,7 @@ def _failure_error_field(result: FailedContainerRequest) -> str:
             id="running-again-after-a-restart",
         ),
         pytest.param(
-            _state(status="dead", running=False, exit_code=137, restart_count=0),
+            _state(status="dead", running=False, exit_code=1, restart_count=0),
             "is not running",
             id="dead",
         ),
@@ -6925,14 +6927,14 @@ def _failure_error_field(result: FailedContainerRequest) -> str:
 )
 @pytest.mark.asyncio
 async def test_a_key_injection_that_fails_on_an_exiting_image_names_the_image(
-    docker_service, monkeypatch, state, marker
+    docker_service, monkeypatch, state, expected_backend_marker
 ):
     result = await _create_failing_at_add_public_keys(
         docker_service, monkeypatch, state=state, exec_error=_EXEC_KILLED_BY_EXIT
     )
 
     error = _failure_error_field(result)
-    assert marker in error, error
+    assert expected_backend_marker in error, error
     assert f"status={state.status!r}" in error
     assert f"image {_CUDA_IMAGE!r} has no long-running command" in error
     assert f"exit_code={state.exit_code!r}" in error
@@ -6952,6 +6954,25 @@ async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_
     )
 
     assert _failure_error_field(result) == str(exec_error)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param(_state(status="exited", running=False, exit_code=137, oom_killed=True), id="oom-killed"),
+        pytest.param(_state(status="exited", running=False, exit_code=137), id="sigkill"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_key_injection_that_fails_after_a_host_kill_keeps_the_exec_error(
+    docker_service, monkeypatch, state
+):
+    """An OOM or SIGKILL is not the image's fault: the renter must not read "add `sleep infinity`"."""
+    result = await _create_failing_at_add_public_keys(
+        docker_service, monkeypatch, state=state, exec_error=_EXEC_KILLED_BY_EXIT
+    )
+
+    assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
 
 
 @pytest.mark.asyncio
