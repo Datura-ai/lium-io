@@ -30,6 +30,11 @@ def test_version_is_public():
     assert _client().get("/version").status_code == 200
 
 
+def test_update_status_is_public():
+    # The release check polls it without a signature; the middleware must not answer 401.
+    assert _client().get("/update-status").status_code != 401
+
+
 def test_container_logs_reaches_its_own_signature_check():
     # Reaches the route: FastAPI rejects the missing signature headers (422),
     # not the middleware (401).
