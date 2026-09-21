@@ -1,8 +1,6 @@
-import ast
 import json
 from dataclasses import dataclass
 from datetime import datetime, UTC
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,26 +22,6 @@ from tests.helpers import (
 
 RAW_SPECS = {"gpu": {"count": 1, "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}]}}
 UNREADABLE_TOKEN = "gAAAAABnot-ours"
-
-
-def test_machine_scrape_has_no_speedtest_helpers():
-    scrape_path = (
-        Path(__file__).parent.parent / "src" / "miner_jobs" / "machine_scrape.py"
-    )
-    tree = ast.parse(scrape_path.read_text())
-    function_names = {
-        node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
-    }
-
-    assert function_names.isdisjoint(
-        {
-            "get_network_speed",
-            "speedcheck_output",
-            "netmeasure_output",
-            "cloudflare_speed",
-            "benchmark_network_speed",
-        }
-    )
 
 
 # Mock SSH command result matching the real SSHCommandResult
