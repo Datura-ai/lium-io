@@ -3163,7 +3163,11 @@ class DockerService:
         container_name: str,
         log_tag: str,
         log_extra: dict,
+        raise_if_container_gone: bool = False,
     ) -> bool:
+        # raise_if_container_gone: the create path wants the ContainerGoneBeforeExec (with the
+        # State it carries) rather than a False it never read; the start path keeps its
+        # "did not complete cleanly" warning for every failure of the first exec.
         local_script_path = self._ssh_bootstrap_script_path()
         container_path = IN_CONTAINER_SSH_BOOTSTRAP_PATH
 
@@ -3207,10 +3211,10 @@ class DockerService:
                 exec_spec=create_spec,
                 log_extra=log_extra,
             )
-        except ContainerGoneBeforeExec:
-            # The container has left: nothing below can run, and the create explains the exit.
-            raise
         except Exception as exc:
+            if raise_if_container_gone and isinstance(exc, ContainerGoneBeforeExec):
+                # The container has left: nothing below can run, and the create explains the exit.
+                raise
             await self.stream_log(
                 "Failed to create SSH bootstrap script in container",
                 "error",
@@ -5766,6 +5770,7 @@ class DockerService:
                             container_name=container_name,
                             log_tag=log_tag,
                             log_extra=default_extra,
+                            raise_if_container_gone=True,
                         )
 
                     jupyter_url = None

@@ -313,6 +313,61 @@ async def test_a_delete_in_flight_makes_it_cancelled_by_delete(svc, monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_a_kill_seen_at_the_key_injection_is_the_kill_not_an_exiting_image(svc, monkeypatch, caplog):
+    api = FakeApiClient()
+    api.container_states = [_oom_killed_state()]  # gone before the very first exec
+    _bootstrapping_create(svc, monkeypatch, api)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "killed_during_bootstrap"
+    assert "has no long-running command" not in result.detail  # DAH-3678 is for an image's own exit
+    assert "it ran out of memory" in result.detail and "during add_public_keys" in result.detail
+    assert api.exec_created == []
+
+
+@pytest.mark.asyncio
+async def test_an_image_whose_command_exits_at_the_key_injection_keeps_its_own_explanation(svc, monkeypatch, caplog):
+    api = FakeApiClient()
+    api.container_states = [_container_state(status="exited", running=False, exit_code=0)]
+    _bootstrapping_create(svc, monkeypatch, api)
+    caplog.set_level(logging.WARNING)
+
+    result = await _create(svc, _payload())
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "add_public_keys"
+    assert "has no long-running command" in result.detail
+    assert _events(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_the_start_path_keeps_its_soft_failure_for_a_gone_container(svc, monkeypatch, caplog):
+    # `start_existing_container` / the edit undo read the bool and warn; only the create asks to raise
+    api = FakeApiClient()
+    api.container_states = [_container_state(status="exited", running=False, exit_code=137)]
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    caplog.set_level(logging.WARNING)
+
+    ok = await svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+        docker_client=_SdkExecClient(api), container_name="pod_exec", log_tag="t", log_extra={}
+    )
+
+    assert ok is False
+    assert api.exec_created == []
+    with pytest.raises(ContainerGoneBeforeExec):
+        await svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+            docker_client=_SdkExecClient(api),
+            container_name="pod_exec",
+            log_tag="t",
+            log_extra={},
+            raise_if_container_gone=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_a_healthy_container_bootstraps_as_before(svc, monkeypatch, caplog):
     api = FakeApiClient()
     api.container_states = [_container_state()]
