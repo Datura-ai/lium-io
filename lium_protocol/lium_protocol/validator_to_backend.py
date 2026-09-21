@@ -346,6 +346,11 @@ class FailedContainerRequest(PodContainerResponse):
     # 1.1.0 (DAH-3504): the last lines a failed custom-Dockerfile build printed — the renter's own output,
     # never executor host data; None for every other failure and from validators before it
     build_log_tail: str | None = None
+    # 1.1.0 (DAH-3505): for the volume steps (volume_sizing / volume_creation) the Docker daemon's own bounded
+    # error text; for any other step only the fixed dead-transport hint when the SDK session was gone. Names the
+    # volume and the daemon's reason at most, never the executor's address, port or hotkey. None otherwise and
+    # from validators before it
+    step_detail: str | None = None
 
 
 class PodLog(pydantic.BaseModel):
