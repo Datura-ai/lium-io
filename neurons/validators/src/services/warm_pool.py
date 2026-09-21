@@ -31,6 +31,7 @@ import json
 import shlex
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 from payload_models.payloads import (
     ContainerCreateRequest,
@@ -412,8 +413,43 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
         return "entrypoint"
     if (config.get("Image") or "") != spec.image:
         return "image reference"
-    # Fields the rental spec never sets must be at dockerd's defaults: a container re-created on the
-    # host with any of them changed is not the container the rental would create.
+    # The slot sits on the network the rental would run on — the ICC-off `lium-rentals` bridge
+    # (DAH-3199, `spec.network`); a slot on docker0 or `host` would put the pod back on the network
+    # that bridge exists to end. A spec without a network expects dockerd's default bridge.
+    network_mode = host.get("NetworkMode") or "default"
+    expected_network = spec.network or "default"
+    if network_mode != expected_network and not (
+        expected_network == "default" and network_mode == "bridge"
+    ):
+        return "network"
+    if (default_reason := _slot_keeps_dockerd_defaults(host)) is not None:
+        return default_reason
+    if config.get("User"):
+        return "user"
+    # What runs inside the pod besides Cmd/Entrypoint: a healthcheck is a command dockerd runs in
+    # the container on a timer, so it must be the image's own; the working directory and stop
+    # signal likewise.
+    if (config.get("Healthcheck") or None) != (image_config.get("Healthcheck") or None):
+        return "healthcheck"
+    if (config.get("WorkingDir") or "") != (image_config.get("WorkingDir") or ""):
+        return "working dir"
+    if (config.get("StopSignal") or "") != (image_config.get("StopSignal") or ""):
+        return "stop signal"
+    if any(
+        (binding.get("HostIp") or "") not in ("", "0.0.0.0")
+        for bindings in (host.get("PortBindings") or {}).values()
+        for binding in bindings or []
+    ):
+        return "port host ip"
+    if any(m.get("Type") != "volume" or m.get("RW") is False for m in doc.get("Mounts") or []):
+        return "mount type"
+    return None
+
+
+def _slot_keeps_dockerd_defaults(host: dict) -> str | None:
+    """Why a slot's HostConfig fields the rental spec never sets are not at dockerd's defaults; None
+    when they all are. A container re-created on the host with any of them changed is not the
+    container the rental would create."""
     if host.get("Privileged"):
         return "privileged"
     if (host.get("PidMode") or "") or (host.get("IpcMode") or "private") not in ("", "private", "shareable"):
@@ -425,15 +461,6 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
     # in HostConfig.Mounts (the spec mounts through Binds only).
     if host.get("Tmpfs") or host.get("Mounts"):
         return "tmpfs or mount"
-    # The slot sits on the network the rental would run on — the ICC-off `lium-rentals` bridge
-    # (DAH-3199, `spec.network`); a slot on docker0 or `host` would put the pod back on the network
-    # that bridge exists to end. A spec without a network expects dockerd's default bridge.
-    network_mode = host.get("NetworkMode") or "default"
-    expected_network = spec.network or "default"
-    if network_mode != expected_network and not (
-        expected_network == "default" and network_mode == "bridge"
-    ):
-        return "network"
     if any(
         host.get(field)
         for field in (
@@ -485,25 +512,11 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
     # let a slot that pins swappiness pass; any value set means the slot can swap the renter's pod
     if host.get("MemorySwappiness") is not None:
         return "extra host config"
-    if config.get("User"):
-        return "user"
-    # What runs inside the pod besides Cmd/Entrypoint: a healthcheck is a command dockerd runs in
-    # the container on a timer, so it must be the image's own; the working directory and stop
-    # signal likewise.
-    if (config.get("Healthcheck") or None) != (image_config.get("Healthcheck") or None):
-        return "healthcheck"
-    if (config.get("WorkingDir") or "") != (image_config.get("WorkingDir") or ""):
-        return "working dir"
-    if (config.get("StopSignal") or "") != (image_config.get("StopSignal") or ""):
-        return "stop signal"
-    if any(
-        (binding.get("HostIp") or "") not in ("", "0.0.0.0")
-        for bindings in (host.get("PortBindings") or {}).values()
-        for binding in bindings or []
-    ):
-        return "port host ip"
-    if any(m.get("Type") != "volume" or m.get("RW") is False for m in doc.get("Mounts") or []):
-        return "mount type"
+    # dockerd masks /proc/kcore and friends and makes /proc/sys read-only on every container it
+    # creates; `--security-opt systempaths=unconfined` empties both lists, and the renter would get
+    # the host's /proc paths (Rustam's review, 21 Sep).
+    if not host.get("MaskedPaths") or not host.get("ReadonlyPaths"):
+        return "masked paths"
     return None
 
 
@@ -601,26 +614,38 @@ def _inspected_device_keys(host: dict) -> list[str]:
     ]
 
 
-def _device_requests(host: dict) -> list[tuple[int, tuple[str, ...], tuple[tuple[str, ...], ...]]]:
+class DeviceRequestKey(NamedTuple):
+    """One GPU DeviceRequest as `slot_matches` compares it: what docker reports for the slot and
+    what the rental spec would ask for, in one shape."""
+
+    count: int
+    device_ids: tuple[str, ...]
+    capabilities: tuple[tuple[str, ...], ...]
+
+
+def _device_requests(host: dict) -> list[DeviceRequestKey]:
     out = []
     for req in host.get("DeviceRequests") or []:
         caps = tuple(tuple(sorted(group)) for group in req.get("Capabilities") or [])
-        out.append((int(req.get("Count") or 0), tuple(sorted(req.get("DeviceIDs") or [])), caps))
+        out.append(
+            DeviceRequestKey(
+                count=int(req.get("Count") or 0),
+                device_ids=tuple(sorted(req.get("DeviceIDs") or [])),
+                capabilities=caps,
+            )
+        )
     return sorted(out)
 
 
-def _expected_device_requests(
-    requests: tuple[GpuDeviceRequest, ...],
-) -> list[tuple[int, tuple[str, ...], tuple[tuple[str, ...], ...]]]:
+def _expected_device_requests(requests: tuple[GpuDeviceRequest, ...]) -> list[DeviceRequestKey]:
     out = []
     for req in requests:
         # docker-py sends count=-1 when device ids are given; docker reports Count 0 for id lists.
-        count = 0 if req.device_ids else int(req.count or 0)
         out.append(
-            (
-                count,
-                tuple(sorted(req.device_ids)),
-                tuple(tuple(sorted(g)) for g in req.capabilities),
+            DeviceRequestKey(
+                count=0 if req.device_ids else int(req.count or 0),
+                device_ids=tuple(sorted(req.device_ids)),
+                capabilities=tuple(tuple(sorted(g)) for g in req.capabilities),
             )
         )
     return sorted(out)

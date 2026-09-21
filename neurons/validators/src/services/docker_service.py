@@ -1521,18 +1521,9 @@ class DockerService:
                 # smaller than what the host gives a whole-host rental now: rather than wait
                 # for a rental with a cap small enough to fit it, it goes, and the next
                 # filler start leaves one sized for the host as it is (one create's cost)
-                logger.info(
-                    _m(
-                        "warm_pool slot=remove reason=undersized",
-                        extra=get_extra_info({**default_extra, "slot": slot.name, "detail": size_reason}),
-                    )
+                await self._remove_rejected_warm_slot(
+                    ssh_client, slot, reason="undersized", detail=size_reason, default_extra=default_extra
                 )
-                with contextlib.suppress(Exception):
-                    await ssh_client.run(
-                        warm_pool.remove_slot_command(slot.name, slot.volume_name),
-                        check=False,
-                        timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
-                    )
                 continue
             if size_reason is not None:
                 # larger than this rental's cap: the slot may fit a rental with a larger one
@@ -1547,20 +1538,14 @@ class DockerService:
             # rental would be granted is read from the volume plugin itself before adoption.
             volume_reason = await self._warm_slot_volume_mismatch(ssh_client, slot)
             if volume_reason is not None:
-                logger.warning(
-                    _m(
-                        "warm_pool slot=remove reason=volume differs",
-                        extra=get_extra_info(
-                            {**default_extra, "slot": slot.name, "volume": slot.volume_name, "detail": volume_reason}
-                        ),
-                    )
+                await self._remove_rejected_warm_slot(
+                    ssh_client,
+                    slot,
+                    reason="volume differs",
+                    detail=volume_reason,
+                    default_extra=default_extra,
+                    level=logging.WARNING,
                 )
-                with contextlib.suppress(Exception):
-                    await ssh_client.run(
-                        warm_pool.remove_slot_command(slot.name, slot.volume_name),
-                        check=False,
-                        timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
-                    )
                 continue
             logger.info(
                 _m(
@@ -1573,6 +1558,33 @@ class DockerService:
                 volume_sizing=volume_sizing,
             )
         return WarmPoolLookup(adoption=None, volume_sizing=volume_sizing)
+
+    async def _remove_rejected_warm_slot(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        slot: warm_pool.WarmSlot,
+        *,
+        reason: str,
+        detail: str,
+        default_extra: dict,
+        level: int = logging.INFO,
+    ) -> None:
+        """Remove a slot the pick rejected (with its volume), best-effort, and say why."""
+        logger.log(
+            level,
+            _m(
+                f"warm_pool slot=remove reason={reason}",
+                extra=get_extra_info(
+                    {**default_extra, "slot": slot.name, "volume": slot.volume_name, "detail": detail}
+                ),
+            ),
+        )
+        with contextlib.suppress(Exception):
+            await ssh_client.run(
+                warm_pool.remove_slot_command(slot.name, slot.volume_name),
+                check=False,
+                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+            )
 
     async def _warm_slot_volume_mismatch(
         self, ssh_client: asyncssh.SSHClientConnection, slot: warm_pool.WarmSlot
