@@ -163,17 +163,45 @@ def adopt_block_reason(
     return None
 
 
-def find_slots_command(image: str) -> str:
-    """One host command: the image's inspect, a separator, then the inspect of every created slot.
+def inspect_image_command(image: str) -> str:
+    """The image's inspect as one JSON document; nothing on stdout when it is not on the host."""
+    return f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}"
 
-    The host decides how many labelled containers exist, so the slot part is capped; a truncated
+
+def parse_image_inspect(stdout: str) -> dict | None:
+    """The image document from `inspect_image_command` output, None when absent or not JSON."""
+    doc = _load_json((stdout or "").strip())
+    return doc if isinstance(doc, dict) else None
+
+
+def inspect_slots_command() -> str:
+    """The inspect of every created slot on the host, one JSON list.
+
+    The host decides how many labelled containers exist, so the output is capped; a truncated
     document does not parse and is reported as unreadable (None), never as "no slots"."""
     return (
-        f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}; "
-        f"echo {_FIND_SEPARATOR}; "
         f"/usr/bin/docker ps -aq --filter label={WARM_POOL_LABEL}=1 --filter status=created "
         f"| xargs -r /usr/bin/docker inspect | head -c {_SLOT_INSPECT_MAX_BYTES}"
     )
+
+
+def parse_slot_inspects(stdout: str) -> list[dict] | None:
+    """The slot documents from `inspect_slots_command` output: `[]` when the host listed none
+    (xargs -r prints nothing), None when it printed something that is not a JSON list."""
+    text = (stdout or "").strip()
+    if not text:
+        return []
+    slots = _load_json(text)
+    if not isinstance(slots, list):
+        return None
+    return [s for s in slots if isinstance(s, dict)]
+
+
+def find_slots_command(image: str) -> str:
+    """One host command for the rent path, which asks about one image: the image's inspect, a
+    separator, then the inspect of every created slot (`inspect_slots_command`). Pool maintenance
+    lists the slots once and inspects each image on its own."""
+    return f"{inspect_image_command(image)}; echo {_FIND_SEPARATOR}; {inspect_slots_command()}"
 
 
 def parse_find_slots_output(stdout: str) -> FindSlotsOutput:
@@ -182,15 +210,7 @@ def parse_find_slots_output(stdout: str) -> FindSlotsOutput:
     head, sep, tail = (stdout or "").partition(_FIND_SEPARATOR)
     if not sep:
         return FindSlotsOutput(image_doc=None, slot_docs=None)
-    image = _load_json(head.strip())
-    image_doc = image if isinstance(image, dict) else None
-    tail = tail.strip()
-    if not tail:
-        return FindSlotsOutput(image_doc=image_doc, slot_docs=[])
-    slots = _load_json(tail)
-    if not isinstance(slots, list):
-        return FindSlotsOutput(image_doc=image_doc, slot_docs=None)
-    return FindSlotsOutput(image_doc=image_doc, slot_docs=[s for s in slots if isinstance(s, dict)])
+    return FindSlotsOutput(image_doc=parse_image_inspect(head), slot_docs=parse_slot_inspects(tail))
 
 
 def slot_from_inspect(

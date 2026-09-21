@@ -1715,9 +1715,28 @@ class DockerService:
             await self._sweep_stale_warm_slots(
                 ssh_client=ssh_client, now=now, max_age=max_age, default_extra=default_extra
             )
-            for image in await self._warm_pool_images(ssh_client):
+            images = await self._warm_pool_images(ssh_client)
+            if not images:
+                return
+            # one host-wide slot listing, shared by every image's sweep; each image is inspected alone
+            listing = await ssh_client.run(
+                warm_pool.inspect_slots_command(), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
+            )
+            slot_docs = warm_pool.parse_slot_inspects(listing.stdout or "")
+            if slot_docs is None:
+                # unknown is not "none": a create on an unreadable listing adds a slot per filler start
+                logger.info(
+                    _m("warm_pool maintain=skip reason=listing unreadable", extra=get_extra_info(default_extra))
+                )
+                return
+            for image in images:
                 image_doc = await self._sweep_slots_and_image_to_fill(
-                    ssh_client=ssh_client, image=image, now=now, max_age=max_age, default_extra=default_extra
+                    ssh_client=ssh_client,
+                    image=image,
+                    slot_docs=slot_docs,
+                    now=now,
+                    max_age=max_age,
+                    default_extra=default_extra,
                 )
                 if image_doc is None:
                     continue
@@ -1744,28 +1763,24 @@ class DockerService:
         *,
         ssh_client: asyncssh.SSHClientConnection,
         image: str,
+        slot_docs: list[dict],
         now: datetime,
         max_age: timedelta,
         default_extra: dict,
     ) -> dict | None:
-        """One image's maintenance, both jobs: sweep its slots that are no longer fresh and all but
-        the newest fresh one, then say whether a slot must be created. Returns the image's inspect
-        when the image is left with no slot — the create should follow — and None when it has one,
-        is not on the host, or its slot listing could not be read (unknown is not "none": no create)."""
+        """One image's maintenance, both jobs: sweep its slots (from the host-wide `slot_docs`) that
+        are no longer fresh and all but the newest fresh one, then say whether a slot must be created.
+        Returns the image's inspect when the image is left with no slot — the create should follow —
+        and None when it has one or is not on the host."""
         probe = await ssh_client.run(
-            warm_pool.find_slots_command(image), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
+            warm_pool.inspect_image_command(image), check=False, timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC
         )
-        found = warm_pool.parse_find_slots_output(probe.stdout or "")
-        if found.image_doc is None:
+        image_doc = warm_pool.parse_image_inspect(probe.stdout or "")
+        if image_doc is None:
             return None
-        if found.slot_docs is None:
-            logger.info(
-                _m("warm_pool slot=skip reason=listing unreadable", extra=get_extra_info({**default_extra, "image": image}))
-            )
-            return None
-        image_id = found.image_doc.get("Id") or ""
+        image_id = image_doc.get("Id") or ""
         fresh: list[warm_pool.WarmSlot] = []
-        for doc in found.slot_docs:
+        for doc in slot_docs:
             if (doc.get("Config") or {}).get("Image") != image:
                 continue
             slot = warm_pool.slot_from_inspect(doc, image_id=image_id, now=now, max_age=max_age)
@@ -1799,7 +1814,7 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "slot": extra_slot.name}),
                 )
             )
-        return None if fresh else found.image_doc
+        return None if fresh else image_doc
 
     async def _sweep_stale_warm_slots(
         self,

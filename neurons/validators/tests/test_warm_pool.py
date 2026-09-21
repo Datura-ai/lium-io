@@ -375,6 +375,23 @@ def test_find_output_parses_image_and_slots():
     assert [s["Name"] for s in found.slot_docs] == ["/warm_a", "/warm_b"]
 
 
+def test_slot_listing_and_image_inspect_parse_on_their_own():
+    image = _image_doc()
+    assert warm_pool.parse_image_inspect(json.dumps(image) + "\n") == image
+    assert warm_pool.parse_image_inspect("") is None
+    assert warm_pool.parse_image_inspect("Error: No such image\n") is None
+    docs = [{"Name": "/warm_a"}, {"Name": "/warm_b"}]
+    assert warm_pool.parse_slot_inspects(json.dumps(docs) + "\n") == docs
+    assert warm_pool.parse_slot_inspects("\n") == []
+    whole = json.dumps(docs * 20)
+    assert warm_pool.parse_slot_inspects(whole[: len(whole) // 2]) is None
+    assert warm_pool.parse_slot_inspects('{"Name": "/warm_a"}') is None
+    # the rent path's one-command form is the two commands joined by the separator
+    assert warm_pool.find_slots_command(IMAGE) == (
+        f"{warm_pool.inspect_image_command(IMAGE)}; echo __LIUM_WARM_POOL__; {warm_pool.inspect_slots_command()}"
+    )
+
+
 def test_find_output_without_image_or_slots():
     none_listed = warm_pool.FindSlotsOutput(image_doc=None, slot_docs=[])
     assert warm_pool.parse_find_slots_output("__LIUM_WARM_POOL__\n") == none_listed
@@ -1231,8 +1248,10 @@ async def test_filler_start_leaves_one_slot_per_prepulled_image(svc, monkeypatch
     def _side(cmd, *args, **kwargs):
         if "cache_prefetch_state.json" in cmd:
             return _ssh_result(stdout=json.dumps(state))
-        if "__LIUM_WARM_POOL__" in cmd:
-            return _ssh_result(stdout=json.dumps(image) + "\n__LIUM_WARM_POOL__\n")
+        if cmd == warm_pool.inspect_image_command(IMAGE):
+            return _ssh_result(stdout=json.dumps(image))
+        if cmd == warm_pool.inspect_slots_command():
+            return _ssh_result(stdout="")
         if "nvidia-smi --query-gpu=uuid" in cmd:
             return _ssh_result(stdout="GPU-aaaa\nGPU-bbbb\n")
         if "docker info" in cmd:
@@ -1330,10 +1349,10 @@ async def test_filler_start_skips_images_that_already_have_a_slot_and_drops_stal
     def _side(cmd, *args, **kwargs):
         if "cache_prefetch_state.json" in cmd:
             return _ssh_result(stdout=json.dumps(state))
-        if "__LIUM_WARM_POOL__" in cmd:
-            return _ssh_result(
-                stdout=json.dumps(image) + "\n__LIUM_WARM_POOL__\n" + json.dumps([fresh])
-            )
+        if cmd == warm_pool.inspect_image_command(IMAGE):
+            return _ssh_result(stdout=json.dumps(image))
+        if cmd == warm_pool.inspect_slots_command():
+            return _ssh_result(stdout=json.dumps([fresh]))
         if "docker ps -a --filter label=lium.warm_pool=1" in cmd:
             return _ssh_result(
                 stdout=f"warm_old\t{(datetime.now(UTC) - timedelta(hours=48)).isoformat()}\n"
@@ -1356,6 +1375,59 @@ async def test_filler_start_skips_images_that_already_have_a_slot_and_drops_stal
     assert isinstance(result, ContainerCreated)
     assert client.created == []
     assert any("docker rm -f warm_old" in c and "volume rm volume_old" in c for c in _cmds(ssh))
+
+
+@pytest.mark.asyncio
+async def test_filler_start_lists_the_slots_once_for_all_prepulled_images(svc, monkeypatch):
+    """The slot listing is host-wide, so it runs once per maintenance; each pre-pulled image then
+    costs one `docker image inspect`, not a repeat of the listing. Every image here has its slot, so
+    the maintenance walks all of them and creates nothing."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    other_ref = "daturaai/other:2.0.0"
+    image = _image_doc()
+    other = _image_doc(Id="sha256:" + "22" * 32)
+    other["RepoTags"] = [other_ref]
+    fresh = _slot_doc(_spec(svc, _adoptable_payload()), image)
+    other_slot = _slot_doc(_spec(svc, _adoptable_payload(docker_image=other_ref)), other)
+    state = {
+        "images": {
+            IMAGE: {"last_pull_ok_at": "2026-09-09T01:00:00Z"},
+            other_ref: {"last_pull_ok_at": "2026-09-09T02:00:00Z"},
+        }
+    }
+    ssh = _ssh_client(inspect_exit=0)
+
+    def _side(cmd, *args, **kwargs):
+        if "cache_prefetch_state.json" in cmd:
+            return _ssh_result(stdout=json.dumps(state))
+        if cmd == warm_pool.inspect_image_command(IMAGE):
+            return _ssh_result(stdout=json.dumps(image))
+        if cmd == warm_pool.inspect_image_command(other_ref):
+            return _ssh_result(stdout=json.dumps(other))
+        if cmd == warm_pool.inspect_slots_command():
+            return _ssh_result(stdout=json.dumps([fresh, other_slot]))
+        return _ssh_result(exit_status=0)
+
+    ssh.run = AsyncMock(side_effect=_side)
+    _patch_happy(svc, monkeypatch, ssh)
+    client = _CreatingFakeClient(svc.rental_docker_client_factory.client)
+    svc.rental_docker_client_factory.client = client
+    filler = _payload(workload_kind=WorkloadKind.FILLER, docker_image="daturaai/empty-job:1.0.0")
+
+    result = await svc.create_container(
+        payload=filler,
+        executor_info=_executor_info(filler),
+        keypair=Mock(ss58_address="v"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated)
+    assert client.created == []
+    cmds = _cmds(ssh)
+    assert cmds.count(warm_pool.inspect_slots_command()) == 1
+    assert cmds.count(warm_pool.inspect_image_command(IMAGE)) == 1
+    assert cmds.count(warm_pool.inspect_image_command(other_ref)) == 1
+    assert not any("__LIUM_WARM_POOL__" in c or "docker rm -f warm_" in c for c in cmds)
 
 
 @pytest.mark.asyncio
@@ -1404,6 +1476,7 @@ async def test_filler_start_with_the_flag_off_touches_no_pool(svc, monkeypatch):
     assert isinstance(result, ContainerCreated)
     # no sweep, no prefetch-state read, no slot lookup: the pool is not maintained with the flag off
     assert warm_pool.list_slots_command() not in _cmds(ssh)
+    assert warm_pool.inspect_slots_command() not in _cmds(ssh)
     assert not any("__LIUM_WARM_POOL__" in c or "cache_prefetch_state" in c for c in _cmds(ssh))
 
 
@@ -1644,10 +1717,10 @@ async def test_maintenance_removes_a_slot_whose_image_was_repulled_and_survives_
     def _side(cmd, *args, **kwargs):
         if "cache_prefetch_state.json" in cmd:
             return _ssh_result(stdout=json.dumps(state))
-        if "__LIUM_WARM_POOL__" in cmd:
-            return _ssh_result(
-                stdout=json.dumps(image) + "\n__LIUM_WARM_POOL__\n" + json.dumps([stale])
-            )
+        if cmd == warm_pool.inspect_image_command(IMAGE):
+            return _ssh_result(stdout=json.dumps(image))
+        if cmd == warm_pool.inspect_slots_command():
+            return _ssh_result(stdout=json.dumps([stale]))
         if "nvidia-smi --query-gpu=uuid" in cmd:
             return _ssh_result(stdout="GPU-aaaa\n")
         if "docker info" in cmd:
@@ -1726,9 +1799,10 @@ def _filler_host(svc, monkeypatch, *, gpu_uuids=("GPU-aaaa",), device_nodes=(), 
     def _side(cmd, *args, **kwargs):
         if "cache_prefetch_state.json" in cmd:
             return _ssh_result(stdout=json.dumps(state))
-        if "__LIUM_WARM_POOL__" in cmd:
-            tail = json.dumps(list(slots)) if slots else ""
-            return _ssh_result(stdout=json.dumps(image) + "\n__LIUM_WARM_POOL__\n" + tail)
+        if cmd == warm_pool.inspect_image_command(IMAGE):
+            return _ssh_result(stdout=json.dumps(image))
+        if cmd == warm_pool.inspect_slots_command():
+            return _ssh_result(stdout=json.dumps(list(slots)) if slots else "")
         if "nvidia-smi --query-gpu=uuid" in cmd:
             return _ssh_result(stdout="".join(f"{u}\n" for u in gpu_uuids))
         if "docker info" in cmd:
@@ -1847,7 +1921,8 @@ async def test_cvm_node_gets_no_slot(svc, monkeypatch):
     ssh, client, _ = _filler_host(svc, monkeypatch)
     await _start_filler(svc, tdx_quote="quote-bytes")
     assert client.created == []
-    assert not any("__LIUM_WARM_POOL__" in c for c in _cmds(ssh))
+    assert warm_pool.inspect_slots_command() not in _cmds(ssh)
+    assert not any("docker image inspect" in c for c in _cmds(ssh))
 
 
 # ------------------------------------------------------------------
@@ -1868,8 +1943,10 @@ async def test_unreadable_slot_listing_creates_nothing(svc, monkeypatch):
     def _side(cmd, *args, **kwargs):
         if "cache_prefetch_state.json" in cmd:
             return _ssh_result(stdout=json.dumps(state))
-        if "__LIUM_WARM_POOL__" in cmd:
-            return _ssh_result(stdout=json.dumps(image) + "\n__LIUM_WARM_POOL__\n" + whole[: len(whole) // 2])
+        if cmd == warm_pool.inspect_image_command(IMAGE):
+            return _ssh_result(stdout=json.dumps(image))
+        if cmd == warm_pool.inspect_slots_command():
+            return _ssh_result(stdout=whole[: len(whole) // 2])
         if "nvidia-smi --query-gpu=uuid" in cmd:
             return _ssh_result(stdout="GPU-aaaa\n")
         return _ssh_result(exit_status=0)
