@@ -36,6 +36,7 @@ DISK_HEALTH_HELPERS = {
     "ERRNO_EDQUOT",
     "READ_ONLY_MOUNT_OPTIONS",
     "DiskHealthObservation",
+    "MountLine",
     "covering_mount",
     "mounts_holding",
     "write_probe_failure_reason",

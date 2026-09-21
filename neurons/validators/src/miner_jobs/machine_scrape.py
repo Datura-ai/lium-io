@@ -1546,19 +1546,28 @@ def mounts_holding(mounts_text: str, path: str) -> list[str]:
     kernel 6.6 an ext4 error under errors=remount-ro keeps `rw` in the options and adds
     `emergency_ro` instead. One element or none; a list so the payload shape holds."""
     covering = covering_mount(mounts_text, path)
-    if covering is None or not READ_ONLY_MOUNT_OPTIONS & set(covering[3].split(",")):
+    if covering is None or not READ_ONLY_MOUNT_OPTIONS & set(covering.options):
         return []
-    return [covering[1]]
+    return [covering.mount_point]
 
 
-def covering_mount(mounts_text: str, path: str) -> list[str] | None:
-    """The /proc/<pid>/mounts line whose filesystem a write to `path` lands on, split into its
-    fields (source, mount point, fstype, options, ...); None when no line covers the path.
+class MountLine:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, source: str, mount_point: str, options: list[str]) -> None:
+        self.source = source
+        self.mount_point = mount_point
+        self.options = options
+
+
+def covering_mount(mounts_text: str, path: str) -> MountLine | None:
+    """The /proc/<pid>/mounts line whose filesystem a write to `path` lands on; None when no line
+    covers the path.
 
     The longest mount point that is `path` or a parent of it, the last line winning when a point
     is mounted over. One rule for both readers of the mount table (`mounts_holding`,
     `block_device_holding`), so the disk that is judged read-only is the disk that is typed."""
-    covering: list[str] | None = None
+    covering: MountLine | None = None
     for line in mounts_text.splitlines():
         fields = line.split()
         if len(fields) < 4:
@@ -1566,8 +1575,8 @@ def covering_mount(mounts_text: str, path: str) -> list[str] | None:
         mount_point = fields[1]
         if path != mount_point and not path.startswith(mount_point.rstrip("/") + "/"):
             continue
-        if covering is None or len(mount_point) >= len(covering[1]):
-            covering = fields
+        if covering is None or len(mount_point) >= len(covering.mount_point):
+            covering = MountLine(fields[0], mount_point, fields[3].split(","))
     return covering
 
 
@@ -1603,11 +1612,10 @@ def block_device_holding(mounts_text: str, path: str) -> str | None:
     (a scrape run outside the executor container, a node sysfs does not list) the name as mounted is
     the reading; a by-uuid link then types as unknown downstream."""
     covering = covering_mount(mounts_text, path)
-    if covering is None or not covering[0].startswith("/dev/"):
+    if covering is None or not covering.source.startswith("/dev/"):
         return None
-    source = covering[0]
-    kernel_name = kernel_name_of_device_node(f"{HOST_ROOT_PREFIX}{source}")
-    return kernel_name or os.path.basename(source) or None
+    kernel_name = kernel_name_of_device_node(f"{HOST_ROOT_PREFIX}{covering.source}")
+    return kernel_name or os.path.basename(covering.source) or None
 
 
 def kernel_name_of_device_node(node_path: str) -> str | None:
@@ -1664,7 +1672,7 @@ def disk_type_of(device_name: str | None) -> str:
     return DISK_TYPE_UNKNOWN
 
 
-def get_disk_type() -> str:
+def get_docker_root_disk_type() -> str:
     """The disk type under docker's data root - the filesystem get_host_disk_usage measures."""
     try:
         docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
@@ -1934,7 +1942,7 @@ def get_machine_specs():
         data["hard_disk_docker_scrape_error"] = repr(exc)
 
     try:
-        data["data_hard_disk"]["hard_disk_disk_type"] = get_disk_type()
+        data["data_hard_disk"]["hard_disk_disk_type"] = get_docker_root_disk_type()
     except Exception:
         # a mount table the scrape cannot read is an unknown disk, not a lost hard_disk block
         data["data_hard_disk"]["hard_disk_disk_type"] = DISK_TYPE_UNKNOWN

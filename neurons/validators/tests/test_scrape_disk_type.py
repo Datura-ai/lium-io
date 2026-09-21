@@ -1,4 +1,4 @@
-"""DAH-3674 — get_disk_type() in machine_scrape.py: nvme | ssd | hdd | unknown for the disk under docker's data root.
+"""DAH-3674 — get_docker_root_disk_type() in machine_scrape.py: nvme | ssd | hdd | unknown for the disk under docker's data root.
 
 Two aggregators that list Lium (GPU Finder, rentgpu.org) filter on disk type; the specs carried the disk's size and
 health and nothing about its kind. The scrape now takes the docker root's mount source off the host mount table, names
@@ -35,12 +35,13 @@ DISK_TYPE_HELPERS = {
     "DISK_TYPE_HDD",
     "DISK_TYPE_UNKNOWN",
     "UNTYPED_DEVICE_PREFIXES",
+    "MountLine",
     "covering_mount",
     "block_device_holding",
     "kernel_name_of_device_node",
     "whole_disk_of",
     "disk_type_of",
-    "get_disk_type",
+    "get_docker_root_disk_type",
 }
 
 # /proc/1/mounts of a host whose docker root sits on its own NVMe disk; the root is a partition of a SATA disk.
@@ -329,9 +330,9 @@ def test_no_device_is_unknown(scrape: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# get_disk_type: the docker root, the mount table, sysfs, end to end
+# get_docker_root_disk_type: the docker root, the mount table, sysfs, end to end
 # --------------------------------------------------------------------------------------------------
-def test_get_disk_type_reads_the_disk_under_the_docker_root(
+def test_get_docker_root_disk_type_reads_the_disk_under_the_docker_root(
     scrape: dict[str, Any], tmp_path: Path
 ) -> None:
     # Arrange — docker's data root on a spinning SATA disk while the root filesystem is NVMe
@@ -345,10 +346,10 @@ def test_get_disk_type_reads_the_disk_under_the_docker_root(
     scrape["docker_api_get"] = lambda path: {"DockerRootDir": "/data/docker"}
 
     # Act / Assert
-    assert scrape["get_disk_type"]() == "hdd"
+    assert scrape["get_docker_root_disk_type"]() == "hdd"
 
 
-def test_get_disk_type_falls_back_to_var_lib_docker_when_the_docker_socket_is_down(
+def test_get_docker_root_disk_type_falls_back_to_var_lib_docker_when_the_docker_socket_is_down(
     scrape: dict[str, Any], tmp_path: Path
 ) -> None:
     (tmp_path / "mounts").write_text("/dev/nvme0n1p2 / ext4 rw,relatime 0 0\n")
@@ -361,7 +362,7 @@ def test_get_disk_type_falls_back_to_var_lib_docker_when_the_docker_socket_is_do
 
     scrape["docker_api_get"] = socket_down
 
-    assert scrape["get_disk_type"]() == "nvme"
+    assert scrape["get_docker_root_disk_type"]() == "nvme"
 
 
 # --------------------------------------------------------------------------------------------------
