@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 DIND_SSH_READY_TIMEOUT_SECONDS = 30
 DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
+# cap on the one `docker logs` + `docker exec tail` read of a failed container (DAH-2856)
+DIND_DIAGNOSTICS_TIMEOUT_SECONDS = 15
 
 # DAH-2856: when the container started but sshd never answered, the validator used to know only
 # "connection refused" and the node was scored as having no sysbox — with "install sysbox" as
@@ -201,7 +203,8 @@ class DindVerifier:
         """
         try:
             result = await asyncio.wait_for(
-                ssh_client.run(DockerCommand.dind_diagnostics(name)), timeout=15
+                ssh_client.run(DockerCommand.dind_diagnostics(name)),
+                timeout=DIND_DIAGNOSTICS_TIMEOUT_SECONDS,
             )
             stdout = result.stdout if isinstance(result.stdout, str) else ""
         except Exception as read_error:
