@@ -35,7 +35,12 @@ from neurons.validators.src.services.verifyx_validation_service import (
 )
 from tests.helpers import build_context_config, build_services, build_state
 from tests.test_incentive_flow import _run_sync_with_jobs
-from tests.test_verifyx_capacity_probe import _challenge_data, _judge, _probe_payload
+from tests.test_verifyx_capacity_probe import (
+    _challenge_data,
+    _cloudflare_unreachable_payload,
+    _judge,
+    _probe_payload,
+)
 from tests.test_verifyx_check import DummyVerifyXService, _rented_data_with_ema
 
 pytest_plugins = ["fixtures.incentive_fixtures"]
@@ -192,6 +197,49 @@ def test_shadow_gates_like_off_without_a_cloudflare_reading(mode):
     assert stats["success"] is True
     assert stats["download_speed"] == 300.0
     assert stats["capacity_download_speed"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_mode", ["off", "shadow"])
+async def test_five_failed_probes_decay_and_fail_the_node_exactly_as_on_main(
+    context_factory, mode, gate_mode
+):
+    # The package downloads at 900 Mbps and the probe fails as a whole (Cloudflare unreachable).
+    # main's _verify_network_test returns {"success": False} with no download_speed, so the check
+    # feeds 0.0 and the EMA halves each cycle from 2000: 1000, 500, 250, 125, 62.5, and the fifth
+    # cycle fails the 100 Mbps floor. Before this, shadow kept 900 and ended at 934.4, still listed.
+    mode(gate_mode)
+    payload = _cloudflare_unreachable_payload(single_stream_mbps=900.0)
+    main_stats = {"success": False}
+    main_errors = [f"Network execution failed: {payload['error']}"]
+    main_emas = [1000.0, 500.0, 250.0, 125.0, 62.5]
+    main_passed = [True, True, True, True, False]
+
+    stats, errors = _verify_network_test(_challenge_data(), {"network_execution": payload})
+    shadow_keys = {"package_download_speed": 900.0}
+    if gate_mode == "shadow":
+        shadow_keys["capacity_download_speed"] = 0.0
+    assert stats == {**main_stats, **shadow_keys}
+    assert errors == main_errors
+
+    ema, emas, passed, gate_records = 2000.0, [], [], []
+    for _ in range(5):
+        result, _ = await _run_check(context_factory, _judge(payload), prev_ema=ema)
+        network = result.updates["state"].specs["network"]
+        assert "verifyx_download_speed" not in network
+        ema = network["ema_verifyx_download_speed"]
+        emas.append(ema)
+        passed.append(result.passed)
+        gate_records.append(result.event.what_we_saw.get("network_gate"))
+
+    assert emas == main_emas
+    assert passed == main_passed
+    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+    if gate_mode == "off":
+        assert gate_records == [None] * 5
+    else:
+        assert [record["ema_package"] for record in gate_records] == main_emas
+        assert [record["capacity_download_speed"] for record in gate_records] == [0.0] * 5
 
 
 @pytest.mark.asyncio

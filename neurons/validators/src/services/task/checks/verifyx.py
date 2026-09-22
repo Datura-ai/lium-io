@@ -175,7 +175,7 @@ class VerifyXCheck:
 
             # Always compute verifyx network EMA — use 0.0 when network measurement failed
             # so EMA decays toward 0 on repeated failures, eventually triggering exclusion.
-            # A malformed reading never reaches compute_ema: the previous EMA stands.
+            # Under enforce a malformed reading never reaches compute_ema: the previous EMA stands.
             if "network" not in updated_specs:
                 updated_specs["network"] = {}
             download_speed = verifyx_network.get("download_speed")
@@ -231,7 +231,7 @@ class VerifyXCheck:
                 event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
             if unavailable_readings:
                 event.what_we_saw["unavailable_speed_readings"] = unavailable_readings
-            network_gate = _network_gate(verifyx_network, prev_ema)
+            network_gate = _network_gate(verifyx_network, prev_ema, ema_download)
             if network_gate is not None:
                 event.what_we_saw["network_gate"] = network_gate
                 NETWORK_GATE_TALLY.record(
@@ -335,6 +335,8 @@ def _download_speed(result) -> float | None:
     if not result.data:
         return None
     speed = (result.data.get("network") or {}).get("download_speed")
+    if settings.verifyx.NETWORK_GATE_MODE != "enforce":
+        return speed
     return speed if _is_speed_reading(speed) else None
 
 
@@ -349,11 +351,13 @@ def _feed_ema(
     """Publish one VerifyX speed reading and its EMA into `network`; return the EMA.
 
     None is a failed measurement: the EMA takes 0.0 so repeated failures decay it toward
-    exclusion. A reading `_is_speed_reading` rejects (a string, a bool, NaN, ±inf, a negative)
-    is malformed: it never reaches `compute_ema`, is not published as the raw speed, the
-    previous EMA stands (None when there was none) and the sample is logged as unavailable.
+    exclusion. Off and shadow stop there, as main does. Under enforce a reading
+    `_is_speed_reading` rejects (a string, a bool, NaN, ±inf, a negative) is malformed: it never
+    reaches `compute_ema`, is not published as the raw speed, the previous EMA stands (None when
+    there was none) and the sample is logged as unavailable.
     """
-    if reading is not None and not _is_speed_reading(reading):
+    enforce = settings.verifyx.NETWORK_GATE_MODE == "enforce"
+    if enforce and reading is not None and not _is_speed_reading(reading):
         unavailable.append(direction)
         logger.warning(
             _m(
@@ -379,30 +383,32 @@ def _feed_ema(
 
 
 def _ema_if_gated(prev: float | None, reading: object) -> float | None:
-    """The download EMA `_feed_ema` would store were `reading` the gated one."""
+    """The download EMA enforce's `_feed_ema` would store were `reading` the gated one."""
     if reading is not None and not _is_speed_reading(reading):
         return prev
     return compute_ema(prev, reading if reading is not None else 0.0)
 
 
-def _network_gate(verifyx_network: dict, prev_ema) -> dict | None:
-    """DAH-2774 shadow record: the floor read against the package and the capacity reading, both
-    from the same previous EMA. Under enforce `ema_capacity` is the EMA the check gates on, under
-    shadow `ema_package`; the other says what the node would get on the first cycle of the other
-    mode. None under off."""
+def _network_gate(verifyx_network: dict, prev_ema, ema_gated: float | None) -> dict | None:
+    """DAH-2774 shadow record: the floor read against the package and the capacity reading.
+    `ema_gated` is the EMA the check stored and gates on: `ema_package` under shadow (main's
+    number, a failed probe included), `ema_capacity` under enforce. The other is computed from
+    the same previous EMA and says what the node would get on the first cycle of the other mode.
+    None under off."""
     mode = settings.verifyx.NETWORK_GATE_MODE
     if mode == "off":
         return None
     prev = prev_ema.ema_verifyx_download_speed if prev_ema else None
     package = verifyx_network.get("package_download_speed")
     capacity = verifyx_network.get("capacity_download_speed")
+    enforce = mode == "enforce"
     return {
         "mode": mode,
         "floor_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
         "package_download_speed": package,
         "capacity_download_speed": capacity,
-        "ema_package": _ema_if_gated(prev, package),
-        "ema_capacity": _ema_if_gated(prev, capacity),
+        "ema_package": _ema_if_gated(prev, package) if enforce else ema_gated,
+        "ema_capacity": ema_gated if enforce else _ema_if_gated(prev, capacity),
     }
 
 

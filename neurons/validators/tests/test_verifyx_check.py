@@ -7,6 +7,7 @@ from neurons.validators.src.services.task.messages import (
     VERIFYX_DEBUG_DOC_URL,
     VerifyXMessages as Msg,
 )
+from neurons.validators.src.services.verifyx_validation_service import settings
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
 from tests.helpers import build_context_config, build_services, build_state
@@ -238,6 +239,13 @@ async def test_verifyx_failure_without_diagnostics_falls_back_to_generic_templat
     # No diagnostic keys when no diagnostics available
     assert "failure_class" not in result.event.what_we_saw
     assert result.event.help_uri == VERIFYX_DEBUG_DOC_URL
+
+
+@pytest.fixture
+def enforce_gate(monkeypatch):
+    # The malformed-reading guard is enforce-only; off/shadow feed the EMA as main does
+    # (test_verifyx_network_gate_mode.py).
+    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "enforce")
 
 
 def _rented_data_with_ema(executor_uuid: str, *, download: float | None = None, upload: float | None = None) -> RentedExecutorsResponse:
@@ -510,6 +518,7 @@ async def _run_ema_cycle(
     return await VerifyXCheck().run(ctx)
 
 
+@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "download,expected_ema,published",
@@ -555,6 +564,7 @@ async def test_verifyx_download_reading_feeds_the_ema_only_when_it_is_a_number(
         assert unavailable_logs == []
 
 
+@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.asyncio
 async def test_verifyx_ema_over_a_sequence_of_good_missing_and_malformed_readings(
     context_factory,
@@ -574,6 +584,7 @@ async def test_verifyx_ema_over_a_sequence_of_good_missing_and_malformed_reading
         assert ema == pytest.approx(expected), reading
 
 
+@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.asyncio
 async def test_verifyx_malformed_upload_keeps_the_upload_ema_and_updates_the_download(
     context_factory,
@@ -589,6 +600,7 @@ async def test_verifyx_malformed_upload_keeps_the_upload_ema_and_updates_the_dow
     assert result.event.what_we_saw["unavailable_speed_readings"] == ["upload"]
 
 
+@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.asyncio
 async def test_verifyx_malformed_download_on_a_never_measured_host_leaves_the_ema_unseeded(
     context_factory,
@@ -607,6 +619,7 @@ async def test_verifyx_malformed_download_on_a_never_measured_host_leaves_the_em
     assert result.event.what_we_saw["unavailable_speed_readings"] == ["download"]
 
 
+@pytest.mark.usefixtures("enforce_gate")
 @pytest.mark.parametrize("reading", ["fast", True, float("nan"), float("inf"), -1.0])
 def test_download_speed_helper_reads_a_malformed_reading_as_none(reading):
     from neurons.validators.src.services.task.checks.verifyx import _download_speed

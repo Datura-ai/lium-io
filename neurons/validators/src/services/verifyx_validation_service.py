@@ -539,37 +539,92 @@ def _as_measured_for_the_previous_library(payload: dict) -> dict:
 
 
 def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
-    """`download_speed` is the gated reading VERIFYX_NETWORK_GATE_MODE names: the Cloudflare
-    capacity under enforce, the package download under off/shadow. Under shadow and enforce the
-    capacity reading is also published as `capacity_download_speed`."""
-    network_execution = response_data["network_execution"]
+    """Off and shadow return main's network stats unchanged: the same package reading, the same
+    failure handling (a failed probe carries no `download_speed`, so the EMA is fed 0.0) and the
+    same exceptions. Both add the package reading as `package_download_speed`; shadow adds the
+    Cloudflare capacity as `capacity_download_speed`, which scores nothing. Enforce gates on the
+    capacity (`_verify_network_capacity_test`)."""
     mode = settings.verifyx.NETWORK_GATE_MODE
-    enforce = mode == "enforce"
+    if mode == "enforce":
+        return _verify_network_capacity_test(challenge_data, response_data)
+    stats, errors = _verify_network_package_test(challenge_data, response_data)
+    network_execution = response_data["network_execution"]
+    package_speed = (network_execution.get("download") or {}).get("speed_mbps")
+    stats["package_download_speed"] = package_speed if _is_speed_reading(package_speed) else None
+    if mode == "shadow":
+        capacity_speed = (network_execution.get("speedtest") or {}).get("download_mbps")
+        stats["capacity_download_speed"] = capacity_speed if _is_speed_reading(capacity_speed) else None
+    return stats, errors
+
+
+def _verify_network_package_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+    """main's `_verify_network_test`, verbatim: what off and shadow gate and list on."""
+    network_execution = response_data["network_execution"]
+
+    if not network_execution["success"]:
+        return {"success": False}, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
+
+    errors = []
+    success = True
+
+    expected_download = challenge_data["network_challenge"]["download"]
+    download_result = network_execution["download"]
+    if download_result["pkg"] != expected_download["pkg"]:
+        errors.append(f"Resource validation failed: {download_result['pkg']}")
+        success = False
+
+    if download_result["size"] != expected_download["size"]:
+        errors.append(f"Size validation failed for {download_result['pkg']}")
+        success = False
+
+    if download_result["hash"] != expected_download["hash"]:
+        errors.append(f"Integrity check failed for {download_result['pkg']}")
+        success = False
+
+    download_speed = network_execution["download"]["speed_mbps"]
+    upload_speed = network_execution.get("speedtest", {}).get("upload_mbps")
+
+    if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
+        errors.append(
+            f"Network download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+        )
+        success = False
+
+    stats = {
+        "download_speed": download_speed,
+        "upload_speed": upload_speed,
+        "success": success,
+        "execution_time_ms": network_execution["execution_time_ms"],
+    }
+
+    return stats, errors
+
+
+def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+    """Enforce: `download_speed` is the Cloudflare capacity; the package download keeps its own
+    floor and is published as `package_download_speed`, the capacity as `capacity_download_speed`."""
+    network_execution = response_data["network_execution"]
 
     if not network_execution["success"]:
         # The probe fails as a whole when either direction fails, but the directions are
         # independent (celium-gpu-verifier#25): an upload that could not move its payload still
-        # leaves real download readings from the same run. Keep the gated one so the fatal
+        # leaves real download readings from the same run. Keep the capacity reading so the fatal
         # download EMA (checks/verifyx.py) is fed the measured value, not a 0; success and
         # upload_speed carry the failure.
         speedtest = network_execution.get("speedtest") or {}
         capacity_speed = speedtest.get("download_mbps")
         package_speed = (network_execution.get("download") or {}).get("speed_mbps")
         upload_speed = speedtest.get("upload_mbps")
-        gated_speed = capacity_speed if enforce else package_speed
         stats = {
-            "download_speed": gated_speed if _is_positive_number(gated_speed) else None,
+            "download_speed": capacity_speed if _is_positive_number(capacity_speed) else None,
             # 0.0 is how the probe reports the failed direction; anything that is not a number is
             # a malformed payload and reads as "no upload measurement" like the download above.
             "upload_speed": upload_speed if _is_speed_reading(upload_speed) else None,
             "package_download_speed": package_speed if _is_positive_number(package_speed) else None,
             "success": False,
+            "capacity_download_speed": capacity_speed if _is_positive_number(capacity_speed) else None,
             "execution_time_ms": network_execution.get("execution_time_ms"),
         }
-        if mode != "off":
-            stats["capacity_download_speed"] = (
-                capacity_speed if _is_positive_number(capacity_speed) else None
-            )
         return stats, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
 
     errors = []
@@ -593,34 +648,30 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
     upload_speed = speedtest.get("upload_mbps")
     capacity_speed = speedtest.get("download_mbps")
     package_download_speed = download_result.get("speed_mbps")
-    download_speed = capacity_speed if enforce else package_download_speed
+    download_speed = capacity_speed
     stats = {
         "download_speed": download_speed,
         "upload_speed": upload_speed,
         "package_download_speed": package_download_speed,
+        "capacity_download_speed": capacity_speed,
         "success": success,
         "execution_time_ms": network_execution.get("execution_time_ms"),
     }
-    if mode != "off":
-        stats["capacity_download_speed"] = capacity_speed
 
     # A probe that could not reach Cloudflare (no `speedtest` block, a null or zero reading) is a
     # failed measurement, never an exception: an exception here is caught upstream as "challenge
     # verification failed" and rejects the machine even while VERIFYX_NETWORK_VALIDATION is off.
-    # Off and shadow need only the package reading they gate on.
-    required = (upload_speed, capacity_speed, package_download_speed) if enforce else (download_speed,)
-    if not all(_is_positive_number(value) for value in required):
+    if not all(_is_positive_number(value) for value in (upload_speed, capacity_speed, package_download_speed)):
         errors.append("Network performance data unavailable")
         return {**stats, "success": False}, errors
 
     if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
-        source = "Cloudflare" if enforce else "Network"
         errors.append(
-            f"{source} download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+            f"Cloudflare download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
         )
         success = False
 
-    if enforce and package_download_speed < settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:
+    if package_download_speed < settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:
         errors.append(
             f"Package download speed inadequate: {package_download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
         )
