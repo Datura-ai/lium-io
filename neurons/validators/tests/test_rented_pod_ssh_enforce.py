@@ -52,6 +52,12 @@ async def two_refused_cycles_after_a_healthy_one(h: Harness):
     return await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b")
 
 
+async def accepted_then_one_more_refused_cycle(h: Harness):
+    """Notify cycle (backend accepts) then the next refused cycle, which can enforce."""
+    await two_refused_cycles_after_a_healthy_one(h)
+    return await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b")
+
+
 @pytest.mark.asyncio
 async def test_flag_off_keeps_the_rented_score_at_the_threshold(context_factory, caplog):
     # The default: #1372's behaviour, byte for byte — the event names the pod, the score stands,
@@ -89,12 +95,16 @@ async def test_flag_on_but_streak_below_the_threshold_keeps_the_rented_score(con
 
 @pytest.mark.asyncio
 async def test_flag_on_and_streak_at_the_threshold_fails_the_check(context_factory, caplog):
-    # ticket-0326 with the flag on: the second refused cycle (the notify threshold) fails the
-    # rented-state check the way the rental probe fails an unreachable unrented node — score 0,
-    # verified job cleared with the outage as evidence — and the renter is still told once.
+    # ticket-0326 with the flag on: the notify cycle posts once; the next refused cycle (backend
+    # already accepted) fails the rented-state check the way the rental probe fails an unreachable
+    # unrented node — score 0, verified job cleared with the outage as evidence.
     h = Harness(context_factory)
     with enforcement(enabled=True), caplog.at_level("WARNING", logger=rented_machine.__name__):
-        result = await two_refused_cycles_after_a_healthy_one(h)
+        told = await two_refused_cycles_after_a_healthy_one(h)
+        assert told.passed is True and told.updates["score"] == 0.9
+        assert told.event.what_we_saw.get("enforced") is not True
+        h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+        result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b")
 
     assert result.passed is False
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
@@ -113,7 +123,7 @@ async def test_flag_on_and_streak_at_the_threshold_fails_the_check(context_facto
         "pod_id": POD_ID,
         "ssh_port": SSH_PORT,
         "faults": [FAULT_TCP_REFUSED],
-        "consecutive_cycles": 2,
+        "consecutive_cycles": 3,
         "first_failed_at": h.streak()["first_failed_at"],
         "boot_id_changed": True,
         "enforce_after_cycles": 2,
@@ -124,9 +134,9 @@ async def test_flag_on_and_streak_at_the_threshold_fails_the_check(context_facto
     what = result.event.what_we_saw
     assert what["enforced"] is True and what["enforce_after_cycles"] == 2
     [pod] = what["unreachable_pods"]
-    assert pod["pod_id"] == POD_ID and pod["consecutive_cycles"] == 2
-    # The renter-facing report is #1372's and still goes out once, at the same threshold.
-    assert pod["report_queued"] is True
+    assert pod["pod_id"] == POD_ID and pod["consecutive_cycles"] == 3
+    # The renter-facing report is #1372's and still goes out once, at the notify threshold.
+    assert pod["report_queued"] is False
     h.backend.report_pod_ssh_unreachable.assert_awaited_once()
 
     # One log line names the enforcement; neither it, the event nor the evidence carries key
@@ -149,7 +159,7 @@ async def test_recovery_returns_the_rented_score_on_the_next_healthy_cycle(conte
     # score, the streak is gone, and a later blip starts a new streak at 1 — not enforced.
     h = Harness(context_factory)
     with enforcement(enabled=True):
-        failed = await two_refused_cycles_after_a_healthy_one(h)
+        failed = await accepted_then_one_more_refused_cycle(h)
         assert failed.passed is False and failed.updates["score"] == 0.0
 
         recovered = await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="boot-b")
@@ -218,64 +228,104 @@ async def test_redis_down_at_the_threshold_skips_enforcement_for_the_cycle(conte
 
 @pytest.mark.asyncio
 async def test_the_ticket_0247_fault_is_enforced_the_same_way(context_factory):
-    # Port open, authorized_keys unreadable (the volume never remounted): the renter gets a
-    # password prompt. Same streak, same threshold, same failure.
+    # Host rebooted, port open, authorized_keys unreadable (the volume never remounted): the renter
+    # gets a password prompt. Backend accepts on the notify cycle; the next cycle fails the check.
     h = Harness(context_factory)
     with enforcement(enabled=True):
-        await h.cycle(tcp_fault=None, ssh_keys=KEYS)
-        await h.cycle(tcp_fault=None, ssh_keys=[])
-        result = await h.cycle(tcp_fault=None, ssh_keys=[])
+        await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="boot-a")
+        await h.cycle(tcp_fault=None, ssh_keys=[], boot_id="boot-b")
+        told = await h.cycle(tcp_fault=None, ssh_keys=[], boot_id="boot-b")
+        assert told.passed is True and told.updates["score"] == 0.9
+        result = await h.cycle(tcp_fault=None, ssh_keys=[], boot_id="boot-b")
 
     assert result.passed is False and result.updates["score"] == 0.0
     assert result.updates["clear_verified_job_evidence"]["faults"] == [
         FAULT_AUTHORIZED_KEYS_UNREADABLE
     ]
+    assert result.updates["clear_verified_job_evidence"]["boot_id_changed"] is True
 
 
 @pytest.mark.asyncio
-async def test_a_suppressed_cycle_keeps_an_enforced_events_reason_and_records_the_gate(
-    context_factory,
-):
-    # The cycle-end fleet gate held the renter notice (validator-side outage). #1372 rewrites a
-    # held event to RENTED because the halt kept the rented score; an enforced result scored 0 and cleared the verified job, so
-    # rewriting its event to "Executor already rented" would put a rented halt on the record over a
-    # failed cycle. The event keeps its reason, impact and pods, and the gate's verdict rides under
-    # `probe_suppressed_fleet` so the record says the zero fell in a cycle the gate held.
+async def test_authorized_keys_without_a_reboot_is_not_enforced(context_factory):
+    # A renter who deletes authorized_keys leaves the host boot_id unchanged. The provider cannot
+    # restore those keys, so the fault is reported and never zeroes the node.
+    h = Harness(context_factory)
+    with enforcement(enabled=True):
+        await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="boot-a")
+        await h.cycle(tcp_fault=None, ssh_keys=[], boot_id="boot-a")
+        told = await h.cycle(tcp_fault=None, ssh_keys=[], boot_id="boot-a")
+        assert told.passed is True
+        h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+        result = await h.cycle(tcp_fault=None, ssh_keys=[], boot_id="boot-a")
+
+    assert result.passed is True and result.updates["score"] == 0.9
+    assert "clear_verified_job_info" not in result.updates
+    assert result.event.what_we_saw.get("enforced") is not True
+
+
+@pytest.mark.asyncio
+async def test_a_held_fleet_cycle_does_not_enforce(context_factory):
+    # The fleet gate holds the renter notice (validator-side outage). The backend never accepted,
+    # so the check keeps the rented score — a port outage on our side must not zero every node.
     h = Harness(context_factory)
     with enforcement(enabled=True):
         await h.cycle(tcp_fault=None, ssh_keys=KEYS)
         await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
         held = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, validator_outage=True)
-    assert held.passed is False and held.updates["score"] == 0.0
+
+    assert held.passed is True and held.updates["score"] == 0.9
+    assert held.event.what_we_saw.get("enforced") is not True
     assert h.gate.suppressed_by == "validator_outage" and h.gate.due == [POD_ID]
     h.backend.report_pod_ssh_unreachable.assert_not_awaited()
 
     result = JobResult(
         executor_info=default_executor(),
-        score=0.0,
-        job_score=0.0,
+        score=0.9,
+        job_score=0.9,
         job_batch_id="batch-1",
-        log_status="warning",
+        log_status="info",
         log_text=_m(held.event.event, extra=held.event.model_dump()).to_full_string(),
         validation_event=held.event.model_copy(deep=True),
     )
     rewritten = rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage([result], h.gate)
-
     assert rewritten == 1
-    event = result.validation_event
-    assert event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
-    assert event.severity == "error"
-    assert event.impact == Msg.RENTED_POD_SSH_UNREACHABLE_ENFORCED_IMPACT
-    assert event.trace_id == held.event.trace_id
-    assert event.what_we_saw["enforced"] is True
-    assert [pod["pod_id"] for pod in event.what_we_saw["unreachable_pods"]] == [POD_ID]
-    seen = event.what_we_saw[rented_pod_ssh.PROBE_SUPPRESSED_FLEET]
-    assert seen["suppressed_by"] == "validator_outage" and seen["probed"] == 1
-    assert [pod["pod_id"] for pod in seen["unreachable_pods"]] == [POD_ID]
-    logged = json.loads(result.log_text.split(" >>> ", 1)[1])
-    assert logged["reason_code"] == Msg.RENTED_POD_SSH_UNREACHABLE.reason
-    assert logged["what_we_saw"]["enforced"] is True
-    assert result.score == 0.0  # the rewrite touches the event only; the cycle's score stands
+    assert result.validation_event.reason_code == Msg.ALREADY_RENTED.reason
+
+
+@pytest.mark.asyncio
+async def test_an_already_accepted_outage_stays_enforced_on_a_later_held_cycle(
+    context_factory,
+):
+    # The backend already accepted this pod's outage. A later validator-side outage does not
+    # un-zero it: the report is on record, so is_enforced stays true. Nothing is queued this
+    # cycle (already reported), so the silence rewrite has no held pod and leaves the event.
+    h = Harness(context_factory)
+    with enforcement(enabled=True):
+        failed = await accepted_then_one_more_refused_cycle(h)
+        assert failed.passed is False
+        later = await h.cycle(
+            tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b", validator_outage=True
+        )
+
+    assert later.passed is False and later.updates["score"] == 0.0
+    assert later.event.what_we_saw["enforced"] is True
+    assert h.gate.suppressed_by == "validator_outage"
+    assert h.gate.due == []
+    rewritten = rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage(
+        [
+            JobResult(
+                executor_info=default_executor(),
+                score=0.0,
+                job_score=0.0,
+                job_batch_id="batch-1",
+                log_status="warning",
+                log_text=_m(later.event.event, extra=later.event.model_dump()).to_full_string(),
+                validation_event=later.event.model_copy(deep=True),
+            )
+        ],
+        h.gate,
+    )
+    assert rewritten == 0
 
 
 def test_enforcement_settings_default_off_and_the_threshold_is_never_below_notify(
@@ -326,5 +376,14 @@ def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
         assert rented_pod_ssh.is_enforced(unhealthy) is True
         assert rented_pod_ssh.is_enforced(replace(unhealthy, consecutive_cycles=1)) is False
         assert rented_pod_ssh.is_enforced(replace(unhealthy, healthy=True, consecutive_cycles=0)) is False
+        assert rented_pod_ssh.is_enforced(replace(unhealthy, report_queued=True)) is False
+        assert rented_pod_ssh.is_enforced(replace(unhealthy, report=False)) is False
+        keys_only = replace(
+            unhealthy,
+            faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
+            boot_id_changed=False,
+        )
+        assert rented_pod_ssh.is_enforced(keys_only) is False
+        assert rented_pod_ssh.is_enforced(replace(keys_only, boot_id_changed=True)) is True
     with enforcement(enabled=True, after_cycles=3):
         assert rented_pod_ssh.is_enforced(unhealthy) is False

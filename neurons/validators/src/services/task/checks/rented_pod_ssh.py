@@ -39,7 +39,9 @@ least ``SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE`` pods), or the cycle's executor-
 judged the validator to be the outage (DAH-2748), the queued reports are logged as
 ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` and no report is POSTed, so no renter is told. The
 streaks keep ``reported`` False, so the outage is queued again next cycle and reported once the
-fleet reads clean. The per-executor ``RENTED_POD_SSH_UNREACHABLE`` events of a suppressed cycle
+fleet reads clean. Enforcement follows that accept: ``is_enforced`` is true only when the backend
+already recorded the outage (``report`` and not ``report_queued``), so a held cycle never zeroes
+the node. The per-executor ``RENTED_POD_SSH_UNREACHABLE`` events of a suppressed cycle
 were rendered before the gate ran and name a pod outage the gate then judged to be ours; the sync
 loop passes the gate to
 ``silence_rented_pod_ssh_reports_on_our_own_outage`` before the specs publish, which rewrites them
@@ -190,14 +192,36 @@ def enforce_after_cycles() -> int:
 def is_enforced(verdict: RentedPodSshVerdict) -> bool:
     """True when this verdict fails the rented-state check for the cycle (DAH-2255).
 
-    Only with ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on, only for an unhealthy pod, and only once its
-    streak has reached ``enforce_after_cycles()``. A pod never seen healthy carries no streak
+    Only with ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on, only for an unhealthy pod, only once its
+    streak has reached ``enforce_after_cycles()``, and only after the backend accepted the outage
+    report (``verdict.report`` and not ``verdict.report_queued``). A cycle that only queued the
+    notice — including a validator-side outage the fleet gate holds — does not zero the node. A
+    renter who deletes ``authorized_keys`` (that fault alone, host ``boot_id`` unchanged) is not
+    enforced: the provider cannot restore the keys. A pod never seen healthy carries no streak
     (``consecutive_cycles`` 0), a Redis outage yields no verdict at all, and the flag off leaves the
     check with DAH-2870's record-and-report behaviour: none of those is enforced.
     """
     if not settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED or verdict.healthy:
         return False
-    return verdict.consecutive_cycles >= enforce_after_cycles()
+    if verdict.consecutive_cycles < enforce_after_cycles():
+        return False
+    accepted_by_backend = verdict.report and not verdict.report_queued
+    if not accepted_by_backend:
+        return False
+    if _authorized_keys_only(verdict) and verdict.boot_id_changed is not True:
+        return False
+    return True
+
+
+_PORT_FAULTS = frozenset(
+    {FAULT_TCP_REFUSED, FAULT_TCP_TIMEOUT, FAULT_SSH_BANNER_MISSING}
+)
+
+
+def _authorized_keys_only(verdict: RentedPodSshVerdict) -> bool:
+    return FAULT_AUTHORIZED_KEYS_UNREADABLE in verdict.faults and not (
+        _PORT_FAULTS & set(verdict.faults)
+    )
 
 
 def _ok_key(pod_id: str) -> str:
@@ -723,9 +747,11 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     cycle, so ``reported`` is set and it was never due) stays in ``unreachable_pods``, because that
     pod's outage is real and already on record. When nothing stays, the event becomes RENTED; when
     something stays, it keeps its reason and names only the pods whose outage stands.
-    An enforced event (DAH-2255, ``what_we_saw.enforced``) failed its cycle at score 0 and is never
-    rewritten to RENTED: it keeps reason, impact and pods and gains the gate's verdict under
-    ``probe_suppressed_fleet``. Returns how many results were rewritten, for the caller's log line.
+    An enforced event (DAH-2255, ``what_we_saw.enforced``) is a later cycle whose backend already
+    accepted the report: it failed at score 0 and is never rewritten to RENTED. It keeps reason,
+    impact and pods and gains the gate's verdict under ``probe_suppressed_fleet``. A first-threshold
+    cycle the gate holds is not enforced (``is_enforced`` needs the accept), so it takes the RENTED
+    rewrite. Returns how many results were rewritten, for the caller's log line.
     """
     if gate is None or not gate.suppressed_by:
         return 0

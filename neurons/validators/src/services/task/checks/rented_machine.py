@@ -266,8 +266,9 @@ class TenantEnforcementCheck:
 
         reported = [verdict for verdict in ssh_verdicts if verdict.report]
         # DAH-2255: with RENTED_POD_SSH_ENFORCEMENT_ENABLED on, a pod whose streak reached the
-        # enforce threshold fails the check for this cycle. Judged before the score: the cycle ends
-        # here at 0, the way the rental probe ends an unreachable unrented node's cycle.
+        # enforce threshold AND whose outage the backend already accepted fails the check for this
+        # cycle. Judged before the score: the cycle ends here at 0, the way the rental probe ends
+        # an unreachable unrented node's cycle.
         enforced = [verdict for verdict in reported if is_enforced(verdict)]
         if enforced:
             return self._rented_pod_ssh_enforced_result(
