@@ -52,7 +52,7 @@ def test_a_third_hotkey_is_refused_with_two_accepted(settings):
 
 
 def test_the_swap_is_one_config_value(monkeypatch):
-    # the flip named in the PR body: DEFAULT_VALIDATOR_HOTKEY=<NEXT>; both stay accepted, NEXT is now
+    # the swap-day flip — DEFAULT_VALIDATOR_HOTKEY=<NEXT>; both stay accepted, NEXT is now
     # the one new executors are listed under
     monkeypatch.setenv("DEFAULT_VALIDATOR_HOTKEY", NEXT)
     monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY", NEXT)
@@ -64,7 +64,7 @@ def test_the_swap_is_one_config_value(monkeypatch):
 
 
 def test_a_blank_next_hotkey_adds_no_signer(monkeypatch):
-    # rollback: VALIDATOR_NEXT_HOTKEY="" leaves the miner exactly as before this release
+    # rolling back (VALIDATOR_NEXT_HOTKEY="") leaves the miner exactly as before this release
     monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY", " ")
     monkeypatch.delenv("DEFAULT_VALIDATOR_HOTKEY", raising=False)
     built = core_config.Settings(_env_file=None)
