@@ -10,6 +10,7 @@ from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
 from incentive.config import RENTAL_PRICES_PER_HOUR, IncentiveConfig
 from incentive.utils import get_hourly_rate
+from test_idle_rate_under_base_price import BASE_PRICE_FROM_PR_558
 
 SERVER = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 WORKSTATION = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
@@ -19,10 +20,8 @@ def test_incentive_config_anchors_server_edition_at_workstation_price():
     """Fails when the parity override is dropped or mistyped: the Server entry then falls back to the
     installed lium-core value (0.86 in 0.1.8) and no longer equals the Workstation entry."""
     prices = IncentiveConfig().rental_prices_per_hour
-    upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
     assert prices[SERVER] == prices[WORKSTATION]
-    assert prices[SERVER] == upstream[WORKSTATION]
 
 
 def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
@@ -40,12 +39,12 @@ def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
         assert server_rate == workstation_rate
 
 
-def test_overrides_change_only_the_server_edition_and_b300_entries():
+def test_overrides_change_only_the_pr_558_entries():
     """Guards a hand-edit of `RENTAL_PRICES_PER_HOUR` that adds, drops or re-prices another GPU — the
     algorithm asserts every key is in BASE_GPU_MAP, and any other override belongs in lium-core.
-    B300 is pinned at 6.40 by DAH-3542."""
+    DAH-3623 overrides the models lium-platform#558 moved."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
     assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys()
     differing = {gpu for gpu in upstream if RENTAL_PRICES_PER_HOUR[gpu] != upstream[gpu]}
-    assert differing <= {SERVER, "NVIDIA B300 SXM6 AC"}
+    assert differing <= set(BASE_PRICE_FROM_PR_558)

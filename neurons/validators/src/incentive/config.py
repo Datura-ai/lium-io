@@ -21,19 +21,24 @@ class DefaultPrice:
 DEFAULT_PRICE = DefaultPrice()
 
 
-# Hourly anchor per GPU model for the unrented incentive. The table is lium-core's, installed from
-# PyPI at the version pinned in pdm.lock, which anchors the RTX PRO 6000 Server Edition at 0.86 and
-# the Workstation Edition at 1.0. The two are the same card for a renter (DAH-3230: the source table
-# in packages/lium-core and the backend's MACHINE_PRICES move the Server Edition to 1.0), so the
-# validator pins the two editions to parity here; the override can go once the validator's lock
-# carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
-# the pinned lium-core still has 5.10).
+# Base price per GPU model: the lium-core table pinned in pdm.lock, plus the overrides below.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
-        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
-    ],
-    "NVIDIA B300 SXM6 AC": 6.4,
+    # DAH-3623: the base prices of lium-platform#558 (DAH-3648); the pinned lium-core has the old ones
+    "NVIDIA B300 SXM6 AC": 8.0,
+    "NVIDIA B200": 5.6,
+    "NVIDIA H200": 3.65,
+    "NVIDIA H100 80GB HBM3": 1.39,
+    "NVIDIA H100 PCIe": 1.3,
+    "NVIDIA GeForce RTX 5090": 0.4,
+    "NVIDIA RTX 6000 Ada Generation": 0.75,
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 1.19,
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 1.19,
+    "NVIDIA L40S": 0.38,
+    "NVIDIA L40": 0.33,
+    "NVIDIA A100 80GB PCIe": 0.45,
+    "NVIDIA A100-SXM4-80GB": 0.7,
+    "NVIDIA RTX A6000": 0.42,
 }
 
 
@@ -148,27 +153,21 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
 # Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
 # Resolution order: specific GPU name > "*"; specific count > "*".
-D = DEFAULT_PRICE
+# DAH-3623: idle pays 0.8 x the base price, so it is always less than a rental
+D = DefaultPrice(multiplier=0.8)
 GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
     "*": {"*": 0, "1": D, "8": D},
-    # DAH-3623: idle rate = 0.8 x the base price of lium-platform#558 (DAH-3648), rounded down to the cent
-    "NVIDIA B300 SXM6 AC": {"*": 0, "1": 6.40, "8": 6.40},  # 0.8 x 8.00
-    "NVIDIA B200": {"*": 0, "1": 4.48, "8": 4.48},  # 0.8 x 5.60
-    "NVIDIA H200": {"*": 0, "1": 2.92, "8": 2.92},  # 0.8 x 3.65
-    "NVIDIA H100 80GB HBM3": {"*": 0, "1": 1.11, "8": 1.11},  # 0.8 x 1.39
+    # B200
+    "NVIDIA B200": {"*": 0, "1": D, "8": D},
+    # H100
+    "NVIDIA H100 80GB HBM3": {"*": 0, "1": D, "8": D},
     "NVIDIA H100 NVL": {"*": 0, "1": D, "8": D},
-    "NVIDIA H100 PCIe": {"*": 0, "1": 1.04, "8": 1.04},  # 0.8 x 1.30
-    "NVIDIA GeForce RTX 5090": {"*": 0, "1": 0.32, "8": 0.32},  # 0.8 x 0.40
-    "NVIDIA GeForce RTX 4090": {"*": 0, "1": 0.24, "8": 0.24},  # 0.8 x 0.30
-    "NVIDIA GeForce RTX 3090": {"*": 0, "1": 0.12, "8": 0.12},  # 0.8 x 0.16
-    "NVIDIA RTX 6000 Ada Generation": {"*": 0, "1": 0.60, "8": 0.60},  # 0.8 x 0.75
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": {"*": 0, "1": 0.95, "8": 0.95},  # 0.8 x 1.19
-    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": {"*": 0, "1": 0.95, "8": 0.95},  # 0.8 x 1.19
-    "NVIDIA L40S": {"*": 0, "1": 0.30, "8": 0.30},  # 0.8 x 0.38
-    "NVIDIA L40": {"*": 0, "1": 0.26, "8": 0.26},  # 0.8 x 0.33
-    "NVIDIA A100 80GB PCIe": {"*": 0, "1": 0.36, "8": 0.36},  # 0.8 x 0.45
-    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": 0.56, "8": 0.56},  # 0.8 x 0.70
-    "NVIDIA RTX A6000": {"*": 0, "1": 0.33, "8": 0.33},  # 0.8 x 0.42
+    "NVIDIA H100 PCIe": {"*": 0, "1": D, "8": D},
+    # A100
+    "NVIDIA A100 80GB PCIe": {"*": 0, "1": D, "8": D},
+    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": D, "8": D},
+    # RTX A6000
+    "NVIDIA RTX A6000": {"*": 0, "1": D, "8": D},
     # RTX PRO 6000
     "RTX PRO 6000": {"*": 0, "1": D, "8": D},
 }
