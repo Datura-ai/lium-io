@@ -88,8 +88,8 @@ def test_publish_workflow_pushes_the_version_the_compose_files_pull():
     """Regression: the version is bumped in ``pyproject.toml`` and both compose files, and
     the publish workflow still offers the old tag by default, or its release trigger is
     gone, so the tag the compose files pull is never pushed and every fresh install fails
-    to pull. The workflow builds with ``watchtower/docker_build.sh`` and pushes with the
-    Docker Hub secrets the executor CD uses."""
+    to pull. The workflow builds with ``watchtower/docker_build.sh`` and logs in to Docker
+    Hub the way the executor CD does (``docker/login-action``, OIDC, no stored token)."""
     workflow = yaml.safe_load(PUBLISH_WORKFLOW.read_text())
     triggers = workflow.get("on", workflow.get(True))  # PyYAML reads the bare key ``on`` as True
     inputs = triggers["workflow_dispatch"]["inputs"]
@@ -100,5 +100,5 @@ def test_publish_workflow_pushes_the_version_the_compose_files_pull():
     assert triggers["push"]["tags"] == ["watchtower-v*"]
     text = PUBLISH_WORKFLOW.read_text()
     assert f"IMAGE_REPOSITORY: {UPDATER_REPOSITORY}" in text
-    assert "secrets.DOCKERHUB_USERNAME" in text and "secrets.DOCKERHUB_PAT" in text
+    assert "docker/login-action@" in text and "secrets.DOCKERHUB_PAT" not in text
     assert "bash ./docker_build.sh" in text
