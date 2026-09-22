@@ -25,7 +25,7 @@ TOKEN_HEADER = "X-Validation-Progress-Token"
 
 
 def require_token(token: str | None) -> None:
-    """The header must equal VALIDATION_PROGRESS_TOKEN (constant-time); no token configured = no route."""
+    """The header must equal VALIDATION_PROGRESS_TOKEN, compared in constant time; no token configured = no route."""
     expected = settings.VALIDATION_PROGRESS_TOKEN
     if not expected:
         raise HTTPException(status_code=404, detail="Not found")
