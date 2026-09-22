@@ -13,7 +13,7 @@ from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
 from models.executor import Executor
 from core.collateral import h160_to_ss58
-from core.utils import get_collateral_contract, _m
+from core.utils import get_collateral_contract, versions_holding_collateral, _m
 from bittensor.utils.balance import Balance
 from protocol.miner_portal_request import AddExecutorFailed
 
@@ -59,7 +59,7 @@ class CliService:
         self.default_extra = {
             "hotkey": self.hotkey,
             "netuid": self.netuid,
-            "contract_address": settings.COLLATERAL_CONTRACT_ADDRESS,
+            "contract_address": self.collateral_contract.contract_address,
             "network": settings.BITTENSOR_NETWORK,
             "rpc_url": settings.SUBTENSOR_EVM_RPC_URL,
         }
@@ -486,9 +486,12 @@ class CliService:
                 return False
             executor_uuid = str(executor.uuid)
 
-            collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
-            if float(collateral) > 0:
-                self.logger.error("Executor %s has collateral %f TAO, cannot remove", executor_uuid, collateral)
+            versions = await versions_holding_collateral(executor_uuid)
+            if versions:
+                self.logger.error(
+                    "Executor %s holds collateral on contract version(s) %s; reclaim it first",
+                    executor_uuid, ", ".join(versions),
+                )
                 return False
 
             self.executor_dao.delete_by_address_port(address, port)

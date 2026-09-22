@@ -107,6 +107,10 @@ class CollateralClient:
         ).call()
         return self.w3.from_wei(amount, "ether")
 
+    async def get_reclaim_request(self, reclaim_request_id: int) -> tuple:
+        """(executorId, miner, amount in wei, denyTimeout) of a reclaim request; amount 0 once it is closed."""
+        return tuple(await self.contract.functions.reclaims(reclaim_request_id).call())
+
     async def _send(self, function_call) -> dict:
         if self.miner_account is None:
             raise CollateralTransactionError(
@@ -142,7 +146,7 @@ class CollateralClient:
 
     async def finalize_reclaim(self, reclaim_request_id: int):
         """Pay out a reclaim after its deny window; returns its Reclaimed event or None."""
-        reclaim = await self.contract.functions.reclaims(reclaim_request_id).call()
+        reclaim = await self.get_reclaim_request(reclaim_request_id)
         if reclaim[2] == 0:
             raise CollateralTransactionError(
                 f"Reclaim request {reclaim_request_id} has already been finalized"

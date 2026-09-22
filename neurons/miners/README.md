@@ -213,7 +213,9 @@ An executor that still holds collateral on the contract stays registered until i
 
 ## Withdrawing Collateral
 
-Executors run and earn without collateral. If an executor still holds a TAO deposit on the collateral contract from earlier, withdraw it in two steps: start a reclaim request, then finalize it once the request's deny window has passed. Both steps are transactions from the Ethereum Address associated with your hotkey.
+Executors run and earn without collateral. If an executor still holds a TAO deposit from earlier, withdraw it in two steps: start a reclaim request, then finalize it once the request's deny window has passed. Both steps are transactions from the Ethereum Address associated with your hotkey.
+
+Deposits sit on one of two collateral contracts: version `1.0.2` (current) or `1.0.0` (deposits made before 1.0.2). `reclaim-collateral` and `finalize-reclaim-request` find the contract that holds the executor's collateral or your reclaim request. Every collateral command also takes `--contract <version>` to pick one directly; the read commands ask for the version when it is left out.
 
 ### Getting Miner Collateral
 
@@ -249,6 +251,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-coll
 - `<executor_uuid>`: The uuid of the executor.
 - `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract transactions).
 
+The command logs the reclaim request ID; keep it for the finalize step.
 
 ### Getting Miner Reclaim Requests
 
@@ -280,7 +283,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py finalize-rec
 - `<reclaim-request-id>`: The ID of the reclaim request you wish to finalize.
 - `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract transactions).
 
-This command will finalize the reclaim request and return the collateral to your account.
+This command will finalize the reclaim request and return the collateral to your account. Reclaim request IDs are counted per contract; when the same ID is open on both contracts for your key, the command asks for the version.
 
 ### Monitoring earnings
 

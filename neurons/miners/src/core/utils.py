@@ -109,3 +109,26 @@ def get_collateral_contract(
         rpc_url=settings.SUBTENSOR_EVM_RPC_URL,
         miner_key=miner_key,
     )
+
+
+async def versions_holding_collateral(executor_uuid: str) -> list[str]:
+    """The CONTRACT_VERSIONS keys whose contract holds collateral for this executor."""
+    versions = []
+    for version in settings.CONTRACT_VERSIONS:
+        collateral = await get_collateral_contract(version=version).get_executor_collateral(executor_uuid)
+        if collateral > 0:
+            versions.append(version)
+    return versions
+
+
+async def versions_with_open_reclaim(reclaim_request_id: int, miner_address: str) -> list[str]:
+    """The CONTRACT_VERSIONS keys whose contract holds an open reclaim request with this id for this miner.
+
+    Reclaim request ids are counted per contract, so the same id can exist on several contracts.
+    """
+    versions = []
+    for version in settings.CONTRACT_VERSIONS:
+        _, miner, amount, _ = await get_collateral_contract(version=version).get_reclaim_request(reclaim_request_id)
+        if amount > 0 and miner.lower() == miner_address.lower():
+            versions.append(version)
+    return versions

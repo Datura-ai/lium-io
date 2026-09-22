@@ -60,6 +60,10 @@ class Settings(BaseSettings):
             "address": "0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6",
             "info": "3rd version: Fixed 'ExecutorNotOwned' error",
         },
+        "1.0.0": {
+            "address": "0x999F9A49A85e9D6E981cad42f197349f50172bEB",
+            "info": "Earlier contract: holds deposits made before 1.0.2 (reclaim only)",
+        },
     }
 
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
