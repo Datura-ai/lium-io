@@ -28,31 +28,12 @@ DEFAULT_PRICE = DefaultPrice()
 # validator pins the two editions to parity here; the override can go once the validator's lock
 # carries a lium-core release with the parity table. B300 is pinned at 6.40 the same way (DAH-3542:
 # the pinned lium-core still has 5.10).
-#
-# DAH-3623: a model's idle rate is pinned AT the median price renters paid for it over the trailing
-# 30 days, GPU-hour-weighted (the platform's gpu_price_stat.lium_median_30d: rentals started in the
-# window, each weighted gpu_count x rental_hours, lower weighted median), rounded down to the cent; the
-# paid median is the only cap. The fixture in tests/test_idle_rate_under_paid_median.py holds the
-# medians the pins were derived from. A pin that equals the lium-core value stays explicit so a lock
-# bump cannot move it.
 RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     **DEFAULT_SHARED_CONFIG.machine_prices,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": DEFAULT_SHARED_CONFIG.machine_prices[
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
-    "NVIDIA A100 80GB PCIe": 0.45,  # paid median 30 d
-    "NVIDIA H100 80GB HBM3": 1.39,  # paid median 30 d
-    "NVIDIA GeForce RTX 5090": 0.40,  # paid median 30 d
-    "NVIDIA A100-SXM4-80GB": 0.70,  # paid median 30 d
-    "NVIDIA RTX 6000 Ada Generation": 0.75,  # paid median 30 d
-    "NVIDIA H200": 3.65,  # paid median 30 d
-    "NVIDIA GeForce RTX 3090": 0.16,  # paid median 30 d
-    "NVIDIA GeForce RTX 4090": 0.30,  # paid median 30 d
-    "NVIDIA L40S": 0.38,  # paid median 30 d
-    "NVIDIA B200": 5.60,  # paid median 30 d
-    "NVIDIA RTX A6000": 0.42,  # paid median 30 d
-    "NVIDIA H100 PCIe": 1.30,  # paid median 30 d
 }
 
 
@@ -170,17 +151,24 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
 D = DEFAULT_PRICE
 GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
     "*": {"*": 0, "1": D, "8": D},
-    # B200
-    "NVIDIA B200": {"*": 0, "1": D, "8": D},
-    # H100
-    "NVIDIA H100 80GB HBM3": {"*": 0, "1": D, "8": D},
+    # DAH-3623: idle rate = 0.8 x the base price of lium-platform#558 (DAH-3648), rounded down to the cent
+    "NVIDIA B300 SXM6 AC": {"*": 0, "1": 6.40, "8": 6.40},  # 0.8 x 8.00
+    "NVIDIA B200": {"*": 0, "1": 4.48, "8": 4.48},  # 0.8 x 5.60
+    "NVIDIA H200": {"*": 0, "1": 2.92, "8": 2.92},  # 0.8 x 3.65
+    "NVIDIA H100 80GB HBM3": {"*": 0, "1": 1.11, "8": 1.11},  # 0.8 x 1.39
     "NVIDIA H100 NVL": {"*": 0, "1": D, "8": D},
-    "NVIDIA H100 PCIe": {"*": 0, "1": D, "8": D},
-    # A100
-    "NVIDIA A100 80GB PCIe": {"*": 0, "1": D, "8": D},
-    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": D, "8": D},
-    # RTX A6000
-    "NVIDIA RTX A6000": {"*": 0, "1": D, "8": D},
+    "NVIDIA H100 PCIe": {"*": 0, "1": 1.04, "8": 1.04},  # 0.8 x 1.30
+    "NVIDIA GeForce RTX 5090": {"*": 0, "1": 0.32, "8": 0.32},  # 0.8 x 0.40
+    "NVIDIA GeForce RTX 4090": {"*": 0, "1": 0.24, "8": 0.24},  # 0.8 x 0.30
+    "NVIDIA GeForce RTX 3090": {"*": 0, "1": 0.12, "8": 0.12},  # 0.8 x 0.16
+    "NVIDIA RTX 6000 Ada Generation": {"*": 0, "1": 0.60, "8": 0.60},  # 0.8 x 0.75
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": {"*": 0, "1": 0.95, "8": 0.95},  # 0.8 x 1.19
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": {"*": 0, "1": 0.95, "8": 0.95},  # 0.8 x 1.19
+    "NVIDIA L40S": {"*": 0, "1": 0.30, "8": 0.30},  # 0.8 x 0.38
+    "NVIDIA L40": {"*": 0, "1": 0.26, "8": 0.26},  # 0.8 x 0.33
+    "NVIDIA A100 80GB PCIe": {"*": 0, "1": 0.36, "8": 0.36},  # 0.8 x 0.45
+    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": 0.56, "8": 0.56},  # 0.8 x 0.70
+    "NVIDIA RTX A6000": {"*": 0, "1": 0.33, "8": 0.33},  # 0.8 x 0.42
     # RTX PRO 6000
     "RTX PRO 6000": {"*": 0, "1": D, "8": D},
 }
