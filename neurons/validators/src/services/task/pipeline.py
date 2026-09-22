@@ -322,15 +322,19 @@ class ParallelStage:
 
     Validation fast path: each lane runs its checks in order on its own copy of the context it was
     given, exactly as the serial pipeline would. The first lane to stop — a fatal failure, a halt
-    or an exception — cancels the other lanes, whose in-flight check is interrupted and whose
-    later checks never start, so a failing run does the same work as the serial one would have
-    (a matmul that fails never lets the host lane rent the probe container). The pipeline then
-    applies the completed results in lane order — events, step timings, context updates — so a
-    run reads like the serial one: the stopping check's event ends it, a check's `updates` land
-    the way they do today, and `state` changes are merged field by field (`specs` key by key)
-    because each lane changed a disjoint part of it. Checks the sibling lane completed before the
-    cancel have run but are not emitted and not counted in the step summary. Nothing here decides
-    pass or fail; every check keeps its own verdict.
+    or an exception — cancels the other lanes: their in-flight check is interrupted and no later
+    check of theirs starts. What a cancelled check had already asked of the outside completes
+    there (a rental verification in flight is still rented and deleted by the backend; the DinD
+    probe removes its container on the way out). The pipeline then applies the completed results
+    in lane order — events, step timings, context updates — so a run reads like the serial one:
+    the stopping check's event ends it, a check's `updates` land the way they do today, and
+    `state` changes are merged field by field (`specs` key by key) because each lane changed a
+    disjoint part of it. Checks the sibling lane completed before the cancel have run but are not
+    emitted and not counted in the step summary. Two lanes stopping in the same loop turn are
+    resolved in whichever order `asyncio.wait` hands them back. Lane checks must let
+    CancelledError propagate (all of today's do): one that swallows it keeps its lane running to
+    the end, and that lane's later results would be emitted. Nothing here decides pass or fail;
+    every check keeps its own verdict.
     """
 
     check_id = "pipeline.parallel"

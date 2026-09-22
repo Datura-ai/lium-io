@@ -392,3 +392,63 @@ async def test_dind_verifier_hung_inner_docker_run_degrades_sysbox(mocker):
     assert result.sysbox_runtime is False
     assert seen_timeouts == [30]
     connect.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_dind_verifier_removes_the_container_when_cancelled_mid_probe(mocker):
+    # The validation fast path cancels this check when the sibling lane stops; the probe
+    # container must not stay behind with its port bound until the next wave's cleanup.
+    port = PortPair(9000, 9000)
+    started = _build_started_dind(mocker)
+    ssh_client = started.ssh_client
+    commands: list[str] = []
+
+    async def run(cmd):
+        commands.append(cmd)
+        if len(commands) == 1:
+            return _run_result(mocker, exit_status=0, stdout="container_id")
+        return _run_result(mocker, exit_status=0, stdout="")
+
+    ssh_client.run = run
+    hang = asyncio.Event()
+
+    async def connect_forever(*args, **kwargs):
+        await hang.wait()
+
+    mocker.patch("services.executor_connectivity.dind_probe.asyncssh.connect", side_effect=connect_forever)
+
+    task = asyncio.ensure_future(
+        started.verifier.verify(
+            port, ssh_client=ssh_client, host="127.0.0.1", container_name_prefix="container_miner", sysbox=True
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(commands) == 2, "docker run, then exactly one removal"
+    assert "container_miner_9000" in commands[1] and "rm" in commands[1]
+
+
+@pytest.mark.asyncio
+async def test_dind_verifier_removes_the_container_once_on_every_way_out(mocker):
+    port = PortPair(9000, 9000)
+    for exit_status, connect_side_effect in ((1, None), (0, RuntimeError("ssh exploded"))):
+        started = _build_started_dind(mocker)
+        started.ssh_client.run = mocker.AsyncMock(
+            side_effect=[
+                _run_result(mocker, exit_status=exit_status, stdout="container_id"),
+                _run_result(mocker, exit_status=0, stdout=""),
+            ]
+        )
+        if connect_side_effect is not None:
+            mocker.patch(
+                "services.executor_connectivity.dind_probe.asyncssh.connect", side_effect=connect_side_effect
+            )
+        result = await started.verifier.verify(
+            port, ssh_client=started.ssh_client, host="127.0.0.1", container_name_prefix="container_miner", sysbox=True
+        )
+        assert result.success is False
+        removals = [c for c in started.ssh_client.run.await_args_list if "rm" in str(c.args[0])]
+        assert len(removals) == 1

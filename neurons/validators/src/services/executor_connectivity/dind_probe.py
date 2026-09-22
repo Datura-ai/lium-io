@@ -27,6 +27,9 @@ DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 
 
+# How long the removal of the probe container may take on the way out of a probe.
+REMOVE_TIMEOUT_SECONDS = 20
+
 class DindVerifier:
     """Verifies Docker-in-Docker capability."""
 
@@ -58,7 +61,6 @@ class DindVerifier:
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                 logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
-                await ssh_client.run(DockerCommand.remove_with_volumes(name))
                 return DindProbeResult(
                     success=False,
                     log_text=f"dind: check failed port={port.internal}",
@@ -102,7 +104,6 @@ class DindVerifier:
                     else:
                         logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
 
-            await ssh_client.run(DockerCommand.remove_with_volumes(name))
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
             return DindProbeResult(
@@ -117,12 +118,25 @@ class DindVerifier:
                 _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
                 exc_info=True,
             )
-            await ssh_client.run(DockerCommand.remove_with_volumes(name))
             return DindProbeResult(
                 success=False,
                 log_text=f"dind: check failed port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
+            )
+        finally:
+            # One removal on every way out — ok, failed, raised, and cancelled (the validation
+            # fast path cancels this check when the sibling lane stops), so no probe container
+            # keeps its port bound until the next wave's stale-container cleanup.
+            await self._remove_container(ssh_client, name, log_ctx)
+
+    async def _remove_container(self, ssh_client: SSHClientConnection, name: str, log_ctx: dict[str, Any]) -> None:
+        try:
+            async with asyncio.timeout(REMOVE_TIMEOUT_SECONDS):
+                await ssh_client.run(DockerCommand.remove_with_volumes(name))
+        except Exception as e:  # noqa: BLE001 — the probe's own verdict is already decided
+            logger.warning(
+                _m("DinD container removal failed", extra=get_extra_info({**log_ctx, "error": str(e)}))
             )
 
     async def _connect_retrying_until_sshd_answers(
