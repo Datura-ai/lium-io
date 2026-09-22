@@ -64,7 +64,7 @@ def test_the_swap_is_one_config_value(monkeypatch):
 
 
 def test_a_blank_next_hotkey_adds_no_signer(monkeypatch):
-    # rollback shape: VALIDATOR_NEXT_HOTKEY="" leaves the miner exactly as before this release
+    # rollback: VALIDATOR_NEXT_HOTKEY="" leaves the miner exactly as before this release
     monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY", " ")
     monkeypatch.delenv("DEFAULT_VALIDATOR_HOTKEY", raising=False)
     built = core_config.Settings(_env_file=None)

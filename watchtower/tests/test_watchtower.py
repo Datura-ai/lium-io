@@ -1186,15 +1186,32 @@ def _signed_digest(keypair, digest="sha256:rotation", ts=None):
     )
 
 
-def test_trusted_validator_hotkeys_are_the_two_lium_hotkeys_current_first():
-    # regression: the new address replaces the active one (every executor refuses today's digest),
-    # or is listed first (the log names the wrong key as active)
+def test_trusted_validator_hotkeys_lists_the_active_hotkey_first_then_next():
+    # regression: the pair is emitted next-first (the log names the wrong key as active), or the
+    # next slot is dropped (every executor refuses the digest the moment the platform's wallet swaps)
+    import bittensor
     import watchtower
 
-    assert watchtower.trusted_validator_hotkeys() == (
-        "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p",
-        "5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK",
-    )
+    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationOrderCurrent")
+    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationOrderNext")
+    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
+        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", nxt.ss58_address
+    ):
+        assert watchtower.trusted_validator_hotkeys() == (current.ss58_address, nxt.ss58_address)
+
+
+def test_built_in_validator_hotkeys_are_two_distinct_decodable_addresses():
+    # regression: a typo in either built-in constant (the digest check raises on decode instead of
+    # refusing), or the same address in both slots (the rotation trusts one signer while claiming two)
+    import bittensor
+    import watchtower
+
+    built_in = watchtower.trusted_validator_hotkeys()
+
+    assert len(built_in) == 2
+    assert len(set(built_in)) == 2
+    for hotkey in built_in:
+        assert bittensor.Keypair(ss58_address=hotkey).ss58_address == hotkey
 
 
 def test_digest_signed_by_the_current_hotkey_is_accepted_with_next_configured():
