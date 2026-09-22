@@ -103,9 +103,22 @@ def _matmul_ssh_reason(ctx: Context) -> str | None:
     """
     if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
         return "allcards_ssh"
-    if ctx.config.verifyx_enabled and not ctx.config.first_pass:
+    if _verifyx_wanted(ctx) and not ctx.config.first_pass:
         return "scored_ssh"
     return None
+
+
+def _verifyx_wanted(ctx: Context) -> bool:
+    """Whether VerifyX is part of this run at all. P245: on an own-supply node's first pass
+    VerifyXCheck skips its run, so the one call must not carry the challenge either — otherwise
+    the round trip would hold the full-size VerifyX the profile exists to avoid."""
+    return ctx.config.verifyx_enabled and not ctx.config.trusted_provider
+
+
+def _small_matmul(ctx: Context) -> bool:
+    """The matmul at the first-pass VRAM budget: DAH-3011's first pass, or P245's own-supply first
+    pass (same sizing CapabilityCheck applies on the SSH path)."""
+    return ctx.config.first_pass or ctx.config.trusted_provider
 
 
 class _NothingToSend(Exception):
@@ -156,7 +169,7 @@ class LocalVerifyCheck:
             )
 
         matmul_ssh_reason = _matmul_ssh_reason(ctx)
-        if matmul_ssh_reason is not None and not ctx.config.verifyx_enabled:
+        if matmul_ssh_reason is not None and not _verifyx_wanted(ctx):
             return self._fallback(
                 ctx, "call", matmul_ssh_reason, "matmul on SSH and VerifyX off: nothing to run"
             )
@@ -213,9 +226,11 @@ class LocalVerifyCheck:
                 matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
                     specs,
                     ctx.default_extra,
-                    vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB if first_pass else None,
+                    vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB
+                    if _small_matmul(ctx)
+                    else None,
                 )
-            if ctx.config.verifyx_enabled:
+            if _verifyx_wanted(ctx):
                 verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
                     specs,
                     ctx.default_extra,

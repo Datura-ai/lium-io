@@ -1484,6 +1484,64 @@ async def test_a_scored_cycle_with_verifyx_off_sends_the_matmul_alone(
     assert local.event.what_we_saw["fallbacks"] == {}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_pass", [True, False])
+async def test_own_supply_first_pass_sends_the_budgeted_matmul_alone(
+    keypair, monkeypatch, local_verify_on, verifyx_service, first_pass
+):
+    """P245 trusted-provider profile: VerifyXCheck skips its run on an own-supply node's first
+    pass, so the one call carries no VerifyX challenge (a full-size run there would cost the very
+    80–149 s the profile removes) and the matmul rides alone at the first-pass VRAM budget — with
+    or without DAH-3011's `first_pass` (its flag is off in prod). `scored_ssh` does not fire: the
+    round trip is the matmul's own."""
+    validation = matmul_service(monkeypatch)
+    prepare_matmul = MagicMock(wraps=validation.prepare_matmul_challenge)
+    validation.prepare_matmul_challenge = prepare_matmul
+    async with FakeExecutor(keypair) as executor:
+        ctx = make_context(
+            executor=executor.executor_info,
+            ssh=FakeSSH(),
+            services=build_services(
+                validation=validation,
+                verifyx=verifyx_service,
+                redis=SimpleNamespace(renting_in_progress=AsyncMock(return_value=False)),
+            ),
+            config=build_context_config(
+                validator_keypair=keypair,
+                first_pass=first_pass,
+                verifyx_enabled=True,
+                trusted_provider=True,
+            ),
+            state=build_state(specs=SPECS),
+        )
+        local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+    assert executor.intents[0]["steps"]["verifyx"] is None
+    assert executor.intents[0]["steps"]["matmul"]["cipher_text"]
+    assert (
+        prepare_matmul.call_args.kwargs["vram_budget_mb"] == settings.FIRST_PASS_MATMUL_VRAM_MB
+    )
+    assert local.event.what_we_saw["consumed"] == ["matmul"]
+    assert local.event.what_we_saw["fallbacks"] == {}
+
+
+@pytest.mark.asyncio
+async def test_provider_node_first_pass_still_sends_verifyx_in_the_one_call(
+    keypair, monkeypatch, local_verify_on, verifyx_service
+):
+    """The provider-node twin of the test above: `trusted_provider` off (the default, and the only
+    value a node not registered under a Lium-owned hotkey can have) keeps VerifyX in the intent."""
+    validation = matmul_service(monkeypatch)
+    async with FakeExecutor(keypair) as executor:
+        ctx = context(
+            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
+        )
+        assert ctx.config.trusted_provider is False
+        local = await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
+    assert executor.intents[0]["steps"]["verifyx"]["cipher_text"]
+    assert executor.intents[0]["steps"]["matmul"]["cipher_text"]
+    assert sorted(local.event.what_we_saw["consumed"]) == ["matmul", "verifyx"]
+
+
 def test_pipeline_runs_local_verify_after_tenant_enforcement_and_before_both_consumers():
     names = [type(c).__name__ for c in PipelineFactory.build_checks()]
     assert names.index("TenantEnforcementCheck") < names.index("LocalVerifyCheck")
