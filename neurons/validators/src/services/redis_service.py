@@ -43,6 +43,8 @@ CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 # Written by the connector process, read by the validator process: they share no memory, so
 # this key is how an operator's request for a cycle crosses between them.
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
+# DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
+DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 # One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
 # ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
 FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
@@ -262,6 +264,26 @@ class RedisService:
 
     async def clear_forced_validation_cycle_request(self) -> None:
         await self.delete(FORCED_VALIDATION_CYCLE_KEY)
+
+    @staticmethod
+    def _dind_probe_miss_key(miner_hotkey: str, executor_id: str) -> str:
+        return f"{DIND_PROBE_MISS_PREFIX}:{miner_hotkey}:{executor_id}"
+
+    async def record_dind_probe_miss(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        """Record a DinD probe miss; True when none was on record (the first inside the window).
+
+        SET NX EX records and answers in one call, so two cycles cannot both read "first".
+        """
+        async with self.lock:
+            return bool(
+                await self.redis.set(
+                    self._dind_probe_miss_key(miner_hotkey, executor_id), "1", ex=ttl_seconds, nx=True
+                )
+            )
+
+    async def clear_dind_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
+        """Forget the recorded miss: the probe reached its container again."""
+        await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
 
     async def set(self, key: str, value: str, ex: int | None = None):
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""

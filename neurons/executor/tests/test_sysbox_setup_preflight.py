@@ -712,3 +712,42 @@ def test_help_lists_check_and_exits_zero(tmp_path):
     proc = run_script(tmp_path, "--help")
     assert proc.returncode == 0
     assert "--check" in proc.stdout
+
+
+# ── failure diagnostics (the block printed when the verify container does not start) ─────────
+
+
+def test_diagnostics_print_false_for_a_feature_the_installer_set_to_false(tmp_path):
+    """Regression: `jq '.features.cdi // "not set"'` printed "not set" for `false`, the one value
+    this installer writes, so the block said the setting was missing on a host that had it."""
+    rc, out, _ = run_check(
+        tmp_path,
+        "failure_diagnostics",
+        files={"etc/docker/daemon.json": '{"features": {"cdi": false}}\n'},
+        with_jq=True,
+    )
+    assert rc == 0
+    assert "daemon.json cdi:     false" in out
+    assert "daemon.json time-ns: not set" in out
+
+
+def test_diagnostics_say_when_there_is_no_daemon_json(tmp_path):
+    """Regression: with no daemon.json the two lines were blank (jq's error went to /dev/null)."""
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics", files={"etc/docker/daemon.json": None}, with_jq=True)
+    assert rc == 0
+    assert "daemon.json cdi:     no daemon.json" in out
+    assert "daemon.json time-ns: no daemon.json" in out
+
+
+def test_diagnostics_print_the_sysbox_runc_version_not_its_name(tmp_path):
+    """Regression: `sysbox-runc --version | head -1` is the line "sysbox-runc"; the version is on a later line."""
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics")
+    assert rc == 0
+    assert "sysbox-runc:         0.6.6" in out
+    assert "sysbox-runc:         sysbox-runc" not in out
+
+
+def test_diagnostics_say_not_found_without_sysbox_runc(tmp_path):
+    rc, out, _ = run_check(tmp_path, "failure_diagnostics", without=("sysbox-runc",))
+    assert rc == 0
+    assert "sysbox-runc:         not found" in out

@@ -108,7 +108,7 @@ ENABLE_TDX_ATTESTATION=true
 ENABLE_GPU_ATTESTATION=false                 # optional; GPU_ATTESTATION_ARCH=HOPPER | BLACKWELL when on
 # EXECUTOR_LOCAL_VERIFY_ENABLED=false        # optional; the validator's one-call POST /verify over its SSH tunnel (LOCAL_VERIFY_MAX_DEADLINE_SECONDS, LOCAL_VERIFY_INTENT_WINDOW_SECONDS tune it)
 
-# Measured executor-runner release (from the release notes) — required
+# Measured executor-runner release (release notes, section "CVM attestation") — required
 EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
 
 # Resources

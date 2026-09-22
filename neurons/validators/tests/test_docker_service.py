@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -29,6 +30,7 @@ from services.docker_service import (
 )
 from services.rental_docker_sdk import (
     ContainerExecResult,
+    ContainerStateSnapshot,
     RentalDockerOperationError,
     _wrap_error_message,
     build_gpu_docker_config,
@@ -6846,3 +6848,143 @@ async def test_create_failure_before_the_container_exists_is_not_a_host_kill(
     assert result.error_code == FailedContainerErrorCodes.UnknownError
     # The verdict must never cost us the cleanup itself — volumes and leftovers still go.
     cleanup.assert_awaited_once()
+
+
+# DAH-3678: the backend turns an `add_public_keys` failure into the DAH-2624 renter text ("the image's
+# default command exits right after start … restarting while the SSH keys were being installed") only
+# when the validator's failure text carries one of its markers (`is not running`, `is restarting`,
+# `status='exited'`, `status='restarting'`). Whatever form the exec failure took, the validator now
+# looks at the container and names the exiting image when it has exited or restarted.
+
+_CUDA_IMAGE = "nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04"
+# what the exec returns when the container's CMD exits underneath it: no Docker 409, no marker
+_EXEC_KILLED_BY_EXIT = RuntimeError("Failed to add SSH public keys: exit_status=137; stderr=; stdout=")
+
+
+def _state(**overrides) -> ContainerStateSnapshot:
+    base = dict(
+        status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None, oom_killed=False
+    )
+    return ContainerStateSnapshot(**{**base, **overrides})
+
+
+async def _create_failing_at_add_public_keys(docker_service, monkeypatch, *, state, exec_error):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service, "add_ssh_public_keys_with_rental_docker", AsyncMock(side_effect=exec_error)
+    )
+    inspect = AsyncMock(side_effect=state) if isinstance(state, Exception) else AsyncMock(return_value=state)
+    docker_service.rental_docker_client_factory.client.inspect_container_state = inspect
+    cleanup = AsyncMock(return_value=False)
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
+    payload = _filler_create_payload()
+    payload.docker_image = _CUDA_IMAGE
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "add_public_keys", "dashboards key on the step"
+    assert result.msg == "Failed create_container", "the renter-safe headline is unchanged"
+    # the container was still there to inspect: the explanation is read before cleanup removes it
+    assert inspect.await_args.kwargs == {"container_name": docker_service.get_container_name(payload)}
+    cleanup.assert_awaited_once()
+    return result
+
+
+def _failure_error_field(result: FailedContainerRequest) -> str:
+    """The `error` the backend reads from `detail` (headline >>> json extra)."""
+    return json.loads(result.detail.split(" >>> ", 1)[1])["error"]
+
+
+@pytest.mark.parametrize(
+    "state,expected_backend_marker",
+    [
+        pytest.param(
+            _state(status="exited", running=False, exit_code=0, restart_count=3),
+            "is not running",
+            id="exited",
+        ),
+        pytest.param(
+            _state(status="restarting", running=True, restarting=True, restart_count=2),
+            "is restarting",
+            id="restarting",
+        ),
+        pytest.param(
+            _state(status="running", running=True, restart_count=1),
+            "is restarting",
+            id="running-again-after-a-restart",
+        ),
+        pytest.param(
+            _state(status="dead", running=False, exit_code=1, restart_count=0),
+            "is not running",
+            id="dead",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_key_injection_that_fails_on_an_exiting_image_names_the_image(
+    docker_service, monkeypatch, state, expected_backend_marker
+):
+    result = await _create_failing_at_add_public_keys(
+        docker_service, monkeypatch, state=state, exec_error=_EXEC_KILLED_BY_EXIT
+    )
+
+    error = _failure_error_field(result)
+    assert expected_backend_marker in error, error
+    assert f"status={state.status!r}" in error
+    assert f"image {_CUDA_IMAGE!r} has no long-running command" in error
+    assert f"exit_code={state.exit_code!r}" in error
+    assert "sleep infinity" in error
+    # the exec's own text is kept for ops
+    assert error.endswith(f"Exec error: {_EXEC_KILLED_BY_EXIT}")
+
+
+@pytest.mark.asyncio
+async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_error(
+    docker_service, monkeypatch
+):
+    exec_error = RuntimeError("Failed to add SSH public keys: exit_status=1; stderr=read-only file system")
+
+    result = await _create_failing_at_add_public_keys(
+        docker_service, monkeypatch, state=_state(), exec_error=exec_error
+    )
+
+    assert _failure_error_field(result) == str(exec_error)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param(_state(status="exited", running=False, exit_code=137, oom_killed=True), id="oom-killed"),
+        pytest.param(_state(status="exited", running=False, exit_code=137), id="sigkill"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_key_injection_that_fails_after_a_host_kill_keeps_the_exec_error(
+    docker_service, monkeypatch, state
+):
+    """An OOM or SIGKILL is not the image's fault: the renter must not read "add `sleep infinity`"."""
+    result = await _create_failing_at_add_public_keys(
+        docker_service, monkeypatch, state=state, exec_error=_EXEC_KILLED_BY_EXIT
+    )
+
+    assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
+
+
+@pytest.mark.asyncio
+async def test_a_key_injection_failure_whose_inspect_fails_keeps_the_exec_error(
+    docker_service, monkeypatch
+):
+    """The explanation is best effort: a host that cannot be inspected still reports the exec failure."""
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=RentalDockerOperationError("Docker SDK inspect container failed: connection reset"),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+    )
+
+    assert _failure_error_field(result) == str(_EXEC_KILLED_BY_EXIT)
