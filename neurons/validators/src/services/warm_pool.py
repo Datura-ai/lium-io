@@ -369,6 +369,27 @@ def network_mismatch(inspect_output: str) -> str | None:
     return None
 
 
+def diff_slot_command(container_name: str) -> str:
+    """Every path that differs between the container's writable layer and its image."""
+    return f"/usr/bin/docker diff {shlex.quote(container_name)}"
+
+
+LAYER_MODIFIED = "layer_modified"
+
+
+def layer_modified(diff_output: str) -> str | None:
+    """Why the slot's writable layer is not the image's; None when it is.
+
+    The slot sits created-never-started on the miner's daemon between its create and the adoption,
+    and `slot_matches` reads only its settings. The miner can write into the layer meanwhile
+    (`docker cp`, a write under the overlay upper dir); nothing starts in a created container, so
+    its `docker diff` is empty by definition and any line means a renter would start on a filesystem
+    that is not the image's."""
+    if any(line.strip() for line in (diff_output or "").splitlines()):
+        return LAYER_MODIFIED
+    return None
+
+
 def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str | None:
     """Why the live slot differs from the container the rental would create now; None when equal.
 

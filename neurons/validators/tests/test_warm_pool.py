@@ -736,6 +736,8 @@ def _host(
     volume_inspect: str = VOLUME_INSPECT,
     volume_inspect_exit: int = 0,
     network_inspect: str = NETWORK_INSPECT,
+    layer_diff: str = "",
+    layer_diff_exit: int = 0,
 ):
     """An ssh client whose host answers the warm-pool commands like a node with one slot."""
     ssh = _ssh_client(inspect_exit=0)
@@ -750,6 +752,8 @@ def _host(
             return _ssh_result(exit_status=volume_inspect_exit, stdout=volume_inspect)
         if "docker network inspect" in cmd:
             return _ssh_result(stdout=network_inspect)
+        if "docker diff" in cmd:
+            return _ssh_result(exit_status=layer_diff_exit, stdout=layer_diff)
         if "docker rename" in cmd:
             return _ssh_result(exit_status=adopt_exit, stderr="boom" if adopt_exit else "")
         return _ssh_result(exit_status=0)
@@ -821,6 +825,8 @@ async def test_flag_on_adopts_the_slot_instead_of_creating(svc, monkeypatch):
     assert cmds.index(warm_pool.inspect_volume_command(f"volume_{SLOT_ID}")) < cmds.index(adopt[0])
     # and the rental network was read as an ICC-off bridge before the start (DAH-3199)
     assert cmds.index(warm_pool.inspect_network_command(spec.network)) < cmds.index(adopt[0])
+    # and the writable layer was read as untouched, last thing before the rename
+    assert cmds.index(warm_pool.diff_slot_command(spec.name)) == cmds.index(adopt[0]) - 1
     # the renter's keys still land after the start, as on every rental
     assert any(
         "authorized_keys" in " ".join(s.argv)
@@ -1098,6 +1104,7 @@ LEAK_SITES = [
     ("lookup", "lookup_failed:OSError", "reason"),
     ("volume-inspect", "volume_inspect_failed:OSError", "detail"),
     ("network-inspect", "network_inspect_failed:OSError", "reason"),
+    ("layer-diff", "layer_diff_failed:OSError", "reason"),
     ("slot-matches", "slot_document_unreadable:RuntimeError", "reason"),
     ("adopt-stderr", "adopt_command_exit:1", "reason"),
     ("adopt-raises", "adopt_command_failed:OSError", "reason"),
@@ -1122,6 +1129,8 @@ async def test_adopt_path_failures_log_a_token_and_the_exception_type_only(
         if site == "volume-inspect" and cmd == warm_pool.inspect_volume_command(f"volume_{SLOT_ID}"):
             raise OSError(LEAK_CANARY)
         if site == "network-inspect" and cmd == warm_pool.inspect_network_command(spec.network):
+            raise OSError(LEAK_CANARY)
+        if site == "layer-diff" and cmd == warm_pool.diff_slot_command(spec.name):
             raise OSError(LEAK_CANARY)
         if "docker rename" in cmd:
             if site == "adopt-raises":
@@ -1197,6 +1206,56 @@ async def test_slot_is_not_started_on_a_network_that_lets_containers_talk(
     assert any(f"docker rm -f {spec.name}" in c and f"volume rm volume_{SLOT_ID}" in c for c in cmds)
     svc.create_local_volume.assert_awaited_once()
     assert result.volume_name == f"volume_{payload.pod_id}"
+
+
+@pytest.mark.parametrize(
+    "layer_diff, layer_diff_exit, reason",
+    [
+        ("A /root/.bashrc\n", 0, "layer_modified"),
+        ("C /etc\nA /etc/ld.so.preload\n", 0, "layer_modified"),
+        ("D /usr/bin/python3\n", 0, "layer_modified"),
+        ("\n", 1, "layer diff exit 1"),
+    ],
+    ids=["added-file", "changed-dir", "deleted-file", "diff-fails"],
+)
+@pytest.mark.asyncio
+async def test_slot_with_a_written_layer_is_removed_not_adopted(
+    svc, monkeypatch, caplog, layer_diff, layer_diff_exit, reason
+):
+    """Between its create and the adoption the slot sits on the miner's daemon, which can write into
+    the container (`docker cp`, the overlay upper dir) without touching a setting `slot_matches`
+    reads. A created-never-started container's `docker diff` is empty; anything else — or a diff
+    that cannot be read — is a fallback: the slot and its volume go, the rental takes the
+    `docker run` path."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload()
+    spec = _spec(svc, payload)
+    ssh = _host(svc, spec, _image_doc(), layer_diff=layer_diff, layer_diff_exit=layer_diff_exit)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    cmds = _cmds(ssh)
+    assert warm_pool.diff_slot_command(spec.name) in cmds
+    assert not any("docker rename" in c or "docker start" in c for c in cmds)
+    assert any(
+        f"docker rm -f {spec.name}" in c and f"volume rm volume_{SLOT_ID}" in c for c in cmds
+    )
+    fallback = [r for r in caplog.records if str(r.msg) == "warm_pool adopt=fallback"]
+    assert [r.msg.extra["reason"] for r in fallback] == [reason]
+    svc.create_local_volume.assert_awaited_once()
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    assert result.volume_name == f"volume_{payload.pod_id}"
+
+
+def test_layer_modified_reads_the_diff_lines():
+    assert warm_pool.layer_modified("") is None
+    assert warm_pool.layer_modified("\n  \n") is None
+    assert warm_pool.layer_modified("A /tmp/x\n") == "layer_modified"
+    assert warm_pool.layer_modified("C /etc\nA /etc/ld.so.preload\n") == "layer_modified"
+    assert warm_pool.diff_slot_command("slot; rm -rf /") == "/usr/bin/docker diff 'slot; rm -rf /'"
 
 
 def test_network_mismatch_reads_the_inspect_line():

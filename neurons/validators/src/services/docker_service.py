@@ -1624,6 +1624,25 @@ class DockerService:
             return f"network inspect exit {result.exit_status}"
         return warm_pool.network_mismatch(result.stdout or "")
 
+    async def _warm_slot_layer_modified(
+        self, ssh_client: asyncssh.SSHClientConnection, slot: warm_pool.WarmSlot
+    ) -> str | None:
+        """Why the slot's writable layer is not the image's (`warm_pool.layer_modified`); a failed
+        diff is a mismatch too — a layer that cannot be read is never handed to a renter."""
+        try:
+            result = await ssh_client.run(
+                warm_pool.diff_slot_command(slot.name),
+                check=False,
+                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return f"layer_diff_failed:{type(exc).__name__}"
+        if result.exit_status != 0:
+            return f"layer diff exit {result.exit_status}"
+        return warm_pool.layer_modified(result.stdout or "")
+
     async def _adopt_warm_slot(
         self,
         *,
@@ -1634,7 +1653,8 @@ class DockerService:
         default_extra: dict,
     ) -> bool:
         """rename → cpu/memory → start the slot as `container_name`; False (slot and volume removed)
-        when the live slot differs from `run_spec` in any field or the command fails."""
+        when the live slot differs from `run_spec` in any field, its writable layer is not the
+        image's, or the command fails."""
         slot = adoption.slot
         try:
             reason = warm_pool.slot_matches(slot, run_spec, adoption.image_doc)
@@ -1646,6 +1666,11 @@ class DockerService:
             # A `docker create` proves the rental network is an ICC-off bridge (DAH-3199); the slot
             # was created hours ago, so its start re-reads the live network the same way.
             reason = await self._warm_slot_network_mismatch(ssh_client, run_spec.network)
+        if reason is None:
+            # The settings matched; the filesystem is the miner's until the rename. The last read
+            # before it: a created-never-started container's `docker diff` is empty, anything else
+            # is a layer the renter must not start on.
+            reason = await self._warm_slot_layer_modified(ssh_client, slot)
         if reason is None:
             try:
                 result = await ssh_client.run(
