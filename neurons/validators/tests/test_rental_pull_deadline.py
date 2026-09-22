@@ -1,10 +1,10 @@
 """The rental image pull deadline is one hour, and a pull that outlives it fails the create.
 
-The deadline used to be three hours. In the week to 18 Sep 2026 two customer pulls ran the full
-three hours (same image, ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.0) after the renter had
-deleted the pod at ~22 min — each one held a docker-sdk thread, the SSH session and the host's
-download for the remaining ~2.5 h. No customer rental that reached RUNNING in the 30 days to 18 Sep
-took longer than 44 min from create to ready, so an hour still covers every pull that has succeeded.
+The deadline used to be three hours. In the week to 18 Sep 2026 two pulls of a customer image
+ran the full three hours after the pod was deleted at about 22 min. Each one held a docker-sdk
+thread, the SSH session and the host download for the remaining 2.5 h. No rental that reached
+RUNNING in the 30 days to 18 Sep took longer than 44 min from create to ready, so an hour still
+covers every pull that has succeeded.
 """
 
 import asyncio
