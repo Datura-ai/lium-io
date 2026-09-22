@@ -11,7 +11,6 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationError, AttestationNonce, AttestationService
-from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.interactive_shell_service import InteractiveShellService
@@ -48,7 +47,6 @@ class TaskService:
         redis_service: Annotated[RedisService, Depends(RedisService)],
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
         verifyx_validation_service: Annotated[VerifyXValidationService, Depends(VerifyXValidationService)],
-        collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         backend_client: Annotated[BackendClient, Depends(BackendClient)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
@@ -68,7 +66,6 @@ class TaskService:
             redis_service=redis_service,
             validation_service=validation_service,
             verifyx_validation_service=verifyx_validation_service,
-            collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
             backend_client=backend_client,
             pod_recovery=pod_recovery,

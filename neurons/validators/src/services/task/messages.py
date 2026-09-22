@@ -575,24 +575,6 @@ class DuplicateExecutorMessages:
     )
 
 
-class CollateralMessages:
-    VERIFIED = MessageTemplate(
-        event="Collateral verified",
-        reason="COLLATERAL_OK",
-        severity="info",
-        category="policy",
-        impact="Proceed",
-    )
-    MISSING = MessageTemplate(
-        event="No collateral deposited",
-        reason="COLLATERAL_MISSING",
-        severity="warning",
-        category="policy",
-        impact="Score may be reduced or set to 0 based on policy",
-        remediation="Deposit collateral for this executor.",
-    )
-
-
 class StaleContainerCleanupMessages:
     CLEANED = MessageTemplate(
         event="Stale container cleanup complete",

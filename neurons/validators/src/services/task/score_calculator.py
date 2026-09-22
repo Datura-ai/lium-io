@@ -1,7 +1,7 @@
 """Score calculation logic for executor validation.
 
 This module contains the business logic for calculating actual and job scores
-based on collateral status, rental state, and contract versions.
+based on executor checks and rental state.
 """
 
 from typing import Tuple
@@ -9,9 +9,6 @@ from typing import Tuple
 from core.config import settings, shared_client
 from services.executor_image_policy import ImageVerdict
 from services.task.pipeline import Context
-
-
-SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
 
 def calculate_scores(
@@ -31,8 +28,6 @@ def calculate_scores(
         - warning_message: Empty string or warning message with leading " WARNING: "
     """
     gpu_model = ctx.state.gpu_model or ""
-    collateral_deposited = ctx.collateral_deposited
-    contract_version = ctx.contract_version or ""
     price_per_gpu = ctx.executor.price_per_gpu
 
     warning_messages = []
@@ -108,31 +103,6 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append(
             "EMA verifyx download speed unavailable (probe failed or never measured)"
-        )
-
-    # Early return for collateral-excluded GPU types
-    if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
-        return _format_return(actual_score, job_score, warning_messages, rented)
-
-    # Collateral checks
-    if not collateral_deposited:
-        collateral_error = ctx.collateral_error_message
-        if settings.ENABLE_NO_COLLATERAL:
-            warning_messages.append(collateral_error or "No collateral deposited")
-        else:
-            actual_score = 0.0
-            job_score = 0.0
-            warning_messages.append(collateral_error or "Collateral required but not deposited")
-    elif (
-        contract_version
-        and contract_version != settings.get_latest_contract_version()
-        and not settings.ENABLE_NO_COLLATERAL
-    ):
-        actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
-        job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
-        warning_messages.append(
-            f"Outdated contract version (current: {contract_version}, "
-            f"latest: {settings.get_latest_contract_version()})"
         )
 
     return _format_return(actual_score, job_score, warning_messages, rented)

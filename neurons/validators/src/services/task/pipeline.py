@@ -12,7 +12,6 @@ from core.utils import _m
 from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
 from services.redis_service import RedisService
-from services.collateral_contract_service import CollateralContractService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -71,7 +70,6 @@ class PodRecoverer(Protocol):
 class ContextServices:
     ssh: SSHService
     redis: RedisService
-    collateral: CollateralContractService
     validation: ValidationService
     verifyx: VerifyXValidationService
     inspector: InspectorValidationService
@@ -102,7 +100,6 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    enable_no_collateral: bool = False
     verifyx_enabled: bool = False
     inspector_enabled: bool = False
     port_private_key: Optional[str] = None
@@ -215,7 +212,6 @@ class Context(BaseModel):
     # node scores 0 on every later cycle under this executor id and is never re-anchored.
     gpu_anchor_broken: bool = False
     collateral_deposited: bool = False
-    collateral_error_message: str | None = None
     contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False

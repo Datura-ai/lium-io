@@ -133,7 +133,6 @@ def build_context_config(**overrides) -> ContextConfig:
         max_gpu_count=None,
         gpu_model_rates={},
         nvml_digest_map={},
-        enable_no_collateral=False,
         verifyx_enabled=False,
         inspector_enabled=False,
         port_private_key=None,
@@ -157,7 +156,6 @@ def build_services(**overrides) -> ContextServices:
     base = dict(
         ssh=None,
         redis=None,
-        collateral=None,
         validation=None,
         verifyx=None,
         inspector=None,

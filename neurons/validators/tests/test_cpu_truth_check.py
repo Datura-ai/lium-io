@@ -144,7 +144,6 @@ async def test_mismatch_zeroes_the_final_score(context_factory, enforce, expecte
         state=state,
         ssh=_fake_ssh(present="0-43"),
         services=build_services(score_calculator=calculate_scores),
-        collateral_deposited=True,
         executor=default_executor().model_copy(update={"price_per_gpu": None}),
     )
     with (
@@ -154,8 +153,6 @@ async def test_mismatch_zeroes_the_final_score(context_factory, enforce, expecte
         s.CPU_TRUTH_CHECK_ENABLED = True
         s.CPU_TRUTH_ENFORCEMENT_ENABLED = enforce
         score_s.ENABLE_TDX_ATTESTATION = False
-        score_s.COLLATERAL_EXCLUDED_GPU_TYPES = []
-        score_s.ENABLE_NO_COLLATERAL = True
         pipeline = Pipeline([CpuTruthCheck(), ScoreCheck()], _NullSink())
         _, _, final_ctx = await pipeline.run(ctx)
 
