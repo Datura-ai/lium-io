@@ -1,0 +1,48 @@
+name: image-pins
+
+# Every image a compose file, a Dockerfile or a stack config pins must be in its registry: a provider
+# installs from main, and `docker compose up` on a tag nobody pushed fails for every new install
+# (daturaai/lium-watchtower:1.2.0 on #1432, 404 on Docker Hub). .github/scripts/check_image_pins.py
+# lists the pins and runs `docker manifest inspect` on each, anonymously, the way a provider pulls.
+# A PR checks the references it adds: Docker Hub gives an anonymous IP about 100 manifest requests an
+# hour and a runner's IP is shared. main, the nightly run and a manual run check every pin, so a tag
+# removed from Docker Hub shows too. No `paths:` filter: the job reports on every PR, so it can be
+# required, and a PR that adds no pin passes in seconds.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+    branches: [main]
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-pins-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image-pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # a PR's checkout is its merge ref; the first parent is the base it merges into
+          fetch-depth: 2
+      - run: python3 .github/scripts/test_check_image_pins.py
+      - name: every pinned image is in its registry
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            merge_group) git fetch -q --depth=1 origin "$MERGE_GROUP_BASE" && base="$MERGE_GROUP_BASE" ;;
+            *) base= ;;
+          esac
+          python3 .github/scripts/check_image_pins.py ${base:+--base "$base"}
