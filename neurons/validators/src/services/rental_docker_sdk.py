@@ -889,7 +889,7 @@ def _build_rental_ssh_http_adapter_class(
     from docker.transport.sshconn import SSHHTTPAdapter
 
     class RentalSSHHTTPAdapter(SSHHTTPAdapter):
-        def _connect(self):
+        def _connect(self) -> None:
             super()._connect()
             transport = self.ssh_client.get_transport() if self.ssh_client else None
             if transport is not None:

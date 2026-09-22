@@ -388,7 +388,7 @@
     },
     {
       "expect": "FailedContainerRequest",
-      "note": "1.1.0 (DAH-3505): the volume step failed; step_detail is the Docker daemon's own bounded reason (with the dead-transport hint in front when the SDK session was gone), detail names the step only",
+      "note": "1.1.0 (DAH-3505): the volume step failed; step_detail is the Docker daemon's own bounded reason, detail names the step only",
       "message": {
         "message_type": "FailedRequest",
         "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
@@ -400,7 +400,7 @@
         "detail": "Failed create_container {'executor': '203.0.113.10:2200', 'error': 'volume creation failed (failure_step=volume_creation)', 'failure_step': 'volume_creation'}",
         "error_code": "UnknownError",
         "failure_step": "volume_creation",
-        "step_detail": "the Docker connection to the executor dropped while the pod was being prepared: 500 Server Error: Internal Server Error (\"create lium-vol-0b1c2d3e: error while creating volume: no space left on device\")"
+        "step_detail": "500 Server Error: Internal Server Error (\"create lium-vol-0b1c2d3e: error while creating volume: no space left on device\")"
       }
     },
     {
