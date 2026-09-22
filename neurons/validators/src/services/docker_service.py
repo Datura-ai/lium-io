@@ -525,7 +525,9 @@ class ImageExitedDuringBootstrap(Exception):
 def _image_exited_explanation(*, image: str, state: ContainerStateSnapshot, during: str, cause: Exception) -> str:
     """The renter-facing DAH-2624/3678 text: the image has no long-running command. The backend
     picks its "no long-running process" message from the `is not running` / `is restarting` /
-    `status='…'` markers in here, so both bootstrap steps must say it the same way."""
+    `status='…'` markers in here, but only when `failure_step` is `add_public_keys`; for the later
+    steps (`ssh_bootstrap`, `set_environment`) this text goes to the logs only. Both steps say it
+    the same way so the log reads alike."""
     if state.running:
         # Docker's restart policy already brought it back; the exec landed in the gap.
         situation = f"Docker is restarting it ({state.describe()})"
