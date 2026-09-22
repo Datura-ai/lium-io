@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
-from ..messages import MachineSpecMessages as Msg, render_message
+from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from services.file_encrypt_service import ORIGINAL_KEYS
@@ -104,17 +104,52 @@ def _decrypt_payload(ctx: Context, stdout: str) -> str:
     raise last_exc or ValueError("No scrape payload on stdout")
 
 
-def _scrape_reported_its_own_failure(stdout: str) -> bool:
+def _scrape_error_report(stdout: str) -> dict[str, Any] | None:
     # the scrape prints {"error": ...} as its last line and exits non-zero when it ran but found
     # nothing to report; a source the interpreter could not run prints nothing of ours at all
     last_line = next((line for line in _lines_from_the_end(stdout) if line.strip()), None)
     if last_line is None:
-        return False
+        return None
     try:
         report = json.loads(last_line)
     except ValueError:
-        return False
-    return isinstance(report, dict) and "error" in report
+        return None
+    return report if isinstance(report, dict) and "error" in report else None
+
+
+def _scrape_reported_its_own_failure(stdout: str) -> bool:
+    return _scrape_error_report(stdout) is not None
+
+
+def _is_no_gpu_details(error: Any, obfuscation_keys: dict[str, str] | None) -> bool:
+    # the key substitution that renames `gpu_details` in the shipped scrape (file_encrypt_service)
+    # is a plain text replace, so it renames it inside this string literal too
+    obfuscated = (obfuscation_keys or {}).get("gpu_details", "gpu_details")
+    return error in {"no_gpu_details", f"no_{obfuscated}"}
+
+
+def _scrape_failure(
+    scrape_run: SSHCommandResult, obfuscation_keys: dict[str, str] | None
+) -> tuple[MessageTemplate, dict[str, Any]]:
+    # which side failed, from what came back: the runner sets error_type only when ssh.run raised
+    # or timed out (runner.py), so there is no exit status from the host behind it
+    if scrape_run.error_type == "timeout":
+        return Msg.SCRAPE_TIMEOUT, {"error_type": scrape_run.error_type}
+    if scrape_run.error_type is not None:
+        return Msg.SCRAPE_TRANSPORT_FAILED, {"error_type": scrape_run.error_type}
+
+    report = _scrape_error_report(scrape_run.stdout)
+    if report is not None and _is_no_gpu_details(report.get("error"), obfuscation_keys):
+        data = report.get("data")
+        data = _deobfuscate(data, obfuscation_keys) if isinstance(data, dict) else {}
+        gpu_scrape_error = data.get("gpu_scrape_error")
+        if gpu_scrape_error:
+            return Msg.SCRAPE_FAILED_DRIVER, {
+                "scrape_error": "no_gpu_details",
+                "gpu_scrape_error": str(gpu_scrape_error)[:200],
+            }
+        return Msg.SCRAPE_FAILED_NO_GPU, {"scrape_error": "no_gpu_details"}
+    return Msg.SCRAPE_FAILED_ON_HOST, {}
 
 
 @dataclass(frozen=True)
@@ -231,7 +266,7 @@ class MachineSpecScrapeCheck:
             remote_dir = await upload_validation_files_to_fresh_remote_dir(ctx, attempts=FALLBACK_UPLOAD_ATTEMPTS)
         except UploadFailed as exc:
             event = render_message(
-                Msg.SCRAPE_FAILED,
+                Msg.SCRAPE_TRANSPORT_FAILED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
@@ -290,8 +325,9 @@ class MachineSpecScrapeCheck:
             what["fallback_from"] = fallback_from.as_event_field()
 
         if not scrape_run.success or not scrape_run.stdout.strip():
+            template, cause = _scrape_failure(scrape_run, ctx.config.obfuscation_keys)
             event = render_message(
-                Msg.SCRAPE_FAILED,
+                template,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
@@ -300,6 +336,7 @@ class MachineSpecScrapeCheck:
                     "exit_code": scrape_run.exit_code,
                     "duration_ms": scrape_run.duration_ms,
                     "stderr_tail": scrape_run.stderr[-400:],
+                    **cause,
                 },
             )
             return CheckResult(passed=False, event=event)
