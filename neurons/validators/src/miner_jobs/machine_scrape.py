@@ -1789,11 +1789,11 @@ def disk_type_of(device_name: str | None) -> str:
     """nvme | ssd | hdd | unknown for the physical disk(s) behind a block device name.
 
     A partition is walked up to its whole disk. A stacked device (LVM / dm-crypt `dm-*`, md RAID
-    `md*`) is followed through `slaves/` down to the physical disks and typed as the slowest of
-    them. `nvme*` is NVMe by name; anything else is what the kernel's `queue/rotational` flag
-    says: 0 is a solid-state disk, 1 a spinning one. A virtual machine's disk, a device with no
-    physical disk behind it (loop, nbd), a missing sysfs entry or any other reading is unknown -
-    never a default of one of the three."""
+    `md*`) is followed through `slaves/` down to the physical disks: one resolved kind, repeated,
+    is that kind; different resolved kinds, or none, is unknown. `nvme*` is NVMe by name; anything
+    else is what the kernel's `queue/rotational` flag says: 0 is a solid-state disk, 1 a spinning
+    one. A virtual machine's disk, a device with no physical disk behind it (loop, nbd), a missing
+    sysfs entry or any other reading is unknown - never a default of one of the three."""
     if not device_name or host_is_a_virtual_machine():
         return DISK_TYPE_UNKNOWN
     return disk_type_following_slaves(device_name, 0)
