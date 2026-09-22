@@ -33,6 +33,7 @@ from services.task_service import JobResult
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from core.validation_progress import progress as validation_progress
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,11 @@ EXPRESS_PUBLISHED_EVENT = "[express] Executor verified and published ahead of th
 # unreachable): try again later, a bounded number of times, then leave it to the normal cycle.
 MAX_ATTEMPTS = 3
 RETRY_SECONDS = 120
+# The one deferral the validation fast path shortens (settings.EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS):
+# the central miner serves executors from a portal snapshot it refreshes every 30 s, so a node this
+# validator's snapshot already lists is often one refresh away on the miner's side. Every other
+# deferral keeps RETRY_SECONDS.
+MINER_DID_NOT_RETURN_EXECUTOR = "miner did not return the executor"
 # job_batch_id format the backend parses into the prod_executors row's time.
 JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -110,7 +116,8 @@ class ExpressLane:
                 "[express] Express lane started",
                 extra=get_extra_info(
                     {
-                        "tick_seconds": settings.EXPRESS_LANE_TICK_SECONDS,
+                        "tick_seconds": settings.express_lane_tick_seconds(),
+                        "fast_path": settings.VALIDATION_FAST_PATH_ENABLED,
                         "max_in_flight": settings.EXPRESS_LANE_MAX_IN_FLIGHT,
                         "max_in_flight_per_miner": settings.EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER,
                     }
@@ -125,7 +132,7 @@ class ExpressLane:
                     _m("[express] Tick failed", extra=get_extra_info({"error": str(exc)})),
                     exc_info=True,
                 )
-            await asyncio.sleep(settings.EXPRESS_LANE_TICK_SECONDS)
+            await asyncio.sleep(settings.express_lane_tick_seconds())
 
     def _hotkey(self) -> str:
         if self._my_hotkey is None:
@@ -184,6 +191,7 @@ class ExpressLane:
                     pending = self._pending[executor.id] = _Pending(
                         executor=executor, miner_hotkey=miner_hotkey, first_seen_at=now_wall
                     )
+                    validation_progress.discovered(executor.id, miner_hotkey, EXPRESS_LANE)
                 if executor.id in in_flight or pending.not_before > now:
                     continue
                 candidates.append(pending)
@@ -285,6 +293,7 @@ class ExpressLane:
             "attempt": attempt,
         }
         try:
+            validation_progress.asking_miner(executor_id, miner.hotkey, EXPRESS_LANE, attempt)
             payload = MinerJobRequestPayload(
                 job_batch_id=started_wall.strftime(JOB_BATCH_ID_FORMAT),
                 miner_hotkey=miner.hotkey,
@@ -327,7 +336,7 @@ class ExpressLane:
                 if result.executor_info.uuid == executor_id
             ]
             if not results:
-                self._defer(pending, "miner did not return the executor")
+                self._defer(pending, MINER_DID_NOT_RETURN_EXECUTOR)
                 return
             await self._publish(pending, miner, results, extra, started)
         except Exception as exc:
@@ -364,6 +373,8 @@ class ExpressLane:
         """
         executor_id = pending.executor.id
         await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey)
+        result = results[0]
+        validation_progress.published(executor_id, passed=result.score > 0 or result.job_score > 0)
         try:
             await self.redis_service.mark_executors_validated([executor_id])
         except Exception as exc:
@@ -380,7 +391,6 @@ class ExpressLane:
         self._pending.pop(executor_id, None)
 
         published_at = datetime.now(UTC)
-        result = results[0]
         registered_at = pending.executor.created_at
         logger.info(
             _m(
@@ -424,11 +434,31 @@ class ExpressLane:
         if pending.attempts >= MAX_ATTEMPTS:
             self._left_to_cycle.add(pending.executor.id)
             self._pending.pop(pending.executor.id, None)
+            validation_progress.left_to_cycle(pending.executor.id, reason, pending.attempts)
             logger.warning(
                 _m("[express] Executor left to the normal cycle", extra=get_extra_info(extra))
             )
             return
-        pending.not_before = time.monotonic() + RETRY_SECONDS
+        retry_seconds = retry_seconds_for(reason)
+        pending.not_before = time.monotonic() + retry_seconds
+        validation_progress.retry_scheduled(pending.executor.id, reason, retry_seconds, pending.attempts)
         logger.info(
-            _m("[express] Executor not verified yet, will retry", extra=get_extra_info(extra))
+            _m(
+                "[express] Executor not verified yet, will retry",
+                extra=get_extra_info({**extra, "retry_seconds": retry_seconds}),
+            )
         )
+
+
+def retry_seconds_for(reason: str) -> int:
+    """How long a deferred executor waits before the lane asks its miner again.
+
+    Validation fast path: a miner that did not list the node yet is asked again once its portal
+    snapshot has had time to refresh (EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS, default 35 s >
+    the central miner's 30-s TTL) instead of after RETRY_SECONDS. MAX_ATTEMPTS is unchanged, so the
+    lane gives up on the node after the same number of asks; only the pause between them changes.
+    Every other reason, and the flag off, keep RETRY_SECONDS.
+    """
+    if settings.VALIDATION_FAST_PATH_ENABLED and reason == MINER_DID_NOT_RETURN_EXECUTOR:
+        return settings.EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS
+    return RETRY_SECONDS
