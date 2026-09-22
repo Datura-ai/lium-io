@@ -1,0 +1,39 @@
+name: "CI: pinned images exist"
+
+# Providers install from `main`, so a compose file or install script that pins a daturaai/ tag
+# or digest nobody has pushed breaks `docker compose up` for every new executor once it merges
+# (lium-io#1432 pinned lium-watchtower:1.2.0 before the image existed). The job asks Docker Hub
+# for each pinned manifest with anonymous HEAD requests: no pull, no login, no secret.
+# `paths` equals SCAN_GLOBS in scripts/check_pinned_images.py plus the two CI files
+# (neurons/executor/tests/test_check_pinned_images.py holds them equal). The check is not a
+# required status check: a required check with a `paths` filter never reports on other PRs.
+
+on:
+  pull_request:
+    paths:
+      - 'neurons/**/docker-compose*.yml'
+      - 'neurons/executor/**/*.yml'
+      - 'neurons/**/*.sh'
+      - 'neurons/**/Dockerfile*'
+      - 'scripts/**/*.sh'
+      - 'watchtower/**/*.sh'
+      - 'watchtower/**/Dockerfile*'
+      - 'scripts/check_pinned_images.py'
+      - '.github/workflows/pinned_images.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pinned-images-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pinned-images:
+    name: Pinned images exist on Docker Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check every pinned daturaai/ image on the PR's tree
+        run: python3 scripts/check_pinned_images.py
