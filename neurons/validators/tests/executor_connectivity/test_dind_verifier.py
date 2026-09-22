@@ -3,13 +3,8 @@ from typing import Any, NamedTuple
 
 import pytest
 
-from services.executor_connectivity.dind_probe import (
-    DIND_INNER_DOCKERD_IPTABLES,
-    DindVerifier,
-    diagnose_dind_log,
-)
-from services.executor_connectivity.models import DindLogCause
-from services.executor_connectivity.models import PortPair
+from services.executor_connectivity.dind_probe import DindVerifier, diagnose_dind_log
+from services.executor_connectivity.models import DIND_INNER_DOCKERD_IPTABLES, DindLogCause, PortPair
 
 
 def _run_result(mocker, exit_status=0, stdout="", stderr=""):

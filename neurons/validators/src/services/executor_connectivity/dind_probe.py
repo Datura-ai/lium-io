@@ -34,12 +34,6 @@ DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 # cap on the one `docker logs` + `docker exec tail` read of a failed container (DAH-2856)
 DIND_DIAGNOSTICS_TIMEOUT_SECONDS = 15
 
-# DAH-2856: when the container started but sshd never answered, the validator used to know only
-# "connection refused" and the node was scored as having no sysbox — with "install sysbox" as
-# the advice. The image's entrypoint waits for the inner dockerd before sshd starts, so the
-# container's own logs hold the real cause. Read before removal; the first matching pattern wins.
-# The cause codes live in models.py next to DindLogCause, so the task checks read them from there.
-
 # (pattern in the log, the cause it names); the first matching pattern wins
 DIND_LOG_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
     (
@@ -135,34 +129,8 @@ class DindVerifier:
                 host, port, pkey, log_ctx
             ) as ssh:
                 sshd_answered = True
-                # Test sysbox
                 if sysbox:
-                    # daturaai/dind bundles the hello-world image into the inner dockerd
-                    # at container start (DAH-1959), so `docker run` resolves it locally with no
-                    # registry round-trip. If the bundled load failed for any reason the local
-                    # image is absent and docker falls back to a Docker Hub pull, matching the
-                    # previous behaviour.
-                    try:
-                        result = await asyncio.wait_for(
-                            ssh.run("docker run --rm hello-world"), timeout=30
-                        )
-                        sysbox_ok = result.exit_status == 0
-                        error_msg = (
-                            result.stderr.strip()
-                            if not sysbox_ok and result.stderr and isinstance(result.stderr, str)
-                            else "unknown error"
-                        )
-                    except asyncio.TimeoutError:
-                        sysbox_ok = False
-                        error_msg = "sysbox check timed out after 30s"
-
-                    if not sysbox_ok:
-                        logger.warning(
-                            _m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
-                        )
-                        sysbox = False
-                    else:
-                        logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
+                    sysbox = await self._sysbox_works(ssh, log_ctx)
 
             await ssh_client.run(DockerCommand.remove_with_volumes(name))
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
@@ -190,6 +158,24 @@ class DindVerifier:
                 port=port,
                 error=error,
             )
+
+    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool:
+        """Run hello-world inside the DinD container; True when it exits 0 within 30s.
+
+        daturaai/dind loads hello-world into the inner dockerd at start (DAH-1959), so no registry
+        pull is needed; when that load failed, docker falls back to a Docker Hub pull.
+        """
+        try:
+            result = await asyncio.wait_for(ssh.run("docker run --rm hello-world"), timeout=30)
+        except asyncio.TimeoutError:
+            error_msg = "sysbox check timed out after 30s"
+        else:
+            if result.exit_status == 0:
+                logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
+                return True
+            error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
+        logger.warning(_m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+        return False
 
     async def _diagnose_unanswered_container(
         self,
