@@ -4,9 +4,11 @@ name: "CI: pinned images exist"
 # or digest nobody has pushed breaks `docker compose up` for every new executor once it merges
 # (lium-io#1432 pinned lium-watchtower:1.2.0 before the image existed). The job asks Docker Hub
 # for each pinned manifest with anonymous HEAD requests: no pull, no login, no secret.
-# `paths` equals SCAN_GLOBS in scripts/check_pinned_images.py plus the two CI files
-# (neurons/executor/tests/test_check_pinned_images.py holds them equal). The check is not a
-# required status check: a required check with a `paths` filter never reports on other PRs.
+# `paths` equals SCAN_GLOBS in scripts/check_pinned_images.py plus the CI files
+# (neurons/executor/tests/test_check_pinned_images.py holds them equal). Script-only
+# changes skip the executor job, so this workflow also runs that file's offline tests;
+# an empty-match parser would otherwise report success. The check is not a required
+# status check: a required check with a `paths` filter never reports on other PRs.
 
 on:
   pull_request:
@@ -20,6 +22,7 @@ on:
       - 'watchtower/**/Dockerfile*'
       - 'scripts/check_pinned_images.py'
       - '.github/workflows/pinned_images.yml'
+      - 'neurons/executor/tests/test_check_pinned_images.py'
 
 permissions:
   contents: read
@@ -35,5 +38,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Run the offline parser tests
+        run: |
+          python3 -m pip install --quiet pytest pyyaml
+          python3 -m pytest neurons/executor/tests/test_check_pinned_images.py -q --tb=short
       - name: Check every pinned daturaai/ image on the PR's tree
         run: python3 scripts/check_pinned_images.py

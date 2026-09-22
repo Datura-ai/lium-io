@@ -133,7 +133,8 @@ def _request(url: str, method: str = "GET", headers: dict[str, str] | None = Non
             last = e
         except (urllib.error.URLError, TimeoutError) as e:
             last = e
-        time.sleep(2 ** (attempt + 1))
+        if attempt + 1 < ATTEMPTS:
+            time.sleep(2 ** (attempt + 1))
     raise RegistryUnavailable(f"{method} {url}: {last}")
 
 

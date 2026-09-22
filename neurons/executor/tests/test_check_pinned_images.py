@@ -3,6 +3,7 @@ Docker Hub does not have. The tests run offline: the registry call is replaced."
 
 import importlib.util
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -149,4 +150,38 @@ def test_workflow_paths_cover_every_scanned_glob():
         *cpi.SCAN_GLOBS,
         "scripts/check_pinned_images.py",
         ".github/workflows/pinned_images.yml",
+        "neurons/executor/tests/test_check_pinned_images.py",
     ]
+
+
+def test_workflow_runs_the_offline_tests():
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["pinned-images"]["steps"]
+    runs = "\n".join(step.get("run") or "" for step in steps)
+    assert "test_check_pinned_images.py" in runs
+
+
+def test_request_sleeps_only_when_a_retry_remains(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(cpi.time, "sleep", sleeps.append)
+
+    def down(*_a, **_k):
+        raise urllib.error.URLError("down")
+
+    monkeypatch.setattr(cpi.urllib.request, "urlopen", down)
+    with pytest.raises(cpi.RegistryUnavailable):
+        cpi._request("https://example.invalid/")
+    assert sleeps == [2 ** (i + 1) for i in range(cpi.ATTEMPTS - 1)]
+
+
+def test_request_returns_a_non_retryable_status_without_sleep(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(cpi.time, "sleep", sleeps.append)
+
+    def missing(*_a, **_k):
+        raise urllib.error.HTTPError("https://example.invalid/", 404, "not found", hdrs=None, fp=None)
+
+    monkeypatch.setattr(cpi.urllib.request, "urlopen", missing)
+    status, body = cpi._request("https://example.invalid/")
+    assert status == 404
+    assert body == b""
+    assert sleeps == []
