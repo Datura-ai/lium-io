@@ -109,6 +109,10 @@ class JobResult(BaseModel):
     total_unrented_by_gpu_type: float | None = None          # Weighted GPU count for the executor in this cycle for scoring logic
     cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
     eligible_for_rental_share: bool = False
+    # DAH-3698: free GPUs of a GPU-split node that its free verified ports cannot back at the
+    # marketplace floor; they earn no idle pay while ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS
+    # is on. 0 for every other result, so `idle_payable_gpu_count == gpu_count` there.
+    port_unbacked_gpu_count: int = 0
     unrented_cap_multiplier: float | None = None          # Cap dilution multiplier: min(count, cap) / count
     rental_share: float | None = None                  # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                    # Burn share for the executor in this cycle for scoring logic
@@ -136,6 +140,11 @@ class JobResult(BaseModel):
         self.incentive_rented = rented
         self.incentive_idle = idle
         self.incentive = rented + idle
+
+    @property
+    def idle_payable_gpu_count(self) -> int:
+        """GPUs the unrented pool pays for: `gpu_count` less the port-unbacked ones (DAH-3698)."""
+        return max(self.gpu_count - self.port_unbacked_gpu_count, 0)
 
     def record_mixed_formula_inputs(self, inputs: "MixedFormulaInputs") -> None:
         """Take both portions' formula snapshots — call it while each portion still holds
@@ -195,6 +204,7 @@ class JobResult(BaseModel):
                 "burn_share": self.burn_share,
                 "gpu_model": self.gpu_model,
                 "gpu_count": self.gpu_count,
+                "port_unbacked_gpu_count": self.port_unbacked_gpu_count,
                 "hourly_rate": self.hourly_rate,
                 "unrented_cap_multiplier": self.unrented_cap_multiplier,
                 "sysbox_multiplier": self.sysbox_multiplier,

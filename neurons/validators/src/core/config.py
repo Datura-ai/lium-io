@@ -438,6 +438,14 @@ class Settings(BaseSettings):
         env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
     )
 
+    # DAH-3698 (owner, 22 Sep 2026) — a GPU-split node's free GPUs earn idle pay only up to the
+    # number its free verified ports can back at the marketplace floor (MIN_PORT_COUNT ports per
+    # rentable bundle of gpu_splitting_min_count GPUs). True withholds the idle pay of the GPUs
+    # beyond that budget; False only logs the shortfall (shadow mode).
+    ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS: bool = Field(
+        env="ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", default=False
+    )
+
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )

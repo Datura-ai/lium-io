@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from incentive.rental_price import (
         InsufficientDisk,
         MissingFlagshipCapability,
+        PortBudgetShortfall,
         PortLimitedRemainder,
         PowerCapIncapable,
     )
@@ -510,6 +511,33 @@ class MinerLogLine(BaseModel):
                 "burn_share": result.burn_share,
                 "incentive": result.incentive,
                 "total_rental_cost": result.total_rental_cost,
+            },
+        )
+
+    @staticmethod
+    def unrented_gpus_beyond_port_budget(result: JobResult, shortfall: PortBudgetShortfall) -> MinerLogLine:
+        # DAH-3698 report line, not a zero reason: the node is paid, for the GPUs its ports can back.
+        # `result` is the idle result (a whole idle split node or the free remainder), so
+        # gpu_count is the number of free GPUs the message names.
+        return MinerLogLine(
+            message=(
+                f"Unrented incentive covers {shortfall.backed_gpu_count} of the {shortfall.free_gpu_count} "
+                f"free GPU(s) on this GPU-split node: it has {shortfall.available_port_count} free port(s), "
+                f"the marketplace gives every pod {shortfall.ports_per_bundle} ports and rents this node in "
+                f"bundles of {shortfall.gpu_splitting_min_count} GPU(s), so {shortfall.unbacked_gpu_count} "
+                "free GPU(s) cannot be rented right now and earn no idle pay. Open more ports in "
+                "RENTING_PORT_RANGE to cover every GPU the node splits into."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "port_unbacked_gpus",
+                "available_port_count": shortfall.available_port_count,
+                "ports_per_bundle": shortfall.ports_per_bundle,
+                "gpu_splitting_min_count": shortfall.gpu_splitting_min_count,
+                "backed_gpu_count": shortfall.backed_gpu_count,
+                "unbacked_gpu_count": shortfall.unbacked_gpu_count,
             },
         )
 

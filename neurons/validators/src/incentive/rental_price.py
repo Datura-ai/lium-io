@@ -107,6 +107,24 @@ class PortLimitedRemainder(BaseModel):
     required: int  # MIN_PORT_COUNT at the time of the measurement
 
 
+PORT_UNBACKED_GPUS_EVENT = "port_unbacked_gpus"  # log/job-log event code, append-only
+
+
+class PortBudgetShortfall(BaseModel):
+    """Free GPUs of a GPU-split node that its free verified ports cannot back (DAH-3698, owner
+    22 Sep 2026: a split node needs ports for every GPU it splits into). The marketplace hands
+    every pod MIN_PORT_COUNT ports and rents a split node in bundles of gpu_splitting_min_count
+    GPUs, so `available_port_count // MIN_PORT_COUNT` bundles can still start on the node:
+    `backed_gpu_count` free GPUs are rentable, the `unbacked_gpu_count` beyond them are not."""
+
+    available_port_count: int
+    ports_per_bundle: int  # MIN_PORT_COUNT at the time of the measurement
+    gpu_splitting_min_count: int
+    free_gpu_count: int
+    backed_gpu_count: int
+    unbacked_gpu_count: int
+
+
 # ── Snapshot models ──────────────────────────────────────────────────────────
 
 class GpuBucketRentalState(BaseModel):
@@ -550,6 +568,83 @@ class RentalPriceIncentive(DefaultIncentive):
         )
         return True
 
+    @staticmethod
+    def _port_budget_shortfall(result: JobResult) -> PortBudgetShortfall | None:
+        """The free GPUs of an idle GPU-split result its free ports cannot back, else None.
+
+        Applies to the free remainder of a part-rented split node and to a whole idle node that
+        splits (gpu_splitting_min_count < gpu_count). None whenever the spec carries no readable
+        port count: a synthetic result or an older validator must never cost a miner the incentive.
+        """
+        if result.is_rented or result.spec is None:
+            return None
+        min_count: int | None = result.gpu_splitting_min_count
+        if not (result.supports_gpu_splitting and min_count and min_count > 0):
+            return None
+        if not result.is_split_remainder and min_count >= result.gpu_count:
+            return None  # a whole node rented only whole: one pod, MIN_PORT_COUNT covers it
+        # a Lium filler runs on the free GPUs and holds their ports: filler revenue, not idle pay
+        if result.default_job_owner == DEFAULT_JOB_OWNER_LIUM:
+            return None
+        available: Any = result.spec.get("available_port_count")
+        # bool is excluded explicitly - it passes isinstance(int) and would read True as 1
+        if not isinstance(available, int) or isinstance(available, bool) or available < 0:
+            return None
+        free_gpu_count: int = result.gpu_count
+        backed_gpu_count: int = min(free_gpu_count, (available // MIN_PORT_COUNT) * min_count)
+        unbacked_gpu_count: int = free_gpu_count - backed_gpu_count
+        if unbacked_gpu_count <= 0:
+            return None
+        return PortBudgetShortfall(
+            available_port_count=available,
+            ports_per_bundle=MIN_PORT_COUNT,
+            gpu_splitting_min_count=min_count,
+            free_gpu_count=free_gpu_count,
+            backed_gpu_count=backed_gpu_count,
+            unbacked_gpu_count=unbacked_gpu_count,
+        )
+
+    def _log_port_budget_shortfall(self, result: JobResult, shortfall: PortBudgetShortfall) -> None:
+        # structured log for every idle split result whose ports back fewer GPUs than it has free;
+        # the event code is what Loki and the provider dashboard key off
+        enforced: bool = settings.ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS
+        logger.info(
+            _m(
+                "Free GPUs of a GPU-split node exceed what its free ports can back at the marketplace floor"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "is_split_remainder": result.is_split_remainder,
+                    "available_port_count": shortfall.available_port_count,
+                    "ports_per_bundle": shortfall.ports_per_bundle,
+                    "gpu_splitting_min_count": shortfall.gpu_splitting_min_count,
+                    "backed_gpu_count": shortfall.backed_gpu_count,
+                    "unbacked_gpu_count": shortfall.unbacked_gpu_count,
+                    "enforced": enforced,
+                    "event": PORT_UNBACKED_GPUS_EVENT,
+                    "pool": "rental_partial" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _withhold_idle_pay_of_port_unbacked_gpus(self, job_result: JobResult) -> None:
+        """Log a port-budget shortfall; with the flag on, pay idle only for the backed GPUs.
+
+        While ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS is off the shortfall is only logged.
+        """
+        shortfall: PortBudgetShortfall | None = self._port_budget_shortfall(job_result)
+        if shortfall is None:
+            return
+        self._log_port_budget_shortfall(job_result, shortfall)
+        if not settings.ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS:
+            return
+        job_result.port_unbacked_gpu_count = shortfall.unbacked_gpu_count
+        job_result.record_incentive_log(
+            MinerLogLine.unrented_gpus_beyond_port_budget(job_result, shortfall)
+        )
+
     def _reason_excluded_from_both_pools(self, job_result: JobResult) -> MinerLogLine | None:
         """First reason (if any) the executor is excluded from BOTH incentive pools.
 
@@ -744,15 +839,17 @@ class RentalPriceIncentive(DefaultIncentive):
             result.count_bucket = bucket
             result.max_cap = max_cap
 
-            # accumulate raw unrented GPU count and weighted rate sum per bucket
+            # accumulate raw unrented GPU count and weighted rate sum per bucket; a GPU-split
+            # node's port-unbacked GPUs (DAH-3698) are left out of both
+            payable_gpu_count: int = result.idle_payable_gpu_count
             if result.hourly_rate > 0 and max_cap > 0:
                 key = (base_model, bucket)
                 self.unrented_count_by_bucket[key] = (
-                    self.unrented_count_by_bucket.get(key, 0) + result.gpu_count
+                    self.unrented_count_by_bucket.get(key, 0) + payable_gpu_count
                 )
                 self._weighted_rate_sum_by_bucket[key] = (
                     self._weighted_rate_sum_by_bucket.get(key, 0.0)
-                    + result.gpu_count
+                    + payable_gpu_count
                     * result.hourly_rate
                     * result.sysbox_multiplier
                     * result.driver_multiplier
@@ -799,7 +896,8 @@ class RentalPriceIncentive(DefaultIncentive):
                 # source bucket pays full weight already (or emptied by earlier moves)
                 continue
             tgt_count = self.unrented_count_by_bucket.get(tgt_key, 0)
-            if tgt_count + result.gpu_count > tgt_cap:
+            payable_gpu_count: int = result.idle_payable_gpu_count
+            if tgt_count + payable_gpu_count > tgt_cap:
                 # the whole node must fit: never over-fill the target
                 continue
             # Admission implies the move pays strictly better: the target ends at or
@@ -808,14 +906,14 @@ class RentalPriceIncentive(DefaultIncentive):
             src_multiplier = min(src_count, src_cap) / src_count
 
             weighted_rate = (
-                result.gpu_count
+                payable_gpu_count
                 * result.hourly_rate
                 * result.sysbox_multiplier
                 * result.driver_multiplier
             )
-            self.unrented_count_by_bucket[src_key] = src_count - result.gpu_count
+            self.unrented_count_by_bucket[src_key] = src_count - payable_gpu_count
             self._weighted_rate_sum_by_bucket[src_key] -= weighted_rate
-            self.unrented_count_by_bucket[tgt_key] = tgt_count + result.gpu_count
+            self.unrented_count_by_bucket[tgt_key] = tgt_count + payable_gpu_count
             self._weighted_rate_sum_by_bucket[tgt_key] = (
                 self._weighted_rate_sum_by_bucket.get(tgt_key, 0.0) + weighted_rate
             )
@@ -915,8 +1013,9 @@ class RentalPriceIncentive(DefaultIncentive):
         self._set_cycle_formula_context(result)
 
         # calculate incentive score
+        # DAH-3698: a GPU-split node's port-unbacked GPUs earn nothing here (payable count)
         result.incentive = (
-            result.rental_share * result.gpu_count * result.effective_rate / result.total_rental_cost
+            result.rental_share * result.idle_payable_gpu_count * result.effective_rate / result.total_rental_cost
             if result.total_rental_cost > 0 else 0.0
         )
 
@@ -1009,6 +1108,12 @@ class RentalPriceIncentive(DefaultIncentive):
         # rent, so it earns no idle pay; first in the chain so it never reaches the shadow numbers.
         if eligible_for_rental_share and self._withhold_idle_pay_if_port_limited(job_result):
             eligible_for_rental_share = False
+
+        # DAH-3698 (owner, 22 Sep 2026): a split node's free GPUs are paid idle only up to the
+        # number its free ports can back — one pod of gpu_splitting_min_count GPUs per
+        # MIN_PORT_COUNT free ports. The result stays eligible; only its payable count shrinks.
+        if eligible_for_rental_share:
+            self._withhold_idle_pay_of_port_unbacked_gpus(job_result)
 
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays
