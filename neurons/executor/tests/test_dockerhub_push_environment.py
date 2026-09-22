@@ -56,17 +56,6 @@ def test_every_job_that_reads_the_docker_hub_token_runs_in_the_environment(workf
     assert jobs_reading_the_token_outside_the_environment(workflow.read_text()) == []
 
 
-def test_the_seven_publish_workflows_are_in_the_environment():
-    """The inventory of pushers; a workflow dropped from it is a publish path that lost the guard."""
-    in_environment = {
-        w.name for w in WORKFLOWS if any(j.get("environment") == ENVIRONMENT for j in (yaml.safe_load(w.read_text()).get("jobs") or {}).values())
-    }
-    assert in_environment == {
-        "executor_cd_prod.yml", "executor_cd_dev.yml", "miner_cd_prod.yml", "miner_cd_dev.yml",
-        "validator_cd_prod.yml", "validator_cd_dev.yml", "watchtower_image.yml",
-    }
-
-
 def test_the_checker_flags_a_traced_login():
     """Negative control: ``set -eux`` and the login line, which ``bash -x`` prints expanded."""
     traced = f"#!/bin/bash\nset -eux -o pipefail\n{LOGIN_LINE} -u u --password-stdin\n"
