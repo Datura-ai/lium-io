@@ -33,11 +33,11 @@ def test_client_encodes_the_reclaim_and_finalize_calls():
     def selector(signature: str) -> str:
         return "0x" + client.w3.keccak(text=signature)[:4].hex().removeprefix("0x")
 
-    reclaim = client.contract.encodeABI(
+    reclaim = client.contract.encode_abi(
         fn_name="reclaimCollateral",
         args=[executor_uuid_bytes(EXECUTOR), "Manual reclaim", bytes(16)],
     )
-    finalize = client.contract.encodeABI(fn_name="finalizeReclaim", args=[7])
+    finalize = client.contract.encode_abi(fn_name="finalizeReclaim", args=[7])
     assert reclaim.startswith(selector("reclaimCollateral(bytes16,string,bytes16)"))
     assert UUID(EXECUTOR).bytes.hex() in reclaim
     assert finalize == selector("finalizeReclaim(uint256)") + f"{7:064x}"
