@@ -26,8 +26,9 @@ one in `pyproject.toml`, runs `twine check`, and then waits in the **`pypi` envi
 approves the run (Actions → the run → **Review deployments**). The upload is PyPI trusted publishing with PEP 740
 attestations: pypi.org's publisher for `lium-core` names this repository, this workflow file and the `pypi`
 environment, so the token exists only inside the approved job; no PyPI token is stored in this repository or on
-anyone's machine. A `workflow_dispatch` run only builds. Every file of a release shows a *Provenance* link on
-pypi.org; `https://pypi.org/integrity/lium-core/X.Y.Z/<filename>/provenance` returns the signed statement.
+anyone's machine. A `workflow_dispatch` run only builds, whatever ref it is started from. Every file of a release
+shows a *Provenance* link on pypi.org; `https://pypi.org/integrity/lium-core/X.Y.Z/<filename>/provenance` returns
+the signed statement.
 
 Who may tag: the `lium-core-release-tags` ruleset (`.github/rulesets/lium-core-release-tags.json`) lets only its
 bypass list create, move or delete a `lium-core-v*` tag. Both guards are repository settings a repository admin
@@ -51,3 +52,18 @@ Check: `gh api "repos/$R/environments/pypi" --jq '.protection_rules[]|.type'` �
 `branch_policy`; `gh api "repos/$R/rulesets?targets=tag" --jq '.[]|.name+" "+.enforcement'` →
 `lium-core-release-tags active`. Other publishers in this repository that later use the same environment add their
 tag pattern with one more `deployment-branch-policies` call.
+
+**Order — it matters.** (1) Create the `pypi` environment with its reviewer and policy, as above, **before the
+workflow change merges**: a workflow that names an environment that does not exist makes GitHub create it with no
+protection, and the first tagged run would publish with no click. (2) Register the `pypi` publisher on pypi.org
+(Manage → Publishing → Add a new publisher → GitHub: owner `Datura-ai`, repository `lium-io`, workflow
+`lium-core-release.yml`, environment `pypi`). (3) Merge. (4) Proof release, approved by the reviewer. (5) **Delete
+the old publishers** on pypi.org: `Datura-ai/lium-io · lium-core-release.yml · release` and the archived
+`Datura-ai/lium-core · release.yml · release`. Until they are gone a branch whose edited `lium-core-release.yml`
+keeps `environment: release` (no reviewer, no branch policy), run by hand, still uploads — any of the 7 accounts
+with write access can do that today. (6) Apply the tag ruleset. The publish job checks step (1) itself: it reads
+`repos/$R/environments/pypi` back and stops with `environment pypi has no required reviewer` when none is set
+(an unauthenticated read for a public repository; the job holds `actions: read` for it). It cannot check step (5)
+— pypi.org's side is the owner's click. With no `pypi` publisher registered, PyPI rejects the `pypi`-environment
+token (the current publisher is bound to `release`), so between (3) and (2) a tag fails closed — that is the only
+state that does.

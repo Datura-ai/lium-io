@@ -57,11 +57,13 @@ jobs:
         name: dist
         path: packages/lium-core/dist/
 
-  # The only path to PyPI: runs for a `lium-core-v*` tag only, inside the `pypi` environment, with the OIDC token
-  # minted for this job. PEP 740 attestations are the action's default; written out so an edit cannot drop them
-  # unnoticed (`pypi.org/integrity/lium-core/<version>/<file>/provenance` holds the signed statement).
+  # The only path to PyPI: runs for a pushed `lium-core-v*` tag only (a workflow_dispatch started at a tag ref has
+  # ref_type == 'tag' too, hence the event_name test), inside the `pypi` environment, with the OIDC token minted
+  # for this job. PEP 740 attestations are the action's default; written out so an edit cannot drop them unnoticed
+  # (`pypi.org/integrity/lium-core/<version>/<file>/provenance` holds the signed statement). `startsWith` is
+  # case-insensitive; the build job's tag-equals-version compare is not and runs first.
   approve-and-publish:
-    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'lium-core-v')
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'lium-core-v')
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -69,10 +71,31 @@ jobs:
       name: pypi
       url: https://pypi.org/project/lium-core/
     permissions:
+      actions: read     # the environment read below (GitHub: "Actions" repository permission, read)
       contents: read
       id-token: write
+    env:
+      PYPI_REQUIRED_REVIEWER: surcyf123
 
     steps:
+    # A workflow that names an environment that does not exist makes GitHub create it with NO protection, so
+    # reaching this step proves nothing by itself. Read the environment's rules back and stop unless a required
+    # reviewer is set and the owner is one of them: a run that got here without a click cannot upload.
+    # What this cannot prove: that pypi.org's old `release`-bound publisher is gone (until it is, an edited copy
+    # of this file on a branch that keeps `environment: release`, run by hand, still uploads — README "Release").
+    - name: Environment pypi must have a required reviewer
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        reviewers="$(gh api "repos/$GITHUB_REPOSITORY/environments/pypi" \
+          --jq '[.protection_rules[] | select(.type == "required_reviewers") | .reviewers[].reviewer.login] | join(" ")')"
+        echo "required reviewers on environment pypi: ${reviewers:-none}"
+        if [[ " $reviewers " != *" $PYPI_REQUIRED_REVIEWER "* ]]; then
+          echo "environment pypi has no required reviewer $PYPI_REQUIRED_REVIEWER — admin step pending" >&2
+          echo "(packages/lium-core/README.md 'Release', step 1); nothing published" >&2
+          exit 1
+        fi
+
     - name: Download artifact
       uses: actions/download-artifact@v4
       with:
