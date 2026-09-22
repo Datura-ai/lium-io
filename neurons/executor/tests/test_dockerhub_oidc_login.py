@@ -6,9 +6,7 @@ publish in the deployment repository sources them) and skip it when no token is 
 printing the value under ``set -x``.
 """
 
-import json
 import os
-import re
 import stat
 import subprocess
 from pathlib import Path
@@ -43,8 +41,11 @@ def docker_hub_login_problems(workflow_text: str) -> list[str]:
     for job_id, job in (yaml.safe_load(workflow_text).get("jobs") or {}).items():
         # a `registry:` other than Docker Hub (the staging workflows log in to ghcr.io with GITHUB_TOKEN) is not a Docker Hub login
         login_steps = [
-            s for s in job.get("steps") or []
-            if str(s.get("uses", "")).startswith(LOGIN_ACTION) and (s.get("with") or {}).get("registry", "docker.io") in ("docker.io", "registry-1.docker.io")
+            s
+            for s in job.get("steps") or []
+            if str(s.get("uses", "")).startswith(LOGIN_ACTION)
+            and (s.get("with") or {}).get("registry", "docker.io")
+            in ("docker.io", "registry-1.docker.io")
         ]
         if not login_steps:
             continue
@@ -72,7 +73,11 @@ def test_the_checker_flags_the_token_login_shape():
         "on: workflow_dispatch\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n"
         "      - uses: docker/login-action@v4\n        with:\n          username: daturaai\n          password: ${{ secrets.X }}\n"
     )
-    assert docker_hub_login_problems(password_login) == ["deploy: no `id-token: write`", "deploy: login step carries a password", "deploy: no DOCKERHUB_OIDC_CONNECTIONID from vars"]
+    assert docker_hub_login_problems(password_login) == [
+        "deploy: no `id-token: write`",
+        "deploy: login step carries a password",
+        "deploy: no DOCKERHUB_OIDC_CONNECTIONID from vars",
+    ]
     ghcr = password_login.replace("username: daturaai", "registry: ghcr.io\n          username: x")
     assert docker_hub_login_problems(ghcr) == []
 
@@ -86,12 +91,19 @@ def test_the_seven_publish_workflows_log_in_with_the_action():
     """The inventory of pushers: each one carries the OIDC login step (a pusher without it would push unauthenticated and fail)."""
     with_login = {w.name for w in WORKFLOWS if LOGIN_ACTION in w.read_text()}
     assert with_login >= {
-        "executor_cd_prod.yml", "executor_cd_dev.yml", "miner_cd_prod.yml", "miner_cd_dev.yml",
-        "validator_cd_prod.yml", "validator_cd_dev.yml", "watchtower_image.yml",
+        "executor_cd_prod.yml",
+        "executor_cd_dev.yml",
+        "miner_cd_prod.yml",
+        "miner_cd_dev.yml",
+        "validator_cd_prod.yml",
+        "validator_cd_dev.yml",
+        "watchtower_image.yml",
     }
 
 
-def _run_publish(script: Path, tmp_path: Path, env_extra: dict) -> tuple[subprocess.CompletedProcess, list[str]]:
+def _run_publish(
+    script: Path, tmp_path: Path, env_extra: dict
+) -> tuple[subprocess.CompletedProcess, list[str]]:
     """Run a publish script in a scratch dir with a stub `docker` and a stub `docker_build.sh` / `docker_runner_build.sh`."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -103,10 +115,15 @@ def _run_publish(script: Path, tmp_path: Path, env_extra: dict) -> tuple[subproc
     log = tmp_path / "calls.log"
     log.write_text("")
     env = {
-        "PATH": f"{bin_dir}:{os.environ['PATH']}", "STUB_LOG": str(log), "IMAGE_NAME": "daturaai/stub:test",
-        "DOCKERHUB_USERNAME": ORG, **env_extra,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "STUB_LOG": str(log),
+        "IMAGE_NAME": "daturaai/stub:test",
+        "DOCKERHUB_USERNAME": ORG,
+        **env_extra,
     }
-    proc = subprocess.run(["bash", str(script)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(
+        ["bash", str(script)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30
+    )
     return proc, [line for line in log.read_text().splitlines() if line]
 
 
@@ -122,14 +139,20 @@ def test_publish_script_skips_the_login_when_no_token_is_passed(script, tmp_path
 def test_publish_script_logs_in_once_with_a_passed_token_and_never_prints_it(script, tmp_path):
     proc, calls = _run_publish(script, tmp_path, {"DOCKERHUB_PAT": "FAKE-TOKEN-VALUE"})
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert [c for c in calls if c.startswith("docker login")] == [f"docker login -u {ORG} --password-stdin"]
-    assert "FAKE-TOKEN-VALUE" not in proc.stdout + proc.stderr, "the token reached the log (set -x trace)"
+    assert [c for c in calls if c.startswith("docker login")] == [
+        f"docker login -u {ORG} --password-stdin"
+    ]
+    assert "FAKE-TOKEN-VALUE" not in proc.stdout + proc.stderr, (
+        "the token reached the log (set -x trace)"
+    )
 
 
 def test_a_traced_login_prints_the_token(tmp_path):
     """Negative control for the trace assertion: the pre-change shape of the miner script leaks under `set -x`."""
     traced = tmp_path / "traced.sh"
-    traced.write_text('#!/bin/bash\nset -eux\nsource ./docker_build.sh\necho "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin\ndocker push "$IMAGE_NAME"\n')
+    traced.write_text(
+        '#!/bin/bash\nset -eux\nsource ./docker_build.sh\necho "$DOCKERHUB_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin\ndocker push "$IMAGE_NAME"\n'
+    )
     proc, calls = _run_publish(traced, tmp_path, {"DOCKERHUB_PAT": "FAKE-TOKEN-VALUE"})
     assert proc.returncode == 0
     assert "FAKE-TOKEN-VALUE" in proc.stderr
