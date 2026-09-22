@@ -553,6 +553,27 @@ class Settings(BaseSettings):
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
 
+    # Own-supply fast validation (P245, 22 Sep 2026: "we want the validation process to be quick, so
+    # that we can quickly add on-demand nodes when lium has no supply left"). A node Lium rents from
+    # an outside cloud and registers itself (lium-platform own-supply registrar, design
+    # OWN_SUPPLY_B300.md §3) is registered under a Lium-owned miner hotkey. The checks that exist to
+    # catch a DISHONEST provider — the collateral read, VerifyX's RAM/disk/bandwidth proof, the
+    # full-card matmul — prove nothing about a node Lium itself pays for, and they are the bulk of a
+    # first verification's wall time (VerifyX p50 80 s / p90 149 s, matmul p50 26.5 s, collateral
+    # 3.5 s; 11.6 % of VerifyX runs fail and cost the node a whole cycle). With the flag on, the
+    # FIRST, unscored verification (the express lane's `first_pass=True` call) of an executor whose
+    # miner hotkey is in OWN_SUPPLY_MINER_HOTKEYS runs the trusted-provider profile: collateral and
+    # VerifyX are skipped and the matmul is sized from FIRST_PASS_MATMUL_VRAM_MB; every check that
+    # catches a BROKEN node (scrape, GPU count/model/VRAM, disk, NVML digest, ports, sysbox, GPU
+    # compute probe, the backend's rental verification) is unchanged. Every scored cycle, and every
+    # other miner's every verification, is byte-for-byte today's. The hotkey is the miner's signed
+    # identity — nothing a provider sets on a node can put it in this set. Off by default; an empty
+    # hotkey list trusts nobody even with the flag on.
+    OWN_SUPPLY_FAST_VALIDATION_ENABLED: bool = Field(env="OWN_SUPPLY_FAST_VALIDATION_ENABLED", default=False)
+    # Comma-separated ss58 miner hotkeys of the Lium-owned provider account(s) the own-supply
+    # registrar registers nodes under. Operator-set; never read from a miner or an executor.
+    OWN_SUPPLY_MINER_HOTKEYS: str = Field(env="OWN_SUPPLY_MINER_HOTKEYS", default="")
+
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
     # is authoritative for the size cap but the validator double-checks it as
@@ -641,6 +662,18 @@ class Settings(BaseSettings):
 
     def get_latest_contract_version(self) -> str:
         return max(self.CONTRACT_VERSIONS.keys())
+
+    def own_supply_miner_hotkeys(self) -> frozenset[str]:
+        """The Lium-owned miner hotkeys whose nodes get the trusted-provider profile (P245)."""
+        return frozenset(h.strip() for h in self.OWN_SUPPLY_MINER_HOTKEYS.split(",") if h.strip())
+
+    def is_own_supply_trusted_first_pass(self, miner_hotkey: str | None, first_pass: bool) -> bool:
+        """True only for the FIRST, unscored verification of a node registered under a Lium-owned hotkey,
+        with OWN_SUPPLY_FAST_VALIDATION_ENABLED on. The wave never passes ``first_pass``, so a scored
+        verification never takes the profile; an empty OWN_SUPPLY_MINER_HOTKEYS trusts nobody."""
+        if not first_pass or not self.OWN_SUPPLY_FAST_VALIDATION_ENABLED or not miner_hotkey:
+            return False
+        return miner_hotkey in self.own_supply_miner_hotkeys()
 
     def get_referral_feed_url(self) -> str:
         """Referral-weights feed URL, derived from COMPUTE_REST_API_URL unless overridden.

@@ -64,6 +64,27 @@ class VerifyXCheck:
             )
             return CheckResult(passed=False, event=event)
 
+        if ctx.config.trusted_provider:
+            # P245: VerifyX proves the RAM, disk and bandwidth an outside provider CLAIMS (75 % of
+            # RAM written and read back, 5 GB of disk, a 263–501 MB CDN download; p50 80 s, p90 149 s,
+            # 11.6 % of runs fail and cost the node a cycle). A node Lium rents from a cloud has a
+            # known spec sheet and Lium's own money behind it, so its first pass publishes the
+            # scrape's readings (specs.ram / hard_disk / network from the speedtest) as they are and
+            # leaves the VerifyX EMA unseeded: the first scored cycle measures it and enforces the
+            # gate as on any node. State is untouched on purpose — nothing here is measured.
+            event = render_message(
+                Msg.OWN_SUPPLY_SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "skipped": True,
+                    "reason": "own_supply_first_pass",
+                    "network": specs.get("network", {}) or {},
+                    "bandwidth_gate": "deferred_to_first_scored_cycle",
+                },
+            )
+            return CheckResult(passed=True, event=event)
+
         filler_container = _get_filler_only_container(ctx)
         if filler_container:
             updated_specs = _with_last_known_verifyx_ema(ctx)

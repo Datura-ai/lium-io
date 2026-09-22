@@ -115,6 +115,14 @@ class ContextConfig:
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
     # scored cycle; every other check is the same.
     first_pass: bool = False
+    # P245 own-supply fast validation: True only for the FIRST, unscored verification of a node
+    # registered under a Lium-owned miner hotkey (settings.OWN_SUPPLY_MINER_HOTKEYS) with
+    # OWN_SUPPLY_FAST_VALIDATION_ENABLED on (resolved in PipelineFactory.build_context). The
+    # collateral read and VerifyX are skipped, the matmul runs at the first-pass VRAM budget and
+    # the score calculator waives the two gates those checks feed (collateral, VerifyX EMA);
+    # every check that catches a broken node runs as on any other node. Independent of
+    # `first_pass` above: FIRST_PASS_FAST_PATH_ENABLED off leaves this profile whole.
+    trusted_provider: bool = False
 
 
 @dataclass(frozen=True)

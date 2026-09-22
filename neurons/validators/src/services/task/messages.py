@@ -591,6 +591,13 @@ class CollateralMessages:
         impact="Score may be reduced or set to 0 based on policy",
         remediation="Deposit collateral for this executor.",
     )
+    OWN_SUPPLY_SKIPPED = MessageTemplate(
+        event="Collateral check skipped (own-supply node, first pass)",
+        reason="COLLATERAL_SKIPPED_OWN_SUPPLY",
+        severity="info",
+        category="policy",
+        impact="Proceed; Lium is the provider of this node, so no bond is read",
+    )
 
 
 class StaleContainerCleanupMessages:
@@ -994,6 +1001,13 @@ class VerifyXMessages:
         severity="info",
         category="policy",
         impact="Active filler runtime preserved; reused last-known VerifyX EMA when available",
+    )
+    OWN_SUPPLY_SKIPPED = MessageTemplate(
+        event="VerifyX validation skipped (own-supply node, first pass)",
+        reason="VERIFYX_SKIPPED_OWN_SUPPLY",
+        severity="info",
+        category="policy",
+        impact="Proceed on the scrape's RAM/disk/speed readings; the first scored cycle runs VerifyX",
     )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
