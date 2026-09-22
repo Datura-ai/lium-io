@@ -128,12 +128,20 @@ class _RefusingThenRecordingSubtensor(_RecordingSubtensor):
         super().__init__(network=network, config=config, **kwargs)
 
 
+def _switch_lines(caplog) -> list[str]:
+    return [
+        r.msg.message
+        for r in caplog.records
+        if getattr(r.msg, "message", "").startswith("Subtensor endpoint switched")
+    ]
+
+
 def test_initialize_subtensor_falls_back_to_the_public_node_when_our_endpoint_fails(
     monkeypatch, caplog
 ):
-    """Rustam's review (21 Sep): with the proxy down the validator had no chain client, so
-    metagraph sync and set_weights stopped. The own endpoint is tried first; when it fails and
-    one is configured, the public `BITTENSOR_NETWORK` node is dialled and the log says why."""
+    """taiberium (22 Sep): proxy refused → the public node answers → ONE
+    `Subtensor endpoint switched from=… to=…` line. Without it the validator had no chain
+    client and metagraph sync and set_weights stopped."""
     _RecordingSubtensor.calls = []
     _RefusingThenRecordingSubtensor.refused = []
     monkeypatch.setattr(subtensor_client_module.bittensor, "Subtensor", _RefusingThenRecordingSubtensor)
@@ -150,10 +158,98 @@ def test_initialize_subtensor_falls_back_to_the_public_node_when_our_endpoint_fa
     extra = _connected_extra(caplog)
     assert extra["chain_endpoint"] == PUBLIC_FINNEY
     assert extra["endpoint_source"] == "BITTENSOR_NETWORK (own endpoint failed)"
-    assert any(
-        getattr(r.msg, "message", None) == "Own chain endpoint failed, dialling the public network node"
-        for r in caplog.records
+    assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
+
+
+SECOND_ENDPOINT = "ws://archive-node-proxy-2.proxy"
+
+
+def test_chain_endpoints_list_is_ordered_with_the_public_node_last():
+    settings = Settings(
+        BITTENSOR_NETWORK="finney",
+        BITTENSOR_CHAIN_ENDPOINTS=f"{OWN_ENDPOINT}, {SECOND_ENDPOINT},,finney",
+        BITTENSOR_CHAIN_ENDPOINT="ws://ignored-when-the-list-is-set",
     )
+
+    assert [e.value for e in settings.get_chain_endpoints()] == [OWN_ENDPOINT, SECOND_ENDPOINT, "finney"]
+    assert [e.source for e in settings.get_chain_endpoints()] == [
+        "BITTENSOR_CHAIN_ENDPOINTS[0]",
+        "BITTENSOR_CHAIN_ENDPOINTS[1]",
+        "BITTENSOR_NETWORK",
+    ]
+    assert settings.get_chain_endpoint_or_network_name() == OWN_ENDPOINT
+    assert _resolve(settings)[0] == OWN_ENDPOINT
+
+
+def test_endpoint_list_walks_every_own_node_before_the_public_one(monkeypatch, caplog):
+    """Two proxies down: two switch lines, the public node answers, the cursor sits on it."""
+    refused: list[str] = []
+
+    class _RefusingOwnNodes(_RecordingSubtensor):
+        def __init__(self, network=None, config=None, **kwargs):
+            if network in (OWN_ENDPOINT, SECOND_ENDPOINT):
+                refused.append(network)
+                raise ConnectionRefusedError("[Errno 111] Connect call failed")
+            super().__init__(network=network, config=config, **kwargs)
+
+    _RecordingSubtensor.calls = []
+    monkeypatch.setattr(subtensor_client_module.bittensor, "Subtensor", _RefusingOwnNodes)
+    monkeypatch.setattr(SubtensorClient, "_subtensor", None)
+    settings = Settings(
+        BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINTS=f"{OWN_ENDPOINT},{SECOND_ENDPOINT}"
+    )
+    client = _bare_client(settings)
+
+    with patch.object(subtensor_client_module, "settings", settings), caplog.at_level(logging.INFO):
+        client.initialize_subtensor()
+
+    assert refused == [OWN_ENDPOINT, SECOND_ENDPOINT]
+    assert client.subtensor.chain_endpoint == PUBLIC_FINNEY
+    assert _switch_lines(caplog) == [
+        f"Subtensor endpoint switched from={OWN_ENDPOINT} to={SECOND_ENDPOINT}",
+        f"Subtensor endpoint switched from={SECOND_ENDPOINT} to=finney",
+    ]
+    assert client._endpoints.current.value == "finney"
+
+
+def test_read_failure_switches_to_the_next_endpoint_and_the_next_sync_returns_to_the_first(
+    recording_subtensor, caplog
+):
+    """A read on the proxy fails after connecting: the client is dropped, the redial goes to
+    the public node (one switch line); after a completed sync cycle the cursor is back on the
+    proxy and the next dial tries it first."""
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    client = _bare_client(settings)
+
+    with patch.object(subtensor_client_module, "settings", settings), caplog.at_level(logging.INFO):
+        client.initialize_subtensor()
+        assert client.subtensor.chain_endpoint == OWN_ENDPOINT
+
+        client._switch_endpoint_after_read_failure(TimeoutError("metagraph read timed out"))
+        assert client.subtensor is None
+        client.set_subtensor()
+        assert client.subtensor.chain_endpoint == PUBLIC_FINNEY
+        assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
+        assert not client._endpoints.on_first
+
+        client._return_to_first_endpoint()
+        assert client.subtensor is None and client._endpoints.on_first
+        client.set_subtensor()
+        assert client.subtensor.chain_endpoint == OWN_ENDPOINT
+
+    assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT, "finney", OWN_ENDPOINT]
+
+
+def test_read_failure_without_an_own_endpoint_does_not_switch(recording_subtensor, caplog):
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=None)
+    client = _bare_client(settings)
+
+    with patch.object(subtensor_client_module, "settings", settings), caplog.at_level(logging.INFO):
+        client.initialize_subtensor()
+        client._switch_endpoint_after_read_failure(TimeoutError("read timed out"))
+
+    assert client.subtensor is not None
+    assert _switch_lines(caplog) == []
 
 
 def test_initialize_subtensor_without_endpoint_does_not_retry_on_failure(monkeypatch, caplog):

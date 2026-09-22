@@ -136,13 +136,21 @@ class _RefusingThenRecordingAsyncSubtensor(_RecordingAsyncSubtensor):
         return self
 
 
+def _switch_lines(caplog) -> list[str]:
+    return [
+        r.msg.message
+        for r in caplog.records
+        if getattr(r.msg, "message", "").startswith("Subtensor endpoint switched")
+    ]
+
+
 @pytest.mark.asyncio
 async def test_initialize_subtensor_falls_back_to_the_public_node_when_our_endpoint_fails(
     monkeypatch, caplog
 ):
-    """Rustam's review (21 Sep): the central miner depends on the proxy too. The own endpoint is
-    tried first; when it fails and one is configured, the public `BITTENSOR_NETWORK` node is
-    dialled and the log says why. Providers set no endpoint, so nothing changes for them."""
+    """taiberium (22 Sep): proxy refused → the public node answers → ONE
+    `Subtensor endpoint switched from=… to=…` line. Providers set no endpoint, so nothing
+    changes for them."""
     _RecordingAsyncSubtensor.calls = []
     _RefusingThenRecordingAsyncSubtensor.refused = []
     monkeypatch.setattr(
@@ -160,3 +168,61 @@ async def test_initialize_subtensor_falls_back_to_the_public_node_when_our_endpo
     extra = _connected_extra(caplog)
     assert extra["chain_endpoint"] == PUBLIC_FINNEY
     assert extra["endpoint_source"] == "BITTENSOR_NETWORK (own endpoint failed)"
+    assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
+
+
+SECOND_ENDPOINT = "ws://archive-node-proxy-2.proxy"
+
+
+def test_chain_endpoints_list_is_ordered_with_the_public_node_last():
+    settings = Settings(
+        BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINTS=f"{OWN_ENDPOINT},{SECOND_ENDPOINT}"
+    )
+
+    assert [e.value for e in settings.get_chain_endpoints()] == [OWN_ENDPOINT, SECOND_ENDPOINT, "finney"]
+    assert settings.get_chain_endpoint_or_network_name() == OWN_ENDPOINT
+
+
+@pytest.mark.asyncio
+async def test_sync_read_failure_switches_to_the_next_endpoint_and_the_next_sync_returns_to_the_first(
+    recording_subtensor, caplog
+):
+    """`sync()` fails on a read after connecting to the proxy: the redial goes to the public node
+    (one switch line); the sync after that goes back to the proxy first."""
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    miner = _make_miner(settings)
+    miner._cycle_completed_on_fallback = False
+    miner.bootstrap = AsyncMock(side_effect=[TimeoutError("metagraph read timed out"), None, None])
+
+    with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
+        await miner.sync()  # connects to the proxy, bootstrap read fails → switched, redialled
+        assert miner.subtensor.chain_endpoint == PUBLIC_FINNEY
+        assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
+
+        await miner.sync()  # completes on the public node
+        assert miner.subtensor.chain_endpoint == PUBLIC_FINNEY
+        assert miner._cycle_completed_on_fallback
+
+        await miner.sync()  # the next sync loop starts on the first endpoint again
+        assert miner.subtensor.chain_endpoint == OWN_ENDPOINT
+        assert not miner._cycle_completed_on_fallback
+
+    assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT, "finney", OWN_ENDPOINT]
+    assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
+
+
+@pytest.mark.asyncio
+async def test_sync_read_failure_without_an_own_endpoint_redials_the_same_node(
+    recording_subtensor, caplog
+):
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=None)
+    miner = _make_miner(settings)
+    miner._cycle_completed_on_fallback = False
+    miner.bootstrap = AsyncMock(side_effect=[TimeoutError("read timed out"), None])
+
+    with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
+        await miner.sync()
+
+    assert miner.subtensor.chain_endpoint == PUBLIC_FINNEY
+    assert [c["network"] for c in recording_subtensor.calls] == ["finney", "finney"]
+    assert _switch_lines(caplog) == []

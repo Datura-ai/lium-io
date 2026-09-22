@@ -11,7 +11,7 @@ import aiohttp
 import bittensor
 import numpy as np
 from bittensor.utils.weight_utils import process_weights_for_netuid
-from datura.chain import ChainConnection, EndpointSource
+from datura.chain import ChainConnection, ChainEndpoint, EndpointCursor, EndpointSource
 from pydantic import BaseModel, Field, ValidationError
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
@@ -243,38 +243,74 @@ class SubtensorClient:
     def subtensor(self):
         return SubtensorClient._subtensor
 
+    @property
+    def _endpoints(self) -> EndpointCursor:
+        """Where in the ordered dial list (`settings.get_chain_endpoints()`: our proxy first, the
+        public node last) this client is; built lazily so tests can construct a bare client."""
+        cursor = getattr(self, "_endpoint_cursor", None)
+        if cursor is None:
+            cursor = self._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
+        return cursor
+
+    def _log_endpoint_switched(
+        self, previous: ChainEndpoint, current: ChainEndpoint, reason: str, error: Exception
+    ) -> None:
+        logger.warning(
+            _m(
+                f"Subtensor endpoint switched from={previous.value} to={current.value}",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        "from": previous.value,
+                        "to": current.value,
+                        "from_source": previous.source,
+                        "to_source": current.source,
+                        "reason": reason,
+                        "error": str(error),
+                    }
+                ),
+            ),
+        )
+
     def _connect_subtensor(self) -> ChainConnection[bittensor.Subtensor]:
-        """Dial our own chain endpoint when one is set; when that fails, the public
-        `BITTENSOR_NETWORK` node, so a proxy outage never leaves the validator without a chain
-        client (metagraph sync and set_weights would stop). Returns the client and which setting
-        chose the endpoint."""
-        try:
-            return ChainConnection(
-                bittensor.Subtensor(
-                    network=settings.get_chain_endpoint_or_network_name(), config=self.config
-                ),
-                "BITTENSOR_CHAIN_ENDPOINT" if settings.BITTENSOR_CHAIN_ENDPOINT else "BITTENSOR_NETWORK",
-            )
-        except Exception as e:
-            if not settings.BITTENSOR_CHAIN_ENDPOINT:
-                raise
-            logger.warning(
-                _m(
-                    "Own chain endpoint failed, dialling the public network node",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "chain_endpoint": settings.BITTENSOR_CHAIN_ENDPOINT,
-                            "network": settings.BITTENSOR_NETWORK,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-            )
-            return ChainConnection(
-                bittensor.Subtensor(network=settings.BITTENSOR_NETWORK, config=self.config),
-                "BITTENSOR_NETWORK (own endpoint failed)",
-            )
+        """Dial the current entry of the ordered endpoint list; when it refuses, move to the next
+        one (`Subtensor endpoint switched from=… to=…`) until one answers, so a proxy outage never
+        leaves the validator without a chain client (metagraph sync and set_weights would stop).
+        Raises the last error when every entry failed. Returns the client and which setting chose
+        the endpoint."""
+        cursor = self._endpoints
+        last_error: Exception | None = None
+        for _attempt in range(len(cursor.candidates)):
+            endpoint = cursor.current
+            try:
+                subtensor = bittensor.Subtensor(network=endpoint.value, config=self.config)
+            except Exception as e:
+                last_error = e
+                if len(cursor.candidates) == 1:
+                    raise
+                previous, current = cursor.advance()
+                self._log_endpoint_switched(previous, current, "connect failed", e)
+                continue
+            return ChainConnection(subtensor, cursor.source_label())
+        assert last_error is not None
+        raise last_error
+
+    def _switch_endpoint_after_read_failure(self, error: Exception) -> None:
+        """A read on the connected endpoint failed: drop the client and move the cursor to the
+        next entry, so the redial that follows skips the failing one."""
+        if SubtensorClient._subtensor is None or len(self._endpoints.candidates) == 1:
+            return
+        SubtensorClient._subtensor = None
+        previous, current = self._endpoints.advance()
+        self._log_endpoint_switched(previous, current, "read failed", error)
+
+    def _return_to_first_endpoint(self) -> None:
+        """A sync cycle starts on the first entry again: after a cycle ran on a fallback node the
+        client is dropped and the next dial tries our own endpoint first (the proxy may be back)."""
+        if self._endpoints.on_first:
+            return
+        self._endpoints.reset()
+        SubtensorClient._subtensor = None
 
     def _log_subtensor_connected(
         self, subtensor: bittensor.Subtensor, endpoint_source: EndpointSource
@@ -952,8 +988,13 @@ class SubtensorClient:
     async def _warm_up_subtensor(self):
         count = 0
         backoff = SUBTENSOR_BACKOFF_INITIAL
+        cycle_completed_on_fallback = False
         while True:
             try:
+                if cycle_completed_on_fallback:
+                    # the next sync loop goes back to the first endpoint (our proxy may be back)
+                    cycle_completed_on_fallback = False
+                    self._return_to_first_endpoint()
                 self.set_subtensor()
 
                 if SubtensorClient._subtensor is None:
@@ -970,6 +1011,7 @@ class SubtensorClient:
                     count = 1
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL
+                cycle_completed_on_fallback = not self._endpoints.on_first
                 await asyncio.sleep(SYNC_CYCLE)
             except ProviderPortalDataUnavailable as exc:
                 logger.error(
@@ -983,6 +1025,8 @@ class SubtensorClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
             except Exception as e:
+                # a read on the connected endpoint failed: the retry after the backoff dials the next one
+                self._switch_endpoint_after_read_failure(e)
                 logger.error(
                     _m(
                         "[_warm_up_subtensor] Failed to connect into subtensor",

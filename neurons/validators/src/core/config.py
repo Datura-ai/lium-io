@@ -4,6 +4,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
+from datura.chain import ChainEndpoint, chain_endpoint_candidates
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -97,6 +98,8 @@ class Settings(BaseSettings):
     BITTENSOR_WALLET_HOTKEY_NAME: str = Field(env="BITTENSOR_WALLET_HOTKEY_NAME")
     BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID", default=51)
     BITTENSOR_CHAIN_ENDPOINT: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
+    # Ordered, comma-separated: our proxy first, the public node is always appended last.
+    BITTENSOR_CHAIN_ENDPOINTS: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINTS", default=None)
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK", default="finney")
     SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
 
@@ -650,8 +653,9 @@ class Settings(BaseSettings):
         if self.BITTENSOR_NETWORK:
             config.subtensor.network = self.BITTENSOR_NETWORK
 
-        if self.BITTENSOR_CHAIN_ENDPOINT:
-            config.subtensor.chain_endpoint = self.BITTENSOR_CHAIN_ENDPOINT
+        own = self.get_chain_endpoints()[0]
+        if own.source != "BITTENSOR_NETWORK":
+            config.subtensor.chain_endpoint = own.value
 
         return config
 
@@ -665,7 +669,17 @@ class Settings(BaseSettings):
         the public finney node (DAH-3579). Only the `network` argument outranks the
         Config, so the endpoint goes there.
         """
-        return self.BITTENSOR_CHAIN_ENDPOINT or self.BITTENSOR_NETWORK
+        return self.get_chain_endpoints()[0].value
+
+    def get_chain_endpoints(self) -> list[ChainEndpoint]:
+        """The ordered dial list: `BITTENSOR_CHAIN_ENDPOINTS` (comma-separated) or the single
+        `BITTENSOR_CHAIN_ENDPOINT`, then the public `BITTENSOR_NETWORK` node last. A connect or
+        read failure moves the client to the next entry; the next sync cycle starts at the first."""
+        return chain_endpoint_candidates(
+            chain_endpoints=self.BITTENSOR_CHAIN_ENDPOINTS,
+            chain_endpoint=self.BITTENSOR_CHAIN_ENDPOINT,
+            network=self.BITTENSOR_NETWORK,
+        )
 
     def get_debug_miner(self) -> dict:
         if not self.debug.MINER_ADDRESS or not self.debug.MINER_PORT:
