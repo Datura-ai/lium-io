@@ -52,7 +52,7 @@ class CapabilityCheck:
 
         # DAH-3011: a first, unscored verification sizes the matmul from a VRAM budget instead of
         # the whole card (same challenge/seal/UUID check). The keyword is only passed on that path
-        # so the scored call is byte-for-byte today's. P245: an own-supply node's first pass takes
+        # so the scored call is byte-for-byte today's. An own-supply node's first pass takes
         # the same budget — the probe is KEPT (it is what proves the card computes and answers to
         # its UUID), only the fill-the-card size, which exists to make a scored cycle expensive to
         # fake, is dropped.

@@ -65,6 +65,10 @@ class Validator:
         self.should_exit = False
         self.last_job_run_blocks = 0
         self.default_extra = {}
+        # Own-supply profile: the config-load refusal needs both hotkey lists; when the pool mirror
+        # is empty only the operator can hold the dedicated-hotkey rule, and this line tells them.
+        for warning in settings.own_supply_startup_warnings():
+            logger.warning(_m(f"[own_supply] {warning}", extra=get_extra_info(self.default_extra)))
         # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
         # express lane so its verifications are the cycle's pipeline. None before the first cycle.
         self.cycle_inputs: CycleInputs | None = None

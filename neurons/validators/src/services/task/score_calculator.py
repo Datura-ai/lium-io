@@ -99,11 +99,11 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Provider-side access to a rented pod detected by the Inspector")
 
-    # P245: on an own-supply node's first pass VerifyXCheck and CollateralCheck did not run (the
+    # Own-supply profile: on such a node's first pass VerifyXCheck and CollateralCheck did not run (the
     # trusted-provider profile), so the two gates they feed are waived here — the readings do not
     # exist, and a zero would keep a node Lium is paying for off the market. Every gate above and
     # the price cap stay; the first scored cycle runs both checks and enforces both gates.
-    if getattr(getattr(ctx, "config", None), "trusted_provider", False):
+    if ctx.config.trusted_provider:
         warning_messages.append(
             "Own-supply node, first pass: VerifyX and collateral deferred to the first scored cycle"
         )

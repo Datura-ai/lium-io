@@ -109,14 +109,14 @@ def _matmul_ssh_reason(ctx: Context) -> str | None:
 
 
 def _verifyx_wanted(ctx: Context) -> bool:
-    """Whether VerifyX is part of this run at all. P245: on an own-supply node's first pass
+    """Whether VerifyX is part of this run at all. Own-supply profile: on such a node's first pass
     VerifyXCheck skips its run, so the one call must not carry the challenge either — otherwise
     the round trip would hold the full-size VerifyX the profile exists to avoid."""
     return ctx.config.verifyx_enabled and not ctx.config.trusted_provider
 
 
 def _small_matmul(ctx: Context) -> bool:
-    """The matmul at the first-pass VRAM budget: DAH-3011's first pass, or P245's own-supply first
+    """The matmul at the first-pass VRAM budget: DAH-3011's first pass, or the own-supply first
     pass (same sizing CapabilityCheck applies on the SSH path)."""
     return ctx.config.first_pass or ctx.config.trusted_provider
 

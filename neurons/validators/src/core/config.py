@@ -553,26 +553,36 @@ class Settings(BaseSettings):
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
 
-    # Own-supply fast validation (P245, 22 Sep 2026: "we want the validation process to be quick, so
-    # that we can quickly add on-demand nodes when lium has no supply left"). A node Lium rents from
-    # an outside cloud and registers itself (lium-platform own-supply registrar, design
-    # OWN_SUPPLY_B300.md §3) is registered under a Lium-owned miner hotkey. The checks that exist to
-    # catch a DISHONEST provider — the collateral read, VerifyX's RAM/disk/bandwidth proof, the
-    # full-card matmul — prove nothing about a node Lium itself pays for, and they are the bulk of a
-    # first verification's wall time (VerifyX p50 80 s / p90 149 s, matmul p50 26.5 s, collateral
-    # 3.5 s; 11.6 % of VerifyX runs fail and cost the node a whole cycle). With the flag on, the
-    # FIRST, unscored verification (the express lane's `first_pass=True` call) of an executor whose
-    # miner hotkey is in OWN_SUPPLY_MINER_HOTKEYS runs the trusted-provider profile: collateral and
-    # VerifyX are skipped and the matmul is sized from FIRST_PASS_MATMUL_VRAM_MB; every check that
-    # catches a BROKEN node (scrape, GPU count/model/VRAM, disk, NVML digest, ports, sysbox, GPU
-    # compute probe, the backend's rental verification) is unchanged. Every scored cycle, and every
-    # other miner's every verification, is byte-for-byte today's. The hotkey is the miner's signed
-    # identity — nothing a provider sets on a node can put it in this set. Off by default; an empty
-    # hotkey list trusts nobody even with the flag on.
+    # Own-supply fast validation. A node Lium rents from an outside cloud and registers itself is
+    # registered under a miner hotkey Lium holds. The checks that exist to catch a DISHONEST provider
+    # — the collateral read, VerifyX's RAM/disk/bandwidth proof, the full-card matmul — prove nothing
+    # about a node Lium itself pays for, and they are the bulk of a first verification's wall time
+    # (VerifyX p50 80 s / p90 149 s, matmul p50 26.5 s, collateral 3.5 s; 11.6 % of VerifyX runs fail
+    # and cost the node a whole cycle). With the flag on, the FIRST, unscored verification (the
+    # express lane's `first_pass=True` call) of an executor whose miner hotkey is in
+    # OWN_SUPPLY_MINER_HOTKEYS runs the trusted-provider profile: collateral and VerifyX are skipped
+    # and the matmul is sized from FIRST_PASS_MATMUL_VRAM_MB; every check that catches a BROKEN node
+    # (scrape, GPU count/model/VRAM, disk, NVML digest, ports, sysbox, GPU compute probe, the
+    # backend's rental verification) is unchanged. Every scored cycle, and every other miner's every
+    # verification, is today's. Off by default; an empty hotkey list trusts nobody even with the flag on.
+    #
+    # The list must hold DEDICATED own-supply hotkeys only. A miner hotkey names an account, not a
+    # person: the platform's custodied (wallet-free) provider accounts all list their nodes under one
+    # shared Lium pool hotkey (the portal's LIUM_POOL_HOTKEYS), so putting that pool hotkey here would
+    # hand the profile to every custodied provider's first pass. Nothing a provider sets on a node is
+    # read — only the operator's list decides — which is exactly why the list must never contain a
+    # hotkey other people's nodes list under. `validate_own_supply_hotkeys` refuses that at config
+    # load when the pool mirror below is filled; `own_supply_startup_warnings()` names the gap when
+    # it is not.
     OWN_SUPPLY_FAST_VALIDATION_ENABLED: bool = Field(env="OWN_SUPPLY_FAST_VALIDATION_ENABLED", default=False)
-    # Comma-separated ss58 miner hotkeys of the Lium-owned provider account(s) the own-supply
-    # registrar registers nodes under. Operator-set; never read from a miner or an executor.
+    # Comma-separated ss58 miner hotkeys of the DEDICATED own-supply provider account(s) the
+    # own-supply registrar registers nodes under. Operator-set; never read from a miner or an executor;
+    # never a pool hotkey custodied provider accounts share.
     OWN_SUPPLY_MINER_HOTKEYS: str = Field(env="OWN_SUPPLY_MINER_HOTKEYS", default="")
+    # Comma-separated mirror of the portal's LIUM_POOL_HOTKEYS (the shared hotkey(s) custodied
+    # provider accounts list under). Read for one purpose: refusing an own-supply list that names
+    # one of them. Operator-set; empty means the refusal cannot check and the startup warning says so.
+    LIUM_POOL_HOTKEYS: str = Field(env="LIUM_POOL_HOTKEYS", default="")
 
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
@@ -644,6 +654,40 @@ class Settings(BaseSettings):
                 )
         return self
 
+    @model_validator(mode="after")
+    def validate_own_supply_hotkeys(self) -> "Settings":
+        """Refuse an own-supply list that names a shared pool hotkey: the profile would then apply to
+        every custodied provider's first pass, not to Lium's own nodes. Checked whenever both lists
+        are set, flag on or off, so a bad pair never waits for the flag flip to surface."""
+        shared = self.own_supply_miner_hotkeys() & self.lium_pool_hotkeys()
+        if shared:
+            raise ValueError(
+                f"OWN_SUPPLY_MINER_HOTKEYS names {len(shared)} hotkey(s) that are also in "
+                "LIUM_POOL_HOTKEYS; own-supply nodes need a dedicated hotkey — a pool hotkey is shared "
+                "by every custodied provider account"
+            )
+        return self
+
+    def own_supply_startup_warnings(self) -> list[str]:
+        """What the operator should hear at startup about the own-supply profile: with the flag on and
+        the pool mirror empty the config-load refusal cannot compare the lists, so the dedicated-hotkey
+        rule rests on the operator alone. Empty when there is nothing to say."""
+        if not self.OWN_SUPPLY_FAST_VALIDATION_ENABLED:
+            return []
+        warnings: list[str] = []
+        if not self.own_supply_miner_hotkeys():
+            warnings.append(
+                "OWN_SUPPLY_FAST_VALIDATION_ENABLED is on with an empty OWN_SUPPLY_MINER_HOTKEYS: "
+                "no node takes the profile"
+            )
+        elif not self.lium_pool_hotkeys():
+            warnings.append(
+                "OWN_SUPPLY_FAST_VALIDATION_ENABLED is on and LIUM_POOL_HOTKEYS is empty: the "
+                "dedicated-hotkey rule is not checked — confirm no own-supply hotkey is a pool hotkey "
+                "custodied provider accounts list under"
+            )
+        return warnings
+
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
@@ -663,14 +707,22 @@ class Settings(BaseSettings):
     def get_latest_contract_version(self) -> str:
         return max(self.CONTRACT_VERSIONS.keys())
 
+    @staticmethod
+    def _hotkey_list(raw: str) -> frozenset[str]:
+        return frozenset(h.strip() for h in raw.split(",") if h.strip())
+
     def own_supply_miner_hotkeys(self) -> frozenset[str]:
-        """The Lium-owned miner hotkeys whose nodes get the trusted-provider profile (P245)."""
-        return frozenset(h.strip() for h in self.OWN_SUPPLY_MINER_HOTKEYS.split(",") if h.strip())
+        """The dedicated own-supply miner hotkeys whose nodes get the trusted-provider profile."""
+        return self._hotkey_list(self.OWN_SUPPLY_MINER_HOTKEYS)
+
+    def lium_pool_hotkeys(self) -> frozenset[str]:
+        """The shared pool hotkey(s) custodied provider accounts list under (mirror of the portal's)."""
+        return self._hotkey_list(self.LIUM_POOL_HOTKEYS)
 
     def is_own_supply_trusted_first_pass(self, miner_hotkey: str | None, first_pass: bool) -> bool:
-        """True only for the FIRST, unscored verification of a node registered under a Lium-owned hotkey,
-        with OWN_SUPPLY_FAST_VALIDATION_ENABLED on. The wave never passes ``first_pass``, so a scored
-        verification never takes the profile; an empty OWN_SUPPLY_MINER_HOTKEYS trusts nobody."""
+        """True only for the FIRST, unscored verification of a node registered under a listed own-supply
+        hotkey, with OWN_SUPPLY_FAST_VALIDATION_ENABLED on. The wave never passes ``first_pass``, so a
+        scored verification never takes the profile; an empty OWN_SUPPLY_MINER_HOTKEYS trusts nobody."""
         if not first_pass or not self.OWN_SUPPLY_FAST_VALIDATION_ENABLED or not miner_hotkey:
             return False
         return miner_hotkey in self.own_supply_miner_hotkeys()

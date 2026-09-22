@@ -21,7 +21,7 @@ class CollateralCheck:
         self.fatal = not enable_no_collateral
 
         if ctx.config.trusted_provider:
-            # P245: the bond exists to hold an outside provider to the marketplace's rules; on a node
+            # Own-supply profile: the bond exists to hold an outside provider to the marketplace's rules; on a node
             # Lium rents and registers itself there is nobody to bond, and the on-chain read is a
             # network round trip a first pass has no use for. Recorded as "not deposited" so the
             # published row says what is true; calculate_scores waives the gate for this profile.

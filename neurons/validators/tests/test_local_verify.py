@@ -1489,7 +1489,7 @@ async def test_a_scored_cycle_with_verifyx_off_sends_the_matmul_alone(
 async def test_own_supply_first_pass_sends_the_budgeted_matmul_alone(
     keypair, monkeypatch, local_verify_on, verifyx_service, first_pass
 ):
-    """P245 trusted-provider profile: VerifyXCheck skips its run on an own-supply node's first
+    """Own-supply trusted-provider profile: VerifyXCheck skips its run on an own-supply node's first
     pass, so the one call carries no VerifyX challenge (a full-size run there would cost the very
     80–149 s the profile removes) and the matmul rides alone at the first-pass VRAM budget — with
     or without DAH-3011's `first_pass` (its flag is off in prod). `scored_ssh` does not fire: the

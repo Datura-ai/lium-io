@@ -1,4 +1,4 @@
-"""P245 (22 Sep 2026): the trusted-provider profile for a node Lium rents and registers itself.
+"""The trusted-provider profile for a node Lium rents and registers itself.
 
 Applied ONLY to the FIRST, unscored verification (the express lane's `first_pass=True` call) of an
 executor whose miner hotkey is in OWN_SUPPLY_MINER_HOTKEYS, and only with
@@ -76,6 +76,66 @@ def test_hotkey_list_is_parsed_trimmed_and_ignores_blanks(profile_on, monkeypatc
         settings, "OWN_SUPPLY_MINER_HOTKEYS", f" {LIUM_HOTKEY} ,, {OTHER_LIUM_HOTKEY},"
     )
     assert settings.own_supply_miner_hotkeys() == frozenset({LIUM_HOTKEY, OTHER_LIUM_HOTKEY})
+
+
+# --- the dedicated-hotkey rule ----------------------------------------------------------------
+# A miner hotkey names an account, not a person: custodied (wallet-free) provider accounts all list
+# under one shared pool hotkey. That hotkey in the own-supply list would give every such provider's
+# first pass the profile, so config load refuses the overlap and startup names the unchecked gap.
+
+POOL_HOTKEY = "lium-pool-hotkey-fixture"
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_config_load_refuses_an_own_supply_hotkey_that_is_a_pool_hotkey(flag):
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    with pytest.raises(ValidationError, match="dedicated hotkey"):
+        Settings(
+            _env_file=None,
+            OWN_SUPPLY_FAST_VALIDATION_ENABLED=flag,
+            OWN_SUPPLY_MINER_HOTKEYS=f"{LIUM_HOTKEY}, {POOL_HOTKEY}",
+            LIUM_POOL_HOTKEYS=f"{POOL_HOTKEY},other-pool-hotkey-fixture",
+        )
+
+
+def test_config_load_accepts_dedicated_hotkeys_beside_a_filled_pool_mirror():
+    from core.config import Settings
+
+    s = Settings(
+        _env_file=None,
+        OWN_SUPPLY_FAST_VALIDATION_ENABLED=True,
+        OWN_SUPPLY_MINER_HOTKEYS=f"{LIUM_HOTKEY},{OTHER_LIUM_HOTKEY}",
+        LIUM_POOL_HOTKEYS=POOL_HOTKEY,
+    )
+    assert s.lium_pool_hotkeys() == frozenset({POOL_HOTKEY})
+    assert s.is_own_supply_trusted_first_pass(LIUM_HOTKEY, first_pass=True) is True
+    assert s.is_own_supply_trusted_first_pass(POOL_HOTKEY, first_pass=True) is False
+    assert s.own_supply_startup_warnings() == []
+
+
+@pytest.mark.parametrize(
+    ("flag", "own", "pool", "expected_fragment"),
+    [
+        (False, LIUM_HOTKEY, "", None),  # flag off: nothing to say
+        (True, "", "", "empty OWN_SUPPLY_MINER_HOTKEYS"),  # on, trusts nobody
+        (True, LIUM_HOTKEY, "", "LIUM_POOL_HOTKEYS is empty"),  # on, rule unchecked
+        (True, LIUM_HOTKEY, POOL_HOTKEY, None),  # on, rule checked at load
+    ],
+)
+def test_startup_warning_names_the_unchecked_dedicated_hotkey_rule(
+    monkeypatch, flag, own, pool, expected_fragment
+):
+    monkeypatch.setattr(settings, "OWN_SUPPLY_FAST_VALIDATION_ENABLED", flag)
+    monkeypatch.setattr(settings, "OWN_SUPPLY_MINER_HOTKEYS", own)
+    monkeypatch.setattr(settings, "LIUM_POOL_HOTKEYS", pool)
+    warnings = settings.own_supply_startup_warnings()
+    if expected_fragment is None:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1 and expected_fragment in warnings[0]
 
 
 @pytest.mark.parametrize(

@@ -65,7 +65,7 @@ class VerifyXCheck:
             return CheckResult(passed=False, event=event)
 
         if ctx.config.trusted_provider:
-            # P245: VerifyX proves the RAM, disk and bandwidth an outside provider CLAIMS (75 % of
+            # Own-supply profile: VerifyX proves the RAM, disk and bandwidth an outside provider CLAIMS (75 % of
             # RAM written and read back, 5 GB of disk, a 263–501 MB CDN download; p50 80 s, p90 149 s,
             # 11.6 % of runs fail and cost the node a cycle). A node Lium rents from a cloud has a
             # known spec sheet and Lium's own money behind it, so its first pass publishes the
