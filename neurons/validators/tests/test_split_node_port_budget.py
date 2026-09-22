@@ -525,9 +525,7 @@ async def test_flag_on_reassignment_moves_the_backed_gpus_only(monkeypatch):
     assert incentive.unrented_count_by_bucket.get(("H200", 8)) == 8
     assert incentive.unrented_count_by_bucket.get(("H200", 1)) == 2
     assert split_job.idle_payable_gpu_count == 2
-    assert (
-        or split_job.bucket_reassigned_from == 8
-    )
+    assert "unrented_bucket_reassigned" in split_job.full_log_text
     # neither tier is over cap after the move, so both nodes are paid at full weight
     assert plain_8x.incentive_idle == pytest.approx(0.1 * 8 / 10)
     assert split_job.incentive_idle == pytest.approx(0.1 * 2 / 10)
