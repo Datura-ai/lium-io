@@ -28,7 +28,9 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
        attestation (offer any of the three to earn),
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
      free remainder of a partially rented split node with fewer free ports than the
-       marketplace floor (nobody can rent it; the rented GPUs keep earning),
+     marketplace floor (nobody can rent it; the rented GPUs keep earning),
+     idle GPU-split node whose free ports cannot start even one pod (DAH-3698 port
+       budget backs 0 of its free GPUs; open more ports to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -92,6 +94,7 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
+    PORT_UNBACKED_SPLIT_GPUS = "port_unbacked_split_gpus"
 
 
 class IncentiveReason(BaseModel):
@@ -434,6 +437,34 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "available_port_count": port_limited.available_port_count,
                 "required_port_count": port_limited.required,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_port_unbacked_split_gpus(
+        result: JobResult, shortfall: PortBudgetShortfall
+    ) -> MinerLogLine:
+        # DAH-3698 budget with zero backed GPUs: the free ports cannot start even one pod, so no
+        # free GPU of this split node earns idle pay. Its own code, so a rollback of the
+        # ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER value never leaves a silent zero.
+        # `result` is the idle result (a whole idle split node or the free remainder).
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.PORT_UNBACKED_SPLIT_GPUS,
+            message=(
+                f"No unrented incentive for the {shortfall.free_gpu_count} free GPU(s) on this "
+                f"GPU-split node: it has {shortfall.available_port_count} free port(s) and the "
+                f"marketplace gives every pod {shortfall.ports_per_bundle} ports, so not one pod of "
+                f"{shortfall.gpu_splitting_min_count} GPU(s) can start and nobody can rent these GPUs "
+                "right now. Any rented GPUs keep earning. Idle pay resumes when the node gets more "
+                "open ports in RENTING_PORT_RANGE."
+            ),
+            extra_fields={
+                "available_port_count": shortfall.available_port_count,
+                "ports_per_bundle": shortfall.ports_per_bundle,
+                "gpu_splitting_min_count": shortfall.gpu_splitting_min_count,
+                "backed_gpu_count": shortfall.backed_gpu_count,
+                "unbacked_gpu_count": shortfall.unbacked_gpu_count,
             },
         )
 

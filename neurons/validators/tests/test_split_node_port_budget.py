@@ -84,12 +84,16 @@ def _plain_idle_job(gpu_count: int = 1) -> JobResult:
     )
 
 
-def _build_incentive(*jobs_by_hotkey: tuple[str, JobResult]) -> RentalPriceIncentive:
+def _build_incentive(
+    *jobs_by_hotkey: tuple[str, JobResult], config: IncentiveConfig | None = None
+) -> RentalPriceIncentive:
     redis_service = AsyncMock()
     redis_service.get_portion_per_gpu_type = AsyncMock(return_value=0.3)
     job_results = {hotkey: [job] for hotkey, job in jobs_by_hotkey}
     total = sum(job.gpu_count for _, job in jobs_by_hotkey)
-    return RentalPriceIncentive(IncentiveConfig(), redis_service, job_results, {H200: total})
+    return RentalPriceIncentive(
+        config or IncentiveConfig(), redis_service, job_results, {H200: total}
+    )
 
 
 def _remainder_of(incentive: RentalPriceIncentive, hotkey: str = SPLIT_HOTKEY) -> JobResult:
@@ -100,7 +104,8 @@ def _remainder_of(incentive: RentalPriceIncentive, hotkey: str = SPLIT_HOTKEY) -
 
 def _budget_lines(caplog) -> list:
     return [
-        r.msg for r in caplog.records
+        r.msg
+        for r in caplog.records
         if hasattr(r.msg, "extra") and r.msg.extra.get("event") == PORT_UNBACKED_GPUS_EVENT
     ]
 
@@ -127,7 +132,9 @@ def test_remainder_with_five_ports_backs_one_of_four_free_gpus():
 
 def test_remainder_with_ports_for_every_free_gpu_has_no_shortfall():
     # Arrange — 4 free GPUs, 12 free ports: four 1-GPU pods fit.
-    remainder = _remainder_of(_build_incentive((SPLIT_HOTKEY, _make_job(available_port_count=4 * MIN_PORT_COUNT))))
+    remainder = _remainder_of(
+        _build_incentive((SPLIT_HOTKEY, _make_job(available_port_count=4 * MIN_PORT_COUNT)))
+    )
 
     # Act / Assert
     assert RentalPriceIncentive._port_budget_shortfall(remainder) is None
@@ -135,7 +142,9 @@ def test_remainder_with_ports_for_every_free_gpu_has_no_shortfall():
 
 def test_bundles_of_two_gpus_are_counted_per_bundle():
     # Arrange — 5 free GPUs, 2-GPU bundles, 6 ports: two bundles (4 GPUs) fit, 1 GPU is beyond them.
-    job = _make_job(available_port_count=6, gpu_count=8, rented_gpu_count=3, gpu_splitting_min_count=2)
+    job = _make_job(
+        available_port_count=6, gpu_count=8, rented_gpu_count=3, gpu_splitting_min_count=2
+    )
     remainder = _remainder_of(_build_incentive((SPLIT_HOTKEY, job)))
 
     # Act
@@ -159,9 +168,44 @@ def test_whole_idle_split_node_is_measured_too():
     assert (shortfall.backed_gpu_count, shortfall.unbacked_gpu_count) == (2, 6)
 
 
+@pytest.mark.parametrize(
+    ("gpu_splitting_min_count", "backed"),
+    [(1, 1), (2, 2), (4, 4)],
+)
+def test_whole_idle_node_with_exactly_the_floor_backs_one_bundle(gpu_splitting_min_count, backed):
+    # Arrange — exactly MIN_PORT_COUNT open ports: one pod of min_count GPUs can start, no more.
+    job = _make_job(
+        available_port_count=MIN_PORT_COUNT,
+        is_rented=False,
+        rented_gpu_count=None,
+        gpu_splitting_min_count=gpu_splitting_min_count,
+    )
+
+    # Act
+    shortfall = RentalPriceIncentive._port_budget_shortfall(job)
+
+    # Assert
+    assert shortfall is not None
+    assert (shortfall.backed_gpu_count, shortfall.unbacked_gpu_count) == (backed, 8 - backed)
+
+
+def test_whole_idle_node_below_the_floor_backs_nothing():
+    # Arrange — 2 open ports on an idle 8-GPU split node: not one pod can start.
+    job = _make_job(available_port_count=2, is_rented=False, rented_gpu_count=None)
+
+    # Act
+    shortfall = RentalPriceIncentive._port_budget_shortfall(job)
+
+    # Assert
+    assert shortfall is not None
+    assert (shortfall.backed_gpu_count, shortfall.unbacked_gpu_count) == (0, 8)
+
+
 def test_whole_node_without_real_splitting_is_out_of_scope():
     # Arrange — min count equal to the GPU count: the node rents as one pod, MIN_PORT_COUNT covers it.
-    job = _make_job(available_port_count=3, is_rented=False, rented_gpu_count=None, gpu_splitting_min_count=8)
+    job = _make_job(
+        available_port_count=3, is_rented=False, rented_gpu_count=None, gpu_splitting_min_count=8
+    )
 
     # Act / Assert
     assert RentalPriceIncentive._port_budget_shortfall(job) is None
@@ -169,8 +213,11 @@ def test_whole_node_without_real_splitting_is_out_of_scope():
 
 def test_node_that_does_not_split_is_out_of_scope():
     job = _make_job(
-        available_port_count=3, is_rented=False, rented_gpu_count=None,
-        supports_gpu_splitting=False, gpu_splitting_min_count=None,
+        available_port_count=3,
+        is_rented=False,
+        rented_gpu_count=None,
+        supports_gpu_splitting=False,
+        gpu_splitting_min_count=None,
     )
     assert RentalPriceIncentive._port_budget_shortfall(job) is None
 
@@ -202,6 +249,8 @@ def test_lium_filler_remainder_is_never_measured():
         {"available_port_count": None},
         {"available_port_count": "five"},  # unreadable: the miner's machine wrote the scrape
         {"available_port_count": True},  # bool passes isinstance(int); must not read as 1
+        {"available_port_count": -1},  # a probe that failed and wrote a sentinel
+        {"available_port_count": 5.0},  # a float is not a port count
     ],
 )
 def test_unreadable_port_count_fails_open(spec):
@@ -218,7 +267,9 @@ def test_unreadable_port_count_fails_open(spec):
 # ── the scoring decision ──────────────────────────────────────────────────────
 
 
-async def _score(incentive: RentalPriceIncentive, rental_share: float = 0.1) -> RentalPriceIncentive:
+async def _score(
+    incentive: RentalPriceIncentive, rental_share: float = 0.1
+) -> RentalPriceIncentive:
     incentive._calculate_rental_share = AsyncMock(return_value=rental_share)
     await incentive.calculate_mining_scores()
     return incentive
@@ -239,7 +290,9 @@ async def test_default_settings_pay_every_free_gpu_exactly_as_before(caplog):
 
     # Act
     with caplog.at_level(logging.INFO):
-        incentive = await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job)))
+        incentive = await _score(
+            _build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job))
+        )
 
     # Assert — 4 + 1 GPUs in the 1× tier, idle pay in proportion, nothing withheld.
     assert incentive.unrented_count_by_bucket.get(("H200", 1)) == 5
@@ -268,7 +321,9 @@ async def test_flag_on_pays_idle_only_for_the_backed_gpus(monkeypatch, caplog):
 
     # Act
     with caplog.at_level(logging.INFO):
-        incentive = await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job)))
+        incentive = await _score(
+            _build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job))
+        )
 
     # Assert — the tier counts the backed GPU only; idle pay halves; the plain node gains.
     assert incentive.unrented_count_by_bucket.get(("H200", 1)) == 2
@@ -279,7 +334,9 @@ async def test_flag_on_pays_idle_only_for_the_backed_gpus(monkeypatch, caplog):
     assert incentive.job_results[SPLIT_HOTKEY] == [split_job]
     assert split_job.gpu_count == 8
     assert split_job.mining_score == pytest.approx(1.0 * 0.3 * 4 / 9)
-    assert split_job.incentive == pytest.approx(split_job.incentive_rented + split_job.incentive_idle)
+    assert split_job.incentive == pytest.approx(
+        split_job.incentive_rented + split_job.incentive_idle
+    )
     assert split_job.node_state_at_cycle == "mixed"
 
     # Paid, for fewer GPUs: a report line in the job log, no zero reason; the formula snapshot
@@ -307,7 +364,7 @@ async def test_flag_on_whole_idle_split_node_is_paid_for_the_backed_gpus(monkeyp
     plain_job = _plain_idle_job()
 
     # Act
-    incentive = await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job)))
+    await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job)))
 
     # Assert
     assert split_job.port_unbacked_gpu_count == 6
@@ -328,7 +385,9 @@ async def test_flag_on_node_with_ports_for_every_gpu_is_paid_as_before(monkeypat
 
     # Act
     with caplog.at_level(logging.INFO):
-        incentive = await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job)))
+        incentive = await _score(
+            _build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job))
+        )
 
     # Assert
     assert incentive.unrented_count_by_bucket.get(("H200", 1)) == 5
@@ -352,9 +411,126 @@ async def test_remainder_below_the_floor_is_left_to_the_port_floor_gate(monkeypa
 
     # Assert
     assert split_job.incentive_idle == 0.0
-    assert [r.reason for r in split_job.zero_incentive_reasons] == [ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value]
+    assert [r.reason for r in split_job.zero_incentive_reasons] == [
+        ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value
+    ]
     assert _budget_lines(caplog) == []
     assert "port_unbacked_gpus" not in split_job.full_log_text
+
+
+@pytest.mark.asyncio
+async def test_flag_on_remainder_backed_by_no_port_leaves_the_pool_with_its_own_reason(
+    monkeypatch, caplog
+):
+    # Arrange — lium-io#1414's floor is OFF (the state after a rollback of its config value)
+    # and this rule is on: 2 free ports back no GPU. The remainder is alone in its tier, the
+    # shape where a silent zero would otherwise pick up a misleading capacity reason.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", False)
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
+    split_job = _make_job(available_port_count=2)
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        incentive = await _score(_build_incentive((SPLIT_HOTKEY, split_job)))
+
+    # Assert — idle 0 with exactly one reason, this rule's own; the tier counts nothing.
+    assert split_job.incentive_idle == 0.0
+    assert [r.reason for r in split_job.zero_incentive_reasons] == [
+        ZeroIncentiveReason.PORT_UNBACKED_SPLIT_GPUS.value
+    ]
+    assert (
+        ZeroIncentiveReason.NO_UNRENTED_CAPACITY_FOR_GPU_COUNT.value not in split_job.full_log_text
+    )
+    assert "not one pod" in split_job.full_log_text
+    assert incentive.unrented_count_by_bucket.get(("H200", 1), 0) == 0
+    # an ineligible portion takes no unrented formula snapshot, like every other zero reason
+    assert split_job.incentive_formula_inputs["free_gpu_count"] == 4
+    assert "port_unbacked_gpu_count" not in split_job.incentive_formula_inputs["unrented"]
+
+    # The rented 4 GPUs earn in the mining pool exactly as before.
+    assert split_job.mining_score == pytest.approx(1.0 * 0.3 * 4 / 8)
+    assert split_job.incentive_rented > 0
+    assert split_job.incentive == pytest.approx(split_job.incentive_rented)
+
+    lines = _budget_lines(caplog)
+    assert len(lines) == 1
+    assert (lines[0].extra["backed_gpu_count"], lines[0].extra["unbacked_gpu_count"]) == (0, 4)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("port_floor_flag", [False, True])
+async def test_flag_on_whole_idle_split_node_below_the_floor_gets_this_rules_reason(
+    monkeypatch, port_floor_flag
+):
+    # Arrange — a whole idle split node is outside lium-io#1414's remainder-only floor, so with
+    # 2 open ports this rule is the only gate whichever way that flag is set.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", port_floor_flag)
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
+    split_job = _make_job(available_port_count=2, is_rented=False, rented_gpu_count=None)
+    plain_job = _plain_idle_job()
+
+    # Act
+    incentive = await _score(_build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_job)))
+
+    # Assert — the split node earns nothing with one named reason; the plain node takes the pool.
+    assert split_job.incentive_idle == 0.0
+    assert split_job.incentive == 0.0
+    assert [r.reason for r in split_job.zero_incentive_reasons] == [
+        ZeroIncentiveReason.PORT_UNBACKED_SPLIT_GPUS.value
+    ]
+    assert (
+        "covers 0 of" not in split_job.full_log_text
+    )  # the partial-pay report line is not written
+    assert incentive.unrented_count_by_bucket.get(("H200", 8), 0) == 0
+    assert plain_job.incentive_idle == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_flag_on_whole_idle_split_node_stays_in_its_gpu_count_tier(monkeypatch):
+    # Arrange — an idle 8-GPU node splitting into 1-GPU pods with 6 open ports (2 GPUs backed).
+    # DAH-2528 pins a split-capable node to its gpu_count tier while that tier has a cap; the
+    # budget changes how many GPUs it counts there, not which tier it is rated in.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
+    split_job = _make_job(available_port_count=6, is_rented=False, rented_gpu_count=None)
+
+    # Act
+    incentive = await _score(_build_incentive((SPLIT_HOTKEY, split_job)))
+
+    # Assert
+    assert split_job.count_bucket == 8
+    assert split_job.bucket_reassigned_from is None
+    assert incentive.unrented_count_by_bucket.get(("H200", 8)) == 2
+    assert incentive.unrented_count_by_bucket.get(("H200", 1)) is None
+    assert split_job.incentive_idle == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_flag_on_reassignment_moves_the_backed_gpus_only(monkeypatch):
+    # Arrange — the 8× tier is capped at 8 GPUs and a plain idle 8× node already fills it. The
+    # split node (6 ports → 2 backed GPUs) is over cap there; DAH-2528 moves it to the 1× tier
+    # when the node fits — and "the node" is its 2 payable GPUs, not 8, on both sides of the move.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_PORT_BUDGET_FOR_SPLIT_GPUS", True)
+    config = IncentiveConfig(max_unrented_gpus={"H200": {1: 10, 8: 8}})
+    split_job = _make_job(available_port_count=6, is_rented=False, rented_gpu_count=None)
+    plain_8x = _plain_idle_job(gpu_count=8)
+
+    # Act
+    incentive = await _score(
+        _build_incentive((SPLIT_HOTKEY, split_job), (PLAIN_HOTKEY, plain_8x), config=config)
+    )
+
+    # Assert — the 8× tier is back at its cap of 8, the 1× tier holds the 2 backed GPUs.
+    assert split_job.bucket_reassigned_from == 8
+    assert split_job.count_bucket == 1
+    assert incentive.unrented_count_by_bucket.get(("H200", 8)) == 8
+    assert incentive.unrented_count_by_bucket.get(("H200", 1)) == 2
+    assert split_job.idle_payable_gpu_count == 2
+    assert (
+        or split_job.bucket_reassigned_from == 8
+    )
+    # neither tier is over cap after the move, so both nodes are paid at full weight
+    assert plain_8x.incentive_idle == pytest.approx(0.1 * 8 / 10)
+    assert split_job.incentive_idle == pytest.approx(0.1 * 2 / 10)
 
 
 def test_idle_payable_gpu_count_defaults_to_gpu_count():

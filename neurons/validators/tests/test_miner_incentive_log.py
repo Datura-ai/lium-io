@@ -10,6 +10,7 @@ from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from incentive.rental_price import (
     InsufficientDisk,
     MissingFlagshipCapability,
+    PortBudgetShortfall,
     PortLimitedRemainder,
     PowerCapIncapable,
     RentalPriceIncentive,
@@ -38,6 +39,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "cannot_apply_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
+        "port_unbacked_split_gpus",
     }
 
 
@@ -152,6 +154,17 @@ def _job(**overrides) -> JobResult:
             ),
             "port_limited_remainder",
             "2 free port",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_port_unbacked_split_gpus(
+                job,
+                PortBudgetShortfall(
+                    available_port_count=2, ports_per_bundle=3, gpu_splitting_min_count=1,
+                    free_gpu_count=4, backed_gpu_count=0, unbacked_gpu_count=4,
+                ),
+            ),
+            "port_unbacked_split_gpus",
+            "not one pod",
         ),
     ],
 )
