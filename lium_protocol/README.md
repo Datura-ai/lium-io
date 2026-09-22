@@ -41,12 +41,12 @@ Compatibility rules for a change:
 - add an optional field or an enum member → minor version bump (`1.0.0` → `1.1.0`, as `FailedContainerRequest.build_log_tail` did);
 - make a field required, remove or rename one, change a type → major version bump and a new `snapshots/lium_protocol.v2.json`.
 
-Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The plan for lium-platform (its pull request for DAH-3247): vendor the tree — models, snapshot and recordings — under `apps/lium/backend/apps/server/src/lium_protocol/`, with a `PROTOCOL_PIN.json` naming the tag, the commit and the tree's sha256, and a CI check that compares the vendored copy with that commit.
+Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The plan for lium-platform: vendor the tree — models, snapshot and recordings — under `apps/lium/backend/apps/server/src/lium_protocol/`, with a `PROTOCOL_PIN.json` naming the tag, the commit and the tree's sha256, and a CI check that compares the vendored copy with that commit.
 
 ## Versions
 
-- `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed, DAH-3504, lium-io#1376). lium-platform reads it on its backend subclass until it re-vendors this tag.
-- `1.0.0` — first release (DAH-3247).
+- `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed, lium-io#1376). lium-platform reads it on its backend subclass until it re-vendors this tag.
+- `1.0.0` — first release.
 
 ## Tests
 
