@@ -7,7 +7,13 @@ from asyncssh import SSHClientConnection, SSHKey
 
 from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
-from services.executor_connectivity.models import DindProbeResult, PortPair
+from services.executor_connectivity.models import (
+    DIND_INNER_DOCKERD_DOWN,
+    DIND_INNER_DOCKERD_IPTABLES,
+    DindLogCause,
+    DindProbeResult,
+    PortPair,
+)
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -25,6 +31,52 @@ logger = logging.getLogger(__name__)
 DIND_SSH_READY_TIMEOUT_SECONDS = 30
 DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
+# cap on the one `docker logs` + `docker exec tail` read of a failed container (DAH-2856)
+DIND_DIAGNOSTICS_TIMEOUT_SECONDS = 15
+
+# (pattern in the log, the cause it names); the first matching pattern wins
+DIND_LOG_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
+    (
+        "can't initialize iptables table",
+        DindLogCause(
+            DIND_INNER_DOCKERD_IPTABLES,
+            "the inner dockerd cannot use legacy iptables: the host runs iptables in nf_tables mode and "
+            "the ip_tables/iptable_nat kernel modules are not loaded. Fix on the host: "
+            "`sudo modprobe -a ip_tables iptable_nat iptable_filter` (nvidia_docker_sysbox_setup.sh "
+            "--check shows it)",
+        ),
+    ),
+    (
+        "failed to start daemon",
+        DindLogCause(DIND_INNER_DOCKERD_DOWN, "the inner dockerd did not start"),
+    ),
+)
+# the validator log gets this much of the container log; the provider-facing error gets the one matching
+# line, head first (dockerd's real iptables line measured 333 chars on EC2, run 20260917T180704Z-2185)
+DIND_LOG_EXCERPT_MAX_CHARS = 1500
+DIND_LOG_LINE_MAX_CHARS = 400
+DIND_SSHD_NOT_READY_MESSAGE = (
+    f"sshd inside the DinD container did not answer within {DIND_SSH_READY_TIMEOUT_SECONDS}s and its "
+    "log shows no dockerd error"
+)
+DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
+
+
+def diagnose_dind_log(log_text: str | None) -> DindLogCause:
+    """Name the cause for a DinD container whose sshd never answered.
+
+    The message carries the matching log line (capped), so the provider sees dockerd's own error
+    in the event and not only the validator's reading of it.
+    """
+    text = log_text or ""
+    for pattern, cause in DIND_LOG_CAUSES:
+        if pattern in text:
+            line = next((ln for ln in text.splitlines() if pattern in ln), "")
+            line = line.strip()[:DIND_LOG_LINE_MAX_CHARS]
+            if line:
+                return DindLogCause(cause.code, f"{cause.message}. dockerd said: {line}", dockerd_line=line)
+            return cause
+    return DIND_SSHD_NOT_READY
 
 
 class DindVerifier:
@@ -46,6 +98,8 @@ class DindVerifier:
         """Verify DinD on port."""
         name = f"{container_name_prefix}_{port.external}"
         log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
+        created = False
+        sshd_answered = False
 
         try:
             logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
@@ -67,40 +121,16 @@ class DindVerifier:
                 )
 
             logger.info(_m("DinD container created", extra=get_extra_info(log_ctx)))
+            created = True
 
             # Test SSH
             pkey = asyncssh.import_private_key(private_key)
             async with await self._connect_retrying_until_sshd_answers(
                 host, port, pkey, log_ctx
             ) as ssh:
-                # Test sysbox
+                sshd_answered = True
                 if sysbox:
-                    # daturaai/dind:0.0.1 bundles the hello-world image into the inner dockerd
-                    # at container start (DAH-1959), so `docker run` resolves it locally with no
-                    # registry round-trip. If the bundled load failed for any reason the local
-                    # image is absent and docker falls back to a Docker Hub pull, matching the
-                    # previous behaviour.
-                    try:
-                        result = await asyncio.wait_for(
-                            ssh.run("docker run --rm hello-world"), timeout=30
-                        )
-                        sysbox_ok = result.exit_status == 0
-                        error_msg = (
-                            result.stderr.strip()
-                            if not sysbox_ok and result.stderr and isinstance(result.stderr, str)
-                            else "unknown error"
-                        )
-                    except asyncio.TimeoutError:
-                        sysbox_ok = False
-                        error_msg = "sysbox check timed out after 30s"
-
-                    if not sysbox_ok:
-                        logger.warning(
-                            _m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
-                        )
-                        sysbox = False
-                    else:
-                        logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
+                    sysbox = await self._sysbox_works(ssh, log_ctx)
 
             await ssh_client.run(DockerCommand.remove_with_volumes(name))
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
@@ -117,13 +147,75 @@ class DindVerifier:
                 _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
                 exc_info=True,
             )
+            error: DindLogCause | None = None
+            if created and not sshd_answered and sysbox:
+                error = await self._diagnose_unanswered_container(ssh_client, name, e, log_ctx)
             await ssh_client.run(DockerCommand.remove_with_volumes(name))
             return DindProbeResult(
                 success=False,
                 log_text=f"dind: check failed port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
+                error=error,
             )
+
+    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool:
+        """Run hello-world inside the DinD container; True when it exits 0 within 30s.
+
+        daturaai/dind loads hello-world into the inner dockerd at start (DAH-1959), so no registry
+        pull is needed; when that load failed, docker falls back to a Docker Hub pull.
+        """
+        try:
+            result = await asyncio.wait_for(ssh.run("docker run --rm hello-world"), timeout=30)
+        except asyncio.TimeoutError:
+            error_msg = "sysbox check timed out after 30s"
+        else:
+            if result.exit_status == 0:
+                logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
+                return True
+            error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
+        logger.warning(_m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+        return False
+
+    async def _diagnose_unanswered_container(
+        self,
+        ssh_client: SSHClientConnection,
+        name: str,
+        ssh_error: Exception,
+        log_ctx: dict[str, Any],
+    ) -> DindLogCause:
+        """Read the container's logs while it still exists and name the cause (DAH-2856).
+
+        Best-effort: a failed read still yields the generic cause, never an exception — the
+        caller is on its way to remove the container and report the miss.
+        """
+        try:
+            result = await asyncio.wait_for(
+                ssh_client.run(DockerCommand.dind_diagnostics(name)),
+                timeout=DIND_DIAGNOSTICS_TIMEOUT_SECONDS,
+            )
+            stdout = result.stdout if isinstance(result.stdout, str) else ""
+        except Exception as read_error:
+            # diagnosis must not mask the probe result
+            stdout = f"(could not read the container log: {read_error})"
+        cause = diagnose_dind_log(stdout)
+        if cause.code == DIND_SSHD_NOT_READY.code:
+            # the log said nothing, so the ssh error is the only fact left for the provider
+            cause = DindLogCause(cause.code, f"{cause.message} (ssh: {str(ssh_error)[:120]})")
+        logger.warning(
+            _m(
+                "DinD container started but sshd never answered",
+                extra=get_extra_info(
+                    {
+                        **log_ctx,
+                        "cause": cause.code,
+                        "ssh_error": str(ssh_error),
+                        "log_excerpt": stdout[-DIND_LOG_EXCERPT_MAX_CHARS:],
+                    }
+                ),
+            )
+        )
+        return cause
 
     async def _connect_retrying_until_sshd_answers(
         self,

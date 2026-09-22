@@ -40,6 +40,11 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     "NVIDIA A100-SXM4-80GB": 0.7,
     "NVIDIA RTX A6000": 0.42,
 }
+# `NVIDIA B300 SXM6 PC`: provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300
+# SXM6 PC, memory.total 275040 MiB, all 8 GPUs of the host); not in NVIDIA's public chip list, which has
+# only the AC spelling. Listed as the AC card's alias and never a row of its own: every table derives it
+# from the AC entry, so a re-price of the AC card moves both names.
+RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -266,6 +271,7 @@ BASE_GPU_MAP = {
     "NVIDIA GeForce GTX 1060": "GTX 1060",
     "NVIDIA Tesla M40": "Tesla M40",
 }
+BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # derived, see RENTAL_PRICES_PER_HOUR
 
 
 class IncentiveConfig(BaseModel):
