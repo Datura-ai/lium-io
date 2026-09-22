@@ -48,7 +48,12 @@ def test_the_checker_flags_a_job_that_reads_the_token_without_the_environment():
         "    env:\n      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }}\n    steps: []\n"
     )
     assert jobs_reading_the_token_outside_the_environment(text) == ["deploy"]
-    assert jobs_reading_the_token_outside_the_environment(text.replace("    env:", f"    environment: {ENVIRONMENT}\n    env:")) == []
+    assert (
+        jobs_reading_the_token_outside_the_environment(
+            text.replace("    env:", f"    environment: {ENVIRONMENT}\n    env:")
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda p: p.name)
@@ -75,7 +80,10 @@ def test_release_tag_ruleset_covers_every_tag_trigger_of_the_publish_workflows()
     ruleset = json.loads(RULESET.read_text())
     assert ruleset["target"] == "tag" and ruleset["enforcement"] == "active"
     assert {r["type"] for r in ruleset["rules"]} == {"creation", "update", "deletion"}
-    assert ruleset["bypass_actors"] and all(a["actor_type"] == "User" and isinstance(a["actor_id"], int) for a in ruleset["bypass_actors"])
+    assert ruleset["bypass_actors"] and all(
+        a["actor_type"] == "User" and isinstance(a["actor_id"], int)
+        for a in ruleset["bypass_actors"]
+    )
     triggered = set()
     for workflow in WORKFLOWS:
         parsed = yaml.safe_load(workflow.read_text())
@@ -83,4 +91,9 @@ def test_release_tag_ruleset_covers_every_tag_trigger_of_the_publish_workflows()
         if "secrets.DOCKERHUB_PAT" in workflow.read_text():
             triggered.update(f"refs/tags/{t}" for t in push.get("tags") or [])
     assert triggered == set(ruleset["conditions"]["ref_name"]["include"])
-    assert triggered == {"refs/tags/executor-v*", "refs/tags/miner-v*", "refs/tags/validator-v*", "refs/tags/watchtower-v*"}
+    assert triggered == {
+        "refs/tags/executor-v*",
+        "refs/tags/miner-v*",
+        "refs/tags/validator-v*",
+        "refs/tags/watchtower-v*",
+    }
