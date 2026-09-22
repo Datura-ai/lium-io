@@ -10,6 +10,7 @@ After a filler start the validator leaves one slot per image the executor keeps 
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -1216,6 +1217,30 @@ async def test_sizing_leaves_slot_volumes_out_of_the_declared_sum(svc, monkeypat
     assert any("lium.warm_pool=1" in c.args[0] for c in ssh.run.await_args_list)
 
 
+# A failed host command's text can carry the host's address, paths and key material; the pool's
+# failure lines keep the exception's type and the ids already on the line.
+LEAK_CANARY = "ssh root@10.77.0.9: /root/.ssh/id_rsa AKIACANARYKEY0000 refused"
+
+
+def _log_text(record: logging.LogRecord) -> str:
+    return str(record.msg) + " " + json.dumps(getattr(record.msg, "extra", {}), default=str)
+
+
+@pytest.mark.asyncio
+async def test_slot_volume_listing_failure_logs_the_exception_type_only(svc, caplog):
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=OSError(LEAK_CANARY))
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        assert await svc._warm_slot_volume_names(ssh) == set()
+
+    unlisted = [r for r in caplog.records if str(r.msg) == "warm_pool slot volumes unlisted"]
+    assert len(unlisted) == 1
+    assert unlisted[0].msg.extra["error"] == "OSError"
+    assert unlisted[0].exc_info is None
+    assert all(LEAK_CANARY not in _log_text(r) for r in caplog.records)
+
+
 # ------------------------------------------------------------------
 # leaving a slot behind a filler start
 # ------------------------------------------------------------------
@@ -1923,6 +1948,36 @@ async def test_cvm_node_gets_no_slot(svc, monkeypatch):
     assert client.created == []
     assert warm_pool.inspect_slots_command() not in _cmds(ssh)
     assert not any("docker image inspect" in c for c in _cmds(ssh))
+
+
+@pytest.mark.asyncio
+async def test_maintenance_failure_logs_the_exception_type_only(svc, monkeypatch, caplog):
+    """Maintenance is best-effort: its failure line keeps the executor ids it already carries and
+    the exception's type; the exception text (a host command's stderr) stays out of the log."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    monkeypatch.setattr(ds_module.settings, "ENABLE_CVM_POD_QUOTE_SOCKET", False)
+    ssh, client, _ = _filler_host(svc, monkeypatch)
+    monkeypatch.setattr(svc, "_sweep_stale_warm_slots", AsyncMock(side_effect=RuntimeError(LEAK_CANARY)))
+    filler = _payload(workload_kind=WorkloadKind.FILLER, docker_image="daturaai/empty-job:1.0.0")
+    default_extra = {"executor_uuid": filler.executor_id, "pod_id": filler.pod_id}
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        await svc._maintain_warm_pool(
+            ssh_client=ssh,
+            docker_client=client,
+            executor_info=_executor_info(filler),
+            filler_payload=filler,
+            default_extra=default_extra,
+        )
+
+    failed = [r for r in caplog.records if str(r.msg) == "warm_pool maintain failed"]
+    assert len(failed) == 1
+    assert failed[0].msg.extra["error"] == "RuntimeError"
+    assert failed[0].msg.extra["executor_uuid"] == filler.executor_id
+    assert failed[0].exc_info is None
+    assert all(LEAK_CANARY not in _log_text(r) for r in caplog.records)
+    assert client.created == []
+    assert filler.executor_id not in svc._warm_pool_maintaining
 
 
 # ------------------------------------------------------------------

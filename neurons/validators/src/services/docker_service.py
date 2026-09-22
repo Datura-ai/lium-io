@@ -1754,7 +1754,9 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning(_m("warm_pool maintain failed", extra=get_extra_info({**default_extra, "error": str(exc)})))
+            logger.warning(
+                _m("warm_pool maintain failed", extra=get_extra_info({**default_extra, "error": type(exc).__name__}))
+            )
         finally:
             self._warm_pool_maintaining.discard(executor_id)
 
@@ -4536,7 +4538,7 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.info(_m("warm_pool slot volumes unlisted", extra=get_extra_info({"error": str(exc)})))
+            logger.info(_m("warm_pool slot volumes unlisted", extra=get_extra_info({"error": type(exc).__name__})))
             return set()
         if getattr(slot_result, "exit_status", 0) != 0:
             return set()
