@@ -347,7 +347,6 @@ class LocalVerifyCheck:
         if verifyx_challenge is None:
             return outcome
         step = answer.step("verifyx")
-        lib_sha256 = (step.data or {}).get("lib_sha256")
         if step.status != "ok" or step.stdout is None:
             reason = _step_reason(step)
             outcome.fallbacks["verifyx"] = reason
@@ -355,9 +354,7 @@ class LocalVerifyCheck:
         elif _over_time("verifyx", answer):
             outcome.fallbacks["verifyx"] = "step_overtime"
             self._metric(ctx, "fallback", "verifyx", "step_overtime", **common)
-        elif lib_sha256 not in (
-            verifyx_challenge.accepted_lib_sha256s or {verifyx_challenge.expected_lib_sha256}
-        ):
+        elif step.data.get("lib_sha256") != verifyx_challenge.expected_lib_sha256:
             # The SSH path refuses an outdated libverifyx before running; here the digest rides
             # along with the answer and the same refusal applies.
             outcome.fallbacks["verifyx"] = "lib_mismatch"
@@ -367,10 +364,7 @@ class LocalVerifyCheck:
                 stdout=step.stdout, stderr=step.stderr_tail, exit_status=step.exit_status
             )
             response = ctx.services.verifyx.evaluate_verifyx_capture(
-                verifyx_challenge,
-                capture,
-                ctx.default_extra,
-                previous_library=lib_sha256 != verifyx_challenge.expected_lib_sha256,
+                verifyx_challenge, capture, ctx.default_extra
             )
             if response.data and response.data.get("success"):
                 outcome.verifyx = response

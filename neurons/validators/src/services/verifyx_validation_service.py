@@ -4,8 +4,8 @@ import math
 import random
 import os
 import logging
+import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 
@@ -29,6 +29,13 @@ STDERR_TAIL_BYTES = 2048
 # minutes, so this is generous — it only cuts true hangs (same silent-hang class as the
 # matrix check, DAH-2365) instead of blocking until the outer JOB_TIME_OUT cancellation.
 VERIFYX_COMMAND_TIMEOUT_SECONDS = 600
+
+# DAH-2774: both images ship two VerifyX builds. LIB_PATH is the one every executor runs today; off
+# and shadow gate on it exactly as before and ask executors for nothing new. CAPACITY_LIB_PATH
+# (celium-gpu-verifier#25) reads the Cloudflare capacity: beside the gate under shadow
+# (`measure_capacity_shadow`), as the gate under enforce.
+LIB_PATH = "/usr/lib/libverifyx.so"
+CAPACITY_LIB_PATH = "/usr/lib/libverifyx_capacity.so"
 
 
 class VerifyXFailureClass(str, Enum):
@@ -160,9 +167,6 @@ class VerifyXChallenge:
     log_extra: Dict[str, Any]
     # sha256 of the validator's own libverifyx.so; the executor's must match before its answer counts.
     expected_lib_sha256: str
-    # expected_lib_sha256 plus, inside the transition window, the library it replaced
-    # (VerifyXValidationService.accepted_lib_sha256s).
-    accepted_lib_sha256s: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -171,7 +175,8 @@ class NetworkGateTally:
     counted per node since the last summary (the validator logs one per cycle; express-lane runs
     between cycles land in the next one). `newly_fail` is a node the package reading passes and
     the capacity reading fails: what flipping VERIFYX_NETWORK_GATE_MODE to enforce would cost.
-    A previous-library executor is measured by its package download under either mode."""
+    `capacity_library_missing` is a node without the validator's libverifyx_capacity.so: one
+    enforce would fail as outdated."""
 
     package_pass: int = 0
     package_fail: int = 0
@@ -180,7 +185,7 @@ class NetworkGateTally:
     newly_fail: int = 0
     newly_pass: int = 0
     unmeasured: int = 0
-    previous_library: int = 0
+    capacity_library_missing: int = 0
     probe_failed: int = 0
 
     def record(
@@ -188,10 +193,10 @@ class NetworkGateTally:
         package_ema: float | None,
         capacity_ema: float | None,
         floor_mbps: float,
-        previous_library: bool = False,
+        capacity_library_missing: bool = False,
     ) -> None:
-        if previous_library:
-            self.previous_library += 1
+        if capacity_library_missing:
+            self.capacity_library_missing += 1
         if package_ema is None or capacity_ema is None:
             self.unmeasured += 1
             return
@@ -238,47 +243,45 @@ NETWORK_GATE_TALLY = NetworkGateTally()
 
 class VerifyXValidationService:
     def __init__(self):
-        self.lib_name = "/usr/lib/libverifyx.so"
-        self._lib_sha256: str | None = None
+        self.lib_name = LIB_PATH
+        self.capacity_lib_name = CAPACITY_LIB_PATH
+        self._lib_sha256s: dict[str, str] = {}
 
-    def lib_sha256(self) -> str:
-        """sha256 of the validator's own libverifyx.so, read once per process.
+    def gated_lib_name(self) -> str:
+        """The library whose answer gates: libverifyx_capacity.so under enforce, libverifyx.so otherwise."""
+        if settings.verifyx.NETWORK_GATE_MODE == "enforce":
+            return self.capacity_lib_name
+        return self.lib_name
 
-        The file changes only with a validator upgrade, which restarts the process, so both readers
+    def lib_sha256(self, lib_name: str | None = None) -> str:
+        """sha256 of one of the validator's own libraries (the gated one by default), read once per process.
+
+        The files change only with a validator upgrade, which restarts the process, so both readers
         (the SSH path's checksum gate and the challenge's `expected_lib_sha256`) share one digest.
         """
-        if self._lib_sha256 is None:
-            self._lib_sha256 = sha256_from_path(self.lib_name)
-        return self._lib_sha256
-
-    def accepted_lib_sha256s(self, now: datetime | None = None) -> frozenset[str]:
-        """The executor library digests that may answer: this validator's own, and until
-        `VERIFYX_PREVIOUS_LIB_ACCEPTED_UNTIL` the one it replaced (`VERIFYX_PREVIOUS_LIB_SHA256`),
-        so executors that have not pulled the new image yet keep passing during a rollout."""
-        current = self.lib_sha256()
-        previous = settings.verifyx.PREVIOUS_LIB_SHA256
-        until = settings.verifyx.PREVIOUS_LIB_ACCEPTED_UNTIL
-        if until.tzinfo is None:
-            until = until.replace(tzinfo=UTC)
-        now = now or datetime.now(UTC)
-        if previous and previous != current and now < until:
-            return frozenset({current, previous})
-        return frozenset({current})
+        lib_name = lib_name or self.gated_lib_name()
+        if lib_name not in self._lib_sha256s:
+            self._lib_sha256s[lib_name] = sha256_from_path(lib_name)
+        return self._lib_sha256s[lib_name]
 
     def prepare_verifyx_challenge(
         self,
         machine_spec: dict,
         default_extra: dict,
         challenge_config_overrides: dict | None = None,
+        *,
+        lib_name: str | None = None,
     ) -> "VerifyXChallenge":
         """Encrypt one VerifyX challenge; the caller decides how it reaches the executor.
 
         The SSH path runs `verifyx_executor.py --seed … --cipher_text …` over the shell; the local
         path (liumd phase 1, `POST /verify`) sends the same two arguments in the intent. Either way
         the response comes back to `evaluate_verifyx_capture`, the one place that decides.
+        `lib_name` defaults to the gated library.
         """
         # challenge_config_overrides (DAH-3011): keys of the challenge `config` block to replace for
         # this run — a first, unscored verification writes less RAM/disk. None = today's config.
+        lib_name = lib_name or self.gated_lib_name()
         gpu_details = machine_spec.get("gpu", {}).get("details", [])
         gpu_count = machine_spec.get("gpu", {}).get("count", 0)
         gpu_uuids = ",".join([detail.get("uuid", "") for detail in gpu_details])
@@ -287,7 +290,7 @@ class VerifyXValidationService:
         gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
 
         seed = random.getrandbits(64)
-        verifyx_validator = VerifyXValidator(self.lib_name, seed)
+        verifyx_validator = VerifyXValidator(lib_name, seed)
 
         challenge_config = {
             "memory_allocation_percentage": settings.verifyx.MEMORY_ALLOCATION_PERCENTAGE,
@@ -319,8 +322,7 @@ class VerifyXValidationService:
             cipher_text=cipher_text,
             challenge_input=challenge_input,
             log_extra=log_extra,
-            expected_lib_sha256=self.lib_sha256(),
-            accepted_lib_sha256s=self.accepted_lib_sha256s(),
+            expected_lib_sha256=self.lib_sha256(lib_name),
         )
 
     def evaluate_verifyx_capture(
@@ -328,13 +330,8 @@ class VerifyXValidationService:
         challenge: "VerifyXChallenge",
         capture: SSHCapture,
         default_extra: dict,
-        *,
-        previous_library: bool = False,
     ) -> "VerifyXResponse":
-        """Judge the executor's `verifyx_executor.py` output — SSH capture or `/verify` step alike.
-
-        `previous_library`: the executor presented the library this one replaced (accepted during
-        the transition window); its answer is read as that library's validator read it."""
+        """Judge the executor's `verifyx_executor.py` output — SSH capture or `/verify` step alike."""
         if capture.transport_error is not None:
             return self._failure_response(
                 error=f"SSH transport error ({capture.transport_error})",
@@ -363,14 +360,8 @@ class VerifyXValidationService:
 
         try:
             payload = challenge.validator.verify_response(challenge_response)
-            if previous_library:
-                payload = _as_measured_for_the_previous_library(payload)
             verification_result = _perform_verification_checks(payload)
-            log_extra = default_extra
-            if previous_library:
-                verification_result["verifyx_library"] = "previous"
-                log_extra = {**default_extra, "verifyx_library": "previous"}
-            _log_verifyx_network_speeds(verification_result.get("network") or {}, log_extra)
+            _log_verifyx_network_speeds(verification_result.get("network") or {}, default_extra)
             return VerifyXResponse(data=verification_result)
         except Exception as e:
             return self._failure_response(
@@ -392,27 +383,23 @@ class VerifyXValidationService:
         # (checks/local_verify.py) calls the same prepare/evaluate around `POST /verify`.
         try:
             # Verify checksum before proceeding with validation
-            local_checksum = self.lib_sha256()
-            executor_checksum = await sha256_from_executor(shell, self.lib_name)
+            lib_name = self.gated_lib_name()
+            local_checksum = self.lib_sha256(lib_name)
+            executor_checksum = await sha256_from_executor(shell, lib_name)
 
-            if executor_checksum not in self.accepted_lib_sha256s():
+            if local_checksum != executor_checksum:
                 return VerifyXResponse(error=OUTDATED_LIBRARY_ERROR)
 
             challenge = self.prepare_verifyx_challenge(
-                machine_spec, default_extra, challenge_config_overrides
+                machine_spec, default_extra, challenge_config_overrides, lib_name=lib_name
             )
 
-            command = f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py --seed {challenge.seed} --cipher_text {challenge.cipher_text}"
+            command = self._verifyx_command(executor_info, challenge, lib_name)
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
             ssh_capture = await self._run_ssh_command(shell, command)
-            return self.evaluate_verifyx_capture(
-                challenge,
-                ssh_capture,
-                default_extra,
-                previous_library=executor_checksum != local_checksum,
-            )
+            return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
         except Exception as e:
             # Pre-SSH failure (checksum fetch, challenge generation, etc.) — emit a structured
@@ -424,10 +411,93 @@ class VerifyXValidationService:
             logger.error(_m("VerifyX validation failed", extra=get_extra_info({**default_extra, **diagnostics})))
             return VerifyXResponse(error=f"unexpected error ({e})", diagnostics=diagnostics)
 
-    async def _run_ssh_command(self, shell, command: str) -> SSHCapture:
+    async def measure_capacity_shadow(
+        self,
+        shell,
+        executor_info,
+        default_extra: dict,
+        machine_spec: dict,
+        timeout_seconds: float,
+    ) -> dict:
+        """DAH-2774 shadow: one libverifyx_capacity.so run, read as enforce would read its network.
+
+        Recorded beside the gate and never scored, so every outcome is a record (`status`
+        measured | library_missing | run_failed), never an exception. Memory and storage run at
+        their smallest sizes; the network test is the one enforce would gate on. An executor
+        whose libverifyx_capacity.so is absent or another build is not run (`library_missing`).
+        """
+        started = time.monotonic()
+        record = await self._capacity_shadow_run(
+            shell, executor_info, default_extra, machine_spec, timeout_seconds
+        )
+        record["seconds"] = round(time.monotonic() - started, 1)
+        logger.info(
+            _m(
+                "VerifyX capacity shadow run "
+                f"status={record['status']} "
+                f"cloudflare_download_mbps={_format_mbps(record.get('capacity_download_speed'))} "
+                f"exec={default_extra.get('executor_uuid') or 'none'}",
+                extra=get_extra_info({**default_extra, "capacity_shadow": record}),
+            )
+        )
+        return record
+
+    async def _capacity_shadow_run(
+        self, shell, executor_info, default_extra: dict, machine_spec: dict, timeout_seconds: float
+    ) -> dict:
+        try:
+            lib_name = self.capacity_lib_name
+            executor_checksum = await sha256_from_executor(shell, lib_name)
+            if executor_checksum != self.lib_sha256(lib_name):
+                return {"status": "library_missing", "executor_lib_sha256": executor_checksum or None}
+            challenge = self.prepare_verifyx_challenge(
+                machine_spec,
+                default_extra,
+                {
+                    "memory_max_test_gb": settings.verifyx.MEMORY_MIN_TEST_GB,
+                    "storage_throughput_test_gb": settings.FIRST_PASS_VERIFYX_STORAGE_TEST_GB,
+                },
+                lib_name=lib_name,
+            )
+            capture = await self._run_ssh_command(
+                shell,
+                self._verifyx_command(executor_info, challenge, lib_name),
+                timeout=timeout_seconds,
+            )
+            if capture.transport_error is not None:
+                return {"status": "run_failed", "error": f"SSH transport error ({capture.transport_error})"}
+            if capture.exit_status is not None and capture.exit_status != 0:
+                return {"status": "run_failed", "error": f"exit status {capture.exit_status}"}
+            response = (capture.stdout or "").strip()
+            if len(response) < MIN_CIPHER_LEN:
+                return {"status": "run_failed", "error": f"stdout_len={len(response)}"}
+            payload = challenge.validator.verify_response(response)
+            stats, errors = _verify_network_capacity_test(
+                payload["challenge_data"], payload["response_data"]
+            )
+        except Exception as e:
+            return {"status": "run_failed", "error": f"{type(e).__name__}: {e}"}
+        return {
+            "status": "measured",
+            "capacity_download_speed": stats.get("capacity_download_speed"),
+            "upload_speed": stats.get("upload_speed"),
+            "package_download_speed": stats.get("package_download_speed"),
+            "success": stats.get("success"),
+            "errors": errors,
+        }
+
+    def _verifyx_command(self, executor_info, challenge: "VerifyXChallenge", lib_name: str) -> str:
+        command = f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py --seed {challenge.seed} --cipher_text {challenge.cipher_text}"
+        if lib_name != self.lib_name:
+            command += f" --lib {lib_name}"
+        return command
+
+    async def _run_ssh_command(
+        self, shell, command: str, timeout: float = VERIFYX_COMMAND_TIMEOUT_SECONDS
+    ) -> SSHCapture:
         """Run SSH command; on transport failure populate `transport_error`, else the payload fields."""
         try:
-            result = await shell.ssh_client.run(command, timeout=VERIFYX_COMMAND_TIMEOUT_SECONDS)
+            result = await shell.ssh_client.run(command, timeout=timeout)
         except Exception as e:
             return SSHCapture(transport_error=f"{type(e).__name__}: {e}")
 
@@ -520,40 +590,18 @@ def _verify_memory_test(challenge_data: dict, response_data: dict) -> Tuple[dict
     return stats, errors
 
 
-def _as_measured_for_the_previous_library(payload: dict) -> dict:
-    """The previous libverifyx.so (lium-io main before DAH-2774) reports `speedtest.download_mbps`
-    as its requested byte count over the elapsed time, whatever the HTTP status or the bytes that
-    arrived, and its validator gated and listed `download.speed_mbps` (the package download). An
-    executor still on it is read that way: the package speed stands in for the capacity reading."""
-    response_data = payload.get("response_data") or {}
-    network_execution = response_data.get("network_execution") or {}
-    package_speed = (network_execution.get("download") or {}).get("speed_mbps")
-    speedtest = {**(network_execution.get("speedtest") or {}), "download_mbps": package_speed}
-    return {
-        **payload,
-        "response_data": {
-            **response_data,
-            "network_execution": {**network_execution, "speedtest": speedtest},
-        },
-    }
-
-
 def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
-    """Off and shadow return main's network stats unchanged: the same package reading, the same
-    failure handling (a failed probe carries no `download_speed`, so the EMA is fed 0.0) and the
-    same exceptions. Both add the package reading as `package_download_speed`; shadow adds the
-    Cloudflare capacity as `capacity_download_speed`, which scores nothing. Enforce gates on the
-    capacity (`_verify_network_capacity_test`)."""
-    mode = settings.verifyx.NETWORK_GATE_MODE
-    if mode == "enforce":
+    """The gated answer's network. Off and shadow judge libverifyx.so's answer with main's
+    function unchanged: the same package reading, the same failure handling (a failed probe
+    carries no `download_speed`, so the EMA is fed 0.0) and the same exceptions, plus the package
+    reading as `package_download_speed`. The shadow capacity reading comes from its own run
+    (`VerifyXValidationService.measure_capacity_shadow`). Enforce judges libverifyx_capacity.so's
+    answer on its capacity (`_verify_network_capacity_test`)."""
+    if settings.verifyx.NETWORK_GATE_MODE == "enforce":
         return _verify_network_capacity_test(challenge_data, response_data)
     stats, errors = _verify_network_package_test(challenge_data, response_data)
-    network_execution = response_data["network_execution"]
-    package_speed = (network_execution.get("download") or {}).get("speed_mbps")
+    package_speed = (response_data["network_execution"].get("download") or {}).get("speed_mbps")
     stats["package_download_speed"] = package_speed if _is_speed_reading(package_speed) else None
-    if mode == "shadow":
-        capacity_speed = (network_execution.get("speedtest") or {}).get("download_mbps")
-        stats["capacity_download_speed"] = capacity_speed if _is_speed_reading(capacity_speed) else None
     return stats, errors
 
 
@@ -601,8 +649,9 @@ def _verify_network_package_test(challenge_data: dict, response_data: dict) -> T
 
 
 def _verify_network_capacity_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
-    """Enforce: `download_speed` is the Cloudflare capacity; the package download keeps its own
-    floor and is published as `package_download_speed`, the capacity as `capacity_download_speed`."""
+    """libverifyx_capacity.so's network (the enforce gate and the shadow record): `download_speed`
+    is the Cloudflare capacity; the package download keeps its own floor and is published as
+    `package_download_speed`, the capacity as `capacity_download_speed`."""
     network_execution = response_data["network_execution"]
 
     if not network_execution["success"]:
@@ -764,7 +813,7 @@ def _is_positive_number(value: object) -> bool:
 def _is_speed_reading(value: object) -> bool:
     """A usable Mbps reading: a finite positive number, or 0 (how a failed direction reads).
 
-    A bool, a string, NaN, ±inf or a negative number is not one — the paired libverifyx.so only
+    A bool, a string, NaN, ±inf or a negative number is not one — both vendored libraries only
     serializes f64, so any such value is a malformed payload and must never reach EMA arithmetic.
     """
     if _is_positive_number(value):

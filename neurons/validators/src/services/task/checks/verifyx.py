@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -16,6 +17,16 @@ from .network_ema import compute_ema
 logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+
+# DAH-2774 shadow: the libverifyx_capacity.so run is best effort and must never cost a node its
+# cycle. miner_service cancels an executor's whole pipeline at JOB_TIME_OUT - 120 s, so the run
+# takes at most CAPACITY_SHADOW_TIMEOUT_SECONDS and only while that leaves the checks after VerifyX
+# (matmul, rental checks) CAPACITY_SHADOW_RESERVE_SECONDS; under CAPACITY_SHADOW_MIN_SECONDS (the
+# 120 s network test plus the light memory/storage run) it is skipped.
+EXECUTOR_TASK_TIMEOUT_MARGIN_SECONDS = 120
+CAPACITY_SHADOW_TIMEOUT_SECONDS = 240
+CAPACITY_SHADOW_RESERVE_SECONDS = 300
+CAPACITY_SHADOW_MIN_SECONDS = 150
 
 
 @dataclass(frozen=True)
@@ -221,8 +232,6 @@ class VerifyXCheck:
             )
             if errors:
                 event.what_we_saw["errors"] = errors
-            if result.data.get("verifyx_library"):
-                event.what_we_saw["verifyx_library"] = result.data["verifyx_library"]
             if sizing:
                 event.what_we_saw["first_pass_challenge_config"] = sizing[
                     "challenge_config_overrides"
@@ -231,14 +240,20 @@ class VerifyXCheck:
                 event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
             if unavailable_readings:
                 event.what_we_saw["unavailable_speed_readings"] = unavailable_readings
-            network_gate = _network_gate(verifyx_network, prev_ema, ema_download)
+            capacity_run = (
+                await _measure_capacity_shadow(ctx, specs)
+                if settings.verifyx.NETWORK_GATE_MODE == "shadow"
+                else None
+            )
+            network_gate = _network_gate(verifyx_network, prev_ema, ema_download, capacity_run)
             if network_gate is not None:
                 event.what_we_saw["network_gate"] = network_gate
+                library_missing = (capacity_run or {}).get("status") == "library_missing"
                 NETWORK_GATE_TALLY.record(
                     network_gate["ema_package"],
                     network_gate["ema_capacity"],
                     MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
-                    previous_library=result.data.get("verifyx_library") == "previous",
+                    capacity_library_missing=library_missing,
                 )
 
             updated_state = replace(ctx.state, specs=updated_specs)
@@ -389,26 +404,74 @@ def _ema_if_gated(prev: float | None, reading: object) -> float | None:
     return compute_ema(prev, reading if reading is not None else 0.0)
 
 
-def _network_gate(verifyx_network: dict, prev_ema, ema_gated: float | None) -> dict | None:
-    """DAH-2774 shadow record: the floor read against the package and the capacity reading.
+async def _measure_capacity_shadow(ctx: Context, specs: dict) -> dict:
+    """The shadow libverifyx_capacity.so run, inside the executor task's time budget. Any failure,
+    ours included, is a record: the verdict is already decided and this cannot change it."""
+    if ctx.config.first_pass:
+        return {"status": "skipped_first_pass"}
+    seconds_left = (
+        settings.JOB_TIME_OUT
+        - EXECUTOR_TASK_TIMEOUT_MARGIN_SECONDS
+        - (time.monotonic() - ctx.started_at_monotonic)
+        - CAPACITY_SHADOW_RESERVE_SECONDS
+    )
+    timeout_seconds = min(float(CAPACITY_SHADOW_TIMEOUT_SECONDS), seconds_left)
+    if timeout_seconds < CAPACITY_SHADOW_MIN_SECONDS:
+        return {"status": "skipped_no_budget", "seconds_left": round(seconds_left)}
+    try:
+        return await ctx.services.verifyx.measure_capacity_shadow(
+            shell=ctx.services.shell,
+            executor_info=ctx.executor,
+            default_extra=ctx.default_extra,
+            machine_spec=specs,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "VerifyX capacity shadow run raised; recorded as run_failed",
+                extra=get_extra_info({**ctx.default_extra, "error": repr(exc)}),
+            )
+        )
+        return {"status": "run_failed", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _network_gate(
+    verifyx_network: dict, prev_ema, ema_gated: float | None, capacity_run: dict | None
+) -> dict | None:
+    """DAH-2774 record: the floor read against the package and the capacity reading.
     `ema_gated` is the EMA the check stored and gates on: `ema_package` under shadow (main's
-    number, a failed probe included), `ema_capacity` under enforce. The other is computed from
-    the same previous EMA and says what the node would get on the first cycle of the other mode.
-    None under off."""
+    library and number, a failed probe included), `ema_capacity` under enforce. The other is
+    computed from the same previous EMA and says what the node would get on the first cycle of
+    the other mode. Under shadow the capacity comes from `capacity_run` (its own
+    libverifyx_capacity.so run); a run that did not measure leaves `ema_capacity` None. None under
+    off."""
     mode = settings.verifyx.NETWORK_GATE_MODE
     if mode == "off":
         return None
     prev = prev_ema.ema_verifyx_download_speed if prev_ema else None
     package = verifyx_network.get("package_download_speed")
-    capacity = verifyx_network.get("capacity_download_speed")
-    enforce = mode == "enforce"
+    if mode == "enforce":
+        capacity = verifyx_network.get("capacity_download_speed")
+        return {
+            "mode": mode,
+            "floor_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+            "package_download_speed": package,
+            "capacity_download_speed": capacity,
+            "ema_package": _ema_if_gated(prev, package),
+            "ema_capacity": ema_gated,
+        }
+    capacity_run = capacity_run or {}
+    measured = capacity_run.get("status") == "measured"
+    capacity = capacity_run.get("capacity_download_speed") if measured else None
     return {
         "mode": mode,
         "floor_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
         "package_download_speed": package,
         "capacity_download_speed": capacity,
-        "ema_package": _ema_if_gated(prev, package) if enforce else ema_gated,
-        "ema_capacity": ema_gated if enforce else _ema_if_gated(prev, capacity),
+        "ema_package": ema_gated,
+        "ema_capacity": _ema_if_gated(prev, capacity) if measured else None,
+        "capacity_run": capacity_run,
     }
 
 

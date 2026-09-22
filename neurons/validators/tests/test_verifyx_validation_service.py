@@ -441,7 +441,7 @@ async def test_run_ssh_command_is_bounded_by_the_hard_timeout():
 
 
 @pytest.mark.asyncio
-async def test_the_library_digest_is_read_once_per_service(tmp_path):
+async def test_the_library_digest_is_read_once_per_service(tmp_path, monkeypatch):
     """Review round on #1340: `validate_verifyx_and_process_job` hashed libverifyx.so for the
     checksum gate and `prepare_verifyx_challenge` hashed it again for `expected_lib_sha256`, so
     every SSH run read the .so twice. The digest is cached on the service: the file is hashed
@@ -450,6 +450,8 @@ async def test_the_library_digest_is_read_once_per_service(tmp_path):
     lib = tmp_path / "libverifyx.so"
     lib.write_bytes(b"first build")
     first_digest = hashlib.sha256(b"first build").hexdigest()
+    # off gates on libverifyx.so (enforce on libverifyx_capacity.so, read the same way)
+    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "off")
     service = VerifyXValidationService()
     service.lib_name = str(lib)
     with patch(

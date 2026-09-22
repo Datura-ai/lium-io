@@ -1,5 +1,5 @@
 import pathlib
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -56,13 +56,17 @@ class VerifyXSettings(BaseSettings):
         default=120,
         description="Timeout for network tests in seconds"
     )
-    # DAH-2774: which download reading is THE network number (the published verifyx_download_speed,
-    # the 100 Mbps EMA floor in checks/verifyx.py, NETWORK_MIN_DOWNLOAD_SPEED_MBPS):
-    #   off     the package download, as before DAH-2774; the Cloudflare reading is ignored.
-    #   shadow  the package download; the Cloudflare capacity reading is recorded next to it (event
-    #           `network_gate`, the per-cycle "VerifyX network gate summary" log line) and scores
-    #           nothing.
-    #   enforce the Cloudflare capacity reading, with the package download under its own floor.
+    # DAH-2774: which library and which download reading is THE network number (the published
+    # verifyx_download_speed, the 100 Mbps EMA floor in checks/verifyx.py,
+    # NETWORK_MIN_DOWNLOAD_SPEED_MBPS). Both images ship two builds: libverifyx.so, the one every
+    # executor runs today, and libverifyx_capacity.so (celium-gpu-verifier#25, the Cloudflare
+    # capacity probe).
+    #   off     libverifyx.so and its package download, as before DAH-2774.
+    #   shadow  exactly off; then one light libverifyx_capacity.so run whose capacity reading is
+    #           recorded next to it (event `network_gate`, the per-cycle "VerifyX network gate
+    #           summary" log line) and scores nothing.
+    #   enforce libverifyx_capacity.so gates on its capacity reading, with the package download
+    #           under its own floor; an executor without that library fails VerifyX as outdated.
     # A value outside the three refuses to start the validator.
     NETWORK_GATE_MODE: Literal["off", "shadow", "enforce"] = Field(
         default="shadow",
@@ -83,19 +87,6 @@ class VerifyXSettings(BaseSettings):
     ENABLE_XET_CHALLENGE: bool = Field(
         default=True,
         description="Include HuggingFace Xet download challenge in VerifyX",
-    )
-    # DAH-2774: an executor must present the validator's own libverifyx.so sha256 or it fails
-    # VerifyX (OUTDATED_LIBRARY_ERROR), and executors reach a new image only as fast as their
-    # updater (EXECUTOR_IMAGE_CHECK_ENFORCE is off for that reason). So a library bump accepts the
-    # library it replaces until PREVIOUS_LIB_ACCEPTED_UNTIL; such an executor is measured as that
-    # library's validator measured it (the package download speed). "" closes the window.
-    PREVIOUS_LIB_SHA256: str = Field(
-        default="16b9a5012f8e6b4438fbedfe722b9c30de9e2f2e98373aed33094c6ff6be564f",
-        description="sha256 of the libverifyx.so before the current one (lium-io 5aad3566)",
-    )
-    PREVIOUS_LIB_ACCEPTED_UNTIL: datetime = Field(
-        default=datetime(2026, 10, 13, tzinfo=UTC),
-        description="UTC moment the previous libverifyx.so stops being accepted",
     )
 
 

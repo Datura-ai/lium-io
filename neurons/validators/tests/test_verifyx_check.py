@@ -47,6 +47,7 @@ class DummyVerifyXService:
         executor_info,
         default_extra: dict,
         machine_spec: dict,
+        challenge_config_overrides: dict | None = None,
     ) -> MockVerifyXResponse:
         """Mock method that mimics the real verifyx service."""
         # Track what parameters we were called with
@@ -71,6 +72,14 @@ class DummyVerifyXService:
             else:
                 data = {"success": False, "errors": "Verification failed"}
                 return MockVerifyXResponse(data=data)
+
+    async def measure_capacity_shadow(
+        self, *, shell, executor_info, default_extra: dict, machine_spec: dict, timeout_seconds: float
+    ) -> dict:
+        """The shadow libverifyx_capacity.so run (VERIFYX_NETWORK_GATE_MODE=shadow): `capacity_run`
+        when a test sets one, else an executor without that library."""
+        self.capacity_timeout_seconds = timeout_seconds
+        return dict(getattr(self, "capacity_run", None) or {"status": "library_missing"})
 
 
 @pytest.mark.parametrize(

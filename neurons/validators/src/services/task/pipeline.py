@@ -177,6 +177,9 @@ class CheckResult(BaseModel):
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
+    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # the executor task's timeout from here (checks/verifyx.py `_measure_capacity_shadow`).
+    started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
     miner_hotkey: str
     miner_coldkey: str | None = None
