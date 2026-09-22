@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 16 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 9 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.1.0`) is semver over the wire; 1.1.0 added `PodStatesReport`, `ExecutorSpecRequest.pod_states` and `FailedContainerErrorCodes.ExecutorUnreachable` (DAH-3338).
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.1.0`) is semver over the wire; 1.1.0 added `PodStatesReport`, `ExecutorSpecRequest.pod_states` and `FailedContainerErrorCodes.ExecutorUnreachable` (per-cycle pod container states, and "unreachable" told apart from "unknown id").
 
 ## Using it
 
