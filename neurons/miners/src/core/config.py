@@ -9,6 +9,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 if TYPE_CHECKING:
     from bittensor import Wallet
 
+# The Lium validator's hotkeys (public ss58 addresses). CURRENT is the one on chain today; NEXT is
+# the one the owner swaps to. Same pair as the executor's core/config.py and the platform's
+# ACCEPTED_VALIDATOR_HOTKEYS — the swap is a config flip in each, not a code change.
+LIUM_VALIDATOR_HOTKEY_CURRENT = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
+LIUM_VALIDATOR_HOTKEY_NEXT = "5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK"
+
 
 class DebugSettings(BaseSettings):
     """Debug configuration - all flags default to False/None.
@@ -67,8 +73,18 @@ class Settings(BaseSettings):
 
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
     MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")
-    DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default="5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p")
+    # The Lium validator this miner serves: new executors are listed under it (cli add-executor) and
+    # only its sign-ins are accepted. The hotkey is being rotated (owner, 22 Sep 2026): both addresses
+    # below are accepted, DEFAULT_VALIDATOR_HOTKEY stays the current one until the chain swap, and the
+    # swap is one config change — DEFAULT_VALIDATOR_HOTKEY=<VALIDATOR_NEXT_HOTKEY> — not a release.
+    DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default=LIUM_VALIDATOR_HOTKEY_CURRENT)
+    VALIDATOR_NEXT_HOTKEY: str = Field(env="VALIDATOR_NEXT_HOTKEY", default=LIUM_VALIDATOR_HOTKEY_NEXT)
     CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)
+
+    @property
+    def accepted_validator_hotkeys(self) -> frozenset[str]:
+        """Every validator hotkey whose sign-in this miner accepts: the active one and the one it swaps to."""
+        return frozenset(h.strip() for h in (self.DEFAULT_VALIDATOR_HOTKEY, self.VALIDATOR_NEXT_HOTKEY) if h and h.strip())
     
     # Debug settings - loaded from DEBUG_* environment variables
     debug: DebugSettings = Field(default_factory=DebugSettings)

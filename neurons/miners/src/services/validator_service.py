@@ -13,5 +13,6 @@ class ValidatorService:
     def is_valid_validator(self, validator_hotkey: str) -> bool:
         if settings.debug.SKIP_VALIDATOR_REGISTRATION_CHECK:
             return True
-        
-        return settings.DEFAULT_VALIDATOR_HOTKEY == validator_hotkey
+
+        # the active hotkey and the one it swaps to (core/config.py); a sign-in from any other is refused
+        return validator_hotkey in settings.accepted_validator_hotkeys

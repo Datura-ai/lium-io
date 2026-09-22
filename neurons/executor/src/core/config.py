@@ -15,6 +15,11 @@ logger = get_logger(__name__)
 # at another validator at runtime. Non-prod images bake a different anchor in at
 # build time — docker_build.sh writes core/config_override.py.
 _BUILTIN_VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
+# The hotkey the Lium validator swaps to (owner, 22 Sep 2026). Accepted as `next` from this release
+# on, so the fleet is ready before the chain swap; the swap release makes it `current` and drops the
+# address above. Applies to the built-in anchor only: a build with core/config_override.py names
+# its own `next` (or none) — a staging executor keeps trusting staging's validator alone.
+_BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58 = "5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK"
 
 
 def _resolve_validator_hotkey() -> str:
@@ -40,17 +45,22 @@ VALIDATOR_HOTKEY_SS58 = _resolve_validator_hotkey()
 
 # DAH-3394: the validator hotkey is being rotated. A release that trusts only the new hotkey
 # would be refused by every executor that has not restarted onto it yet, so this release accepts
-# two: `current` (above) and `next`, the hotkey the validator swaps to. `next` is empty until the
-# new hotkey exists; it is then set here or in config_override at build time — like `current`,
-# never from the environment: the set of signers an executor trusts is fixed by the image, not by
-# whoever writes its .env. With `next` empty the executor behaves exactly as before.
-VALIDATOR_NEXT_HOTKEY_SS58 = ""
-try:
-    from core.config_override import _VALIDATOR_NEXT_HOTKEY_SS58
-    VALIDATOR_NEXT_HOTKEY_SS58 = _VALIDATOR_NEXT_HOTKEY_SS58
-except ImportError:
-    # no override module (the default build) or one that names only `current`
-    pass
+# two: `current` (above) and `next`, the hotkey the validator swaps to. Like `current`, `next` is
+# never read from the environment: the set of signers an executor trusts is fixed by the image,
+# not by whoever writes its .env. The default build takes the built-in pair; a build with a
+# config_override module takes `_VALIDATOR_NEXT_HOTKEY_SS58` from it, or none.
+def _resolve_validator_next_hotkey() -> str:
+    if importlib.util.find_spec("core.config_override") is None:
+        return _BUILTIN_VALIDATOR_NEXT_HOTKEY_SS58
+    try:
+        from core.config_override import _VALIDATOR_NEXT_HOTKEY_SS58
+    except ImportError:
+        # an override that names only `current` (a staging or e2e build): one trusted signer
+        return ""
+    return _VALIDATOR_NEXT_HOTKEY_SS58
+
+
+VALIDATOR_NEXT_HOTKEY_SS58 = _resolve_validator_next_hotkey()
 
 
 def _validator_hotkeys(current: str, next_: str) -> dict[str, str]:

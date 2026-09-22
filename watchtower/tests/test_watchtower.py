@@ -1174,3 +1174,77 @@ def test_check_and_update_skips_the_probe_when_there_is_no_runner_yet(
 
     mock_probe.assert_not_called()
     mock_pull.assert_called_once_with(client, IMAGE, NEW_DIGEST)
+
+
+# ── the validator hotkey rotation: two trusted signers, real signatures ───────────────────────
+
+
+def _signed_digest(keypair, digest="sha256:rotation", ts=None):
+    ts = int(time.time()) if ts is None else ts
+    return WatchtowerDigestResponse(
+        digest=digest, timestamp=ts, signature="0x" + keypair.sign(f"{digest}:{ts}").hex()
+    )
+
+
+def test_trusted_validator_hotkeys_are_the_two_lium_hotkeys_current_first():
+    # regression: the new address replaces the active one (every executor refuses today's digest),
+    # or is listed first (the log names the wrong key as active)
+    import watchtower
+
+    assert watchtower.trusted_validator_hotkeys() == (
+        "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p",
+        "5DZhu7LLGGc7qRa8ZPFArt7KV2XEKMTr5Q7ZuM9LNdTaoNfK",
+    )
+
+
+def test_digest_signed_by_the_current_hotkey_is_accepted_with_next_configured():
+    import bittensor
+
+    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationCurrent")
+    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationNext")
+    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
+        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", nxt.ss58_address
+    ):
+        verify_watchtower_signature(_signed_digest(current))
+
+
+def test_digest_signed_by_the_next_hotkey_is_accepted_before_the_swap():
+    # regression: only the first hotkey is checked, so the digest goes unverifiable the moment the
+    # platform's wallet swaps and no executor updates again
+    import bittensor
+
+    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationCurrent")
+    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationNext")
+    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
+        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", nxt.ss58_address
+    ):
+        verify_watchtower_signature(_signed_digest(nxt))
+
+
+def test_digest_signed_by_a_third_hotkey_is_refused_with_two_trusted():
+    # regression: a loop that keeps the last comparison, or treats "no key raised" as verified
+    import bittensor
+
+    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationCurrent")
+    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationNext")
+    stranger = bittensor.Keypair.create_from_uri("//WatchtowerRotationStranger")
+    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
+        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", nxt.ss58_address
+    ):
+        with pytest.raises(Exception, match="Invalid signature"):
+            verify_watchtower_signature(_signed_digest(stranger))
+
+
+def test_a_blank_next_hotkey_trusts_one_signer():
+    # a staging config_override that names only WATCHTOWER_VALIDATOR_HOTKEY behaves as before this release
+    import bittensor
+    import watchtower
+
+    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationCurrent")
+    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationNext")
+    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
+        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", ""
+    ):
+        assert watchtower.trusted_validator_hotkeys() == (current.ss58_address,)
+        with pytest.raises(Exception, match="Invalid signature"):
+            verify_watchtower_signature(_signed_digest(nxt))
