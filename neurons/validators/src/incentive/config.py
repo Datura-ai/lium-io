@@ -158,7 +158,8 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
 # Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
 # Resolution order: specific GPU name > "*"; specific count > "*".
-# DAH-3623: idle pays a share of the base price by the 30-day rental rate (gpu_price_stat, 22 Sep 2026):
+# DAH-3623: idle rate = share x base price (RENTAL_PRICES_PER_HOUR, the prices of lium-platform#558).
+# The share comes from the 30-day rental rate = rented / offered GPU-hours (gpu_price_stat, 22 Sep 2026):
 # >= 80 % rented -> 0.9, 60-80 % -> 0.8, < 60 % -> 0.7, no data -> 0.8. Always less than the base price.
 IDLE_SCARCE = DefaultPrice(multiplier=0.9)
 D = DefaultPrice(multiplier=0.8)
