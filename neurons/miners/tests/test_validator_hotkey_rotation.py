@@ -80,7 +80,7 @@ def test_flipping_default_alone_drops_the_old_hotkey_at_once(monkeypatch):
 
 
 def test_the_old_hotkey_is_dropped_by_blanking_next_after_the_flip(monkeypatch):
-    # the follow-up release, after the old hotkey is deregistered: VALIDATOR_NEXT_HOTKEY="" — the new
+    # the follow-up release once the old hotkey has left the chain — VALIDATOR_NEXT_HOTKEY="" — the new
     # hotkey stays active, the old one no longer signs in
     built = _built(monkeypatch, default=NEXT, nxt="")
 
