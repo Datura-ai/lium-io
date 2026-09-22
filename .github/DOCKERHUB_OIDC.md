@@ -14,13 +14,18 @@ Per job: `permissions: id-token: write` (plus `contents: read` for the checkout)
   uses: docker/login-action@v4
   env:
     DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+    DOCKERHUB_OIDC_EXPIREIN: "1800"
   with:
     username: daturaai
 ```
 
 `username` is the Docker organization name (only organization accounts can sign in with OIDC);
 `DOCKERHUB_OIDC_CONNECTIONID` is a repository **variable** (Settings → Secrets and variables →
-Actions → Variables), not a secret — the id is not sensitive. The `docker_publish.sh` scripts under
+Actions → Variables), not a secret — the id is not sensitive. `DOCKERHUB_OIDC_EXPIREIN` is the
+lifetime of the exchanged Docker Hub token, which is the docker password for every later `docker
+push` in the job (the action allows 300–21600 s, default 300). The login runs before the build, and
+the longest measured build+push window is about 140 s (`executor_cd_prod`: executor + runner images);
+1800 s keeps a cold cache or a slow runner from ending in an `unauthorized` push after a green build. The `docker_publish.sh` scripts under
 `neurons/*/` log in themselves only when a caller passes `DOCKERHUB_PAT`, so a caller in another
 repository that still holds a token keeps working.
 
@@ -51,7 +56,12 @@ gh variable set DOCKERHUB_OIDC_CONNECTIONID -R Datura-ai/lium-io --body "<connec
 Check: dispatch `executor_cd_dev.yml` from `main`; the login step ends with `Login Succeeded`.
 Failures are listed on the connection's Edit page (Failures table).
 
-Once every repository that pushes `daturaai/*` images from CI has its own ruleset here, the
+The other two pushing repositories use the same step with the same variable name and lifetime:
+`Datura-ai/lium-io-deployment` (`staging_executor_publish.yml`, subject
+`repo:Datura-ai/lium-io-deployment:environment:dockerhub-push`) and
+`Datura-ai/dstack-sysbox-installer` (`release.yml`, subject
+`repo:Datura-ai/dstack-sysbox-installer:environment:dockerhub-push`) — one ruleset each on this
+connection. Once every repository that pushes `daturaai/*` images from CI has its ruleset here, the
 organization access token used by CI can be deleted (Docker Home → Access tokens), and the GitHub
 secrets `DOCKERHUB_PAT` / `DOCKERHUB_USERNAME` go last.
 

@@ -22,6 +22,9 @@ jobs:
         uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          # The exchanged token is the docker password for the rest of the job (default 300 s);
+          # build+push here takes up to ~140 s, so 30 min leaves room for a cold cache or a slow runner.
+          DOCKERHUB_OIDC_EXPIREIN: "1800"
         with:
           username: daturaai
 

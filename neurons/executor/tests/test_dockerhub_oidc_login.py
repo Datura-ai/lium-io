@@ -20,6 +20,9 @@ PUBLISH_SCRIPTS = sorted((REPO / "neurons").glob("*/docker*publish.sh"))
 LOGIN_ACTION = "docker/login-action@"
 ORG = "daturaai"
 CONNECTION_ID = "${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}"
+# docker/login-action: DOCKERHUB_OIDC_EXPIREIN must be between 300 and 21600 s; the token has to outlive the build+push.
+EXPIRE_MIN, EXPIRE_MAX = 300, 21600
+LONGEST_MEASURED_BUILD_AND_PUSH_S = 138  # executor_cd_prod, run 35682929949
 
 STUB_DOCKER = """#!/bin/bash
 # records every call; `push` answers like the real client, `login` swallows stdin
@@ -59,6 +62,15 @@ def docker_hub_login_problems(workflow_text: str) -> list[str]:
                 problems.append(f"{job_id}: username is not the organization name")
             if (step.get("env") or {}).get("DOCKERHUB_OIDC_CONNECTIONID") != CONNECTION_ID:
                 problems.append(f"{job_id}: no DOCKERHUB_OIDC_CONNECTIONID from vars")
+            expire = str((step.get("env") or {}).get("DOCKERHUB_OIDC_EXPIREIN", "")).strip()
+            if not expire.isdigit() or not EXPIRE_MIN <= int(expire) <= EXPIRE_MAX:
+                problems.append(
+                    f"{job_id}: DOCKERHUB_OIDC_EXPIREIN not set within {EXPIRE_MIN}-{EXPIRE_MAX} s"
+                )
+            elif int(expire) < 4 * LONGEST_MEASURED_BUILD_AND_PUSH_S:
+                problems.append(
+                    f"{job_id}: DOCKERHUB_OIDC_EXPIREIN leaves under 4x the longest measured build+push"
+                )
     return problems
 
 
@@ -77,7 +89,23 @@ def test_the_checker_flags_the_token_login_shape():
         "deploy: no `id-token: write`",
         "deploy: login step carries a password",
         "deploy: no DOCKERHUB_OIDC_CONNECTIONID from vars",
+        "deploy: DOCKERHUB_OIDC_EXPIREIN not set within 300-21600 s",
     ]
+    default_lifetime = (
+        "on: workflow_dispatch\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write\n    steps:\n"
+        "      - uses: docker/login-action@v4\n        env:\n          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}\n"
+        "        with:\n          username: daturaai\n"
+    )
+    assert docker_hub_login_problems(default_lifetime) == [
+        "deploy: DOCKERHUB_OIDC_EXPIREIN not set within 300-21600 s"
+    ]
+    five_minutes = default_lifetime.replace(
+        "        with:", '          DOCKERHUB_OIDC_EXPIREIN: "300"\n        with:'
+    )
+    assert docker_hub_login_problems(five_minutes) == [
+        "deploy: DOCKERHUB_OIDC_EXPIREIN leaves under 4x the longest measured build+push"
+    ]
+    assert docker_hub_login_problems(five_minutes.replace('"300"', '"1800"')) == []
     ghcr = password_login.replace("username: daturaai", "registry: ghcr.io\n          username: x")
     assert docker_hub_login_problems(ghcr) == []
 
