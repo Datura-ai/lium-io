@@ -4,7 +4,7 @@ import json
 import logging
 
 from core.config import settings
-from celium_collateral_contracts import CollateralContract
+from core.collateral import CollateralClient
 
 logger = logging.getLogger(__name__)
 
@@ -91,29 +91,21 @@ _m = StructuredMessage
 def get_collateral_contract(
     miner_key: str = None,
     version: str = "1.0.2",
-) -> CollateralContract:
+) -> CollateralClient:
     """
-    Initializes and returns a CollateralContract instance.
+    Returns a client for the collateral contract of the given version.
 
     Args:
-        version (str): Contract version to use (defaults to 1.0.1).
-        miner_key (str): Optional miner key required for contract operations.
-
-    Returns:
-        CollateralContract: The initialized contract instance.
+        version (str): Contract version to use (defaults to 1.0.2).
+        miner_key (str): Optional miner key, required to send reclaim transactions.
     """
-    network = settings.BITTENSOR_NETWORK
-    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS  # Default address
-    
-    # Use version-specific address if available
+    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
     if version and settings.CONTRACT_VERSIONS.get(version):
         contract_address = settings.CONTRACT_VERSIONS.get(version)["address"]
-    
-    rpc_url = settings.SUBTENSOR_EVM_RPC_URL
 
-    return CollateralContract(
-        network=network,
+    return CollateralClient(
+        network=settings.BITTENSOR_NETWORK,
         contract_address=contract_address,
-        rpc_url=rpc_url,
+        rpc_url=settings.SUBTENSOR_EVM_RPC_URL,
         miner_key=miner_key,
     )

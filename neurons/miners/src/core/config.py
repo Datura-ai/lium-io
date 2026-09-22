@@ -50,7 +50,6 @@ class Settings(BaseSettings):
     MIN_ALPHA_STAKE: int = Field(env="MIN_ALPHA_STAKE", default=10)
     MIN_TOTAL_STAKE: int = Field(env="MIN_TOTAL_STAKE", default=20000)
 
-    REQUIRED_TAO_COLLATERAL: float = 0.01
     RENTAL_REQUEST_HOOK: str | None = Field(env="RENTAL_REQUEST_HOOK", default=None)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
@@ -62,8 +61,6 @@ class Settings(BaseSettings):
             "info": "3rd version: Fixed 'ExecutorNotOwned' error",
         },
     }
-
-    COLLATERAL_DAYS: int = 7
 
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
     MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")

@@ -103,7 +103,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-associat
 
 ### Transfer TAO to Ethereum Address from your Miner Wallet
 
-You need to fund/transfer TAO into your Ethereum Address to deposit collateral (TAO) for your executors.
+Reclaim transactions (see [Withdrawing Collateral](#withdrawing-collateral)) pay gas from your Ethereum Address, so it needs a small TAO balance first.
 
 To transfer TAO from your miner wallet (the wallet in your env config), you can use the following command 
 
@@ -150,7 +150,7 @@ Executors are machines running on GPUs that you can add to your central miner. T
 2. Use the following command to add an executor to the central miner:
 
     ```bash
-    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --price <gpu-price> [--validator <validator-hotkey>] [--gpu-type <gpu-type>] [--gpu-count <gpu-count>] [--deposit-amount <deposit-amount>] [--private-key <ethereum-private-key>]
+    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --price <gpu-price> [--validator <validator-hotkey>]
     ```
 
     **Required parameters:**
@@ -160,10 +160,6 @@ Executors are machines running on GPUs that you can add to your central miner. T
 
     **Optional parameters:**
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, our validator_hotkey will be used as default.
-    - `<gpu-type>`: Type of GPU available on the executor.
-    - `<gpu-count>`: Number of GPUs available on the executor.
-    - `<deposit-amount>`: The amount of TAO to deposit as collateral for this executor (must meet minimum required collateral).
-    - `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral transactions).
 
 ### List Executors
 
@@ -213,6 +209,12 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py remove-execu
 
 2. Type "y" and click enter in the interactive shell.
 
+An executor that still holds collateral on the contract stays registered until its collateral is withdrawn (see below).
+
+## Withdrawing Collateral
+
+Executors run and earn without collateral. If an executor still holds a TAO deposit on the collateral contract from earlier, withdraw it in two steps: start a reclaim request, then finalize it once the request's deny window has passed. Both steps are transactions from the Ethereum Address associated with your hotkey.
+
 ### Getting Miner Collateral
 
 To check the total collateral deposited by the miner, use the following command:
@@ -222,22 +224,6 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-miner-co
 ```
 
 This will display the total TAO collateral that miner has deposited.
-
-
-### Depositing Collateral for an Executor
-
-To deposit additional collateral for an existing executor, use the following command:
-
-```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py deposit-collateral --address <executor-ip-address> --port <executor-port> --deposit_amount <deposit-amount> --private-key <ethereum-private-key>
-```
-
-- `<executor-ip-address>`: The IP address of the executor machine.
-- `<executor-port>`: The port number used for the executor.
-- `<deposit-amount>`: The amount of TAO to deposit as additional collateral for this executor.
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral transactions).
-
-This command allows you to increase the collateral for an executor already registered in the database.
 
 ### Getting Executor Collateral
 
