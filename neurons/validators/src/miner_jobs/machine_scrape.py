@@ -1584,6 +1584,9 @@ def covering_mount(mounts_text: str, path: str) -> MountLine | None:
 # public nodes feed (lium-platform). A reading, not a verdict: nothing scores or gates on it.
 SYS_CLASS_BLOCK_PATH = "/sys/class/block"
 SYS_DEV_BLOCK_PATH = "/sys/dev/block"
+SYS_DMI_ID_PATH = "/sys/class/dmi/id"
+SYS_HYPERVISOR_TYPE_PATH = "/sys/hypervisor/type"
+PROC_CPUINFO_PATH = "/proc/cpuinfo"
 # st_mode's file-type bits and the block-device value, spelled out because the packaged scrape cannot
 # import stat (obfuscator allowlist)
 ST_MODE_TYPE_MASK = 0o170000
@@ -1592,11 +1595,57 @@ DISK_TYPE_NVME = "nvme"
 DISK_TYPE_SSD = "ssd"
 DISK_TYPE_HDD = "hdd"
 DISK_TYPE_UNKNOWN = "unknown"
-# Devices whose `rotational` flag describes no physical disk: one stacked on other devices (LVM /
-# dm-crypt, md RAID, a loop file, a network block device) hides which disks sit underneath, and a
-# virtual disk (virtio `vd*`, Xen `xvd*` - what a CVM executor sees) reports 1 whatever backs it
-# (measured on a virtio VM, 19 Sep 2026). Reported as unknown rather than as a guess.
-UNTYPED_DEVICE_PREFIXES = ("dm-", "md", "loop", "nbd", "rbd", "drbd", "vd", "xvd")
+# Devices with no physical disk of their own and nothing under `slaves/` to follow: a loop file,
+# a network block device. A device-mapper (LVM / dm-crypt) or md RAID device lands here only when
+# sysfs lists no slaves for it; with slaves it is typed by the disks underneath.
+UNTYPED_DEVICE_PREFIXES = ("dm-", "md", "loop", "nbd", "rbd", "drbd")
+# How many layers of `slaves/` to follow (LVM over LUKS over md RAID is three); sysfs is a tree,
+# the cap only bounds a broken one.
+STACKED_DEVICE_MAX_DEPTH = 8
+# DAH-3746: a virtual disk's `rotational` flag describes the hypervisor's emulated controller, not
+# the disk behind it: virtio `vd*` reports 1 whatever backs it (measured on a virtio VM, 19 Sep
+# 2026), and QEMU's emulated SATA/SCSI `sda` reported 1 on 34 of 35 checked VMs (QEMU, DigitalOcean,
+# 21 Sep 2026) whatever the host's storage is. A VM's disk is unknown, never hdd. Three tells, any
+# one enough: the device name (virtio, Xen), the disk's SCSI vendor/model (`QEMU HARDDISK`,
+# DigitalOcean's `DO Volume`, VirtualBox, VMware, Hyper-V, EC2/GCE volumes), and the host's DMI
+# vendor/product, `/sys/hypervisor/type` (what systemd-detect-virt reads), or the `hypervisor`
+# flag in `/proc/cpuinfo` (every x86 hypervisor sets it; a VM whose DMI names no listed vendor
+# still reads unknown without it). A bare-metal EC2
+# `.metal` instance carries `Amazon EC2` in DMI and reads unknown too - the marker list, not the
+# flag, is where that would change.
+VIRTUAL_DISK_PREFIXES = ("vd", "xvd")
+VIRTUAL_DISK_IDENTITY_MARKERS = (
+    "qemu",
+    "virtio",
+    "0x1af4",  # the virtio PCI vendor id, what a virtio-blk disk's device/vendor reads
+    "do volume",
+    "vbox",
+    "vmware",
+    "msft virtual",
+    "google persistentdisk",
+    "amazon elastic block store",
+    "amazon ec2 nvme",
+    "xen",
+)
+VIRTUAL_MACHINE_DMI_MARKERS = (
+    "qemu",
+    "kvm",
+    "bochs",
+    "digitalocean",
+    "droplet",
+    "amazon ec2",
+    "google",
+    "microsoft corporation",
+    "virtual machine",
+    "vmware",
+    "virtualbox",
+    "innotek",
+    "xen",
+    "openstack",
+    "parallels",
+    "bhyve",
+    "standard pc (",
+)
 
 
 def block_device_holding(mounts_text: str, path: str) -> str | None:
@@ -1647,29 +1696,107 @@ def whole_disk_of(device_name: str) -> str:
     return os.path.basename(os.path.dirname(os.path.realpath(device_path)))
 
 
-def disk_type_of(device_name: str | None) -> str:
-    """nvme | ssd | hdd | unknown for the whole disk behind a block device name.
+def read_sysfs_text(path: str) -> str:
+    """The stripped text of one sysfs attribute, '' when it is missing or unreadable."""
+    try:
+        with open(path) as attribute_file:
+            return attribute_file.read().strip()
+    except Exception:
+        return ""
 
-    `nvme*` is NVMe by name. Anything else is what the kernel's `queue/rotational` flag says: 0 is
-    a solid-state disk, 1 a spinning one. A stacked or virtual device, a missing sysfs entry or any
-    other reading is unknown - never a default of one of the three."""
-    if not device_name:
-        return DISK_TYPE_UNKNOWN
+
+def host_is_a_virtual_machine() -> bool:
+    """True when the host runs under a hypervisor: its DMI vendor or product names one (QEMU/KVM,
+    DigitalOcean, EC2, GCE, Hyper-V, VMware, VirtualBox, Xen, OpenStack, ...), `/sys/hypervisor/type`
+    exists (Xen), or `/proc/cpuinfo` carries the `hypervisor` flag (every x86 hypervisor sets it).
+    Bare metal names its board maker (Supermicro, Dell, ASUS, Gigabyte) and has neither tell."""
+    for attribute in ("sys_vendor", "product_name"):
+        dmi_text = read_sysfs_text(f"{SYS_DMI_ID_PATH}/{attribute}").lower()
+        if dmi_text and any(marker in dmi_text for marker in VIRTUAL_MACHINE_DMI_MARKERS):
+            return True
+    if read_sysfs_text(SYS_HYPERVISOR_TYPE_PATH):
+        return True
+    return _cpuinfo_has_hypervisor_flag()
+
+
+def _cpuinfo_has_hypervisor_flag() -> bool:
+    """True when `/proc/cpuinfo` lists `hypervisor` among the CPU flags."""
+    for line in read_sysfs_text(PROC_CPUINFO_PATH).splitlines():
+        if line.startswith("flags") or line.startswith("Flags"):
+            flags = f" {line.split(':', 1)[-1]} "
+            return " hypervisor " in flags
+    return False
+
+
+def disk_is_virtual(disk: str) -> bool:
+    """True when a whole disk is a hypervisor's emulated one: named by a paravirtual driver
+    (`vd*`, `xvd*`), or its SCSI/ATA `device/vendor` + `device/model` says so (`QEMU HARDDISK`,
+    `DO Volume`, `VBOX HARDDISK`, `VMware Virtual disk`, `Msft Virtual Disk`, ...). A real disk
+    names its maker and model there (`ATA Samsung SSD 870`, `SEAGATE ST16000NM`)."""
+    if disk.startswith(VIRTUAL_DISK_PREFIXES):
+        return True
+    identity = " ".join(
+        read_sysfs_text(f"{SYS_CLASS_BLOCK_PATH}/{disk}/device/{attribute}")
+        for attribute in ("vendor", "model")
+    ).lower()
+    return any(marker in identity for marker in VIRTUAL_DISK_IDENTITY_MARKERS)
+
+
+def slaves_of(disk: str) -> list[str]:
+    """The kernel names under `/sys/class/block/<disk>/slaves/` - the devices a stacked one (LVM,
+    dm-crypt, md RAID) is built on; [] for a plain disk or when sysfs has no such directory."""
+    try:
+        return sorted(os.listdir(f"{SYS_CLASS_BLOCK_PATH}/{disk}/slaves"))
+    except Exception:
+        return []
+
+
+def slowest_disk_type(disk_types: list[str]) -> str:
+    """The type of a stacked device. Members that resolve to different kinds (hdd vs ssd vs nvme)
+    read ``unknown`` — a mixed stack has no single kind. Unknown members are skipped, so a stack is
+    unknown when none of its members resolves or when the resolved members differ. One resolved
+    kind, repeated, is that kind."""
+    known = {disk_type for disk_type in disk_types if disk_type != DISK_TYPE_UNKNOWN}
+    if len(known) == 1:
+        return known.pop()
+    return DISK_TYPE_UNKNOWN
+
+
+def disk_type_following_slaves(device_name: str, depth: int) -> str:
+    """`disk_type_of` for one device, recursing through its slaves; `depth` is how deep this call
+    already is in the stack."""
     disk = whole_disk_of(device_name)
-    if disk.startswith(UNTYPED_DEVICE_PREFIXES):
+    slaves = slaves_of(disk)
+    if slaves:
+        if depth >= STACKED_DEVICE_MAX_DEPTH:
+            return DISK_TYPE_UNKNOWN
+        return slowest_disk_type(
+            [disk_type_following_slaves(slave, depth + 1) for slave in slaves]
+        )
+    if disk.startswith(UNTYPED_DEVICE_PREFIXES) or disk_is_virtual(disk):
         return DISK_TYPE_UNKNOWN
     if disk.startswith("nvme"):
         return DISK_TYPE_NVME
-    try:
-        with open(f"{SYS_CLASS_BLOCK_PATH}/{disk}/queue/rotational") as rotational_file:
-            rotational = rotational_file.read().strip()
-    except Exception:
-        return DISK_TYPE_UNKNOWN
+    rotational = read_sysfs_text(f"{SYS_CLASS_BLOCK_PATH}/{disk}/queue/rotational")
     if rotational == "0":
         return DISK_TYPE_SSD
     if rotational == "1":
         return DISK_TYPE_HDD
     return DISK_TYPE_UNKNOWN
+
+
+def disk_type_of(device_name: str | None) -> str:
+    """nvme | ssd | hdd | unknown for the physical disk(s) behind a block device name.
+
+    A partition is walked up to its whole disk. A stacked device (LVM / dm-crypt `dm-*`, md RAID
+    `md*`) is followed through `slaves/` down to the physical disks: one resolved kind, repeated,
+    is that kind; different resolved kinds, or none, is unknown. `nvme*` is NVMe by name; anything
+    else is what the kernel's `queue/rotational` flag says: 0 is a solid-state disk, 1 a spinning
+    one. A virtual machine's disk, a device with no physical disk behind it (loop, nbd), a missing
+    sysfs entry or any other reading is unknown - never a default of one of the three."""
+    if not device_name or host_is_a_virtual_machine():
+        return DISK_TYPE_UNKNOWN
+    return disk_type_following_slaves(device_name, 0)
 
 
 def get_docker_root_disk_type() -> str:

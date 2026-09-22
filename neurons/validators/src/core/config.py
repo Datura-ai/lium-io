@@ -571,7 +571,7 @@ class Settings(BaseSettings):
     # unprivileged-on-host (user-namespaced) container. Egress is firewalled
     # host-side to block cloud metadata + RFC1918. See the DAH-2211 build flow.
     CUSTOM_DOCKERFILE_DIND_IMAGE: str = Field(
-        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.1",
+        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.3",
         description="Sysbox DinD image used to build custom-dockerfile pods in isolation.",
     )
     CUSTOM_DOCKERFILE_DIND_CPUS: str = Field(

@@ -95,6 +95,8 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce GTX 1060": 0.0,
     "NVIDIA Tesla M40": 0.0,
 }
+# `NVIDIA B300 SXM6 PC` is derived from the AC entry, never a row of its own (incentive/config.py says why).
+GPU_MODEL_RATES["NVIDIA B300 SXM6 PC"] = GPU_MODEL_RATES["NVIDIA B300 SXM6 AC"]
 
 MAX_UPLOAD_SPEED = 1000
 MAX_DOWNLOAD_SPEED = 1000
@@ -144,7 +146,7 @@ SECONDS_PER_BLOCK = 12  # seconds per block
 FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
 
 IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
-DOCKER_DIND_IMAGE = "daturaai/dind:0.0.1"
+DOCKER_DIND_IMAGE = "daturaai/dind:0.0.3"
 
 LIB_NVIDIA_ML_DIGESTS = {
     "535.54.03": "49e63c42aa95bba6b9aa562ee57e496c:15a37892671187547b6dd21a07e8149315e529211dc30ca6ee8d8d089a338d53",

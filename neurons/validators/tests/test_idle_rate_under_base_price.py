@@ -6,10 +6,28 @@ old prices, so RENTAL_PRICES_PER_HOUR overrides the models #558 moved.
 """
 
 import pytest
-from incentive.config import RENTAL_PRICES_PER_HOUR, IncentiveConfig
+from incentive.config import (
+    GPU_COUNT_CUSTOM_PRICES,
+    RENTAL_PRICES_PER_HOUR,
+    DefaultPrice,
+    IncentiveConfig,
+)
 from incentive.utils import get_hourly_rate
 
-GPU_COUNTS: tuple[int, ...] = (1, 8)
+
+def _idle_paying_counts(gpu_model: str) -> tuple[int, ...]:
+    """The GPU counts GPU_COUNT_CUSTOM_PRICES pays idle for on this model (its own row, else "*")."""
+    row = GPU_COUNT_CUSTOM_PRICES.get(gpu_model, GPU_COUNT_CUSTOM_PRICES["*"])
+    return tuple(
+        sorted(int(count) for count, price in row.items() if count != "*" and isinstance(price, DefaultPrice))
+    )
+
+
+IDLE_PAYING_MODEL_COUNTS: tuple[tuple[str, int], ...] = tuple(
+    (gpu_model, gpu_count)
+    for gpu_model in sorted(RENTAL_PRICES_PER_HOUR)
+    for gpu_count in _idle_paying_counts(gpu_model)
+)
 
 # lium-platform#558 MACHINE_PRICES that differ from the lium-core wheel, USD per GPU-hour
 BASE_PRICE_FROM_PR_558: dict[str, float] = {
@@ -39,6 +57,7 @@ def test_base_price_is_the_one_of_pr_558(gpu_model: str) -> None:
 RENTAL_RATE_30D: dict[str, float] = {
     "NVIDIA A100 80GB PCIe": 0.99,
     "NVIDIA B300 SXM6 AC": 0.90,
+    "NVIDIA B300 SXM6 PC": 0.90,  # alias of the AC card
     "NVIDIA L40S": 0.87,
     "NVIDIA L40": 0.87,
     "NVIDIA A100-SXM4-80GB": 0.86,
@@ -68,8 +87,11 @@ def _idle_share_of_base_price(gpu_model: str) -> float:
     return 0.7
 
 
-@pytest.mark.parametrize("gpu_count", GPU_COUNTS)
-@pytest.mark.parametrize("gpu_model", sorted(RENTAL_PRICES_PER_HOUR))
+def test_every_priced_model_pays_idle_for_at_least_one_gpu_count() -> None:
+    assert {gpu_model for gpu_model, _ in IDLE_PAYING_MODEL_COUNTS} == set(RENTAL_PRICES_PER_HOUR)
+
+
+@pytest.mark.parametrize(("gpu_model", "gpu_count"), IDLE_PAYING_MODEL_COUNTS)
 def test_idle_rate_share_follows_the_rental_rate(gpu_model: str, gpu_count: int) -> None:
     config = IncentiveConfig()
 

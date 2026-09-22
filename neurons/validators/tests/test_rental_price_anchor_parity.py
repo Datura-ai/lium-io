@@ -8,7 +8,7 @@ node until the 1.0 table in this PR is released and picked up by the pin.
 
 from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
-from incentive.config import RENTAL_PRICES_PER_HOUR, IncentiveConfig
+from incentive.config import BASE_GPU_MAP, RENTAL_PRICES_PER_HOUR, IncentiveConfig
 from incentive.utils import get_hourly_rate
 from test_idle_rate_under_base_price import BASE_PRICE_FROM_PR_558
 
@@ -42,9 +42,14 @@ def test_hourly_rate_is_the_same_for_both_editions_through_the_price_resolver():
 def test_overrides_change_only_the_pr_558_entries():
     """Guards a hand-edit of `RENTAL_PRICES_PER_HOUR` that adds, drops or re-prices another GPU — the
     algorithm asserts every key is in BASE_GPU_MAP, and any other override belongs in lium-core.
-    DAH-3623 overrides the models lium-platform#558 moved."""
+    DAH-3623 overrides the models lium-platform#558 moved. `NVIDIA B300 SXM6 PC` is the one key the
+    override may ADD: the AC card's alias (derived from the AC entry, never its own price), in the
+    lium-core source table but not yet in the release the lock installs — the union is a no-op once the
+    lock carries it."""
     upstream = DEFAULT_SHARED_CONFIG.machine_prices
 
-    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys()
+    assert RENTAL_PRICES_PER_HOUR.keys() == upstream.keys() | {"NVIDIA B300 SXM6 PC"}
+    assert RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] == RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
+    assert BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] == BASE_GPU_MAP["NVIDIA B300 SXM6 AC"] == "B300"
     differing = {gpu for gpu in upstream if RENTAL_PRICES_PER_HOUR[gpu] != upstream[gpu]}
-    assert differing <= set(BASE_PRICE_FROM_PR_558)
+    assert differing <= set(BASE_PRICE_FROM_PR_558) | {"NVIDIA B300 SXM6 PC"}
