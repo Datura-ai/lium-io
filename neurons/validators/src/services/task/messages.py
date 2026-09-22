@@ -694,6 +694,20 @@ class InspectorMessages:
         impact="Inspector result unavailable; score unchanged",
         remediation="Check libinspector installation and executor SSH process logs.",
     )
+    UNREADABLE = MessageTemplate(
+        event="Inspector executor response unreadable",
+        reason="INSPECTOR_UNREADABLE",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable on this executor; score unchanged; the node is counted as unreadable, not as clean",
+        remediation=(
+            "The inspector_executor.py --interactive stdout line for this command was not one JSON "
+            "object (payload_head / json_error_pos say where it broke; payload_terminated=false "
+            "means the line was cut at EOF or at the size cap). Check the executor container logs "
+            "for what else wrote to its stdout, and the response size against "
+            "INSPECTOR_RESPONSE_MAX_BYTES."
+        ),
+    )
     FAILED_LIB_MISMATCH = MessageTemplate(
         event="Inspector libinspector.so mismatch",
         reason="INSPECTOR_FAILED_LIB_MISMATCH",
