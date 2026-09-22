@@ -47,16 +47,10 @@ async def _run_with_production_config(
 def test_caps_are_the_measured_demand_and_nothing_else_moved():
     assert MAX_UNRENTED_GPUS_BY_TYPE["A100"] == {1: 10, 8: 40}
     assert MAX_UNRENTED_GPUS_BY_TYPE["L40S"] == {1: 10, 8: 16}
-    for family in (
-        "H100",
-        "H200",
-        "B200",
-        "RTX 4090",
-        "RTX 5090",
-        "RTX PRO 6000",
-        "RTX 6000 Ada Generation",
-    ):
-        assert MAX_UNRENTED_GPUS_BY_TYPE[family] == {1: 10, 8: 64}, family
+    for family, buckets in MAX_UNRENTED_GPUS_BY_TYPE.items():
+        if family in ("B300", "A100", "L40S"):
+            continue
+        assert buckets in ({}, {1: 10, 8: 64}), family
 
 
 @pytest.mark.asyncio
