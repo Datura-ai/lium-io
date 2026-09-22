@@ -158,7 +158,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
 # Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
 # Resolution order: specific GPU name > "*"; specific count > "*".
-# DAH-3623: idle pays 0.8 x the base price, so it is always less than a rental
+# DAH-3623: idle pays 0.8 x the base price, so it is less than the base price
 D = DefaultPrice(multiplier=0.8)
 GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
     "*": {"*": 0, "1": D, "8": D},
