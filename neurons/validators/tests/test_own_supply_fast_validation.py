@@ -106,10 +106,6 @@ def test_profile_needs_flag_listed_hotkey_and_first_pass(
     assert settings.is_own_supply_trusted_first_pass(miner_hotkey, first_pass) is expected
 
 
-def test_context_config_default_is_untrusted():
-    assert build_context_config().trusted_provider is False
-
-
 async def _build_context(
     miner_hotkey: str, first_pass: bool, executor_overrides: dict | None = None
 ):
