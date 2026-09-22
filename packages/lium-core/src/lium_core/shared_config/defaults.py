@@ -2,7 +2,7 @@ from lium_core.shared_config.model import SharedConfig
 
 DEFAULT_SHARED_CONFIG = SharedConfig(
     # The base listing price per GPU model (USD per GPU-hour): a listing sits between machine_min_price_rate x and
-    # machine_max_price_rate x of it. DAH-3648 (owner, 2026-09-18): every model with >= 50 paid rentals in the trailing
+    # machine_max_price_rate x of it. Rule (owner, 2026-09-18): every model with >= 50 paid rentals in the trailing
     # 30 days is its 30-day paid median, GPU-hour-weighted, floored to the cent -- the platform's
     # gpu_price_stat.lium_median_30d (rental_history.price_per_gpu over rentals started in the window, each row
     # weighted gpu_count x rental_hours, lower weighted median); models under 50 rentals or with none keep their value.
@@ -23,7 +23,7 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
         "NVIDIA GeForce RTX 4090 D": 0.11,
         "NVIDIA RTX 4000 Ada Generation": 0.16,
         "NVIDIA RTX 6000 Ada Generation": 0.75,
-        # same card for a renter; anchored at parity (DAH-3230, owner 2026-09-08) at the Server Edition's weighted
+        # same card for a renter; anchored at parity (owner's rule, 2026-09-08) at the Server Edition's weighted
         # median (942 of the 1,041 rentals; the Workstation Edition alone reads 1.00)
         "NVIDIA RTX PRO 6000 Blackwell Server Edition": 1.19,
         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 1.19,
