@@ -1643,6 +1643,36 @@ class DockerService:
             return f"layer diff exit {result.exit_status}"
         return warm_pool.layer_modified(result.stdout or "")
 
+    async def _warm_slot_rejection_reason(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        slot: warm_pool.WarmSlot,
+        run_spec: ContainerRunSpec,
+        image_doc: dict,
+    ) -> str | None:
+        """Why `slot` must not become `run_spec`'s container, or None when it may: its settings
+        (`warm_pool.slot_matches`), then the live rental network, then its writable layer. Each read
+        happens only when the one before passed; the layer diff is last so it is the final read
+        before the rename."""
+        try:
+            reason = warm_pool.slot_matches(slot, run_spec, image_doc)
+        except Exception as exc:
+            # A document the host authored: anything unreadable in it is a fallback, never a
+            # failed rental (the lookup treats its slot documents the same way).
+            return f"slot_document_unreadable:{type(exc).__name__}"
+        if reason is not None:
+            return reason
+        if run_spec.network:
+            # A `docker create` proves the rental network is an ICC-off bridge (DAH-3199); the slot
+            # was created hours ago, so its start re-reads the live network the same way.
+            reason = await self._warm_slot_network_mismatch(ssh_client, run_spec.network)
+            if reason is not None:
+                return reason
+        # The settings matched; the filesystem is the miner's until the rename. A
+        # created-never-started container's `docker diff` is empty, anything else is a layer the
+        # renter must not start on.
+        return await self._warm_slot_layer_modified(ssh_client, slot)
+
     async def _adopt_warm_slot(
         self,
         *,
@@ -1653,24 +1683,11 @@ class DockerService:
         default_extra: dict,
     ) -> bool:
         """rename → cpu/memory → start the slot as `container_name`; False (slot and volume removed)
-        when the live slot differs from `run_spec` in any field, its writable layer is not the
-        image's, or the command fails."""
+        when `_warm_slot_rejection_reason` rejects the live slot or the adopt command fails."""
         slot = adoption.slot
-        try:
-            reason = warm_pool.slot_matches(slot, run_spec, adoption.image_doc)
-        except Exception as exc:
-            # A document the host authored: anything unreadable in it is a fallback, never a
-            # failed rental (the lookup treats its slot documents the same way).
-            reason = f"slot_document_unreadable:{type(exc).__name__}"
-        if reason is None and run_spec.network:
-            # A `docker create` proves the rental network is an ICC-off bridge (DAH-3199); the slot
-            # was created hours ago, so its start re-reads the live network the same way.
-            reason = await self._warm_slot_network_mismatch(ssh_client, run_spec.network)
-        if reason is None:
-            # The settings matched; the filesystem is the miner's until the rename. The last read
-            # before it: a created-never-started container's `docker diff` is empty, anything else
-            # is a layer the renter must not start on.
-            reason = await self._warm_slot_layer_modified(ssh_client, slot)
+        reason = await self._warm_slot_rejection_reason(
+            ssh_client, slot, run_spec, adoption.image_doc
+        )
         if reason is None:
             try:
                 result = await ssh_client.run(

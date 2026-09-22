@@ -1250,6 +1250,70 @@ async def test_slot_with_a_written_layer_is_removed_not_adopted(
     assert result.volume_name == f"volume_{payload.pod_id}"
 
 
+@pytest.mark.parametrize(
+    "settings_reason, network_reason, layer_reason, expected, reads",
+    [
+        ("mounts", None, None, "mounts", []),
+        (None, "network not inspectable", None, "network not inspectable", ["network"]),
+        (None, None, "layer_modified", "layer_modified", ["network", "layer"]),
+        (None, None, None, None, ["network", "layer"]),
+    ],
+    ids=["settings-first", "network-second", "layer-last", "adoptable"],
+)
+@pytest.mark.asyncio
+async def test_rejection_reason_reads_settings_then_network_then_layer(
+    svc, monkeypatch, settings_reason, network_reason, layer_reason, expected, reads
+):
+    """`_warm_slot_rejection_reason` is the whole pre-rename verdict: the first check that rejects
+    is the reason and nothing after it touches the host; the layer diff is the last read."""
+    spec = _spec(svc, _adoptable_payload())
+    image = _image_doc()
+    slot = warm_pool.slot_from_inspect(
+        _slot_doc(spec, image), image_id=image["Id"], now=NOW, max_age=MAX_AGE
+    )
+    assert slot is not None
+    order: list[str] = []
+    monkeypatch.setattr(ds_module.warm_pool, "slot_matches", Mock(return_value=settings_reason))
+
+    async def _network(ssh_client, network_name):
+        order.append("network")
+        assert network_name == spec.network
+        return network_reason
+
+    async def _layer(ssh_client, got_slot):
+        order.append("layer")
+        assert got_slot is slot
+        return layer_reason
+
+    monkeypatch.setattr(svc, "_warm_slot_network_mismatch", _network)
+    monkeypatch.setattr(svc, "_warm_slot_layer_modified", _layer)
+
+    reason = await svc._warm_slot_rejection_reason(Mock(), slot, spec, image)
+
+    assert reason == expected
+    assert order == reads
+    ds_module.warm_pool.slot_matches.assert_called_once_with(slot, spec, image)
+
+
+@pytest.mark.asyncio
+async def test_rejection_reason_names_only_the_type_of_an_unreadable_document(svc, monkeypatch):
+    spec = _spec(svc, _adoptable_payload())
+    image = _image_doc()
+    slot = warm_pool.slot_from_inspect(
+        _slot_doc(spec, image), image_id=image["Id"], now=NOW, max_age=MAX_AGE
+    )
+    monkeypatch.setattr(
+        ds_module.warm_pool, "slot_matches", Mock(side_effect=RuntimeError(LEAK_CANARY))
+    )
+    ssh = Mock()
+    ssh.run = AsyncMock()
+
+    reason = await svc._warm_slot_rejection_reason(ssh, slot, spec, image)
+
+    assert reason == "slot_document_unreadable:RuntimeError"
+    ssh.run.assert_not_awaited()
+
+
 def test_layer_modified_reads_the_diff_lines():
     assert warm_pool.layer_modified("") is None
     assert warm_pool.layer_modified("\n  \n") is None
