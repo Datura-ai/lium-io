@@ -5,6 +5,7 @@ from services.executor_connectivity.models import DIND_INNER_DOCKERD_CODES, Dind
 
 from ..messages import MessageTemplate, render_message
 from ..messages import SysboxRequiredMessages as Msg
+from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 
 # DAH-3634: probe causes that get their own reason code instead of SYSBOX_REQUIRED_MISSING, keyed
@@ -58,7 +59,7 @@ class SysboxRequiredCheck:
         )
         return CheckResult(passed=True, event=event)
 
-    def _render_missing_sysbox_event(self, ctx: Context, is_rented: bool):
+    def _render_missing_sysbox_event(self, ctx: Context, is_rented: bool) -> ValidationEvent:
         """The failure event for an unrented node with no sysbox verdict: the plain SYSBOX_MISSING
         template, or the probe cause's own template and remediation when the probe never measured
         sysbox at all."""
