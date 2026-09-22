@@ -98,7 +98,7 @@ miner signature → 401/403, a substituted public key (#744) → 400/401.
 the pyarmor+PyInstaller scrape build, key install through the miner, SSH, scrape upload + run, the check pipeline,
 a `JobResult` for OUR executor (not the synthetic `1111…` failure), with the deterministic verdict for the host — on
 a GPU-less runner the scrape runs and fails on the executor (its stderr comes back in the event) and the pipeline
-halts with **`SCRAPE_FAILED`**, score 0, "GPU unverified" (a provider whose driver is gone gets exactly this today;
+halts with **`SCRAPE_FAILED_ON_HOST`**, score 0, "GPU unverified" (a provider whose driver is gone gets exactly this today;
 known verdicts below); with `E2E_GPU=1` the suite expects `gpu_count ≥ 1` and a model (not yet observed — see above). Then
 `publish_machine_specs` → the `MACHINE_SPEC_CHANNEL` message the connector relays to the platform, with the fields
 the platform reads (`executor_uuid`, `score`, `log_text`, `incentive_reasons`, …). Failure paths: the seeded
@@ -116,9 +116,9 @@ does); no `/dev/nvidia0` inside on a GPU-less host (with `E2E_GPU=1` the suite e
 
 ## Known verdicts the suite pins
 
-- **No GPU → `SCRAPE_FAILED`, not `GPU_COUNT_ZERO`.** `miner_jobs/machine_scrape.py` derives its output key from
+- **No GPU → `SCRAPE_FAILED_ON_HOST`, not `GPU_COUNT_ZERO`.** `miner_jobs/machine_scrape.py` derives its output key from
   `gpu_details[0]`, so a host with zero GPUs cannot report `gpu.count = 0`; the validator sees the scrape's
-  `IndexError` and the provider gets the generic "ensure the script is executable" remediation. The suite asserts
+  `IndexError` and the provider gets the generic "the scrape exited with an error" remediation. The suite asserts
   the current behaviour so a change to it is a visible diff (and the misleading remediation is tracked as a ticket).
 
 ## What it cannot prove (and where that is proven)
