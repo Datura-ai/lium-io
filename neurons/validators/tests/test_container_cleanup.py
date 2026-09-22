@@ -183,10 +183,10 @@ async def test_cleanup_filter_includes_all_rental_prefixes():
     await cleanup.cleanup(ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID)
 
     ps_cmd = next((c for c in seen_cmds if "docker ps -a" in c), "")
-    assert "pod_*" in ps_cmd
-    assert "filler_*" in ps_cmd
-    assert "container_*" in ps_cmd
-    assert "health_check_*" in ps_cmd
+    assert "name=^pod_" in ps_cmd
+    assert "name=^filler_" in ps_cmd
+    assert "name=^container_" in ps_cmd
+    assert "name=^health_check_" in ps_cmd
 
 
 @pytest.mark.asyncio

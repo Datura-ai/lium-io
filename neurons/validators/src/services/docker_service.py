@@ -95,9 +95,12 @@ from services.prerun_host_probe import (
     prerun_host_probe_command,
 )
 from services.rental_container_labels import (
+    KIND_BUILD,
     KIND_FILLER,
+    KIND_LABEL,
     KIND_POD,
     container_in_scope,
+    label_flags,
     netuid_owns,
     parse_names_with_netuid,
     rental_labels,
@@ -4222,6 +4225,7 @@ class DockerService:
         payload: ContainerCreateRequest,
         log_tag: str,
         default_extra: dict,
+        labels: dict[str, str] | None = None,
     ) -> tuple[bool, str | None]:
         """Build a custom image from `payload.dockerfile_content` on the executor.
 
@@ -4229,6 +4233,10 @@ class DockerService:
         built image tag is `_custom_build_image_tag(pod_id)`. On failure returns
         (False, failure_step) — caller routes through the same CCF
         `UnknownError` path used by today's pull-failure.
+
+        ``labels`` (the network scheme of services/rental_container_labels.py)
+        go on the DinD build container and on the built image, so the orphan
+        sweep of another network's validator leaves both alone.
         """
         from core.config import settings
 
@@ -4240,6 +4248,7 @@ class DockerService:
         ready_timeout_s = int(settings.CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS)
         dind_image = settings.CUSTOM_DOCKERFILE_DIND_IMAGE
         cidrs = self._parse_egress_block_cidrs(settings.CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS)
+        labels_arg = f"{label_flags(labels)} " if labels else ""
 
         # Defense-in-depth size cap. Route is authoritative; this is a wire-trust guard.
         max_bytes = int(settings.CUSTOM_DOCKERFILE_MAX_BYTES)
@@ -4295,7 +4304,7 @@ class DockerService:
             )
             run_dind = (
                 f"/usr/bin/docker run -d --runtime=sysbox-runc "
-                f"--name {shlex.quote(dind_name)} "
+                f"--name {shlex.quote(dind_name)} {labels_arg}"
                 f"--cpus={shlex.quote(str(settings.CUSTOM_DOCKERFILE_DIND_CPUS))} "
                 f"--memory={shlex.quote(str(settings.CUSTOM_DOCKERFILE_DIND_MEMORY))} "
                 f"{shlex.quote(dind_image)}"
@@ -4401,7 +4410,7 @@ class DockerService:
             #    redirect build output to stdout (streamed as success logs) and
             #    emit to stderr ONLY on non-zero exit — the streamer's signal.
             inner_build = (
-                f"docker build --progress=plain --pull "
+                f"docker build --progress=plain --pull {labels_arg}"
                 f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; "
                 f"rc=$?; [ $rc -ne 0 ] && echo BUILD_FAILED_RC=$rc >&2; exit $rc"
             )
@@ -4966,6 +4975,7 @@ class DockerService:
                         payload=payload,
                         log_tag=log_tag,
                         default_extra=default_extra,
+                        labels={**resource_labels, KIND_LABEL: KIND_BUILD},
                     )
                     if not build_ok:
                         # Best-effort scratch dir cleanup; image is most likely

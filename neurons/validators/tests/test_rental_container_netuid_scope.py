@@ -29,6 +29,7 @@ from services.rental_container_labels import (
     LabeledName,
     container_in_scope,
     foreign_rental_containers,
+    label_flags,
     netuid_owns,
     parse_names_with_netuid,
     ps_filter_names_netuid_command,
@@ -85,10 +86,25 @@ def test_netuid_owns(label, caller, owned):
     assert netuid_owns(label, caller) is owned
 
 
-def test_unscoped_prefixes_keep_the_name_only_rule():
+def test_backend_port_check_prefixes_keep_the_name_only_rule():
     assert container_in_scope("health_check_123", None, STAGING) is True
-    assert container_in_scope("container_legacy", None, STAGING) is False
-    assert container_in_scope("container_legacy", None, MAINNET) is True
+    assert container_in_scope("container_5Miner_9001", None, STAGING) is True
+    assert container_in_scope("container_5Miner_9001", "51", STAGING) is True
+
+
+def test_warm_pool_slots_are_scoped_like_pods():
+    assert container_in_scope("warm_a", "37", STAGING) is True
+    assert container_in_scope("warm_a", "51", STAGING) is False
+    assert container_in_scope("warm_a", None, STAGING) is False
+    assert container_in_scope("warm_a", None, MAINNET) is True
+    assert container_in_scope("warm_a", "37", MAINNET) is False
+
+
+def test_label_flags_quote_each_label():
+    assert label_flags({NETUID_LABEL: "37", KIND_LABEL: "build"}) == (
+        "--label io.lium.netuid=37 --label io.lium.kind=build"
+    )
+    assert label_flags({VALIDATOR_LABEL: "a b"}) == "--label 'io.lium.validator=a b'"
 
 
 def test_rental_labels_name_network_validator_and_kind():
@@ -276,7 +292,11 @@ async def test_vloopback_sweep_on_staging_removes_only_its_own(
 # the stale sweep every validation pass runs (ContainerCleanup.cleanup)
 # -------------------------------------------------------------------------------------------------
 
-STALE_LISTING = "pod_legacy \npod_prod 51\npod_stage 37\ncontainer_old \nhealth_check_1 \n"
+STALE_LISTING = (
+    "pod_legacy \npod_prod 51\npod_stage 37\ncontainer_old \nhealth_check_1 \n"
+    # docker's name filter matches anywhere in the name: these two only contain a prefix
+    "mypod_legacy \nsidecar_filler_x 37\n"
+)
 
 
 def _stale_ssh() -> tuple[AsyncMock, list[str]]:
@@ -311,7 +331,7 @@ async def test_stale_sweep_on_mainnet_removes_legacy_and_own_and_keeps_staging()
     assert removed_count == 4
     assert "pod_stage" not in _removed(commands)
     assert commands[0] == ps_filter_names_netuid_command(
-        "pod_*", "filler_*", "container_*", "health_check_*"
+        "^pod_", "^filler_", "^container_", "^health_check_"
     )
 
 
@@ -319,9 +339,9 @@ async def test_stale_sweep_on_mainnet_removes_legacy_and_own_and_keeps_staging()
 async def test_stale_sweep_on_staging_keeps_prod_labeled_and_unlabeled_pods():
     ssh, commands = _stale_ssh()
     _, removed, _ = await ContainerCleanup(netuid=STAGING).cleanup(ssh, None, "ex")
-    # health_check_* is the backend's short-lived port probe and keeps the name-only rule
-    assert removed == ["pod_stage", "health_check_1"]
-    assert _removed(commands) == ["pod_stage", "health_check_1"]
+    # container_*/health_check_* are the backend's port-check containers: name-only rule
+    assert removed == ["pod_stage", "container_old", "health_check_1"]
+    assert _removed(commands) == ["pod_stage", "container_old", "health_check_1"]
     assert "/usr/bin/docker volume rm volume_stage 2>/dev/null || true" in commands
     assert not any("volume_prod" in command or "volume_legacy" in command for command in commands)
 

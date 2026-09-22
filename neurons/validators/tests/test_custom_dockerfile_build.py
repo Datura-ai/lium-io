@@ -27,6 +27,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import (
     ContainerCreateRequest,
@@ -584,6 +585,55 @@ async def test_A9_build_runs_in_sysbox_dind_with_network(svc, monkeypatch):
     assert any("--network=host" in c and "DOCKER-USER" in c for c in esl.seen)
     assert any("docker save" in c and "docker load" in c for c in esl.seen)
     assert any(f"lium-build-{payload.pod_id}" in c for c in esl.seen)
+
+
+@pytest.mark.asyncio
+async def test_A9_build_container_and_image_carry_the_network_labels(svc, monkeypatch):
+    ssh_client = _make_dind_ssh()
+    esl = _make_esl()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    ok, _ = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={},
+        labels={"io.lium.netuid": "37", "io.lium.validator": "5Val", "io.lium.kind": "build"},
+    )
+    assert ok is True
+    flags = "--label io.lium.netuid=37 --label io.lium.validator=5Val --label io.lium.kind=build"
+    dind_run = next(c for c in ssh_client.calls if "run -d --runtime=sysbox-runc" in c)
+    assert flags in dind_run
+    build = next(c for c in esl.seen if "docker build" in c)
+    assert f"docker build --progress=plain --pull {flags} -t" in build
+
+
+@pytest.mark.asyncio
+async def test_A2_create_passes_the_build_labels_to_the_build(svc, monkeypatch):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result(stdout=str(1024 * 1024 * 100)))
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    build_mock = AsyncMock(return_value=(True, None))
+    monkeypatch.setattr(svc, "_custom_build_image", build_mock)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(settings, "BITTENSOR_NETUID", 37)
+
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert build_mock.await_args.kwargs["labels"] == {
+        "io.lium.netuid": "37",
+        "io.lium.kind": "build",
+        "io.lium.validator": "validator-hotkey",
+    }
+    assert svc.rental_docker_client_factory.client.run_specs[-1].labels["io.lium.kind"] == "pod"
 
 
 # ------------------------------------------------------------------

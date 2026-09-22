@@ -19,6 +19,13 @@ Implementation notes
   is the desired forgiving behavior.
 - The check is non-fatal. Any sweep error is logged and the pipeline
   proceeds: the validator must not block scoring on a janitorial GC.
+- The build container and the built image live on the executor host's Docker
+  daemon, which a testnet executor can share with a mainnet one. Both carry the
+  `io.lium.netuid` label (services/rental_container_labels.py); the sweep
+  removes only its own network's (unlabeled ones only on mainnet), and only
+  once they are older than the grace, so a build still running for a pod the
+  backend does not list yet is left alone. A listing that cannot be read
+  removes nothing.
 """
 
 from __future__ import annotations
@@ -27,7 +34,15 @@ import asyncio
 import logging
 import time
 
+from core.config import settings
+from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
+from services.rental_container_labels import (
+    NETUID_LABEL,
+    netuid_owns,
+    parse_names_with_netuid,
+    ps_filter_names_netuid_command,
+)
 
 from ..messages import CustomBuildOrphanSweepMessages as Msg
 from ..messages import render_message
@@ -48,6 +63,28 @@ BUILD_SCRATCH_PREFIX = "/tmp/lium-build-"
 # leftover so a stale container does not pin CPU/mem/disk on the executor host.
 BUILD_DIND_PREFIX = "lium-dind-build-"
 
+# A build container or image younger than this is never an orphan: the build
+# runs up to CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS before the pod exists.
+BUILD_ORPHAN_MIN_GRACE_SECONDS = 2 * 60 * 60
+
+
+def default_grace_seconds() -> int:
+    return max(
+        BUILD_ORPHAN_MIN_GRACE_SECONDS,
+        2 * int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS),
+    )
+
+
+def build_images_command(label_filter: str | None = None) -> str:
+    label = f'--filter "label={label_filter}" ' if label_filter else ""
+    return (
+        f'/usr/bin/docker images --filter "reference={BUILD_IMAGE_PREFIX}*" {label}'
+        f'--format "{{{{.Repository}}}}:{{{{.Tag}}}}"'
+    )
+
+
+DIND_CONTAINERS_COMMAND = ps_filter_names_netuid_command(f"^{BUILD_DIND_PREFIX}")
+
 
 class CustomBuildOrphanSweepCheck:
     """Per-executor orphan sweep for `lium-build-{pod_id}` artifacts.
@@ -58,8 +95,15 @@ class CustomBuildOrphanSweepCheck:
     check_id = "executor.cleanup.custom_build_orphans"
     fatal = False
 
-    def __init__(self, interval_seconds: int = SWEEP_INTERVAL_SECONDS) -> None:
+    def __init__(
+        self,
+        interval_seconds: int = SWEEP_INTERVAL_SECONDS,
+        netuid: int | None = None,
+        grace_seconds: int | None = None,
+    ) -> None:
         self._interval = interval_seconds
+        self._netuid = settings.BITTENSOR_NETUID if netuid is None else netuid
+        self._grace = default_grace_seconds() if grace_seconds is None else grace_seconds
         # executor_uuid -> last successful sweep monotonic timestamp
         self._last_sweep: dict[str, float] = {}
 
@@ -79,22 +123,41 @@ class CustomBuildOrphanSweepCheck:
             return set()
         return {pod.pod_id for pod in executor.pods}
 
-    async def _list_orphan_images(self, ssh, active_pod_ids: set[str]) -> list[str]:
-        """Return `lium-build-*` image tags that are NOT in active_pod_ids."""
-        cmd = (
-            f'/usr/bin/docker images --filter "reference={BUILD_IMAGE_PREFIX}*" '
-            f'--format "{{{{.Repository}}}}:{{{{.Tag}}}}" 2>/dev/null || true'
-        )
+    @staticmethod
+    async def _list(ssh, cmd: str, what: str) -> list[str] | None:
+        """Non-blank output lines, or None when the listing cannot be read."""
         try:
             result = await ssh.run(cmd, check=False)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Custom build orphan sweep: docker images failed: %s", exc)
+            logger.warning("Custom build orphan sweep: %s failed: %s", what, exc)
+            return None
+        if result.exit_status != 0:
+            logger.warning(
+                "Custom build orphan sweep: %s exited %s", what, result.exit_status
+            )
+            return None
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+    async def _list_orphan_images(self, ssh, active_pod_ids: set[str]) -> list[str]:
+        """Return this network's `lium-build-*` image tags that are NOT in active_pod_ids.
+
+        `docker images` has no label column, so three listings (every build
+        image, the labeled ones, this network's) tell each image's label apart.
+        """
+        listings = await asyncio.gather(
+            self._list(ssh, build_images_command(), "docker images"),
+            self._list(ssh, build_images_command(NETUID_LABEL), "docker images (labeled)"),
+            self._list(
+                ssh,
+                build_images_command(f"{NETUID_LABEL}={self._netuid}"),
+                "docker images (own network)",
+            ),
+        )
+        if any(listing is None for listing in listings):
             return []
+        every, labeled, own = (set(listing) for listing in listings)
         orphans: list[str] = []
-        for raw in (result.stdout or "").splitlines():
-            line = raw.strip()
-            if not line:
-                continue
+        for line in sorted(every):
             # Format is `repo:tag`. Repo is `lium-build-{pod_id}`; tag is usually
             # `latest`. We match on the repo segment.
             repo = line.split(":", 1)[0]
@@ -103,11 +166,18 @@ class CustomBuildOrphanSweepCheck:
             pod_id = repo[len(BUILD_IMAGE_PREFIX):]
             if pod_id in active_pod_ids:
                 continue
-            orphans.append(line)
+            if line in own:
+                orphans.append(line)
+            elif line not in labeled and netuid_owns(None, self._netuid):
+                orphans.append(line)
         return orphans
 
     async def _list_orphan_scratch_dirs(self, ssh, active_pod_ids: set[str]) -> list[str]:
-        """Return `/tmp/lium-build-*` scratch dirs whose pod_id is not active."""
+        """Return `/tmp/lium-build-*` scratch dirs whose pod_id is not active.
+
+        The dirs sit in this executor's own filesystem, never on the Docker
+        daemon another network's executor may share, so they need no label.
+        """
         cmd = (
             'ls -1d /tmp/lium-build-* 2>/dev/null || true'
         )
@@ -128,26 +198,46 @@ class CustomBuildOrphanSweepCheck:
         return orphans
 
     async def _list_orphan_dind_containers(self, ssh, active_pod_ids: set[str]) -> list[str]:
-        """Return `lium-dind-build-*` container names whose pod_id is not active."""
-        cmd = (
-            f'/usr/bin/docker ps -a --filter "name={BUILD_DIND_PREFIX}" '
-            f'--format "{{{{.Names}}}}" 2>/dev/null || true'
-        )
-        try:
-            result = await ssh.run(cmd, check=False)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Custom build orphan sweep: docker ps failed: %s", exc)
+        """Return this network's `lium-dind-build-*` container names whose pod_id is not active."""
+        lines = await self._list(ssh, DIND_CONTAINERS_COMMAND, "docker ps")
+        if lines is None:
             return []
         orphans: list[str] = []
-        for raw in (result.stdout or "").splitlines():
-            name = raw.strip()
+        for entry in parse_names_with_netuid("\n".join(lines)):
+            name = entry.name
             if not name.startswith(BUILD_DIND_PREFIX):
                 continue
             pod_id = name[len(BUILD_DIND_PREFIX):]
             if not pod_id or pod_id in active_pod_ids:
                 continue
+            if not netuid_owns(entry.netuid_label, self._netuid):
+                continue
             orphans.append(name)
         return orphans
+
+    async def _older_than_grace(self, ssh, refs: list[str]) -> list[str]:
+        """The containers/images among ``refs`` created at least the grace ago; an unreadable age keeps one."""
+        if not refs:
+            return []
+        now = await self._host_seconds(ssh, "date +%s")
+        if now is None:
+            return []
+        old: list[str] = []
+        for ref in refs:
+            created = await self._host_seconds(ssh, DockerCommand.inspect_created_timestamp(ref))
+            if created is not None and now - created >= self._grace:
+                old.append(ref)
+        return old
+
+    @staticmethod
+    async def _host_seconds(ssh, cmd: str) -> int | None:
+        try:
+            result = await ssh.run(cmd, check=False)
+            if result.exit_status != 0:
+                return None
+            return int((result.stdout or "").strip())
+        except Exception:  # noqa: BLE001
+            return None
 
     async def _remove_dind_container(self, ssh, name: str) -> bool:
         # Defensive — only act on names matching our prefix.
@@ -208,6 +298,8 @@ class CustomBuildOrphanSweepCheck:
                 self._list_orphan_scratch_dirs(ctx.ssh, active_pod_ids),
                 self._list_orphan_dind_containers(ctx.ssh, active_pod_ids),
             )
+            orphan_images = await self._older_than_grace(ctx.ssh, orphan_images)
+            orphan_dind = await self._older_than_grace(ctx.ssh, orphan_dind)
         except Exception as exc:  # noqa: BLE001 — non-fatal
             logger.warning(
                 _m(

@@ -471,15 +471,22 @@ class ContainerCleanup:
         A stale running `health_check_*` from a crashed backend would otherwise
         hold ports 9100-9130 indefinitely.
 
-        A `pod_*`/`filler_*`/`container_*` container is listed only when its `io.lium.netuid`
-        label is this validator's (or it has none and this is mainnet): a testnet executor can
-        share the host's daemon with a mainnet one, and this backend never lists the other
-        network's pods.
+        A `pod_*`/`filler_*` container is listed only when its `io.lium.netuid` label is this
+        validator's (or it has none and this is mainnet): a testnet executor can share the host's
+        daemon with a mainnet one, and this backend never lists the other network's pods.
+
+        Docker's `name=` filter is a regex match anywhere in the name, so a name must also start
+        with one of the prefixes here: a foreign container that merely contains `pod_` is never
+        a candidate.
         """
         try:
-            patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
+            patterns = [f"^{prefix}" for prefix in RENTAL_CONTAINER_PREFIXES]
             result = await ssh_client.run(ps_filter_names_netuid_command(*patterns))
-            listed = parse_names_with_netuid(result.stdout or "")
+            listed = [
+                entry
+                for entry in parse_names_with_netuid(result.stdout or "")
+                if entry.name.startswith(RENTAL_CONTAINER_PREFIXES)
+            ]
             in_scope = [
                 entry.name
                 for entry in listed
