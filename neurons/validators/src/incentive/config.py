@@ -153,21 +153,33 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
 # Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
 # Resolution order: specific GPU name > "*"; specific count > "*".
-# DAH-3623: idle pays 0.8 x the base price, so it is always less than a rental
+# DAH-3623: idle pays a share of the base price by the 30-day rental rate (gpu_price_stat, 22 Sep 2026):
+# >= 80 % rented -> 0.9, 60-80 % -> 0.8, < 60 % -> 0.7, no data -> 0.8. Always less than a rental.
+IDLE_SCARCE = DefaultPrice(multiplier=0.9)
 D = DefaultPrice(multiplier=0.8)
+IDLE_SURPLUS = DefaultPrice(multiplier=0.7)
 GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
     "*": {"*": 0, "1": D, "8": D},
+    # B300
+    "NVIDIA B300 SXM6 AC": {"*": 0, "1": IDLE_SCARCE, "8": IDLE_SCARCE},
     # B200
     "NVIDIA B200": {"*": 0, "1": D, "8": D},
     # H100
-    "NVIDIA H100 80GB HBM3": {"*": 0, "1": D, "8": D},
+    "NVIDIA H100 80GB HBM3": {"*": 0, "1": IDLE_SURPLUS, "8": IDLE_SURPLUS},
     "NVIDIA H100 NVL": {"*": 0, "1": D, "8": D},
-    "NVIDIA H100 PCIe": {"*": 0, "1": D, "8": D},
+    "NVIDIA H100 PCIe": {"*": 0, "1": IDLE_SURPLUS, "8": IDLE_SURPLUS},
     # A100
-    "NVIDIA A100 80GB PCIe": {"*": 0, "1": D, "8": D},
-    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": D, "8": D},
+    "NVIDIA A100 80GB PCIe": {"*": 0, "1": IDLE_SCARCE, "8": IDLE_SCARCE},
+    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": IDLE_SCARCE, "8": IDLE_SCARCE},
     # RTX A6000
-    "NVIDIA RTX A6000": {"*": 0, "1": D, "8": D},
+    "NVIDIA RTX A6000": {"*": 0, "1": IDLE_SCARCE, "8": IDLE_SCARCE},
+    # RTX 6000 Ada
+    "NVIDIA RTX 6000 Ada Generation": {"*": 0, "1": IDLE_SURPLUS, "8": IDLE_SURPLUS},
+    # L40
+    "NVIDIA L40S": {"*": 0, "1": IDLE_SCARCE, "8": IDLE_SCARCE},
+    "NVIDIA L40": {"*": 0, "1": IDLE_SCARCE, "8": IDLE_SCARCE},
+    # RTX 3090
+    "NVIDIA GeForce RTX 3090": {"*": 0, "1": IDLE_SURPLUS, "8": IDLE_SURPLUS},
     # RTX PRO 6000
     "RTX PRO 6000": {"*": 0, "1": D, "8": D},
 }

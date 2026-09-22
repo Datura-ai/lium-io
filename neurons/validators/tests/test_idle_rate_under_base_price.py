@@ -1,4 +1,5 @@
-"""DAH-3623: the base price is the one of lium-platform#558 (DAH-3648) and every idle rate is 0.8 x it.
+"""DAH-3623: the base price is the one of lium-platform#558 (DAH-3648); the idle rate is a share of it
+set by how much the model is rented: scarce cards keep more idle pay, surplus cards less.
 
 The validator's base table comes from the lium-core wheel pinned in pdm.lock, which still carries the
 old prices, so RENTAL_PRICES_PER_HOUR overrides the models #558 moved.
@@ -8,7 +9,6 @@ import pytest
 from incentive.config import RENTAL_PRICES_PER_HOUR, IncentiveConfig
 from incentive.utils import get_hourly_rate
 
-IDLE_SHARE_OF_BASE_PRICE: float = 0.8
 GPU_COUNTS: tuple[int, ...] = (1, 8)
 
 # lium-platform#558 MACHINE_PRICES that differ from the lium-core wheel, USD per GPU-hour
@@ -35,13 +35,46 @@ def test_base_price_is_the_one_of_pr_558(gpu_model: str) -> None:
     assert RENTAL_PRICES_PER_HOUR[gpu_model] == BASE_PRICE_FROM_PR_558[gpu_model]
 
 
+# gpu_price_stat.lium_rental_rate_30d on prod, 22 Sep 2026: rented / offered GPU-hours
+RENTAL_RATE_30D: dict[str, float] = {
+    "NVIDIA A100 80GB PCIe": 0.99,
+    "NVIDIA B300 SXM6 AC": 0.90,
+    "NVIDIA L40S": 0.87,
+    "NVIDIA L40": 0.87,
+    "NVIDIA A100-SXM4-80GB": 0.86,
+    "NVIDIA RTX A6000": 0.85,
+    "NVIDIA B200": 0.79,
+    "NVIDIA H200": 0.78,
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.77,
+    # parity with the Server Edition (DAH-3230); its own 0.48 is on 10 GPUs
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.77,
+    "NVIDIA GeForce RTX 4090": 0.72,
+    "NVIDIA GeForce RTX 5090": 0.64,
+    "NVIDIA RTX 6000 Ada Generation": 0.56,
+    "NVIDIA H100 80GB HBM3": 0.54,
+    "NVIDIA H100 PCIe": 0.53,
+    "NVIDIA GeForce RTX 3090": 0.45,
+}
+
+
+def _idle_share_of_base_price(gpu_model: str) -> float:
+    rental_rate = RENTAL_RATE_30D.get(gpu_model)
+    if rental_rate is None:
+        return 0.8
+    if rental_rate >= 0.8:
+        return 0.9
+    if rental_rate >= 0.6:
+        return 0.8
+    return 0.7
+
+
 @pytest.mark.parametrize("gpu_count", GPU_COUNTS)
 @pytest.mark.parametrize("gpu_model", sorted(RENTAL_PRICES_PER_HOUR))
-def test_idle_rate_is_0_8_of_the_base_price(gpu_model: str, gpu_count: int) -> None:
+def test_idle_rate_share_follows_the_rental_rate(gpu_model: str, gpu_count: int) -> None:
     config = IncentiveConfig()
 
     rate = get_hourly_rate(
         gpu_model, gpu_count, config.gpu_count_custom_prices, config.rental_prices_per_hour
     )
 
-    assert rate == pytest.approx(IDLE_SHARE_OF_BASE_PRICE * RENTAL_PRICES_PER_HOUR[gpu_model])
+    assert rate == pytest.approx(_idle_share_of_base_price(gpu_model) * RENTAL_PRICES_PER_HOUR[gpu_model])
