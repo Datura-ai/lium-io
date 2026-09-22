@@ -91,4 +91,5 @@ class ConnectivityOrchestrator:
             dind_ok=dind_result.success,
             sysbox_runtime=sysbox_runtime,
             status=status,
+            dind_error=dind_result.error,
         )
