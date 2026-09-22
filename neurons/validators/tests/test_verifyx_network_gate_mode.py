@@ -16,6 +16,7 @@ what is asserted is the verdict and the `specs.network` keys lium-platform lists
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -95,6 +96,13 @@ def test_the_default_is_shadow_and_an_unknown_mode_refuses_to_start(monkeypatch)
     monkeypatch.setenv("VERIFYX_NETWORK_GATE_MODE", "enforced")
     with pytest.raises(ValidationError):
         VerifyXSettings()
+
+
+def test_env_template_documents_shadow_and_that_enforce_is_a_flip():
+    text = Path(__file__).resolve().parents[1].joinpath(".env.template").read_text()
+    assert "VERIFYX_NETWORK_GATE_MODE=shadow" in text
+    assert "flip this to enforce" in text
+    assert "No date is set" in text
 
 
 @pytest.mark.asyncio
