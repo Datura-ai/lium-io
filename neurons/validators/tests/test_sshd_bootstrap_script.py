@@ -270,6 +270,27 @@ def test_no_grace_wait_when_image_ships_no_sshd_binary(harness):
     assert harness.sshd_start_attempts() == ["started"]
 
 
+def test_install_runs_under_the_setup_lock(harness):
+    """A retried run (one Docker exec retry after a dropped SSH transport) must queue on the
+    lock while the first run is inside `apt-get install`, not race it for the dpkg lock."""
+    harness.stage_sshd_payload(SSHD_STARTS)
+    lock_dir = harness.run_dir / "lium-ssh-setup.lock"
+    harness._write_executable(
+        harness.shims / "apt-get",
+        APT_GET_SHIM.replace(
+            "exit 0",
+            f'if [ -d "{lock_dir}" ]; then echo held; else echo free; fi '
+            '>> "$SHIM_STATE/lock_at_install"\nexit 0',
+        ),
+    )
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (harness.state / "lock_at_install").read_text().split() == ["held", "held"]
+    assert harness.sshd_start_attempts() == ["started"]
+
+
 def test_grace_zero_skips_waiting_even_with_sshd_binary(harness):
     harness.install_sshd_bin(SSHD_STARTS)
 

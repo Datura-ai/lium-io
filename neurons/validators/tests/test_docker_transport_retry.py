@@ -44,6 +44,7 @@ READ_TIMEOUT_TEXT = (
     "Docker SDK run container failed: SSHConnectionPool(host='localhost', port=None): "
     "Read timed out. (read timeout=60)"
 )
+SOCKET_CLOSED_TEXT = "Docker SDK exec failed: Socket is closed"
 # Answers from the daemon are not transport errors.
 NAME_CONFLICT_TEXT = (
     "Docker SDK run container failed: 409 Client Error for http+docker://ssh/v1.45/containers/create"
@@ -160,7 +161,9 @@ def _run_spec(name: str = "pod_test") -> ContainerRunSpec:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("text", [RUN_EOF_TEXT, VOLUME_NONE_CHANNEL_TEXT, READ_TIMEOUT_TEXT])
+@pytest.mark.parametrize(
+    "text", [RUN_EOF_TEXT, VOLUME_NONE_CHANNEL_TEXT, READ_TIMEOUT_TEXT, SOCKET_CLOSED_TEXT]
+)
 def test_cluster_error_texts_are_the_transport_class(text):
     exc = RentalDockerOperationError(text)
     assert is_rental_docker_transport_error(exc)

@@ -34,6 +34,7 @@ _TRANSPORT_ERROR_TEXTS = (
     "'NoneType' object has no attribute 'settimeout'",
     "SSH session not active",
     "SSH transport dropped",
+    "Socket is closed",  # paramiko: a send over a channel whose transport is gone
 )
 # paramiko's EOFError has no text; the SDK client wraps it as "<operation> failed: EOFError".
 _TRANSPORT_EOF_SUFFIX = ": EOFError"
