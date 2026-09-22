@@ -1434,7 +1434,7 @@ class DockerService:
                 raise
             except Exception as exc:
                 found = warm_pool.FindSlotsOutput(image_doc=None, slot_docs=[])
-                reason = f"lookup failed: {exc}"
+                reason = f"lookup_failed:{type(exc).__name__}"
             image_doc, slot_docs = found.image_doc, found.slot_docs
             if reason is None and image_doc is None:
                 reason = "image not inspectable"
@@ -1495,7 +1495,7 @@ class DockerService:
                 )
             except Exception as exc:
                 logger.info(
-                    _m("warm_pool slot=unreadable", extra=get_extra_info({**default_extra, "error": str(exc)}))
+                    _m("warm_pool slot=unreadable", extra=get_extra_info({**default_extra, "error": type(exc).__name__}))
                 )
                 continue
             if slot is None or port_maps is None:
@@ -1600,7 +1600,7 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return f"volume inspect failed: {exc}"
+            return f"volume_inspect_failed:{type(exc).__name__}"
         if result.exit_status != 0:
             return f"volume inspect exit {result.exit_status}"
         return warm_pool.volume_mismatch(slot, result.stdout or "")
@@ -1619,7 +1619,7 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return f"network inspect failed: {exc}"
+            return f"network_inspect_failed:{type(exc).__name__}"
         if result.exit_status != 0:
             return f"network inspect exit {result.exit_status}"
         return warm_pool.network_mismatch(result.stdout or "")
@@ -1641,7 +1641,7 @@ class DockerService:
         except Exception as exc:
             # A document the host authored: anything unreadable in it is a fallback, never a
             # failed rental (the lookup treats its slot documents the same way).
-            reason = f"slot document unreadable: {exc}"
+            reason = f"slot_document_unreadable:{type(exc).__name__}"
         if reason is None and run_spec.network:
             # A `docker create` proves the rental network is an ICC-off bridge (DAH-3199); the slot
             # was created hours ago, so its start re-reads the live network the same way.
@@ -1656,11 +1656,12 @@ class DockerService:
                     timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
                 )
                 if result.exit_status != 0:
-                    reason = f"adopt command exit {result.exit_status}: {(result.stderr or '')[:200]}"
+                    # the command's stderr stays out of the log: it can carry the host's paths or names
+                    reason = f"adopt_command_exit:{result.exit_status}"
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                reason = f"adopt command failed: {exc}"
+                reason = f"adopt_command_failed:{type(exc).__name__}"
         if reason is None:
             logger.info(
                 _m(
@@ -2005,7 +2006,10 @@ class DockerService:
                     timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
                 )
             logger.warning(
-                _m("warm_pool slot=create failed", extra=get_extra_info({**default_extra, "image": image, "error": str(exc)}))
+                _m(
+                    "warm_pool slot=create failed",
+                    extra=get_extra_info({**default_extra, "image": image, "error": type(exc).__name__}),
+                )
             )
             return
         logger.info(

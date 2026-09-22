@@ -758,6 +758,15 @@ def _host(
     return ssh
 
 
+# A failed host command's text can carry the host's address, paths and key material; the pool's
+# failure lines keep the exception's type and the ids already on the line.
+LEAK_CANARY = "ssh root@10.77.0.9: /root/.ssh/id_rsa AKIACANARYKEY0000 refused"
+
+
+def _log_text(record: logging.LogRecord) -> str:
+    return str(record.msg) + " " + json.dumps(getattr(record.msg, "extra", {}), default=str)
+
+
 def _cmds(ssh):
     return [c.args[0] for c in ssh.run.await_args_list if c.args]
 
@@ -1078,6 +1087,89 @@ async def test_failed_adopt_command_falls_back_and_removes_the_slot(svc, monkeyp
     assert result.volume_name == f"volume_{payload.pod_id}"
 
 
+def _log_fields(records, key):
+    return [r.msg.extra[key] for r in records if key in getattr(r.msg, "extra", {})]
+
+
+# Every branch on the adopt path that catches an exception or reads a command's stderr; the log
+# line the branch ends in (`adopt=miss`, `adopt=fallback`, `slot=remove reason=volume differs`)
+# names the branch and the exception's type, never the text.
+LEAK_SITES = [
+    ("lookup", "lookup_failed:OSError", "reason"),
+    ("volume-inspect", "volume_inspect_failed:OSError", "detail"),
+    ("network-inspect", "network_inspect_failed:OSError", "reason"),
+    ("slot-matches", "slot_document_unreadable:RuntimeError", "reason"),
+    ("adopt-stderr", "adopt_command_exit:1", "reason"),
+    ("adopt-raises", "adopt_command_failed:OSError", "reason"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("site, expected, key", LEAK_SITES, ids=[s[0] for s in LEAK_SITES])
+async def test_adopt_path_failures_log_a_token_and_the_exception_type_only(
+    svc, monkeypatch, caplog, site, expected, key
+):
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload()
+    spec = _spec(svc, payload)
+    image = _image_doc()
+    ssh = _host(svc, spec, image)
+    plain = ssh.run.side_effect
+
+    def _side(cmd, *args, **kwargs):
+        if site == "lookup" and "__LIUM_WARM_POOL__" in cmd:
+            raise OSError(LEAK_CANARY)
+        if site == "volume-inspect" and cmd == warm_pool.inspect_volume_command(f"volume_{SLOT_ID}"):
+            raise OSError(LEAK_CANARY)
+        if site == "network-inspect" and cmd == warm_pool.inspect_network_command(spec.network):
+            raise OSError(LEAK_CANARY)
+        if "docker rename" in cmd:
+            if site == "adopt-raises":
+                raise OSError(LEAK_CANARY)
+            if site == "adopt-stderr":
+                return _ssh_result(exit_status=1, stderr=LEAK_CANARY)
+        return plain(cmd, *args, **kwargs)
+
+    ssh.run = AsyncMock(side_effect=_side)
+    if site == "slot-matches":
+        monkeypatch.setattr(
+            ds_module.warm_pool, "slot_matches", Mock(side_effect=RuntimeError(LEAK_CANARY))
+        )
+    _patch_happy(svc, monkeypatch, ssh)
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert result.volume_name == f"volume_{payload.pod_id}"
+    assert expected in _log_fields(caplog.records, key)
+    assert all(LEAK_CANARY not in _log_text(r) for r in caplog.records)
+    assert all(r.exc_info is None for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_unreadable_slot_document_logs_the_exception_type_only(svc, monkeypatch, caplog):
+    """The document is the host's: a value in it that makes the parser raise must not come back
+    out through the `slot=unreadable` line."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload()
+    spec = _spec(svc, payload)
+    image = _image_doc()
+    doc = _slot_doc(spec, image)
+    doc["HostConfig"]["PortBindings"] = {"bad/tcp": [{"HostIp": "", "HostPort": LEAK_CANARY}]}
+    ssh = _host(svc, spec, image, slot_doc=doc)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    unreadable = [r for r in caplog.records if str(r.msg) == "warm_pool slot=unreadable"]
+    assert len(unreadable) == 1
+    assert unreadable[0].msg.extra["error"] == "ValueError"
+    assert all(LEAK_CANARY not in _log_text(r) for r in caplog.records)
+
+
 @pytest.mark.parametrize(
     "network_inspect",
     ["bridge|true\n", "bridge|\n", "macvlan|false\n", "", "a|false\nb|false\n"],
@@ -1215,15 +1307,6 @@ async def test_sizing_leaves_slot_volumes_out_of_the_declared_sum(svc, monkeypat
     ssh.run = AsyncMock(side_effect=_side)
     assert await svc._get_existing_vloopback_bytes(ssh) == 10 * 1024**3
     assert any("lium.warm_pool=1" in c.args[0] for c in ssh.run.await_args_list)
-
-
-# A failed host command's text can carry the host's address, paths and key material; the pool's
-# failure lines keep the exception's type and the ids already on the line.
-LEAK_CANARY = "ssh root@10.77.0.9: /root/.ssh/id_rsa AKIACANARYKEY0000 refused"
-
-
-def _log_text(record: logging.LogRecord) -> str:
-    return str(record.msg) + " " + json.dumps(getattr(record.msg, "extra", {}), default=str)
 
 
 @pytest.mark.asyncio
@@ -1730,7 +1813,7 @@ def test_external_volume_rental_is_blocked():
 
 @pytest.mark.asyncio
 async def test_maintenance_removes_a_slot_whose_image_was_repulled_and_survives_a_create_failure(
-    svc, monkeypatch
+    svc, monkeypatch, caplog
 ):
     monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
     image = _image_doc()
@@ -1757,7 +1840,7 @@ async def test_maintenance_removes_a_slot_whose_image_was_repulled_and_survives_
     client = _CreatingFakeClient(svc.rental_docker_client_factory.client)
 
     async def _boom(spec, *, labels=None):
-        raise RuntimeError("daemon busy")
+        raise RuntimeError(LEAK_CANARY)
 
     client.create_container = _boom
     svc.rental_docker_client_factory.client = client
@@ -1769,12 +1852,13 @@ async def test_maintenance_removes_a_slot_whose_image_was_repulled_and_survives_
     executor_info = _executor_info(filler)
     executor_info.port_range = "20000-20020"
 
-    result = await svc.create_container(
-        payload=filler,
-        executor_info=executor_info,
-        keypair=Mock(ss58_address="v"),
-        private_key="encrypted",
-    )
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        result = await svc.create_container(
+            payload=filler,
+            executor_info=executor_info,
+            keypair=Mock(ss58_address="v"),
+            private_key="encrypted",
+        )
 
     # the filler still came up; the stale slot went; the half-created slot's volume was removed
     assert isinstance(result, ContainerCreated)
@@ -1782,6 +1866,12 @@ async def test_maintenance_removes_a_slot_whose_image_was_repulled_and_survives_
     assert any(f"docker rm -f {stale['Name'].lstrip('/')}" in c for c in cmds)
     created_volume = svc.create_local_volume.await_args.kwargs["local_volume"]
     assert any(f"volume rm {created_volume}" in c for c in cmds)
+    # the SDK's error text (dockerd's message, a path, a name) stays out of the create-failed line
+    failed = [r for r in caplog.records if str(r.msg) == "warm_pool slot=create failed"]
+    assert len(failed) == 1
+    assert failed[0].msg.extra["error"] == "RuntimeError"
+    assert failed[0].exc_info is None
+    assert all(LEAK_CANARY not in _log_text(r) for r in caplog.records)
 
 
 @pytest.mark.asyncio
