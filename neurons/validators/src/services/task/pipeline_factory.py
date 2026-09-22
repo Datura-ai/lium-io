@@ -33,6 +33,7 @@ from .checks import (
     CachedTemplateVerificationCheck,
     CapabilityCheck,
     CollateralCheck,
+    CollateralPrefetchCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
     DiskHealthCheck,
@@ -72,6 +73,7 @@ from .pipeline import (
     ContextServices,
     ContextState,
     LoggerSink,
+    ParallelStage,
     Pipeline,
     PodRecoverer,
 )
@@ -266,12 +268,18 @@ class PipelineFactory:
         )
 
     @staticmethod
-    def build_checks() -> list[Check]:
+    def build_checks(fast_path: bool = False) -> list[Check]:
         """Build the standard validation check pipeline.
+
+        fast_path (validation fast path): the same checks with the same verdicts, arranged so a
+        new node's first verification waits less — see build_fast_path_checks. The wave never
+        asks for it.
 
         Returns:
             Ordered list of validation checks to execute
         """
+        if fast_path:
+            return PipelineFactory.build_fast_path_checks()
         return cast(
             list[Check],
             [
@@ -357,6 +365,98 @@ class PipelineFactory:
                 # would (default image, probe key, verified ports), and prove sshd, the login and
                 # `nvidia-smi -L`. Last before scoring: it needs the verified ports, the GPU list and
                 # the rented/filler state every check above settled. Flag-gated, off by default.
+                RentalProbeCheck(),
+                ScoreCheck(),
+                FinalizeCheck(),
+            ],
+        )
+
+    @staticmethod
+    def takes_fast_path(
+        first_pass: bool, executor_uuid: str, rented_data: RentedExecutorsResponse | None
+    ) -> bool:
+        """Whether this run gets build_fast_path_checks: the flag is on, it is a never-validated
+        node's first pass (the express lane's; the wave passes first_pass=False), and the backend
+        lists no pod and no filler on it — a node someone is using takes the serial list, so the
+        rented halt and the filler skips happen before any GPU work exactly as today."""
+        if not (first_pass and settings.VALIDATION_FAST_PATH_ENABLED):
+            return False
+        if rented_data is None:
+            return False
+        rented_executor = rented_data.executors.get(executor_uuid)
+        if rented_executor is not None and rented_executor.pods:
+            return False
+        if rented_data.get_filler_containers(executor_uuid):
+            return False
+        return True
+
+    @staticmethod
+    def build_fast_path_checks() -> list[Check]:
+        """The first-pass pipeline with the validation fast path on: every check of build_checks,
+        each deciding exactly as there, in an order that waits less.
+
+        - `CollateralPrefetchCheck` right after the scrape starts the contract read that
+          `CollateralCheck` (kept at its place, fatal as today) awaits instead of starting.
+        - VerifyX runs alone first: it measures the node's network, and nothing else of ours may
+          be pulling an image or copying a challenge while it does.
+        - Then one `ParallelStage` with two lanes that share no data: the GPU lane (matmul,
+          fault probe, cached template — the challenge lives on the card) and the host lane
+          (port connectivity, port count, sysbox, rental check — containers, ports and the
+          backend's probe). The executor's own one-call verification already runs its facts
+          steps (docker, ports, inspector) beside its GPU group, and runs VerifyX before the
+          matmul unless asked otherwise (`LocalVerifyService`, `parallel_gpu`) — the same split
+          and the same order kept here. `StaleContainerCleanupCheck` still precedes the port
+          checks, and `TenantEnforcementCheck` still halts a rented node before either lane
+          starts.
+        - The rental probe, score and finalize follow as today.
+        The list differs from build_checks only in where these checks sit; a node that would fail
+        there fails here on the same check.
+        """
+        return cast(
+            list[Check],
+            [
+                StartGPUMonitorCheck(),
+                UploadFilesCheck(),
+                MachineSpecScrapeCheck(),
+                CollateralPrefetchCheck(),
+                TdxHostCheck(),
+                GpuCountCheck(),
+                GpuModelValidCheck(),
+                GpuVramPrecheck(),
+                DiskHealthCheck(),
+                CpuTruthCheck(),
+                GpuPowerLimitCheck(),
+                NvmlDigestCheck(),
+                GpuFingerprintCheck(),
+                SpecChangeCheck(),
+                BannedProviderCheck(),
+                BannedGpuCheck(),
+                DuplicateExecutorCheck(),
+                CollateralCheck(),
+                _STALE_CONTAINER_CLEANUP_SINGLETON,
+                ProviderSideLoadCheck(),
+                _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                ExecutorImageCheck(),
+                InspectorRentedCheck(),
+                TenantEnforcementCheck(),
+                GpuUsageCheck(),
+                LocalVerifyCheck(),
+                VerifyXCheck(),
+                ParallelStage(
+                    [
+                        [
+                            PortConnectivityCheck(),
+                            PortCountCheck(),
+                            SysboxRequiredCheck(),
+                            RentalVerificationCheck(),
+                        ],
+                        [
+                            CapabilityCheck(),
+                            GpuFaultProbeCheck(),
+                            CachedTemplateVerificationCheck(),
+                        ],
+                    ]
+                ),
                 RentalProbeCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),

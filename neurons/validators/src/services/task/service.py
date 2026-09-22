@@ -21,6 +21,8 @@ from services.verifyx_validation_service import VerifyXValidationService
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from core.validation_progress import PipelineProgress
+from core.validation_progress import progress as validation_progress
 from services.ssh_service import SSHService
 
 from .availability import availability_errors, build_ssh_unreachable_event
@@ -125,6 +127,9 @@ class TaskService:
         is_opening_ssh_connection = False
         # Once the shell is open the node is proven reachable, whatever fails afterwards.
         has_reached_the_node = False
+        validation_progress.run_started(
+            executor_info.uuid, miner_info.miner_hotkey, lane="express" if first_pass else "cycle"
+        )
 
         try:
             # Decrypt private key. The encrypted form is kept for the rental probe (DAH-3436), whose
@@ -191,8 +196,14 @@ class TaskService:
                 if settings.DRY_RUN:
                     checks = self.pipeline_factory.build_dry_run_checks()
                 else:
-                    checks = self.pipeline_factory.build_checks()
+                    # Validation fast path: a never-validated idle node's first pass runs the
+                    # same checks arranged to wait less (flag-gated); the wave never does.
+                    if PipelineFactory.takes_fast_path(first_pass, executor_info.uuid, rented_data):
+                        checks = self.pipeline_factory.build_checks(fast_path=True)
+                    else:
+                        checks = self.pipeline_factory.build_checks()
                 pipeline = self.pipeline_factory.build_pipeline(checks)
+                pipeline.progress = PipelineProgress(validation_progress)
                 ok, events, last_context = await pipeline.run(base_ctx)
 
                 # Determine log_text and success based on ok status
@@ -225,6 +236,9 @@ class TaskService:
                 # (success=True, score 0 when the image is OUTDATED).
                 if not success or result.score <= 0:
                     result.failure_reason_code = last_event.reason_code
+                validation_progress.run_finished(
+                    executor_info.uuid, passed=success and result.score > 0, reason_code=last_event.reason_code
+                )
                 return result
 
         except Exception as e:
@@ -269,6 +283,9 @@ class TaskService:
                 # there says nothing, and must not clear what the cycle before it found.
                 availability_problems = [] if has_reached_the_node else None
             logger.error(log_text, exc_info=True)
+            validation_progress.run_finished(
+                executor_info.uuid, passed=False, reason_code=failure_reason_code or "PIPELINE_ERROR"
+            )
             return JobResult(
                 spec=None,
                 executor_info=executor_info,

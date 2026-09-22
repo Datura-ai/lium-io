@@ -552,6 +552,28 @@ class Settings(BaseSettings):
     EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
+    # Validation fast path for a new node's first, unscored verification (the express lane's).
+    # Every check still runs and decides as it does today; only the waiting changes:
+    # - the checks with no data dependency run at once (`PipelineFactory.build_checks(fast_path=True)`:
+    #   the matmul chain beside the port/sysbox/rental-check chain, after VerifyX has measured the
+    #   network alone — the split and the order the executor's own one-call verification uses);
+    # - the collateral read starts under the pure-data GPU checks and is awaited where it is today
+    #   (`CollateralPrefetchCheck`); the fatal collateral gate and the score gate are unchanged;
+    # - the express lane ticks every EXPRESS_LANE_FAST_TICK_SECONDS and, when the miner's portal
+    #   snapshot does not list the node yet, asks again after EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS
+    #   (the central miner refreshes that snapshot every 30 s); the 120-s retry stays for every other reason.
+    # Scored cycles never take this path: the wave passes first_pass=False. Off by default.
+    VALIDATION_FAST_PATH_ENABLED: bool = Field(env="VALIDATION_FAST_PATH_ENABLED", default=False)
+    EXPRESS_LANE_FAST_TICK_SECONDS: int = Field(env="EXPRESS_LANE_FAST_TICK_SECONDS", default=15, gt=0)
+    EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS: int = Field(
+        env="EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS", default=35, gt=0
+    )
+
+    def express_lane_tick_seconds(self) -> int:
+        """How often the express lane reads the portal snapshot: the fast tick with the fast path on."""
+        if self.VALIDATION_FAST_PATH_ENABLED:
+            return min(self.EXPRESS_LANE_TICK_SECONDS, self.EXPRESS_LANE_FAST_TICK_SECONDS)
+        return self.EXPRESS_LANE_TICK_SECONDS
 
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route

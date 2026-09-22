@@ -593,6 +593,23 @@ class CollateralMessages:
     )
 
 
+class CollateralPrefetchMessages:
+    STARTED = MessageTemplate(
+        event="Collateral read started",
+        reason="COLLATERAL_READ_STARTED",
+        severity="info",
+        category="policy",
+        impact="Proceed; the collateral check decides when the read answers",
+    )
+    SKIPPED = MessageTemplate(
+        event="Collateral read not started",
+        reason="COLLATERAL_READ_SKIPPED",
+        severity="info",
+        category="policy",
+        impact="Proceed; the collateral check reads the contract itself",
+    )
+
+
 class StaleContainerCleanupMessages:
     CLEANED = MessageTemplate(
         event="Stale container cleanup complete",
