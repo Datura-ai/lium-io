@@ -348,7 +348,8 @@ class ExpressLane:
                 ),
                 exc_info=True,
             )
-            self._defer(pending, str(exc))
+            # The registry (and the route) get the exception's class; the text stays in the log line above.
+            self._defer(pending, str(exc), progress_reason=f"verification raised {type(exc).__name__}")
         finally:
             if self.miner_service.in_flight.get(executor_id) == EXPRESS_LANE:
                 del self.miner_service.in_flight[executor_id]
@@ -420,8 +421,10 @@ class ExpressLane:
             )
         )
 
-    def _defer(self, pending: _Pending, reason: str) -> None:
-        """Try again after RETRY_SECONDS, or after MAX_ATTEMPTS leave the executor to the cycle.
+    def _defer(self, pending: _Pending, reason: str, progress_reason: str | None = None) -> None:
+        """Try again after retry_seconds_for(reason), or after max_attempts_for(reason) asks leave
+        the executor to the cycle. `progress_reason`, when given, is what the support view records
+        instead of `reason` (the exception path passes the exception's class, not its text).
 
         The caller has already counted the attempt.
         """
@@ -431,17 +434,19 @@ class ExpressLane:
             "attempt": pending.attempts,
             "reason": reason,
         }
-        if pending.attempts >= MAX_ATTEMPTS:
+        if pending.attempts >= max_attempts_for(reason):
             self._left_to_cycle.add(pending.executor.id)
             self._pending.pop(pending.executor.id, None)
-            validation_progress.left_to_cycle(pending.executor.id, reason, pending.attempts)
+            validation_progress.left_to_cycle(pending.executor.id, progress_reason or reason, pending.attempts)
             logger.warning(
                 _m("[express] Executor left to the normal cycle", extra=get_extra_info(extra))
             )
             return
         retry_seconds = retry_seconds_for(reason)
         pending.not_before = time.monotonic() + retry_seconds
-        validation_progress.retry_scheduled(pending.executor.id, reason, retry_seconds, pending.attempts)
+        validation_progress.retry_scheduled(
+            pending.executor.id, progress_reason or reason, retry_seconds, pending.attempts
+        )
         logger.info(
             _m(
                 "[express] Executor not verified yet, will retry",
@@ -455,10 +460,18 @@ def retry_seconds_for(reason: str) -> int:
 
     Validation fast path: a miner that did not list the node yet is asked again once its portal
     snapshot has had time to refresh (EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS, default 35 s >
-    the central miner's 30-s TTL) instead of after RETRY_SECONDS. MAX_ATTEMPTS is unchanged, so the
-    lane gives up on the node after the same number of asks; only the pause between them changes.
-    Every other reason, and the flag off, keep RETRY_SECONDS.
+    the central miner's 30-s TTL) instead of after RETRY_SECONDS, and max_attempts_for gives that
+    reason more asks so the window the lane covers stays at least the serial one (the miner serves
+    a stale snapshot while its portal refresh fails, and a blip longer than the window sends the
+    node to the wave). Every other reason, and the flag off, keep RETRY_SECONDS and MAX_ATTEMPTS.
     """
     if settings.VALIDATION_FAST_PATH_ENABLED and reason == MINER_DID_NOT_RETURN_EXECUTOR:
         return settings.EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS
     return RETRY_SECONDS
+
+
+def max_attempts_for(reason: str) -> int:
+    """How many asks a deferred executor gets before the lane leaves it to the cycle (see retry_seconds_for)."""
+    if settings.VALIDATION_FAST_PATH_ENABLED and reason == MINER_DID_NOT_RETURN_EXECUTOR:
+        return max(MAX_ATTEMPTS, settings.EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS)
+    return MAX_ATTEMPTS

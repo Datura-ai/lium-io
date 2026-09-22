@@ -568,6 +568,15 @@ class Settings(BaseSettings):
     EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS: int = Field(
         env="EXPRESS_LANE_MINER_SNAPSHOT_RETRY_SECONDS", default=35, gt=0
     )
+    # With the fast re-ask the lane asks this many times for a node the miner did not list yet, so
+    # the window it covers (7 × 35 s ≈ 245 s) stays at least the serial one (2 × 120 s = 240 s).
+    EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS: int = Field(
+        env="EXPRESS_LANE_MINER_SNAPSHOT_MAX_ATTEMPTS", default=8, gt=0
+    )
+    # Support view of each node's verification (GET /validation-progress on the validator's port,
+    # which docker-compose publishes). Unset = the route is not registered; set = every request
+    # must carry the token in X-Validation-Progress-Token. Read from the operator's box only.
+    VALIDATION_PROGRESS_TOKEN: str | None = Field(env="VALIDATION_PROGRESS_TOKEN", default=None)
 
     def express_lane_tick_seconds(self) -> int:
         """How often the express lane reads the portal snapshot: the fast tick with the fast path on."""

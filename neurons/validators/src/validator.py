@@ -42,8 +42,10 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     lifespan=app_lifespan,
 )
-# Support view: which check each node is on, since when, last error (core/validation_progress.py).
-app.include_router(validation_progress_router)
+# Support view: which check each node is on, since when, last error class (core/validation_progress.py).
+# Registered only when the operator set VALIDATION_PROGRESS_TOKEN; every request must carry it.
+if settings.VALIDATION_PROGRESS_TOKEN:
+    app.include_router(validation_progress_router)
 
 reload = True if settings.ENV == "dev" else False
 

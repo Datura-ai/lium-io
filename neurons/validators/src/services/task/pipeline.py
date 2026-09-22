@@ -314,17 +314,23 @@ class ProgressSink(Protocol):
 
     def step_finished(self, ctx: Context, check_id: str, event: ValidationEvent, passed: bool) -> None: ...
 
+    def step_aborted(self, ctx: Context, check_id: str, error_class: str) -> None: ...
+
 
 class ParallelStage:
     """Lanes of checks with no data dependency between them, run at once on one Context.
 
     Validation fast path: each lane runs its checks in order on its own copy of the context it was
-    given, exactly as the serial pipeline would, and stops at the same fatal failure or halt. The
-    pipeline then applies every lane's results in lane order — events, step timings, context
-    updates — so a run reads like the serial one: the first fatal failure in lane order ends it
-    with that check's event, a check's `updates` land the way they do today, and `state` changes
-    are merged field by field (`specs` key by key) because each lane changed a disjoint part of
-    it. Nothing here decides pass or fail; every check keeps its own verdict.
+    given, exactly as the serial pipeline would. The first lane to stop — a fatal failure, a halt
+    or an exception — cancels the other lanes, whose in-flight check is interrupted and whose
+    later checks never start, so a failing run does the same work as the serial one would have
+    (a matmul that fails never lets the host lane rent the probe container). The pipeline then
+    applies the completed results in lane order — events, step timings, context updates — so a
+    run reads like the serial one: the stopping check's event ends it, a check's `updates` land
+    the way they do today, and `state` changes are merged field by field (`specs` key by key)
+    because each lane changed a disjoint part of it. Checks the sibling lane completed before the
+    cancel have run but are not emitted and not counted in the step summary. Nothing here decides
+    pass or fail; every check keeps its own verdict.
     """
 
     check_id = "pipeline.parallel"
@@ -377,6 +383,21 @@ def merge_state(current: ContextState, before: ContextState, after: ContextState
     return replace(current, **changes) if changes else current
 
 
+def _stops_run(chk: Check, res: CheckResult) -> bool:
+    return (not res.passed and getattr(chk, "fatal", False)) or res.halt
+
+
+def cancel_pending_collateral_prefetch(ctx: Context) -> bool:
+    """Cancel a collateral read the fast path started that no check consumed (the run ended
+    before CollateralCheck). Returns whether one was cancelled."""
+    prefetch = getattr(ctx.state, "collateral_prefetch", None)
+    task = getattr(prefetch, "task", None)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
+
 class Pipeline:
     def __init__(self, checks: List[Check], sink: EventSink, progress: ProgressSink | None = None):
         self.checks = checks
@@ -387,28 +408,67 @@ class Pipeline:
         if self.progress is not None:
             self.progress.step_started(ctx, chk.check_id)
         started = time.perf_counter()
-        res = await chk.run(ctx)
+        try:
+            res = await chk.run(ctx)
+        except BaseException as exc:
+            # The exception class is what support sees; the text stays in the run's own log line.
+            if self.progress is not None:
+                self.progress.step_aborted(ctx, chk.check_id, type(exc).__name__)
+            raise
         finished = time.perf_counter()
         return _RanCheck(check=chk, result=res, before_state=ctx.state, started=started, finished=finished)
 
-    async def _run_lane(self, lane: list[Check], ctx: Context) -> list[_RanCheck]:
-        """One lane of a ParallelStage, serially, stopping where the serial pipeline would."""
-        ran: list[_RanCheck] = []
+    async def _run_lane(self, lane: list[Check], ctx: Context, ran: list[_RanCheck]) -> None:
+        """One lane of a ParallelStage, serially, stopping where the serial pipeline would.
+
+        Completed checks are appended to `ran` as they finish, so a lane cancelled by its sibling
+        still hands over what it completed."""
         current = ctx
         for chk in lane:
             step = await self._run_check(chk, current)
             ran.append(step)
             res = step.result
-            if (not res.passed and getattr(chk, "fatal", False)) or res.halt:
-                break
+            if _stops_run(chk, res):
+                return
             if res.updates:
                 current = current.model_copy(update=updates_with_clear_verified_job_evidence(res, chk.check_id))
-        return ran
+
+    async def _run_stage(self, stage: ParallelStage, ctx: Context) -> list[_RanCheck]:
+        """Run the lanes at once; the first lane to stop (fatal, halt or exception) cancels the rest."""
+        lane_results: list[list[_RanCheck]] = [[] for _ in stage.lanes]
+        tasks = [
+            asyncio.ensure_future(self._run_lane(lane, ctx, lane_results[index]))
+            for index, lane in enumerate(stage.lanes)
+        ]
+        first_error: BaseException | None = None
+        try:
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                stop = False
+                for task in done:
+                    exc = asyncio.CancelledError() if task.cancelled() else task.exception()
+                    if exc is not None:
+                        first_error = first_error or exc
+                        stop = True
+                        continue
+                    index = tasks.index(task)
+                    if lane_results[index] and _stops_run(lane_results[index][-1].check, lane_results[index][-1].result):
+                        stop = True
+                if stop:
+                    break
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if first_error is not None:
+            raise first_error
+        return [ran for lane in lane_results for ran in lane]
 
     async def _run_step(self, step: Check | ParallelStage, ctx: Context) -> list[_RanCheck]:
         if isinstance(step, ParallelStage):
-            lanes = await asyncio.gather(*(self._run_lane(lane, ctx) for lane in step.lanes))
-            return [ran for lane in lanes for ran in lane]
+            return await self._run_stage(step, ctx)
         return [await self._run_check(step, ctx)]
 
     def _apply(self, current_ctx: Context, ran: _RanCheck, parallel: bool) -> Context:
@@ -421,6 +481,15 @@ class Pipeline:
         return current_ctx.model_copy(update=updates)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        latest = [ctx]
+        try:
+            return await self._run(ctx, latest)
+        except BaseException:
+            # A run that raises leaves no check to consume the early collateral read.
+            cancel_pending_collateral_prefetch(latest[0])
+            raise
+
+    async def _run(self, ctx: Context, latest: list[Context]) -> Tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()
@@ -430,18 +499,17 @@ class Pipeline:
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
             ran_checks = await self._run_step(step, current_ctx)
-            # Every check that ran counts toward the summary, including the other lanes of a
-            # stage whose earlier lane failed: they did run, and the timings are what they cost.
             for ran in ran_checks:
-                execution_time_ms = int((ran.finished - ran.started) * 1000)
-                ran.result.event.context["execution_time_ms"] = execution_time_ms
+                ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
                 ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)
-                steps.append((ran.check.check_id, execution_time_ms))
 
             # A stage's wall time is its slowest lane's, whichever lane's event carries the summary.
             stage_elapsed_ms = max(ran.result.event.context["elapsed_time_ms"] for ran in ran_checks)
             for position, ran in enumerate(ran_checks):
                 chk, res = ran.check, ran.result
+                # Only emitted checks enter the summary: a sibling lane's checks completed before
+                # the cancel ran, but the run does not report them.
+                steps.append((chk.check_id, res.event.context["execution_time_ms"]))
                 elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
                 failed = not res.passed and getattr(chk, "fatal", False)
                 last_of_run = index == last_index and position == len(ran_checks) - 1
@@ -458,11 +526,14 @@ class Pipeline:
                     self.progress.step_finished(current_ctx, chk.check_id, res.event, res.passed)
 
                 current_ctx = self._apply(current_ctx, ran, parallel)
+                latest[0] = current_ctx
 
                 if failed:
+                    cancel_pending_collateral_prefetch(current_ctx)
                     return False, events, current_ctx
 
                 if res.halt:
+                    cancel_pending_collateral_prefetch(current_ctx)
                     return True, events, current_ctx
 
         return True, events, current_ctx

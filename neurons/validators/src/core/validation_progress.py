@@ -4,9 +4,12 @@ One in-memory record per executor this validator is verifying or has recently ve
 (cycle or express), the check running and since when, the last event's reason code and the last
 failure. The pipeline reports each check as it starts and finishes (`Pipeline(progress=...)`), the
 express lane reports its own waits (discovered, retry scheduled, left to the cycle, published).
-Read through the validator's `GET /validation-progress[/{executor_uuid}]` and, on every state
-change, one `[progress]` log line. Records of finished runs are kept for RETENTION so a support
-reader arriving after the verdict still sees the timeline; nothing here is persisted.
+Read through the validator's `GET /validation-progress[/{executor_uuid}]` (token-gated,
+routes/validation_progress.py) and, on every state change, one `[progress]` log line (INFO for
+the express lane, DEBUG for the cycle's runs). What leaves this process names a node by executor
+uuid with its steps and timings; the miner hotkey stays in the log line only, and an error is its
+class and step, never the exception text. Records of finished runs are kept for RETENTION so a
+support reader arriving after the verdict still sees the timeline; nothing here is persisted.
 """
 
 from __future__ import annotations
@@ -24,8 +27,13 @@ logger = logging.getLogger(__name__)
 
 # How long a finished record stays readable.
 RETENTION_SECONDS = 2 * 60 * 60
-# Hard cap on records so a fleet-wide cycle cannot grow the map without bound.
+# Hard cap on records so a fleet-wide cycle cannot grow the map without bound: finished records
+# go first; live ones are evicted only when the live set alone is over the cap.
 MAX_RECORDS = 5000
+# Finished records are also swept on a write at most this often, not only when one is created.
+PRUNE_EVERY_SECONDS = 60
+# A check that raised or was cancelled: what support sees as its reason code.
+ABORTED_PREFIX = "ABORTED:"
 
 # Phases of one record. `waiting` states name what the node waits for; `running` names a check.
 DISCOVERED = "discovered"
@@ -39,6 +47,9 @@ LEFT_TO_CYCLE = "left_to_cycle"
 VERIFIED = "verified"
 PUBLISHED = "published"
 FAILED = "failed"
+FINISHED_PHASES = frozenset({VERIFIED, PUBLISHED, FAILED, LEFT_TO_CYCLE})
+# The lane names TaskService / ExpressLane report (services.miner_service.EXPRESS_LANE is "express").
+EXPRESS = "express"
 
 
 def _now() -> datetime:
@@ -72,8 +83,10 @@ class ProgressRecord:
     _touched_monotonic: float = field(default_factory=time.monotonic, repr=False)
 
     def as_dict(self) -> dict[str, Any]:
+        """The payload the route serves: no hotkey, no exception text (see the module docstring)."""
         data = asdict(self)
         data.pop("_touched_monotonic", None)
+        data.pop("miner_hotkey", None)
         return data
 
 
@@ -83,12 +96,15 @@ class ValidationProgress:
     def __init__(self) -> None:
         self._records: dict[str, ProgressRecord] = {}
         self._lock = Lock()
+        self._last_prune = time.monotonic()
 
     # -- writes -------------------------------------------------------------------------------
     def _record(self, executor_uuid: str) -> ProgressRecord:
         record = self._records.get(executor_uuid)
-        if record is None:
+        if record is None or time.monotonic() - self._last_prune > PRUNE_EVERY_SECONDS:
             self._prune_locked()
+            record = self._records.get(executor_uuid)
+        if record is None:
             record = self._records[executor_uuid] = ProgressRecord(executor_uuid=executor_uuid)
         record.updated_at = _now()
         record._touched_monotonic = time.monotonic()
@@ -100,7 +116,10 @@ class ValidationProgress:
         record.detail = detail
         if changed:
             record.phase_since = _now()
-            logger.info(
+            # One line per state change: INFO for a new node's express run (a handful a day),
+            # DEBUG for the cycle's runs (three per executor per wave).
+            logger.log(
+                logging.INFO if record.lane == EXPRESS else logging.DEBUG,
                 _m(
                     "[progress] Executor verification state changed",
                     extra=get_extra_info(
@@ -157,18 +176,28 @@ class ValidationProgress:
     def step_finished(self, executor_uuid: str, check_id: str, reason_code: str | None, passed: bool) -> None:
         with self._lock:
             record = self._record(executor_uuid)
-            for step in reversed(record.steps):
-                if step.check_id == check_id and step.finished_at is None:
-                    step.finished_at = _now()
-                    step.passed = passed
-                    step.reason_code = reason_code
-                    break
-            record.last_reason_code = reason_code
-            if not passed:
-                record.last_error = reason_code
-            if record.current_check_id == check_id:
-                record.current_check_id = None
-                record.current_check_since = None
+            self._close_step(record, check_id, reason_code, passed)
+
+    def step_aborted(self, executor_uuid: str, check_id: str, error_class: str) -> None:
+        """The check raised or was cancelled; only the exception's class name is recorded."""
+        with self._lock:
+            record = self._record(executor_uuid)
+            self._close_step(record, check_id, f"{ABORTED_PREFIX}{error_class}", passed=False)
+
+    @staticmethod
+    def _close_step(record: ProgressRecord, check_id: str, reason_code: str | None, passed: bool) -> None:
+        for step in reversed(record.steps):
+            if step.check_id == check_id and step.finished_at is None:
+                step.finished_at = _now()
+                step.passed = passed
+                step.reason_code = reason_code
+                break
+        record.last_reason_code = reason_code
+        if not passed:
+            record.last_error = f"{check_id}: {reason_code}" if reason_code else check_id
+        if record.current_check_id == check_id:
+            record.current_check_id = None
+            record.current_check_since = None
 
     def retry_scheduled(self, executor_uuid: str, reason: str, in_seconds: float, attempt: int) -> None:
         with self._lock:
@@ -212,15 +241,16 @@ class ValidationProgress:
             return [record.as_dict() for record in self._records.values()]
 
     def _prune_locked(self) -> None:
-        cutoff = time.monotonic() - RETENTION_SECONDS
-        finished = {VERIFIED, PUBLISHED, FAILED, LEFT_TO_CYCLE}
+        self._last_prune = time.monotonic()
+        cutoff = self._last_prune - RETENTION_SECONDS
         for executor_uuid in [
-            e for e, r in self._records.items() if r.phase in finished and r._touched_monotonic < cutoff
+            e for e, r in self._records.items() if r.phase in FINISHED_PHASES and r._touched_monotonic < cutoff
         ]:
             del self._records[executor_uuid]
         if len(self._records) > MAX_RECORDS:
-            oldest = sorted(self._records.values(), key=lambda r: r._touched_monotonic)
-            for record in oldest[: len(self._records) - MAX_RECORDS]:
+            # Finished records first, oldest first; live records only when they alone exceed the cap.
+            by_age = sorted(self._records.values(), key=lambda r: (r.phase not in FINISHED_PHASES, r._touched_monotonic))
+            for record in by_age[: len(self._records) - MAX_RECORDS]:
                 del self._records[record.executor_uuid]
 
 
@@ -241,6 +271,12 @@ class PipelineProgress:
             self.registry.step_finished(ctx.executor.uuid, check_id, getattr(event, "reason_code", None), passed)
         except Exception:  # noqa: BLE001
             logger.debug("progress step_finished failed", exc_info=True)
+
+    def step_aborted(self, ctx, check_id: str, error_class: str) -> None:
+        try:
+            self.registry.step_aborted(ctx.executor.uuid, check_id, error_class)
+        except Exception:  # noqa: BLE001
+            logger.debug("progress step_aborted failed", exc_info=True)
 
 
 # One registry per validator process: the pipeline writes it, the HTTP route reads it.
