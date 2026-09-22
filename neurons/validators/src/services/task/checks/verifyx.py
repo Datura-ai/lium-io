@@ -221,6 +221,8 @@ class VerifyXCheck:
             )
             if errors:
                 event.what_we_saw["errors"] = errors
+            if result.data.get("verifyx_library"):
+                event.what_we_saw["verifyx_library"] = result.data["verifyx_library"]
             if sizing:
                 event.what_we_saw["first_pass_challenge_config"] = sizing[
                     "challenge_config_overrides"

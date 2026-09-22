@@ -1,5 +1,5 @@
 import pathlib
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -71,6 +71,19 @@ class VerifyXSettings(BaseSettings):
     ENABLE_XET_CHALLENGE: bool = Field(
         default=True,
         description="Include HuggingFace Xet download challenge in VerifyX",
+    )
+    # DAH-2774: an executor must present the validator's own libverifyx.so sha256 or it fails
+    # VerifyX (OUTDATED_LIBRARY_ERROR), and executors reach a new image only as fast as their
+    # updater (EXECUTOR_IMAGE_CHECK_ENFORCE is off for that reason). So a library bump accepts the
+    # library it replaces until PREVIOUS_LIB_ACCEPTED_UNTIL; such an executor is measured as that
+    # library's validator measured it (the package download speed). "" closes the window.
+    PREVIOUS_LIB_SHA256: str = Field(
+        default="16b9a5012f8e6b4438fbedfe722b9c30de9e2f2e98373aed33094c6ff6be564f",
+        description="sha256 of the libverifyx.so before the current one (lium-io 5aad3566)",
+    )
+    PREVIOUS_LIB_ACCEPTED_UNTIL: datetime = Field(
+        default=datetime(2026, 10, 13, tzinfo=UTC),
+        description="UTC moment the previous libverifyx.so stops being accepted",
     )
 
 

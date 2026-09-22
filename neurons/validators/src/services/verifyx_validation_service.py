@@ -5,6 +5,7 @@ import random
 import os
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 
@@ -159,6 +160,9 @@ class VerifyXChallenge:
     log_extra: Dict[str, Any]
     # sha256 of the validator's own libverifyx.so; the executor's must match before its answer counts.
     expected_lib_sha256: str
+    # expected_lib_sha256 plus, inside the transition window, the library it replaced
+    # (VerifyXValidationService.accepted_lib_sha256s).
+    accepted_lib_sha256s: frozenset[str] = frozenset()
 
 
 class VerifyXValidationService:
@@ -175,6 +179,20 @@ class VerifyXValidationService:
         if self._lib_sha256 is None:
             self._lib_sha256 = sha256_from_path(self.lib_name)
         return self._lib_sha256
+
+    def accepted_lib_sha256s(self, now: datetime | None = None) -> frozenset[str]:
+        """The executor library digests that may answer: this validator's own, and until
+        `VERIFYX_PREVIOUS_LIB_ACCEPTED_UNTIL` the one it replaced (`VERIFYX_PREVIOUS_LIB_SHA256`),
+        so executors that have not pulled the new image yet keep passing during a rollout."""
+        current = self.lib_sha256()
+        previous = settings.verifyx.PREVIOUS_LIB_SHA256
+        until = settings.verifyx.PREVIOUS_LIB_ACCEPTED_UNTIL
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=UTC)
+        now = now or datetime.now(UTC)
+        if previous and previous != current and now < until:
+            return frozenset({current, previous})
+        return frozenset({current})
 
     def prepare_verifyx_challenge(
         self,
@@ -231,6 +249,7 @@ class VerifyXValidationService:
             challenge_input=challenge_input,
             log_extra=log_extra,
             expected_lib_sha256=self.lib_sha256(),
+            accepted_lib_sha256s=self.accepted_lib_sha256s(),
         )
 
     def evaluate_verifyx_capture(
@@ -238,8 +257,13 @@ class VerifyXValidationService:
         challenge: "VerifyXChallenge",
         capture: SSHCapture,
         default_extra: dict,
+        *,
+        previous_library: bool = False,
     ) -> "VerifyXResponse":
-        """Judge the executor's `verifyx_executor.py` output — SSH capture or `/verify` step alike."""
+        """Judge the executor's `verifyx_executor.py` output — SSH capture or `/verify` step alike.
+
+        `previous_library`: the executor presented the library this one replaced (accepted during
+        the transition window); its answer is read as that library's validator read it."""
         if capture.transport_error is not None:
             return self._failure_response(
                 error=f"SSH transport error ({capture.transport_error})",
@@ -268,11 +292,14 @@ class VerifyXValidationService:
 
         try:
             payload = challenge.validator.verify_response(challenge_response)
+            if previous_library:
+                payload = _as_measured_for_the_previous_library(payload)
             verification_result = _perform_verification_checks(payload)
-            _log_verifyx_network_speeds(
-                verification_result.get("network") or {},
-                default_extra,
-            )
+            log_extra = default_extra
+            if previous_library:
+                verification_result["verifyx_library"] = "previous"
+                log_extra = {**default_extra, "verifyx_library": "previous"}
+            _log_verifyx_network_speeds(verification_result.get("network") or {}, log_extra)
             return VerifyXResponse(data=verification_result)
         except Exception as e:
             return self._failure_response(
@@ -297,7 +324,7 @@ class VerifyXValidationService:
             local_checksum = self.lib_sha256()
             executor_checksum = await sha256_from_executor(shell, self.lib_name)
 
-            if local_checksum != executor_checksum:
+            if executor_checksum not in self.accepted_lib_sha256s():
                 return VerifyXResponse(error=OUTDATED_LIBRARY_ERROR)
 
             challenge = self.prepare_verifyx_challenge(
@@ -309,7 +336,12 @@ class VerifyXValidationService:
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
             ssh_capture = await self._run_ssh_command(shell, command)
-            return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
+            return self.evaluate_verifyx_capture(
+                challenge,
+                ssh_capture,
+                default_extra,
+                previous_library=executor_checksum != local_checksum,
+            )
 
         except Exception as e:
             # Pre-SSH failure (checksum fetch, challenge generation, etc.) — emit a structured
@@ -415,6 +447,24 @@ def _verify_memory_test(challenge_data: dict, response_data: dict) -> Tuple[dict
     stats = _get_memory_stats(memory_execution, success)
 
     return stats, errors
+
+
+def _as_measured_for_the_previous_library(payload: dict) -> dict:
+    """The previous libverifyx.so (lium-io main before DAH-2774) reports `speedtest.download_mbps`
+    as its requested byte count over the elapsed time, whatever the HTTP status or the bytes that
+    arrived, and its validator gated and listed `download.speed_mbps` (the package download). An
+    executor still on it is read that way: the package speed stands in for the capacity reading."""
+    response_data = payload.get("response_data") or {}
+    network_execution = response_data.get("network_execution") or {}
+    package_speed = (network_execution.get("download") or {}).get("speed_mbps")
+    speedtest = {**(network_execution.get("speedtest") or {}), "download_mbps": package_speed}
+    return {
+        **payload,
+        "response_data": {
+            **response_data,
+            "network_execution": {**network_execution, "speedtest": speedtest},
+        },
+    }
 
 
 def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
