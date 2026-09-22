@@ -11,6 +11,7 @@ from core.utils import (
     widen_default_thread_pool,
 )
 from core.validator import Validator
+from routes.validation_progress import router as validation_progress_router
 
 configure_logs_of_other_modules()
 wait_for_services_sync()
@@ -41,6 +42,8 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     lifespan=app_lifespan,
 )
+# Support view: which check each node is on, since when, last error (core/validation_progress.py).
+app.include_router(validation_progress_router)
 
 reload = True if settings.ENV == "dev" else False
 
