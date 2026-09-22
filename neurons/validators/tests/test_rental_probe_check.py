@@ -110,10 +110,12 @@ class FakeDocker:
             else ContainerDeleted(miner_hotkey=MINER, executor_id=EXECUTOR.uuid, pod_id="pod")
         )
         self.create_calls: list[tuple] = []
+        self.create_kinds: list[str | None] = []
         self.delete_calls: list[tuple] = []
 
-    async def create_container(self, payload, executor_info, keypair, private_key):
+    async def create_container(self, payload, executor_info, keypair, private_key, container_kind=None):
         self.create_calls.append((payload, executor_info, keypair, private_key))
+        self.create_kinds.append(container_kind)
         if isinstance(self.create_result, Exception):
             raise self.create_result
         return self.create_result
@@ -575,7 +577,7 @@ async def test_the_probe_holds_the_create_lock_from_the_idleness_re_read_until_i
     events: list[str] = []
 
     class RecordingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, container_kind=None):
             events.append("create")
             return await super().create_container(payload, executor_info, keypair, private_key)
 
@@ -639,13 +641,72 @@ async def test_a_create_lock_that_cannot_be_taken_is_no_verdict():
     assert docker.create_calls == []
 
 
+def host_lists_containers(ctx, listing: str, *, exit_status: int = 0) -> None:
+    """The validation shell answers the container listing with `listing` and every other command as before."""
+    default = ctx.ssh.run.return_value
+
+    async def run(command, *args, **kwargs):
+        if command == module.DOCKER_PS_ALL_NAMES_NETUID_CMD:
+            return MagicMock(exit_status=exit_status, stdout=listing, stderr="")
+        return default
+
+    ctx.ssh.run.side_effect = run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "netuid,listing,foreign",
+    [
+        # a staging probe on a host that also runs a mainnet executor's renter pod
+        (37, "pod_prod 51\nwatchtower \n", ["pod_prod"]),
+        # a staging probe beside a pod started before the label existed
+        (37, "pod_legacy \n", ["pod_legacy"]),
+        # a mainnet probe beside a staging filler, and beside an unlabeled pod its backend does not list
+        (51, "filler_stage 37\npod_legacy \n", ["filler_stage", "pod_legacy"]),
+    ],
+)
+async def test_a_host_with_another_networks_rental_container_is_not_probed(netuid, listing, foreign):
+    """Regression: the probe's create sweeps every pod_/filler_ container it is not told about, and the
+    backend's "idle" covers only this network's pods; on a host shared with another network's executor the
+    probe removes that network's renter pod."""
+    ctx, docker, redis = make_probe_context()
+    host_lists_containers(ctx, listing)
+    with probe_settings(), renter_path(), patch.object(module.settings, "BITTENSOR_NETUID", netuid):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FOREIGN_RENTAL_CONTAINER.reason == "RENTAL_PROBE_FOREIGN_RENTAL_CONTAINER"
+    assert result.event.what_we_saw["foreign_containers"] == foreign
+    assert docker.create_calls == [] and redis.create_lock_events == ["acquired", "released"]
+
+
+@pytest.mark.asyncio
+async def test_a_host_whose_container_list_cannot_be_read_is_not_probed():
+    ctx, docker, redis = make_probe_context()
+    host_lists_containers(ctx, "", exit_status=1)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.event.what_we_saw["reason"] == "could not list the node's containers"
+    assert docker.create_calls == [] and redis.create_lock_events == ["acquired", "released"]
+
+
+@pytest.mark.asyncio
+async def test_a_host_holding_only_this_networks_rental_containers_is_probed_with_the_probe_label():
+    ctx, docker, _ = make_probe_context()
+    host_lists_containers(ctx, "pod_leftover 37\nwatchtower \n")
+    with probe_settings(), renter_path(), patch.object(module.settings, "BITTENSOR_NETUID", 37):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.PROBE_OK.reason
+    assert len(docker.create_calls) == 1 and docker.create_kinds == ["probe"]
+
+
 @pytest.mark.asyncio
 async def test_the_create_lock_is_released_when_the_create_is_cut_short():
     """Regression: the create's deadline, a raise or the cycle's cancellation leaves the lock held until
     its TTL, and a renter's create waits that long."""
 
     class RaisingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, container_kind=None):
             raise RuntimeError("redis down")
 
     ctx, _, redis = make_probe_context(docker=RaisingDocker())
@@ -655,7 +716,7 @@ async def test_the_create_lock_is_released_when_the_create_is_cut_short():
     assert redis.create_lock_events == ["acquired", "released"]
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, container_kind=None):
             await asyncio.sleep(30)
 
     ctx, _, redis = make_probe_context(docker=HangingDocker())
@@ -1056,7 +1117,7 @@ async def test_the_cycles_cancellation_mid_create_still_removes_the_container_by
     mark, and the container binds the verified ports into the next cycle."""
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, container_kind=None):
             self.create_calls.append((payload, executor_info, keypair, private_key))
             await asyncio.sleep(30)
             return created()
@@ -1208,7 +1269,7 @@ async def test_a_create_that_hangs_is_cut_off_and_its_container_removed_by_name(
     the node."""
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, container_kind=None):
             self.create_calls.append((payload, executor_info, keypair, private_key))
             await asyncio.sleep(30)
             return created()

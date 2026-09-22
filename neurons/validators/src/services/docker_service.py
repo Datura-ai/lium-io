@@ -85,12 +85,22 @@ from services.gpu_power_limit import (
 )
 from services.prerun_host_probe import (
     DOCKER_MOUNTED_VOLUME_NAMES_CMD,
-    DOCKER_PS_ALL_NAMES_CMD,
-    DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
+    DOCKER_PS_ALL_NAMES_NETUID_CMD,
+    DOCKER_VOLUME_LS_NAME_DRIVER_NETUID_CMD,
     PrerunHostProbe,
+    ProbedVolume,
     image_label_command,
     parse_prerun_host_probe,
+    parse_volume_line,
     prerun_host_probe_command,
+)
+from services.rental_container_labels import (
+    KIND_FILLER,
+    KIND_POD,
+    container_in_scope,
+    netuid_owns,
+    parse_names_with_netuid,
+    rental_labels,
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
@@ -1302,6 +1312,7 @@ class DockerService:
         effective_storage_limit_gb: int | None,
         cpu_count: int | None,
         quote_socket: bool = False,
+        labels: dict[str, str] | None = None,
     ) -> ContainerRunSpec:
         environment = {
             key: str(value)
@@ -1362,6 +1373,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            labels=dict(labels or {}),
         )
 
     async def _ensure_pod_quote_socket(
@@ -2085,12 +2097,18 @@ class DockerService:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+        Only containers carrying this validator's `io.lium.netuid` label are candidates (unlabeled
+        legacy ones too on mainnet): a testnet executor can share the host's daemon with a mainnet
+        one, and the other network's backend is the one that knows its pods.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
+            netuid_labels: dict[str, str] = dict(host_probe.container_netuid_labels)
         else:
-            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_CMD)
-            all_names = [name for name in (result.stdout or "").strip().split("\n") if name]
+            result = await ssh_client.run(DOCKER_PS_ALL_NAMES_NETUID_CMD)
+            listed = parse_names_with_netuid(result.stdout or "")
+            all_names = [entry.name for entry in listed]
+            netuid_labels = {entry.name: entry.netuid_label for entry in listed if entry.netuid_label}
         if all_names:
             # Optional pre-GC delay (default 0). DAH-1524 removed the 10s
             # deploy-path sleep; the port-race it hedged is now covered by
@@ -2110,10 +2128,27 @@ class DockerService:
                 or name.startswith(FILLER_CONTAINER_PREFIX)
             ]
             stale_containers = []
+            other_network_containers = []
             for name in pod_containers:
                 if name in active_set:
                     continue
+                if name != pod_name and not container_in_scope(
+                    name, netuid_labels.get(name), settings.BITTENSOR_NETUID
+                ):
+                    other_network_containers.append(name)
+                    continue
                 stale_containers.append(name)
+            if other_network_containers:
+                logger.info(
+                    _m(
+                        "Leaving containers of another network's validator on the host",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "netuid": settings.BITTENSOR_NETUID,
+                            "kept_containers": other_network_containers,
+                        }),
+                    ),
+                )
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return []
@@ -2161,17 +2196,17 @@ class DockerService:
 
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
         failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
-        caller passes it only while nothing has removed a container since the probe ran.
+        caller passes it only while nothing has removed a container since the probe ran. A volume
+        is a candidate only when it carries this validator's `io.lium.netuid` label (or none, on
+        mainnet), the same rule as clean_existing_containers.
         """
         skip_set = {name for name in (skip_volume_names or []) if name}
-        list_volumes_cmd = DOCKER_VOLUME_LS_NAME_DRIVER_CMD
+        list_volumes_cmd = DOCKER_VOLUME_LS_NAME_DRIVER_NETUID_CMD
         mounted_volumes_cmd = DOCKER_MOUNTED_VOLUME_NAMES_CMD
 
         try:
             if host_probe is not None and host_probe.volumes is not None:
-                volume_rows: list[tuple[str, str]] = [
-                    (volume.name, volume.driver) for volume in host_probe.volumes
-                ]
+                volume_rows: list[ProbedVolume] = list(host_probe.volumes)
             else:
                 volume_result = await ssh_client.run(list_volumes_cmd)
                 if getattr(volume_result, "exit_status", 0) != 0:
@@ -2185,20 +2220,23 @@ class DockerService:
                         )
                     )
                     return []
-                volume_rows = []
-                for line in (volume_result.stdout or "").splitlines():
-                    parts = line.strip().split(maxsplit=1)
-                    if len(parts) == 2:
-                        volume_rows.append((parts[0], parts[1]))
+                volume_rows = [
+                    volume
+                    for volume in (
+                        parse_volume_line(line) for line in (volume_result.stdout or "").splitlines()
+                    )
+                    if volume is not None
+                ]
 
             vloopback_volumes = set()
-            for name, driver in volume_rows:
+            for volume in volume_rows:
                 if not (
-                    name.startswith("volume_")
-                    and (driver == "vloopback" or driver.startswith("vloopback:"))
+                    volume.name.startswith("volume_")
+                    and (volume.driver == "vloopback" or volume.driver.startswith("vloopback:"))
+                    and netuid_owns(volume.netuid_label, settings.BITTENSOR_NETUID)
                 ):
                     continue
-                vloopback_volumes.add(name)
+                vloopback_volumes.add(volume.name)
             if not vloopback_volumes:
                 return []
 
@@ -3687,6 +3725,7 @@ class DockerService:
         timeout: int = 10,
         sparse: bool = False,
         host_probe: VolumeHostProbe | None = None,
+        labels: dict[str, str] | None = None,
     ):
         requested_timeout = timeout
         _quote_safe_docker_volume_name(
@@ -3766,6 +3805,7 @@ class DockerService:
                 driver=volume_driver,
                 driver_opts=volume_driver_opts,
                 timeout=timeout,
+                labels=labels,
             ),
             volume_name=local_volume,
             volume_driver=volume_driver,
@@ -4575,10 +4615,19 @@ class DockerService:
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
+        container_kind: str | None = None,
     ):
+        """``container_kind`` names the `io.lium.kind` label; the payload's workload kind by default."""
         warnings = []
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
+        validator_hotkey = getattr(keypair, "ss58_address", None)
+        resource_labels = rental_labels(
+            netuid=settings.BITTENSOR_NETUID,
+            validator_hotkey=validator_hotkey if isinstance(validator_hotkey, str) else None,
+            kind=container_kind
+            or (KIND_FILLER if payload.workload_kind == WorkloadKind.FILLER else KIND_POD),
+        )
 
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
@@ -5282,6 +5331,7 @@ class DockerService:
                         limit=effective_volume_limit_gb,
                         sparse=full_node_rental,
                         host_probe=volume_probe,
+                        labels=resource_labels,
                     )
                     created_local_volume = True
 
@@ -5440,6 +5490,7 @@ class DockerService:
                     effective_storage_limit_gb=effective_storage_limit_gb,
                     cpu_count=cpu_count,
                     quote_socket=quote_socket,
+                    labels=resource_labels,
                 )
 
                 logger.info(

@@ -971,3 +971,44 @@ async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
         {"username": "renter", "password": "renter-secret", "image": _DEFAULT_IMAGE}
     ]
     assert _login_step(result).skipped is False
+
+
+# ------------------------------------------------------------------
+# io.lium.netuid / io.lium.validator / io.lium.kind on the container and its volume
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_labels_the_container_and_its_volume_with_network_validator_and_kind(svc, monkeypatch):
+    ssh_client = _ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(ds_module.settings, "BITTENSOR_NETUID", 37)
+
+    result = await _run(svc, _payload())
+
+    assert isinstance(result, ContainerCreated)
+    expected = {"io.lium.netuid": "37", "io.lium.validator": "validator-hotkey", "io.lium.kind": "pod"}
+    assert _created_run_spec(svc).labels == expected
+    assert svc.create_local_volume.await_args.kwargs["labels"] == expected
+
+
+@pytest.mark.asyncio
+async def test_create_labels_the_rental_probe_with_its_own_kind(svc, monkeypatch):
+    ssh_client = _ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    payload = _payload()
+
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+        container_kind="probe",
+    )
+
+    assert isinstance(result, ContainerCreated)
+    assert _created_run_spec(svc).labels == {
+        "io.lium.netuid": "51",
+        "io.lium.validator": "validator-hotkey",
+        "io.lium.kind": "probe",
+    }

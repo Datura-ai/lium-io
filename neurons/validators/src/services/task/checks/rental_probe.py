@@ -23,6 +23,12 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 
 from ...const import MIN_PORT_COUNT, POD_CONTAINER_PREFIX
+from ...prerun_host_probe import DOCKER_PS_ALL_NAMES_NETUID_CMD
+from ...rental_container_labels import (
+    KIND_PROBE,
+    foreign_rental_containers,
+    parse_names_with_netuid,
+)
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -178,8 +184,10 @@ class RentalProbeCheck:
     pod is the backend's to judge; the standing failure applies again once the node is idle. It runs
     again when the node is idle and the image is pulled (the interval stamp is written
     on success only). Otherwise the probe runs at most once per RENTAL_PROBE_INTERVAL_HOURS per
-    executor. It never runs on a rented node or beside a filler: the start path sweeps
-    `pod_*`/`filler_*` containers it was not told about and lifts GPU power caps. Before the
+    executor. It never runs on a rented node, beside a filler, or on a Docker host holding a
+    `pod_*`/`filler_*` container without this network's `io.lium.netuid` label
+    (RENTAL_PROBE_FOREIGN_RENTAL_CONTAINER): the start path sweeps `pod_*`/`filler_*` containers it
+    was not told about and lifts GPU power caps. Before the
     container starts the probe takes the per-executor create lock a renter's create holds around
     `create_container` (RedisService.executor_create_exclusion) without waiting, skips the node when a
     renter holds it, and re-reads the node's idleness from the backend and this validator's pending-pod
@@ -327,10 +335,43 @@ class RentalProbeCheck:
         except BaseException:
             await create_lock.release(ctx)
             raise
+        if refusal is None:
+            try:
+                refusal = await self._host_holds_only_own_rentals(ctx, standing)
+            except BaseException:
+                await create_lock.release(ctx)
+                raise
         if refusal is not None:
             await create_lock.release(ctx)
             return refusal
         return _ProbeGate(image_ref=image_ref, create_lock=create_lock, standing=standing)
+
+    async def _host_holds_only_own_rentals(
+        self, ctx: Context, standing: _Failure | None
+    ) -> CheckResult | None:
+        """The result that stops the cycle when the host runs a rental container this network did not
+        start (or the listing failed); None when every `pod_*`/`filler_*` there carries our netuid.
+
+        The executor drives the host's Docker daemon, which a testnet executor can share with a
+        mainnet one. The backend's "idle" covers only this network's pods, and the create's sweep
+        would remove any rental container it is not told about, so the probe stays off such a host.
+        """
+        listed = await _host_rental_containers(ctx)
+        if listed is None:
+            return self._inconclusive(
+                ctx, "could not list the node's containers", steps=[], standing=standing
+            )
+        foreign = foreign_rental_containers(listed, settings.BITTENSOR_NETUID)
+        if not foreign:
+            return None
+        return self._inconclusive(
+            ctx,
+            "the Docker host runs a rental container this network did not start",
+            steps=[],
+            what={"foreign_containers": foreign[:_FOREIGN_CONTAINERS_LISTED]},
+            standing=standing,
+            template=Msg.FOREIGN_RENTAL_CONTAINER,
+        )
 
     async def _idle_under_lock(self, ctx: Context, standing: _Failure | None) -> CheckResult | None:
         """Re-read the node's idleness under the create lock; the result that stops the cycle, or None.
@@ -426,11 +467,12 @@ class RentalProbeCheck:
         steps: list[_Step],
         what: dict[str, Any] | None = None,
         standing: _Failure | None = None,
+        template: Any = Msg.INCONCLUSIVE,
     ) -> CheckResult:
         if standing is not None:
             return self._carried(ctx, standing, no_verdict=f"inconclusive: {reason}")
         event = render_message(
-            Msg.INCONCLUSIVE,
+            template,
             ctx=ctx,
             check_id=self.check_id,
             what={
@@ -502,6 +544,25 @@ async def _busy_now(ctx: Context) -> str | None:
         _read_failed(ctx, "its pending-pod marks in Redis")
         return None
     return ""
+
+
+# how many foreign container names the event carries (the host could run many)
+_FOREIGN_CONTAINERS_LISTED = 10
+
+
+async def _host_rental_containers(ctx: Context) -> list | None:
+    """Every container on the host with its netuid label; None when the validation shell could not list them."""
+    try:
+        result = await asyncio.wait_for(
+            ctx.ssh.run(DOCKER_PS_ALL_NAMES_NETUID_CMD, check=False),
+            timeout=_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (TimeoutError, asyncssh.Error, OSError):
+        _read_failed(ctx, "the node's container list")
+        return None
+    if result.exit_status != 0:
+        return None
+    return parse_names_with_netuid(result.stdout or "")
 
 
 def _missing_inputs(ctx: Context) -> str | None:
@@ -736,6 +797,7 @@ def _probe_payload(
         ],
         pod_mapping=[],
         # nothing to protect: the probe runs only when the backend lists no pod and no filler here
+        # and every rental container on the host carries this network's label
         active_container_names=[],
         active_volume_names=[],
     )
@@ -812,6 +874,7 @@ async def _step_container_start(
                 ctx.executor,
                 ctx.config.validator_keypair,
                 ctx.executor_ssh_private_key_encrypted,
+                container_kind=KIND_PROBE,
             ),
             timeout=_CREATE_DEADLINE_SECONDS,
         )

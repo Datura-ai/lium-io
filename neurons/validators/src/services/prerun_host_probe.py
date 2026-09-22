@@ -28,6 +28,7 @@ from services.nvidia_devices import (
     PROC_GPU_INFO_CMD,
     shared_device_nodes_command,
 )
+from services.rental_container_labels import NETUID_FORMAT_FIELD, parse_name_with_netuid
 
 # Tags, in the order the probe prints them. Every tag ends with a `<TAG>_RC` line.
 PS_TAG = "PS"
@@ -57,9 +58,14 @@ _RC_SUFFIX = "_RC"
 PROBE_OUTPUT_LOG_CAP = 512
 
 # The docker listings, shared with the per-command path in docker_service.py (imported there, so
-# the two paths run the same text).
-DOCKER_PS_ALL_NAMES_CMD = '/usr/bin/docker ps -a --format "{{.Names}}"'
-DOCKER_VOLUME_LS_NAME_DRIVER_CMD = '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
+# the two paths run the same text). Each line ends with the `io.lium.netuid` label (empty when the
+# resource has none): the sweeps remove only their own network's containers and volumes.
+DOCKER_PS_ALL_NAMES_NETUID_CMD = (
+    f"/usr/bin/docker ps -a --format '{{{{.Names}}}} {NETUID_FORMAT_FIELD}'"
+)
+DOCKER_VOLUME_LS_NAME_DRIVER_NETUID_CMD = (
+    f"/usr/bin/docker volume ls --format '{{{{.Name}}}} {{{{.Driver}}}} {NETUID_FORMAT_FIELD}'"
+)
 DOCKER_MOUNTED_VOLUME_NAMES_CMD = (
     "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
     '\'{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\\n"}}{{end}}{{end}}\''
@@ -84,6 +90,7 @@ class ProbedVolume:
 
     name: str
     driver: str  # `local`, `vloopback`, `vloopback:latest`, …
+    netuid_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +112,9 @@ class PrerunHostProbe:
         str | None
     )  # raw nvidia-smi CSV for `_parse_power_state_csv`; None when not asked
     image_label_value: str | None  # the label's value, stripped; None when inspect failed
+    # (name, netuid label) for every listed container that carries the label; a name in
+    # container_names and not here has none
+    container_netuid_labels: tuple[tuple[str, str], ...] = ()
 
     @property
     def volume_names(self) -> tuple[str, ...] | None:
@@ -143,8 +153,8 @@ def prerun_host_probe_command(*, docker_image: str, image_label: str, with_power
         'if [ -n "$out" ]; then printf \'%s\\n\' "$out" | awk -v t="$tag" \'{ print t "\\t" $0 }\' '
         f"|| echo {PREFIX_FAILED_MARKER}; fi; "
         f'printf \'%s{_RC_SUFFIX}\\t%s\\n\' "$tag" "$rc"; }}',
-        _section(PS_TAG, DOCKER_PS_ALL_NAMES_CMD),
-        _section(VOL_TAG, DOCKER_VOLUME_LS_NAME_DRIVER_CMD),
+        _section(PS_TAG, DOCKER_PS_ALL_NAMES_NETUID_CMD),
+        _section(VOL_TAG, DOCKER_VOLUME_LS_NAME_DRIVER_NETUID_CMD),
         _section(MNT_TAG, DOCKER_MOUNTED_VOLUME_NAMES_CMD),
         _section(GPU_MINOR_MAP_TAG, PROC_GPU_INFO_CMD),
         _section(GPUDEV_TAG, GPU_DEVICE_NODES_CMD),
@@ -158,6 +168,18 @@ def prerun_host_probe_command(*, docker_image: str, image_label: str, with_power
         parts.append(_section(POWER_TAG, POWER_STATE_CMD))
     parts.append(_section(LABEL_TAG, image_label_command(docker_image, image_label)))
     return "; ".join(parts)
+
+
+def parse_volume_line(line: str) -> ProbedVolume | None:
+    """One `{{.Name}} {{.Driver}} {{.Label "io.lium.netuid"}}` line; None when it has no driver.
+
+    The per-command path in docker_service.py parses its listing with this too.
+    """
+    parts = line.split(maxsplit=2)
+    if len(parts) < 2:
+        return None
+    label = parts[2].strip() if len(parts) == 3 else ""
+    return ProbedVolume(name=parts[0], driver=parts[1], netuid_label=label or None)
 
 
 class PrerunHostProbeParseError(ValueError):
@@ -212,15 +234,26 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
     def stripped_lines(tag: str) -> tuple[str, ...]:
         return tuple(line.strip() for line in lines.get(tag, ()) if line.strip())
 
+    container_names: tuple[str, ...] | None = None
+    container_netuid_labels: list[tuple[str, str]] = []
+    if ok(PS_TAG):
+        names = []
+        for line in lines.get(PS_TAG, ()):
+            entry = parse_name_with_netuid(line)
+            if entry is None:
+                continue
+            names.append(entry.name)
+            if entry.netuid_label:
+                container_netuid_labels.append((entry.name, entry.netuid_label))
+        container_names = tuple(names)
+
     volumes: tuple[ProbedVolume, ...] | None = None
     if ok(VOL_TAG):
-        # `{{.Name}} {{.Driver}}` — the per-command path splits on the first space too.
-        parsed = []
-        for line in lines.get(VOL_TAG, ()):
-            parts = line.strip().split(maxsplit=1)
-            if len(parts) == 2:
-                parsed.append(ProbedVolume(name=parts[0], driver=parts[1]))
-        volumes = tuple(parsed)
+        volumes = tuple(
+            volume
+            for volume in (parse_volume_line(line) for line in lines.get(VOL_TAG, ()))
+            if volume is not None
+        )
 
     label_value: str | None = None
     if ok(LABEL_TAG):
@@ -229,7 +262,7 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
         label_value = "\n".join(lines.get(LABEL_TAG, ())).strip()
 
     return PrerunHostProbe(
-        container_names=stripped_lines(PS_TAG) if ok(PS_TAG) else None,
+        container_names=container_names,
         volumes=volumes,
         mounted_volume_names=stripped_lines(MNT_TAG) if ok(MNT_TAG) else None,
         gpu_minor_map_stdout="\n".join(lines.get(GPU_MINOR_MAP_TAG, ()))
@@ -242,4 +275,5 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
             "\n".join(lines.get(POWER_TAG, ())) if with_power and ok(POWER_TAG) else None
         ),
         image_label_value=label_value,
+        container_netuid_labels=tuple(container_netuid_labels),
     )

@@ -1415,6 +1415,13 @@ class RentalProbeMessages:
         category="runtime",
         impact="Proceed without penalty; the probe runs again next cycle",
     )
+    FOREIGN_RENTAL_CONTAINER = MessageTemplate(
+        event="Rental probe held: the node's Docker host runs a rental container this network did not start",
+        reason="RENTAL_PROBE_FOREIGN_RENTAL_CONTAINER",
+        severity="warning",
+        category="policy",
+        impact="Proceed without penalty; the probe runs once the host holds only this network's rental containers",
+    )
 
 
 class CpuTruthMessages:

@@ -88,6 +88,7 @@ class _FakeRentalDockerClient:
         # (operation, container_name) tuples shared by stop/remove, so tests can assert ordering
         self.container_call_order = []
         self.created_volumes = []
+        self.volume_labels = []
         self.removed_volumes = []
         self.pruned_images = 0
         self.login_error = None
@@ -159,6 +160,7 @@ class _FakeRentalDockerClient:
         driver: str | None = None,
         driver_opts: dict[str, str] | None = None,
         timeout: int | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         self.created_volumes.append(
             {
@@ -168,6 +170,7 @@ class _FakeRentalDockerClient:
                 "timeout": timeout,
             }
         )
+        self.volume_labels.append(labels)
 
     async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
         self.removed_volumes.append(

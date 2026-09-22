@@ -43,8 +43,8 @@ from services.nvidia_devices import (
 )
 from services.prerun_host_probe import (
     DOCKER_MOUNTED_VOLUME_NAMES_CMD,
-    DOCKER_PS_ALL_NAMES_CMD,
-    DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
+    DOCKER_PS_ALL_NAMES_NETUID_CMD,
+    DOCKER_VOLUME_LS_NAME_DRIVER_NETUID_CMD,
     PREFIX_FAILED_MARKER,
     PrerunHostProbe,
     PrerunHostProbeParseError,
@@ -151,8 +151,8 @@ def test_probe_command_carries_every_section_and_the_per_command_texts():
     # shlex.quote wraps each section command; the quoted forms of the shared texts are inside
     import shlex
 
-    assert shlex.quote(DOCKER_PS_ALL_NAMES_CMD) in cmd
-    assert shlex.quote(DOCKER_VOLUME_LS_NAME_DRIVER_CMD) in cmd
+    assert shlex.quote(DOCKER_PS_ALL_NAMES_NETUID_CMD) in cmd
+    assert shlex.quote(DOCKER_VOLUME_LS_NAME_DRIVER_NETUID_CMD) in cmd
     assert shlex.quote(DOCKER_MOUNTED_VOLUME_NAMES_CMD) in cmd
     assert f"|| echo {PREFIX_FAILED_MARKER}" in cmd
 
@@ -550,7 +550,7 @@ async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_n
             "/usr/bin/docker volume rm volume_new volume_x 2>/dev/null || true",
         ]
     )
-    assert _cmds(live) == ['/usr/bin/docker ps -a --format "{{.Names}}"']
+    assert _cmds(live) == [DOCKER_PS_ALL_NAMES_NETUID_CMD]
     assert _cmds(probed) == []
 
 
@@ -584,7 +584,7 @@ async def test_clean_existing_containers_failed_ps_section_lists_itself(docker_s
         )
         == []
     )
-    assert _cmds(ssh) == ['/usr/bin/docker ps -a --format "{{.Names}}"']
+    assert _cmds(ssh) == [DOCKER_PS_ALL_NAMES_NETUID_CMD]
 
 
 @pytest.mark.asyncio

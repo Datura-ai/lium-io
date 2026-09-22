@@ -131,6 +131,8 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # io.lium.netuid / io.lium.validator / io.lium.kind (services/rental_container_labels.py)
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -376,6 +378,7 @@ class RentalDockerSdkClient:
         driver: str | None = None,
         driver_opts: dict[str, str] | None = None,
         timeout: int | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         try:
             await _in_docker_thread(
@@ -384,6 +387,7 @@ class RentalDockerSdkClient:
                 driver=driver,
                 driver_opts=driver_opts,
                 timeout=timeout,
+                labels=labels,
             )
         except Exception as exc:
             raise RentalDockerOperationError(
@@ -534,6 +538,7 @@ class RentalDockerSdkClient:
             name=spec.name,
             entrypoint=spec.entrypoint or None,
             host_config=host_config,
+            labels=dict(spec.labels) or None,
         )
         self._api_client.start(spec.name)
 
@@ -584,6 +589,7 @@ class RentalDockerSdkClient:
         driver: str | None,
         driver_opts: dict[str, str] | None,
         timeout: int | None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         original_timeout = getattr(self._api_client, "timeout", None)
         should_override_timeout = timeout is not None and hasattr(
@@ -597,6 +603,7 @@ class RentalDockerSdkClient:
                 name=volume_name,
                 driver=driver,
                 driver_opts=driver_opts,
+                labels=labels or None,
             )
         finally:
             if should_override_timeout:

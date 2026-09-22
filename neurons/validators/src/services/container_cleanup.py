@@ -6,6 +6,7 @@ from typing import Optional
 import asyncssh
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from core.config import settings
 from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
 from core.utils import _m
 from services.const import (
@@ -18,6 +19,11 @@ from services.const import (
     FILLER_CONTAINER_PREFIX,
     POD_CONTAINER_PREFIX,
     RENTAL_CONTAINER_PREFIXES,
+)
+from services.rental_container_labels import (
+    container_in_scope,
+    parse_names_with_netuid,
+    ps_filter_names_netuid_command,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,9 +65,16 @@ DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
 
-    def __init__(self, stale_threshold_minutes: int = FILLER_CONTAINER_GRACE_MINUTES, dry_run: bool = False):
+    def __init__(
+        self,
+        stale_threshold_minutes: int = FILLER_CONTAINER_GRACE_MINUTES,
+        dry_run: bool = False,
+        netuid: int | None = None,
+    ):
         self.stale_threshold_minutes = stale_threshold_minutes
         self.dry_run = dry_run
+        # the network whose containers this validator may remove (services/rental_container_labels.py)
+        self.netuid = settings.BITTENSOR_NETUID if netuid is None else netuid
 
     async def cleanup(
         self,
@@ -451,18 +464,40 @@ class ContainerCleanup:
             return 0
 
     async def _get_all_rental_containers(self, ssh_client) -> list[str]:
-        """Get all containers with rental-related prefixes.
+        """Get this network's containers with rental-related prefixes.
 
         Iterates RENTAL_CONTAINER_PREFIXES (services/const.py) so any short-lived
         container that competes for the rental port range is caught by cleanup.
         A stale running `health_check_*` from a crashed backend would otherwise
         hold ports 9100-9130 indefinitely.
+
+        A `pod_*`/`filler_*`/`container_*` container is listed only when its `io.lium.netuid`
+        label is this validator's (or it has none and this is mainnet): a testnet executor can
+        share the host's daemon with a mainnet one, and this backend never lists the other
+        network's pods.
         """
         try:
             patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
-            result = await ssh_client.run(DockerCommand.ps_filter(*patterns))
-            if result.stdout and result.stdout.strip():
-                return result.stdout.strip().split('\n')
+            result = await ssh_client.run(ps_filter_names_netuid_command(*patterns))
+            listed = parse_names_with_netuid(result.stdout or "")
+            in_scope = [
+                entry.name
+                for entry in listed
+                if container_in_scope(entry.name, entry.netuid_label, self.netuid)
+            ]
+            if len(in_scope) != len(listed):
+                logger.info(
+                    _m(
+                        "Leaving containers of another network's validator on the host",
+                        extra={
+                            "netuid": self.netuid,
+                            "kept_containers": [
+                                entry.name for entry in listed if entry.name not in in_scope
+                            ],
+                        },
+                    )
+                )
+            return in_scope
         except Exception as e:
             logger.warning(
                 _m(

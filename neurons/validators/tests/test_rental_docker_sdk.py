@@ -588,6 +588,17 @@ def _rental_spec(network: str | None = RENTAL_NETWORK_NAME) -> ContainerRunSpec:
 
 
 @pytest.mark.asyncio
+async def test_run_container_passes_the_network_labels_to_docker():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+    labels = {"io.lium.netuid": "37", "io.lium.kind": "pod"}
+
+    await client.run_container(ContainerRunSpec(image="img:tag", name="pod_test", labels=labels))
+
+    assert api_client.created_container["labels"] == labels
+
+
+@pytest.mark.asyncio
 async def test_run_container_creates_the_icc_off_network_before_the_container():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
@@ -1146,6 +1157,7 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         driver="vloopback",
         driver_opts={"size": "23g"},
         timeout=133,
+        labels={"io.lium.netuid": "51"},
     )
     await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
@@ -1155,6 +1167,7 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
             "name": "volume_test",
             "driver": "vloopback",
             "driver_opts": {"size": "23g"},
+            "labels": {"io.lium.netuid": "51"},
             "client_timeout": 133,
         }
     ]
