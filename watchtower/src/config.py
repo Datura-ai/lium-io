@@ -1,6 +1,12 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# `project.version` in pyproject.toml (tests/test_watchtower.py holds the two equal). Sent as the
+# User-Agent of every digest request so the platform can count which watchtower versions poll it —
+# the fleet has no other watchtower-version signal (the executor's update-status report carries none).
+WATCHTOWER_VERSION: str = "1.2.0"
+WATCHTOWER_USER_AGENT: str = f"lium-watchtower/{WATCHTOWER_VERSION}"
+
 WATCHTOWER_ENDPOINT_URL: str = "https://lium.io/api/watchtower/digest"
 # The validator hotkey whose signature on the digest is trusted, and the one the Lium validator swaps
 # to (owner, 22 Sep 2026). Both are checked until the swap release drops the first; a build with a

@@ -159,8 +159,24 @@ def test_fetch_verified_digest_returns_digest_on_success(mock_get, mock_verify):
 
     # Assert — verified digest is returned and the correct URL was used
     assert digest == "sha256:newdigest"
-    mock_get.assert_called_once_with("http://test-endpoint.com/digest", timeout=30)
+    mock_get.assert_called_once_with(
+        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.0"}, timeout=30
+    )
     mock_verify.assert_called_once()
+
+
+def test_the_version_the_digest_request_announces_is_the_pyproject_version():
+    # regression: pyproject.toml is bumped for a release and the User-Agent keeps the old number, so the
+    # platform's per-version count (the read that gates the wallet swap) reports a fleet that never updated
+    import tomllib
+    from pathlib import Path
+
+    import config
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        assert config.WATCHTOWER_VERSION == tomllib.load(handle)["project"]["version"]
+    assert config.WATCHTOWER_USER_AGENT == f"lium-watchtower/{config.WATCHTOWER_VERSION}"
 
 
 @patch('watchtower.requests.get')

@@ -76,7 +76,10 @@ class Settings(BaseSettings):
     # The Lium validator this miner serves: new executors are listed under it (cli add-executor) and
     # only its sign-ins are accepted. The hotkey is being rotated (owner, 22 Sep 2026): both addresses
     # below are accepted, DEFAULT_VALIDATOR_HOTKEY stays the current one until the chain swap, and the
-    # swap is one config change — DEFAULT_VALIDATOR_HOTKEY=<VALIDATOR_NEXT_HOTKEY> — not a release.
+    # swap is one config edit, not a release — the pair swap DEFAULT_VALIDATOR_HOTKEY=<new>,
+    # VALIDATOR_NEXT_HOTKEY=<old>, so the old hotkey stays accepted while the chain settles. Setting
+    # only DEFAULT_VALIDATOR_HOTKEY=<new> would drop the old one at once. The old hotkey is dropped
+    # later by VALIDATOR_NEXT_HOTKEY="" (tests/test_validator_hotkey_rotation.py).
     DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default=LIUM_VALIDATOR_HOTKEY_CURRENT)
     VALIDATOR_NEXT_HOTKEY: str = Field(env="VALIDATOR_NEXT_HOTKEY", default=LIUM_VALIDATOR_HOTKEY_NEXT)
     CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)

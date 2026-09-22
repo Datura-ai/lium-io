@@ -10,6 +10,7 @@ from docker.models.containers import Container
 from config import (
     settings,
     WATCHTOWER_ENDPOINT_URL,
+    WATCHTOWER_USER_AGENT,
     WATCHTOWER_VALIDATOR_HOTKEY,
     WATCHTOWER_VALIDATOR_NEXT_HOTKEY,
 )
@@ -301,7 +302,8 @@ def fetch_verified_digest() -> Optional[str]:
     try:
         response = requests.get(
             WATCHTOWER_ENDPOINT_URL,
-            timeout=30
+            headers={"User-Agent": WATCHTOWER_USER_AGENT},
+            timeout=30,
         )
         response.raise_for_status()
 

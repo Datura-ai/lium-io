@@ -362,31 +362,39 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
         logger.error("❌ Failed to finalize reclaim request.")
         
 @cli.command()
-def migrate_validator_hotkey():
-    from core.config import settings
+@click.option(
+    "--from-hotkey",
+    "old_hotkey",
+    default=None,
+    help="The validator hotkey the rows are keyed to today. Default: VALIDATOR_NEXT_HOTKEY, which after the "
+    "swap-day pair swap (DEFAULT_VALIDATOR_HOTKEY=<new>, VALIDATOR_NEXT_HOTKEY=<old>) is the previous hotkey.",
+)
+@click.option(
+    "--to-hotkey",
+    "new_hotkey",
+    default=None,
+    help="The validator hotkey the rows move to. Default: DEFAULT_VALIDATOR_HOTKEY (the active one).",
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Count the rows that would move; change nothing.")
+def migrate_validator_hotkey(old_hotkey: str | None, new_hotkey: str | None, dry_run: bool):
+    """Re-key this miner's executor rows from one validator hotkey to another (the validator hotkey rotation:
+    run once per miner DB after the config pair swap; the central miner has no rows of its own)."""
     from core.db import get_db
-    from models.executor import Executor
-    from sqlmodel import func, select, update
+    from services.validator_service import migrate_validator_hotkey_rows
 
-    old_validator_hotkey = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
-
+    old_hotkey = old_hotkey or settings.VALIDATOR_NEXT_HOTKEY
+    new_hotkey = new_hotkey or settings.DEFAULT_VALIDATOR_HOTKEY
     session = next(get_db())
-    filters = [
-        Executor.validator == old_validator_hotkey,
-    ]
-    select_stmt = select(func.count(Executor.uuid)).where(*filters)
-    count = session.exec(select_stmt).one()
-    logger.info(f"Found {count} miners with validator {old_validator_hotkey}")
-    
-    update_stmt = (
-        update(Executor)
-        .where(*filters)
-        .values(validator=settings.DEFAULT_VALIDATOR_HOTKEY)
-    )
-    result = session.exec(update_stmt)
-    updated_count = result.rowcount
-    session.commit()
-    logger.info(f"Migration completed. Updated {updated_count} miners")
+    try:
+        result = migrate_validator_hotkey_rows(session, old_hotkey, new_hotkey, dry_run=dry_run)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
+
+    logger.info(f"Found {result.found} executor rows keyed to validator {old_hotkey}")
+    if dry_run:
+        logger.info(f"Dry run: {result.found} rows would move to validator {new_hotkey}; nothing changed")
+    else:
+        logger.info(f"Migration completed. Moved {result.updated} executor rows to validator {new_hotkey}")
 
 
 if __name__ == "__main__":
