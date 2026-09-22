@@ -1586,6 +1586,7 @@ SYS_CLASS_BLOCK_PATH = "/sys/class/block"
 SYS_DEV_BLOCK_PATH = "/sys/dev/block"
 SYS_DMI_ID_PATH = "/sys/class/dmi/id"
 SYS_HYPERVISOR_TYPE_PATH = "/sys/hypervisor/type"
+PROC_CPUINFO_PATH = "/proc/cpuinfo"
 # st_mode's file-type bits and the block-device value, spelled out because the packaged scrape cannot
 # import stat (obfuscator allowlist)
 ST_MODE_TYPE_MASK = 0o170000
@@ -1607,7 +1608,9 @@ STACKED_DEVICE_MAX_DEPTH = 8
 # 21 Sep 2026) whatever the host's storage is. A VM's disk is unknown, never hdd. Three tells, any
 # one enough: the device name (virtio, Xen), the disk's SCSI vendor/model (`QEMU HARDDISK`,
 # DigitalOcean's `DO Volume`, VirtualBox, VMware, Hyper-V, EC2/GCE volumes), and the host's DMI
-# vendor/product or `/sys/hypervisor/type` (what systemd-detect-virt reads). A bare-metal EC2
+# vendor/product, `/sys/hypervisor/type` (what systemd-detect-virt reads), or the `hypervisor`
+# flag in `/proc/cpuinfo` (every x86 hypervisor sets it; a VM whose DMI names no listed vendor
+# still reads unknown without it). A bare-metal EC2
 # `.metal` instance carries `Amazon EC2` in DMI and reads unknown too - the marker list, not the
 # flag, is where that would change.
 VIRTUAL_DISK_PREFIXES = ("vd", "xvd")
@@ -1704,14 +1707,25 @@ def read_sysfs_text(path: str) -> str:
 
 def host_is_a_virtual_machine() -> bool:
     """True when the host runs under a hypervisor: its DMI vendor or product names one (QEMU/KVM,
-    DigitalOcean, EC2, GCE, Hyper-V, VMware, VirtualBox, Xen, OpenStack, ...) or `/sys/hypervisor/type`
-    exists (Xen). Bare metal names its board maker (Supermicro, Dell, ASUS, Gigabyte) and has no
-    /sys/hypervisor."""
+    DigitalOcean, EC2, GCE, Hyper-V, VMware, VirtualBox, Xen, OpenStack, ...), `/sys/hypervisor/type`
+    exists (Xen), or `/proc/cpuinfo` carries the `hypervisor` flag (every x86 hypervisor sets it).
+    Bare metal names its board maker (Supermicro, Dell, ASUS, Gigabyte) and has neither tell."""
     for attribute in ("sys_vendor", "product_name"):
         dmi_text = read_sysfs_text(f"{SYS_DMI_ID_PATH}/{attribute}").lower()
         if dmi_text and any(marker in dmi_text for marker in VIRTUAL_MACHINE_DMI_MARKERS):
             return True
-    return bool(read_sysfs_text(SYS_HYPERVISOR_TYPE_PATH))
+    if read_sysfs_text(SYS_HYPERVISOR_TYPE_PATH):
+        return True
+    return _cpuinfo_has_hypervisor_flag()
+
+
+def _cpuinfo_has_hypervisor_flag() -> bool:
+    """True when `/proc/cpuinfo` lists `hypervisor` among the CPU flags."""
+    for line in read_sysfs_text(PROC_CPUINFO_PATH).splitlines():
+        if line.startswith("flags") or line.startswith("Flags"):
+            flags = f" {line.split(':', 1)[-1]} "
+            return " hypervisor " in flags
+    return False
 
 
 def disk_is_virtual(disk: str) -> bool:
@@ -1738,14 +1752,13 @@ def slaves_of(disk: str) -> list[str]:
 
 
 def slowest_disk_type(disk_types: list[str]) -> str:
-    """The slowest of several readings (hdd < ssd < nvme) - a volume group over an SSD and a
-    spinning disk delivers what the spinning disk does; unknown members are skipped, so a stack is
-    unknown only when none of its members resolves. The order is a tuple inside the function, not
-    a module-level one: obfuscator.py renames the names inside a function body, but not the members
-    of a module-level tuple literal."""
-    for disk_type in (DISK_TYPE_HDD, DISK_TYPE_SSD, DISK_TYPE_NVME):
-        if disk_type in disk_types:
-            return disk_type
+    """The type of a stacked device. Members that resolve to different kinds (hdd vs ssd vs nvme)
+    read ``unknown`` — a mixed stack has no single kind. Unknown members are skipped, so a stack is
+    unknown when none of its members resolves or when the resolved members differ. One resolved
+    kind, repeated, is that kind."""
+    known = {disk_type for disk_type in disk_types if disk_type != DISK_TYPE_UNKNOWN}
+    if len(known) == 1:
+        return known.pop()
     return DISK_TYPE_UNKNOWN
 
 

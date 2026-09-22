@@ -33,6 +33,7 @@ DISK_TYPE_HELPERS = {
     "SYS_DEV_BLOCK_PATH",
     "SYS_DMI_ID_PATH",
     "SYS_HYPERVISOR_TYPE_PATH",
+    "PROC_CPUINFO_PATH",
     "ST_MODE_TYPE_MASK",
     "ST_MODE_BLOCK_DEVICE",
     "DISK_TYPE_NVME",
@@ -51,6 +52,7 @@ DISK_TYPE_HELPERS = {
     "whole_disk_of",
     "read_sysfs_text",
     "host_is_a_virtual_machine",
+    "_cpuinfo_has_hypervisor_flag",
     "disk_is_virtual",
     "slaves_of",
     "slowest_disk_type",
@@ -80,6 +82,7 @@ def scrape(tmp_path: Path) -> dict[str, Any]:
     namespace["HOST_ROOT_PREFIX"] = str(tmp_path / "pid1-root")
     namespace["SYS_DMI_ID_PATH"] = str(tmp_path / "dmi_id")
     namespace["SYS_HYPERVISOR_TYPE_PATH"] = str(tmp_path / "hypervisor_type")
+    namespace["PROC_CPUINFO_PATH"] = str(tmp_path / "cpuinfo")
     return namespace
 
 
@@ -421,6 +424,20 @@ def test_a_sys_hypervisor_type_file_marks_the_host_as_a_vm(
     assert scrape["disk_type_of"]("sda") == "unknown"
 
 
+def test_a_cpuinfo_hypervisor_flag_marks_the_host_as_a_vm(
+    scrape: dict[str, Any], tmp_path: Path
+) -> None:
+    # Arrange — DMI names no listed vendor; every x86 hypervisor still sets the cpuinfo flag
+    (tmp_path / "cpuinfo").write_text(
+        "processor\t: 0\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 hypervisor\n"
+    )
+    fake_disk(tmp_path, "sda", "1")
+    scrape["SYS_CLASS_BLOCK_PATH"] = str(tmp_path / "class_block")
+
+    assert scrape["host_is_a_virtual_machine"]() is True
+    assert scrape["disk_type_of"]("sda") == "unknown"
+
+
 @pytest.mark.parametrize(
     ("sys_vendor", "product_name", "vendor", "model", "rotational", "expected"),
     [
@@ -498,16 +515,16 @@ def test_md_raid_over_two_ssds_reads_ssd(scrape: dict[str, Any], tmp_path: Path)
     assert scrape["disk_type_of"]("md127p1") == "ssd"
 
 
-def test_a_mixed_stack_reads_as_its_slowest_member(scrape: dict[str, Any], tmp_path: Path) -> None:
-    # Arrange — a volume group spanning an NVMe disk and a spinning one: the LV delivers what the
-    # spinning disk does
+def test_a_mixed_stack_reads_unknown(scrape: dict[str, Any], tmp_path: Path) -> None:
+    # Arrange — a volume group spanning an NVMe disk and a spinning one: members differ, so unknown
     fake_disk(tmp_path, "dm-0", "0", slaves=("nvme0n1", "sdb1"))
     fake_disk(tmp_path, "nvme0n1", "0")
     fake_disk(tmp_path, "sdb", "1", ("sdb1",))
     scrape["SYS_CLASS_BLOCK_PATH"] = str(tmp_path / "class_block")
 
-    assert scrape["disk_type_of"]("dm-0") == "hdd"
-    assert scrape["slowest_disk_type"](["nvme", "ssd"]) == "ssd"
+    assert scrape["disk_type_of"]("dm-0") == "unknown"
+    assert scrape["slowest_disk_type"](["nvme", "ssd"]) == "unknown"
+    assert scrape["slowest_disk_type"](["nvme", "nvme"]) == "nvme"
     assert scrape["slowest_disk_type"](["nvme", "unknown"]) == "nvme"
     assert scrape["slowest_disk_type"](["unknown", "unknown"]) == "unknown"
     assert scrape["slowest_disk_type"]([]) == "unknown"
