@@ -275,6 +275,10 @@ async def test_a_second_refusal_on_the_new_mapping_fails_without_a_third_candida
 
     assert len(client.specs) == 2
     assert port_maps == [(22, 9103, 29103)]
+    assert any(
+        entry["log_status"] == "error" and entry["log_tag"] == "container_creation"
+        for entry in service.logs_queue
+    )
 
 
 @pytest.mark.asyncio

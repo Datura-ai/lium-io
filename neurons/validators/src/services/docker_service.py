@@ -226,11 +226,6 @@ _PORT_ALLOCATED_PHRASES = ("port is already allocated", "address already in use"
 _PORT_ALLOCATED_RETRY_BUDGET_SEC = 90
 _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
 
-# A host port the backend handed the pod is bound by something the 90 s wait above never
-# outlives (a stale container of another rental, a provider process): with
-# PORT_COLLISION_RETRY_ENABLED the pod moves to the next free pair of the executor's advertised
-# range — at most this many candidates are considered, the host's listening sockets are read once
-# over the create's own SSH session, and `docker run` is retried ONCE with the new mapping.
 PORT_COLLISION_ERROR_CLASS = "port_collision"
 _PORT_COLLISION_CANDIDATE_CAP = 3
 _PORT_COLLISION_PROBE_TIMEOUT_SEC = 10
@@ -1318,6 +1313,8 @@ class DockerService:
                 port_allocation_phrase = _port_allocated_phrase(exc)
                 if port_allocation_phrase and remapped:
                     # the one retry on the new mapping was refused too: no third candidate
+                    error_text = str(exc)
+                    await self.stream_log(error_text, "error", log_tag)
                     raise RentalPortCollisionError(
                         f"docker run could not bind a host port on the remapped port either: {exc}"
                     ) from exc
