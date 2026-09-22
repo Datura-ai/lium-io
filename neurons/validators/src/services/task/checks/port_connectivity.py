@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from core.config import settings
+from services.executor_connectivity.models import PortVerificationResult
+
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -55,7 +58,7 @@ class PortConnectivityCheck:
             },
         )
         verified_port_count = len(result.successful_ports)
-        extra_info = {
+        extra_info: dict[str, object] = {
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
         }
@@ -71,17 +74,7 @@ class PortConnectivityCheck:
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
         )
 
-        # DAH-2272 (tolerate): a customer rental force-removes port-check / DinD
-        # probe containers the instant a ContainerCreateRequest lands (see
-        # DockerService.wait_for_port_check_containers). That race can flip
-        # sysbox_runtime to False for this cycle even though the executor is
-        # fine. Don't record a rental-induced sysbox downgrade — keep the last
-        # known value and let the next verification cycle re-measure. Mirrors
-        # the rented-executor sysbox fallback in ExecutorConnectivityService.
-        sysbox_downgraded = ctx.state.sysbox_runtime and not result.sysbox_runtime
-        if sysbox_downgraded and await ctx.services.redis.renting_in_progress(
-            ctx.miner_hotkey, ctx.executor.uuid
-        ):
+        if await self._should_keep_last_known_sysbox(ctx, result, extra_info):
             extra_info["sysbox_downgrade_tolerated"] = True
             updated_state = replace(
                 updated_state,
@@ -182,3 +175,40 @@ class PortConnectivityCheck:
                 "state": updated_state,
             },
         )
+
+    @staticmethod
+    async def _should_keep_last_known_sysbox(
+        ctx: Context, result: PortVerificationResult, extra_info: dict[str, object]
+    ) -> bool:
+        # DAH-2272 (tolerate): a customer rental force-removes port-check / DinD
+        # probe containers the instant a ContainerCreateRequest lands (see
+        # DockerService.wait_for_port_check_containers). That race can flip
+        # sysbox_runtime to False for this cycle even though the executor is
+        # fine. Don't record a rental-induced sysbox downgrade — keep the last
+        # known value and let the next verification cycle re-measure. Mirrors
+        # the rented-executor sysbox fallback in ExecutorConnectivityService.
+        sysbox_downgraded = ctx.state.sysbox_runtime and not result.sysbox_runtime
+        if sysbox_downgraded and await ctx.services.redis.renting_in_progress(
+            ctx.miner_hotkey, ctx.executor.uuid
+        ):
+            return True
+        if not settings.DIND_PROBE_FIRST_MISS_GRACE:
+            return False
+        # DAH-3597: a probe that never reached its container (dind_ok False: docker run
+        # refused, sshd not up in 30 s, SSH reset) measured nothing about sysbox, so the first
+        # such miss inside the TTL window keeps the last known value and the next cycle
+        # re-measures. A second miss inside the window is recorded as before. A probe that
+        # reached its container and still says no sysbox is a verdict, never tolerated.
+        if sysbox_downgraded and not result.dind_ok:
+            first_miss = await ctx.services.redis.record_dind_probe_miss(
+                ctx.miner_hotkey,
+                ctx.executor.uuid,
+                settings.DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS,
+            )
+            if first_miss:
+                extra_info["sysbox_downgrade_tolerated_reason"] = "first_dind_probe_miss"
+                return True
+            extra_info["dind_probe_miss_repeated"] = True
+        elif result.dind_ok:
+            await ctx.services.redis.clear_dind_probe_miss(ctx.miner_hotkey, ctx.executor.uuid)
+        return False

@@ -157,6 +157,42 @@ class _ContainerExecReadiness:
     detail: str
 
 
+@dataclass(slots=True)
+class ContainerStateSnapshot:
+    """`docker inspect` State plus RestartCount, read once at a moment of interest."""
+
+    status: str | None
+    running: bool
+    restarting: bool
+    exit_code: int | None
+    restart_count: int
+    error: str | None
+    oom_killed: bool
+
+    @property
+    def killed_by_host(self) -> bool:
+        """The kernel OOM killer or a SIGKILL (exit 137) ended it, not the image's own command."""
+        return self.oom_killed or self.exit_code == 137
+
+    @property
+    def exited_since_start(self) -> bool:
+        """The container's main process has ended at least once since `docker run`.
+
+        Not running now (exited/dead/removing), mid-restart, or running again after Docker's
+        restart policy brought it back (RestartCount > 0). A `created` container never started,
+        so it is not an exit.
+        """
+        if self.restarting or self.restart_count > 0:
+            return True
+        return not self.running and (self.status or "").lower() != "created"
+
+    def describe(self) -> str:
+        return (
+            f"status={self.status!r} running={self.running!r} restarting={self.restarting!r} "
+            f"exit_code={self.exit_code!r} restart_count={self.restart_count!r} error={self.error!r}"
+        )
+
+
 class RentalDockerSdkClient:
     def __init__(
         self,
@@ -308,6 +344,16 @@ class RentalDockerSdkClient:
             v=remove_volumes,
         )
 
+    async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
+        try:
+            return await _in_docker_thread(self._inspect_container_state_sync, container_name)
+        except RentalDockerOperationError:
+            raise
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+
     async def mount_source_for_destination(
         self,
         *,
@@ -446,6 +492,23 @@ class RentalDockerSdkClient:
             ready=ready,
             terminal=terminal,
             detail=_format_container_state_detail(state),
+        )
+
+    def _inspect_container_state_sync(self, container_name: str) -> ContainerStateSnapshot:
+        info = self._api_client.inspect_container(container_name)
+        state = info.get("State") if isinstance(info, dict) else None
+        if not isinstance(state, dict):
+            raise RentalDockerOperationError("Docker inspect did not include container State")
+        exit_code = state.get("ExitCode")
+        restart_count = info.get("RestartCount")
+        return ContainerStateSnapshot(
+            status=state.get("Status"),
+            running=bool(state.get("Running")),
+            restarting=bool(state.get("Restarting")),
+            exit_code=int(exit_code) if isinstance(exit_code, int) else None,
+            restart_count=int(restart_count) if isinstance(restart_count, int) else 0,
+            error=state.get("Error") or None,
+            oom_killed=bool(state.get("OOMKilled")),
         )
 
     def _mount_source_for_destination_sync(

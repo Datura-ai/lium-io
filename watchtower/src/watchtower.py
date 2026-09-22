@@ -4,7 +4,7 @@ import requests
 import bittensor
 import time
 from datetime import datetime, UTC
-from typing import Optional
+from typing import NamedTuple, Optional
 from docker.models.containers import Container
 
 from config import settings, WATCHTOWER_ENDPOINT_URL, WATCHTOWER_VALIDATOR_HOTKEY
@@ -21,6 +21,28 @@ EXECUTOR_RUNNER_SERVICE_LABEL = "com.docker.compose.service=executor-runner"
 # Docker Hub's registry host. `registry-mirrors` in the daemon apply to `docker.io` names only,
 # so a reference that names this host goes straight to Docker Hub.
 CANONICAL_REGISTRY_HOST = "registry-1.docker.io"
+
+
+# B-176: the executor container asks for every GPU (`deploy.resources.reservations.devices`
+# in docker-compose.app.yml), so the NVIDIA container runtime hook runs when it starts. When
+# the host's driver and its user-space libraries disagree (a driver package update with no
+# reboot) that hook fails and the executor cannot start. An update on such a host replaces a
+# running executor with one that never comes back (ticket-0325: rented node offline for hours).
+# The probe below starts a throwaway container from the runner's OWN image (already on the
+# host, nothing pulled) with the same GPU request and the command `true`; the hook runs, the
+# container exits 0, or the daemon reports why it could not start.
+RUNTIME_PROBE_NVIDIA_MISMATCH = "NVIDIA_RUNTIME_MISMATCH"
+RUNTIME_PROBE_FAILED = "RUNTIME_PROBE_FAILED"
+# The one phrase NVML prints for a driver package updated without a reboot. `initialization
+# error` and `nvml error` alone also cover a missing device node, a stopped persistence daemon
+# or a wrong container-toolkit install, whose remedy is not a reboot; those stay RUNTIME_PROBE_FAILED.
+_NVIDIA_MISMATCH_MARKER = "driver/library version mismatch"
+RUNTIME_PROBE_TIMEOUT_SECONDS = 60
+# Every probe container carries this label. A probe whose removal failed (daemon busy, the
+# process killed mid-probe) is found by it at the next probe and removed first, so a held host
+# never accumulates one exited container per cycle.
+RUNTIME_PROBE_LABEL_KEY = "io.lium.watchtower.probe"
+RUNTIME_PROBE_LABEL = f"{RUNTIME_PROBE_LABEL_KEY}=nvidia-runtime"
 
 
 class DigestMismatchError(Exception):
@@ -478,6 +500,77 @@ def pull_and_restart_containers(client: docker.DockerClient, image_name: str, re
         return False
 
 
+class RuntimeProbe(NamedTuple):
+    ok: bool
+    reason_code: Optional[str]
+    error: Optional[str]
+
+
+def classify_runtime_probe_error(error: str) -> str:
+    """`NVIDIA_RUNTIME_MISMATCH` for the driver/library disagreement, else `RUNTIME_PROBE_FAILED`."""
+    if _NVIDIA_MISMATCH_MARKER in error.lower():
+        return RUNTIME_PROBE_NVIDIA_MISMATCH
+    return RUNTIME_PROBE_FAILED
+
+
+def remove_stale_probe_containers(client: docker.DockerClient) -> None:
+    """
+    Remove every container that carries the probe label, whatever its state.
+
+    Raises the first removal error: the caller must not create another probe on top of one it
+    cannot remove, or a held host gains one container per cycle.
+    """
+    stale = client.containers.list(all=True, filters={"label": RUNTIME_PROBE_LABEL})
+    for leftover in stale:
+        logger.warning(_m("Removing a stale runtime probe container", {
+            "id": leftover.short_id, "status": leftover.status,
+        }))
+        leftover.remove(force=True)
+
+
+def probe_nvidia_runtime(client: docker.DockerClient, image_id: str) -> RuntimeProbe:
+    """
+    Start a throwaway container from `image_id` with every GPU requested and the entrypoint
+    `true`, the way the executor container is started. Ready when it exits 0.
+
+    Nothing is pulled: `image_id` is the image the runner already runs. The container is
+    labelled and removed whatever happens; a labelled leftover from an earlier probe is removed
+    before this one is created, and a leftover that cannot be removed is a failed probe with
+    no new container. A daemon that cannot create or start the probe reads as not ready, with
+    the daemon's message as the error.
+    """
+    try:
+        remove_stale_probe_containers(client)
+    except Exception as e:
+        return RuntimeProbe(False, RUNTIME_PROBE_FAILED, f"stale runtime probe container not removed: {e}")
+    container = None
+    try:
+        container = client.containers.create(
+            image_id,
+            entrypoint=["true"],
+            command=[],
+            labels={RUNTIME_PROBE_LABEL_KEY: "nvidia-runtime"},
+            device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
+        )
+        container.start()
+        status = container.wait(timeout=RUNTIME_PROBE_TIMEOUT_SECONDS).get("StatusCode", 1)
+        if status != 0:
+            return RuntimeProbe(False, RUNTIME_PROBE_FAILED, f"probe container exited {status}")
+        return RuntimeProbe(True, None, None)
+    except docker.errors.APIError as e:
+        return RuntimeProbe(False, classify_runtime_probe_error(str(e)), str(e))
+    except Exception as e:
+        return RuntimeProbe(False, RUNTIME_PROBE_FAILED, str(e))
+    finally:
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except Exception as e:
+                logger.warning(_m("Could not remove the runtime probe container", {
+                    "id": container.short_id, "error": str(e),
+                }))
+
+
 def check_and_update() -> None:
     """
     Single iteration: check for updates and apply if needed.
@@ -512,6 +605,28 @@ def check_and_update() -> None:
             "current": current_digest,
             "remote": remote_digest
         }))
+
+        # B-176: a running runner is replaced only on a host whose NVIDIA runtime can start a
+        # GPU container right now. The check repeats every cycle, so the update resumes on its
+        # own once the host is fixed (reboot or driver reload). A first boot (no runner) has
+        # nothing to break and skips the probe.
+        if container is not None:
+            image_id = container.attrs.get("Image")
+            probe = (
+                probe_nvidia_runtime(client, image_id)
+                if image_id
+                else RuntimeProbe(False, RUNTIME_PROBE_FAILED, f"container {container.name} has no image id")
+            )
+            if not probe.ok:
+                logger.warning(_m("Update held: the NVIDIA runtime cannot start a GPU container on this host", {
+                    "reason_code": probe.reason_code,
+                    "error": probe.error,
+                    "current": current_digest,
+                    "remote": remote_digest,
+                    "retry_in_seconds": settings.WATCHTOWER_INTERVAL,
+                }))
+                return
+            logger.info(_m("NVIDIA runtime probe ok, updating", {"remote": remote_digest}))
 
         success = pull_and_restart_containers(client, image_name, remote_digest)
         if success:

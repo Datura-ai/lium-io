@@ -341,9 +341,17 @@ TDX_WHITELIST = {
             # Seen in the event log of the 146.88.195.16 CVM on 2026-09-03. Covers app/
             # docker-compose.yml, init_script.sh and pre_launch_script.sh at 880cb585 plus default
             # `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo). Editing any of those
-            # three files moves the hash: DAH-2780 rewrites pre_launch_script.sh and needs its own
-            # version-5 entry here.
+            # three files moves the hash and needs the next version here: the checkout's hash is
+            # rebuilt by neurons/executor/dstacktee/scripts/compose_hash.py and
+            # tests/test_tdx_compose_hash_whitelist.py fails CI while it is missing. Kept: CVMs
+            # created from executor-v1.127 and earlier still attest with it.
             "8224d58801af6333561f116e2d566b179b399f1d1d700f0e8a5ab9326ae901d9": 4,
+            # DAH-3602 — the same runner digest with the measured files at c102a332 (lium-io#1339,
+            # DAH-2834, three settings added to init_script.sh; executor-v1.128 to v1.130 and main).
+            # Missing here from 2026-09-14 to this entry, so every CVM created from those releases
+            # would score zero with the whitelist on. Version 5; DAH-2780's pre_launch_script.sh
+            # rewrite (lium-io#1266) takes 6.
+            "87d3430000bb7046a19eeaa6efe074fd8b5f7856bbfe2906addab238174c542d": 5,
             # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
             # that runner bakes the STAGING validator hotkey via config_override.py and answers every
             # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.
