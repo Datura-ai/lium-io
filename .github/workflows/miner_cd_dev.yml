@@ -6,6 +6,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dockerhub-push
     env:
       TAG: "dev" 
       TARGET_FILE: "docker-compose.app.dev.yml"

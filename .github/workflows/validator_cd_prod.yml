@@ -8,6 +8,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: dockerhub-push
     env:
       TAG: "latest" 
       TARGET_FILE: "docker-compose.app.dstacktee.yml"
