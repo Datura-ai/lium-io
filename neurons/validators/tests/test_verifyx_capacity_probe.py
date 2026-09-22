@@ -50,6 +50,12 @@ B300_PC_UPLOAD_MBPS = 1900.0
 PACKAGE = {"pkg": "distilbert-base-uncased.tar", "size": 268_000_000, "hash": "sha256:abc"}
 
 
+@pytest.fixture(autouse=True)
+def _enforce_the_capacity_gate(monkeypatch):
+    # Everything here is VERIFYX_NETWORK_GATE_MODE=enforce; off/shadow: test_verifyx_network_gate_mode.py.
+    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "enforce")
+
+
 def _challenge_data() -> dict:
     return {"network_challenge": {"download": dict(PACKAGE), "timeout_seconds": 120}}
 
@@ -139,6 +145,7 @@ def test_service_reads_the_capacity_and_the_single_stream_figure_into_their_own_
         "download_speed": B300_PC_CAPACITY_MBPS,
         "upload_speed": B300_PC_UPLOAD_MBPS,
         "package_download_speed": B300_PC_SINGLE_STREAM_MBPS,
+        "capacity_download_speed": B300_PC_CAPACITY_MBPS,
         "success": True,
         "execution_time_ms": 24_300,
     }
@@ -230,6 +237,7 @@ def test_cloudflare_unreachable_keeps_the_package_reading_and_reports_no_capacit
         "download_speed": None,  # no capacity sample — never 0.0 published as a speed
         "upload_speed": 0.0,  # the failed direction, as the probe reports it
         "package_download_speed": B300_PC_SINGLE_STREAM_MBPS,
+        "capacity_download_speed": None,
         "success": False,
         "execution_time_ms": 131_200,
     }

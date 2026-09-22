@@ -42,8 +42,9 @@ from services.redis_service import (
     RedisService,
 )
 from services.task.availability import silence_availability_errors_on_our_own_outage
+from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
-from services.verifyx_validation_service import VerifyXValidationService
+from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
 from core.express_lane import CycleInputs, ExpressLane
@@ -525,6 +526,11 @@ class Validator:
                             ),
                         ),
                     )
+                    if settings.verifyx.NETWORK_GATE_MODE != "off":
+                        NETWORK_GATE_TALLY.log_and_reset(
+                            MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                            {**self.default_extra, "job_batch_id": job_batch_id},
+                        )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window

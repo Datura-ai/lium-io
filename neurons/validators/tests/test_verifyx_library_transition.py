@@ -139,8 +139,9 @@ async def _run(service: VerifyXValidationService, executor_digest: str):
 
 @pytest.mark.asyncio
 async def test_an_executor_on_the_previous_library_passes_and_is_measured_by_its_package_download(
-    window,
+    window, monkeypatch
 ):
+    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "enforce")
     with patch(f"{SERVICE}.datetime") as clock:
         clock.now.return_value = UNTIL - timedelta(days=1)
         previous, ran = await _run(_service(), PREVIOUS)

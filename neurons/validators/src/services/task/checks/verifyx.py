@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.verifyx_validation_service import _is_speed_reading
+from services.verifyx_validation_service import NETWORK_GATE_TALLY, _is_speed_reading
 
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -231,6 +231,15 @@ class VerifyXCheck:
                 event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
             if unavailable_readings:
                 event.what_we_saw["unavailable_speed_readings"] = unavailable_readings
+            network_gate = _network_gate(verifyx_network, prev_ema)
+            if network_gate is not None:
+                event.what_we_saw["network_gate"] = network_gate
+                NETWORK_GATE_TALLY.record(
+                    network_gate["ema_package"],
+                    network_gate["ema_capacity"],
+                    MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                    previous_library=result.data.get("verifyx_library") == "previous",
+                )
 
             updated_state = replace(ctx.state, specs=updated_specs)
 
@@ -273,6 +282,8 @@ class VerifyXCheck:
                 )
                 if cold_sample_retry is not None:
                     slow_event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
+                if network_gate is not None:
+                    slow_event.what_we_saw["network_gate"] = network_gate
                 return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
 
             return CheckResult(
@@ -282,6 +293,9 @@ class VerifyXCheck:
                     "state": updated_state,
                 },
             )
+
+        if settings.verifyx.NETWORK_GATE_MODE != "off":
+            NETWORK_GATE_TALLY.record_probe_failed()
 
         # Ensure we have an error message for the failure case
         error_message = errors or "Unknown errors"
@@ -362,6 +376,34 @@ def _feed_ema(
     ema = compute_ema(prev, reading if reading is not None else 0.0)
     network[f"ema_verifyx_{direction}_speed"] = ema
     return ema
+
+
+def _ema_if_gated(prev: float | None, reading: object) -> float | None:
+    """The download EMA `_feed_ema` would store were `reading` the gated one."""
+    if reading is not None and not _is_speed_reading(reading):
+        return prev
+    return compute_ema(prev, reading if reading is not None else 0.0)
+
+
+def _network_gate(verifyx_network: dict, prev_ema) -> dict | None:
+    """DAH-2774 shadow record: the floor read against the package and the capacity reading, both
+    from the same previous EMA. Under enforce `ema_capacity` is the EMA the check gates on, under
+    shadow `ema_package`; the other says what the node would get on the first cycle of the other
+    mode. None under off."""
+    mode = settings.verifyx.NETWORK_GATE_MODE
+    if mode == "off":
+        return None
+    prev = prev_ema.ema_verifyx_download_speed if prev_ema else None
+    package = verifyx_network.get("package_download_speed")
+    capacity = verifyx_network.get("capacity_download_speed")
+    return {
+        "mode": mode,
+        "floor_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+        "package_download_speed": package,
+        "capacity_download_speed": capacity,
+        "ema_package": _ema_if_gated(prev, package),
+        "ema_capacity": _ema_if_gated(prev, capacity),
+    }
 
 
 def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:

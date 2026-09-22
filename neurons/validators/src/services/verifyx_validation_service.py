@@ -165,6 +165,77 @@ class VerifyXChallenge:
     accepted_lib_sha256s: frozenset[str] = frozenset()
 
 
+@dataclass
+class NetworkGateTally:
+    """DAH-2774: the download-EMA floor (checks/verifyx.py) read against both download readings,
+    counted per node since the last summary (the validator logs one per cycle; express-lane runs
+    between cycles land in the next one). `newly_fail` is a node the package reading passes and
+    the capacity reading fails: what flipping VERIFYX_NETWORK_GATE_MODE to enforce would cost.
+    A previous-library executor is measured by its package download under either mode."""
+
+    package_pass: int = 0
+    package_fail: int = 0
+    capacity_pass: int = 0
+    capacity_fail: int = 0
+    newly_fail: int = 0
+    newly_pass: int = 0
+    unmeasured: int = 0
+    previous_library: int = 0
+    probe_failed: int = 0
+
+    def record(
+        self,
+        package_ema: float | None,
+        capacity_ema: float | None,
+        floor_mbps: float,
+        previous_library: bool = False,
+    ) -> None:
+        if previous_library:
+            self.previous_library += 1
+        if package_ema is None or capacity_ema is None:
+            self.unmeasured += 1
+            return
+        package_passes = package_ema >= floor_mbps
+        capacity_passes = capacity_ema >= floor_mbps
+        self.package_pass += package_passes
+        self.package_fail += not package_passes
+        self.capacity_pass += capacity_passes
+        self.capacity_fail += not capacity_passes
+        self.newly_fail += package_passes and not capacity_passes
+        self.newly_pass += capacity_passes and not package_passes
+
+    def record_probe_failed(self) -> None:
+        self.probe_failed += 1
+
+    def log_and_reset(self, floor_mbps: float, default_extra: dict) -> dict[str, int]:
+        counts = {name: getattr(self, name) for name in self.__dataclass_fields__}
+        message = (
+            "VerifyX network gate summary "
+            f"mode={settings.verifyx.NETWORK_GATE_MODE} floor_mbps={floor_mbps:.0f} "
+            + " ".join(f"{name}={value}" for name, value in counts.items())
+        )
+        logger.info(
+            _m(
+                message,
+                extra=get_extra_info(
+                    {
+                        **default_extra,
+                        "network_gate_mode": settings.verifyx.NETWORK_GATE_MODE,
+                        "floor_mbps": floor_mbps,
+                        **counts,
+                    }
+                ),
+            )
+        )
+        for name in counts:
+            setattr(self, name, 0)
+        return counts
+
+
+# One per process: the validator and the ioc container each build a VerifyXValidationService.
+NETWORK_GATE_TALLY = NetworkGateTally()
+
+
 class VerifyXValidationService:
     def __init__(self):
         self.lib_name = "/usr/lib/libverifyx.so"
@@ -468,27 +539,38 @@ def _as_measured_for_the_previous_library(payload: dict) -> dict:
 
 
 def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+    """`download_speed` is the gated reading VERIFYX_NETWORK_GATE_MODE names: the Cloudflare
+    capacity under enforce, the package download under off/shadow. Under shadow and enforce the
+    capacity reading is also published as `capacity_download_speed`."""
     network_execution = response_data["network_execution"]
+    mode = settings.verifyx.NETWORK_GATE_MODE
+    enforce = mode == "enforce"
 
     if not network_execution["success"]:
         # The probe fails as a whole when either direction fails, but the directions are
         # independent (celium-gpu-verifier#25): an upload that could not move its payload still
-        # leaves a real Cloudflare download reading from the same run. Keep that download so the
-        # fatal download EMA (checks/verifyx.py) is fed the measured value, not a 0; success and
+        # leaves real download readings from the same run. Keep the gated one so the fatal
+        # download EMA (checks/verifyx.py) is fed the measured value, not a 0; success and
         # upload_speed carry the failure.
         speedtest = network_execution.get("speedtest") or {}
-        download_speed = speedtest.get("download_mbps")
+        capacity_speed = speedtest.get("download_mbps")
         package_speed = (network_execution.get("download") or {}).get("speed_mbps")
         upload_speed = speedtest.get("upload_mbps")
-        return {
-            "download_speed": download_speed if _is_positive_number(download_speed) else None,
+        gated_speed = capacity_speed if enforce else package_speed
+        stats = {
+            "download_speed": gated_speed if _is_positive_number(gated_speed) else None,
             # 0.0 is how the probe reports the failed direction; anything that is not a number is
             # a malformed payload and reads as "no upload measurement" like the download above.
             "upload_speed": upload_speed if _is_speed_reading(upload_speed) else None,
             "package_download_speed": package_speed if _is_positive_number(package_speed) else None,
             "success": False,
             "execution_time_ms": network_execution.get("execution_time_ms"),
-        }, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
+        }
+        if mode != "off":
+            stats["capacity_download_speed"] = (
+                capacity_speed if _is_positive_number(capacity_speed) else None
+            )
+        return stats, [f"Network execution failed: {network_execution.get('error', 'Unknown error')}"]
 
     errors = []
     success = True
@@ -509,46 +591,42 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
 
     speedtest = network_execution.get("speedtest") or {}
     upload_speed = speedtest.get("upload_mbps")
-    download_speed = speedtest.get("download_mbps")
+    capacity_speed = speedtest.get("download_mbps")
     package_download_speed = download_result.get("speed_mbps")
-
-    # A probe that could not reach Cloudflare (no `speedtest` block, a null or zero reading) is a
-    # failed measurement, never an exception: an exception here is caught upstream as "challenge
-    # verification failed" and rejects the machine even while VERIFYX_NETWORK_VALIDATION is off.
-    if not all(
-        _is_positive_number(value)
-        for value in (upload_speed, download_speed, package_download_speed)
-    ):
-        errors.append("Network performance data unavailable")
-        return {
-            "download_speed": download_speed,
-            "upload_speed": upload_speed,
-            "package_download_speed": package_download_speed,
-            "success": False,
-            "execution_time_ms": network_execution.get("execution_time_ms"),
-        }, errors
-
-    if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
-        errors.append(
-            f"Cloudflare download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
-        )
-        success = False
-
-    if package_download_speed < settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:
-        errors.append(
-            f"Package download speed inadequate: {package_download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
-        )
-        success = False
-
+    download_speed = capacity_speed if enforce else package_download_speed
     stats = {
         "download_speed": download_speed,
         "upload_speed": upload_speed,
         "package_download_speed": package_download_speed,
         "success": success,
-        "execution_time_ms": network_execution["execution_time_ms"],
+        "execution_time_ms": network_execution.get("execution_time_ms"),
     }
+    if mode != "off":
+        stats["capacity_download_speed"] = capacity_speed
 
-    return stats, errors
+    # A probe that could not reach Cloudflare (no `speedtest` block, a null or zero reading) is a
+    # failed measurement, never an exception: an exception here is caught upstream as "challenge
+    # verification failed" and rejects the machine even while VERIFYX_NETWORK_VALIDATION is off.
+    # Off and shadow need only the package reading they gate on.
+    required = (upload_speed, capacity_speed, package_download_speed) if enforce else (download_speed,)
+    if not all(_is_positive_number(value) for value in required):
+        errors.append("Network performance data unavailable")
+        return {**stats, "success": False}, errors
+
+    if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
+        source = "Cloudflare" if enforce else "Network"
+        errors.append(
+            f"{source} download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+        )
+        success = False
+
+    if enforce and package_download_speed < settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:
+        errors.append(
+            f"Package download speed inadequate: {package_download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+        )
+        success = False
+
+    return {**stats, "success": success}, errors
 
 
 def _verify_storage_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
@@ -651,7 +729,7 @@ def _format_mbps(value: object) -> str:
 
 def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
     package_download_mbps = network.get("package_download_speed")
-    cloudflare_download_mbps = network.get("download_speed")
+    cloudflare_download_mbps = network.get("capacity_download_speed")
     cloudflare_upload_mbps = network.get("upload_speed")
     exec_id = default_extra.get("executor_uuid") or "none"
     message = (
@@ -660,6 +738,7 @@ def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
         f"cloudflare_download_mbps={_format_mbps(cloudflare_download_mbps)} "
         f"cloudflare_upload_mbps={_format_mbps(cloudflare_upload_mbps)} "
         f"success={network.get('success')} "
+        f"gate_mode={settings.verifyx.NETWORK_GATE_MODE} "
         f"exec={exec_id}"
     )
     logger.info(

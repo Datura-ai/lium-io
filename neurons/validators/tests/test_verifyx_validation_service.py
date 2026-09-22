@@ -29,6 +29,13 @@ from neurons.validators.src.services.verifyx_validation_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _enforce_the_capacity_gate(monkeypatch):
+    # The network tests here pin VERIFYX_NETWORK_GATE_MODE=enforce; off/shadow:
+    # test_verifyx_network_gate_mode.py.
+    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "enforce")
+
+
 def _executor_info() -> SimpleNamespace:
     return SimpleNamespace(python_path="/usr/bin/python3", root_dir="/root/app", uuid="exec-1")
 
@@ -76,6 +83,7 @@ def test_network_stats_use_cloudflare_download_speed():
         "download_speed": 125.0,
         "upload_speed": 20.0,
         "package_download_speed": 80.0,
+        "capacity_download_speed": 125.0,
         "success": True,
         "execution_time_ms": 250,
     }
@@ -214,6 +222,7 @@ def test_network_reports_unavailable_when_probe_has_no_speedtest_block():
         "download_speed": None,
         "upload_speed": None,
         "package_download_speed": 100.0,
+        "capacity_download_speed": None,
         "success": False,
         "execution_time_ms": 250,
     }
@@ -318,6 +327,7 @@ def test_format_mbps_and_network_speed_log_line(caplog):
             {
                 "package_download_speed": 80.0,
                 "download_speed": 125.5,
+                "capacity_download_speed": 125.5,
                 "upload_speed": 20.25,
                 "success": True,
             },
@@ -330,6 +340,7 @@ def test_format_mbps_and_network_speed_log_line(caplog):
         "cloudflare_download_mbps=125.50 "
         "cloudflare_upload_mbps=20.25 "
         "success=True "
+        "gate_mode=enforce "
         "exec=exec-abc" in rec.getMessage()
         for rec in caplog.records
     )
