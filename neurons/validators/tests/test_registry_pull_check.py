@@ -8,8 +8,11 @@ node passed every one.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import shutil
+import socket
 import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -110,10 +113,12 @@ class FakeRunner:
 
 
 class FakeRedis:
-    def __init__(self, *, unreadable: bool = False):
+    def __init__(self, *, unreadable: bool = False, hashes_unreadable: bool = False):
         self.store: dict[str, str] = {}
         self.ttl: dict[str, int | None] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
         self.unreadable = unreadable
+        self.hashes_unreadable = hashes_unreadable
 
     async def get(self, key):
         if self.unreadable:
@@ -126,6 +131,30 @@ class FakeRedis:
 
     async def delete(self, key):
         self.store.pop(key, None)
+
+    async def hset(self, key, field, value):
+        self.hashes.setdefault(key, {})[field] = value
+
+    async def hgetall(self, key):
+        if self.hashes_unreadable:
+            raise ConnectionError("redis down")
+        return {k.encode(): v.encode() for k, v in self.hashes.get(key, {}).items()}
+
+    async def hdel(self, key, *fields):
+        for f in fields:
+            self.hashes.get(key, {}).pop(f, None)
+
+
+class FakeHub:
+    """Stands in for probe_docker_hub: the validator's own GET of registry-1.docker.io/v2/."""
+
+    def __init__(self, answer=HUB_UP):
+        self.answer = answer
+        self.calls = 0
+
+    async def __call__(self):
+        self.calls += 1
+        return self.answer
 
 
 class Clock:
@@ -149,10 +178,13 @@ def rented() -> RentedExecutorsResponse:
     )
 
 
-def make_ctx(*answers: SSHCommandResult, redis: FakeRedis | None = None, rented_data=None):
+def make_ctx(
+    *answers: SSHCommandResult, redis: FakeRedis | None = None, rented_data=None, uuid: str | None = None
+):
     runner = FakeRunner(*answers)
     redis = redis if redis is not None else FakeRedis()
     ctx = make_context(
+        executor=EXECUTOR.model_copy(update={"uuid": uuid}) if uuid else None,
         state=build_state(rented_data=rented_data),
         runner=runner,
         services=build_services(redis=redis),
@@ -167,15 +199,24 @@ def flags(
     enforced: bool = True,
     interval_hours: float = 6.0,
     retry_minutes: float = 30.0,
+    breaker_share: float = 0.3,
+    breaker_min_pulls: int = 20,
+    hub: FakeHub | None = None,
 ):
     fake = SimpleNamespace(
         REGISTRY_PULL_CHECK_ENABLED=check,
         REGISTRY_PULL_ENFORCEMENT_ENABLED=enforced,
         REGISTRY_PULL_PROBE_INTERVAL_HOURS=interval_hours,
         REGISTRY_PULL_PROBE_RETRY_MINUTES=retry_minutes,
+        REGISTRY_PULL_FLEET_BREAKER_SHARE=breaker_share,
+        REGISTRY_PULL_FLEET_BREAKER_MIN_PULLS=breaker_min_pulls,
     )
     clock = Clock()
-    with patch.object(module, "settings", fake), patch.object(module, "time", clock):
+    with (
+        patch.object(module, "settings", fake),
+        patch.object(module, "time", clock),
+        patch.object(module, "probe_docker_hub", hub or FakeHub()),
+    ):
         yield clock
 
 
@@ -186,6 +227,8 @@ def test_defaults_log_only_and_bounded():
     assert fields["REGISTRY_PULL_ENFORCEMENT_ENABLED"].default is False
     assert fields["REGISTRY_PULL_PROBE_INTERVAL_HOURS"].default == 6.0
     assert fields["REGISTRY_PULL_PROBE_RETRY_MINUTES"].default == 30.0
+    assert fields["REGISTRY_PULL_FLEET_BREAKER_SHARE"].default == 0.3
+    assert fields["REGISTRY_PULL_FLEET_BREAKER_MIN_PULLS"].default == 20
 
 
 def test_the_image_is_a_tiny_official_image_pinned_by_digest():
@@ -520,7 +563,7 @@ async def test_a_pull_that_works_passes_and_resets_the_count():
     assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_OK.reason
     assert res.event.what_we_saw["failures_in_a_row"] == 0
     assert res.event.what_we_saw["pull"]["outcome"] == "ok"
-    assert list(redis.ttl.values()) == [7 * 24 * 3600]
+    assert redis.ttl[f"registry_pull_probe:{EXECUTOR.uuid}"] == 7 * 24 * 3600
 
 
 @pytest.mark.asyncio
@@ -655,3 +698,256 @@ async def test_an_open_streak_is_re_pulled_on_the_retry_after_a_429():
         res = await check.run(ctx)
     assert len(runner.commands) == 3
     assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_OK.reason
+
+
+# ------------------------------------------------------------------ the Docker Hub control and the fleet breaker
+
+HUB_TLS_TIMEOUT = (
+    "lium_pull driver=overlayfs mirrors=[]\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=10\n"
+    'Error response from daemon: Get "https://registry-1.docker.io/v2/": net/http: TLS handshake timeout\n'
+)
+
+
+def _logged(caplog, reason: str) -> int:
+    return sum(reason in record.getMessage() for record in caplog.records)
+
+
+def _seed_fleet(redis: FakeRedis, now: float, *, ok: int, failed: int, age: float = 0) -> None:
+    fleet = redis.hashes.setdefault("registry_pull_fleet", {})
+    for i in range(ok):
+        fleet[f"seed-ok-{i}"] = json.dumps({"at": now - age, "failed": False})
+    for i in range(failed):
+        fleet[f"seed-failed-{i}"] = json.dumps({"at": now - age, "failed": True})
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pull_while_docker_hub_is_down_from_the_validator_is_no_verdict():
+    """Regression (r4 M2): with enforcement on, a Docker Hub outage that reads as a TLS handshake timeout failed
+    every mirror-less idle node within about 30 minutes."""
+    ctx, _, _ = make_ctx(result(HUB_TLS_TIMEOUT), result(HUB_TLS_TIMEOUT))
+    hub = FakeHub(HUB_DOWN)
+    check = RegistryPullCheck()
+    with flags(hub=hub, interval_hours=0.1) as clock:
+        first = await check.run(ctx)
+        clock.now += 3600
+        second = await check.run(ctx)
+    for res in (first, second):
+        assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN.reason
+        what = res.event.what_we_saw
+        assert what["failures_in_a_row"] == 0 and what["no_verdict"] == "docker_hub_down"
+        assert what["pull"]["outcome"] == "timeout"
+        assert what["guard"]["docker_hub_control"]["reachable"] is False
+    assert hub.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_the_control_is_fetched_once_per_window_for_every_node(caplog):
+    redis = FakeRedis()
+    hub = FakeHub(HUB_DOWN)
+    check = RegistryPullCheck()
+    results = []
+    with flags(hub=hub) as clock, caplog.at_level(logging.WARNING):
+        for i in range(5):
+            ctx, _, _ = make_ctx(result(HUB_TLS_TIMEOUT), redis=redis, uuid=f"node-{i}")
+            results.append(await check.run(ctx))
+            clock.now += 30
+        assert hub.calls == 1 and _logged(caplog, "REGISTRY_PULL_NO_VERDICT_HUB_DOWN") == 1
+        clock.now += module.HUB_CONTROL_TTL_SECONDS
+        ctx, _, _ = make_ctx(result(HUB_TLS_TIMEOUT), redis=redis, uuid="node-late")
+        results.append(await check.run(ctx))
+    assert hub.calls == 2 and _logged(caplog, "REGISTRY_PULL_NO_VERDICT_HUB_DOWN") == 2
+    assert {r.event.reason_code for r in results} == {Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN.reason}
+    assert redis.ttl["registry_pull_hub_control"] == module.HUB_CONTROL_TTL_SECONDS == 300
+
+
+@pytest.mark.asyncio
+async def test_with_docker_hub_up_a_node_whose_mirror_fails_still_counts():
+    """The control guards against Docker Hub's outages, not the node's own mirror: 14e704ba still fails."""
+    ctx, _, _ = make_ctx(result(MIRROR_DNS_TIMEOUT), result(MIRROR_DNS_TIMEOUT))
+    hub = FakeHub(HUB_UP)
+    check = RegistryPullCheck()
+    with flags(hub=hub) as clock:
+        first = await check.run(ctx)
+        clock.now += 30 * 60
+        second = await check.run(ctx)
+    assert first.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
+    assert second.passed is False and second.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
+    guard = second.event.what_we_saw["guard"]
+    assert guard["docker_hub_control"] == {"at": clock.now, "reachable": True, "seen": "HTTP 401"}
+    assert guard["fleet"] == {"pulls": 1, "failed": 1, "share": 1.0, "breaker_open": False}
+    assert "no_verdict" not in second.event.what_we_saw
+    # 30 minutes apart: each failed pull has a control reading of its own
+    assert hub.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a_pull_that_works_never_fetches_the_control():
+    ctx, _, _ = make_ctx(result(PULL_OK))
+    hub = FakeHub(HUB_DOWN)
+    with flags(hub=hub):
+        res = await RegistryPullCheck().run(ctx)
+    assert res.event.reason_code == Msg.REGISTRY_PULL_OK.reason and hub.calls == 0
+
+
+async def _serve(handler):
+    from aiohttp import web
+
+    app = web.Application()
+    app.router.add_get("/v2/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    return runner, site._server.sockets[0].getsockname()[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,reachable", [(401, True), (200, True), (503, False), (429, False)])
+async def test_the_control_reads_401_or_200_as_reachable(status, reachable):
+    from aiohttp import web
+
+    async def handler(request):
+        return web.Response(status=status)
+
+    runner, port = await _serve(handler)
+    try:
+        with patch.object(module, "DOCKER_HUB_CONTROL_URL", f"http://127.0.0.1:{port}/v2/"):
+            assert await module.probe_docker_hub() == (reachable, f"HTTP {status}")
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_the_control_reads_a_refused_connection_as_unreachable():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    with patch.object(module, "DOCKER_HUB_CONTROL_URL", f"http://127.0.0.1:{port}/v2/"):
+        reachable, seen = await module.probe_docker_hub()
+    assert reachable is False and seen.startswith("ClientConnectorError")
+
+
+@pytest.mark.asyncio
+async def test_past_30_percent_of_the_hours_pulls_failing_new_failures_are_no_verdict(caplog):
+    """Regression (r4 M2): a Docker Hub incident the validator does not see (one region's CDN) failed the fleet."""
+    redis = FakeRedis()
+    check = RegistryPullCheck()
+    results = []
+    with flags() as clock, caplog.at_level(logging.WARNING):
+        _seed_fleet(redis, clock.now, ok=13, failed=6)
+        for i in range(3):
+            ctx, _, _ = make_ctx(result(HUB_TLS_TIMEOUT), redis=redis, uuid=f"node-{i}")
+            results.append(await check.run(ctx))
+            clock.now += 60
+    for res in results:
+        assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_FLEET.reason
+        what = res.event.what_we_saw
+        assert what["failures_in_a_row"] == 0 and what["no_verdict"] == "fleet_breaker"
+        assert what["guard"]["docker_hub_control"]["reachable"] is True
+    assert results[0].event.what_we_saw["guard"]["fleet"] == {
+        "pulls": 20,
+        "failed": 7,
+        "share": 0.35,
+        "breaker_open": True,
+    }
+    assert _logged(caplog, "REGISTRY_PULL_FLEET_BREAKER_OPEN") == 1
+
+
+@pytest.mark.asyncio
+async def test_the_fleet_event_is_logged_again_an_hour_later_while_the_breaker_stays_open(caplog):
+    redis = FakeRedis()
+    check = RegistryPullCheck()
+    with flags() as clock, caplog.at_level(logging.WARNING):
+        _seed_fleet(redis, clock.now, ok=10, failed=10)
+        ctx, _, _ = make_ctx(result(HUB_TLS_TIMEOUT), redis=redis, uuid="node-a")
+        await check.run(ctx)
+        clock.now += module.FLEET_WINDOW_SECONDS - 60
+        _seed_fleet(redis, clock.now, ok=10, failed=10)
+        ctx, _, _ = make_ctx(result(HUB_TLS_TIMEOUT), redis=redis, uuid="node-b")
+        await check.run(ctx)
+        assert _logged(caplog, "REGISTRY_PULL_FLEET_BREAKER_OPEN") == 1
+        clock.now += 120
+        ctx, _, _ = make_ctx(result(HUB_TLS_TIMEOUT), redis=redis, uuid="node-c")
+        res = await check.run(ctx)
+    assert res.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_FLEET.reason
+    assert _logged(caplog, "REGISTRY_PULL_FLEET_BREAKER_OPEN") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ok,failed,why",
+    [
+        (14, 5, "6 of 20 is 30%, not past it"),
+        (0, 5, "6 of 6 failed, but under 20 pulls"),
+    ],
+)
+async def test_under_the_share_or_the_minimum_a_failure_counts(ok, failed, why):
+    redis = FakeRedis()
+    with flags() as clock:
+        _seed_fleet(redis, clock.now, ok=ok, failed=failed)
+        ctx, _, _ = make_ctx(result(MIRROR_DNS_TIMEOUT), redis=redis, uuid="node-x")
+        res = await RegistryPullCheck().run(ctx)
+    assert res.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason, why
+    assert res.event.what_we_saw["guard"]["fleet"]["breaker_open"] is False
+
+
+@pytest.mark.asyncio
+async def test_pulls_older_than_an_hour_leave_the_fleet_window():
+    redis = FakeRedis()
+    with flags() as clock:
+        _seed_fleet(redis, clock.now, ok=0, failed=30, age=module.FLEET_WINDOW_SECONDS + 1)
+        ctx, _, _ = make_ctx(result(MIRROR_DNS_TIMEOUT), redis=redis, uuid="node-x")
+        res = await RegistryPullCheck().run(ctx)
+    assert res.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
+    assert list(redis.hashes["registry_pull_fleet"]) == ["node-x"]
+
+
+@pytest.mark.asyncio
+async def test_the_retry_of_an_open_streak_is_not_a_fleet_pull():
+    """A broken node re-pulls every 30 minutes; counting each retry would let a few broken nodes trip the breaker
+    against a healthy fleet that pulls once per 6 h."""
+    redis = FakeRedis()
+    ctx, runner, _ = make_ctx(*(result(MIRROR_DNS_TIMEOUT) for _ in range(4)), redis=redis)
+    check = RegistryPullCheck()
+    with flags() as clock:
+        first_at = clock.now
+        for _ in range(3):
+            await check.run(ctx)
+            clock.now += 30 * 60
+        clock.now -= 30 * 60
+        entry = json.loads(redis.hashes["registry_pull_fleet"][EXECUTOR.uuid])
+        assert entry == {"at": first_at, "failed": True}
+        clock.now += 30 * 60
+        await check.run(ctx)
+    assert len(runner.commands) == 4
+    # an hour after its scheduled pull the node has left the window, however often it re-pulled since
+    assert EXECUTOR.uuid not in redis.hashes["registry_pull_fleet"]
+
+
+@pytest.mark.asyncio
+async def test_a_scheduled_pull_that_works_is_a_fleet_pull():
+    redis = FakeRedis()
+    ctx, _, _ = make_ctx(result(PULL_OK), redis=redis)
+    with flags() as clock:
+        await RegistryPullCheck().run(ctx)
+    assert json.loads(redis.hashes["registry_pull_fleet"][EXECUTOR.uuid]) == {"at": clock.now, "failed": False}
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_fleet_window_is_no_verdict():
+    ctx, _, _ = make_ctx(result(MIRROR_DNS_TIMEOUT), redis=FakeRedis(hashes_unreadable=True))
+    with flags():
+        res = await RegistryPullCheck().run(ctx)
+    assert res.passed and res.event.reason_code == Msg.REGISTRY_PULL_UNMEASURED.reason
+    assert res.event.what_we_saw["no_verdict"] == "fleet_state_unreadable"
+    assert res.event.what_we_saw["failures_in_a_row"] == 0
+
+
+@pytest.mark.asyncio
+async def test_docker_hub_down_wins_over_the_breaker():
+    redis = FakeRedis()
+    with flags(hub=FakeHub(HUB_DOWN)) as clock:
+        _seed_fleet(redis, clock.now, ok=0, failed=30)
+        ctx, _, _ = make_ctx(result(HUB_TLS_TIMEOUT), redis=redis, uuid="node-x")
+        res = await RegistryPullCheck().run(ctx)
+    assert res.event.reason_code == Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN.reason

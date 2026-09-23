@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -7,6 +8,8 @@ import shlex
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -35,6 +38,25 @@ REGISTRY_PULL_FAILURES_BEFORE_VERDICT = 2
 _REDIS_PREFIX = "registry_pull_probe"
 _REDIS_TTL_SECONDS = 7 * 24 * 3600
 _TAIL_CHARS = 600
+
+# the validator's own reading of Docker Hub, taken before a failed pull counts: if the validator cannot reach
+# it either, the node's failure says nothing about the node. One fetch per window, shared by every node
+DOCKER_HUB_CONTROL_URL = "https://registry-1.docker.io/v2/"
+# /v2/ answers 401 to an anonymous client and 200 to an authenticated one; anything else is not a working hub
+_HUB_REACHABLE_STATUSES = frozenset({200, 401})
+_HUB_CONTROL_TIMEOUT_SECONDS = 10
+_HUB_CONTROL_KEY = "registry_pull_hub_control"
+HUB_CONTROL_TTL_SECONDS = 5 * 60
+# this validator's scheduled pulls over the last hour, one entry per node: {"at": ..., "failed": ...}
+_FLEET_KEY = "registry_pull_fleet"
+_FLEET_BREAKER_KEY = "registry_pull_fleet_breaker"
+FLEET_WINDOW_SECONDS = 3600
+# the Redis reads and writes of the control and the breaker run one at a time, so one fetch and one fleet
+# event come out per window however many nodes fail in the same cycle
+_FLEET_LOCK = asyncio.Lock()
+
+# why a failed pull did not count
+NoVerdict = Literal["docker_hub_down", "fleet_breaker", "fleet_state_unreadable"]
 
 # POSIX sh, run by the executor container's docker CLI against the host's dockerd, so the pull takes the
 # node's configured registry path (registry-mirrors, then registry-1.docker.io) exactly as a rental's pull
@@ -256,6 +278,8 @@ class _ProbeState:
     outcome: str
     failures_in_a_row: int = 0
     reading: dict[str, Any] = field(default_factory=dict)
+    no_verdict: str | None = None
+    guard: dict[str, Any] | None = None
 
     @property
     def standing_failure(self) -> bool:
@@ -275,6 +299,8 @@ class _ProbeState:
                 "outcome": self.outcome,
                 "failures_in_a_row": self.failures_in_a_row,
                 "reading": self.reading,
+                "no_verdict": self.no_verdict,
+                "guard": self.guard,
             }
         )
 
@@ -287,6 +313,8 @@ class _ProbeState:
                 outcome=str(data["outcome"]),
                 failures_in_a_row=int(data.get("failures_in_a_row", 0)),
                 reading=dict(data.get("reading") or {}),
+                no_verdict=data.get("no_verdict"),
+                guard=data.get("guard"),
             )
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
@@ -294,6 +322,21 @@ class _ProbeState:
 
 class _RedisUnreadable(Exception):
     pass
+
+
+def _decode(raw: Any) -> str:
+    return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+
+async def probe_docker_hub() -> tuple[bool, str]:
+    """The validator's own GET of Docker Hub's registry root: (reachable, what it saw)."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=_HUB_CONTROL_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(DOCKER_HUB_CONTROL_URL, allow_redirects=False) as response:
+                return response.status in _HUB_REACHABLE_STATUSES, f"HTTP {response.status}"
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:200]
 
 
 class RegistryPullCheck:
@@ -310,8 +353,21 @@ class RegistryPullCheck:
     node's recovery, comes soon). A Docker Hub 429 (anonymous pulls are counted
     per IP, and a provider's nodes can share one) is no verdict, never a failure. Between pulls the last
     reading stands. A node fails once REGISTRY_PULL_FAILURES_BEFORE_VERDICT measured pulls in a row
-    failed (timeout, DNS error, manifest unknown), and only under REGISTRY_PULL_ENFORCEMENT_ENABLED;
-    without it the finding is logged as REGISTRY_PULL_FAILED_OBSERVED and the node passes.
+    failed (timeout, DNS error, unreachable, manifest unknown), and only under
+    REGISTRY_PULL_ENFORCEMENT_ENABLED; without it the finding is logged as REGISTRY_PULL_FAILED_OBSERVED
+    and the node passes.
+
+    A failed pull counts only when two guards say the fault is the node's, not Docker Hub's:
+    - the validator's own GET of DOCKER_HUB_CONTROL_URL answered 200 or 401 (cached for
+      HUB_CONTROL_TTL_SECONDS); if it did not, the pull is REGISTRY_PULL_NO_VERDICT_HUB_DOWN;
+    - no more than REGISTRY_PULL_FLEET_BREAKER_SHARE of this validator's scheduled pulls in the last hour
+      failed (with at least REGISTRY_PULL_FLEET_BREAKER_MIN_PULLS of them); past it the pull is
+      REGISTRY_PULL_NO_VERDICT_FLEET, and REGISTRY_PULL_FLEET_BREAKER_OPEN is logged once an hour.
+      A scheduled pull is a node's regular one, not the retry of an open streak, so a few broken nodes
+      re-pulling every 30 minutes cannot trip it.
+    The control sees an outage from where the validator stands, at once and on a fleet of any size; the
+    breaker catches what the validator cannot see (an outage of Docker Hub's CDN in one region, a mirror
+    many providers share, an error text a new Docker release words differently), once enough pulls fail.
     """
 
     check_id = "executor.validate.registry_pull"
@@ -335,18 +391,146 @@ class RegistryPullCheck:
 
         reading = await self._pull(ctx)
         failures = last.failures_in_a_row if last is not None else 0
+        no_verdict: NoVerdict | None = None
+        guard: dict[str, Any] | None = None
+        if reading.outcome == "ok" or reading.failed:
+            if failures == 0:
+                await self._record_fleet_pull(ctx, now, failed=reading.failed)
         if reading.outcome == "ok":
             failures = 0
         elif reading.failed:
-            failures += 1
+            no_verdict, guard = await self._guard(ctx, now)
+            if no_verdict is None:
+                failures += 1
         state = _ProbeState(
             at=now,
             outcome=reading.outcome,
             failures_in_a_row=failures,
             reading=reading.as_record(),
+            no_verdict=no_verdict,
+            guard=guard,
         )
         await self._save(ctx, state)
         return self._verdict(ctx, state, probed=True)
+
+    async def _guard(
+        self, ctx: Context, now: float
+    ) -> tuple[NoVerdict | None, dict[str, Any] | None]:
+        """Why this failed pull does not count, or None when it does; and what the guards saw."""
+        async with _FLEET_LOCK:
+            control = await self._hub_control(ctx, now)
+            guard: dict[str, Any] = {"docker_hub_control": control}
+            if not control["reachable"]:
+                return "docker_hub_down", guard
+            fleet = await self._fleet_share(ctx, now)
+            if fleet is None:
+                return "fleet_state_unreadable", guard
+            guard["fleet"] = fleet
+            if fleet["breaker_open"]:
+                await self._announce_breaker(ctx, now, fleet)
+                return "fleet_breaker", guard
+            return None, guard
+
+    async def _hub_control(self, ctx: Context, now: float) -> dict[str, Any]:
+        redis = ctx.services.redis
+        try:
+            raw = await redis.get(_HUB_CONTROL_KEY)
+            cached = json.loads(_decode(raw)) if raw is not None else None
+            if cached is not None and now - float(cached["at"]) < HUB_CONTROL_TTL_SECONDS:
+                return cached
+        except Exception:
+            logger.warning(
+                _m("Registry pull: the cached Docker Hub control is unreadable; fetching it again"),
+                exc_info=True,
+            )
+        reachable, seen = await probe_docker_hub()
+        control = {"at": now, "reachable": reachable, "seen": seen}
+        try:
+            await redis.set(_HUB_CONTROL_KEY, json.dumps(control), ex=HUB_CONTROL_TTL_SECONDS)
+        except Exception:
+            logger.warning(_m("Registry pull: could not cache the Docker Hub control"), exc_info=True)
+        if not reachable:
+            logger.warning(
+                _m(
+                    "REGISTRY_PULL_NO_VERDICT_HUB_DOWN: the validator cannot reach Docker Hub either; "
+                    f"failed pulls are no verdict for the next {HUB_CONTROL_TTL_SECONDS // 60} minutes",
+                    extra=get_extra_info({"url": DOCKER_HUB_CONTROL_URL, "seen": seen}),
+                )
+            )
+        return control
+
+    async def _record_fleet_pull(self, ctx: Context, now: float, *, failed: bool) -> None:
+        try:
+            await ctx.services.redis.hset(
+                _FLEET_KEY, ctx.executor.uuid, json.dumps({"at": now, "failed": failed})
+            )
+        except Exception:
+            logger.warning(
+                _m(
+                    "Registry pull: could not record the pull in the fleet window",
+                    extra=get_extra_info(ctx.default_extra),
+                ),
+                exc_info=True,
+            )
+
+    async def _fleet_share(self, ctx: Context, now: float) -> dict[str, Any] | None:
+        redis = ctx.services.redis
+        try:
+            raw = await redis.hgetall(_FLEET_KEY) or {}
+        except Exception:
+            logger.warning(_m("Registry pull: the fleet window is unreadable"), exc_info=True)
+            return None
+        in_window: list[bool] = []
+        expired: list[str] = []
+        for key, value in raw.items():
+            try:
+                entry = json.loads(_decode(value))
+                fresh = now - float(entry["at"]) <= FLEET_WINDOW_SECONDS
+            except (TypeError, ValueError, KeyError):
+                fresh = False
+            if fresh:
+                in_window.append(bool(entry.get("failed")))
+            else:
+                expired.append(_decode(key))
+        if expired:
+            try:
+                await redis.hdel(_FLEET_KEY, *expired)
+            except Exception:
+                logger.warning(_m("Registry pull: could not prune the fleet window"), exc_info=True)
+        pulls, failed = len(in_window), sum(in_window)
+        share = failed / pulls if pulls else 0.0
+        return {
+            "pulls": pulls,
+            "failed": failed,
+            "share": round(share, 3),
+            "breaker_open": pulls >= settings.REGISTRY_PULL_FLEET_BREAKER_MIN_PULLS
+            and share > settings.REGISTRY_PULL_FLEET_BREAKER_SHARE,
+        }
+
+    async def _announce_breaker(self, ctx: Context, now: float, fleet: dict[str, Any]) -> None:
+        redis = ctx.services.redis
+        try:
+            raw = await redis.get(_FLEET_BREAKER_KEY)
+            if raw is not None and now - float(json.loads(_decode(raw))["at"]) < FLEET_WINDOW_SECONDS:
+                return
+        except Exception:
+            logger.warning(_m("Registry pull: the fleet breaker mark is unreadable"), exc_info=True)
+        try:
+            await redis.set(
+                _FLEET_BREAKER_KEY, json.dumps({"at": now, **fleet}), ex=FLEET_WINDOW_SECONDS
+            )
+        except Exception:
+            logger.warning(_m("Registry pull: could not record the fleet breaker mark"), exc_info=True)
+        logger.warning(
+            _m(
+                "REGISTRY_PULL_FLEET_BREAKER_OPEN: "
+                f"{fleet['failed']} of this validator's {fleet['pulls']} scheduled pulls in the last hour failed; "
+                "new failed pulls are no verdict until the share falls",
+                extra=get_extra_info(
+                    {**fleet, "threshold": settings.REGISTRY_PULL_FLEET_BREAKER_SHARE}
+                ),
+            )
+        )
 
     def _verdict(self, ctx: Context, state: _ProbeState, *, probed: bool) -> CheckResult:
         what: dict[str, Any] = {
@@ -357,6 +541,10 @@ class RegistryPullCheck:
         }
         if not probed:
             what["read_at"] = state.at
+        if state.no_verdict is not None:
+            what["no_verdict"] = state.no_verdict
+        if state.guard is not None:
+            what["guard"] = state.guard
         if state.standing_failure:
             template = (
                 Msg.REGISTRY_PULL_FAILED
@@ -367,7 +555,13 @@ class RegistryPullCheck:
             return CheckResult(passed=not settings.REGISTRY_PULL_ENFORCEMENT_ENABLED, event=event)
         if not probed:
             return self._skipped(ctx, "not due", last=what)
-        if state.outcome in FAILING_OUTCOMES:
+        if state.no_verdict == "docker_hub_down":
+            template = Msg.REGISTRY_PULL_NO_VERDICT_HUB_DOWN
+        elif state.no_verdict == "fleet_breaker":
+            template = Msg.REGISTRY_PULL_NO_VERDICT_FLEET
+        elif state.no_verdict is not None:
+            template = Msg.REGISTRY_PULL_UNMEASURED
+        elif state.outcome in FAILING_OUTCOMES:
             template = Msg.REGISTRY_PULL_FAILED_ONCE
         elif state.outcome == "ok":
             template = Msg.REGISTRY_PULL_OK

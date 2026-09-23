@@ -387,8 +387,11 @@ class Settings(BaseSettings):
     # templates start fine. RegistryPullCheck removes and pulls a digest-pinned hello-world through the
     # daemon (registry-mirrors apply) under a 30 s bound on idle nodes, at most once per INTERVAL_HOURS
     # (RETRY_MINUTES after a failed pull, so the confirming pull comes soon). A Docker Hub 429 is no
-    # verdict. Two failed pulls in a row (timeout, DNS error, manifest unknown) are the finding: logged as
-    # REGISTRY_PULL_FAILED_OBSERVED, or with ENFORCEMENT a fail (REGISTRY_PULL_FAILED, score 0).
+    # verdict. Two failed pulls in a row (timeout, DNS error, unreachable, manifest unknown) are the
+    # finding: logged as REGISTRY_PULL_FAILED_OBSERVED, or with ENFORCEMENT a fail (REGISTRY_PULL_FAILED,
+    # score 0). A failed pull does not count while the validator itself cannot reach Docker Hub, or while
+    # more than FLEET_BREAKER_SHARE of its scheduled pulls in the last hour failed (FLEET_BREAKER_MIN_PULLS
+    # or more), so a Docker Hub outage never fails the fleet.
     # Enforcement is off by default: it goes on after a 48 h log-only window with the OBSERVED rows
     # reviewed. Decider: taiberium; backup jam6099 (Muhammad) from 28 Sep 2026.
     REGISTRY_PULL_CHECK_ENABLED: bool = Field(env="REGISTRY_PULL_CHECK_ENABLED", default=True)
@@ -398,6 +401,12 @@ class Settings(BaseSettings):
     )
     REGISTRY_PULL_PROBE_RETRY_MINUTES: float = Field(
         env="REGISTRY_PULL_PROBE_RETRY_MINUTES", default=30.0, gt=0
+    )
+    REGISTRY_PULL_FLEET_BREAKER_SHARE: float = Field(
+        env="REGISTRY_PULL_FLEET_BREAKER_SHARE", default=0.3, gt=0, le=1
+    )
+    REGISTRY_PULL_FLEET_BREAKER_MIN_PULLS: int = Field(
+        env="REGISTRY_PULL_FLEET_BREAKER_MIN_PULLS", default=20, ge=1
     )
     # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
     # wave writes nothing about it: no report row, no availability error, no evidence for the
