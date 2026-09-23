@@ -1108,3 +1108,17 @@ async def test_B1_log_emit_to_publish_p95_under_2s(svc):
     )
     p95 = latencies_ms[int(0.95 * len(latencies_ms))]
     assert p95 <= 2000, f"p95 emit→publish latency={p95:.1f}ms exceeds 2000ms budget"
+
+
+def test_A16e_str_of_a_failed_request_leaves_out_the_build_tail():
+    """compute_client logs `str(response)` at INFO; the tail must stay out of it and stay on the wire."""
+    request = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        msg="Custom build failed",
+        build_log_tail="#3 ARG HF_TOKEN=abc",
+    )
+
+    assert "HF_TOKEN=abc" not in str(request)
+    assert request.model_dump()["build_log_tail"] == "#3 ARG HF_TOKEN=abc"

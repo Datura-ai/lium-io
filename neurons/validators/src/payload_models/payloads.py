@@ -728,7 +728,7 @@ class FailedContainerRequest(ContainerBaseResponse):
     # (docker_build), the timeout (build_timeout) or a fixed one-line reason for build_export and the
     # setup steps (never their stderr). Renter-safe: the renter's own Dockerfile output, never executor
     # host data. None for every other failure and from old validators.
-    build_log_tail: str | None = None
+    build_log_tail: str | None = Field(default=None, repr=False)
 
 
 class DuplicateExecutorsResponse(BaseModel):
