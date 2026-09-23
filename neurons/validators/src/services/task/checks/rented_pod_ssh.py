@@ -40,7 +40,7 @@ judged the validator to be the outage (DAH-2748), the queued reports are logged 
 ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` and no report is POSTed, so no renter is told. The
 streaks keep ``reported`` False, so the outage is queued again next cycle and reported once the
 fleet reads clean. Enforcement follows the backend accept, not the mail: ``is_enforced`` is true
-only when the streak is ``accepted`` (a 200, including ``notify_failed``), so a held cycle never
+only when the streak is ``backend_accepted`` (a 200, including ``notify_failed``), so a held cycle never
 zeroes the node and a refused mail does not protect the provider. The gate also stores its verdict
 (``RENTED_POD_SSH_LAST_GATE_KEY``): while the last gate held the reports as our own outage, an
 accepted outage is not enforced either, so our outage zeroes a node for one cycle at most (the gate
@@ -168,10 +168,10 @@ class RentedPodSshVerdict:
     report_queued: bool = False
     # Backend accepted this outage (HTTP 200), including a ``notify_failed`` delivery.
     # Mail retry still queues; enforcement reads this, not ``reported``.
-    accepted: bool = False
+    backend_accepted: bool = False
     accepted_faults: list[str] = field(default_factory=list)
     # The last cycle-end gate held the reports as our own outage.
-    last_gate_held: bool = False
+    last_gate_suppressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,13 +207,14 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
 
     Only with ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on, only for an unhealthy pod, only once its
     streak has reached ``enforce_after_cycles()``, and only after the backend accepted the outage
-    report (``verdict.accepted``), and not while the last cycle-end gate held the reports as our own
-    outage (``verdict.last_gate_held``). Mail delivery is separate: a ``notify_failed`` 200 still accepts,
+    report (``verdict.backend_accepted``), and not while the last cycle-end gate held the reports as our own
+    outage (``verdict.last_gate_suppressed``). Mail delivery is separate: a ``notify_failed`` 200 still accepts,
     and a cycle that only queued the notice — including a validator-side outage the fleet gate
     holds — does not zero the node. Enforce only when the accepted fault was a port fault; a
     keys-only accept does not let a later port fault zero the node. A renter who deletes
-    ``authorized_keys`` (that fault alone, host ``boot_id`` unchanged) is not enforced: the
-    provider cannot restore the keys. A pod never seen healthy carries no streak
+    ``authorized_keys`` (that fault alone, host ``boot_id`` unchanged) is not enforced, whether that is the
+    accepted report's fault or this cycle's after a port-fault accept: the provider cannot restore the keys.
+    A pod never seen healthy carries no streak
     (``consecutive_cycles`` 0), a Redis outage yields no verdict at all, and the flag off leaves the
     check with DAH-2870's record-and-report behaviour: none of those is enforced.
     """
@@ -221,12 +222,16 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
         return False
     if verdict.consecutive_cycles < enforce_after_cycles():
         return False
-    if not verdict.accepted or verdict.last_gate_held:
+    if not verdict.backend_accepted or verdict.last_gate_suppressed:
         return False
     accepted_faults = set(verdict.accepted_faults) or set(verdict.faults)
     if _PORT_FAULTS & accepted_faults:
+        current_faults = set(verdict.faults)
+        # the boot rule applies to this cycle's faults too: keys alone and no reboot is the renter's doing
+        if FAULT_AUTHORIZED_KEYS_UNREADABLE in current_faults and not (_PORT_FAULTS & current_faults):
+            return verdict.boot_id_changed is True
         return True
-    if FAULT_AUTHORIZED_KEYS_UNREADABLE in accepted_faults and not (_PORT_FAULTS & accepted_faults):
+    if FAULT_AUTHORIZED_KEYS_UNREADABLE in accepted_faults:
         return verdict.boot_id_changed is True
     return False
 
@@ -314,13 +319,13 @@ class OkMark:
 @dataclass(frozen=True)
 class FailStreak:
     """The `fail` key: how many consecutive cycles the pod has failed, when the first one was,
-    whether the backend accepted this outage (``accepted``, any 200), which faults that accept
+    whether the backend accepted this outage (``backend_accepted``, any 200), which faults that accept
     named, and whether the renter was told (``reported`` — not set on ``notify_failed``)."""
 
     count: int
     first_failed_at: str
     reported: bool = False
-    accepted: bool = False
+    backend_accepted: bool = False
     accepted_faults: list[str] = field(default_factory=list)
 
     @classmethod
@@ -344,7 +349,7 @@ class FailStreak:
             if isinstance(first_failed_at, str) and first_failed_at
             else now_iso,
             reported=reported,
-            accepted=value.get("accepted") is True or reported,
+            backend_accepted=value.get("accepted") is True or reported,
             accepted_faults=accepted_faults,
         )
 
@@ -357,7 +362,8 @@ class FailStreak:
                 "count": self.count,
                 "first_failed_at": self.first_failed_at,
                 "reported": self.reported,
-                "accepted": self.accepted,
+                # the stored key stays "accepted": streaks already in Redis keep enforcing across the deploy
+                "accepted": self.backend_accepted,
                 "accepted_faults": list(self.accepted_faults),
             }
         )
@@ -586,9 +592,9 @@ async def _judge_with_streak(
         first_failed_at=first_failed_at,
         boot_id_changed=boot_id_changed,
         report=consecutive >= threshold,
-        accepted=streak.accepted,
+        backend_accepted=streak.backend_accepted,
         accepted_faults=list(streak.accepted_faults),
-        last_gate_held=bool(await store.get(RENTED_POD_SSH_LAST_GATE_KEY)),
+        last_gate_suppressed=bool(await store.get(RENTED_POD_SSH_LAST_GATE_KEY)),
     )
     if consecutive < threshold or streak.reported or settings.DRY_RUN:
         # Under the threshold, or the backend already acknowledged this outage. DRY_RUN validates
@@ -878,7 +884,7 @@ async def _post_one(
         )
     accepted_faults = [item for item in (payload.get("faults") or []) if isinstance(item, str)]
     # Backend accepted (200). A Redis error on this write costs one duplicate POST next cycle,
-    # which the backend dedupes; ``accepted`` then stays off until that retry lands.
+    # which the backend dedupes; ``backend_accepted`` then stays off until that retry lands.
     try:
         stored = await redis.get(_fail_key(pod_id))
         if stored is not None:
@@ -887,7 +893,7 @@ async def _post_one(
                 _fail_key(pod_id),
                 replace(
                     streak,
-                    accepted=True,
+                    backend_accepted=True,
                     accepted_faults=accepted_faults,
                     reported=not mail_failed,
                 ).dump(),
