@@ -145,21 +145,25 @@ def _is_positive_number(value: Any) -> bool:
 
 
 def scrape_egress_finding(specs: dict[str, Any] | None) -> dict[str, Any] | None:
-    """What the scrape's speed tests say about egress; None when the scrape carried no network block.
+    """What the scrape's speed tests say about egress; None when the scrape ran no speed test.
 
     benchmark_network_speed keeps the first download and upload any method measured and each method's
-    `network_speed_error` under `measurements`. A finding only when neither direction was measured: a
-    missing download alone is not one (ticket-0361: 24 of one provider's 27 active nodes had no download,
-    most of them a Cloudflare download recorded as 0, and 14e704ba's upload measured 77-105 Mbps), nor
-    is an error from a method a later one measured past.
+    result under `measurements`; with neither measured, all four methods ran. A finding only when
+    neither direction was measured: a missing download alone is not one (ticket-0361: 24 of one
+    provider's 27 active nodes had no download, most of them a Cloudflare download recorded as 0, and
+    14e704ba's upload measured 77-105 Mbps), nor is an error from a method a later one measured past.
+    A network block without `measurements` is no reading: lium-io#1419 (DAH-2774) removes the scrape's
+    speed tests and leaves `{}`, which must not read as every node without egress.
     """
     network = (specs or {}).get("network")
     if not isinstance(network, dict):
         return None
+    if not isinstance(network.get("measurements"), dict) or not network["measurements"]:
+        return None
     errors: dict[str, str] = {}
     if network.get("network_speed_error"):
         errors["network"] = str(network["network_speed_error"])[:_TAIL_CHARS]
-    for method, measurement in (network.get("measurements") or {}).items():
+    for method, measurement in network["measurements"].items():
         if isinstance(measurement, dict) and measurement.get("network_speed_error"):
             errors[method] = str(measurement["network_speed_error"])[:_TAIL_CHARS]
     download = network.get("download_speed")
@@ -185,7 +189,7 @@ class OutboundInternetCheck:
 
     Two readings, either one is enough: a container on the rental network (`pod_probe_command`, the
     pod's network and runtime) could not resolve pypi.org or got no HTTP answer from it, or the scrape
-    measured neither a download nor an upload. The pod probe is the one that sees a pod-network-only
+    ran its speed tests and measured neither a download nor an upload. The pod probe is the one that sees a pod-network-only
     fault (14e704ba: no download, 77-105 Mbps upload, 3 renters without internet). A
     slow host passes: speed stays behind FeatureFlag.VERIFYX_NETWORK_VALIDATION. A pod probe that did
     not run (docker refused it, the SSH command timed out) reaches no verdict, never fails the node and

@@ -376,8 +376,9 @@ class Settings(BaseSettings):
     # the error. OutboundInternetCheck starts one `alpine` container on the rental network
     # (`lium-rentals`, the renter's runtime) that resolves and fetches pypi.org; the rental probe runs
     # the same check inside its renter container. That in-pod verdict is the reading: a pod-only fault
-    # (14e704ba: no download, upload 77-105 Mbps) only shows there. The scrape counts only when neither
-    # direction was measured; a null download alone is not a finding (24 of one provider's 27 nodes).
+    # (14e704ba: no download, upload 77-105 Mbps) only shows there. The scrape counts only when its speed
+    # tests ran and neither direction was measured; a null download alone is not a finding (24 of one
+    # provider's 27 nodes), and a scrape without speed tests (lium-io#1419) is no reading.
     # Slow is not this check's business: any HTTP answer passes. CHECK runs it on idle nodes and logs
     # the verdict (NO_OUTBOUND_INTERNET_OBSERVED); ENFORCEMENT fails the node with NO_OUTBOUND_INTERNET
     # (score 0, like INSUFFICIENT_PORTS) and the rental probe's egress step with it. Enforcement is off

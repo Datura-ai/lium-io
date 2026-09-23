@@ -41,6 +41,9 @@ POD_NO_ANSWER = "lium_egress dns=ok\nlium_egress tool=wget http=000\nwget: can't
 
 
 def network(download, upload=None, **measurements) -> dict:
+    """A scrape's network block; without `measurements`, one Cloudflare test that read these figures."""
+    if not measurements:
+        measurements = {"cloudflare": {"download_speed": download, "upload_speed": upload}}
     return {
         "download_speed": download,
         "upload_speed": upload,
@@ -422,10 +425,34 @@ async def test_the_check_sends_the_node_runtime_to_the_pod_probe():
 
 def test_scrape_without_a_network_block_is_no_reading():
     assert scrape_egress_finding({}) is None
-    assert scrape_egress_finding({"network": {"download_speed": float("nan")}})["no_egress"] is True
-    measured_up = {"network": {"download_speed": None, "upload_speed": 90.0, "upload_source": "cloudflare"}}
+    nan = network(float("nan"), cloudflare={"download_speed": float("nan")})
+    assert scrape_egress_finding({"network": nan})["no_egress"] is True
+    measured_up = {"network": network(None, 90.0)}
     assert scrape_egress_finding(measured_up)["no_egress"] is False
     assert scrape_egress_finding(measured_up)["upload_source"] == "cloudflare"
+
+
+@pytest.mark.parametrize(
+    "net",
+    [{}, {"download_speed": None, "upload_speed": None}, {"download_speed": None, "measurements": {}}],
+    ids=["empty_block", "no_measurements", "empty_measurements"],
+)
+def test_a_scrape_that_ran_no_speed_test_is_no_reading(net):
+    """Regression: lium-io#1419 (DAH-2774) removes the scrape's speed tests and leaves `network: {}`,
+    which read as neither direction measured: every idle node NO_OUTBOUND_INTERNET."""
+    assert scrape_egress_finding({"network": net}) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pod,passed", [(POD_OK, True), (POD_NO_ANSWER, False)])
+async def test_without_speed_tests_the_pod_probe_alone_decides(pod, passed):
+    ctx, _ = make_ctx({}, pod=result(pod))
+    with flags():
+        res = await OutboundInternetCheck().run(ctx)
+    assert res.passed is passed
+    assert res.event.what_we_saw["scrape"] is None
+    if not passed:
+        assert res.event.what_we_saw["failed_by"] == ["pod_probe"]
 
 
 def _stub(directory, name: str, body: str) -> None:
