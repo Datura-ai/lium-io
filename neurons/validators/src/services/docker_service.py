@@ -4742,7 +4742,7 @@ class DockerService:
                         ),
                     )
                 )
-                return False, "build_dind_start"
+                return CustomBuildOutcome(False, "build_dind_start", "isolated build container failed to start")
             if start_res.exit_status == 124:
                 # coreutils `timeout` exit code: the start (usually its image pull) outlived the bound.
                 await self.stream_log(
@@ -4811,7 +4811,7 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "setup_timeout_s": setup_timeout_s}),
                     )
                 )
-                return False, "build_egress_setup"
+                return CustomBuildOutcome(False, "build_egress_setup", "could not resolve the build container address")
             raw_ip = (ip_res.stdout or "").strip()
             try:
                 dind_ip = str(ipaddress.ip_address(raw_ip))
@@ -4841,7 +4841,7 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "setup_timeout_s": setup_timeout_s}),
                     )
                 )
-                return False, "build_egress_setup"
+                return CustomBuildOutcome(False, "build_egress_setup", "could not read the build container's DNS resolvers")
             if resolv_res.exit_status == 0:
                 dns_servers = self._dind_nameservers_inside_blocked_cidrs(resolv_res.stdout or "", cidrs)
             else:

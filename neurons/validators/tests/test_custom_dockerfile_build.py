@@ -1587,7 +1587,7 @@ async def test_A22_build_on_a_host_with_a_private_resolver_lets_dns_through(svc,
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client,
         payload=payload,
         log_tag="t",
@@ -1623,7 +1623,7 @@ async def test_A22b_public_resolver_or_unreadable_resolv_keeps_todays_rules(svc,
         monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
         monkeypatch.setattr(svc, "stream_log", AsyncMock())
         payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-        ok, step = await svc._custom_build_image(
+        ok, step, _tail = await svc._custom_build_image(
             ssh_client=ssh_client,
             payload=payload,
             log_tag="t",
@@ -1651,7 +1651,7 @@ async def test_A23_setup_commands_are_bounded_and_a_hung_dind_start_fails_the_st
     monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
     )
     assert ok is True and step is None
@@ -1673,7 +1673,7 @@ async def test_A23_setup_commands_are_bounded_and_a_hung_dind_start_fails_the_st
     esl2 = _make_esl()
     monkeypatch.setattr(svc, "execute_and_stream_logs", esl2)
     payload2 = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=hung, payload=payload2, log_tag="t", default_extra={"pod_id": payload2.pod_id},
     )
     assert ok is False and step == "build_dind_start"
@@ -1695,7 +1695,7 @@ async def test_A23b_a_hung_readiness_probe_fails_at_build_dind_unready_within_th
     # hour; the executor-side `timeout -k 2 1` on the probe turns that into one
     # not-ready probe (exit 124) after 1 s, and with a budget of one probe the
     # build fails at `build_dind_unready` instead of hanging.
-    ok, step = await asyncio.wait_for(
+    ok, step, _tail = await asyncio.wait_for(
         svc._custom_build_image(
             ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
         ),
@@ -1724,7 +1724,7 @@ async def test_A23c_readiness_keeps_its_probe_budget_when_probes_fail_fast(svc, 
     monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
     )
     assert ok is False and step == "build_dind_unready"
@@ -1749,7 +1749,7 @@ async def test_A23d_a_probe_that_hits_its_bound_is_not_ready_and_the_next_probe_
     monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await asyncio.wait_for(
+    ok, step, _tail = await asyncio.wait_for(
         svc._custom_build_image(
             ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
         ),
@@ -1780,7 +1780,7 @@ async def test_A23e_a_probe_that_outlives_the_backstop_is_closed_before_the_next
     monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await asyncio.wait_for(
+    ok, step, _tail = await asyncio.wait_for(
         svc._custom_build_image(
             ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
         ),
@@ -1812,7 +1812,7 @@ async def test_A24_egress_helper_runs_under_the_setup_bound(svc, monkeypatch):
     monkeypatch.setattr(svc, "execute_and_stream_logs", _esl)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=_make_dind_ssh(), payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
     )
     assert ok is True and step is None
@@ -1936,7 +1936,7 @@ async def test_A24c_egress_helper_silent_non_zero_exit_fails_the_apply_and_never
     errors: list = []
     monkeypatch.setattr("services.docker_service.logger.error", lambda msg, *a, **k: errors.append(msg))
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
     )
     assert (ok, step) == (False, "build_egress_setup")
@@ -1961,7 +1961,7 @@ async def test_A24d_egress_helper_exit_zero_proceeds_to_the_build(svc, monkeypat
     ssh_client = _make_process_ssh(egress_exit=0)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
     )
     assert (ok, step) == (True, None)
@@ -2029,7 +2029,7 @@ async def test_A26_teardown_bounds_the_remove_helper_and_removes_both_helpers_be
     warnings: list = []  # the _StructuredMessage objects: message + extra
     monkeypatch.setattr("services.docker_service.logger.warning", lambda msg, *a, **k: warnings.append(msg))
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id},
     )
     assert ok is True and step is None
