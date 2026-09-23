@@ -696,21 +696,26 @@ CLOUDFLARE_DOWN_BYTES = 50_000_000
 CLOUDFLARE_UP_BYTES = 25 * 1024 * 1024
 CLOUDFLARE_MAX_SECONDS = 15
 CURL_EXIT_OPERATION_TIMEDOUT = 28
+# __up answers once the whole body is in, so an upload cut at --max-time has no final status: 000, or
+# 100 where curl sent `Expect: 100-continue` (curl 8.5 against a slow reader)
+CLOUDFLARE_UP_CUT_STATUSES = ("200", "000", "100")
 
 
-def cloudflare_transfer_mbps(returncode, stdout, stderr, expected_bytes):
+def cloudflare_transfer_mbps(returncode, stdout, stderr, expected_bytes, cut_statuses=("200",)):
     """Mbps from curl's `-w '%{http_code} <size> <speed>'`; raises when the answer is no measurement.
 
     Cloudflare refuses what it will not serve with a tiny body (HTTP 403 and 1 byte for __down of
     100 MB or more) and curl exits 0 on it, so reading the speed alone recorded a refusal as 0.0 Mbps.
-    A 200 transfer cut at --max-time is a measurement (its average), not a failure.
+    A transfer cut at --max-time with a status in `cut_statuses` is a measurement (its average), not a
+    failure.
     """
     fields = stdout.split()
     if returncode not in (0, CURL_EXIT_OPERATION_TIMEDOUT) or len(fields) != 3:
         raise RuntimeError(f"curl exit {returncode}: {(stderr or stdout).strip()[-200:]}")
     status, size, speed = fields
     size = int(float(size))
-    if status != "200":
+    cut = returncode == CURL_EXIT_OPERATION_TIMEDOUT
+    if status != "200" and not (cut and status in cut_statuses):
         raise RuntimeError(f"HTTP {status}, {size} bytes")
     if returncode == 0 and size < expected_bytes:
         raise RuntimeError(f"{size} of {expected_bytes} bytes")
@@ -741,10 +746,11 @@ def cloudflare_speed():
             *run_cmd_status(
                 f"dd if=/dev/zero bs=1M count={CLOUDFLARE_UP_BYTES // (1024 * 1024)} 2>/dev/null | "
                 "curl -o /dev/null -sS -w '%{http_code} %{size_upload} %{speed_upload}' "
-                f"--max-time {CLOUDFLARE_MAX_SECONDS} -X POST --data-binary @- "
+                f"--max-time {CLOUDFLARE_MAX_SECONDS} -X POST -H 'Expect:' --data-binary @- "
                 "'https://speed.cloudflare.com/__up'"
             ),
             CLOUDFLARE_UP_BYTES,
+            CLOUDFLARE_UP_CUT_STATUSES,
         )
     except Exception as exc:
         errors.append(f"upload: {exc!r}")

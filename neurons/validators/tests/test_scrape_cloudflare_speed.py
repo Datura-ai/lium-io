@@ -22,6 +22,7 @@ HELPERS = {
     "CLOUDFLARE_UP_BYTES",
     "CLOUDFLARE_MAX_SECONDS",
     "CURL_EXIT_OPERATION_TIMEDOUT",
+    "CLOUDFLARE_UP_CUT_STATUSES",
     "cloudflare_transfer_mbps",
     "cloudflare_speed",
 }
@@ -86,6 +87,39 @@ def test_a_transfer_cut_at_max_time_is_a_slow_measurement():
 
     assert data["download_speed"] == 10.0
     assert "network_speed_error" not in data
+
+
+# curl 8.5 posting 25 MB to a local server that reads slowly, --max-time 3: `100 1900544 633113` exit 28
+# with curl's default `Expect: 100-continue`, `000 1966080 654831` exit 28 with `-H 'Expect:'`
+@pytest.mark.parametrize("status", ["000", "100"], ids=["no_expect", "expect_100_continue"])
+def test_an_upload_cut_at_max_time_is_a_slow_measurement(status):
+    """Regression (r3): __up answers only once the whole body is in, so an upload cut at --max-time has no
+    final status (000, or 100 after Expect: 100-continue) and a slow host's upload was read as refused."""
+    namespace, commands = scrape(
+        DOWN_OK, (28, f"{status} 1966080 654831", "curl: (28) Operation timed out")
+    )
+
+    data = namespace["cloudflare_speed"]()
+
+    assert data == {"download_speed": 100.0, "upload_speed": 5.24}
+    assert "-H 'Expect:'" in commands[1]
+
+
+def test_a_cut_transfer_without_a_measurement_raises():
+    """A download cut before any answer has no 200; an upload cut before a byte went out measured nothing."""
+    namespace, _ = scrape()
+    cut_before_anything = (28, "000 0 0", "curl: (28) Operation timed out")
+
+    with pytest.raises(RuntimeError, match="HTTP 000, 0 bytes"):
+        namespace["cloudflare_transfer_mbps"](
+            *cut_before_anything, namespace["CLOUDFLARE_DOWN_BYTES"]
+        )
+    with pytest.raises(RuntimeError, match="0 bytes in 15 s"):
+        namespace["cloudflare_transfer_mbps"](
+            *cut_before_anything,
+            namespace["CLOUDFLARE_UP_BYTES"],
+            namespace["CLOUDFLARE_UP_CUT_STATUSES"],
+        )
 
 
 @pytest.mark.parametrize(
