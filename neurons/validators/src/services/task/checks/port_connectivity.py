@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from core.config import settings
 from services.executor_connectivity.models import PortVerificationResult
+from services.port_utils import get_all_ports
 
 from ..messages import PortConnectivityMessages as Msg
 from ..messages import render_message
@@ -58,9 +59,16 @@ class PortConnectivityCheck:
             },
         )
         verified_port_count = len(result.successful_ports)
+        probed_port_count = len(result.selected_ports)
+        declared_port_count = len(
+            get_all_ports(ctx.executor.port_range, ctx.executor.port_mappings, ctx.executor.ssh_port)
+        )
         extra_info: dict[str, object] = {
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
+            "probed_port_count": probed_port_count,
+            "declared_port_count": declared_port_count,
+            "probe_tier": result.probe_tier,
         }
         if result.dind_error:
             extra_info["dind_error"] = result.dind_error.text
@@ -73,6 +81,8 @@ class PortConnectivityCheck:
             },
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=verified_port_count,
+            probed_port_count=probed_port_count,
+            declared_port_count=declared_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
         )

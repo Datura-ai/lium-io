@@ -92,4 +92,5 @@ class ConnectivityOrchestrator:
             sysbox_runtime=sysbox_runtime,
             status=status,
             dind_error=dind_result.error,
+            probe_tier=probe_result.tier,
         )

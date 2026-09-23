@@ -13,9 +13,12 @@ from ...const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
 )
-from ..messages import TenantEnforcementMessages as Msg
+from core.config import settings
+
+from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .port_count import hidden_from_renters_text, listing_port_shortfall, port_floor_what
 
 logger = logging.getLogger(__name__)
 
@@ -179,21 +182,45 @@ class TenantEnforcementCheck:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
                 if rental_active and not rental_active.active:
+                    stale_what = {
+                        "pod_id": pod_id,
+                        "container_name": pod_container_name,
+                        "executor_uuid": ctx.executor.uuid,
+                        "rental_closed_at": (
+                            rental_active.rental_closed_at.isoformat()
+                            if rental_active.rental_closed_at
+                            else None
+                        ),
+                        "diagnostics": diagnostics,
+                    }
+                    # PortCountCheck exempted this node from the port floor for this pod alone (it reads
+                    # the batch-start rented list); the pod is gone, so the node goes on as unrented
+                    # with a count the backend will not list.
+                    shortfall = listing_port_shortfall(ctx.state)
+                    if shortfall is not None and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD:
+                        event = render_message(
+                            PortCountMessages.INSUFFICIENT_PORTS,
+                            ctx=ctx,
+                            check_id=self.check_id,
+                            what={**port_floor_what(ctx.state, shortfall), "stale_pod": stale_what},
+                            extra=extra,
+                        )
+                        return CheckResult(
+                            passed=False,
+                            event=event,
+                            updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
+                        )
+                    impact = None
+                    if shortfall is not None:
+                        stale_what["port_floor"] = port_floor_what(ctx.state, shortfall)
+                        impact = f"{hidden_from_renters_text(shortfall)}; the port floor applied only while the pod was listed"
                     event = render_message(
                         Msg.STALE_POD_NOT_RUNNING,
                         ctx=ctx,
                         check_id=self.check_id,
-                        what={
-                            "pod_id": pod_id,
-                            "container_name": pod_container_name,
-                            "executor_uuid": ctx.executor.uuid,
-                            "rental_closed_at": (
-                                rental_active.rental_closed_at.isoformat()
-                                if rental_active.rental_closed_at
-                                else None
-                            ),
-                            "diagnostics": diagnostics,
-                        },
+                        severity="warning" if shortfall is not None else None,
+                        impact=impact,
+                        what=stale_what,
                         extra=extra,
                     )
                     return CheckResult(
