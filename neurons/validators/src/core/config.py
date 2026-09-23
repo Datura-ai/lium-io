@@ -158,6 +158,9 @@ class Settings(BaseSettings):
     # live: unrented executors are enforced, rented ones are exempt (the check runs after the
     # tenant short-circuit).
     CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 14, 12, 0, 0)
+    # DAH-2977: advisory probe of the backend's pre-pull images on idle executors; publishes
+    # executor.specs["pre_pull_images"], never changes score. Off = the check only records a skip.
+    PRE_PULL_CACHED_CHECK_ENABLED: bool = Field(env="PRE_PULL_CACHED_CHECK_ENABLED", default=True)
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that

@@ -1575,6 +1575,41 @@ class CachedTemplateMessages:
     )
 
 
+class PrePullCachedMessages:
+    """DAH-2977 — which of the backend's pre-pull images the idle executor holds.
+
+    Advisory only (severity="info", never changes score): the counts ride
+    ``executor.specs["pre_pull_images"]``. See ``PrePullCachedCheck``.
+    """
+
+    ALL_CACHED = MessageTemplate(
+        event="Every pre-pull image is cached on executor",
+        reason="PRE_PULL_IMAGES_CACHED",
+        severity="info",
+        category="runtime",
+        impact="None — rentals of these templates skip the docker pull",
+    )
+    MISSING = MessageTemplate(
+        event="Pre-pull images missing on executor",
+        reason="PRE_PULL_IMAGES_MISSING",
+        severity="info",
+        category="runtime",
+        impact="None (advisory) — rentals of the missing templates pay a docker pull",
+        remediation=(
+            "The executor pre-pulls these while idle when PRE_PULL_TEMPLATES_ENABLED is on "
+            "and the docker root keeps PRE_PULL_MIN_FREE_GB free; `docker logs <executor> | "
+            "grep 'pre_pull '` shows each attempt's outcome."
+        ),
+    )
+    SKIPPED = MessageTemplate(
+        event="Pre-pull cache check skipped",
+        reason="PRE_PULL_IMAGES_CHECK_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="None — could not determine the pre-pull images this cycle",
+    )
+
+
 class LocalVerifyMessages:
     """liumd phase 1: one signed `POST /verify` in place of the SSH-driven matmul and VerifyX."""
 

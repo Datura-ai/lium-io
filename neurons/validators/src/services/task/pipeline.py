@@ -165,6 +165,9 @@ class ContextState:
     # serves STALE content under an unchanged tag); None = not compared this cycle
     # (not cached / no backend digest / unreadable RepoDigest — strict fail-open).
     recommended_image_digest_match: bool | None = None
+    # DAH-2977: advisory pre-pull coverage, {"expected": n, "cached": k, "missing": [refs]};
+    # None = not measured this cycle. ResultHandler publishes it into executor.specs.
+    pre_pull_images: dict | None = None
     executor_image_report: ExecutorImageReport | None = None
     # liumd phase 1 (DAH-2834): what `POST /verify` answered this cycle, already judged. None =
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged

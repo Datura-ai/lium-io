@@ -52,6 +52,7 @@ from .checks import (
     NvmlDigestCheck,
     PortConnectivityCheck,
     PortCountCheck,
+    PrePullCachedCheck,
     ProviderSideLoadCheck,
     RentalProbeCheck,
     RentalVerificationCheck,
@@ -352,6 +353,9 @@ class PipelineFactory:
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
                 # idle valid-executor population. No scoring impact; fails open on any error.
                 CachedTemplateVerificationCheck(),
+                # DAH-2977: advisory, never fatal — which of the backend's pre-pull images the idle
+                # node holds, published to executor.specs["pre_pull_images"]. No scoring impact.
+                PrePullCachedCheck(),
                 RentalVerificationCheck(),
                 # DAH-3436: rent the idle node from the validator once per interval, the way a renter
                 # would (default image, probe key, verified ports), and prove sshd, the login and

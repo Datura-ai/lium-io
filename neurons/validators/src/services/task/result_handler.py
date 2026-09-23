@@ -180,6 +180,11 @@ class ResultHandler:
         if context.state.recommended_image_digest_match is not None:
             specs["recommended_image_digest_match"] = context.state.recommended_image_digest_match
 
+        # DAH-2977: advisory pre-pull coverage from PrePullCachedCheck — how many of the backend's
+        # pre-pull images the node holds and which are missing. Only published when measured.
+        if context.state.pre_pull_images is not None:
+            specs["pre_pull_images"] = context.state.pre_pull_images
+
         executor_image_report = (
             context.state.executor_image_report.as_dict()
             if context.state.executor_image_report

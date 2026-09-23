@@ -271,6 +271,8 @@ class DefaultDockerImage(BaseModel, extra="allow"):
     # DAH-2461 (resolved live from Docker Hub) so executors can pull digest-pinned;
     # the validator still verifies against its OWN Hub snapshot (DAH-2380), not this field.
     docker_image_digest: str | None = None
+    # DAH-2977: True for the top-N entries the backend appends when asked with include_pre_pull.
+    pre_pull: bool = False
 
     @property
     def image_ref(self) -> str:

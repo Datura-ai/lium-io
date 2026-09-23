@@ -256,7 +256,7 @@ class BackendClient:
         )
 
     async def get_default_docker_image(
-        self, gpu_model: str, driver_version: str
+        self, gpu_model: str, driver_version: str, *, include_pre_pull: bool = False
     ) -> list[DefaultDockerImage] | None:
         """Fetch the recommended/default template image(s) for a GPU + driver combo.
 
@@ -264,8 +264,14 @@ class BackendClient:
         cache pre-pull consumes (DAH-2265 Plan 2). Advisory caller: no retry (must not
         block the validation pipeline), unsigned (mirrors the executor), and `get()`
         already returns None on any error / non-200 / bad JSON, so this fails open.
+
+        ``include_pre_pull`` asks for the top-N pre-pull entries too (DAH-2977), appended
+        after the default image with ``pre_pull=True``, exactly as the executor asks.
         """
-        query = urlencode({"gpu_model": gpu_model, "driver_version": driver_version})
+        params = {"gpu_model": gpu_model, "driver_version": driver_version}
+        if include_pre_pull:
+            params["include_pre_pull"] = "true"
+        query = urlencode(params)
         response = await self.get(
             f"/executors/default-docker-image?{query}",
             DefaultDockerImagesResponse,
