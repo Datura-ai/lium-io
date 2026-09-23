@@ -500,7 +500,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # older validator must never cost a miner the incentive.
         if not result.is_split_remainder or result.spec is None:
             return None
-        # a Lium filler runs on the free GPUs and holds their ports: filler revenue, not idle pay
+        # Lium's own filler holds these ports, so the remainder keeps its idle pay
         if result.default_job_owner == DEFAULT_JOB_OWNER_LIUM:
             return None
         available: Any = result.spec.get("available_port_count")
