@@ -396,7 +396,7 @@ async def probe_rented_pod_ssh(
         )
         if port_fault:
             faults.append(port_fault)
-    if not ssh_pub_keys:
+    if not any(key.strip() for key in ssh_pub_keys):
         faults.append(FAULT_AUTHORIZED_KEYS_UNREADABLE)
 
     try:

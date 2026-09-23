@@ -268,6 +268,19 @@ async def test_a_keys_read_the_docker_daemon_refused_is_skipped_not_counted(cont
 
 
 @pytest.mark.asyncio
+async def test_an_authorized_keys_file_of_blank_lines_is_the_keys_fault(context_factory):
+    # `cat` of a file holding only a newline gives [""], which is no key a renter can log in with.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    for _ in range(2):
+        result = await h.cycle(tcp_fault=None, ssh_keys=["", "  "])
+
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["faults"] == [FAULT_AUTHORIZED_KEYS_UNREADABLE]
+
+
+@pytest.mark.asyncio
 async def test_a_missing_authorized_keys_file_is_still_the_keys_fault(context_factory):
     # ticket-0247: the volume was not remounted, so `cat` finds no file and exits 1 as well.
     h = Harness(context_factory)
