@@ -605,8 +605,24 @@ async def test_an_express_publish_inside_a_cycle_carries_that_cycles_job_batch_i
 
     request = harness.miner_service.request_job_to_miner.await_args.kwargs
     assert request["payload"].job_batch_id == CYCLE_BATCH_ID
-    (results, _, _), _ = harness.miner_service.publish_machine_specs.await_args
-    assert [r.job_batch_id for r in results] == [CYCLE_BATCH_ID]
+    # the wave's publish under the same id carries the miner's batch_total, not this one node
+    assert harness.miner_service.publish_machine_specs.await_args.kwargs == {"miner_batch": False}
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_without_a_block_time_still_gets_its_new_nodes_published(monkeypatch, wallet):
+    """get_time_from_block returns "Unknown" after three failed reads. The backend cannot parse
+    that into a row time and its write fails before the node is listed, so the lane falls back
+    to the clock for that cycle."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.inputs = _cycle_inputs(job_batch_id="Unknown")
+
+    assert await harness.tick_and_settle() == 1
+
+    sent = harness.miner_service.request_job_to_miner.await_args.kwargs["payload"].job_batch_id
+    sent_at = datetime.strptime(sent, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    assert abs(sent_at - datetime.now(UTC)) < timedelta(minutes=1)
 
 
 @pytest.mark.asyncio
@@ -642,8 +658,9 @@ async def test_a_verification_running_across_a_cycle_boundary_keeps_the_cycle_it
 async def test_flag_off_every_miner_is_asked_under_the_cycles_block_time_id(
     validator_with_mocks, create_neuron_info, monkeypatch
 ):
-    """Lane off: the cycle is the only writer and keeps the id it derives from the job block. The
-    inputs a lane would read carry that same id, so turning the flag on adds no time of its own."""
+    """Lane off: the cycle is the only writer and every miner is still asked under the id it
+    derives from the job block. The last line guards the wiring the lane reads once the flag is
+    on: the inputs carry that same id."""
     from core.config import settings
 
     monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", False)

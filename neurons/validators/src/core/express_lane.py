@@ -43,6 +43,20 @@ EXPRESS_PUBLISHED_EVENT = "[express] Executor verified and published ahead of th
 # unreachable): try again later, a bounded number of times, then leave it to the normal cycle.
 MAX_ATTEMPTS = 3
 RETRY_SECONDS = 120
+# job_batch_id format the backend parses into the prod_executors row's time.
+JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _publishable_batch_id(cycle_batch_id: str) -> str:
+    """The cycle's id, or the clock when the cycle could not read its block time
+    (SubtensorClient.get_time_from_block gives "Unknown"): the backend's write of a spec whose id
+    does not parse fails before it lists the node, and a node checked ahead of the cycle must
+    still be published."""
+    try:
+        datetime.strptime(cycle_batch_id, JOB_BATCH_ID_FORMAT)
+    except (TypeError, ValueError):
+        return datetime.now(UTC).strftime(JOB_BATCH_ID_FORMAT)
+    return cycle_batch_id
 
 
 @dataclass
@@ -290,7 +304,7 @@ class ExpressLane:
             payload = MinerJobRequestPayload(
                 # The cycle whose job files this run uses, even when the next cycle starts
                 # before it publishes: that cycle's wave may publish the node under its own id.
-                job_batch_id=inputs.job_batch_id,
+                job_batch_id=_publishable_batch_id(inputs.job_batch_id),
                 miner_hotkey=miner.hotkey,
                 miner_coldkey=miner.coldkey,
                 miner_address=miner.axon_info.ip,
@@ -367,7 +381,10 @@ class ExpressLane:
         The next scored cycle overwrites the row as today.
         """
         executor_id = pending.executor.id
-        await self.miner_service.publish_machine_specs(results, miner.hotkey, miner.coldkey)
+        # One node under the cycle's id: never the miner's batch for that id, the wave's is.
+        await self.miner_service.publish_machine_specs(
+            results, miner.hotkey, miner.coldkey, miner_batch=False
+        )
         try:
             await self.redis_service.mark_executors_validated([executor_id])
         except Exception as exc:

@@ -1049,9 +1049,19 @@ class MinerService:
         logger.info(_m("Forced validation cycle requested", extra=get_extra_info({})))
 
     async def publish_machine_specs(
-        self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str
+        self,
+        results: list[JobResult],
+        miner_hotkey: str,
+        miner_coldkey: str,
+        *,
+        miner_batch: bool = True,
     ):
-        """Publish machine specs to compute app connector process"""
+        """Publish machine specs to compute app connector process.
+
+        `miner_batch` False leaves `batch_total` unset: the backend's delivery metrics (DAH-2792)
+        take a miner's expected spec count from the first spec per (validator, job_batch_id,
+        miner), so a spec that is not the miner's whole batch for that id must not set it.
+        """
         default_extra = {
             "miner_hotkey": miner_hotkey,
         }
@@ -1073,7 +1083,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
             ),
         )
-        batch_total = len(results)
+        batch_total = len(results) if miner_batch else None
         for result in results:
             try:
                 await self.redis_service.publish(
