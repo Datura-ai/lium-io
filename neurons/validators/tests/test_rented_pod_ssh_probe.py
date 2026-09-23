@@ -268,6 +268,19 @@ async def test_a_keys_read_the_docker_daemon_refused_is_skipped_not_counted(cont
 
 
 @pytest.mark.asyncio
+async def test_an_authorized_keys_file_of_blank_lines_is_the_keys_fault(context_factory):
+    # `cat` of a file holding only a newline gives [""], which is no key a renter can log in with.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    for _ in range(2):
+        result = await h.cycle(tcp_fault=None, ssh_keys=["", "  "])
+
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["faults"] == [FAULT_AUTHORIZED_KEYS_UNREADABLE]
+
+
+@pytest.mark.asyncio
 async def test_a_missing_authorized_keys_file_is_still_the_keys_fault(context_factory):
     # ticket-0247: the volume was not remounted, so `cat` finds no file and exits 1 as well.
     h = Harness(context_factory)
@@ -1301,7 +1314,7 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
     stored = rented_pod_ssh.FailStreak(count=2, first_failed_at="2026-09-15T14:30:00+00:00")
     loaded = rented_pod_ssh.FailStreak.load(stored.dump().encode(), now_iso=now)
     assert loaded == stored
-    assert loaded.next() == rented_pod_ssh.FailStreak(
+    assert loaded.plus_one_cycle() == rented_pod_ssh.FailStreak(
         count=3, first_failed_at=stored.first_failed_at
     )
     assert json.loads(stored.dump()) == {
@@ -1314,7 +1327,7 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
     reported = rented_pod_ssh.FailStreak.load(
         b'{"count": 2, "first_failed_at": "x", "reported": true}', now_iso=now
     )
-    assert reported.reported is True and reported.next().reported is True
+    assert reported.reported is True and reported.plus_one_cycle().reported is True
     # a streak stored before the accept fields does not count as accepted: its faults are unknown
     assert reported.backend_accepted is False
     assert (

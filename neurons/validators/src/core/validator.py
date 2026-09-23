@@ -648,25 +648,25 @@ class Validator:
                     # the gate ran and name a pod outage that was ours: they are rewritten to RENTED
                     # here, before the publish, so the stored event says what happened.
                     try:
-                        ssh_gate = await flush_rented_pod_ssh_reports(
+                        rented_pod_ssh_gate = await flush_rented_pod_ssh_reports(
                             self.redis_service,
                             self.backend_client,
                             job_batch_id,
                             validator_outage=silenced_count > 0,
                         )
-                        rewritten_count = silence_rented_pod_ssh_reports_on_our_own_outage(
-                            cycle_results, ssh_gate
+                        results_rewritten_to_rented = silence_rented_pod_ssh_reports_on_our_own_outage(
+                            cycle_results, rented_pod_ssh_gate
                         )
-                        if rewritten_count:
+                        if results_rewritten_to_rented:
                             logger.warning(
                                 _m(
                                     "[sync] rented-pod SSH reports held back this cycle; their events publish as RENTED",
                                     extra=get_extra_info(
                                         {
                                             **self.default_extra,
-                                            "rewritten_results": rewritten_count,
-                                            "suppressed_by": ssh_gate.suppressed_by,
-                                            "held_pods": ssh_gate.due,
+                                            "rewritten_results": results_rewritten_to_rented,
+                                            "suppressed_by": rented_pod_ssh_gate.suppressed_by,
+                                            "held_pods": rented_pod_ssh_gate.due,
                                         }
                                     ),
                                 )
