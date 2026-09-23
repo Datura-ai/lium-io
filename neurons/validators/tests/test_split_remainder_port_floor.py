@@ -119,15 +119,19 @@ def test_rented_portion_is_never_port_limited():
     assert incentive._port_limited_remainder(rented_portion) is None
 
 
-def test_lium_filler_remainder_is_never_port_limited():
-    # Arrange — the free GPUs run a Lium filler, which holds their ports: filler revenue, not idle pay
+def test_lium_filler_remainder_below_the_floor_is_port_limited():
+    # Arrange — a Lium filler on the free GPUs does not make them rentable on Lium
     incentive = _build_incentive(_make_job(available_port_count=2))
     incentive._expand_partially_rented_split_results()
     _, remainder = incentive.job_results[MINER_HOTKEY]
     remainder.default_job_owner = DEFAULT_JOB_OWNER_LIUM
 
-    # Act / Assert
-    assert incentive._port_limited_remainder(remainder) is None
+    # Act
+    port_limited = incentive._port_limited_remainder(remainder)
+
+    # Assert
+    assert port_limited is not None
+    assert port_limited.available_port_count == 2
 
 
 def test_whole_idle_node_is_out_of_scope():
