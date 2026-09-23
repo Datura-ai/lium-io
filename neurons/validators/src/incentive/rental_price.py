@@ -29,7 +29,6 @@ from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
 from services.const import (
-    DEFAULT_JOB_OWNER_LIUM,
     DEFAULT_JOB_OWNER_MINER,
     FIXED_RATIO,
     MIN_PORT_COUNT,
@@ -518,9 +517,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # older validator must never cost a miner the incentive.
         if not result.is_split_remainder or result.spec is None:
             return None
-        # a Lium filler runs on the free GPUs and holds their ports: filler revenue, not idle pay
-        if result.default_job_owner == DEFAULT_JOB_OWNER_LIUM:
-            return None
+        # a Lium filler does not exempt it: not rentable on Lium means no idle pay
         available: Any = result.spec.get("available_port_count")
         # bool is excluded explicitly - it passes isinstance(int) and would read True as 1
         if not isinstance(available, int) or isinstance(available, bool):
