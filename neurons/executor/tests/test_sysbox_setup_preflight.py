@@ -640,7 +640,8 @@ def test_install_mode_stops_on_a_stopped_rental(tmp_path):
     # a renter's stopped pod is still a rental; the upgrade path removes every stopped container
     proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_STOPPED_POD": "pod_abc123"})
     assert proc.returncode == 1
-    assert "Active rentals found (pod_* containers). Cannot proceed." in proc.stdout
+    assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
+    assert "docker ps -a --filter name=pod_" in proc.stdout
     assert "pod_abc123" in proc.stdout
     assert "Removing stopped containers" not in proc.stdout
 
