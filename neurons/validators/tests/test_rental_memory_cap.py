@@ -62,9 +62,8 @@ def test_the_reserve_is_the_percent_of_host_ram_rounded_up_and_never_below_the_m
 
 
 def test_ticket_0355_guest_whole_host_rental_is_clamped_to_ram_less_the_reserve():
-    requested = _backend_memory_gb(
-        H200_GUEST_KIB
-    )  # 1841: 2 GiB left for the guest, as in ticket-0355
+    # 1841: 2 GiB left for the guest, as in ticket-0355
+    requested = _backend_memory_gb(H200_GUEST_KIB)
 
     limit = rental_memory_limit(requested, H200_GUEST_KIB, **DEFAULTS)
 
