@@ -235,6 +235,7 @@ class PrePuller:
         for image_ref in protected & self.state.images.keys():
             self.state.forget(image_ref)
             logger.info(f"pre-pull: {image_ref} is now a mandatory image; no longer tracked for eviction")
+        await self._evict_unlisted(entries, protected)
         if not entries:
             self.state.flush()
             return
@@ -322,6 +323,41 @@ class PrePuller:
             break  # one pull per sweep per node
 
         self.state.flush()
+
+    async def _evict_unlisted(self, entries: list[dict], protected: frozenset[str]) -> None:
+        """Remove a pre-pulled image once the backend has stopped serving it for
+        ``PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS`` (0 keeps it until the disk floor needs the room).
+
+        The clock starts at the first sweep that no longer lists it and resets if it comes back,
+        so a template that drifts in and out at the edge of the top-N is not pulled and removed
+        in turn. Only images this puller pulled are candidates; docker refuses to remove one a
+        container still uses, and that image stays tracked for the next sweep."""
+        after = settings.PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS
+        served = {
+            f"{data['docker_image']}:{data['docker_image_tag']}"
+            for data in entries
+            if data.get("docker_image") and data.get("docker_image_tag")
+        }
+        now = time.time()
+        for image_ref in list(self.state.images):
+            record = self.state.images[image_ref]
+            if image_ref in served or image_ref in protected or image_ref in self.protected:
+                record.pop("unlisted_since", None)
+                continue
+            since = record.setdefault("unlisted_since", now)
+            if after <= 0 or now - since < after:
+                continue
+            removed = await asyncio.to_thread(_remove_ref, self.client, image_ref)
+            digest = record.get("digest")
+            if digest:
+                digest_ref = f"{image_ref.rpartition(':')[0]}@{digest}"
+                removed = await asyncio.to_thread(_remove_ref, self.client, digest_ref) and removed
+            if removed:
+                self.state.forget(image_ref)
+                logger.info(
+                    f"pre_pull image={image_ref} digest={digest} outcome=evicted_unlisted "
+                    f"detail=not served for {(now - since) / 3600:.1f}h"
+                )
 
     async def _retire_superseded(self, image_ref: str, repo: str, digest: str) -> None:
         """When a tracked tag moved to a new digest, drop the old ``repo@<digest>`` reference:
