@@ -41,7 +41,10 @@ judged the validator to be the outage (DAH-2748), the queued reports are logged 
 streaks keep ``reported`` False, so the outage is queued again next cycle and reported once the
 fleet reads clean. Enforcement follows the backend accept, not the mail: ``is_enforced`` is true
 only when the streak is ``accepted`` (a 200, including ``notify_failed``), so a held cycle never
-zeroes the node and a refused mail does not protect the provider. The per-executor
+zeroes the node and a refused mail does not protect the provider. The gate also stores its verdict
+(``RENTED_POD_SSH_LAST_GATE_KEY``): while the last gate held the reports as our own outage, an
+accepted outage is not enforced either, so our outage zeroes a node for one cycle at most (the gate
+runs after the cycle's checks). The per-executor
 ``RENTED_POD_SSH_UNREACHABLE`` events of a suppressed cycle
 were rendered before the gate ran and name a pod outage the gate then judged to be ours; the sync
 loop passes the gate to
@@ -101,6 +104,9 @@ RENTED_POD_SSH_FAIL_KEY_PREFIX = "rented_pod_ssh_fail"
 RENTED_POD_SSH_FLEET_KEY_PREFIX = "rented_pod_ssh_fleet"
 RENTED_POD_SSH_DUE_KEY_PREFIX = "rented_pod_ssh_due"
 FLEET_KEY_TTL_SECONDS = 3600
+# The last cycle-end gate's `suppressed_by` ("" when it held nothing). `is_enforced` reads it: a
+# validator the last gate judged to be the outage does not zero a pod. Expires with the fleet keys.
+RENTED_POD_SSH_LAST_GATE_KEY = "rented_pod_ssh_last_gate"
 FLEET_MARK_OK = "ok"
 # A cycle whose reports the gate held back: the field every suppressed log line carries.
 PROBE_SUPPRESSED_FLEET = "probe_suppressed_fleet"
@@ -164,6 +170,8 @@ class RentedPodSshVerdict:
     # Mail retry still queues; enforcement reads this, not ``reported``.
     accepted: bool = False
     accepted_faults: list[str] = field(default_factory=list)
+    # The last cycle-end gate held the reports as our own outage.
+    last_gate_held: bool = False
 
 
 @dataclass(frozen=True)
@@ -199,7 +207,8 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
 
     Only with ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on, only for an unhealthy pod, only once its
     streak has reached ``enforce_after_cycles()``, and only after the backend accepted the outage
-    report (``verdict.accepted``). Mail delivery is separate: a ``notify_failed`` 200 still accepts,
+    report (``verdict.accepted``), and not while the last cycle-end gate held the reports as our own
+    outage (``verdict.last_gate_held``). Mail delivery is separate: a ``notify_failed`` 200 still accepts,
     and a cycle that only queued the notice — including a validator-side outage the fleet gate
     holds — does not zero the node. Enforce only when the accepted fault was a port fault; a
     keys-only accept does not let a later port fault zero the node. A renter who deletes
@@ -212,7 +221,7 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
         return False
     if verdict.consecutive_cycles < enforce_after_cycles():
         return False
-    if not verdict.accepted:
+    if not verdict.accepted or verdict.last_gate_held:
         return False
     accepted_faults = set(verdict.accepted_faults) or set(verdict.faults)
     if _PORT_FAULTS & accepted_faults:
@@ -579,6 +588,7 @@ async def _judge_with_streak(
         report=consecutive >= threshold,
         accepted=streak.accepted,
         accepted_faults=list(streak.accepted_faults),
+        last_gate_held=bool(await store.get(RENTED_POD_SSH_LAST_GATE_KEY)),
     )
     if consecutive < threshold or streak.reported or settings.DRY_RUN:
         # Under the threshold, or the backend already acknowledged this outage. DRY_RUN validates
@@ -676,7 +686,9 @@ async def flush_rented_pod_ssh_reports(
     ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` with the pods it names; nothing is lost, because the
     streaks still read ``reported`` False and queue again next cycle.
 
-    Returns None when the probe is off or Redis failed (logged), else what the gate saw and posted.
+    The verdict is also stored under ``RENTED_POD_SSH_LAST_GATE_KEY`` for the next cycle's
+    ``is_enforced``. Returns None when the probe is off or Redis failed (logged), else what the gate
+    saw and posted.
     Never raises: a backend or Redis error here is one more cycle of waiting, not a failed cycle.
     """
     if not settings.RENTED_POD_SSH_PROBE_ENABLED:
@@ -686,6 +698,10 @@ async def flush_rented_pod_ssh_reports(
     try:
         fleet = _decode_hash(await redis.hgetall(fleet_key))
         due = _decode_hash(await redis.hgetall(due_key))
+        gate = judge_fleet_gate(fleet, due, job_batch_id, validator_outage=validator_outage)
+        await redis.set(
+            RENTED_POD_SSH_LAST_GATE_KEY, gate.suppressed_by or "", ex=FLEET_KEY_TTL_SECONDS
+        )
         # Deleted before posting: a crash below costs one cycle (the streaks re-queue), a crash
         # after a post would otherwise post the same outage twice.
         await redis.delete(fleet_key)
@@ -700,7 +716,6 @@ async def flush_rented_pod_ssh_reports(
         )
         return None
 
-    gate = judge_fleet_gate(fleet, due, job_batch_id, validator_outage=validator_outage)
     gate_log_fields = {
         **extra,
         "probed": gate.probed,
@@ -764,7 +779,9 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     something stays, it keeps its reason and names only the pods whose outage stands.
     An enforced event (DAH-2255, ``what_we_saw.enforced``) is a later cycle whose backend already
     accepted the report: it failed at score 0 and is never rewritten to RENTED. It keeps reason,
-    impact and pods and gains the gate's verdict under ``probe_suppressed_fleet``. A first-threshold
+    impact and pods and gains the gate's verdict under ``probe_suppressed_fleet``. The stored gate
+    verdict stops enforcement from the next cycle on, so this is at most the first cycle of our
+    outage. A first-threshold
     cycle the gate holds is not enforced (``is_enforced`` needs the accept), so it takes the RENTED
     rewrite. Returns how many results were rewritten, for the caller's log line.
     """
@@ -796,7 +813,8 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
         if event.what_we_saw.get("enforced") is True:
             # DAH-2255: the check failed this cycle (score 0, verified job cleared) — that is not the
             # rented halt, so the event keeps its reason, impact and pods; the gate's verdict rides
-            # along so the record says the zero fell in a cycle whose renter notice was held.
+            # along so the record says the zero fell in a cycle whose renter notice was held. The
+            # score and the job reset were applied before the gate ran, so the record keeps them.
             rewritten_event = event.model_copy(
                 update={"what_we_saw": {**event.what_we_saw, PROBE_SUPPRESSED_FLEET: suppressed}}
             )

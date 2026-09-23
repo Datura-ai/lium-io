@@ -294,39 +294,29 @@ async def test_a_held_fleet_cycle_does_not_enforce(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_an_already_accepted_outage_stays_enforced_on_a_later_held_cycle(
-    context_factory,
-):
-    # The backend already accepted this pod's outage. A later validator-side outage does not
-    # un-zero it: the report is on record, so is_enforced stays true. Nothing is queued this
-    # cycle (already reported), so the silence rewrite has no held pod and leaves the event.
+async def test_an_accepted_outage_is_not_enforced_after_a_cycle_the_gate_held(context_factory):
+    # The backend already accepted this pod's outage, then our own validator breaks. The gate runs
+    # at the cycle's end, so the cycle it holds is still judged by the gate before it; every later
+    # cycle reads the held gate and keeps the rented score and the verified job. A clean gate
+    # enforces again.
     h = Harness(context_factory)
     with enforcement(enabled=True):
         failed = await accepted_then_one_more_refused_cycle(h)
         assert failed.passed is False
-        later = await h.cycle(
+        held = await h.cycle(
             tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b", validator_outage=True
         )
+        assert held.passed is False
+        assert h.gate.suppressed_by == "validator_outage"
+        after_held = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b")
+        assert h.gate.suppressed_by is None
+        after_clean = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b")
 
-    assert later.passed is False and later.updates["score"] == 0.0
-    assert later.event.what_we_saw["enforced"] is True
-    assert h.gate.suppressed_by == "validator_outage"
-    assert h.gate.due == []
-    rewritten = rented_pod_ssh.silence_rented_pod_ssh_reports_on_our_own_outage(
-        [
-            JobResult(
-                executor_info=default_executor(),
-                score=0.0,
-                job_score=0.0,
-                job_batch_id="batch-1",
-                log_status="warning",
-                log_text=_m(later.event.event, extra=later.event.model_dump()).to_full_string(),
-                validation_event=later.event.model_copy(deep=True),
-            )
-        ],
-        h.gate,
-    )
-    assert rewritten == 0
+    assert after_held.passed is True
+    assert after_held.updates["score"] == 0.9 and after_held.updates["job_score"] == 0.9
+    assert "clear_verified_job_info" not in after_held.updates
+    assert after_held.event.what_we_saw.get("enforced") is not True
+    assert after_clean.passed is False and after_clean.updates["score"] == 0.0
 
 
 def test_enforcement_settings_default_off_and_the_threshold_is_never_below_notify(
