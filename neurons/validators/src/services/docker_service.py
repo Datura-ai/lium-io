@@ -2094,20 +2094,9 @@ class DockerService:
                 ),
             )
 
-            if remove_every_filler:
-                await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
-            else:
-                command = f'/usr/bin/docker rm -fv {container_names}'
-                await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
-
-            removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
-            if remove_every_filler and removed_fillers:
-                await self._confirm_fillers_removed(
-                    ssh_client=ssh_client,
-                    default_extra=default_extra,
-                    pod_name=pod_name,
-                    removed_fillers=removed_fillers,
-                )
+            await self._remove_stale_containers(
+                ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
+            )
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2126,6 +2115,31 @@ class DockerService:
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             return stale_containers
         return []
+
+    async def _remove_stale_containers(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        stale_containers: list[str],
+        remove_every_filler: bool,
+    ) -> None:
+        """`docker rm -fv` the stale containers. A customer create (DAH-3706) uses the tolerant rm
+        and then confirms that no filler survived."""
+        if not remove_every_filler:
+            names = " ".join(shlex.quote(name) for name in stale_containers)
+            await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+            return
+
+        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
+        removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
+        if removed_fillers:
+            await self._confirm_fillers_removed(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                pod_name=pod_name,
+                removed_fillers=removed_fillers,
+            )
 
     async def _confirm_fillers_removed(
         self,
