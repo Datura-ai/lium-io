@@ -52,10 +52,29 @@ reads the marker with a helper container and runs the new image's `dockerd --ver
 pod's runtime (no network, no mounts). If the new dockerd is older than the one that wrote the
 store (an edit to a template with an older Docker), the store is emptied first, because an older
 dockerd may not start on a newer store. Logged as `Inner Docker store version` with `outcome`
-`no_marker`, `kept`, `reset_on_downgrade`, `reset_failed: …` or `failed: …`; on a failure the
-store is kept as it is.
+`no_marker`, `unknown_version`, `kept`, `reset_on_downgrade`, `reset_failed: exit N` or
+`failed: …`; on anything but a downgrade the store is kept as it is.
 
-If an edit fails after the reset, the restored container also finds an empty store.
+Both versions are text the renter controls (the marker lives in their `/var/lib/docker`, and the
+image is theirs), so:
+
+- Every read is cut to 256 bytes on the host. The marker is read only if it is a regular file,
+  not a symlink, by our `alpine:3.19` helper, with a 10 s deadline inside it.
+- Only an exact `Docker version X.Y.Z[suffix][, build B]` line counts. Anything else is
+  `unknown_version`, and the store is kept. The log carries only the parsed `X.Y.Z`.
+- The helpers (`lium-dind-probe-<pod>-marker`, `-dockerd`, `-reset`) are labelled
+  `io.lium.purpose=dind-store-probe` and run with `--memory 128m --memory-swap 128m --cpus 0.5
+  --pids-limit 32` and no network. The image's `dockerd --version` runs detached, gets 20 s to
+  exit, and is then removed whether it exited or not; its log is capped at 64 KiB.
+- The validator always removes the pod's helpers after the check, with its own 30 s timeout. The
+  periodic stale-container cleanup removes any labelled helper older than 10 minutes by the host's
+  clock (a validator that lost its SSH session mid-check).
+- The SSH calls are bounded: 90 s for the check, 360 s for a reset (`rm -rf` has a 300 s deadline
+  inside the helper), 30 s for recording the version. An image whose dockerd never answers costs
+  a reboot or edit 20 s.
+
+If an edit fails after the reset, the restored container also finds an empty store. A reset that
+hits its deadline leaves the store partly emptied (`reset_failed`).
 
 ## Removal
 
@@ -63,4 +82,7 @@ Every path that removes a pod's volume removes both companion volumes, whatever 
 now: delete, the pre-create sweep, failed-create cleanup, the stale-container cleanup, the rental
 probe's shell fallback, and the vloopback volume sweep. Companions whose pod volume is already gone
 and that no container references are swept by the vloopback sweep at create and by the periodic
-stale-container cleanup, which skips pods the backend still lists on the executor.
+stale-container cleanup, which skips pods the backend still lists on the executor. Only
+`volume_<pod uuid>_docker` / `volume_<pod uuid>_workspace` are read as companions, so a volume
+named like one is never taken for it; a companion of a pod volume that is not `volume_<uuid>`
+still goes with its pod but is never swept as an orphan.
