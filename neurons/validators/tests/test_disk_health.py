@@ -34,7 +34,10 @@ DISK_HEALTH_HELPERS = {
     "ERRNO_ENOSPC",
     "ERRNO_EROFS",
     "ERRNO_EDQUOT",
+    "READ_ONLY_MOUNT_OPTIONS",
     "DiskHealthObservation",
+    "MountLine",
+    "covering_mount",
     "mounts_holding",
     "write_probe_failure_reason",
     "probe_write",
@@ -51,6 +54,14 @@ tmpfs /run tmpfs rw,nosuid,nodev,size=13158620k,mode=755 0 0
 
 # The same host after ext4 hit an error and honoured errors=remount-ro on the docker disk.
 HOST_MOUNTS_DOCKER_RO = HOST_MOUNTS.replace("/var/lib/docker ext4 rw,relatime", "/var/lib/docker ext4 ro,relatime")
+
+# The /proc/mounts line a 7.0 kernel wrote for a docker root whose ext4 hit an error under errors=remount-ro
+# (EC2 20260916T041828Z-z2w6, reading loop_root_ro_kernel): kernels 6.6+ keep `rw` and add `emergency_ro`;
+# the write probe on that root failed with EROFS while the mount half of the check saw nothing.
+HOST_MOUNTS_DOCKER_EMERGENCY_RO = (
+    "/dev/nvme0n1p2 / ext4 rw,relatime,errors=remount-ro 0 0\n"
+    "/dev/loop3 /mnt/liumdisk ext4 rw,relatime,errors=remount-ro,emergency_ro 0 0\n"
+)
 
 @pytest.fixture
 def scrape() -> dict[str, Any]:
@@ -75,6 +86,15 @@ def test_read_only_docker_root_mount_is_reported(scrape: dict[str, Any]) -> None
 
 def test_read_write_mounts_report_nothing(scrape: dict[str, Any]) -> None:
     assert scrape["mounts_holding"](HOST_MOUNTS, "/var/lib/docker") == []
+
+
+def test_a_kernel_6_6_emergency_remount_counts_as_read_only(scrape: dict[str, Any]) -> None:
+    # Arrange — the real line: `rw` kept, `emergency_ro` added; a check that only looks for `ro` returns []
+    # Act
+    read_only = scrape["mounts_holding"](HOST_MOUNTS_DOCKER_EMERGENCY_RO, "/mnt/liumdisk/docker")
+
+    # Assert
+    assert read_only == ["/mnt/liumdisk"]
 
 
 def test_a_read_only_root_counts_when_the_docker_root_lives_on_it(scrape: dict[str, Any]) -> None:

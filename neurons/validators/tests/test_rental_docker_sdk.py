@@ -1315,6 +1315,94 @@ def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_p
     assert isinstance(calls["policy"], FakeRejectPolicy)
 
 
+# DAH-3678: one read of the container's state after a failed exec, for the create path to tell an
+# image whose CMD exits at once (DAH-2624) from an exec that failed inside a running container.
+
+
+@pytest.mark.asyncio
+async def test_inspect_container_state_reads_state_and_restart_count():
+    api_client = FakeApiClient()
+    api_client.container_states = [
+        {**_container_state(status="exited", running=False, exit_code=0), "RestartCount": 3},
+    ]
+    client = RentalDockerSdkClient(api_client)
+
+    state = await client.inspect_container_state(container_name="pod_exec")
+
+    assert api_client.containers_inspected == ["pod_exec"]
+    assert (state.status, state.running, state.restarting) == ("exited", False, False)
+    assert (state.exit_code, state.restart_count, state.error) == (0, 3, None)
+    assert state.exited_since_start is True
+    assert "status='exited'" in state.describe() and "restart_count=3" in state.describe()
+
+
+@pytest.mark.parametrize(
+    "oom_killed,exit_code,expected_killed_by_host",
+    [
+        pytest.param(True, 137, True, id="oom-killed"),
+        pytest.param(False, 137, True, id="sigkill"),
+        pytest.param(False, 1, False, id="own-exit"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inspect_container_state_tells_a_host_kill(oom_killed, exit_code, expected_killed_by_host):
+    inspect_result = _container_state(status="exited", running=False, exit_code=exit_code)
+    inspect_result["State"]["OOMKilled"] = oom_killed
+    api_client = FakeApiClient()
+    api_client.container_states = [inspect_result]
+    client = RentalDockerSdkClient(api_client)
+
+    state = await client.inspect_container_state(container_name="pod_exec")
+
+    assert state.oom_killed is oom_killed
+    assert state.killed_by_host is expected_killed_by_host
+
+
+@pytest.mark.parametrize(
+    "inspect_result,expected_exited_since_start",
+    [
+        pytest.param(_container_state(), False, id="running-never-restarted"),
+        pytest.param({**_container_state(), "RestartCount": 1}, True, id="running-again-after-a-restart"),
+        pytest.param(
+            _container_state(status="restarting", running=True, restarting=True), True, id="restarting"
+        ),
+        pytest.param(_container_state(status="exited", running=False, exit_code=1), True, id="exited"),
+        pytest.param(_container_state(status="dead", running=False, dead=True), True, id="dead"),
+        pytest.param(_container_state(status="created", running=False), False, id="never-started"),
+        pytest.param(_container_state(status="paused", running=True, paused=True), False, id="paused"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inspect_container_state_tells_an_exit_since_start(inspect_result, expected_exited_since_start):
+    api_client = FakeApiClient()
+    api_client.container_states = [inspect_result]
+    client = RentalDockerSdkClient(api_client)
+
+    state = await client.inspect_container_state(container_name="pod_exec")
+
+    assert state.exited_since_start is expected_exited_since_start
+
+
+@pytest.mark.asyncio
+async def test_inspect_container_state_wraps_the_daemon_error():
+    api_client = FakeApiClient()
+    api_client.inspect_container = Mock(side_effect=NotFound("No such container: pod_exec"))
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="inspect container failed.*No such container"):
+        await client.inspect_container_state(container_name="pod_exec")
+
+
+@pytest.mark.asyncio
+async def test_inspect_container_state_without_a_state_block_is_an_error():
+    api_client = FakeApiClient()
+    api_client.container_states = [{"Id": "container-id"}]
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="did not include container State"):
+        await client.inspect_container_state(container_name="pod_exec")
+
+
 def test_rental_ssh_adapter_sets_a_keepalive_on_its_transport(monkeypatch, tmp_path):
     """The SDK's paramiko session idles through a long build, so the adapter arms its keepalive
     right after every connect."""

@@ -10,6 +10,7 @@ import secrets
 import shlex
 import time
 from collections.abc import Awaitable, Callable, Iterator
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, NamedTuple
@@ -116,16 +117,16 @@ from services.rental_docker_sdk import (
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
-    build_authorized_keys_and_environment_exec_spec,
+    build_authorized_keys_exec_spec,
     build_container_command_argv,
     build_environment_exec_spec,
-    environment_fits_exec_variable,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     start_storage_operation,
+    supports_bootstrap_restore,
     supports_storage_operation,
     wait_for_storage_operation,
 )
@@ -162,12 +163,18 @@ CONTAINER_STOP_GRACE_SECONDS = 30
 
 # Fillers get a shorter grace window than customer workloads. The backend preempts a filler
 # before a customer rent with a total budget of FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s in
-# compute-app) and starts the rent anyway on timeout. This grace must stay strictly below that
+# the backend) and starts the rent anyway on timeout. This grace must stay strictly below that
 # budget with room for the forced removal and the stopped-callback, so a SIGTERM-ignoring filler
 # can never burn the whole budget inside docker stop and hold the GPUs into the customer rent.
 # Half the budget leaves ~15s of headroom while still letting a well-behaved filler exit cleanly
-# and avoid the containerd/sysbox wedge. Keep in sync with compute-app FILLER_STOP_WAIT_TIMEOUT_SECONDS.
+# and avoid the containerd/sysbox wedge. Keep in sync with the backend FILLER_STOP_WAIT_TIMEOUT_SECONDS.
 FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
+
+# DAH-3706: typed event written when a `filler_*` container is still on the host after a
+# customer create's `docker rm -fv`. Same name as the backend's FILLER_STILL_RUNNING_EVENT so one
+# log query counts both halves. Join key: `executor_uuid` (the validator-side id; the backend's rent
+# path writes it too -- its `executor_id` is the backend's DB row id), plus pod_name, container_names, reason.
+FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 
 # In-container port the cache-template images' start.sh hardcodes for Jupyter
 # (`jupyter lab --port=8888`). It reads no port from the environment, so the
@@ -252,6 +259,13 @@ _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
 # container; /tmp is part of the container's writable layer, i.e. a directory on the provider's
 # disk, where an unlinked file stays recoverable until its blocks are reused.
 _VOLUME_SETUP_TMPFS = "/dev/shm"
+# DAH-3274 (review, 14 Sep): the create-time restore into an encrypted volume runs through the
+# pod's own mount while the image's entrypoint is already running, so the entrypoint and the
+# restore write under /root at the same time. Until the workload can be held stopped for the
+# whole restore, the create refuses an encrypted `--restore-backup` before the volume and the
+# pod exist. Not a setting: nothing in config can lift it. The follow-up that holds the workload
+# removes this constant; the probes and the post-mount restore below it are the path it holds back.
+_ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD = True
 # the path comes from a customer-authored template and the backend only requires a leading slash,
 # so anything that is not a plain absolute path is refused here rather than mounted over
 _PLAINTEXT_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
@@ -644,6 +658,57 @@ class CustomBuildFailed(Exception):
 
 class _CreateCancelledByDelete(Exception):
     """Raised at a create checkpoint when this pod's delete has already reported it gone."""
+
+
+class ImageExitedDuringKeyInjection(Exception):
+    """The SSH-key exec failed because the image's default command had already exited (DAH-2624)."""
+
+
+async def _explain_add_public_keys_failure(
+    docker_client: RentalDockerSdkClient,
+    *,
+    container_name: str,
+    image: str,
+    cause: Exception,
+    log_extra: dict,
+) -> Exception:
+    """The exception to raise for a failed `add_public_keys` step: the DAH-2624 explanation when the
+    container has exited or restarted since `docker run`, otherwise `cause` unchanged.
+
+    DAH-3678: the backend picks the renter-facing "image has no long-running process" text from
+    markers in this failure text (`is not running`, `is restarting`, `status='exited'` …). Only the
+    failures whose exec happened to hit Docker's 409 or the readiness poll carried one; an exec that
+    the exit itself killed (non-zero exit_status, empty stderr) read as the generic step failure —
+    6 of 8 on 19 Sep for one renter's `nvidia/cuda` templates. Every failure of the step now looks
+    at the container, which cleanup has not removed yet.
+    """
+    try:
+        state = await docker_client.inspect_container_state(container_name=container_name)
+    except Exception as inspect_exc:
+        logger.warning(
+            _m(
+                "Could not inspect the container after a failed SSH-key injection",
+                extra=get_extra_info({
+                    **log_extra,
+                    "container_name": container_name,
+                    "error": str(inspect_exc),
+                }),
+            )
+        )
+        return cause
+    if not state.exited_since_start or state.killed_by_host:
+        return cause
+    if state.running:
+        # Docker's restart policy already brought it back; the exec landed in the gap.
+        situation = f"Docker is restarting it ({state.describe()})"
+    else:
+        situation = f"the container is not running ({state.describe()})"
+    return ImageExitedDuringKeyInjection(
+        f"Failed to add SSH public keys: image {image!r} has no long-running command — its default "
+        f"command exited right after start (exit_code={state.exit_code!r}) and {situation} while the "
+        "SSH keys were being installed; a pod needs a long-running process, for example a start "
+        f"command such as `sleep infinity`. Exec error: {cause}"
+    )
 
 
 class _EditSwap:
@@ -1153,39 +1218,6 @@ class DockerService:
     ) -> bool:
         rented_machine = await self.redis_service.get_rented_machine(executor_info)
         return bool(rented_machine and rented_machine.get("containers"))
-
-    async def _settle_inspector_after_failed_create(
-        self,
-        inspector_task: asyncio.Task,
-        *,
-        ssh_client: asyncssh.SSHClientConnection,
-        executor_info: ExecutorSSHInfo,
-        default_extra: dict,
-    ) -> None:
-        """DAH-3258: the collector was started alongside the mount and the create then failed.
-
-        Let the start finish (it never raises), then leave the host as a delete would: stop the
-        collector when no other rented container keeps it needed. Best-effort — the create's
-        own failure is what gets reported.
-        """
-        try:
-            await inspector_task
-            if not await self._has_rented_containers(executor_info):
-                await self._run_inspector_collector_lifecycle(
-                    ssh_client=ssh_client,
-                    executor_info=executor_info,
-                    action="stop",
-                    default_extra=default_extra,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                _m(
-                    "Inspector collector could not be settled after a failed create",
-                    extra=get_extra_info({**default_extra, "error": str(exc)}),
-                ),
-            )
 
     def _ssh_bootstrap_script_path(self) -> Path:
         return Path(__file__).resolve().parent / "assets" / "sshd_bootstrap.sh"
@@ -2200,10 +2232,17 @@ class DockerService:
         active_container_names: list[str] | None = None,
         active_volume_names: list[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
+        remove_every_filler: bool = False,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+
+        DAH-3706: ``remove_every_filler`` (a customer's create) treats every `filler_*` as stale
+        whatever ``active_container_names`` says -- a paying pod never shares the node with a
+        filler, and a backend whose stop did not confirm may still list one. The removal is then
+        re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
+        (typed fields, countable) and the create goes on.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
@@ -2218,6 +2257,8 @@ class DockerService:
                 await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
+            if remove_every_filler:
+                active_set = {name for name in active_set if not name.startswith(FILLER_CONTAINER_PREFIX)}
             # DAH-2740: a sibling create on the same host sweeps while an edit's parked container is
             # the customer's only copy; the parked twin of every active pod name is protected too
             active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
@@ -2244,12 +2285,14 @@ class DockerService:
                         **default_extra,
                         "container_names": container_names,
                         "active_containers": list(active_set),
+                        "remove_every_filler": remove_every_filler,
                     }),
                 ),
             )
 
-            command = f'/usr/bin/docker rm -fv {container_names}'
-            await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            await self._remove_stale_containers(
+                ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
+            )
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2268,6 +2311,148 @@ class DockerService:
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             return stale_containers
         return []
+
+    async def _remove_stale_containers(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        stale_containers: list[str],
+        remove_every_filler: bool,
+    ) -> None:
+        """`docker rm -fv` the stale containers. A customer create (DAH-3706) uses the tolerant rm
+        and then confirms that no filler survived."""
+        if not remove_every_filler:
+            names = " ".join(shlex.quote(name) for name in stale_containers)
+            await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+            return
+
+        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
+        removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
+        if removed_fillers:
+            await self._confirm_fillers_removed(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                pod_name=pod_name,
+                removed_fillers=removed_fillers,
+            )
+
+    async def _confirm_fillers_removed(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        removed_fillers: list[str],
+    ) -> None:
+        """Re-read `docker ps -a` after a customer create's filler removal; log any survivor.
+
+        A listing that fails, times out or exits non-zero is logged as well -- the confirmation
+        never fails the create.
+        """
+        names_after = await self._list_all_container_names(ssh_client)
+        if names_after is None:
+            logger.warning(
+                _m(
+                    "Unable to confirm the filler removal before the customer's create",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "pod_name": pod_name,
+                        "container_names": removed_fillers,
+                    }),
+                )
+            )
+            return
+        survivors = [name for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)]
+        if survivors:
+            logger.warning(
+                _m(
+                    "Filler still running on a node a customer rents after docker rm -fv",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "event": FILLER_STILL_RUNNING_EVENT,
+                        "reason": "validator_rm_survived",
+                        "pod_name": pod_name,
+                        "container_names": survivors,
+                        "removed_fillers": removed_fillers,
+                    }),
+                )
+            )
+
+    async def _remove_stale_containers_tolerantly(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        stale_containers: list[str],
+    ) -> None:
+        """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
+
+        A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
+        non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
+        for nothing. So: one attempt; on an error re-read `docker ps -a`; names already gone are not an
+        error; names still there get retry_ssh_command's full budget (and raise as before). A re-read
+        that cannot be made re-raises the rm error.
+        """
+        names = " ".join(shlex.quote(name) for name in stale_containers)
+        try:
+            await retry_ssh_command(
+                ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers', max_attempts=1
+            )
+            return
+        except Exception:
+            still_present = await self._names_still_on_host(ssh_client, stale_containers)
+            if still_present is None:
+                raise
+        if not still_present:
+            logger.info(
+                _m(
+                    "docker rm -fv reported an error but every stale container is gone; continuing",
+                    extra=get_extra_info({**default_extra, "container_names": stale_containers}),
+                ),
+            )
+            return
+        logger.info(
+            _m(
+                "docker rm -fv failed with containers still on the host; retrying those",
+                extra=get_extra_info({**default_extra, "container_names": still_present}),
+            ),
+        )
+        names = " ".join(shlex.quote(name) for name in still_present)
+        await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+
+    @staticmethod
+    async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
+        """`docker ps -a` names with the prerun probe's timeout; None when the listing raised, timed out
+        or exited non-zero (a wedged dockerd is the very condition a survivor lives under -- the
+        caller must not hang or read an empty listing as 'confirmed')."""
+        try:
+            result = await ssh_client.run(
+                DOCKER_PS_ALL_NAMES_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            # typed fields only: an asyncssh error's text can carry the host's banner
+            logger.warning(
+                _m("docker ps -a listing failed", extra={"error_type": exc.__class__.__name__, "timeout_s": _PRERUN_HOST_PROBE_TIMEOUT_SECONDS})
+            )
+            return None
+        if result.exit_status != 0:
+            logger.warning(
+                _m(
+                    "docker ps -a listing exited non-zero",
+                    extra={"exit_status": result.exit_status, "stderr": (result.stderr or "").strip()[:500]},
+                )
+            )
+            return None
+        return [name for name in (result.stdout or "").strip().split("\n") if name]
+
+    async def _names_still_on_host(
+        self, ssh_client: asyncssh.SSHClientConnection, names: list[str]
+    ) -> list[str] | None:
+        """Which of ``names`` `docker ps -a` still lists; None when the listing could not be read."""
+        all_names = await self._list_all_container_names(ssh_client)
+        if all_names is None:
+            return None
+        wanted = set(names)
+        return [name for name in all_names if name in wanted]
 
     async def clean_stale_vloopback_volumes(
         self,
@@ -3346,35 +3531,26 @@ class DockerService:
         public_keys: list[str] | tuple[str, ...],
         log_tag: str,
         log_extra: dict,
-        environment: dict[str, str] | None = None,
     ) -> None:
-        """Append the renter's keys to authorized_keys — and, with ``environment`` (DAH-3258), the
-        renter's `/etc/environment` lines in the same exec. Raises on a non-zero exit."""
-        # falls back to the keys-only spec when there are no environment lines
-        exec_spec = build_authorized_keys_and_environment_exec_spec(
+        exec_spec = build_authorized_keys_exec_spec(
             container_name=container_name,
             public_keys=public_keys,
-            environment=environment,
         )
-        with_environment = bool(exec_spec.environment)
-        added_items = "SSH public keys and environment" if with_environment else "SSH public keys"
         result = await exec_logged_rental_docker_sdk_operation(
             docker_client=docker_client,
-            operation=(
-                "exec_add_authorized_keys_and_environment" if with_environment else "exec_add_authorized_keys"
-            ),
+            operation="exec_add_authorized_keys",
             exec_spec=exec_spec,
             log_extra=log_extra,
         )
         if result.exit_status != 0:
             await self.stream_log(
-                result.stderr or result.stdout or f"Failed to add {added_items}",
+                result.stderr or result.stdout or "Failed to add SSH public keys",
                 "error",
                 log_tag,
             )
             logger.warning(
                 _m(
-                    f"Failed to add {added_items}",
+                    "Failed to add SSH public keys",
                     extra=get_extra_info({
                         **log_extra,
                         "container_name": container_name,
@@ -3385,7 +3561,7 @@ class DockerService:
                 )
             )
             raise Exception(
-                f"Failed to add {added_items}: "
+                "Failed to add SSH public keys: "
                 f"exit_status={result.exit_status}; "
                 f"stderr={result.stderr}; stdout={result.stdout}"
             )
@@ -3724,6 +3900,11 @@ class DockerService:
             target_path = local_volume_path if encrypted_local_volume else "/root"
             container_q = shlex.quote(container_name)
             target_q = shlex.quote(target_path)
+            # DAH-3639: `docker cp` into the container's /tmp fails with "Could not
+            # find the file /tmp in container" even after the directory exists, because
+            # the daemon resolves the destination against the container's rootfs while
+            # the container's own exec namespace sees the directory. `docker exec` runs
+            # inside that namespace, so the script is piped in from the host instead.
             command = (
                 f"/usr/bin/docker exec -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
@@ -3737,20 +3918,10 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker cp /root/app/run_jupyter.sh "
-                f"{container_q}:/tmp/run_jupyter.sh"
-            )
-            await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Copying run_jupyter.sh to container",
-                log_extra=log_extra,
-                raise_exception=True,
-            )
-            command = (
-                f"/usr/bin/docker exec -u 0 {container_q} "
-                f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
+                f"test -s /root/app/run_jupyter.sh || "
+                f"{{ echo 'run_jupyter.sh is missing on the executor host' >&2; exit 1; }}; "
+                f"cat /root/app/run_jupyter.sh | /usr/bin/docker exec -i -u 0 {container_q} "
+                f"sh -c {shlex.quote(f'cat > {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -4699,6 +4870,33 @@ class DockerService:
             f"delete for pod {payload.pod_id} arrived while {container_name} was being created"
         )
 
+    @staticmethod
+    async def _connect_ssh_and_docker(
+        connections: AsyncExitStack,
+        ssh_connect: AbstractAsyncContextManager[asyncssh.SSHClientConnection],
+        docker_connect: AbstractAsyncContextManager[RentalDockerSdkClient],
+    ) -> tuple[asyncssh.SSHClientConnection, RentalDockerSdkClient]:
+        """DAH-3004: enter both connection contexts at once on the caller's exit stack.
+
+        ``gather`` waits for both outcomes, so whichever succeeded is already registered on
+        ``connections`` when the SSH failure, or the Docker failure if SSH succeeded, is re-raised —
+        the stack closes it on the way out and nothing is leaked, which a bare ``gather`` (one
+        coroutine still connecting while the exception propagates) would not guarantee.
+        """
+        ssh_outcome, docker_outcome = await asyncio.gather(
+            connections.enter_async_context(ssh_connect),
+            connections.enter_async_context(docker_connect),
+            return_exceptions=True,
+        )
+        if isinstance(ssh_outcome, BaseException):
+            if isinstance(docker_outcome, BaseException):
+                # both sides failed: the SSH error is raised, the Docker one rides along as its cause
+                raise ssh_outcome from docker_outcome
+            raise ssh_outcome
+        if isinstance(docker_outcome, BaseException):
+            raise docker_outcome
+        return ssh_outcome, docker_outcome
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -4917,24 +5115,33 @@ class DockerService:
             # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
             # split for this connect (host/network vs. remote sshd) without
             # changing how the connection is established.
-            async with (
-                connect_with_phase_timing(
-                    log_extra=default_extra,
-                    host=executor_info.address,
-                    port=executor_info.ssh_port,
-                    username=executor_info.ssh_username,
-                    client_keys=[pkey],
-                    known_hosts=known_hosts_policy,
-                    keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
-                    keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
-                ) as ssh_client,
-                self.rental_docker_client_factory.connect(
-                    executor_info=executor_info,
-                    private_key=private_key,
-                ) as docker_client,
+            #
+            # DAH-3004: the asyncssh session and the Docker-SDK-over-SSH client are two
+            # independent SSH handshakes to the same host; opened one after the other they
+            # cost p50 2.1 s / p90 4.3 s per rent (container_profiler_events, 7 d). Open them
+            # together: same connections, same order of use, roughly half the wait.
+            async with AsyncExitStack() as connections:
+                ssh_client, docker_client = await self._connect_ssh_and_docker(
+                    connections,
+                    connect_with_phase_timing(
+                        log_extra=default_extra,
+                        host=executor_info.address,
+                        port=executor_info.ssh_port,
+                        username=executor_info.ssh_username,
+                        client_keys=[pkey],
+                        known_hosts=known_hosts_policy,
+                        keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
+                        keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
+                    ),
+                    self.rental_docker_client_factory.connect(
+                        executor_info=executor_info,
+                        private_key=private_key,
+                    ),
+                )
                 # DAH-2740: undoes a failed edit while this SSH session is still open
-                _EditSwap(ssh_client, self.get_container_name(payload), default_extra) as edit_swap,
-            ):
+                edit_swap = await connections.enter_async_context(
+                    _EditSwap(ssh_client, self.get_container_name(payload), default_extra)
+                )
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
                 prev_timestamp = now_ms()
@@ -5245,6 +5452,10 @@ class DockerService:
                     active_container_names=protected_container_names,
                     active_volume_names=payload.active_volume_names,
                     host_probe=docker_listing_probe,
+                    # DAH-3706: a customer's pod never shares the node with a filler, so its
+                    # create removes every filler_* whatever the backend listed; a filler create
+                    # keeps protecting its listed sibling bundle (DAH-2465).
+                    remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                 )
                 if removed_containers:
                     docker_listing_probe = None
@@ -5298,6 +5509,75 @@ class DockerService:
                 effective_volume_limit_gb = payload.volume_limit_gb
                 effective_storage_limit_gb = payload.storage_limit_gb
 
+                # Decided before the volume exists so a refusal below leaves nothing behind.
+                use_encrypted_volume = _should_encrypt_local_volume(
+                    local_volume or f"volume_{payload.pod_id}",
+                    payload.workload_kind,
+                    payload.is_sysbox,
+                    payload.enable_volume_encryption,
+                )
+                if use_encrypted_volume:
+                    current_step = "encrypted_volume_image_inspect"
+                    if not await self._image_has_encrypted_volume_label(
+                        ssh_client,
+                        payload.docker_image,
+                        host_probe=host_probe,
+                    ):
+                        use_encrypted_volume = False
+                        volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
+                        await self.stream_log(
+                            "Image missing lium.volume_encryption.enable=1; using plain local volume",
+                            "warning",
+                            log_tag,
+                        )
+                        logger.warning(
+                            _m(
+                                "Image missing volume-encryption label; falling back to plain volume",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "container_name": container_name,
+                                    "docker_image": payload.docker_image,
+                                    "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
+                                }),
+                            ),
+                        )
+
+                if payload.bootstrap_restore and use_encrypted_volume:
+                    if _ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD:
+                        # See the constant: the pod's entrypoint would run while the restore
+                        # writes under /root. Refused here, before the volume and the pod exist.
+                        current_step = "bootstrap_restore_hold"
+                        raise RuntimeError(
+                            "an encrypted volume cannot be restored at create time yet: the "
+                            "image's entrypoint keeps running while the restore writes under "
+                            "/root; create the pod without --restore-backup and run "
+                            "`lium bk restore` once it is up"
+                        )
+                    # The encrypted restore after `docker run` sends `workspace.bootstrap`; an
+                    # executor image from before DAH-3274 ignores the key and refuses the target
+                    # the entrypoint has already written to, so the create would fail with the
+                    # pod half-built. Stop here, before the volume and the pod exist. This is a
+                    # hard failure on purpose, unlike the label check above: that one downgrades
+                    # because the renter's own image can never encrypt (and the status says so),
+                    # while an old executor is the provider's to update — a plain-volume restore
+                    # would put the backup's plaintext on a disk the renter asked to encrypt, and
+                    # the old encrypted mode would hand the executor the passphrase.
+                    current_step = "bootstrap_restore_probe"
+                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
+                        raise RuntimeError(
+                            "executor image cannot restore into an encrypted volume at create time "
+                            "(no workspace.bootstrap); the provider must update the executor image"
+                        )
+                    # Same reason, same place: the runner and its engine binary are checked
+                    # again inside _run_bootstrap_restore, but by then the pod is built.
+                    if not await supports_storage_operation(
+                        ssh_client, payload.bootstrap_restore.backup_engine
+                    ):
+                        raise RuntimeError(
+                            "executor does not support bootstrap restore engine "
+                            f"{payload.bootstrap_restore.backup_engine}; the provider must update "
+                            "the executor image"
+                        )
                 if not local_volume:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (flag off → None → the per-command path below, unchanged).
@@ -5356,39 +5636,14 @@ class DockerService:
                     prev_timestamp = now_ms()
 
                 external_volume_name = None
-                use_encrypted_volume = _should_encrypt_local_volume(
-                    local_volume,
-                    payload.workload_kind,
-                    payload.is_sysbox,
-                    payload.enable_volume_encryption,
-                )
-                if use_encrypted_volume:
-                    current_step = "encrypted_volume_image_inspect"
-                    if not await self._image_has_encrypted_volume_label(
-                        ssh_client,
-                        payload.docker_image,
-                        host_probe=host_probe,
-                    ):
-                        use_encrypted_volume = False
-                        volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
-                        await self.stream_log(
-                            "Image missing lium.volume_encryption.enable=1; using plain local volume",
-                            "warning",
-                            log_tag,
-                        )
-                        logger.warning(
-                            _m(
-                                "Image missing volume-encryption label; falling back to plain volume",
-                                extra=get_extra_info({
-                                    **default_extra,
-                                    "container_name": container_name,
-                                    "docker_image": payload.docker_image,
-                                    "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
-                                }),
-                            ),
-                        )
-
-                if payload.bootstrap_restore:
+                if payload.bootstrap_restore and not use_encrypted_volume:
+                    # A plain volume is restored before the container exists: the data is in
+                    # place when the image's entrypoint starts. An encrypted volume cannot be:
+                    # its plaintext exists only behind the gocryptfs mount inside the running
+                    # pod, so that restore runs after setup_encrypted_local_volume below —
+                    # through the pod's own mount, never with the passphrase (DAH-3274). That
+                    # path is on hold (_ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD): the preflight
+                    # refused the create before this point.
                     current_step = "bootstrap_restore"
                     await self._run_bootstrap_restore(
                         ssh_client=ssh_client,
@@ -5397,7 +5652,7 @@ class DockerService:
                         restore=payload.bootstrap_restore,
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
-                        encrypted=use_encrypted_volume,
+                        encrypted=False,
                     )
                 if external_volume_info:
                     current_step = "external_volume_creation"
@@ -5669,24 +5924,6 @@ class DockerService:
 
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
-                # DAH-3258: the inspector collector is a host-side process that reads the container
-                # from outside; it needs neither the encrypted mount nor the keys, so with the flag on
-                # it starts now and runs alongside them. It is awaited before ContainerCreated is
-                # returned (nothing here moves past RUNNING), and a create that fails after this
-                # point settles it the way a delete does (_settle_inspector_after_failed_create).
-                postrun_concurrent = settings.RENTAL_POSTRUN_CONCURRENT_ENABLED
-                inspector_extra = {**default_extra, "container_name": container_name}
-                inspector_task: asyncio.Task | None = None
-                if postrun_concurrent and settings.ENABLE_INSPECTOR:
-                    inspector_task = asyncio.create_task(
-                        self._run_inspector_collector_lifecycle(
-                            ssh_client=ssh_client,
-                            executor_info=executor_info,
-                            action="start",
-                            default_extra=inspector_extra,
-                        )
-                    )
-
                 try:
                     if use_encrypted_volume:
                         current_step = "encrypted_volume_setup"
@@ -5703,32 +5940,55 @@ class DockerService:
                         profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                         prev_timestamp = now_ms()
 
+                        if payload.bootstrap_restore:
+                            # Reached only once _ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD is gone: the
+                            # preflight above refuses an encrypted create-time restore today.
+                            # DAH-3274: restore into the mounted plaintext through the pod's own
+                            # gocryptfs (the executor nsenters the pod's user namespace, as the
+                            # online `lium restore` does). The passphrase stays in the
+                            # validator→pod channel; the executor never sees it. Runs before the
+                            # key injection below: the entrypoint may already have written to the
+                            # fresh mount, but the restore comes first, so it cannot erase the
+                            # keys the injection puts under /root.
+                            current_step = "bootstrap_restore"
+                            await self._run_bootstrap_restore(
+                                ssh_client=ssh_client,
+                                executor_info=executor_info,
+                                payload=payload,
+                                restore=payload.bootstrap_restore,
+                                local_volume=local_volume,
+                                local_volume_path=local_volume_path,
+                                encrypted=True,
+                                container_name=container_name,
+                            )
+
                     # DAH-2341: inject the customer's public keys before the sshd
                     # bootstrap. The keys are plain data (mkdir + append) with no
                     # dependency on a running sshd, and the bootstrap may now spend
                     # a grace period waiting for an image-provided sshd — whichever
                     # sshd comes up first must already find the keys in place.
                     current_step = "add_public_keys"
-                    # DAH-3258: with the flag on the renter's /etc/environment lines ride in this
-                    # exec (one exec instead of two); they are plain data with no dependency on the
-                    # bootstrap, and the file is read at login, so writing them before sshd is up
-                    # changes nothing for the renter. An environment too large for one exec
-                    # variable keeps its own stdin exec below.
-                    environment_in_keys_exec = postrun_concurrent and environment_fits_exec_variable(
-                        custom_options.environment if custom_options else None
-                    )
-                    await self.add_ssh_public_keys_with_rental_docker(
-                        docker_client=docker_client,
-                        container_name=container_name,
-                        public_keys=payload.user_public_keys,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                        environment=(
-                            custom_options.environment
-                            if environment_in_keys_exec and custom_options
-                            else None
-                        ),
-                    )
+                    try:
+                        await self.add_ssh_public_keys_with_rental_docker(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            public_keys=payload.user_public_keys,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                    except Exception as keys_exc:
+                        # DAH-3678: name the exiting image (DAH-2624) whatever form the exec
+                        # failure took; the step and the cleanup below stay as they are.
+                        explained = await _explain_add_public_keys_failure(
+                            docker_client,
+                            container_name=container_name,
+                            image=payload.docker_image,
+                            cause=keys_exc,
+                            log_extra=default_extra,
+                        )
+                        if explained is keys_exc:
+                            raise
+                        raise explained from keys_exc
 
                     current_step = "ssh_bootstrap"
                     if image_manages_services:
@@ -5785,28 +6045,21 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.SSH_SERVICE_INSTALLATION, prev_timestamp))
                     prev_timestamp = now_ms()
 
-                    # add environment variables (already written by the keys exec with DAH-3258 on)
+                    # add environment variables
                     current_step = "set_environment"
-                    if not environment_in_keys_exec:
-                        environment_error = await self.add_environment_variables_with_rental_docker(
-                            docker_client=docker_client,
-                            container_name=container_name,
-                            environment=custom_options.environment if custom_options else None,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                        )
-                        if environment_error:
-                            raise RuntimeError(f"Failed to set environment variables: {environment_error}")
+                    environment_error = await self.add_environment_variables_with_rental_docker(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        environment=custom_options.environment if custom_options else None,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
+                    if environment_error:
+                        raise RuntimeError(f"Failed to set environment variables: {environment_error}")
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
-                    profilers.append(
-                        ProfilerStep.since(
-                            ProfilerStepName.ADDING_PUBLIC_KEYS,
-                            prev_timestamp,
-                            skipped=environment_in_keys_exec,
-                        )
-                    )
+                    profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
                     prev_timestamp = now_ms()
 
                     await self.finish_stream_logs()
@@ -5822,15 +6075,15 @@ class DockerService:
                         container_name=container_name,
                         default_extra=default_extra,
                     )
-                    if inspector_task is not None:
-                        # started alongside the mount above; this step times only what is left of it
-                        await inspector_task
-                    elif settings.ENABLE_INSPECTOR:
+                    if settings.ENABLE_INSPECTOR:
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,
                             executor_info=executor_info,
                             action="start",
-                            default_extra=inspector_extra,
+                            default_extra={
+                                **default_extra,
+                                "container_name": container_name,
+                            },
                         )
                     profilers.append(
                         ProfilerStep.since(
@@ -5841,13 +6094,6 @@ class DockerService:
                     )
                     prev_timestamp = now_ms()
                 except Exception:
-                    if inspector_task is not None:
-                        await self._settle_inspector_after_failed_create(
-                            inspector_task,
-                            ssh_client=ssh_client,
-                            executor_info=executor_info,
-                            default_extra=inspector_extra,
-                        )
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -6006,7 +6252,15 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
         encrypted: bool,
+        container_name: str | None = None,
     ) -> None:
+        if encrypted and not container_name:
+            # No mode exists that restores into an encrypted volume without the pod: the
+            # only other way is to hand the executor the passphrase, which is the leak this
+            # method must never reopen (DAH-3274).
+            raise RuntimeError(
+                "encrypted bootstrap restore needs the running rental container"
+            )
         if not await supports_storage_operation(ssh_client, restore.backup_engine):
             # Legacy archives must remain restorable while executor-image adoption
             # is gradual. Restic has no safe fallback without its pinned binary.
@@ -6023,16 +6277,24 @@ class DockerService:
                 f"executor does not support bootstrap restore engine {restore.backup_engine}"
             )
         operation_id = UUID(restore.restore_log_id)
+        # The spec is SFTP'd into the executor container — a file on the provider's disk — so
+        # it carries what the executor needs to reach the data and nothing that unlocks it.
+        # `encrypted_running` restores through the pod's live gocryptfs mount; the passphrase
+        # never appears here (DAH-3274 — the former `encrypted_bootstrap` mode put it in the
+        # helper's `docker run -e`, i.e. in `docker inspect` for the life of the pod).
         workspace: dict[str, object] = {
-            "mode": "encrypted_bootstrap" if encrypted else "plain_volume",
+            "mode": "encrypted_running" if encrypted else "plain_volume",
             "volume_name": local_volume,
             "volume_path": local_volume_path,
             "requested_path": restore.restore_path or local_volume_path,
         }
         if encrypted:
-            workspace["volume_passphrase"] = VolumeKeyDeriver.from_settings(settings).material(
-                payload.pod_id
-            ).passphrase
+            workspace["container_name"] = container_name
+            # The pod has been running since `docker run`; its entrypoint may already have
+            # written under the fresh mount (`.jupyter`, `.bashrc`). At create time nothing
+            # there is the customer's, so the executor lets the backup write over it instead
+            # of refusing a non-empty target as an online restore would.
+            workspace["bootstrap"] = True
 
         repository: dict[str, object] = {
             "bucket": restore.backup_volume_info.name,

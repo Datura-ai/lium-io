@@ -1,6 +1,8 @@
 import logging
 import os
 import sys
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,6 +40,9 @@ _shared_config_patcher.start()
 
 from helpers import make_context
 
+if TYPE_CHECKING:
+    from services.task_service import JobResult
+
 # Prevent wallet KeyFileError during module-level PriceProvider() instantiation in rental_price.py.
 # rental_price.py creates PriceProvider() as a class variable at import time; after the
 # price_provider.py update, PriceProvider.__init__ calls SubtensorClient.get_instance() which
@@ -47,6 +52,39 @@ _subtensor_patcher = patch(
     return_value=MagicMock(),
 )
 _subtensor_patcher.start()
+
+
+@pytest.fixture
+def make_pcc_job() -> Callable[..., "JobResult"]:
+    """Factory for a rental-price `JobResult` (one node, one GPU model, N cards) with the fields the
+    per-count-cap algorithm reads, for any rental-price test that needs one without importing another
+    test module's private helper (a rename there would break collection)."""
+    from services.task_service import JobResult  # after the subtensor patch above, like the flow test's helper
+
+    def _make(
+        executor_id: str,
+        gpu_model: str,
+        gpu_count: int,
+        *,
+        is_rented: bool = False,
+        supports_gpu_splitting: bool = False,
+        gpu_splitting_min_count: int | None = None,
+    ) -> JobResult:
+        return JobResult(
+            executor_info=ExecutorSSHInfo(
+                uuid=executor_id, address="10.0.0.1", port=8080,
+                ssh_username="root", ssh_port=22,
+                python_path="/usr/bin/python3", root_dir="/tmp",
+            ),
+            score=1.0, job_score=1.0, job_batch_id="pcc-batch",
+            log_status="success", log_text="ok",
+            gpu_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented,
+            collateral_deposited=True, sysbox_runtime=True,
+            supports_gpu_splitting=supports_gpu_splitting,
+            gpu_splitting_min_count=gpu_splitting_min_count,
+        )
+
+    return _make
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

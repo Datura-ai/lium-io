@@ -140,6 +140,12 @@ class Settings(BaseSettings):
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-2313: reject unrented executors without sysbox so they never appear on the network.
     REQUIRE_SYSBOX_FOR_UNRENTED: bool = Field(env="REQUIRE_SYSBOX_FOR_UNRENTED", default=True)
+    # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
+    # in PortConnectivityCheck, the TTL bounds the window between two misses.
+    DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
+    DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS: int = Field(
+        env="DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS", default=3600, gt=0
+    )
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
     # DAH-2265: cached-template requirement. Before the cutoff the CachedTemplateVerificationCheck
@@ -231,11 +237,6 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
-    # DAH-3258: after `docker run`, start the inspector collector concurrently with the encrypted
-    # volume mount (a host-side process, independent of the container's filesystem) and write
-    # authorized_keys and /etc/environment in ONE `docker exec` after the mount. Every step still
-    # completes before ContainerCreated is returned. Off: the serial order as before.
-    RENTAL_POSTRUN_CONCURRENT_ENABLED: bool = Field(env="RENTAL_POSTRUN_CONCURRENT_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
@@ -369,6 +370,14 @@ class Settings(BaseSettings):
     RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
+    # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
+    # wave writes nothing about it: no report row, no availability error, no evidence for the
+    # backend's staleness sweep. On, the wave writes one failed result per rented executor of that
+    # miner that the backend lists and the miner did not return (RENTED_EXECUTOR_NOT_LISTED,
+    # score 0, availability error). Manual rentals keep their forced pass. Off = today's behaviour.
+    RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED: bool = Field(
+        env="RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED", default=False
+    )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
@@ -436,6 +445,12 @@ class Settings(BaseSettings):
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
     # scoring the whole box as rented.
     ENABLE_SPLIT_PARTIAL_RENTAL_SCORING: bool = Field(env="ENABLE_SPLIT_PARTIAL_RENTAL_SCORING", default=True)
+
+    # DAH-3698 — True withholds the unrented incentive from a split remainder below the
+    # marketplace port floor (the rented GPUs keep earning); False only logs it (shadow mode).
+    ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
+        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
+    )
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
@@ -562,7 +577,7 @@ class Settings(BaseSettings):
     # unprivileged-on-host (user-namespaced) container. Egress is firewalled
     # host-side to block cloud metadata + RFC1918. See the DAH-2211 build flow.
     CUSTOM_DOCKERFILE_DIND_IMAGE: str = Field(
-        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.1",
+        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.3",
         description="Sysbox DinD image used to build custom-dockerfile pods in isolation.",
     )
     CUSTOM_DOCKERFILE_DIND_CPUS: str = Field(

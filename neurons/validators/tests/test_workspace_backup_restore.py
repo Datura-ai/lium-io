@@ -566,6 +566,96 @@ async def test_legacy_bootstrap_restore_falls_back_when_runner_is_unavailable(mo
     service._run_legacy_bootstrap_restore.assert_awaited_once()
 
 
+def _walk_json(value, path=""):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _walk_json(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _walk_json(item, f"{path}[{index}]")
+    else:
+        yield path, value
+
+
+@pytest.mark.asyncio
+async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(monkeypatch):
+    # DAH-3274: the operation spec is SFTP'd into the executor container = a file on the
+    # provider's disk. It must reach the data through the running pod, never unlock it.
+    import json
+
+    from services.volume_keys import derive_volume_passphrase
+
+    master_secret = "test-master-secret-32-chars-long!!"
+    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", master_secret)
+    monkeypatch.setattr(docker_service_module, "supports_storage_operation", AsyncMock(return_value=True))
+    start = AsyncMock(return_value={"spec": "/tmp/spec.json"})
+    monkeypatch.setattr(docker_service_module, "start_storage_operation", start)
+    monkeypatch.setattr(docker_service_module, "wait_for_storage_operation", AsyncMock())
+    service = DockerService.__new__(DockerService)
+    restore = SimpleNamespace(
+        backup_engine="restic",
+        restore_log_id="33333333-3333-4333-8333-333333333333",
+        restore_path="",
+        backup_volume_info=SimpleNamespace(
+            name="bucket",
+            iam_user_access_key="ak",
+            iam_user_secret_key="sk",
+            session_token=None,
+        ),
+        repository_password="repo-password",
+        repository_pod_id="pod-1",
+        snapshot_id="a" * 64,
+        legacy_object_key=None,
+        legacy_object_size_bytes=None,
+        auth_token="token",
+        failure_timeout_seconds=600,
+    )
+
+    await service._run_bootstrap_restore(
+        ssh_client=AsyncMock(),
+        executor_info=_executor_info(),
+        payload=SimpleNamespace(pod_id="pod-1"),
+        restore=restore,
+        local_volume="volume_pod-1",
+        local_volume_path="/root",
+        encrypted=True,
+        container_name="pod_pod-1",
+    )
+
+    spec = start.await_args.args[3]
+    passphrase = derive_volume_passphrase(master_secret, "pod-1")
+    assert passphrase not in json.dumps(spec)
+    assert not [path for path, _ in _walk_json(spec) if "passphrase" in path.lower()]
+    assert spec["workspace"]["mode"] == "encrypted_running"
+    assert spec["workspace"]["container_name"] == "pod_pod-1"
+    assert spec["workspace"]["requested_path"] == "/root"
+    # create-time: the entrypoint may have touched the fresh mount already; the backup wins
+    assert spec["workspace"]["bootstrap"] is True
+
+
+@pytest.mark.asyncio
+async def test_encrypted_bootstrap_restore_refuses_to_run_without_the_pod(monkeypatch):
+    supports = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service_module, "supports_storage_operation", supports)
+    start = AsyncMock()
+    monkeypatch.setattr(docker_service_module, "start_storage_operation", start)
+    service = DockerService.__new__(DockerService)
+
+    with pytest.raises(RuntimeError, match="needs the running rental container"):
+        await service._run_bootstrap_restore(
+            ssh_client=AsyncMock(),
+            executor_info=_executor_info(),
+            payload=SimpleNamespace(pod_id="pod-1"),
+            restore=SimpleNamespace(backup_engine="restic"),
+            local_volume="volume_pod-1",
+            local_volume_path="/root",
+            encrypted=True,
+        )
+
+    supports.assert_not_awaited()
+    start.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_restic_bootstrap_restore_requires_runner_capability(monkeypatch):
     monkeypatch.setattr(
