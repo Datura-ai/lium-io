@@ -590,3 +590,75 @@ async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_scrape_repor
     assert result.event.what_we_saw["delivery"] == "stdin"
     assert len(runner.calls) == 1
     assert ssh_client.sftp_client.put_called_with is None
+
+
+# ── ticket-0331: the storage-limit verdict and its reason code in SCRAPE_OK ──────────────────────
+
+
+async def _scrape_ok_event_for(context_factory, extra_specs: dict[str, Any]):
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+    ctx = context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data={**RAW_SPECS, **extra_specs})),
+        config=build_context_config(machine_scrape_filename="scrape.sh", machine_scrape_timeout=300, obfuscation_keys={}),
+        state=build_state(remote_dir="/remote/path"),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+    return await MachineSpecScrapeCheck().run(ctx)
+
+
+@pytest.mark.parametrize(
+    ("extra_specs", "expected_summary"),
+    [
+        ({"storage_limit_supported": True}, {"supported": True}),
+        (
+            {
+                "storage_limit_supported": False,
+                "storage_limit_scrape_error": "VLOOPBACK_SYSBOX_MOUNT_FAILED: docker: Error response from daemon: error setting up ID-mapped mount on path 206/fs",
+            },
+            {
+                "supported": False,
+                "reason_code": "VLOOPBACK_SYSBOX_MOUNT_FAILED",
+                "detail": "docker: Error response from daemon: error setting up ID-mapped mount on path 206/fs",
+            },
+        ),
+        (
+            {"storage_limit_supported": False, "storage_limit_scrape_error": "VLOOPBACK_MOUNTPOINT_NOT_ABSOLUTE: docker volume inspect gave Mountpoint '206/fs'"},
+            {"supported": False, "reason_code": "VLOOPBACK_MOUNTPOINT_NOT_ABSOLUTE", "detail": "docker volume inspect gave Mountpoint '206/fs'"},
+        ),
+        # an executor still on the old scrape text: no code to name, the text is kept as it came
+        (
+            {"storage_limit_supported": False, "storage_limit_scrape_error": "Storage limit is not supported."},
+            {"supported": False, "detail": "Storage limit is not supported."},
+        ),
+        ({}, {"supported": False}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_reports_the_storage_limit_verdict_with_its_reason_code(
+    context_factory, extra_specs, expected_summary
+):
+    # Act
+    result = await _scrape_ok_event_for(context_factory, extra_specs)
+
+    # Assert
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SCRAPE_OK.reason
+    assert result.event.what_we_saw["storage_limit"] == expected_summary
+
+
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_passes_the_vloopback_failure_to_the_backend_in_specs(context_factory):
+    # the backend reads storage_limit_supported for every rental's disk limit; the reason travels with it
+    reason = "VLOOPBACK_SYSBOX_MOUNT_FAILED: lstat 206: no such file or directory"
+
+    # Act
+    result = await _scrape_ok_event_for(
+        context_factory, {"storage_limit_supported": False, "storage_limit_scrape_error": reason}
+    )
+
+    # Assert
+    specs = result.updates["state"].specs
+    assert specs["storage_limit_supported"] is False
+    assert specs["storage_limit_scrape_error"] == reason
+    assert result.updates["state"].supports_gpu_splitting is False

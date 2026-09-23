@@ -1087,9 +1087,118 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
         return False, f"An unexpected error occurred: {e}"
 
 
+# ticket-0331 (22 Sep 2026): the `--storage-opt` probe alone passed on a host where every volume of a
+# rental with a disk limit failed to mount ("setting up ID-mapped mount on path 206/fs"). Such a rental
+# also gets a vloopback volume mounted into its sysbox container, so the check does that too. Plugin,
+# image and DATA_DIR are the rental path's (docker_service.create_local_volume); nvidia_docker_sysbox_setup.sh
+# runs the same test at setup. A failure is "<REASON_CODE>: <detail>" in storage_limit_scrape_error.
+VLOOPBACK_PLUGIN = VLOOPBACK_DRIVER_PREFIX
+VLOOPBACK_PLUGIN_IMAGE = "ashald/docker-volume-loopback"
+VLOOPBACK_PROBE_IMAGE = "daturaai/compute-subnet-executor:latest"
+VLOOPBACK_PROBE_TOKEN = "lium-vloopback-ok"
+VLOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS = 120
+VLOOPBACK_COMMAND_TIMEOUT_SECONDS = 60
+STORAGE_PROBE_DETAIL_CAP = 300
+
+
+def run_storage_probe(command, timeout):
+    # (exit status, stdout, last stderr line); the exit status is None when the command timed out
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return None, "", f"{' '.join(command[:3])} timed out after {timeout}s"
+    stderr_lines = [line for line in (result.stderr or "").splitlines() if line.strip()]
+    last_error = stderr_lines[-1][:STORAGE_PROBE_DETAIL_CAP] if stderr_lines else ""
+    return result.returncode, (result.stdout or "").strip(), last_error
+
+
+def check_vloopback_volume_ability() -> tuple[bool, str]:
+    status, docker_root_dir, error = run_storage_probe(
+        ["docker", "info", "--format", "{{.DockerRootDir}}"], VLOOPBACK_COMMAND_TIMEOUT_SECONDS
+    )
+    if status != 0 or not docker_root_dir.startswith("/"):
+        return False, f"VLOOPBACK_DOCKER_ROOT_UNREADABLE: data-root {docker_root_dir!r} {error}".rstrip()
+
+    status, enabled, error = run_storage_probe(
+        ["docker", "plugin", "inspect", "--format", "{{.Enabled}}", VLOOPBACK_PLUGIN], VLOOPBACK_COMMAND_TIMEOUT_SECONDS
+    )
+    if status is None:
+        return False, f"VLOOPBACK_CHECK_TIMEOUT: {error}"
+    if status != 0:
+        # not installed yet: the first rental with a disk limit installs it exactly like this
+        status, _, error = run_storage_probe(
+            [
+                "docker", "plugin", "install", VLOOPBACK_PLUGIN_IMAGE,
+                "--alias", VLOOPBACK_PLUGIN, "--grant-all-permissions",
+                f"DATA_DIR={docker_root_dir.rstrip('/')}/loopback",
+            ],
+            VLOOPBACK_PLUGIN_INSTALL_TIMEOUT_SECONDS,
+        )
+        if status != 0:
+            return False, f"VLOOPBACK_PLUGIN_INSTALL_FAILED: {error}"
+    elif enabled.splitlines()[-1:] != ["true"]:
+        # the rental path only skips `docker plugin install` for an enabled plugin; on a disabled one
+        # the install fails with "already exists" and so does the rental
+        return False, f"VLOOPBACK_PLUGIN_DISABLED: docker plugin inspect says Enabled={enabled!r}"
+
+    status, plugin_env, error = run_storage_probe(
+        ["docker", "plugin", "inspect", "--format", "{{range .Settings.Env}}{{println .}}{{end}}", VLOOPBACK_PLUGIN],
+        VLOOPBACK_COMMAND_TIMEOUT_SECONDS,
+    )
+    data_dir = ""
+    for env_line in plugin_env.splitlines():
+        if env_line.startswith("DATA_DIR="):
+            data_dir = env_line[len("DATA_DIR="):]
+    if not data_dir.startswith("/"):
+        return False, f"VLOOPBACK_DATA_DIR_NOT_ABSOLUTE: the {VLOOPBACK_PLUGIN} plugin's DATA_DIR is {data_dir!r} {error}".rstrip()
+
+    # sparse: this runs every cycle on every node, and a sparse file writes only what the probe writes
+    volume = f"lium_storage_check_{os.getpid()}"
+    status, _, error = run_storage_probe(
+        ["docker", "volume", "create", "-d", VLOOPBACK_PLUGIN, "-o", "size=1G", "-o", "sparse=true", volume],
+        VLOOPBACK_COMMAND_TIMEOUT_SECONDS,
+    )
+    if status != 0:
+        return False, f"VLOOPBACK_VOLUME_CREATE_FAILED: {error}"
+
+    verdict = None
+    status, mountpoint, error = run_storage_probe(
+        ["docker", "volume", "inspect", "--format", "{{.Mountpoint}}", volume], VLOOPBACK_COMMAND_TIMEOUT_SECONDS
+    )
+    if not mountpoint.startswith("/"):
+        verdict = (False, f"VLOOPBACK_MOUNTPOINT_NOT_ABSOLUTE: docker volume inspect gave Mountpoint {mountpoint!r} {error}".rstrip())
+    else:
+        status, output, error = run_storage_probe(
+            [
+                "docker", "run", "--rm", "--runtime=sysbox-runc",
+                "-v", f"{volume}:/lium-vol",
+                VLOOPBACK_PROBE_IMAGE,
+                "sh", "-c", f"echo {VLOOPBACK_PROBE_TOKEN} > /lium-vol/probe && cat /lium-vol/probe",
+            ],
+            VLOOPBACK_COMMAND_TIMEOUT_SECONDS,
+        )
+        if status != 0 or output.splitlines()[-1:] != [VLOOPBACK_PROBE_TOKEN]:
+            verdict = (False, f"VLOOPBACK_SYSBOX_MOUNT_FAILED: {error or output[-STORAGE_PROBE_DETAIL_CAP:]}")
+
+    # the container exited, so the plugin has unmounted the volume; removing it is the last step of the test
+    status, _, error = run_storage_probe(["docker", "volume", "rm", "-f", volume], VLOOPBACK_COMMAND_TIMEOUT_SECONDS)
+    if verdict is not None:
+        return verdict
+    if status != 0:
+        return False, f"VLOOPBACK_VOLUME_REMOVE_FAILED: {error}"
+    return True, "Storage limit is supported."
+
+
 def check_storage_limit_ability() -> tuple[bool, str]:
     """
-    Checks if the system supports limiting the storage size of a container.
+    Checks if the system supports limiting the storage size of a container: `--storage-opt size=`
+    on the container, and a vloopback volume mounted into a sysbox container.
     """
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
@@ -1102,16 +1211,15 @@ def check_storage_limit_ability() -> tuple[bool, str]:
             timeout=30
         )
 
-        if result.returncode == 0:
-            return True, "Storage limit is supported."
-        else:
-            return False, "Storage limit is not supported."
+        if result.returncode != 0:
+            return False, "STORAGE_OPT_UNSUPPORTED: Storage limit is not supported."
+        return check_vloopback_volume_ability()
 
     except subprocess.TimeoutExpired:
-        return False, "Test command timed out."
+        return False, "STORAGE_LIMIT_CHECK_TIMEOUT: Test command timed out."
 
     except Exception as e:
-        return False, f"An unexpected error occurred: {e}"
+        return False, f"STORAGE_LIMIT_CHECK_ERROR: An unexpected error occurred: {e}"
 
 
 NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"

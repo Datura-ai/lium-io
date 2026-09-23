@@ -161,6 +161,22 @@ def _interconnect_summary(specs: dict[str, Any]) -> dict[str, Any] | None:
     return summary
 
 
+def _storage_limit_summary(specs: dict[str, Any]) -> dict[str, Any]:
+    # the scrape's storage-limit verdict with its reason code ("VLOOPBACK_SYSBOX_MOUNT_FAILED: …"), so a
+    # node that reports storage_limit_supported=false says why in the validator's own log
+    supported = bool(specs.get("storage_limit_supported", False))
+    summary: dict[str, Any] = {"supported": supported}
+    scrape_error = specs.get("storage_limit_scrape_error")
+    if not supported and scrape_error:
+        code, separator, detail = str(scrape_error).partition(": ")
+        if separator and code.isupper() and " " not in code:
+            summary["reason_code"] = code
+            summary["detail"] = detail
+        else:
+            summary["detail"] = str(scrape_error)
+    return summary
+
+
 def _binary_command(remote_dir: str, script_filename: str) -> str:
     script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
     return f"chmod +x {script_path} && {script_path}"
@@ -360,6 +376,8 @@ class MachineSpecScrapeCheck:
                     "network": specs.get("network"),
                     # DAH-2922: the NVLink/P2P verdict per cycle, without the 8x8 matrix
                     "interconnect": _interconnect_summary(specs),
+                    # ticket-0331: why rentals with a disk limit will not get one on this node
+                    "storage_limit": _storage_limit_summary(specs),
                 },
                 extra=extra_info,
             )
