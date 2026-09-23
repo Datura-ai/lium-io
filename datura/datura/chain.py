@@ -7,7 +7,11 @@ failure the client moves to the next entry and logs `Subtensor endpoint switched
 failed entry is not dialled again for `retry_after_seconds` (`BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS`,
 5 minutes by default), so a dead proxy does not stall every sync cycle with a new dial; after that
 window the next sync cycle goes back to it. A proxy outage never leaves a neuron without a chain
-client, and a recovered proxy is picked up again without a restart (taiberium, lium-io#1393).
+client, and a recovered proxy is picked up again without a restart.
+
+The endpoint goes to the `network=` argument of the Subtensor constructor: bittensor 10.5 ignores
+an endpoint placed only in the Config (`setup_config` keeps the last set candidate, and `Config()`
+defaults `subtensor.network` to finney).
 """
 
 from time import monotonic

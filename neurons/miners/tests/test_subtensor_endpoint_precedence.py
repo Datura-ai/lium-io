@@ -27,14 +27,14 @@ PUBLIC_FINNEY = "wss://entrypoint-finney.opentensor.ai:443"
 
 def _resolve(settings: Settings) -> tuple[str, str]:
     return AsyncSubtensor.setup_config(
-        settings.get_chain_endpoint_or_network_name(), settings.get_bittensor_config()
+        settings.get_chain_endpoints()[0].value, settings.get_bittensor_config()
     )
 
 
 def test_provider_shape_network_name_only_stays_on_the_public_node():
     settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=None)
 
-    assert settings.get_chain_endpoint_or_network_name() == "finney"
+    assert settings.get_chain_endpoints()[0].value == "finney"
     assert _resolve(settings) == (PUBLIC_FINNEY, "finney")
 
 
@@ -195,7 +195,7 @@ def test_chain_endpoints_list_is_ordered_with_the_public_node_last():
     )
 
     assert [e.value for e in settings.get_chain_endpoints()] == [OWN_ENDPOINT, SECOND_ENDPOINT, "finney"]
-    assert settings.get_chain_endpoint_or_network_name() == OWN_ENDPOINT
+    assert settings.get_chain_endpoints()[0].value == OWN_ENDPOINT
 
 
 @pytest.mark.asyncio

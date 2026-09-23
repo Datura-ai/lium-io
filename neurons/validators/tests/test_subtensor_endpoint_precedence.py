@@ -30,7 +30,7 @@ PUBLIC_TEST = "wss://test.finney.opentensor.ai:443"
 def _resolve(settings: Settings) -> tuple[str, str]:
     """What `bittensor.Subtensor(network=..., config=...)` connects to for these settings."""
     return Subtensor.setup_config(
-        settings.get_chain_endpoint_or_network_name(), settings.get_bittensor_config()
+        settings.get_chain_endpoints()[0].value, settings.get_bittensor_config()
     )
 
 
@@ -198,7 +198,7 @@ def test_chain_endpoints_list_is_ordered_with_the_public_node_last():
         "BITTENSOR_CHAIN_ENDPOINTS[1]",
         PUBLIC_NODE_SOURCE,
     ]
-    assert settings.get_chain_endpoint_or_network_name() == OWN_ENDPOINT
+    assert settings.get_chain_endpoints()[0].value == OWN_ENDPOINT
     assert _resolve(settings)[0] == OWN_ENDPOINT
 
 

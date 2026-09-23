@@ -110,17 +110,6 @@ class Settings(BaseSettings):
 
         return config
 
-    def get_chain_endpoint_or_network_name(self) -> str:
-        """The value for `AsyncSubtensor(network=...)`: the chain endpoint when it is set,
-        else the network name. Providers set only `BITTENSOR_NETWORK`, so for them this
-        is the network name, as before.
-
-        bittensor 10.5 `setup_config` keeps the LAST set candidate from the Config and
-        `bittensor.Config()` defaults `subtensor.network` to finney, so an endpoint placed
-        only in the Config is ignored; the `network` argument outranks it (DAH-3579).
-        """
-        return self.get_chain_endpoints()[0].value
-
     def get_chain_endpoints(self) -> list[ChainEndpoint]:
         """The ordered dial list: `BITTENSOR_CHAIN_ENDPOINTS` (comma-separated) or the single
         `BITTENSOR_CHAIN_ENDPOINT`, then the public `BITTENSOR_NETWORK` node last. A connect or

@@ -668,18 +668,6 @@ class Settings(BaseSettings):
 
         return config
 
-    def get_chain_endpoint_or_network_name(self) -> str:
-        """The value for `Subtensor(network=...)`: our own chain endpoint when it is set,
-        else the network name.
-
-        A chain endpoint placed only in the Config object is ignored by bittensor 10.5:
-        `Subtensor.setup_config` keeps the LAST set candidate, and `bittensor.Config()`
-        defaults `subtensor.network` to finney, so the config alone always resolves to
-        the public finney node (DAH-3579). Only the `network` argument outranks the
-        Config, so the endpoint goes there.
-        """
-        return self.get_chain_endpoints()[0].value
-
     def get_chain_endpoints(self) -> list[ChainEndpoint]:
         """The ordered dial list: `BITTENSOR_CHAIN_ENDPOINTS` (comma-separated) or the single
         `BITTENSOR_CHAIN_ENDPOINT`, then the public `BITTENSOR_NETWORK` node last. A connect or
