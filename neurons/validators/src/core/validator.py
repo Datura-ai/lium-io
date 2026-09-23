@@ -414,8 +414,13 @@ class Validator:
                     all_job_results = {}
                     miner_coldkeys = {}
 
-                    # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    # Run all jobs with asyncio.wait and set a timeout. asyncio.wait rejects an
+                    # empty set; a cycle with no miners still writes the incentive snapshot and
+                    # the GPU estimates below.
+                    if jobs:
+                        done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
+                    else:
+                        done, pending = set(), set()
 
                     # Process completed jobs
                     for task in done:
@@ -671,7 +676,10 @@ class Validator:
                                 ),
                             )
 
-                    self.completed_cycles_since_start += 1
+                    # A cycle with no miners validated nobody, so it keeps the post-restart
+                    # warm-up closed: set_weights and the express lane wait for a scored cycle.
+                    if jobs:
+                        self.completed_cycles_since_start += 1
 
                     logger.info(
                         _m(
