@@ -582,12 +582,12 @@ VOLUME_STEP_DETAIL_MAX_CHARS = 300
 # docker-py's SSH transport stack (urllib3 over a paramiko channel) raises these once the session
 # under the Docker SDK client is gone; the text alone reads like a code bug, so the detail says what
 # it means.
-_STALE_SDK_TRANSPORT_MARKERS = (
+DEAD_DOCKER_SSH_SESSION_MARKERS = (
     "has no attribute 'settimeout'",
     "SSH session not active",
     "Socket is closed",
 )
-STALE_SDK_TRANSPORT_HINT = (
+DEAD_DOCKER_SSH_SESSION_HINT = (
     "the Docker connection to the executor dropped while the pod was being prepared"
 )
 
@@ -597,9 +597,9 @@ def _plain_text(exc: BaseException) -> str:
     return " ".join(str(exc).split())
 
 
-def _is_stale_sdk_transport(exc: BaseException) -> bool:
+def _is_dead_docker_ssh_session(exc: BaseException) -> bool:
     text = _plain_text(exc)
-    return any(marker in text for marker in _STALE_SDK_TRANSPORT_MARKERS)
+    return any(marker in text for marker in DEAD_DOCKER_SSH_SESSION_MARKERS)
 
 
 def volume_step_detail(exc: BaseException) -> str | None:
@@ -608,25 +608,20 @@ def volume_step_detail(exc: BaseException) -> str | None:
     text = _plain_text(exc)
     if not text:
         return None
-    if _is_stale_sdk_transport(exc):
-        text = f"{STALE_SDK_TRANSPORT_HINT}: {text}"
+    if _is_dead_docker_ssh_session(exc):
+        text = f"{DEAD_DOCKER_SSH_SESSION_HINT}: {text}"
     return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
 
 
 def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
-    """The CCF `step_detail` for a failed create step. The volume steps carry the daemon's own
-    reason (`volume_step_detail`). Any other step carries STALE_SDK_TRANSPORT_HINT alone when the
-    error is docker-py's dead-transport text — on a template switch the pod keeps its volume, the
-    volume block is skipped, and the first Docker SDK call after the build is `docker_run`, so the
-    dead session surfaces there (review, taiberium 18 Sep). The raw text of those steps is not
-    forwarded: it is not proven free of executor host data. Every other case stays None — a
-    CustomBuildFailed too, whose text is the renter's own build output (it has `build_log_tail`)."""
+    """Volume steps return the daemon reason via volume_step_detail. Other steps return
+    DEAD_DOCKER_SSH_SESSION_HINT on a dead Docker SSH session, else None."""
     if current_step in VOLUME_STEP_NAMES:
         return volume_step_detail(exc)
     if isinstance(exc, CustomBuildFailed):
         return None
-    if _is_stale_sdk_transport(exc):
-        return STALE_SDK_TRANSPORT_HINT
+    if _is_dead_docker_ssh_session(exc):
+        return DEAD_DOCKER_SSH_SESSION_HINT
     return None
 
 

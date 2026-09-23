@@ -875,7 +875,7 @@ async def test_A20_volume_step_failure_carries_the_daemon_reason(svc, monkeypatc
     """Regression (DAH-3504): a `volume_creation` failure reached the backend as the bare step
     name; `step_detail` now carries the Docker daemon's reason. The dead-transport text docker-py
     raises after a long build gets a plain-language hint in front of it."""
-    from services.docker_service import STALE_SDK_TRANSPORT_HINT
+    from services.docker_service import DEAD_DOCKER_SSH_SESSION_HINT
     from services.rental_docker_sdk import RentalDockerOperationError
 
     ssh_client = AsyncMock()
@@ -903,7 +903,7 @@ async def test_A20_volume_step_failure_carries_the_daemon_reason(svc, monkeypatc
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "volume_creation"
     assert result.step_detail is not None
-    assert result.step_detail.startswith(STALE_SDK_TRANSPORT_HINT)
+    assert result.step_detail.startswith(DEAD_DOCKER_SSH_SESSION_HINT)
     assert "Docker SDK create volume failed" in result.step_detail
     assert "127.0.0.1" not in result.step_detail and "2200" not in result.step_detail
     assert result.build_log_tail is None
@@ -949,7 +949,7 @@ async def test_A20d_template_switch_dead_transport_at_docker_run_carries_the_hin
     after the long build is `docker_run`. The dead-transport text surfaces there; `step_detail`
     carries the fixed hint and nothing of the raw error, since that step's text is not proven
     free of executor host data."""
-    from services.docker_service import STALE_SDK_TRANSPORT_HINT
+    from services.docker_service import DEAD_DOCKER_SSH_SESSION_HINT
     from services.rental_docker_sdk import RentalDockerOperationError
 
     ssh_client = AsyncMock()
@@ -982,7 +982,7 @@ async def test_A20d_template_switch_dead_transport_at_docker_run_carries_the_hin
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_run"
     create_volume.assert_not_awaited()
-    assert result.step_detail == STALE_SDK_TRANSPORT_HINT
+    assert result.step_detail == DEAD_DOCKER_SSH_SESSION_HINT
     assert "settimeout" not in result.step_detail
     assert "127.0.0.1" not in result.step_detail and "2200" not in result.step_detail
     assert result.build_log_tail is None
@@ -1012,7 +1012,7 @@ async def test_A20b_non_volume_failures_have_no_step_detail(svc, monkeypatch):
 
 def test_A21_volume_step_detail_is_bounded_and_plain():
     from services.docker_service import (
-        STALE_SDK_TRANSPORT_HINT,
+        DEAD_DOCKER_SSH_SESSION_HINT,
         VOLUME_STEP_DETAIL_MAX_CHARS,
         volume_step_detail,
     )
@@ -1021,23 +1021,23 @@ def test_A21_volume_step_detail_is_bounded_and_plain():
     assert volume_step_detail(RuntimeError("  \n ")) is None
     plain = volume_step_detail(RuntimeError("Docker SDK create volume failed:\n  no space left on device"))
     assert plain == "Docker SDK create volume failed: no space left on device"
-    assert not plain.startswith(STALE_SDK_TRANSPORT_HINT)
+    assert not plain.startswith(DEAD_DOCKER_SSH_SESSION_HINT)
     long = volume_step_detail(RuntimeError("x" * 1000))
     assert len(long) == VOLUME_STEP_DETAIL_MAX_CHARS
 
 
 def test_A21b_failure_step_detail_routes_by_step():
-    from services.docker_service import STALE_SDK_TRANSPORT_HINT, CustomBuildFailed, failure_step_detail
+    from services.docker_service import DEAD_DOCKER_SSH_SESSION_HINT, CustomBuildFailed, failure_step_detail
 
     stale = RuntimeError("Docker SDK create container failed: SSH session not active (host 10.0.0.9)")
     # volume steps: the raw daemon text, hinted
-    assert failure_step_detail(stale, "volume_creation").startswith(STALE_SDK_TRANSPORT_HINT)
+    assert failure_step_detail(stale, "volume_creation").startswith(DEAD_DOCKER_SSH_SESSION_HINT)
     assert "SSH session not active" in failure_step_detail(stale, "volume_creation")
     assert failure_step_detail(RuntimeError("no space left on device"), "volume_sizing") == "no space left on device"
     # any other step: the hint alone for a dead transport, nothing of the raw text
-    assert failure_step_detail(stale, "docker_run") == STALE_SDK_TRANSPORT_HINT
-    assert failure_step_detail(stale, "container_health_check") == STALE_SDK_TRANSPORT_HINT
-    assert failure_step_detail(stale, None) == STALE_SDK_TRANSPORT_HINT
+    assert failure_step_detail(stale, "docker_run") == DEAD_DOCKER_SSH_SESSION_HINT
+    assert failure_step_detail(stale, "container_health_check") == DEAD_DOCKER_SSH_SESSION_HINT
+    assert failure_step_detail(stale, None) == DEAD_DOCKER_SSH_SESSION_HINT
     # any other step with any other text: None
     assert failure_step_detail(RuntimeError("image not found"), "docker_run") is None
     assert failure_step_detail(RuntimeError(""), "docker_run") is None
