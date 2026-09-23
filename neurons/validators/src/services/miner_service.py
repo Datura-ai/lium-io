@@ -236,9 +236,28 @@ class MinerService:
         # this one process, so a plain dict is the whole coordination: each lane skips what the
         # other holds. Stays empty with the flag off.
         self.in_flight: dict[str, str] = {}
+        # miner hotkey -> job_batch_id of the wave that has not received that miner's executor
+        # list yet. The express lane publishes under the cycle's job_batch_id; it waits for the
+        # wave's list of the node's miner, or the wave could verify and publish the node again
+        # under the same id once the lane let go of it. Stays empty with the flag off.
+        self.awaiting_wave_list: dict[str, str] = {}
+
+    def expect_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
+        """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
+        if settings.EXPRESS_LANE_ENABLED:
+            self.awaiting_wave_list = {hotkey: job_batch_id for hotkey in miner_hotkeys}
+
+    def _wave_list_settled(self, payload: MinerJobRequestPayload) -> None:
+        """The wave has this miner's list, or its request ended without one. An older wave's
+        request that outlived its cycle leaves the current wave's entry alone."""
+        if self.awaiting_wave_list.get(payload.miner_hotkey) == payload.job_batch_id:
+            del self.awaiting_wave_list[payload.miner_hotkey]
 
     def _claim_for_cycle(
-        self, executors: list[ExecutorSSHInfo], default_extra: dict
+        self,
+        payload: MinerJobRequestPayload,
+        executors: list[ExecutorSSHInfo],
+        default_extra: dict,
     ) -> list[ExecutorSSHInfo]:
         """The wave takes every executor the miner returned, minus those the express lane is
         verifying at this moment, so a new node's hardware tests never run twice concurrently
@@ -246,6 +265,7 @@ class MinerService:
         that no cycle has published yet, so a long-known executor's scoring is untouched.
         Flag off: list returned as is.
         """
+        self._wave_list_settled(payload)
         if not settings.EXPRESS_LANE_ENABLED:
             return executors
         claimed: list[ExecutorSSHInfo] = []
@@ -319,6 +339,32 @@ class MinerService:
         return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce)).hex()}"
 
     async def request_job_to_miner(
+        self,
+        payload: MinerJobRequestPayload,
+        encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
+        default_docker_image_digests: dict[str, str],
+        executor_image_snapshot: ExpectedImageSnapshot | None = None,
+        executor_id: str | None = None,
+        first_pass: bool = False,
+    ):
+        """See _route_job_to_miner. A wave request that ends before the miner's list arrived
+        (unreachable, refused, timed out) settles its awaiting_wave_list entry too."""
+        try:
+            return await self._route_job_to_miner(
+                payload,
+                encrypted_files,
+                rented_data,
+                default_docker_image_digests,
+                executor_image_snapshot,
+                executor_id=executor_id,
+                first_pass=first_pass,
+            )
+        finally:
+            if executor_id is None:
+                self._wave_list_settled(payload)
+
+    async def _route_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
         encrypted_files: MinerJobEnryptedFiles,
@@ -478,7 +524,7 @@ class MinerService:
                             "Miner returned zero executors in AcceptSSHKeyRequest",
                         )
                     executors = (
-                        self._claim_for_cycle(msg.executors, default_extra)
+                        self._claim_for_cycle(payload, msg.executors, default_extra)
                         if executor_id is None
                         else self._only_requested(msg.executors, executor_id, default_extra)
                     )
@@ -2281,7 +2327,7 @@ class MinerService:
                         "Miner returned zero executors in AcceptSSHKeyRequest",
                     )
                 executors = (
-                    self._claim_for_cycle(msg.executors, default_extra)
+                    self._claim_for_cycle(payload, msg.executors, default_extra)
                     if executor_id is None
                     else self._only_requested(msg.executors, executor_id, default_extra)
                 )

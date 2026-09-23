@@ -379,6 +379,7 @@ class Validator:
                     job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
                 )
+                self.miner_service.expect_wave_lists(job_batch_id, [miner.hotkey for miner in miners])
 
                 task_info = {}
 

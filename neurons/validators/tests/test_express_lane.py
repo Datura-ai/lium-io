@@ -349,6 +349,7 @@ class _Harness:
         if miner_service is None:
             miner_service = MinerService.__new__(MinerService)
             miner_service.in_flight = {}
+            miner_service.awaiting_wave_list = {}
         self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
         self.release = asyncio.Event()
@@ -686,6 +687,79 @@ async def test_flag_off_every_miner_is_asked_under_the_cycles_block_time_id(
     }
     assert asked == {"miner-a": CYCLE_BATCH_ID, "miner-b": CYCLE_BATCH_ID}
     assert validator.cycle_inputs.job_batch_id == CYCLE_BATCH_ID
+    validator.miner_service.expect_wave_lists.assert_called_once_with(
+        CYCLE_BATCH_ID, ["miner-a", "miner-b"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_lane_waits_for_the_waves_list_of_the_nodes_miner(monkeypatch, wallet):
+    """The wave asks every miner for its list as the cycle starts. Until it has the list of the
+    node's miner the lane does not launch the node: a check that fails in seconds would publish
+    under the cycle's id, and the wave could then list, verify and publish the node under the
+    same id. Waiting spends no attempt. A cycle that starts during the tick's awaits holds too."""
+    early, late = str(uuid4()), str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(early)]}, [_Neuron("miner-a")])
+    harness.miner_service.awaiting_wave_list = {"miner-a": CYCLE_BATCH_ID}
+
+    assert await harness.tick_and_settle() == 0
+    harness.miner_service.request_job_to_miner.assert_not_awaited()
+    assert harness.lane._pending[early].attempts == 0
+
+    del harness.miner_service.awaiting_wave_list["miner-a"]  # the wave's claim: the list arrived
+    assert await harness.tick_and_settle() == 1
+
+    async def miners_while_a_cycle_starts():
+        harness.inputs = _cycle_inputs(job_batch_id=NEXT_CYCLE_BATCH_ID)
+        harness.miner_service.awaiting_wave_list = {"miner-a": NEXT_CYCLE_BATCH_ID}
+        return [_Neuron("miner-a")]
+
+    harness.lane.subtensor_client.get_miners = AsyncMock(side_effect=miners_while_a_cycle_starts)
+    harness.portal_api.get_all_executors.return_value = {"miner-a": [_portal_executor(late)]}
+    assert await harness.tick_and_settle() == 0
+    assert harness.miner_service.request_job_to_miner.await_count == 1
+    assert harness.lane._pending[late].attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_the_wave_settles_a_miners_entry_when_its_list_arrives_or_its_request_ends(
+    rest_miner_service, monkeypatch
+):
+    """expect_wave_lists marks every miner of the cycle. The wave's claim clears a miner's entry
+    before its pipeline runs; a request that ends without a list clears it too; a request of an
+    older cycle leaves the current cycle's entry alone."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
+    batch = _payload().job_batch_id
+    rest_miner_service.expect_wave_lists(batch, ["miner-a", "miner-b"])
+    during_pipeline = {}
+
+    async def create_task(miner_info, executor_info, **_):
+        during_pipeline.update(rest_miner_service.awaiting_wave_list)
+        return _job_result(executor_info.uuid)
+
+    rest_miner_service.task_service.create_task = AsyncMock(side_effect=create_task)
+    rest_miner_service.miner_returns(str(uuid4()))
+    await _request(rest_miner_service)
+    assert during_pipeline == {"miner-b": batch}
+    assert rest_miner_service.awaiting_wave_list == {"miner-b": batch}
+
+    async def refused(*_args, **_kwargs):
+        return 503, None
+
+    rest_miner_service._make_rest_request = refused
+    await rest_miner_service.request_job_to_miner(
+        payload=_payload().model_copy(update={"miner_hotkey": "miner-b"}),
+        encrypted_files=_cycle_inputs().encrypted_files,
+        rented_data=RentedExecutorsResponse(executors={}),
+        default_docker_image_digests={},
+    )
+    assert rest_miner_service.awaiting_wave_list == {}
+
+    rest_miner_service.expect_wave_lists("2026-09-06 16:55:00", ["miner-a"])
+    await _request(rest_miner_service)  # the 16:40 cycle's request, still running
+    assert rest_miner_service.awaiting_wave_list == {"miner-a": "2026-09-06 16:55:00"}
 
 
 @pytest.mark.asyncio

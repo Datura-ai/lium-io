@@ -203,6 +203,10 @@ class ExpressLane:
                     )
                 if executor.id in in_flight or pending.not_before > now:
                     continue
+                # The wave has not received this miner's list yet (a cycle started seconds ago):
+                # wait a tick, no attempt spent. See MinerService.awaiting_wave_list.
+                if miner_hotkey in self.miner_service.awaiting_wave_list:
+                    continue
                 candidates.append(pending)
 
         # Removed from the portal (or validated by the cycle) before this lane got to it.
@@ -268,6 +272,9 @@ class ExpressLane:
         for pending in chosen:
             if pending.executor.id in in_flight:
                 # The wave accepted it during the awaits above; it publishes it at the wave's end.
+                continue
+            if pending.miner_hotkey in self.miner_service.awaiting_wave_list:
+                # A cycle started during the awaits above and its wave has not listed this miner.
                 continue
             miner = miners.get(pending.miner_hotkey)
             if miner is None:
