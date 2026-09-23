@@ -28,7 +28,7 @@ KIB_PER_GIB = 1024 * 1024
 MIN_RENTAL_MEMORY_GB = 1
 # MemTotal in KiB, then the number of GPU device nodes (/dev/nvidia0, /dev/nvidia1, …).
 HOST_MEMORY_PROBE_CMD = (
-    "awk '/^MemTotal:/ {print $2}' /proc/meminfo; " "ls -d /dev/nvidia[0-9]* 2>/dev/null | wc -l"
+    "awk '/^MemTotal:/ {print $2}' /proc/meminfo; ls -d /dev/nvidia[0-9]* 2>/dev/null | wc -l"
 )
 
 SOURCE_CAP_DISABLED = "cap_disabled"
