@@ -511,6 +511,9 @@ STREAM_TIMEOUT_STDERR = "Process timed out"
 # `docker save | docker load` fails on the HOST daemon's side (its paths, its disk); that stderr is
 # for ops, the renter's tail gets this fixed line.
 CUSTOM_BUILD_EXPORT_FAILED_REASON = "built image could not be loaded onto the executor"
+# stderr with no BUILD_FAILED_RC= marker: the build script never finished and the text is the host
+# daemon's `docker exec` error, so the renter gets this fixed line.
+CUSTOM_BUILD_INTERRUPTED_REASON = "build container stopped before the build finished"
 # The build's exit code round-trips through a file in the DinD container's /tmp. When that file
 # cannot be written or read (the overlay is full or read-only) the build is treated as failed and
 # this line ends its tail, so the renter and the tests see WHY rather than `[: Illegal number:`.
@@ -561,14 +564,12 @@ def custom_build_inner_command(image_tag: str, ctx: str) -> str:
     back from CUSTOM_BUILD_RC_FILE). An rc file that cannot be written or read makes the build a
     failure (rc 1) whose tail ends with CUSTOM_BUILD_RC_UNREADABLE_REASON — never a bare `exit`
     that reads as success. No single quotes, so the caller's shlex.quote keeps the text verbatim."""
-    log_file = CUSTOM_BUILD_LOG_FILE
-    rc_file = CUSTOM_BUILD_RC_FILE
     return (
         f"{{ docker build --progress=plain --pull "
-        f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; echo $? > {rc_file}; }} "
-        f"| tee {log_file}; rc=$(cat {rc_file} 2>/dev/null); "
+        f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; echo $? > {CUSTOM_BUILD_RC_FILE}; }} "
+        f"| tee {CUSTOM_BUILD_LOG_FILE}; rc=$(cat {CUSTOM_BUILD_RC_FILE} 2>/dev/null); "
         'if [ -z "$rc" ]; then rc=1; rc_lost=1; fi; '
-        f'if [ "$rc" -ne 0 ]; then grep -v "^[[:space:]]*$" {log_file} '
+        f'if [ "$rc" -ne 0 ]; then grep -v "^[[:space:]]*$" {CUSTOM_BUILD_LOG_FILE} '
         f"| tail -n {CUSTOM_BUILD_LOG_TAIL_LINES} >&2; "
         f'if [ -n "$rc_lost" ]; then echo "{CUSTOM_BUILD_RC_UNREADABLE_REASON}" >&2; fi; '
         f"echo {CUSTOM_BUILD_FAILED_MARKER}$rc >&2; fi; exit $rc"
@@ -4479,6 +4480,14 @@ class DockerService:
                 # only the streamer's bare sentinel is a timeout.
                 if stream_timed_out(err):
                     return CustomBuildOutcome(False, "build_timeout", f"docker build exceeded {timeout_s} s")
+                if CUSTOM_BUILD_FAILED_MARKER not in (err or ""):
+                    logger.error(
+                        _m(
+                            "Custom build interrupted",
+                            extra=get_extra_info({**default_extra, "build_image_tag": image_tag, "error": err}),
+                        )
+                    )
+                    return CustomBuildOutcome(False, "docker_build", CUSTOM_BUILD_INTERRUPTED_REASON)
                 return CustomBuildOutcome(False, "docker_build", custom_build_log_tail(err))
 
             # 7. Export the image from DinD and load it onto the host daemon so
