@@ -237,6 +237,15 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # DAH-3798 (ticket-0355): a rental container's --memory is the backend's memory_gb, never above its
+    # GPU share of (host RAM − reserve); the reserve is RENTAL_MEMORY_RESERVE_PERCENT of the host's RAM,
+    # at least RENTAL_MEMORY_RESERVE_MIN_GB. Swap is off for the container (--memory-swap = --memory) and
+    # its processes carry RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks them before the
+    # executor. Off: the container gets the backend's memory_gb and nothing else, as before.
+    RENTAL_MEMORY_CAP_ENABLED: bool = Field(env="RENTAL_MEMORY_CAP_ENABLED", default=True)
+    RENTAL_MEMORY_RESERVE_MIN_GB: int = Field(env="RENTAL_MEMORY_RESERVE_MIN_GB", default=4)
+    RENTAL_MEMORY_RESERVE_PERCENT: float = Field(env="RENTAL_MEMORY_RESERVE_PERCENT", default=3.0)
+    RENTAL_CONTAINER_OOM_SCORE_ADJ: int = Field(env="RENTAL_CONTAINER_OOM_SCORE_ADJ", default=500)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a

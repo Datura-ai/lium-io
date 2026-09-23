@@ -128,6 +128,9 @@ class ContainerRunSpec:
     device_requests: tuple[GpuDeviceRequest, ...] = ()
     cpu_count: int | None = None
     memory_gb: int | None = None
+    # --memory-swap; equal to memory_gb means the container gets no swap (DAH-3798)
+    memory_swap_gb: int | None = None
+    oom_score_adj: int | None = None
     storage_limit_gb: int | None = None
     shm_size: str | None = None
     entrypoint: str | None = None
@@ -526,7 +529,7 @@ class RentalDockerSdkClient:
         host_config = self._api_client.create_host_config(
             **_build_host_config_kwargs(spec)
         )
-        self._api_client.create_container(
+        created = self._api_client.create_container(
             image=spec.image,
             command=list(spec.command) or None,
             detach=True,
@@ -537,6 +540,7 @@ class RentalDockerSdkClient:
             entrypoint=spec.entrypoint or None,
             host_config=host_config,
         )
+        _log_create_warnings(spec, created)
         self._api_client.start(spec.name)
 
     def _ensure_rental_network_sync(self, name: str) -> None:
@@ -930,6 +934,11 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "device_requests": _device_requests(spec.device_requests),
         "nano_cpus": spec.cpu_count * 1_000_000_000 if spec.cpu_count else None,
         "mem_limit": f"{spec.memory_gb}g" if spec.memory_gb else None,
+        # Docker refuses --memory-swap without --memory
+        "memswap_limit": (
+            f"{spec.memory_swap_gb}g" if spec.memory_gb and spec.memory_swap_gb else None
+        ),
+        "oom_score_adj": spec.oom_score_adj,
         "storage_opt": (
             {"size": f"{spec.storage_limit_gb}g"}
             if spec.storage_limit_gb
@@ -939,6 +948,29 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "network_mode": spec.network,
     }
     return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def _log_create_warnings(spec: ContainerRunSpec, created: object) -> None:
+    """Log the daemon's create warnings; a memory limit it discarded is an error (DAH-3798).
+
+    A kernel without the memory cgroup makes Docker drop --memory with only a warning in the create
+    reply ("Limitation discarded"), and the container then runs with the host's whole RAM.
+    """
+    warnings = created.get("Warnings") if isinstance(created, dict) else None
+    if not warnings:
+        return
+    memory_discarded = spec.memory_gb is not None and any(
+        "memory" in str(warning).lower() for warning in warnings
+    )
+    log = logger.error if memory_discarded else logger.warning
+    log(
+        _m(
+            "rental_memory_limit_discarded" if memory_discarded else "docker_create_warnings",
+            extra=get_extra_info(
+                {"container_name": spec.name, "memory_gb": spec.memory_gb, "warnings": list(warnings)}
+            ),
+        )
+    )
 
 
 def _require_icc_off(name: str, network: dict) -> None:
