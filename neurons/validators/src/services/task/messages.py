@@ -533,6 +533,33 @@ class SysboxRequiredMessages:
         impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
         remediation="Install the sysbox runtime; unrented machines without sysbox are not allowed on the network.",
     )
+    # DAH-3634: the probe's `docker run` was refused by the NVIDIA container hook, so no sysbox
+    # verdict was measured and the node cannot start any GPU container. Same impact as
+    # SYSBOX_MISSING (the check still fails, score 0); the reason code and the advice are truthful.
+    # The call site prefixes the remediation with the probe's cause (dind_probe.DOCKER_RUN_CAUSES).
+    # Same code as the executor updater's hold for this host condition (DAH-3481).
+    NVIDIA_RUNTIME_MISMATCH = MessageTemplate(
+        event="NVIDIA driver/library version mismatch on the host",
+        reason="NVIDIA_RUNTIME_MISMATCH",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "Reboot the host after the NVIDIA driver update, or reinstall the NVIDIA container toolkit. "
+            "Sysbox was not measured; fix this first and the sysbox check runs again on the next cycle."
+        ),
+    )
+    NVIDIA_CONTAINER_HOOK_FAILED = MessageTemplate(
+        event="NVIDIA container hook refused the GPU container",
+        reason="NVIDIA_CONTAINER_HOOK_FAILED",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            "Make `nvidia-smi` work on the host (reset or reboot), then reinstall the NVIDIA container "
+            "toolkit; the sysbox check runs again on the next cycle."
+        ),
+    )
     SYSBOX_OK = MessageTemplate(
         event="Sysbox requirement satisfied",
         reason="SYSBOX_REQUIRED_OK",

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -398,7 +399,7 @@ async def test_A2_build_success_overrides_docker_image_tag(svc, monkeypatch):
     _patch_create_container_happy(svc, monkeypatch, ssh_client)
 
     # Stub the build helper to succeed and assert it's called.
-    build_mock = AsyncMock(return_value=(True, None))
+    build_mock = AsyncMock(return_value=(True, None, None))
     monkeypatch.setattr(svc, "_custom_build_image", build_mock)
     # Mock execute_and_stream_logs so the test does not try to run the real pull either.
     monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
@@ -438,7 +439,7 @@ async def test_A2_image_pull_path_unchanged_when_dockerfile_none(svc, monkeypatc
     ssh_client.run = AsyncMock(side_effect=_ssh_run_side)
     _patch_create_container_happy(svc, monkeypatch, ssh_client)
 
-    build_mock = AsyncMock(return_value=(True, None))
+    build_mock = AsyncMock(return_value=(True, None, None))
     monkeypatch.setattr(svc, "_custom_build_image", build_mock)
 
     monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
@@ -468,7 +469,7 @@ async def test_A4_build_failure_returns_ccf_unknown_error(svc, monkeypatch):
     ssh_client.run = AsyncMock(return_value=_ssh_result())
     _patch_create_container_happy(svc, monkeypatch, ssh_client)
 
-    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(False, "docker_build")))
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(False, "docker_build", "ERROR: failed to solve: process \"/bin/sh -c false\" did not complete successfully: exit code: 1")))
     monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
     monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
 
@@ -564,7 +565,7 @@ async def test_A9_build_runs_in_sysbox_dind_with_network(svc, monkeypatch):
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN curl -m 2 http://example.com\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client,
         payload=payload,
         log_tag="t",
@@ -599,7 +600,7 @@ async def test_A12_sysbox_unavailable_aborts_before_build(svc, monkeypatch):
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client,
         payload=payload,
         log_tag="t",
@@ -625,7 +626,7 @@ async def test_A13_egress_failure_aborts_before_build(svc, monkeypatch):
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client,
         payload=payload,
         log_tag="t",
@@ -652,7 +653,7 @@ async def test_A14_dind_container_always_torn_down(svc, monkeypatch):
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, _tail = await svc._custom_build_image(
         ssh_client=ssh_client,
         payload=payload,
         log_tag="t",
@@ -678,7 +679,7 @@ async def test_A15_export_failure_classifies_build_export(svc, monkeypatch):
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step = await svc._custom_build_image(
+    ok, step, tail = await svc._custom_build_image(
         ssh_client=ssh_client,
         payload=payload,
         log_tag="t",
@@ -686,6 +687,558 @@ async def test_A15_export_failure_classifies_build_export(svc, monkeypatch):
     )
     assert ok is False
     assert step == "build_export"
+    # the export's stderr is the HOST daemon's `docker load`: never the renter's tail
+    assert tail == "built image could not be loaded onto the executor"
+    assert "no space left" not in tail
+
+
+# ------------------------------------------------------------------
+# A.16–A.19 — a failed build says WHY (its last output lines), not only WHERE.
+# ------------------------------------------------------------------
+
+_BUILD_ERROR_OUTPUT = (
+    "#5 [2/2] RUN apt-get install -y nonexistent-package\n"
+    "#5 0.412 E: Unable to locate package nonexistent-package\n"
+    '#5 ERROR: process "/bin/sh -c apt-get install -y nonexistent-package" did not complete successfully: exit code: 100\n'
+    "BUILD_FAILED_RC=1\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_A16_build_failure_carries_the_build_output_tail(svc, monkeypatch):
+    """The CCF for a failed `docker build` carries the last lines the build printed on the
+    wire (`build_log_tail`) — not only the step name. `detail` (ops; the backend classifies it
+    for GPU quarantine) keeps the step and never the renter's output."""
+    ssh_client = _make_dind_ssh()
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
+    monkeypatch.setattr(
+        svc, "execute_and_stream_logs", _make_esl(build=(False, _BUILD_ERROR_OUTPUT))
+    )
+
+    payload = _base_payload(
+        dockerfile_content="FROM ubuntu\nRUN apt-get install -y nonexistent-package\n"
+    )
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_build"
+    assert result.build_log_tail is not None
+    assert "Unable to locate package nonexistent-package" in result.build_log_tail
+    assert "exit code: 100" in result.build_log_tail
+    # the marker is the streamer's signal, not a build line
+    assert "BUILD_FAILED_RC" not in result.build_log_tail
+    # ops path (detail -> backend logs / filler_run.failure_reason) names the step, not the output:
+    # the backend runs classify_gpu_runtime_error over `detail or msg`
+    assert "(failure_step=docker_build)" in result.detail
+    assert "Unable to locate package nonexistent-package" not in result.detail
+    # the headline stays the renter-safe constant the backend trims to
+    assert result.msg.startswith("Failed create_container")
+    # the wire field is the renter's build output only — never the executor host
+    assert "127.0.0.1" not in result.build_log_tail and "2200" not in result.build_log_tail
+
+
+@pytest.mark.asyncio
+async def test_A16c_renter_output_never_reaches_detail(svc, monkeypatch):
+    """A Dockerfile can print anything. The backend runs its GPU-quarantine classifier over
+    `detail or msg` (lium-platform validator_consumer.quarantine_on_gpu_runtime_error), so a
+    `RUN echo` of an NVML fault signature must stay in `build_log_tail`, never in `detail`."""
+    ssh_client = _make_dind_ssh()
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
+    forged = (
+        "#4 [1/1] RUN echo nvidia-container-cli: device error: GPU-0: unknown device\n"
+        "#4 0.101 nvidia-container-cli: device error: GPU-0: unknown device\n"
+        '#4 ERROR: process "/bin/sh -c false" did not complete successfully: exit code: 1\n'
+        "BUILD_FAILED_RC=1\n"
+    )
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, forged)))
+
+    payload = _base_payload(
+        dockerfile_content="FROM alpine\nRUN echo nvidia-container-cli: device error: GPU-0: unknown device; false\n"
+    )
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_build"
+    assert "nvidia-container-cli" in result.build_log_tail
+    assert "nvidia-container-cli" not in (result.detail or "")
+    assert "nvidia-container-cli" not in result.msg
+
+
+def _log_record_texts(caplog) -> list[str]:
+    """Everything a log handler could format from each record: the message, the structured extra
+    (`_StructuredMessage.to_full_string`) and the exception text — what Loki would receive."""
+    texts = []
+    for record in caplog.records:
+        parts = [record.getMessage()]
+        if hasattr(record.msg, "to_full_string"):
+            parts.append(record.msg.to_full_string())
+        if record.exc_info:
+            parts.append(repr(record.exc_info[1]))
+        texts.append("\n".join(parts))
+    return texts
+
+
+@pytest.mark.asyncio
+async def test_A16d_a_credential_in_the_build_tail_never_reaches_a_log_record(svc, monkeypatch, caplog):
+    """BuildKit's `--progress=plain` echoes `ARG HF_TOKEN=…` and `user:TOKEN@host` lines as the renter
+    wrote them. The tail goes to the renter (the secret's owner) in `build_log_tail`; the validator's
+    own log line (`Custom build failed`, Loki) carries the step and the tail's size, never its text."""
+    ssh_client = _make_dind_ssh()
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
+    # the values are resolved at build time (`--build-arg`, an `.env` in the context): they are in
+    # the build output, not in the Dockerfile text the payload carries
+    leaked = (
+        "#3 [2/4] ARG HF_TOKEN=abc\n"
+        "#4 [3/4] RUN pip install --extra-index-url https://user:abc@pypi.example.invalid/simple torch\n"
+        "#4 1.201 ERROR: Could not find a version that satisfies the requirement torch\n"
+        '#4 ERROR: process "/bin/sh -c pip install …" did not complete successfully: exit code: 1\n'
+        "BUILD_FAILED_RC=1\n"
+    )
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, leaked)))
+
+    payload = _base_payload(
+        dockerfile_content=(
+            "FROM python:3.11\nARG HF_TOKEN\nARG PYPI_TOKEN\n"
+            "RUN pip install --extra-index-url https://user:${PYPI_TOKEN}@pypi.example.invalid/simple torch\n"
+        )
+    )
+    with caplog.at_level(logging.DEBUG):
+        result = await svc.create_container(
+            payload=payload,
+            executor_info=_executor_info_for(payload),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_build"
+    # the renter gets their own output back
+    assert "HF_TOKEN=abc" in result.build_log_tail and "user:abc@" in result.build_log_tail
+    # no log record anywhere carries a byte of the tail
+    texts = _log_record_texts(caplog)
+    for text in texts:
+        assert "HF_TOKEN=abc" not in text
+        assert "user:abc@" not in text
+        assert "Could not find a version" not in text
+    # the ops log line exists and says how much was sent, not what
+    failed_lines = [t for t in texts if t.startswith("Custom build failed")]
+    assert len(failed_lines) == 1
+    assert '"failure_step": "docker_build"' in failed_lines[0]
+    assert '"build_log_tail_lines": 4' in failed_lines[0]
+    assert f'"build_log_tail_chars": {len(result.build_log_tail)}' in failed_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_A16b_non_build_failures_have_no_tail(svc, monkeypatch):
+    """`build_log_tail` is None for a template pod whose creation fails: the field belongs to
+    custom builds only, so the backend can trust it as renter-safe build output."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(
+        svc, "create_local_volume", AsyncMock(side_effect=RuntimeError("no space left on device"))
+    )
+
+    payload = _base_payload(dockerfile_content=None)
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "volume_creation"
+    assert result.build_log_tail is None
+
+
+@pytest.mark.asyncio
+async def test_A20_volume_step_failure_carries_the_daemon_reason(svc, monkeypatch):
+    """A `volume_creation` failure carries the Docker daemon's reason in `step_detail`, with the
+    dead-session hint in front of docker-py's dead-transport text."""
+    from services.docker_service import DEAD_DOCKER_SSH_SESSION_HINT
+    from services.rental_docker_sdk import RentalDockerOperationError
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(
+        svc,
+        "create_local_volume",
+        AsyncMock(
+            side_effect=RentalDockerOperationError(
+                "Docker SDK create volume failed: 'NoneType' object has no attribute 'settimeout'"
+            )
+        ),
+    )
+
+    payload = _base_payload(dockerfile_content=None)
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "volume_creation"
+    assert result.step_detail is not None
+    assert result.step_detail.startswith(DEAD_DOCKER_SSH_SESSION_HINT)
+    assert "Docker SDK create volume failed" in result.step_detail
+    assert "127.0.0.1" not in result.step_detail and "2200" not in result.step_detail
+    assert result.build_log_tail is None
+
+
+@pytest.mark.asyncio
+async def test_A20c_volume_sizing_failure_carries_the_min_size_reason(svc, monkeypatch):
+    """`volume_sizing` is the other step a pod dies at before its volume exists; its
+    VolumeMinSizeError text is the renter's answer and travels as `step_detail` unchanged."""
+    from services.docker_service import VolumeMinSizeError
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(
+        svc,
+        "resolve_volume_sizing",
+        AsyncMock(
+            side_effect=VolumeMinSizeError(
+                "Fresh vloopback sizing produced 3GB volume, below required minimum 20GB"
+            )
+        ),
+    )
+
+    payload = _base_payload(dockerfile_content=None)
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "volume_sizing"
+    assert result.step_detail == "Fresh vloopback sizing produced 3GB volume, below required minimum 20GB"
+
+
+@pytest.mark.asyncio
+async def test_A20d_template_switch_dead_transport_at_docker_run_carries_the_hint_alone(svc, monkeypatch):
+    """A template switch keeps the pod's volume, so the dead session surfaces at `docker_run`:
+    `step_detail` is the fixed hint alone, never that step's raw text."""
+    from services.docker_service import DEAD_DOCKER_SSH_SESSION_HINT
+    from services.rental_docker_sdk import RentalDockerOperationError
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None, None)))
+    create_volume = AsyncMock()
+    monkeypatch.setattr(svc, "create_local_volume", create_volume)
+    monkeypatch.setattr(
+        svc,
+        "_run_rental_docker_create_with_port_retry",
+        AsyncMock(
+            side_effect=RentalDockerOperationError(
+                "Docker SDK create container failed: 'NoneType' object has no attribute 'settimeout' "
+                "(executor 127.0.0.1:2200)"
+            )
+        ),
+    )
+
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    payload = payload.model_copy(update={"local_volume": f"volume_{payload.pod_id}"})
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_run"
+    create_volume.assert_not_awaited()
+    assert result.step_detail == DEAD_DOCKER_SSH_SESSION_HINT
+    assert "settimeout" not in result.step_detail
+    assert "127.0.0.1" not in result.step_detail and "2200" not in result.step_detail
+    assert result.build_log_tail is None
+
+
+@pytest.mark.asyncio
+async def test_A20b_non_volume_failures_have_no_step_detail(svc, monkeypatch):
+    """`step_detail` belongs to the volume step, plus the dead-transport hint: a failure elsewhere
+    with any other text (here the custom build) leaves it None so the backend can trust it."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    _patch_create_container_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(False, "docker_build", "boom")))
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN false\n")
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_build"
+    assert result.step_detail is None
+
+
+def test_A21_volume_step_detail_is_bounded_and_plain():
+    from services.docker_service import (
+        DEAD_DOCKER_SSH_SESSION_HINT,
+        VOLUME_STEP_DETAIL_MAX_CHARS,
+        volume_step_detail,
+    )
+
+    assert volume_step_detail(RuntimeError("")) is None
+    assert volume_step_detail(RuntimeError("  \n ")) is None
+    plain = volume_step_detail(RuntimeError("Docker SDK create volume failed:\n  no space left on device"))
+    assert plain == "Docker SDK create volume failed: no space left on device"
+    assert not plain.startswith(DEAD_DOCKER_SSH_SESSION_HINT)
+    long = volume_step_detail(RuntimeError("x" * 1000))
+    assert len(long) == VOLUME_STEP_DETAIL_MAX_CHARS
+
+
+def test_A21b_failure_step_detail_routes_by_step():
+    from services.docker_service import DEAD_DOCKER_SSH_SESSION_HINT, CustomBuildFailed, failure_step_detail
+
+    stale = RuntimeError("Docker SDK create container failed: SSH session not active (host 10.0.0.9)")
+    # volume steps: the raw daemon text, hinted
+    assert failure_step_detail(stale, "volume_creation").startswith(DEAD_DOCKER_SSH_SESSION_HINT)
+    assert "SSH session not active" in failure_step_detail(stale, "volume_creation")
+    assert failure_step_detail(RuntimeError("no space left on device"), "volume_sizing") == "no space left on device"
+    # any other step: the hint alone for a dead transport, nothing of the raw text
+    assert failure_step_detail(stale, "docker_run") == DEAD_DOCKER_SSH_SESSION_HINT
+    assert failure_step_detail(stale, "container_health_check") == DEAD_DOCKER_SSH_SESSION_HINT
+    assert failure_step_detail(stale, None) == DEAD_DOCKER_SSH_SESSION_HINT
+    # any other step with any other text: None
+    assert failure_step_detail(RuntimeError("image not found"), "docker_run") is None
+    assert failure_step_detail(RuntimeError(""), "docker_run") is None
+    # a failed custom build: its text is the renter's build output, which may say anything
+    assert failure_step_detail(CustomBuildFailed("docker_build", "Socket is closed"), "docker_build") is None
+
+
+@pytest.mark.asyncio
+async def test_A17_build_command_puts_the_output_tail_on_stderr(svc, monkeypatch):
+    """The build runs through `execute_and_stream_logs`, which returns stderr only. So the
+    command run inside DinD must tee the build output to a file outside the build context and,
+    on a non-zero exit, print its tail to stderr before the BUILD_FAILED_RC marker."""
+    ssh_client = _make_dind_ssh()
+    esl = _make_esl(build=(False, _BUILD_ERROR_OUTPUT))
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN false\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert (ok, step) == (False, "docker_build")
+    assert tail is not None and "exit code: 100" in tail
+
+    build_cmd = next(c for c in esl.seen if "docker build" in c)
+    assert "tee /tmp/lium-build.log" in build_cmd
+    # blank lines are dropped before the cap, so all 25 slots carry build output
+    assert 'grep -v "^[[:space:]]*$" /tmp/lium-build.log | tail -n 25 >&2' in build_cmd
+    assert "echo BUILD_FAILED_RC=$rc >&2" in build_cmd
+    # the tail goes out before the marker, and the exit code is preserved
+    assert build_cmd.index("tail -n 25") < build_cmd.index("BUILD_FAILED_RC")
+    assert build_cmd.rstrip("'").endswith("exit $rc")
+    # the log never lands inside the build context (a `COPY .` must not pick it up)
+    assert "/build/" not in build_cmd.split("| tee", 1)[1]
+
+
+def test_A17b_rendered_build_command_runs_under_sh(tmp_path, monkeypatch):
+    """The inner command really does what A17 asserts by substring: run it under `sh` with a
+    `docker` stub that prints 30 lines (3 of them blank) and exits 7 — stderr is the last 25
+    NON-blank lines then `BUILD_FAILED_RC=7`, the exit code is 7 without pipefail."""
+    import subprocess
+
+    from services import docker_service
+    from services.docker_service import custom_build_inner_command
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'i=1; while [ $i -le 30 ]; do echo "line $i"; '
+        "if [ $((i % 10)) -eq 0 ]; then echo; fi; i=$((i + 1)); done\n"
+        "exit 7\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_LOG_FILE", str(tmp_path / "lium-build.log"))
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_RC_FILE", str(tmp_path / "lium-build.rc"))
+    inner = custom_build_inner_command("lium-custom-test:latest", "/build")
+    run = subprocess.run(
+        ["sh", "-c", inner],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bindir}:/usr/bin:/bin"},
+    )
+    assert run.returncode == 7
+    stderr_lines = run.stderr.splitlines()
+    assert stderr_lines[-1] == "BUILD_FAILED_RC=7"
+    assert stderr_lines[:-1] == [f"line {i}" for i in range(6, 31)]
+    assert "" not in stderr_lines
+
+
+def test_A17c_an_unwritable_rc_file_is_a_failure_with_a_reason(tmp_path, monkeypatch):
+    """The exit code round-trips through `CUSTOM_BUILD_RC_FILE` in the DinD container's /tmp. When
+    that file cannot be written (the overlay is full or read-only) the build is not reported as a
+    success by a bare `exit`: rc is 1, the tail is printed and ends with the fixed reason, then
+    the marker."""
+    import subprocess
+
+    from services import docker_service
+    from services.docker_service import (
+        CUSTOM_BUILD_RC_UNREADABLE_REASON,
+        custom_build_inner_command,
+        custom_build_log_tail,
+    )
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "docker"
+    stub.write_text("#!/bin/sh\necho step one\necho step two\nexit 0\n")
+    stub.chmod(0o755)
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_LOG_FILE", str(tmp_path / "lium-build.log"))
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_RC_FILE", str(tmp_path / "no-such-dir" / "lium-build.rc"))
+    inner = custom_build_inner_command("lium-custom-test:latest", "/build")
+    run = subprocess.run(
+        ["sh", "-c", inner],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bindir}:/usr/bin:/bin"},
+    )
+    assert run.returncode == 1
+    stderr_lines = run.stderr.splitlines()
+    assert stderr_lines[-1] == "BUILD_FAILED_RC=1"
+    assert stderr_lines[-2] == CUSTOM_BUILD_RC_UNREADABLE_REASON
+    assert stderr_lines[-4:-2] == ["step one", "step two"]
+    assert "Illegal number" not in run.stderr
+    # what the renter reads: the build lines, then why it counts as failed
+    tail = custom_build_log_tail(run.stderr)
+    assert tail.endswith(CUSTOM_BUILD_RC_UNREADABLE_REASON)
+    assert "BUILD_FAILED_RC" not in tail
+
+
+@pytest.mark.asyncio
+async def test_A18_build_timeout_tail_names_the_limit(svc, monkeypatch):
+    ssh_client = _make_dind_ssh()
+    monkeypatch.setattr(
+        svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out"))
+    )
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN sleep 99999\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert (ok, step) == (False, "build_timeout")
+    assert tail == "docker build exceeded 1200 s"
+
+
+@pytest.mark.asyncio
+async def test_A18b_a_build_that_prints_process_timed_out_is_not_a_timeout(svc, monkeypatch):
+    """The streamer's timeout puts exactly `Process timed out` on stderr and nothing else. A build
+    whose own output says "process timed out" and then fails comes back with its tail and the
+    BUILD_FAILED_RC= marker: that is a docker_build failure carrying that text, not build_timeout."""
+    ssh_client = _make_dind_ssh()
+    printed = (
+        "#6 [3/3] RUN ./fetch-weights.sh\n"
+        "#6 12.40 ERROR: download process timed out after 10s\n"
+        '#6 ERROR: process "/bin/sh -c ./fetch-weights.sh" did not complete successfully: exit code: 1\n'
+        "BUILD_FAILED_RC=1\n"
+    )
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, printed)))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN ./fetch-weights.sh\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert (ok, step) == (False, "docker_build")
+    assert "download process timed out after 10s" in tail
+    assert "BUILD_FAILED_RC" not in tail
+
+
+@pytest.mark.asyncio
+async def test_A18c_stderr_without_the_marker_is_host_text_not_the_build_tail(svc, monkeypatch):
+    """No BUILD_FAILED_RC= marker means the build script never finished: the stderr is the host
+    daemon's `docker exec` error, so the renter gets a fixed reason instead of that text."""
+    from services.docker_service import CUSTOM_BUILD_INTERRUPTED_REASON
+
+    ssh_client = _make_dind_ssh()
+    daemon_error = "Error response from daemon: container 3f2a9c is not running\n"
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, daemon_error)))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert (ok, step) == (False, "docker_build")
+    assert tail == CUSTOM_BUILD_INTERRUPTED_REASON
+
+
+def test_A19_log_tail_is_bounded_and_keeps_the_end():
+    from services.docker_service import (
+        CUSTOM_BUILD_LOG_TAIL_LINES,
+        CUSTOM_BUILD_LOG_TAIL_MAX_CHARS,
+        custom_build_log_tail,
+    )
+
+    assert custom_build_log_tail(None) is None
+    assert custom_build_log_tail("\n  \n") is None
+    # blank lines are dropped, trailing spaces trimmed, order kept
+    assert custom_build_log_tail("a  \n\nb\n") == "a\nb"
+    # the exit-code marker is the streamer's signal, not a build line: dropped before the cap
+    assert custom_build_log_tail("a\nBUILD_FAILED_RC=7\n") == "a"
+    assert custom_build_log_tail("BUILD_FAILED_RC=7\n") is None
+    with_marker = "\n".join(f"line {i}" for i in range(30)) + "\nBUILD_FAILED_RC=1\n"
+    assert custom_build_log_tail(with_marker).splitlines() == [
+        f"line {i}" for i in range(30 - CUSTOM_BUILD_LOG_TAIL_LINES, 30)
+    ]
+    # many short lines: the last CUSTOM_BUILD_LOG_TAIL_LINES survive
+    many = "\n".join(f"line {i}" for i in range(200))
+    tail = custom_build_log_tail(many)
+    assert tail.splitlines() == [f"line {i}" for i in range(200 - CUSTOM_BUILD_LOG_TAIL_LINES, 200)]
+    # few long lines: cut from the front so the error at the end stays
+    long = "x" * 5000 + "\nERROR: the reason"
+    tail = custom_build_log_tail(long)
+    assert len(tail) == CUSTOM_BUILD_LOG_TAIL_MAX_CHARS
+    assert tail.endswith("ERROR: the reason")
 
 
 # ------------------------------------------------------------------
@@ -741,3 +1294,17 @@ async def test_B1_log_emit_to_publish_p95_under_2s(svc):
     )
     p95 = latencies_ms[int(0.95 * len(latencies_ms))]
     assert p95 <= 2000, f"p95 emit→publish latency={p95:.1f}ms exceeds 2000ms budget"
+
+
+def test_A16e_str_of_a_failed_request_leaves_out_the_build_tail():
+    """compute_client logs `str(response)` at INFO; the tail must stay out of it and stay on the wire."""
+    request = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        msg="Custom build failed",
+        build_log_tail="#3 ARG HF_TOKEN=abc",
+    )
+
+    assert "HF_TOKEN=abc" not in str(request)
+    assert request.model_dump()["build_log_tail"] == "#3 ARG HF_TOKEN=abc"
