@@ -10,8 +10,9 @@ executor snapshot, picks the executors assigned to this validator that registere
 cycle since start began and that no cycle has published yet, and runs the SAME pipeline the cycle
 runs — same job files, digests and image snapshot, same checks, as a first pass (DAH-3011) — on
 each one, alone, then publishes the result spec-only (scored_at stays None, so the backend creates
-the executor row but writes no incentive ledger row). The next scored cycle overwrites it as
-today. Off by default (settings.EXPRESS_LANE_ENABLED).
+the executor row but writes no incentive ledger row) under that cycle's job_batch_id, so its
+prod_executors row lands on the cycle's time. The next scored cycle overwrites it as today. Off by
+default (settings.EXPRESS_LANE_ENABLED).
 """
 
 import asyncio
@@ -42,8 +43,6 @@ EXPRESS_PUBLISHED_EVENT = "[express] Executor verified and published ahead of th
 # unreachable): try again later, a bounded number of times, then leave it to the normal cycle.
 MAX_ATTEMPTS = 3
 RETRY_SECONDS = 120
-# job_batch_id format the backend parses into the prod_executors row's time.
-JOB_BATCH_ID_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 @dataclass
@@ -54,6 +53,10 @@ class CycleInputs:
     encrypted_files: MinerJobEnryptedFiles
     default_image_digests: dict[str, str]
     executor_image_snapshot: ExpectedImageSnapshot | None
+    # The cycle's own job_batch_id. The backend parses it into the prod_executors row's time, and
+    # the fleet charts group rows by that time, so an express publish carries it: with an id of
+    # its own the node plots as a 1-2 node point between two fleet points.
+    job_batch_id: str
     # When the first cycle since this process started began. That cycle asked every serving miner
     # for its executors, so an executor registered before it is long-known even when its miner
     # failed or was offline that cycle and it never reached the validated set; only executors
@@ -277,7 +280,6 @@ class ExpressLane:
         # Counted against the node once the outcome is the node's (below); a verification the
         # validator itself spoiled is retried without spending one of MAX_ATTEMPTS.
         attempt = pending.attempts + 1
-        started_wall = datetime.now(UTC)
         started = time.monotonic()
         extra: dict[str, object] = {
             "executor_uuid": executor_id,
@@ -286,7 +288,9 @@ class ExpressLane:
         }
         try:
             payload = MinerJobRequestPayload(
-                job_batch_id=started_wall.strftime(JOB_BATCH_ID_FORMAT),
+                # The cycle whose job files this run uses, even when the next cycle starts
+                # before it publishes: that cycle's wave may publish the node under its own id.
+                job_batch_id=inputs.job_batch_id,
                 miner_hotkey=miner.hotkey,
                 miner_coldkey=miner.coldkey,
                 miner_address=miner.axon_info.ip,

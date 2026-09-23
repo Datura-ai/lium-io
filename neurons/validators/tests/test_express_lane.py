@@ -10,7 +10,8 @@ running express verification reads, and a cycle that starts during a tick moves 
 its files; a verification without its job files is never published as the node's verdict; a
 published result is never run again when recording it fails; the in-flight caps bound a
 registration flood; an executor the miner does not return is retried a bounded number of times
-and then left to the cycle.
+and then left to the cycle; an express publish carries the job_batch_id of the cycle whose job
+files it ran on, so its prod_executors row lands on that cycle's time.
 """
 
 import asyncio
@@ -20,7 +21,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import bittensor
@@ -38,9 +39,15 @@ from services.miner_service import CYCLE_DONE, CYCLE_LANE, EXPRESS_LANE, MinerSe
 from services.redis_service import EXPRESS_LANE_VALIDATED_SET, RedisService
 from services.task.models import JobResult
 
+pytest_plugins = ["fixtures.incentive_fixtures"]
+
 VALIDATOR_HOTKEY = "validator-hotkey"
 # The first cycle since start began an hour ago; the test executors register after it.
 FLEET_KNOWN_SINCE = datetime.now(UTC) - timedelta(hours=1)
+# Two consecutive cycles' job_batch_id (block time at the cycle's job block, as Validator.sync()
+# derives it); the backend parses it into the prod_executors row's time.
+CYCLE_BATCH_ID = "2026-09-22 19:01:12"
+NEXT_CYCLE_BATCH_ID = "2026-09-22 19:16:12"
 
 
 @dataclass
@@ -68,13 +75,13 @@ def _executor_info(executor_id: str) -> ExecutorSSHInfo:
     )
 
 
-def _job_result(executor_id: str, score: float = 1.0) -> JobResult:
+def _job_result(executor_id: str, score: float = 1.0, job_batch_id: str = "2026-09-06 16:40:00") -> JobResult:
     return JobResult(
         spec={"gpu": {"count": 1}},
         executor_info=_executor_info(executor_id),
         score=score,
         job_score=score,
-        job_batch_id="2026-09-06 16:40:00",
+        job_batch_id=job_batch_id,
         log_status="info",
         log_text="Validation task completed",
         gpu_model="NVIDIA H100 80GB HBM3",
@@ -106,7 +113,7 @@ def job_files_root(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _cycle_inputs(tmp_directory: str | None = None) -> CycleInputs:
+def _cycle_inputs(tmp_directory: str | None = None, job_batch_id: str = CYCLE_BATCH_ID) -> CycleInputs:
     if tmp_directory is None:
         tmp_directory = tempfile.mkdtemp(prefix="cycle-", dir=file_encrypt_service.JOB_FILES_ROOT)
     return CycleInputs(
@@ -119,6 +126,7 @@ def _cycle_inputs(tmp_directory: str | None = None) -> CycleInputs:
         ),
         default_image_digests={},
         executor_image_snapshot=None,
+        job_batch_id=job_batch_id,
         fleet_known_since=FLEET_KNOWN_SINCE,
     )
 
@@ -347,10 +355,11 @@ class _Harness:
             return self.job_for(payload, executor_id)
 
         self.miner_service.request_job_to_miner = AsyncMock(side_effect=request_job_to_miner)
+        # The pipeline copies the payload's job_batch_id into every JobResult (ResultHandler).
         self.job_for = lambda payload, executor_id: {
             "miner_hotkey": payload.miner_hotkey,
             "miner_coldkey": payload.miner_coldkey,
-            "results": [_job_result(executor_id)],
+            "results": [_job_result(executor_id, job_batch_id=payload.job_batch_id)],
         }
         self.portal_api = Mock(get_all_executors=AsyncMock(return_value=snapshot))
         self.inputs: CycleInputs | None = _cycle_inputs()
@@ -554,7 +563,7 @@ async def test_a_cycle_that_starts_during_the_tick_moves_the_launch_to_its_job_f
         # Validator.sync(): ecrypt_miner_job_files(keep_directories=directories_in_use()), then
         # the new CycleInputs — one synchronous step from the lane's point of view
         second = FileEncryptService.fresh_job_files_directory(keep=harness.lane.directories_in_use())
-        harness.inputs = _cycle_inputs(tmp_directory=str(second))
+        harness.inputs = _cycle_inputs(tmp_directory=str(second), job_batch_id=NEXT_CYCLE_BATCH_ID)
         prepared.append(second)
         return snapshot
 
@@ -569,11 +578,93 @@ async def test_a_cycle_that_starts_during_the_tick_moves_the_launch_to_its_job_f
     await asyncio.sleep(0)  # the verification task runs up to the miner request
     request = harness.miner_service.request_job_to_miner.call_args.kwargs
     assert request["encrypted_files"].tmp_directory == str(second)
+    assert request["payload"].job_batch_id == NEXT_CYCLE_BATCH_ID  # the files' cycle, not the tick's first read
 
     harness.release.set()
     await asyncio.gather(*harness.lane._tasks)
     harness.miner_service.publish_machine_specs.assert_awaited_once()
     assert await harness.redis_service.get_validated_executors() == {new_node}
+
+
+# --- job_batch_id: the prod_executors row's time ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_express_publish_inside_a_cycle_carries_that_cycles_job_batch_id(monkeypatch, wallet):
+    """The backend parses job_batch_id into the prod_executors row's time, and the fleet charts
+    group rows by that time. Stamped from the clock, every express publish was a point of its own
+    holding 1-2 nodes between two fleet points: the 7 zero-dips on the public GPUs chart, 22 Sep."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    assert await harness.tick_and_settle() == 1
+
+    request = harness.miner_service.request_job_to_miner.await_args.kwargs
+    assert request["payload"].job_batch_id == CYCLE_BATCH_ID
+    (results, _, _), _ = harness.miner_service.publish_machine_specs.await_args
+    assert [r.job_batch_id for r in results] == [CYCLE_BATCH_ID]
+
+
+@pytest.mark.asyncio
+async def test_a_verification_running_across_a_cycle_boundary_keeps_the_cycle_it_started_in(
+    monkeypatch, wallet
+):
+    """A verification started on cycle N's job files may publish after cycle N+1 began. It stays
+    on N: once the lane lets go of the node, N+1's wave may verify it and publish under N+1, and
+    the uptime/finished-job guard of lium-platform DAH-3548 counts once per job_batch_id, so N+1
+    must stay free for that wave. A node launched after the boundary takes N+1."""
+    early, late = str(uuid4()), str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(early)]}, [_Neuron("miner-a")])
+    harness.release.clear()
+    assert await harness.lane.tick() == 1
+
+    harness.inputs = _cycle_inputs(job_batch_id=NEXT_CYCLE_BATCH_ID)  # Validator.sync(): cycle N+1
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+
+    harness.portal_api.get_all_executors.return_value = {
+        "miner-a": [_portal_executor(early), _portal_executor(late)]
+    }
+    assert await harness.tick_and_settle() == 1
+
+    published = {
+        call.args[0][0].executor_info.uuid: call.args[0][0].job_batch_id
+        for call in harness.miner_service.publish_machine_specs.await_args_list
+    }
+    assert published == {early: CYCLE_BATCH_ID, late: NEXT_CYCLE_BATCH_ID}
+
+
+@pytest.mark.asyncio
+async def test_flag_off_every_miner_is_asked_under_the_cycles_block_time_id(
+    validator_with_mocks, create_neuron_info, monkeypatch
+):
+    """Lane off: the cycle is the only writer and keeps the id it derives from the job block. The
+    inputs a lane would read carry that same id, so turning the flag on adds no time of its own."""
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", False)
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(
+        return_value=[create_neuron_info(1, "miner-a"), create_neuron_info(2, "miner-b")]
+    )
+    validator.subtensor_client.get_time_from_block = AsyncMock(return_value=CYCLE_BATCH_ID)
+
+    async def no_results(payload, **_):
+        return {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
+
+    validator.miner_service.request_job_to_miner = AsyncMock(side_effect=no_results)
+    with (
+        patch("core.validator.fetch_default_image_digests", new=AsyncMock(return_value={})),
+        patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
+    ):
+        await validator.sync()
+
+    asked = {
+        c.kwargs["payload"].miner_hotkey: c.kwargs["payload"].job_batch_id
+        for c in validator.miner_service.request_job_to_miner.await_args_list
+    }
+    assert asked == {"miner-a": CYCLE_BATCH_ID, "miner-b": CYCLE_BATCH_ID}
+    assert validator.cycle_inputs.job_batch_id == CYCLE_BATCH_ID
 
 
 @pytest.mark.asyncio
