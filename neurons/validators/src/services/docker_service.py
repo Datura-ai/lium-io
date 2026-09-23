@@ -5705,8 +5705,10 @@ class DockerService:
                     await self._assert_cluster_overlay_port_free(ssh_client, default_extra)
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
-                # gpu_power_limits). Fail-closed: apply undoes any partial work on failure, and the
-                # raise records this create FAILED (12h backoff) — never run the miner uncapped.
+                # gpu_power_limits). A failed apply has already undone its partial work (no GPU
+                # left capped, no restore record). DAH-3630: with ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS
+                # the filler then starts at the host's own limit; without it the raise records this
+                # create FAILED and the backend backs the node off.
                 if payload.workload_kind == WorkloadKind.FILLER and payload.gpu_power_limits:
                     current_step = "gpu_power_cap"
                     cap_applied = await apply_filler_gpu_power_limits(
@@ -5718,7 +5720,22 @@ class DockerService:
                         log_extra=default_extra,
                     )
                     if not cap_applied:
-                        raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
+                        if not settings.ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS:
+                            raise RuntimeError(
+                                "GPU power cap could not be applied; refusing to start PEARL filler uncapped"
+                            )
+                        logger.warning(
+                            _m(
+                                "GPU power cap could not be applied; starting PEARL filler at the host's own power limit",
+                                extra=get_extra_info(
+                                    {
+                                        **default_extra,
+                                        "reason": "pearl_started_uncapped",
+                                        "gpu_uuids": [limit.gpu_uuid for limit in payload.gpu_power_limits],
+                                    }
+                                ),
+                            )
+                        )
                 else:
                     # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
                     # without its own cap starts, so a customer (or an uncapped filler) never

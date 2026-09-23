@@ -25,9 +25,11 @@ unloads once the GPU goes idle and silently reverts ``-pl`` — nvidia-smi still
 So each set first enables persistence mode (``-pm 1``, best-effort: keeps the driver loaded so the
 limit survives) and then READS BACK ``power.limit``; a mismatch counts as a failed set. The readback
 is the hard gate — a cap that cannot be observed on the GPU does not exist.
-**Apply is fail-closed for the filler**: ``apply_filler_gpu_power_limits`` returns ``False`` if the
-cap could not be fully applied, after undoing whatever it already capped or stored; the caller then
-REFUSES to start the PEARL filler (running the miner uncapped defeats the whole point).
+**Apply is all-or-nothing**: ``apply_filler_gpu_power_limits`` returns ``False`` if the cap could
+not be fully applied, after undoing whatever it already capped or stored. The caller refuses to start
+the PEARL filler, unless ``ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS`` (DAH-3630) starts it at the host's
+own limit (the cap spares the host's power bill and heat; a renter runs the same GPU at full power).
+Either way no record is left, so teardown restores nothing.
 **Restore stays best-effort**: teardown must never be blocked by a power-limit hiccup; a record
 whose restore failed is kept and retried by the safety nets. Restores and raises run several GPUs
 at a time (``POWER_LIMIT_SET_CONCURRENCY``): both sit between a customer's rent request and the
@@ -723,9 +725,10 @@ async def apply_filler_gpu_power_limits(
 ) -> bool:
     """Record each GPU's pre-cap limit (frozen), then cap it at the target watts (clamped to hw [min, max]).
 
-    Fail-closed: returns True only when EVERY requested GPU was capped; on failure any partial work
-    (records, pod index, already-capped GPUs) is undone first. False means the caller must NOT start
-    the filler. Every failure path logs an error so it is diagnosable/alertable — no silent skips.
+    All-or-nothing: returns True only when EVERY requested GPU was capped; on failure any partial work
+    (records, pod index, already-capped GPUs) is undone first, so False leaves the host exactly as it
+    was and the caller decides whether the filler starts uncapped (DAH-3630). Every failure path logs
+    an error so it is diagnosable/alertable — no silent skips.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)

@@ -441,6 +441,24 @@ class Settings(BaseSettings):
     # to logging the breach without withholding anything.
     ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
+    # DAH-3630 — PEARL runs on a host whose GPU power cap does not take. When True, a failed
+    # ``apply_filler_gpu_power_limits`` (already undone: no GPU left capped, no restore record)
+    # is logged at WARNING and the filler starts at the host's own power limit. When False the
+    # create fails as before. Turn on only together with the backend half of DAH-3630
+    # (lium-platform: the PEARL power-limit guard stops a run at default power and arms the 12 h
+    # hard-ban backoff); with the guard still on, an uncapped start is stopped after 30 min and
+    # banned on the first occurrence instead of retried.
+    ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS: bool = Field(env="ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS", default=False)
+
+    # DAH-3630 — the power-floor pass a live Lium filler gives GpuPowerLimitCheck covers only
+    # the GPUs this validator capped (a restore record for this executor). When True, a GPU below
+    # MIN_POWER_LIMIT_RATIO x default with no such record while a Lium filler runs is the host's
+    # own limit and zero-scores the node like any below-floor node. When False the breach is only
+    # logged (shadow mode) and the node passes, as before.
+    ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS: bool = Field(
+        env="ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", default=False
+    )
+
     # DAH-2467 — mixed scoring for a partially rented GPU-split node: the rented GPUs earn in
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
     # scoring the whole box as rented.

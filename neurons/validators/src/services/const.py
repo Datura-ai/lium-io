@@ -274,7 +274,8 @@ FILLER_LIVENESS_GRACE_MINUTES = 10
 # An executor running the miner's OWN default job earns no unrented incentive.
 DEFAULT_JOB_OWNER_MINER = "miner"
 # A Lium-owned default job (e.g. the PEARL idle filler) — Lium keeps the unrented incentive and may
-# lower the node's GPU power limit, so GpuPowerLimitCheck exempts these nodes (DAH-2356).
+# lower the node's GPU power limit, so GpuPowerLimitCheck exempts the GPUs Lium capped (DAH-2356,
+# DAH-3630).
 DEFAULT_JOB_OWNER_LIUM = "lium"
 
 # Container name prefixes that count as "rental-related" on an executor.

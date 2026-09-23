@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
+from core.config import settings
+from core.utils import _m, get_extra_info
 from pydantic import BaseModel
 from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.gpu_power_limit import (
@@ -18,6 +21,7 @@ from ..messages import render_message
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 
+logger = logging.getLogger(__name__)
 
 class GpuPowerMeasurement(BaseModel):
     index: int
@@ -56,23 +60,6 @@ class GpuPowerLimitCheck:
         self.restore_stale_caps = restore_stale_caps
 
     async def run(self, ctx: Context) -> CheckResult:
-        # DAH-2356: if Lium is running its own default job (e.g. the PEARL idle filler) on this node,
-        # WE lowered the power limit on purpose, so a below-default reading is expected. Skip the
-        # penalty — the node keeps its score and stays rentable; the pre-cap limit is restored when the
-        # filler stops. Scoped to owner="lium" only: a miner's own default job gets no power-limit pass.
-        rented_data = ctx.state.rented_data
-        default_job_owner: str | None = (
-            rented_data.get_default_job_owner(ctx.executor.uuid) if rented_data else None
-        )
-        if default_job_owner == DEFAULT_JOB_OWNER_LIUM:
-            event = render_message(
-                Msg.SKIPPED_ACTIVE_LIUM_FILLER,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={"executor_uuid": ctx.executor.uuid},
-            )
-            return CheckResult(passed=True, event=event)
-
         measurements: list[GpuPowerMeasurement] = []
         incomplete: list[GpuPowerMeasurement] = []
         rejected: list[GpuPowerMeasurement] = []
@@ -102,32 +89,21 @@ class GpuPowerLimitCheck:
             if ratio < MIN_POWER_LIMIT_RATIO:
                 rejected.append(measurement)
 
+        # DAH-2356: while Lium runs its own default job (e.g. the PEARL idle filler) on this node, WE
+        # may have lowered the power limit on purpose. Scoped to owner="lium" only: a miner's own
+        # default job gets no power-limit pass.
+        rented_data = ctx.state.rented_data
+        default_job_owner: str | None = (
+            rented_data.get_default_job_owner(ctx.executor.uuid) if rented_data else None
+        )
+        if default_job_owner == DEFAULT_JOB_OWNER_LIUM:
+            return await self._verdict_under_lium_filler(ctx, rejected, measurements, incomplete)
+
         if rejected:
             stale_cap_event = await self._rescue_stale_lium_caps(ctx, rejected)
             if stale_cap_event is not None:
                 return CheckResult(passed=True, event=stale_cap_event)
-            event = render_message(
-                Msg.LIMIT_BELOW_DEFAULT,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "threshold": MIN_POWER_LIMIT_RATIO,
-                    "rejected_gpus": _dump_measurements(rejected),
-                    "measurements": _dump_measurements(measurements),
-                    "incomplete_gpus": _dump_measurements(incomplete),
-                },
-            )
-            return CheckResult(
-                passed=False,
-                event=event,
-                updates={
-                    "score": 0.0,
-                    "job_score": 0.0,
-                    "score_warning": (
-                        " WARNING: GPU power limit is below 90% of the default power limit"
-                    ),
-                },
-            )
+            return self._below_floor_result(ctx, rejected, measurements, incomplete)
 
         if incomplete:
             event = render_message(
@@ -152,6 +128,109 @@ class GpuPowerLimitCheck:
             },
         )
         return CheckResult(passed=True, event=event)
+
+    def _below_floor_result(
+        self,
+        ctx: Context,
+        rejected: list[GpuPowerMeasurement],
+        measurements: list[GpuPowerMeasurement],
+        incomplete: list[GpuPowerMeasurement],
+    ) -> CheckResult:
+        event = render_message(
+            Msg.LIMIT_BELOW_DEFAULT,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                "threshold": MIN_POWER_LIMIT_RATIO,
+                "rejected_gpus": _dump_measurements(rejected),
+                "measurements": _dump_measurements(measurements),
+                "incomplete_gpus": _dump_measurements(incomplete),
+            },
+        )
+        return CheckResult(
+            passed=False,
+            event=event,
+            updates={
+                "score": 0.0,
+                "job_score": 0.0,
+                "score_warning": (
+                    " WARNING: GPU power limit is below 90% of the default power limit"
+                ),
+            },
+        )
+
+    async def _verdict_under_lium_filler(
+        self,
+        ctx: Context,
+        rejected: list[GpuPowerMeasurement],
+        measurements: list[GpuPowerMeasurement],
+        incomplete: list[GpuPowerMeasurement],
+    ) -> CheckResult:
+        """DAH-3630: the verdict while a Lium filler runs on this node.
+
+        A GPU at or above the floor passes, whatever the host did to our cap: a host that raised
+        the limit back keeps PEARL and its unrented incentive. A below-floor GPU passes only when
+        this validator holds a restore record for it on this executor, i.e. Lium capped it. A
+        below-floor GPU without one is the host's own limit (the cap failed and PEARL started
+        uncapped, or a filler that never caps): it earns nothing under the floor rule, so with
+        ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS the node is scored like any below-floor
+        node; without it the breach is logged and the node passes. Unknowns pass (a GPU without a
+        uuid, a failed Redis read). Never restores: the filler is live.
+        """
+        skipped = render_message(
+            Msg.SKIPPED_ACTIVE_LIUM_FILLER,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={"executor_uuid": ctx.executor.uuid},
+        )
+        if not rejected or any(measurement.uuid is None for measurement in rejected):
+            return CheckResult(passed=True, event=skipped)
+        read_result = await read_gpu_power_restore_records(
+            ctx.services.redis,
+            [measurement.uuid for measurement in rejected if measurement.uuid],
+            log_extra=ctx.default_extra,
+        )
+        capped_by_lium: set[str] = {
+            record.gpu_uuid for record in read_result.records if record.executor_id == ctx.executor.uuid
+        }
+        host_limited: list[GpuPowerMeasurement] = [
+            measurement for measurement in rejected if measurement.uuid not in capped_by_lium
+        ]
+        if not host_limited:
+            return CheckResult(passed=True, event=skipped)
+        if read_result.read_failed:
+            return CheckResult(
+                passed=True,
+                event=render_message(
+                    Msg.RESCUE_STATE_UNAVAILABLE,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "executor_uuid": ctx.executor.uuid,
+                        "unmatched_gpu_uuids": [measurement.uuid for measurement in host_limited],
+                    },
+                ),
+            )
+        enforced: bool = settings.ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS
+        logger.info(
+            _m(
+                "Lium filler runs on a GPU the host holds below the power floor, not capped by Lium"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra=get_extra_info(
+                    {
+                        **ctx.default_extra,
+                        "executor_uuid": ctx.executor.uuid,
+                        "host_limited_gpus": _dump_measurements(host_limited),
+                        "threshold": MIN_POWER_LIMIT_RATIO,
+                        "enforced": enforced,
+                        "reason": "power_floor_uncapped_lium_filler_gpu",
+                    }
+                ),
+            )
+        )
+        if not enforced:
+            return CheckResult(passed=True, event=skipped)
+        return self._below_floor_result(ctx, host_limited, measurements, incomplete)
 
     async def _rescue_stale_lium_caps(
         self, ctx: Context, rejected: list[GpuPowerMeasurement]
