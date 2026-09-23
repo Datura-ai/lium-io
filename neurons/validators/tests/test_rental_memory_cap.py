@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from core.config import settings
-from services.rental_docker_sdk import ContainerRunSpec, RentalDockerSdkClient, _build_host_config_kwargs
+from services.rental_docker_sdk import (
+    ContainerRunSpec,
+    RentalDockerSdkClient,
+    _build_host_config_kwargs,
+)
 from services.rental_memory import (
     HOST_MEMORY_PROBE_CMD,
     KIB_PER_GIB,
@@ -19,7 +23,6 @@ from services.rental_memory import (
     SOURCE_HOST_MINUS_RESERVE,
     SOURCE_HOST_UNKNOWN,
     SOURCE_REQUESTED,
-    RentalMemoryLimit,
     gpu_share_of_host,
     host_memory_reserve_gb,
     parse_host_memory_probe,
@@ -52,17 +55,26 @@ def _backend_memory_gb(host_kib: int, share: float = 1.0) -> int:
 def test_the_reserve_is_the_percent_of_host_ram_rounded_up_and_never_below_the_minimum():
     assert host_memory_reserve_gb(1843, reserve_min_gb=4, reserve_percent=3.0) == 56  # 55.29 → 56
     assert host_memory_reserve_gb(256, reserve_min_gb=4, reserve_percent=3.0) == 8  # 7.68 → 8
-    assert host_memory_reserve_gb(64, reserve_min_gb=4, reserve_percent=3.0) == 4  # 1.92 → the minimum
+    assert (
+        host_memory_reserve_gb(64, reserve_min_gb=4, reserve_percent=3.0) == 4
+    )  # 1.92 → the minimum
     assert host_memory_reserve_gb(64, reserve_min_gb=4, reserve_percent=-5) == 4
 
 
 def test_ticket_0355_guest_whole_host_rental_is_clamped_to_ram_less_the_reserve():
-    requested = _backend_memory_gb(H200_GUEST_KIB)  # 1841: 2 GiB left for the guest, as in ticket-0355
+    requested = _backend_memory_gb(
+        H200_GUEST_KIB
+    )  # 1841: 2 GiB left for the guest, as in ticket-0355
 
     limit = rental_memory_limit(requested, H200_GUEST_KIB, **DEFAULTS)
 
     assert requested == 1841
-    assert (limit.limit_gb, limit.reserve_gb, limit.ceiling_gb, limit.source) == (1787, 56, 1787, SOURCE_CLAMPED)
+    assert (limit.limit_gb, limit.reserve_gb, limit.ceiling_gb, limit.source) == (
+        1787,
+        56,
+        1787,
+        SOURCE_CLAMPED,
+    )
     assert limit.swap_off is True
 
 
@@ -78,7 +90,12 @@ def test_a_split_host_pod_is_clamped_to_its_gpu_share_of_ram_less_the_reserve():
 
     limit = rental_memory_limit(requested, host_kib, gpu_share=1 / 8, **DEFAULTS)
 
-    assert (requested, limit.limit_gb, limit.reserve_gb, limit.source) == (255, 248, 62, SOURCE_CLAMPED)
+    assert (requested, limit.limit_gb, limit.reserve_gb, limit.source) == (
+        255,
+        248,
+        62,
+        SOURCE_CLAMPED,
+    )
     # eight such pods leave the reserve free
     assert 8 * limit.limit_gb <= 2048 - limit.reserve_gb
 
@@ -87,7 +104,11 @@ def test_a_split_host_pod_is_clamped_to_its_gpu_share_of_ram_less_the_reserve():
 def test_a_pod_row_sized_zero_gets_the_ceiling_instead_of_no_limit(requested):
     limit = rental_memory_limit(requested, 128 * KIB_PER_GIB, **DEFAULTS)
 
-    assert (limit.limit_gb, limit.requested_gb, limit.source) == (124, None, SOURCE_HOST_MINUS_RESERVE)
+    assert (limit.limit_gb, limit.requested_gb, limit.source) == (
+        124,
+        None,
+        SOURCE_HOST_MINUS_RESERVE,
+    )
 
 
 @pytest.mark.parametrize("host_kib", [None, 0, -1])
@@ -135,7 +156,9 @@ async def test_resolve_reads_meminfo_and_the_gpu_count_over_the_rent_connection(
     ssh = Mock()
     ssh.run = AsyncMock(return_value=_ssh_result(stdout=f"{2048 * KIB_PER_GIB}\n8\n"))
 
-    limit = await resolve_rental_memory_limit(ssh, requested_gb=255, gpu_uuids=["GPU-1"], log_extra={})
+    limit = await resolve_rental_memory_limit(
+        ssh, requested_gb=255, gpu_uuids=["GPU-1"], log_extra={}
+    )
 
     ssh.run.assert_awaited_once_with(HOST_MEMORY_PROBE_CMD)
     assert (limit.limit_gb, limit.gpu_share, limit.source) == (248, 1 / 8, SOURCE_CLAMPED)
@@ -180,7 +203,9 @@ def test_the_defaults_are_on_with_a_three_percent_four_gib_reserve_and_renter_fi
 
 def test_host_config_sets_memory_swap_equal_to_memory_and_the_oom_score():
     kwargs = _build_host_config_kwargs(
-        ContainerRunSpec(image="img", name="pod_x", memory_gb=1787, memory_swap_gb=1787, oom_score_adj=500)
+        ContainerRunSpec(
+            image="img", name="pod_x", memory_gb=1787, memory_swap_gb=1787, oom_score_adj=500
+        )
     )
 
     assert kwargs["mem_limit"] == "1787g"
@@ -198,7 +223,9 @@ def test_host_config_without_the_cap_is_the_flags_of_before():
 
 
 def test_host_config_never_sends_memory_swap_without_memory():
-    kwargs = _build_host_config_kwargs(ContainerRunSpec(image="img", name="pod_x", memory_swap_gb=8))
+    kwargs = _build_host_config_kwargs(
+        ContainerRunSpec(image="img", name="pod_x", memory_swap_gb=8)
+    )
 
     assert "mem_limit" not in kwargs and "memswap_limit" not in kwargs
 
@@ -257,22 +284,36 @@ def _ssh_with_meminfo(host_kib: int, gpu_count: int):
 
 
 @pytest.mark.asyncio
-async def test_create_runs_the_container_with_the_clamped_limit_swap_off_and_the_oom_score(svc, monkeypatch):  # noqa: F811
+async def test_create_runs_the_container_with_the_clamped_limit_swap_off_and_the_oom_score(
+    svc,  # noqa: F811
+    monkeypatch,
+):
     ssh_client = _ssh_with_meminfo(H200_GUEST_KIB, 8)
     _patch_happy(svc, monkeypatch, ssh_client)
 
     await _run(svc, _payload(gpu_uuids=[], memory_gb=_backend_memory_gb(H200_GUEST_KIB)))
 
     run_spec = _created_run_spec(svc)
-    assert (run_spec.memory_gb, run_spec.memory_swap_gb, run_spec.oom_score_adj) == (1787, 1787, 500)
+    assert (run_spec.memory_gb, run_spec.memory_swap_gb, run_spec.oom_score_adj) == (
+        1787,
+        1787,
+        500,
+    )
     host_config = _build_host_config_kwargs(run_spec)
-    assert (host_config["mem_limit"], host_config["memswap_limit"], host_config["oom_score_adj"]) == (
+    assert (
+        host_config["mem_limit"],
+        host_config["memswap_limit"],
+        host_config["oom_score_adj"],
+    ) == (
         "1787g",
         "1787g",
         500,
     )
     streamed = [call.args[0] for call in svc.stream_log.await_args_list if call.args]
-    assert "Memory limit: 1787 GiB of the host's 1843 GiB (56 GiB kept for the host, swap off)" in streamed
+    assert (
+        "Memory limit: 1787 GiB of the host's 1843 GiB (56 GiB kept for the host, swap off)"
+        in streamed
+    )
 
 
 @pytest.mark.asyncio
@@ -295,8 +336,14 @@ async def test_create_with_the_cap_off_passes_the_backend_value_and_nothing_else
     await _run(svc, _payload(gpu_uuids=[], memory_gb=1841))
 
     run_spec = _created_run_spec(svc)
-    assert (run_spec.memory_gb, run_spec.memory_swap_gb, run_spec.oom_score_adj) == (1841, None, None)
-    assert HOST_MEMORY_PROBE_CMD not in [c.args[0] for c in ssh_client.run.await_args_list if c.args]
+    assert (run_spec.memory_gb, run_spec.memory_swap_gb, run_spec.oom_score_adj) == (
+        1841,
+        None,
+        None,
+    )
+    assert HOST_MEMORY_PROBE_CMD not in [
+        c.args[0] for c in ssh_client.run.await_args_list if c.args
+    ]
 
 
 def _builder_run_spec(docker_service, *, memory_gb, memory_limit, devices=()):
@@ -304,7 +351,12 @@ def _builder_run_spec(docker_service, *, memory_gb, memory_limit, devices=()):
     from services.rental_docker_sdk import DeviceMount, GpuDockerConfig
 
     payload = ContainerCreateRequest(
-        miner_hotkey="hk", executor_id="ex", pod_id="pod", docker_image="img:tag", gpu_uuids=["g0"], memory_gb=memory_gb
+        miner_hotkey="hk",
+        executor_id="ex",
+        pod_id="pod",
+        docker_image="img:tag",
+        gpu_uuids=["g0"],
+        memory_gb=memory_gb,
     )
     return docker_service._build_rental_container_run_spec(
         payload=payload,
@@ -315,7 +367,9 @@ def _builder_run_spec(docker_service, *, memory_gb, memory_limit, devices=()):
         local_volume_path="/root",
         encrypted_local_volume=False,
         external_volume_name=None,
-        gpu_devices=GpuDockerConfig(device_mounts=tuple(DeviceMount(path_on_host=d) for d in devices)),
+        gpu_devices=GpuDockerConfig(
+            device_mounts=tuple(DeviceMount(path_on_host=d) for d in devices)
+        ),
         effective_storage_limit_gb=None,
         cpu_count=None,
         memory_limit=memory_limit,
@@ -333,13 +387,19 @@ def test_run_spec_with_a_resolved_limit_uses_it_with_swap_off_and_the_oom_score(
 
     run_spec = _builder_run_spec(svc, memory_gb=1841, memory_limit=limit)
 
-    assert (run_spec.memory_gb, run_spec.memory_swap_gb, run_spec.oom_score_adj) == (1787, 1787, 500)
+    assert (run_spec.memory_gb, run_spec.memory_swap_gb, run_spec.oom_score_adj) == (
+        1787,
+        1787,
+        500,
+    )
 
 
 def test_rdma_memlock_follows_the_resolved_limit_for_a_zero_ram_pod_row(svc):  # noqa: F811
     limit = rental_memory_limit(0, 128 * KIB_PER_GIB, **DEFAULTS)
 
-    run_spec = _builder_run_spec(svc, memory_gb=0, memory_limit=limit, devices=("/dev/infiniband/uverbs0",))
+    run_spec = _builder_run_spec(
+        svc, memory_gb=0, memory_limit=limit, devices=("/dev/infiniband/uverbs0",)
+    )
 
     assert run_spec.memory_gb == 124
     assert [(u.name, u.soft, u.hard) for u in run_spec.ulimits] == [("memlock", -1, -1)]

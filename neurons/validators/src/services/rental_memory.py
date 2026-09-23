@@ -28,8 +28,7 @@ KIB_PER_GIB = 1024 * 1024
 MIN_RENTAL_MEMORY_GB = 1
 # MemTotal in KiB, then the number of GPU device nodes (/dev/nvidia0, /dev/nvidia1, …).
 HOST_MEMORY_PROBE_CMD = (
-    "awk '/^MemTotal:/ {print $2}' /proc/meminfo; "
-    "ls -d /dev/nvidia[0-9]* 2>/dev/null | wc -l"
+    "awk '/^MemTotal:/ {print $2}' /proc/meminfo; " "ls -d /dev/nvidia[0-9]* 2>/dev/null | wc -l"
 )
 
 SOURCE_CAP_DISABLED = "cap_disabled"
@@ -75,7 +74,9 @@ class RentalMemoryLimit:
         return {
             "memory_limit_gb": self.limit_gb,
             "memory_requested_gb": self.requested_gb,
-            "host_memory_gb": round(self.host_total_gb, 2) if self.host_total_gb is not None else None,
+            "host_memory_gb": round(self.host_total_gb, 2)
+            if self.host_total_gb is not None
+            else None,
             "host_memory_reserve_gb": self.reserve_gb,
             "memory_ceiling_gb": self.ceiling_gb,
             "gpu_share": self.gpu_share,
@@ -84,7 +85,9 @@ class RentalMemoryLimit:
         }
 
 
-def host_memory_reserve_gb(host_total_gb: float, *, reserve_min_gb: int, reserve_percent: float) -> int:
+def host_memory_reserve_gb(
+    host_total_gb: float, *, reserve_min_gb: int, reserve_percent: float
+) -> int:
     """The RAM the host keeps: ``reserve_percent`` of it, rounded up to a whole GiB, never under ``reserve_min_gb``."""
     percent = max(0.0, float(reserve_percent))
     return max(int(reserve_min_gb), math.ceil(host_total_gb * percent / 100))
@@ -200,5 +203,7 @@ async def resolve_rental_memory_limit(
         reserve_min_gb=settings.RENTAL_MEMORY_RESERVE_MIN_GB,
         reserve_percent=settings.RENTAL_MEMORY_RESERVE_PERCENT,
     )
-    logger.info(_m("rental_memory_limit", extra=get_extra_info({**log_extra, **limit.log_fields()})))
+    logger.info(
+        _m("rental_memory_limit", extra=get_extra_info({**log_extra, **limit.log_fields()}))
+    )
     return limit
