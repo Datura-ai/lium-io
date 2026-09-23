@@ -45,7 +45,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 
 ## Versions
 
-- `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed, lium-io#1376). lium-platform reads it on its backend subclass until it re-vendors this tag.
+- `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed, lium-io#1376).
 - `1.0.0` — first release.
 
 ## Tests
