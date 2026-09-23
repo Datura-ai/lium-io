@@ -593,20 +593,20 @@ DEAD_DOCKER_SSH_SESSION_HINT = (
 )
 
 
-def _plain_text(exc: BaseException) -> str:
+def _exception_text_on_one_line(exc: BaseException) -> str:
     """The exception's text on one line, whitespace collapsed."""
     return " ".join(str(exc).split())
 
 
 def _is_dead_docker_ssh_session(exc: BaseException) -> bool:
-    text = _plain_text(exc)
+    text = _exception_text_on_one_line(exc)
     return any(marker in text for marker in DEAD_DOCKER_SSH_SESSION_MARKERS)
 
 
 def volume_step_detail(exc: BaseException) -> str | None:
     """One bounded line saying why the volume step failed, or None when the exception has no text.
     A dead Docker SDK transport gets a plain-language hint in front of the raw error."""
-    text = _plain_text(exc)
+    text = _exception_text_on_one_line(exc)
     if not text:
         return None
     if _is_dead_docker_ssh_session(exc):

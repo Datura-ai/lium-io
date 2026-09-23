@@ -868,9 +868,8 @@ async def test_A16b_non_build_failures_have_no_tail(svc, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_A20_volume_step_failure_carries_the_daemon_reason(svc, monkeypatch):
-    """Regression (DAH-3504): a `volume_creation` failure reached the backend as the bare step
-    name; `step_detail` now carries the Docker daemon's reason. The dead-transport text docker-py
-    raises after a long build gets a plain-language hint in front of it."""
+    """A `volume_creation` failure carries the Docker daemon's reason in `step_detail`, with the
+    dead-session hint in front of docker-py's dead-transport text."""
     from services.docker_service import DEAD_DOCKER_SSH_SESSION_HINT
     from services.rental_docker_sdk import RentalDockerOperationError
 
@@ -940,11 +939,8 @@ async def test_A20c_volume_sizing_failure_carries_the_min_size_reason(svc, monke
 
 @pytest.mark.asyncio
 async def test_A20d_template_switch_dead_transport_at_docker_run_carries_the_hint_alone(svc, monkeypatch):
-    """Review nit (taiberium, 18 Sep): on a template switch the backend re-sends the Dockerfile with
-    the pod's existing `local_volume`, the volume block is skipped, and the first Docker SDK call
-    after the long build is `docker_run`. The dead-transport text surfaces there; `step_detail`
-    carries the fixed hint and nothing of the raw error, since that step's text is not proven
-    free of executor host data."""
+    """A template switch keeps the pod's volume, so the dead session surfaces at `docker_run`:
+    `step_detail` is the fixed hint alone, never that step's raw text."""
     from services.docker_service import DEAD_DOCKER_SSH_SESSION_HINT
     from services.rental_docker_sdk import RentalDockerOperationError
 

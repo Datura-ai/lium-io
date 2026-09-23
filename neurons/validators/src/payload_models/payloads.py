@@ -729,12 +729,8 @@ class FailedContainerRequest(ContainerBaseResponse):
     # setup steps (never their stderr). Renter-safe: the renter's own Dockerfile output, never executor
     # host data. None for every other failure and from old validators.
     build_log_tail: str | None = Field(default=None, repr=False)
-    # DAH-3505: for the volume step (volume_sizing / volume_creation) the Docker daemon's own
-    # error text, bounded, so the failure says why and not only where. Renter-safe: the text names
-    # the volume and the daemon's reason (a daemon path at most), never the executor's address,
-    # port or hotkey. For any other step, only the fixed dead-transport hint when the Docker SDK's
-    # session was gone (a template switch keeps the volume and fails at docker_run instead). None
-    # otherwise and from old validators.
+    # DAH-3505: the Docker daemon's bounded reason for a failed volume step, or the fixed
+    # dead-SSH-session hint for any other step. Never executor host data; None otherwise.
     step_detail: str | None = None
 
 

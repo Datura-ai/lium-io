@@ -1316,10 +1316,8 @@ def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_p
 
 
 def test_rental_ssh_adapter_sets_a_keepalive_on_its_transport(monkeypatch, tmp_path):
-    """Regression (DAH-3504): the SDK's paramiko session sat idle through a 9 to 14 min custom
-    build with no keepalive and was dead by the first call after it (`create_volume` failed with
-    "'NoneType' object has no attribute 'settimeout'" on all 10 such rentals in 14 d). The adapter
-    must arm paramiko's keepalive right after connecting, at the asyncssh session's cadence."""
+    """The SDK's paramiko session idles through a long build, so the adapter arms its keepalive
+    right after every connect."""
     import paramiko
 
     key_path = tmp_path / "id_executor"
