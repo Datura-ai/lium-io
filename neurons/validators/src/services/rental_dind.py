@@ -38,6 +38,9 @@ _POD_VOLUME_PREFIX = "volume_"
 # Ranges an inner network must never shadow inside the pod: the host daemon's own pools and bridge
 # (Docker's defaults, the sysbox installer's 172.20/172.25, neurons/executor/daemon.json's 172.24
 # and 172.31, all inside 172.16/12), Docker's 192.168 tail, and a cluster pod's WireGuard overlay.
+# A fixed list, checked when the setting is parsed. At create, the pools are also checked against
+# the subnets of the pod's own network as the host daemon reports them (pool_network_conflicts),
+# because a provider can give the host daemon other pools.
 RESERVED_POD_RANGES: tuple[ipaddress.IPv4Network, ...] = (
     ipaddress.IPv4Network("172.16.0.0/12"),
     ipaddress.IPv4Network("192.168.0.0/16"),
@@ -186,3 +189,19 @@ def orphaned_dind_companion_volumes(
             continue
         orphans.append(name)
     return orphans
+
+
+def pool_network_conflicts(pools: Sequence[AddressPool], subnets: Iterable[str]) -> list[str]:
+    """Each pool/subnet overlap between the pools and the pod network's IPv4 subnets."""
+    conflicts = []
+    for raw in subnets:
+        try:
+            subnet = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            continue
+        if subnet.version != 4:
+            continue
+        conflicts.extend(
+            f"{pool.base} overlaps {subnet}" for pool in pools if pool.base.overlaps(subnet)
+        )
+    return conflicts

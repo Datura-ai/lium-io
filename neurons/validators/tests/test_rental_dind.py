@@ -20,9 +20,15 @@ from services.rental_dind import (
     merge_inner_daemon_config,
     orphaned_dind_companion_volumes,
     parse_address_pools,
+    pool_network_conflicts,
     with_dind_companion_volumes,
 )
-from services.rental_docker_sdk import ContainerRunSpec, GpuDockerConfig, RentalDockerSdkClient
+from services.rental_docker_sdk import (
+    RENTAL_NETWORK_OPTIONS,
+    ContainerRunSpec,
+    GpuDockerConfig,
+    RentalDockerSdkClient,
+)
 
 # computenet-docker-images templates/pytorch/daemon.json, the /etc/docker/daemon.json of every
 # default "PyTorch (CUDA + DinD)" template image
@@ -183,7 +189,9 @@ class _ArchiveApiClient:
         daemon_json: bytes | None = PYTORCH_TEMPLATE_DAEMON_JSON,
         get_error=None,
         put_error=None,
+        network_subnets: tuple[str, ...] = ("172.31.0.0/16",),
     ):
+        self.network_subnets = network_subnets
         self.events = []
         self.daemon_json = daemon_json
         self.get_error = get_error
@@ -214,6 +222,14 @@ class _ArchiveApiClient:
 
     def start(self, container):
         self.events.append("start")
+
+    def inspect_network(self, name):
+        return {
+            "Name": name,
+            "Driver": "bridge",
+            "Options": dict(RENTAL_NETWORK_OPTIONS),
+            "IPAM": {"Config": [{"Subnet": subnet} for subnet in self.network_subnets]},
+        }
 
 
 def _spec(pools=POOLS) -> ContainerRunSpec:
@@ -491,4 +507,47 @@ def test_a_protected_companion_is_never_an_orphan():
             ["volume_x_docker"], unreferenced=["volume_x_docker"], protected=["volume_x_docker"]
         )
         == []
+    )
+
+
+# --- the pod's own network ------------------------------------------------------------------
+
+
+def test_pools_are_checked_against_the_pod_networks_ipv4_subnets():
+    assert pool_network_conflicts(POOLS, ["172.31.0.0/16", "fd00::/64", "not-a-subnet"]) == []
+    assert pool_network_conflicts(POOLS, ["10.201.0.0/16"]) == [
+        "10.200.0.0/14 overlaps 10.201.0.0/16"
+    ]
+
+
+def _network_spec(pools=POOLS) -> ContainerRunSpec:
+    return ContainerRunSpec(
+        image="daturaai/pytorch:dind",
+        name="pod_x",
+        network="lium-rentals",
+        inner_daemon_address_pools=pools,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_host_whose_rental_network_is_clear_of_the_pools_gets_them():
+    api = _ArchiveApiClient(network_subnets=("172.31.0.0/16",))
+
+    await RentalDockerSdkClient(api).run_container(_network_spec())
+
+    assert [path for path, _ in api.put] == ["/etc/docker"]
+
+
+@pytest.mark.asyncio
+async def test_a_host_whose_rental_network_overlaps_the_pools_keeps_dockers_own(caplog):
+    api = _ArchiveApiClient(network_subnets=("10.200.7.0/24",))
+
+    await RentalDockerSdkClient(api).run_container(_network_spec())
+
+    assert api.events == ["create_container", "start"]
+    [record] = [r for r in caplog.records if r.getMessage() == "Inner Docker daemon address pools"]
+    assert record.levelname == "WARNING"
+    assert (
+        record.msg.extra["outcome"]
+        == "skipped_pod_network_overlap: 10.200.0.0/14 overlaps 10.200.7.0/24"
     )
