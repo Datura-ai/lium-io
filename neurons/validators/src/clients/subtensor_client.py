@@ -233,7 +233,10 @@ class SubtensorClient:
         if settings.debug.USE_LOCAL_MINER:
             self.debug_miner = settings.get_debug_miner()
 
-        self._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
+        self._endpoint_cursor = EndpointCursor(
+            settings.get_chain_endpoints(),
+            retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
+        )
         self.initialize_subtensor()
 
         SubtensorClient._initialized = True
@@ -312,11 +315,12 @@ class SubtensorClient:
         self._log_endpoint_switched(previous, current, "read failed", error)
 
     def _return_to_first_endpoint(self) -> None:
-        """A sync cycle starts on the first entry again: after a cycle ran on a fallback node the
-        client is dropped and the next dial tries our own endpoint first (the proxy may be back)."""
-        if self._endpoints.on_first:
+        """A sync cycle starts on the first entry that is not resting: after a cycle ran on a
+        fallback node, once the failed endpoint's retry window is over, the client is dropped and
+        the next dial tries it again (the proxy may be back). Inside the window the fallback client
+        stays, so a dead proxy is not redialled every cycle."""
+        if not self._endpoints.reset():
             return
-        self._endpoints.reset()
         self._drop_subtensor()
 
     def _drop_subtensor(self) -> None:
@@ -1015,7 +1019,7 @@ class SubtensorClient:
         while True:
             try:
                 if last_cycle_ran_on_fallback:
-                    # the next sync loop goes back to the first endpoint (our proxy may be back)
+                    # back to the first endpoint once its retry window is over (our proxy may be back)
                     last_cycle_ran_on_fallback = False
                     self._return_to_first_endpoint()
                 self.set_subtensor()

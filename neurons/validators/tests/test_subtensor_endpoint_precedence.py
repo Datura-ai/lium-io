@@ -9,11 +9,13 @@ validator dialled the public, throttled finney node. These tests go through the 
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from bittensor.core.subtensor import Subtensor
 
+import datura.chain as chain_module
 from datura.chain import EndpointCursor, PUBLIC_NODE_SOURCE, is_chain_error
 
 from clients import subtensor_client as subtensor_client_module
@@ -65,6 +67,7 @@ class _RecordingSubtensor:
     def __init__(self, network=None, config=None, **_kwargs):
         self.chain_endpoint, self.network = Subtensor.setup_config(network, config)
         self.closed = False
+        self.substrate = SimpleNamespace(ws=SimpleNamespace(close_code=None))
         _RecordingSubtensor.calls.append({"network": network, "config": config})
 
     def close(self):
@@ -75,7 +78,10 @@ def _bare_client(settings: Settings) -> SubtensorClient:
     client = SubtensorClient.__new__(SubtensorClient)
     client.config = settings.get_bittensor_config()
     client.default_extra = {"version_key": 0}
-    client._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
+    client._endpoint_cursor = EndpointCursor(
+        settings.get_chain_endpoints(),
+        retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
+    )
     client.check_registered = MagicMock()
     return client
 
@@ -86,6 +92,14 @@ def _connected_extra(caplog) -> dict:
         for record in caplog.records
         if getattr(record.msg, "message", None) == "Subtensor connected"
     )
+
+
+@pytest.fixture
+def clock(monkeypatch) -> list[float]:
+    """The monotonic clock the endpoint cursor reads; move it with `clock[0] += seconds`."""
+    now = [1000.0]
+    monkeypatch.setattr(chain_module, "monotonic", lambda: now[0])
+    return now
 
 
 @pytest.fixture
@@ -219,12 +233,12 @@ def test_endpoint_list_walks_every_own_node_before_the_public_one(monkeypatch, c
     assert client._endpoints.current.value == "finney"
 
 
-def test_read_failure_switches_to_the_next_endpoint_and_the_next_sync_returns_to_the_first(
-    recording_subtensor, caplog
+def test_read_failure_rests_the_endpoint_for_the_retry_window_then_returns_to_it(
+    recording_subtensor, clock, caplog
 ):
-    """A read on the proxy fails after connecting: the client is dropped, the redial goes to
-    the public node (one switch line); after a completed sync cycle the cursor is back on the
-    proxy and the next dial tries it first."""
+    """A read on the proxy fails after connecting: the client is dropped and the redial goes to
+    the public node (one switch line). Cycles inside the retry window stay on the public node
+    and do not redial; the first cycle after the window goes back to the proxy."""
     settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
     client = _bare_client(settings)
 
@@ -235,10 +249,16 @@ def test_read_failure_switches_to_the_next_endpoint_and_the_next_sync_returns_to
         client._switch_endpoint_after_read_failure(TimeoutError("metagraph read timed out"))
         assert client.subtensor is None
         client.set_subtensor()
-        assert client.subtensor.chain_endpoint == PUBLIC_FINNEY
+        on_public = client.subtensor
+        assert on_public.chain_endpoint == PUBLIC_FINNEY
         assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
-        assert not client._endpoints.on_first
 
+        clock[0] += settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS - 1
+        client._return_to_first_endpoint()
+        client.set_subtensor()
+        assert client.subtensor is on_public and not on_public.closed
+
+        clock[0] += 1
         client._return_to_first_endpoint()
         assert client.subtensor is None and client._endpoints.on_first
         client.set_subtensor()
@@ -247,7 +267,37 @@ def test_read_failure_switches_to_the_next_endpoint_and_the_next_sync_returns_to
     assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT, "finney", OWN_ENDPOINT]
 
 
-def test_switch_and_return_close_the_dropped_client(recording_subtensor):
+def test_refused_endpoint_is_not_redialled_inside_the_retry_window(monkeypatch, clock, caplog):
+    """The proxy refuses the connect: the validator runs on the public node, and the
+    next cycles do not dial the proxy again until the retry window ends."""
+    _RecordingSubtensor.calls = []
+    _RefusingThenRecordingSubtensor.refused = []
+    monkeypatch.setattr(subtensor_client_module.bittensor, "Subtensor", _RefusingThenRecordingSubtensor)
+    monkeypatch.setattr(SubtensorClient, "_subtensor", None)
+    settings = Settings(
+        BITTENSOR_NETWORK="finney",
+        BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT,
+        BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS=60,
+    )
+    client = _bare_client(settings)
+
+    with patch.object(subtensor_client_module, "settings", settings), caplog.at_level(logging.INFO):
+        client.initialize_subtensor()
+        for _cycle in range(4):
+            clock[0] += 12
+            client._return_to_first_endpoint()
+            client.set_subtensor()
+        assert _RefusingThenRecordingSubtensor.refused == [OWN_ENDPOINT]
+
+        clock[0] += 12
+        client._return_to_first_endpoint()
+        client.set_subtensor()
+
+    assert _RefusingThenRecordingSubtensor.refused == [OWN_ENDPOINT, OWN_ENDPOINT]
+    assert client.subtensor.chain_endpoint == PUBLIC_FINNEY
+
+
+def test_switch_and_return_close_the_dropped_client(recording_subtensor, clock):
     """A dropped client still holds an open websocket; it must be closed, not just forgotten."""
     settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
     client = _bare_client(settings)
@@ -258,6 +308,7 @@ def test_switch_and_return_close_the_dropped_client(recording_subtensor):
         client._switch_endpoint_after_read_failure(TimeoutError("read timed out"))
         client.set_subtensor()
         on_public = client.subtensor
+        clock[0] += settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS
         client._return_to_first_endpoint()
 
     assert on_proxy.closed and on_public.closed

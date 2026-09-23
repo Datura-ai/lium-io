@@ -17,7 +17,10 @@ def _make_miner() -> Miner:
     miner.netuid = 51
     miner.axon = object()
     miner.subtensor = None
-    miner._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
+    miner._endpoint_cursor = EndpointCursor(
+        settings.get_chain_endpoints(),
+        retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
+    )
     miner.last_cycle_ran_on_fallback = False
     miner.bootstrap_complete = False
     miner.should_exit = False

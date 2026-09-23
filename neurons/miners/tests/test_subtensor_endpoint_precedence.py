@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from bittensor.core.async_subtensor import AsyncSubtensor
 
+import datura.chain as chain_module
 from datura.chain import EndpointCursor, PUBLIC_NODE_SOURCE, is_chain_error
 
 import core.miner as miner_module
@@ -67,7 +68,10 @@ def _make_miner(settings: Settings) -> Miner:
     miner.config = settings.get_bittensor_config()
     miner.netuid = 51
     miner.subtensor = None
-    miner._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
+    miner._endpoint_cursor = EndpointCursor(
+        settings.get_chain_endpoints(),
+        retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
+    )
     miner.last_cycle_ran_on_fallback = False
     miner.bootstrap_complete = False
     miner.should_exit = False
@@ -85,6 +89,14 @@ def _connected_extra(caplog) -> dict:
         for record in caplog.records
         if getattr(record.msg, "message", None) == "Subtensor connected"
     )
+
+
+@pytest.fixture
+def clock(monkeypatch) -> list[float]:
+    """The monotonic clock the endpoint cursor reads; move it with `clock[0] += seconds`."""
+    now = [1000.0]
+    monkeypatch.setattr(chain_module, "monotonic", lambda: now[0])
+    return now
 
 
 @pytest.fixture
@@ -188,14 +200,14 @@ def test_chain_endpoints_list_is_ordered_with_the_public_node_last():
 
 
 @pytest.mark.asyncio
-async def test_sync_read_failure_switches_to_the_next_endpoint_and_the_next_sync_returns_to_the_first(
-    recording_subtensor, caplog
+async def test_sync_read_failure_rests_the_endpoint_for_the_retry_window_then_returns_to_it(
+    recording_subtensor, clock, caplog
 ):
     """`sync()` fails on a read after connecting to the proxy: the redial goes to the public node
-    (one switch line); the sync after that goes back to the proxy first."""
+    (one switch line). Syncs inside the retry window stay on the public node and do not redial;
+    the first sync after the window goes back to the proxy."""
     settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
     miner = _make_miner(settings)
-    miner.last_cycle_ran_on_fallback = False
     miner.bootstrap = AsyncMock(side_effect=[TimeoutError("metagraph read timed out"), None, None])
 
     with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
@@ -204,10 +216,15 @@ async def test_sync_read_failure_switches_to_the_next_endpoint_and_the_next_sync
         assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
 
         await miner.sync()  # completes on the public node
-        assert miner.subtensor.chain_endpoint == PUBLIC_FINNEY
+        on_public = miner.subtensor
         assert miner.last_cycle_ran_on_fallback
 
-        await miner.sync()  # the next sync loop starts on the first endpoint again
+        clock[0] += settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS - 1
+        await miner.sync()  # inside the window: stays on the public node
+        assert miner.subtensor is on_public
+
+        clock[0] += 1
+        await miner.sync()  # the window is over: back to the proxy
         assert miner.subtensor.chain_endpoint == OWN_ENDPOINT
         assert not miner.last_cycle_ran_on_fallback
 

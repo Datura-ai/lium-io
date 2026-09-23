@@ -3,11 +3,14 @@
 The validator (`bittensor.Subtensor`) and the central miner (`bittensor.AsyncSubtensor`) dial an
 ORDERED list: our own endpoints first (`BITTENSOR_CHAIN_ENDPOINTS`, comma-separated, else the single
 `BITTENSOR_CHAIN_ENDPOINT`), the public `BITTENSOR_NETWORK` node always last. On a connect or read
-failure the client moves to the next entry and logs `Subtensor endpoint switched from=… to=…`; on
-the next sync cycle it goes back to the first one, so a proxy outage never leaves a neuron without a
-chain client and a recovered proxy is picked up again without a restart (taiberium, lium-io#1393).
+failure the client moves to the next entry and logs `Subtensor endpoint switched from=… to=…`. The
+failed entry is not dialled again for `retry_after_seconds` (`BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS`,
+5 minutes by default), so a dead proxy does not stall every sync cycle with a new dial; after that
+window the next sync cycle goes back to it. A proxy outage never leaves a neuron without a chain
+client, and a recovered proxy is picked up again without a restart (taiberium, lium-io#1393).
 """
 
+from time import monotonic
 from typing import Generic, NamedTuple, TypeVar
 
 SubtensorT = TypeVar("SubtensorT")
@@ -17,6 +20,7 @@ SubtensorT = TypeVar("SubtensorT")
 EndpointSource = str
 
 PUBLIC_NODE_SOURCE = "BITTENSOR_NETWORK"
+DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS = 300
 SWITCHED_SUFFIX = " (own endpoint failed)"
 
 # A connect or read on the websocket / substrate client, not Redis, the portal, or the database.
@@ -73,15 +77,18 @@ def chain_endpoint_candidates(
 
 
 class EndpointCursor:
-    """Which entry of the dial list a client is on. `advance()` moves to the next entry (wrapping to
-    the first when the last one fails too) and reports the switch; `reset()` returns to the first
-    entry for the next sync cycle."""
+    """Which entry of the dial list a client is on. `advance()` marks the current entry as failed
+    and moves to the next entry that is not resting (wrapping to the first when the last one fails
+    too). A failed entry rests for `retry_after_seconds`. `reset()` moves to the first entry that
+    is not resting, at the start of a sync cycle."""
 
-    def __init__(self, candidates: list[ChainEndpoint]):
+    def __init__(self, candidates: list[ChainEndpoint], *, retry_after_seconds: float):
         if not candidates:
             raise ValueError("chain endpoint list is empty")
         self.candidates = candidates
         self.index = 0
+        self.retry_after_seconds = retry_after_seconds
+        self._resting_until: dict[int, float] = {}
 
     @property
     def current(self) -> ChainEndpoint:
@@ -93,11 +100,29 @@ class EndpointCursor:
 
     def advance(self) -> tuple[ChainEndpoint, ChainEndpoint]:
         previous = self.current
-        self.index = (self.index + 1) % len(self.candidates)
+        self._resting_until[self.index] = monotonic() + self.retry_after_seconds
+        next_index = (self.index + 1) % len(self.candidates)
+        ready = self._first_ready_index(start=next_index)
+        # every entry is resting: take the next one anyway, never stop dialling
+        self.index = next_index if ready is None else ready
         return previous, self.current
 
-    def reset(self) -> None:
-        self.index = 0
+    def reset(self) -> bool:
+        """Move to the first entry that is not resting. True when the cursor moved."""
+        ready = self._first_ready_index(start=0)
+        if ready is None or ready == self.index:
+            return False
+        self.index = ready
+        return True
+
+    def _first_ready_index(self, *, start: int) -> int | None:
+        now = monotonic()
+        count = len(self.candidates)
+        for step in range(count):
+            index = (start + step) % count
+            if self._resting_until.get(index, 0.0) <= now:
+                return index
+        return None
 
     def source_label(self) -> EndpointSource:
         """The `endpoint_source` for the current entry: plain on the first entry, marked when a switch
