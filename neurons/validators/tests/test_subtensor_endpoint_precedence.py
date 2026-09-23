@@ -14,8 +14,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from bittensor.core.subtensor import Subtensor
 
+from datura.chain import EndpointCursor, PUBLIC_NODE_SOURCE, is_chain_error
+
 from clients import subtensor_client as subtensor_client_module
-from clients.subtensor_client import SubtensorClient
+from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
 from core.config import Settings
 
 OWN_ENDPOINT = "ws://archive-node-proxy.proxy"
@@ -73,6 +75,7 @@ def _bare_client(settings: Settings) -> SubtensorClient:
     client = SubtensorClient.__new__(SubtensorClient)
     client.config = settings.get_bittensor_config()
     client.default_extra = {"version_key": 0}
+    client._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
     client.check_registered = MagicMock()
     return client
 
@@ -117,7 +120,7 @@ def test_initialize_subtensor_without_endpoint_dials_the_named_network(recording
     assert (client.subtensor.chain_endpoint, client.subtensor.network) == (PUBLIC_FINNEY, "finney")
     extra = _connected_extra(caplog)
     assert extra["chain_endpoint"] == PUBLIC_FINNEY
-    assert extra["endpoint_source"] == "BITTENSOR_NETWORK"
+    assert extra["endpoint_source"] == PUBLIC_NODE_SOURCE
 
 
 class _RefusingThenRecordingSubtensor(_RecordingSubtensor):
@@ -179,7 +182,7 @@ def test_chain_endpoints_list_is_ordered_with_the_public_node_last():
     assert [e.source for e in settings.get_chain_endpoints()] == [
         "BITTENSOR_CHAIN_ENDPOINTS[0]",
         "BITTENSOR_CHAIN_ENDPOINTS[1]",
-        "BITTENSOR_NETWORK",
+        PUBLIC_NODE_SOURCE,
     ]
     assert settings.get_chain_endpoint_or_network_name() == OWN_ENDPOINT
     assert _resolve(settings)[0] == OWN_ENDPOINT
@@ -292,3 +295,28 @@ def test_initialize_subtensor_without_endpoint_does_not_retry_on_failure(monkeyp
 
     assert calls == ["finney"]
     assert client.subtensor is None
+
+
+def test_redis_or_portal_error_leaves_a_healthy_endpoint_in_place(recording_subtensor, caplog):
+    """A Redis miss or a portal HTTP failure is not a chain fault: the cursor stays
+    on the proxy and the next cycle does not log `read failed`."""
+    class RedisError(Exception):
+        __module__ = "redis.exceptions"
+
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    client = _bare_client(settings)
+
+    with patch.object(subtensor_client_module, "settings", settings), caplog.at_level(logging.INFO):
+        client.initialize_subtensor()
+        on_proxy = client.subtensor
+        client._switch_endpoint_after_read_failure(RedisError("redis down"))
+        client._switch_endpoint_after_read_failure(
+            ProviderPortalDataUnavailable("no snapshot")
+        )
+
+    assert client.subtensor is on_proxy
+    assert client._endpoints.on_first
+    assert _switch_lines(caplog) == []
+    assert not is_chain_error(RedisError("redis down"))
+    assert not is_chain_error(ProviderPortalDataUnavailable("no snapshot"))
+    assert is_chain_error(TimeoutError("metagraph read timed out"))

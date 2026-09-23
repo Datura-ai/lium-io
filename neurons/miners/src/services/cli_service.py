@@ -67,12 +67,33 @@ class CliService:
     def get_node(self):
         """
         Get a SubstrateInterface node connection using the current config.
+        Tries each entry of the ordered endpoint list (our proxy first, the public
+        node last) so a down proxy does not fail the command.
         :return: SubstrateInterface instance
         """
-        self.subtensor = bt.Subtensor(
-            network=settings.get_chain_endpoint_or_network_name(), config=self.config
-        )
-        return self.subtensor.substrate
+        last_error: Exception | None = None
+        endpoints = settings.get_chain_endpoints()
+        for index, endpoint in enumerate(endpoints):
+            try:
+                self.subtensor = bt.Subtensor(network=endpoint.value, config=self.config)
+                return self.subtensor.substrate
+            except Exception as e:
+                last_error = e
+                if len(endpoints) == 1 or index == len(endpoints) - 1:
+                    raise
+                nxt = endpoints[index + 1]
+                self.logger.warning(_m(
+                    f"Subtensor endpoint switched from={endpoint.value} to={nxt.value}",
+                    extra={
+                        **self.default_extra,
+                        "from": endpoint.value,
+                        "to": nxt.value,
+                        "reason": "connect failed",
+                        "error": str(e),
+                    },
+                ))
+        assert last_error is not None
+        raise last_error
 
     def print_extrinsic_receipt(self, receipt) -> dict:
         """

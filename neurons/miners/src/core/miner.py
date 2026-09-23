@@ -5,7 +5,13 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import bittensor
-from datura.chain import ChainConnection, ChainEndpoint, EndpointCursor, EndpointSource
+from datura.chain import (
+    ChainConnection,
+    ChainEndpoint,
+    EndpointCursor,
+    EndpointSource,
+    is_chain_error,
+)
 from sqlmodel import Session, select
 
 from core.config import settings
@@ -46,7 +52,8 @@ class Miner:
             ip=settings.EXTERNAL_IP_ADDRESS,
         )
         self.subtensor = None
-        self._cycle_completed_on_fallback = False
+        self._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
+        self.last_cycle_ran_on_fallback = False
 
         self.should_exit = False
         self.bootstrap_complete = False
@@ -54,11 +61,8 @@ class Miner:
     @property
     def _endpoints(self) -> EndpointCursor:
         """Where in the ordered dial list (`settings.get_chain_endpoints()`: our proxy first, the
-        public node last) this miner is; built lazily so tests can construct a bare miner."""
-        cursor = getattr(self, "_endpoint_cursor", None)
-        if cursor is None:
-            cursor = self._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
-        return cursor
+        public node last) this miner is."""
+        return self._endpoint_cursor
 
     def _log_endpoint_switched(
         self, previous: ChainEndpoint, current: ChainEndpoint, reason: str, error: Exception
@@ -106,8 +110,11 @@ class Miner:
         raise last_error
 
     async def _switch_endpoint_after_read_failure(self, error: Exception) -> None:
-        """A read on the connected endpoint failed: close the client and move the cursor to the
-        next entry, so the redial that follows skips the failing one."""
+        """A chain read on the connected endpoint failed: close the client and move the cursor
+        to the next entry, so the redial that follows skips the failing one. A database or
+        other local error leaves the cursor on the healthy proxy."""
+        if not is_chain_error(error):
+            return
         if self.subtensor is None or len(self._endpoints.candidates) == 1:
             return
         await self.close_subtensor()
@@ -377,14 +384,14 @@ class Miner:
 
     async def sync(self):
         try:
-            if getattr(self, "_cycle_completed_on_fallback", False):
+            if self.last_cycle_ran_on_fallback:
                 # the next sync loop goes back to the first endpoint (our proxy may be back)
-                self._cycle_completed_on_fallback = False
+                self.last_cycle_ran_on_fallback = False
                 await self._return_to_first_endpoint()
             await self.set_subtensor()
             if not self.bootstrap_complete:
                 await self.bootstrap()
-            self._cycle_completed_on_fallback = not self._endpoints.on_first
+            self.last_cycle_ran_on_fallback = not self._endpoints.on_first
         except Exception as e:
             logger.error(
                 _m(
@@ -397,8 +404,8 @@ class Miner:
                     ),
                 ),
             )
-            if not self.should_exit:
-                # a read on the connected endpoint failed: the redial below dials the next one
+            if not self.should_exit and is_chain_error(e):
+                # a chain read on the connected endpoint failed: the redial below dials the next one
                 await self._switch_endpoint_after_read_failure(e)
                 await self.initialize_subtensor()
 

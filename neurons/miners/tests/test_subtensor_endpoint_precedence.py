@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from bittensor.core.async_subtensor import AsyncSubtensor
 
+from datura.chain import EndpointCursor, PUBLIC_NODE_SOURCE, is_chain_error
+
 import core.miner as miner_module
 from core.config import Settings
 from core.miner import Miner
@@ -65,6 +67,8 @@ def _make_miner(settings: Settings) -> Miner:
     miner.config = settings.get_bittensor_config()
     miner.netuid = 51
     miner.subtensor = None
+    miner._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
+    miner.last_cycle_ran_on_fallback = False
     miner.bootstrap_complete = False
     miner.should_exit = False
     miner.default_extra = {"external_ip": "203.0.113.10", "external_port": 8000}
@@ -115,7 +119,7 @@ async def test_initialize_subtensor_provider_shape_is_unchanged(recording_subten
 
     assert (miner.subtensor.chain_endpoint, miner.subtensor.network) == (PUBLIC_FINNEY, "finney")
     extra = _connected_extra(caplog)
-    assert extra["endpoint_source"] == "BITTENSOR_NETWORK"
+    assert extra["endpoint_source"] == PUBLIC_NODE_SOURCE
 
 
 class _RefusingThenRecordingAsyncSubtensor(_RecordingAsyncSubtensor):
@@ -191,7 +195,7 @@ async def test_sync_read_failure_switches_to_the_next_endpoint_and_the_next_sync
     (one switch line); the sync after that goes back to the proxy first."""
     settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
     miner = _make_miner(settings)
-    miner._cycle_completed_on_fallback = False
+    miner.last_cycle_ran_on_fallback = False
     miner.bootstrap = AsyncMock(side_effect=[TimeoutError("metagraph read timed out"), None, None])
 
     with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
@@ -201,11 +205,11 @@ async def test_sync_read_failure_switches_to_the_next_endpoint_and_the_next_sync
 
         await miner.sync()  # completes on the public node
         assert miner.subtensor.chain_endpoint == PUBLIC_FINNEY
-        assert miner._cycle_completed_on_fallback
+        assert miner.last_cycle_ran_on_fallback
 
         await miner.sync()  # the next sync loop starts on the first endpoint again
         assert miner.subtensor.chain_endpoint == OWN_ENDPOINT
-        assert not miner._cycle_completed_on_fallback
+        assert not miner.last_cycle_ran_on_fallback
 
     assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT, "finney", OWN_ENDPOINT]
     assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
@@ -217,7 +221,7 @@ async def test_sync_read_failure_without_an_own_endpoint_redials_the_same_node(
 ):
     settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=None)
     miner = _make_miner(settings)
-    miner._cycle_completed_on_fallback = False
+    miner.last_cycle_ran_on_fallback = False
     miner.bootstrap = AsyncMock(side_effect=[TimeoutError("read timed out"), None])
 
     with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
@@ -225,4 +229,41 @@ async def test_sync_read_failure_without_an_own_endpoint_redials_the_same_node(
 
     assert miner.subtensor.chain_endpoint == PUBLIC_FINNEY
     assert [c["network"] for c in recording_subtensor.calls] == ["finney", "finney"]
+    assert _switch_lines(caplog) == []
+
+
+def test_is_chain_error_is_true_only_for_chain_client_faults():
+    class RedisError(Exception):
+        __module__ = "redis.exceptions"
+
+    class PortalError(Exception):
+        __module__ = "aiohttp.client_exceptions"
+
+    class DatabaseError(Exception):
+        __module__ = "sqlalchemy.exc"
+
+    assert is_chain_error(TimeoutError("metagraph read timed out"))
+    assert is_chain_error(ConnectionRefusedError("[Errno 111] Connect call failed"))
+    assert not is_chain_error(RedisError("redis down"))
+    assert not is_chain_error(PortalError("portal 502"))
+    assert not is_chain_error(DatabaseError("disk full"))
+    assert not is_chain_error(RuntimeError("save_validators failed"))
+
+
+@pytest.mark.asyncio
+async def test_sync_database_error_leaves_a_healthy_proxy_in_place(
+    recording_subtensor, caplog
+):
+    """A SQL error in save_validators is not a chain fault: the cursor stays on the proxy
+    and the next sync does not log `read failed` or dial the public node."""
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    miner = _make_miner(settings)
+    miner.bootstrap = AsyncMock(side_effect=RuntimeError("save_validators: disk full"))
+
+    with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
+        await miner.sync()
+
+    assert miner.subtensor.chain_endpoint == OWN_ENDPOINT
+    assert miner._endpoints.on_first
+    assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT]
     assert _switch_lines(caplog) == []

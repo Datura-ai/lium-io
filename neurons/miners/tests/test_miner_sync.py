@@ -4,7 +4,10 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from datura.chain import EndpointCursor
+
 import core.miner as miner_module
+from core.config import settings
 from core.miner import Miner
 from models.validator import Validator
 
@@ -14,6 +17,8 @@ def _make_miner() -> Miner:
     miner.netuid = 51
     miner.axon = object()
     miner.subtensor = None
+    miner._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
+    miner.last_cycle_ran_on_fallback = False
     miner.bootstrap_complete = False
     miner.should_exit = False
     miner.default_extra = {"external_ip": "127.0.0.1", "external_port": 8000}
@@ -188,7 +193,8 @@ async def test_sync_bootstraps_only_once_per_connection():
 
 @pytest.mark.asyncio
 async def test_sync_retries_bootstrap_after_reinitialize_on_failure():
-    """A failed startup bootstrap should reinitialize subtensor and retry on the next cycle."""
+    """A chain fault during startup bootstrap should reinitialize subtensor and retry
+    on the next cycle. A database error does not (see the precedence suite)."""
     # Arrange
     miner = _make_miner()
     miner.set_subtensor = AsyncMock()
@@ -199,7 +205,7 @@ async def test_sync_retries_bootstrap_after_reinitialize_on_failure():
         nonlocal bootstrap_attempts
         bootstrap_attempts += 1
         if bootstrap_attempts == 1:
-            raise RuntimeError("temporary bootstrap failure")
+            raise TimeoutError("metagraph read timed out")
         miner.bootstrap_complete = True
 
     async def initialize_subtensor():
@@ -228,7 +234,7 @@ async def test_sync_skips_reinitialize_when_shutdown_is_in_progress():
     miner = _make_miner()
     miner.should_exit = True
     miner.set_subtensor = AsyncMock()
-    miner.bootstrap = AsyncMock(side_effect=RuntimeError("temporary bootstrap failure"))
+    miner.bootstrap = AsyncMock(side_effect=TimeoutError("metagraph read timed out"))
     miner.initialize_subtensor = AsyncMock()
 
     # Act

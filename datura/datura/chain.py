@@ -19,6 +19,28 @@ EndpointSource = str
 PUBLIC_NODE_SOURCE = "BITTENSOR_NETWORK"
 SWITCHED_SUFFIX = " (own endpoint failed)"
 
+# A connect or read on the websocket / substrate client, not Redis, the portal, or the database.
+_CHAIN_ERROR_TYPES = (TimeoutError, ConnectionError)
+_CHAIN_ERROR_MODULES = (
+    "websocket",
+    "websockets",
+    "substrateinterface",
+    "async_substrate_interface",
+    "scalecodec",
+)
+
+
+def is_chain_error(error: BaseException) -> bool:
+    """True when `error` came from the chain client (connect, websocket, RPC).
+
+    A database error, a Redis miss, or a portal HTTP failure is False, so a healthy
+    proxy is not abandoned for a local fault.
+    """
+    if isinstance(error, _CHAIN_ERROR_TYPES):
+        return True
+    module = type(error).__module__ or ""
+    return any(module == prefix or module.startswith(prefix + ".") for prefix in _CHAIN_ERROR_MODULES)
+
 
 class ChainEndpoint(NamedTuple):
     value: str  # a ws:// URL or a network name, the `network=` argument of the Subtensor constructor

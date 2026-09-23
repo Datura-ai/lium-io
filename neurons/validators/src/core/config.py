@@ -4,7 +4,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
-from datura.chain import ChainEndpoint, chain_endpoint_candidates
+from datura.chain import PUBLIC_NODE_SOURCE, ChainEndpoint, chain_endpoint_candidates
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -654,7 +654,7 @@ class Settings(BaseSettings):
             config.subtensor.network = self.BITTENSOR_NETWORK
 
         own = self.get_chain_endpoints()[0]
-        if own.source != "BITTENSOR_NETWORK":
+        if own.source != PUBLIC_NODE_SOURCE:
             config.subtensor.chain_endpoint = own.value
 
         return config

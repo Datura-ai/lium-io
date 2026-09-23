@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING
 import pathlib
 
 import bittensor
-from datura.chain import ChainEndpoint, chain_endpoint_candidates
+from datura.chain import PUBLIC_NODE_SOURCE, ChainEndpoint, chain_endpoint_candidates
 from lium_core.shared_config import SharedConfigClient
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -96,7 +96,7 @@ class Settings(BaseSettings):
             config.subtensor.network = self.BITTENSOR_NETWORK
 
         own = self.get_chain_endpoints()[0]
-        if own.source != "BITTENSOR_NETWORK":
+        if own.source != PUBLIC_NODE_SOURCE:
             config.subtensor.chain_endpoint = own.value
 
         return config

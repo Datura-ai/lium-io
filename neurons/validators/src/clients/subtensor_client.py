@@ -11,7 +11,13 @@ import aiohttp
 import bittensor
 import numpy as np
 from bittensor.utils.weight_utils import process_weights_for_netuid
-from datura.chain import ChainConnection, ChainEndpoint, EndpointCursor, EndpointSource
+from datura.chain import (
+    ChainConnection,
+    ChainEndpoint,
+    EndpointCursor,
+    EndpointSource,
+    is_chain_error,
+)
 from pydantic import BaseModel, Field, ValidationError
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
@@ -227,6 +233,7 @@ class SubtensorClient:
         if settings.debug.USE_LOCAL_MINER:
             self.debug_miner = settings.get_debug_miner()
 
+        self._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
         self.initialize_subtensor()
 
         SubtensorClient._initialized = True
@@ -246,11 +253,8 @@ class SubtensorClient:
     @property
     def _endpoints(self) -> EndpointCursor:
         """Where in the ordered dial list (`settings.get_chain_endpoints()`: our proxy first, the
-        public node last) this client is; built lazily so tests can construct a bare client."""
-        cursor = getattr(self, "_endpoint_cursor", None)
-        if cursor is None:
-            cursor = self._endpoint_cursor = EndpointCursor(settings.get_chain_endpoints())
-        return cursor
+        public node last) this client is."""
+        return self._endpoint_cursor
 
     def _log_endpoint_switched(
         self, previous: ChainEndpoint, current: ChainEndpoint, reason: str, error: Exception
@@ -296,8 +300,11 @@ class SubtensorClient:
         raise last_error
 
     def _switch_endpoint_after_read_failure(self, error: Exception) -> None:
-        """A read on the connected endpoint failed: drop the client and move the cursor to the
-        next entry, so the redial that follows skips the failing one."""
+        """A chain read on the connected endpoint failed: drop the client and move the cursor
+        to the next entry, so the redial that follows skips the failing one. A Redis or portal
+        error leaves the cursor on the healthy endpoint."""
+        if not is_chain_error(error):
+            return
         if SubtensorClient._subtensor is None or len(self._endpoints.candidates) == 1:
             return
         self._drop_subtensor()
@@ -1004,12 +1011,12 @@ class SubtensorClient:
     async def _warm_up_subtensor(self):
         count = 0
         backoff = SUBTENSOR_BACKOFF_INITIAL
-        cycle_completed_on_fallback = False
+        last_cycle_ran_on_fallback = False
         while True:
             try:
-                if cycle_completed_on_fallback:
+                if last_cycle_ran_on_fallback:
                     # the next sync loop goes back to the first endpoint (our proxy may be back)
-                    cycle_completed_on_fallback = False
+                    last_cycle_ran_on_fallback = False
                     self._return_to_first_endpoint()
                 self.set_subtensor()
 
@@ -1027,7 +1034,7 @@ class SubtensorClient:
                     count = 1
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL
-                cycle_completed_on_fallback = not self._endpoints.on_first
+                last_cycle_ran_on_fallback = not self._endpoints.on_first
                 await asyncio.sleep(SYNC_CYCLE)
             except ProviderPortalDataUnavailable as exc:
                 logger.error(
@@ -1041,7 +1048,7 @@ class SubtensorClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
             except Exception as e:
-                # a read on the connected endpoint failed: the retry after the backoff dials the next one
+                # a chain read on the connected endpoint failed: the retry after the backoff dials the next one
                 self._switch_endpoint_after_read_failure(e)
                 logger.error(
                     _m(
