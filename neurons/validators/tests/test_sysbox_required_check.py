@@ -6,7 +6,7 @@ from neurons.validators.src.services.executor_connectivity.dind_probe import (
     diagnose_docker_run_error,
 )
 from neurons.validators.src.services.task.checks.sysbox_required import (
-    _NVIDIA_HOOK_TEMPLATES,
+    _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE,
     SysboxRequiredCheck,
 )
 from neurons.validators.src.services.task.messages import SysboxRequiredMessages as Msg
@@ -189,8 +189,8 @@ def _cause(stderr: str) -> DindLogCause:
 
 def test_every_docker_run_cause_has_a_template_and_no_template_lacks_a_cause():
     """A rename on either side would route every hook refusal back to SYSBOX_REQUIRED_MISSING in silence."""
-    assert {cause.code for _, cause in DOCKER_RUN_CAUSES} == set(_NVIDIA_HOOK_TEMPLATES)
-    for code, template in _NVIDIA_HOOK_TEMPLATES.items():
+    assert {cause.code for _, cause in DOCKER_RUN_CAUSES} == set(_NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE)
+    for code, template in _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE.items():
         assert template.reason == code
 
 

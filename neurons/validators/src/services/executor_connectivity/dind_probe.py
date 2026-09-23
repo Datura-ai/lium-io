@@ -163,14 +163,9 @@ class DindVerifier:
                 # self-report (machine_scrape.check_sysbox_gpu_compatibility) runs the same hook on the
                 # same host, so a refusal without sysbox-runc has the same cause
                 cause = diagnose_docker_run_error(error_msg)
-                logger.error(
-                    _m(
-                        "DinD creation failed",
-                        extra=get_extra_info(
-                            {**log_ctx, "error": error_msg, "cause": cause.code if cause else None}
-                        ),
-                    )
-                )
+                cause_code = cause.code if cause else None
+                failure_extra = get_extra_info({**log_ctx, "error": error_msg, "cause": cause_code})
+                logger.error(_m("DinD creation failed", extra=failure_extra))
                 await ssh_client.run(DockerCommand.remove_with_volumes(name))
                 return DindProbeResult(
                     success=False,
