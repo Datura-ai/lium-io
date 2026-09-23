@@ -11,9 +11,10 @@ set -e
 #   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
 #   SYSBOX_SETUP_HOST_ROOT      test-only: prefix for the host files the preflight reads (/proc/modules, /etc/os-release, ...)
 
-SYSBOX_VERSION="0.6.6"
-SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
-SYSBOX_SHA="87cfa5cad97dc5dc1a243d6d88be1393be75b93a517dc1580ecd8a2801c2777a"
+# 0.6.7, not 0.6.6: under Docker 29's containerd image store, 0.6.6 cannot start an image with 44+ layers (DAH-3833)
+SYSBOX_VERSION="0.6.7"
+SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}.linux_amd64.deb"
+SYSBOX_SHA="b7ac389e5a19592cadf16e0ca30e40919516128f6e1b7f99e1cb4ff64554172e"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
 
@@ -102,7 +103,7 @@ sysbox_idmapped_report() {
 }
 
 sysbox_runc_version() {
-    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.6.6" is one of the
+    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.6.7" is one of the
     # tab-indented lines after it (edition, version, commit, ...), so the first line is never the
     # version. Prints the number; exit 1 when the binary is missing or prints no version.
     sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep .
@@ -566,7 +567,15 @@ fi
 
 # ── 2. Already working? ─────────────────────────────────
 
-if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc; then
+INSTALLED_SYSBOX=$(sysbox_runc_version || true)
+SYSBOX_IS_OLDER=false
+if [ -n "$INSTALLED_SYSBOX" ] && [ "$INSTALLED_SYSBOX" != "$SYSBOX_VERSION" ] \
+    && [ "$(printf '%s\n' "$INSTALLED_SYSBOX" "$SYSBOX_VERSION" | sort -V | head -1)" = "$INSTALLED_SYSBOX" ]; then
+    SYSBOX_IS_OLDER=true
+    warn "Sysbox $INSTALLED_SYSBOX is installed; upgrading to $SYSBOX_VERSION."
+fi
+
+if [ "$SYSBOX_IS_OLDER" = false ] && command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc; then
     # pull first: without the image the real test cannot run and the host would be judged on kernel version alone
     if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
         abort_on_active_rentals
@@ -591,7 +600,7 @@ elif [ "$(sysbox_idmapped_report)" = "no" ]; then
 fi
 
 SKIP_INSTALL=false
-command -v sysbox-runc &>/dev/null && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
+[ "$SYSBOX_IS_OLDER" = false ] && command -v sysbox-runc &>/dev/null && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
 
 # ── 3. Check running containers ─────────────────────────
 
@@ -688,7 +697,7 @@ apt_install install -y -qq nvidia-container-toolkit jq || exit 1
 ok "nvidia-container-toolkit, jq"
 
 if [ "$SKIP_INSTALL" = false ]; then
-    LOCAL_DEB="./sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
+    LOCAL_DEB="./sysbox-ce_${SYSBOX_VERSION}.linux_amd64.deb"
     if [ -f "$LOCAL_DEB" ]; then
         SYSBOX_DEB="$LOCAL_DEB"
     else

@@ -24,7 +24,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm"]
+REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "sort"]
 
 STUBS = {
     "id": '#!/bin/bash\necho "${STUB_UID:-0}"\n',
@@ -64,7 +64,7 @@ STUBS = {
     ),
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
-    "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t0.6.6\\n\\tcommit:\\tabc123\\n"\n',
+    "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t${STUB_SYSBOX_VERSION:-0.6.7}\\n\\tcommit:\\tabc123\\n"\n',
     "ss": textwrap.dedent(
         """\
         #!/bin/bash
@@ -546,7 +546,7 @@ def test_env_file_in_the_working_directory_is_ignored_when_piped_from_curl(tmp_p
 def test_sysbox_installed_registered_and_running_passes(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_sysbox")
     assert rc == 0
-    assert "PASS sysbox-runc 0.6.6 runs a container." in out
+    assert "PASS sysbox-runc 0.6.7 runs a container." in out
 
 
 def test_sysbox_missing_points_at_the_installer(tmp_path):
@@ -623,6 +623,22 @@ def test_install_mode_on_a_good_host_reaches_the_install_steps(tmp_path):
     assert "Nothing was installed." not in proc.stdout
     assert "Sysbox is already working. Nothing to do." in proc.stdout
     assert "FIX line(s) at the top" not in proc.stdout
+
+
+def test_install_mode_upgrades_an_older_working_sysbox(tmp_path):
+    # DAH-3833: sysbox 0.6.6 works, but cannot start an image with 44+ layers; a re-run must upgrade it
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6"})
+    assert "Sysbox 0.6.6 is installed; upgrading to 0.6.7." in proc.stdout
+    assert "Sysbox is already working. Nothing to do." not in proc.stdout
+    assert "Checking running containers" in proc.stdout
+
+
+def test_install_mode_keeps_a_newer_sysbox(tmp_path):
+    # a provider on a newer sysbox is never downgraded
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.7.1"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Sysbox is already working. Nothing to do." in proc.stdout
+    assert "upgrading" not in proc.stdout
 
 
 @pytest.mark.parametrize(
@@ -743,7 +759,7 @@ def test_diagnostics_print_the_sysbox_runc_version_not_its_name(tmp_path):
     """Regression: `sysbox-runc --version | head -1` is the line "sysbox-runc"; the version is on a later line."""
     rc, out, _ = run_check(tmp_path, "failure_diagnostics")
     assert rc == 0
-    assert "sysbox-runc:         0.6.6" in out
+    assert "sysbox-runc:         0.6.7" in out
     assert "sysbox-runc:         sysbox-runc" not in out
 
 
