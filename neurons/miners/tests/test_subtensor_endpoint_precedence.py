@@ -191,10 +191,16 @@ class _HangingThenRecordingAsyncSubtensor(_RecordingAsyncSubtensor):
     """Our own endpoint's hostname does not resolve: async_substrate_interface retries the DNS
     lookup forever, so `initialize()` never returns; later dials record."""
 
+    closed: list[str] = []
+
     def __init__(self, network=None, config=None, **kwargs):
         self._hang = network == OWN_ENDPOINT
+        self._network = network
         if not self._hang:
             super().__init__(network=network, config=config, **kwargs)
+
+    async def close(self):
+        _HangingThenRecordingAsyncSubtensor.closed.append(self._network)
 
     async def initialize(self):
         if self._hang:
@@ -205,6 +211,7 @@ class _HangingThenRecordingAsyncSubtensor(_RecordingAsyncSubtensor):
 @pytest.mark.asyncio
 async def test_initialize_subtensor_falls_back_when_our_endpoint_connect_hangs(monkeypatch, caplog):
     _RecordingAsyncSubtensor.calls = []
+    _HangingThenRecordingAsyncSubtensor.closed = []
     monkeypatch.setattr(
         miner_module.bittensor, "AsyncSubtensor", _HangingThenRecordingAsyncSubtensor
     )
@@ -217,6 +224,7 @@ async def test_initialize_subtensor_falls_back_when_our_endpoint_connect_hangs(m
 
     assert (miner.subtensor.chain_endpoint, miner.subtensor.network) == (PUBLIC_FINNEY, "finney")
     assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
+    assert _HangingThenRecordingAsyncSubtensor.closed == [OWN_ENDPOINT]
 
 
 SECOND_ENDPOINT = "ws://archive-node-proxy-2.proxy"

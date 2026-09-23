@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import traceback
 from collections.abc import Sequence
@@ -92,12 +93,17 @@ class Miner:
         last_error: Exception | None = None
         for _attempt in range(len(cursor.candidates)):
             endpoint = cursor.current
+            client: bittensor.AsyncSubtensor | None = None
             try:
+                client = bittensor.AsyncSubtensor(network=endpoint.value, config=self.config)
                 subtensor = await asyncio.wait_for(
-                    bittensor.AsyncSubtensor(network=endpoint.value, config=self.config).initialize(),
-                    timeout=CHAIN_CONNECT_TIMEOUT_SECONDS,
+                    client.initialize(), timeout=CHAIN_CONNECT_TIMEOUT_SECONDS
                 )
             except Exception as e:
+                if client is not None:
+                    # a dial cut by the deadline can leave its websocket open
+                    with contextlib.suppress(Exception):
+                        await client.close()
                 last_error = e
                 if len(cursor.candidates) == 1:
                     raise
