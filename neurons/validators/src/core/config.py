@@ -341,12 +341,15 @@ class Settings(BaseSettings):
     RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX: float = Field(env="RENTED_POD_SSH_PROBE_FLEET_FAIL_MAX", default=0.5, ge=0.0, le=1.0)
     # DAH-2255 — the enforcement half of the probe above. Off (the default): RENTED_POD_SSH_UNREACHABLE
     # is recorded and reported and the rented score stands (DAH-2870's behaviour). On: a pod whose
-    # streak reaches ENFORCE_AFTER_CYCLES makes the rented-state check FAIL for the cycle — score 0,
-    # verified job cleared — the way the rental probe fails an unreachable unrented node; the next
-    # healthy cycle scores as rented again. ENFORCE_AFTER_CYCLES unset means RENTED_POD_SSH_PROBE_CYCLES
-    # (the notify threshold); a value below it is refused at startup, so a provider is never zeroed
-    # for an outage no renter was told about and one blip (a streak of 1 under the default 2) never
-    # costs a cycle. Enforcement adds no report: the one POST per outage stays the probe's.
+    # streak reaches ENFORCE_AFTER_CYCLES and whose outage the backend has accepted makes the
+    # rented-state check FAIL for the cycle — score 0, verified job cleared — the way the rental
+    # probe fails an unreachable unrented node; the next healthy cycle scores as rented again.
+    # ENFORCE_AFTER_CYCLES unset means RENTED_POD_SSH_PROBE_CYCLES (the notify threshold); a value
+    # below it is refused at startup, so a provider is never zeroed for an outage no renter was
+    # told about. With the defaults (notify at 2, then wait for the backend accept) enforcement
+    # starts at streak 3, not 2: the notify cycle queues the report, and the next cycle can fail
+    # the check. One blip (a streak of 1) never costs a cycle. Enforcement adds no report: the
+    # one POST per outage stays the probe's.
     RENTED_POD_SSH_ENFORCEMENT_ENABLED: bool = Field(env="RENTED_POD_SSH_ENFORCEMENT_ENABLED", default=False)
     RENTED_POD_SSH_ENFORCE_AFTER_CYCLES: int | None = Field(env="RENTED_POD_SSH_ENFORCE_AFTER_CYCLES", default=None, ge=1)
     # DAH-2735 — judge an idle node's GPU by WHO holds it, not by utilization: a competitor's

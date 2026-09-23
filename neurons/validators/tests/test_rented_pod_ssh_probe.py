@@ -295,6 +295,8 @@ async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does
         "count": 4,
         "first_failed_at": h.streak()["first_failed_at"],
         "reported": True,
+        "accepted": True,
+        "accepted_faults": [FAULT_TCP_REFUSED],
     }
     [pod] = after.event.what_we_saw["unreachable_pods"]
     assert pod["report_queued"] is False
@@ -420,6 +422,8 @@ async def test_a_notify_failed_answer_keeps_the_outage_unacknowledged_and_posts_
     [pod] = refused.event.what_we_saw["unreachable_pods"]
     assert pod["report_queued"] is True
     assert h.streak()["reported"] is False
+    assert h.streak()["accepted"] is True
+    assert h.streak()["accepted_faults"] == [FAULT_TCP_REFUSED]
     assert h.backend.report_pod_ssh_unreachable.await_count == 1
 
     h.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(
@@ -1190,11 +1194,15 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
         "count": 2,
         "first_failed_at": stored.first_failed_at,
         "reported": False,
+        "accepted": False,
+        "accepted_faults": [],
     }
     reported = rented_pod_ssh.FailStreak.load(
         b'{"count": 2, "first_failed_at": "x", "reported": true}', now_iso=now
     )
     assert reported.reported is True and reported.next().reported is True
+    # pre-field streaks that already told the renter stay accepted
+    assert reported.accepted is True
     assert (
         rented_pod_ssh.FailStreak.load(b'{"count": 2, "reported": "yes"}', now_iso=now).reported
         is False

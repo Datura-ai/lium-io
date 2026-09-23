@@ -357,7 +357,7 @@ class TenantEnforcementCheck:
         check read off the pod travels with a failure.
         """
         threshold = enforce_after_cycles()
-        first = enforced[0]
+        evidence_verdict = enforced[0]
         event = render_message(
             Msg.RENTED_POD_SSH_UNREACHABLE,
             ctx=ctx,
@@ -392,8 +392,8 @@ class TenantEnforcementCheck:
                 "score": 0.0,
                 "job_score": 0.0,
                 "score_warning": (
-                    f"Rented pod {first.pod_id} unreachable over SSH for "
-                    f"{first.consecutive_cycles} cycles"
+                    f"Rented pod {evidence_verdict.pod_id} unreachable over SSH for "
+                    f"{evidence_verdict.consecutive_cycles} cycles"
                 ),
                 "clear_verified_job_info": True,
                 # The backend's penalty row shows the outage the way it shows a pod's death diagnostics
@@ -402,12 +402,12 @@ class TenantEnforcementCheck:
                 "clear_verified_job_evidence": {
                     "reason_code": event.reason_code,
                     "check_id": self.check_id,
-                    "pod_id": first.pod_id,
-                    "ssh_port": first.ssh_port,
-                    "faults": list(first.faults),
-                    "consecutive_cycles": first.consecutive_cycles,
-                    "first_failed_at": first.first_failed_at,
-                    "boot_id_changed": first.boot_id_changed,
+                    "pod_id": evidence_verdict.pod_id,
+                    "ssh_port": evidence_verdict.ssh_port,
+                    "faults": list(evidence_verdict.faults),
+                    "consecutive_cycles": evidence_verdict.consecutive_cycles,
+                    "first_failed_at": evidence_verdict.first_failed_at,
+                    "boot_id_changed": evidence_verdict.boot_id_changed,
                     "enforce_after_cycles": threshold,
                 },
             },

@@ -29,6 +29,7 @@ from neurons.validators.src.services.task.models import JobResult
 from neurons.validators.src.services.task.pipeline import (
     updates_with_clear_verified_job_evidence,
 )
+from protocol.vc_protocol.compute_requests import PodSshUnreachableResponse
 from pydantic import ValidationError
 from test_rented_pod_ssh_probe import KEYS, POD_ID, SSH_PORT, Harness
 
@@ -365,10 +366,44 @@ def test_enforcement_settings_default_off_and_the_threshold_is_never_below_notif
         Settings(_env_file=None)
 
 
+@pytest.mark.asyncio
+async def test_notify_failed_accept_still_enforces_on_the_next_cycle(context_factory):
+    # Backend 200 with refused mail: accept is on the streak, mail is not. The next cycle zeros
+    # the node; a renter with refused mail does not protect the provider.
+    h = Harness(context_factory)
+    h.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(
+        recorded=True, delivery="notify_failed"
+    )
+    with enforcement(enabled=True):
+        await two_refused_cycles_after_a_healthy_one(h)
+        assert h.streak()["accepted"] is True and h.streak()["reported"] is False
+        failed = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS, boot_id="boot-b")
+
+    assert failed.passed is False and failed.updates["score"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_keys_only_accept_does_not_enforce_a_later_port_fault(context_factory):
+    # Backend accepted a keys-only outage (renter deleted the keys). A later port refuse must
+    # not zero the node on that accept, including during a validator-side outage.
+    h = Harness(context_factory)
+    with enforcement(enabled=True):
+        await h.cycle(tcp_fault=None, ssh_keys=KEYS, boot_id="boot-a")
+        await h.cycle(tcp_fault=None, ssh_keys=[], boot_id="boot-a")
+        told = await h.cycle(tcp_fault=None, ssh_keys=[], boot_id="boot-a")
+        assert told.passed is True
+        h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+        result = await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=[], boot_id="boot-a")
+
+    assert result.passed is True and result.updates["score"] == 0.9
+    assert result.event.what_we_saw.get("enforced") is not True
+
+
 def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
     unhealthy = RentedPodSshVerdict(
         pod_id=POD_ID, container_name="pod_1", ssh_port=SSH_PORT, healthy=False,
         faults=[FAULT_TCP_REFUSED], consecutive_cycles=2, report=True,
+        accepted=True, accepted_faults=[FAULT_TCP_REFUSED],
     )
     with enforcement(enabled=False):
         assert rented_pod_ssh.is_enforced(unhealthy) is False
@@ -376,14 +411,23 @@ def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
         assert rented_pod_ssh.is_enforced(unhealthy) is True
         assert rented_pod_ssh.is_enforced(replace(unhealthy, consecutive_cycles=1)) is False
         assert rented_pod_ssh.is_enforced(replace(unhealthy, healthy=True, consecutive_cycles=0)) is False
-        assert rented_pod_ssh.is_enforced(replace(unhealthy, report_queued=True)) is False
-        assert rented_pod_ssh.is_enforced(replace(unhealthy, report=False)) is False
+        # mail retry still queues; accept is what enforcement reads
+        assert rented_pod_ssh.is_enforced(replace(unhealthy, report_queued=True)) is True
+        assert rented_pod_ssh.is_enforced(replace(unhealthy, accepted=False)) is False
         keys_only = replace(
             unhealthy,
             faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
+            accepted_faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
             boot_id_changed=False,
         )
         assert rented_pod_ssh.is_enforced(keys_only) is False
         assert rented_pod_ssh.is_enforced(replace(keys_only, boot_id_changed=True)) is True
+        later_port = replace(
+            unhealthy,
+            faults=[FAULT_TCP_REFUSED],
+            accepted_faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
+            boot_id_changed=False,
+        )
+        assert rented_pod_ssh.is_enforced(later_port) is False
     with enforcement(enabled=True, after_cycles=3):
         assert rented_pod_ssh.is_enforced(unhealthy) is False
