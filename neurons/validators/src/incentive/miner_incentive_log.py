@@ -426,13 +426,13 @@ class MinerLogLine(BaseModel):
             message=(
                 f"No unrented incentive for the {result.gpu_count} free GPU(s) on this partially "
                 f"rented node: it has {port_limited.available_port_count} free port(s) and the "
-                f"marketplace needs at least {port_limited.required} to list and rent them, so nobody "
+                f"marketplace needs at least {port_limited.required_port_count} to list and rent them, so nobody "
                 "can rent these GPUs right now. The rented GPUs keep earning. Idle pay resumes "
                 "when the rental ends or the node gets more open ports."
             ),
             extra_fields={
                 "available_port_count": port_limited.available_port_count,
-                "required_port_count": port_limited.required,
+                "required_port_count": port_limited.required_port_count,
             },
         )
 

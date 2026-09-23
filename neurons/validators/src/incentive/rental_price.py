@@ -103,7 +103,7 @@ class PortLimitedRemainder(BaseModel):
     platform lists against and the rent path refuses below."""
 
     available_port_count: int
-    required: int  # MIN_PORT_COUNT at the time of the measurement
+    required_port_count: int
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -506,7 +506,7 @@ class RentalPriceIncentive(DefaultIncentive):
             return None
         if available >= MIN_PORT_COUNT:
             return None
-        return PortLimitedRemainder(available_port_count=available, required=MIN_PORT_COUNT)
+        return PortLimitedRemainder(available_port_count=available, required_port_count=MIN_PORT_COUNT)
 
     def _log_port_limited_remainder(
         self, result: JobResult, port_limited: PortLimitedRemainder
@@ -523,7 +523,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     "gpu_model": result.gpu_model,
                     "gpu_count": result.gpu_count,
                     "available_port_count": port_limited.available_port_count,
-                    "required_port_count": port_limited.required,
+                    "required_port_count": port_limited.required_port_count,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
