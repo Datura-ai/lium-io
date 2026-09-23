@@ -96,7 +96,7 @@ def test_remainder_with_two_free_ports_is_port_limited():
     # Assert
     assert limited is not None
     assert limited.available_port_count == 2
-    assert limited.required == MIN_PORT_COUNT
+    assert limited.required_port_count == MIN_PORT_COUNT
 
 
 def test_remainder_at_the_floor_is_not_port_limited():

@@ -140,6 +140,12 @@ class Settings(BaseSettings):
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-2313: reject unrented executors without sysbox so they never appear on the network.
     REQUIRE_SYSBOX_FOR_UNRENTED: bool = Field(env="REQUIRE_SYSBOX_FOR_UNRENTED", default=True)
+    # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
+    # in PortConnectivityCheck, the TTL bounds the window between two misses.
+    DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
+    DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS: int = Field(
+        env="DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS", default=3600, gt=0
+    )
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
     # DAH-2265: cached-template requirement. Before the cutoff the CachedTemplateVerificationCheck
@@ -364,6 +370,14 @@ class Settings(BaseSettings):
     RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
+    # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
+    # wave writes nothing about it: no report row, no availability error, no evidence for the
+    # backend's staleness sweep. On, the wave writes one failed result per rented executor of that
+    # miner that the backend lists and the miner did not return (RENTED_EXECUTOR_NOT_LISTED,
+    # score 0, availability error). Manual rentals keep their forced pass. Off = today's behaviour.
+    RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED: bool = Field(
+        env="RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED", default=False
+    )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
@@ -571,7 +585,7 @@ class Settings(BaseSettings):
     # unprivileged-on-host (user-namespaced) container. Egress is firewalled
     # host-side to block cloud metadata + RFC1918. See the DAH-2211 build flow.
     CUSTOM_DOCKERFILE_DIND_IMAGE: str = Field(
-        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.1",
+        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.3",
         description="Sysbox DinD image used to build custom-dockerfile pods in isolation.",
     )
     CUSTOM_DOCKERFILE_DIND_CPUS: str = Field(

@@ -35,6 +35,11 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
     ],
     "NVIDIA B300 SXM6 AC": 6.4,
 }
+# `NVIDIA B300 SXM6 PC`: provider-observed on real hardware, 21 Sep 2026 (nvidia-smi: name NVIDIA B300
+# SXM6 PC, memory.total 275040 MiB, all 8 GPUs of the host); not in NVIDIA's public chip list, which has
+# only the AC spelling. Listed as the AC card's alias and never a row of its own: every table derives it
+# from the AC entry, so a re-price of the AC card moves both names.
+RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 PC"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM6 AC"]
 
 
 # Maximum unrented GPUs per `(base_model, gpu_count_bucket)` before cap dilution.
@@ -51,8 +56,17 @@ RENTAL_PRICES_PER_HOUR: dict[str, float] = {
 # bucket cap equals `machines × gpus_per_machine`. Eligible families use
 # `{1: 10, 8: 64}` — 10 single-GPU machines (10 GPUs) and 8 full chassis (8×8 = 64
 # GPUs), matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
+#
+# B300 1× bucket = 4 (DAH-3601, P157/P164, 17 Sep 2026): renters held at most 6 single
+# B300 cards at once over 3–17 Sep (p95 = 5) while 17 were listed and 12 sat idle.
+# The bucket pays for 4 cards, one below that p95 (Rustam, 18 Sep 2026). The
+# 8× bucket is unchanged. The 1× cap also dilutes the free GPUs of partially rented
+# split 8× nodes: their free portion is scored as a virtual result (DAH-2467) that is
+# always rated at the node's `gpu_splitting_min_count` tier (`_resolve_bucket`: a
+# remainder never claims a bundle tier), the 1× bucket for a 1-card split minimum, so
+# those cards share the 4 with the idle single-card nodes.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
-    "B300": {1: 10, 8: 32},
+    "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},
     "H200": {1: 10, 8: 64},
     "H100": {1: 10, 8: 64},
@@ -251,6 +265,7 @@ BASE_GPU_MAP = {
     "NVIDIA GeForce GTX 1060": "GTX 1060",
     "NVIDIA Tesla M40": "Tesla M40",
 }
+BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # derived, see RENTAL_PRICES_PER_HOUR
 
 
 class IncentiveConfig(BaseModel):
