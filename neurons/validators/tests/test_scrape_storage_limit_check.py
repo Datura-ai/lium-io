@@ -92,7 +92,10 @@ class FakeDockerHost:
         returncode = 0
         stderr = ""
         if step == "run --storage-opt" and not self.storage_opt_ok:
-            returncode, stderr = 125, "docker: Error response from daemon: --storage-opt is supported only for overlay over xfs with 'pquota' mount option."
+            returncode, stderr = (
+                125,
+                "docker: Error response from daemon: --storage-opt is supported only for overlay over xfs with 'pquota' mount option.",
+            )
         elif step == "info --format":
             stdout = f"{self.docker_root}\n"
         elif step == "plugin inspect":
@@ -121,9 +124,13 @@ class FakeDockerHost:
 
 
 def _scrape(host: FakeDockerHost) -> dict[str, Any]:
-    fake_subprocess = SimpleNamespace(run=host.run, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)
+    fake_subprocess = SimpleNamespace(
+        run=host.run, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired
+    )
     return build_scrape_namespace(
-        SRC / "miner_jobs" / "machine_scrape.py", STORAGE_HELPERS, {"subprocess": fake_subprocess, "os": os}
+        SRC / "miner_jobs" / "machine_scrape.py",
+        STORAGE_HELPERS,
+        {"subprocess": fake_subprocess, "os": os},
     )
 
 
@@ -170,8 +177,14 @@ def test_a_missing_plugin_is_installed_the_way_the_rental_path_installs_it() -> 
     assert result == (True, "Storage limit is supported.")
     install = next(call for call in host.calls if call[1:3] == ["plugin", "install"])
     assert install == [
-        "docker", "plugin", "install", "ashald/docker-volume-loopback",
-        "--alias", "vloopback", "--grant-all-permissions", "DATA_DIR=/mnt/lium-xfs/lium-docker/loopback",
+        "docker",
+        "plugin",
+        "install",
+        "ashald/docker-volume-loopback",
+        "--alias",
+        "vloopback",
+        "--grant-all-permissions",
+        "DATA_DIR=/mnt/lium-xfs/lium-docker/loopback",
     ]
 
 
@@ -198,7 +211,10 @@ def test_a_relative_mountpoint_fails_before_any_container_starts() -> None:
 
     # Assert
     assert supported is False
-    assert reason == "VLOOPBACK_MOUNTPOINT_NOT_ABSOLUTE: docker volume inspect gave Mountpoint '206/fs'"
+    assert (
+        reason
+        == "VLOOPBACK_MOUNTPOINT_NOT_ABSOLUTE: docker volume inspect gave Mountpoint '206/fs'"
+    )
     assert "run -v" not in host.steps()
     assert host.volumes == set()
 
@@ -272,7 +288,9 @@ def test_each_failing_step_is_reported_with_its_reason_code(
     assert reason == expected_reason
     assert host.steps()[-1] == last_step
     # the test volume never outlives the check, except when removing it is what failed
-    assert host.volumes == (set() if "volume rm" not in host.failing else {f"lium_storage_check_{os.getpid()}"})
+    assert host.volumes == (
+        set() if "volume rm" not in host.failing else {f"lium_storage_check_{os.getpid()}"}
+    )
 
 
 def test_no_docker_cli_is_an_error_with_its_own_code() -> None:
@@ -280,9 +298,13 @@ def test_no_docker_cli_is_an_error_with_its_own_code() -> None:
     def missing_docker(command, **_):
         raise FileNotFoundError(2, "No such file or directory", "docker")
 
-    fake_subprocess = SimpleNamespace(run=missing_docker, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)
+    fake_subprocess = SimpleNamespace(
+        run=missing_docker, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired
+    )
     scrape = build_scrape_namespace(
-        SRC / "miner_jobs" / "machine_scrape.py", STORAGE_HELPERS, {"subprocess": fake_subprocess, "os": os}
+        SRC / "miner_jobs" / "machine_scrape.py",
+        STORAGE_HELPERS,
+        {"subprocess": fake_subprocess, "os": os},
     )
 
     # Act
