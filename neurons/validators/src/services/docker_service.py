@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 from uuid import UUID, uuid4
 
 import asyncssh
@@ -509,6 +509,101 @@ def _exception_texts(exc: Exception) -> list[str]:
         if last_exception is not None:
             texts.append(str(last_exception))
     return texts
+
+
+# DAH-2211 follow-up: how much of a failed custom build's output travels with the failure. The renter
+# wrote the Dockerfile, so its build output is theirs to see; the cap keeps the wire message small.
+CUSTOM_BUILD_LOG_TAIL_LINES = 25
+CUSTOM_BUILD_LOG_TAIL_MAX_CHARS = 2000
+# The build command's own exit-code marker on stderr (`echo BUILD_FAILED_RC=$rc >&2`): the streamer's
+# failure signal, not a build line, so it never counts toward the renter's tail.
+CUSTOM_BUILD_FAILED_MARKER = "BUILD_FAILED_RC="
+# What execute_and_stream_logs returns as stderr when asyncio.wait_for fires — that text alone: the
+# process's own stderr is dropped with the cancelled stream. A failed build that PRINTED "process timed
+# out" comes back with its tail and the BUILD_FAILED_RC= marker around it, so it is not a timeout.
+STREAM_TIMEOUT_STDERR = "Process timed out"
+# `docker save | docker load` fails on the HOST daemon's side (its paths, its disk); that stderr is
+# for ops, the renter's tail gets this fixed line.
+CUSTOM_BUILD_EXPORT_FAILED_REASON = "built image could not be loaded onto the executor"
+# stderr with no BUILD_FAILED_RC= marker: the build script never finished and the text is the host
+# daemon's `docker exec` error, so the renter gets this fixed line.
+CUSTOM_BUILD_INTERRUPTED_REASON = "build container stopped before the build finished"
+# The build's exit code round-trips through a file in the DinD container's /tmp. When that file
+# cannot be written or read (the overlay is full or read-only) the build is treated as failed and
+# this line ends its tail, so the renter and the tests see WHY rather than `[: Illegal number:`.
+CUSTOM_BUILD_RC_UNREADABLE_REASON = (
+    "build exit code could not be read back (the build container could not write to /tmp); "
+    "the build is treated as failed"
+)
+# Paths inside the DinD container. Tests patch these; production keeps them under /tmp, outside /build.
+CUSTOM_BUILD_LOG_FILE = "/tmp/lium-build.log"
+CUSTOM_BUILD_RC_FILE = "/tmp/lium-build.rc"
+
+
+class CustomBuildOutcome(NamedTuple):
+    """What `_custom_build_image` returns: `ok`, the `failure_step` name and the renter-facing `log_tail`
+    (None, None on success)."""
+
+    ok: bool
+    failure_step: str | None
+    log_tail: str | None
+
+
+def custom_build_log_tail(output: str | None) -> str | None:
+    """The last CUSTOM_BUILD_LOG_TAIL_LINES non-empty lines of a build's output, cut to
+    CUSTOM_BUILD_LOG_TAIL_MAX_CHARS from the end (the error is at the bottom). The BUILD_FAILED_RC=
+    marker line is dropped before the cap, so a failed build yields 25 build lines, not 24 and the
+    marker. None when there is nothing."""
+    lines = [
+        line.rstrip()
+        for line in (output or "").splitlines()
+        if line.strip() and not line.lstrip().startswith(CUSTOM_BUILD_FAILED_MARKER)
+    ]
+    if not lines:
+        return None
+    tail = "\n".join(lines[-CUSTOM_BUILD_LOG_TAIL_LINES:])
+    return tail[-CUSTOM_BUILD_LOG_TAIL_MAX_CHARS:]
+
+
+def stream_timed_out(err: str | None) -> bool:
+    """True only when stderr is the streamer's own timeout sentinel and nothing else."""
+    return (err or "").strip().lower() == STREAM_TIMEOUT_STDERR.lower()
+
+
+def custom_build_inner_command(image_tag: str, ctx: str) -> str:
+    """The `sh -c` body that runs `docker build` inside the DinD container. Build output goes to
+    stdout (the streamer's success lines) and to CUSTOM_BUILD_LOG_FILE; on a non-zero exit the last
+    CUSTOM_BUILD_LOG_TAIL_LINES non-blank lines of that file go to stderr, then the
+    BUILD_FAILED_RC=<rc> marker; the exit code is the build's (no pipefail needed: it is read
+    back from CUSTOM_BUILD_RC_FILE). An rc file that cannot be written or read makes the build a
+    failure (rc 1) whose tail ends with CUSTOM_BUILD_RC_UNREADABLE_REASON — never a bare `exit`
+    that reads as success. No single quotes, so the caller's shlex.quote keeps the text verbatim."""
+    return (
+        f"{{ docker build --progress=plain --pull "
+        f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; echo $? > {CUSTOM_BUILD_RC_FILE}; }} "
+        f"| tee {CUSTOM_BUILD_LOG_FILE}; rc=$(cat {CUSTOM_BUILD_RC_FILE} 2>/dev/null); "
+        'if [ -z "$rc" ]; then rc=1; rc_lost=1; fi; '
+        f'if [ "$rc" -ne 0 ]; then grep -v "^[[:space:]]*$" {CUSTOM_BUILD_LOG_FILE} '
+        f"| tail -n {CUSTOM_BUILD_LOG_TAIL_LINES} >&2; "
+        f'if [ -n "$rc_lost" ]; then echo "{CUSTOM_BUILD_RC_UNREADABLE_REASON}" >&2; fi; '
+        f"echo {CUSTOM_BUILD_FAILED_MARKER}$rc >&2; fi; exit $rc"
+    )
+
+
+class CustomBuildFailed(Exception):
+    """A custom-Dockerfile build did not produce an image. `failure_step` is the CCF step
+    (docker_build, build_timeout, build_dind_start, ...); `log_tail` is what the build printed last,
+    or a one-line reason for the setup steps, so the failure says WHY and not only WHERE.
+
+    `str()` carries the step only. The tail is renter-controlled output and the backend classifies
+    the CCF `detail` for GPU quarantine (`classify_gpu_runtime_error(msg.detail or msg.msg)`), so it
+    travels in `build_log_tail` alone; the validator's own log line carries its size, not its text
+    (a build line can hold a credential the renter wrote)."""
+
+    def __init__(self, failure_step: str, log_tail: str | None):
+        self.failure_step = failure_step
+        self.log_tail = log_tail
+        super().__init__(f"Custom dockerfile build failed (failure_step={failure_step})")
 
 
 class _CreateCancelledByDelete(Exception):
@@ -1837,7 +1932,7 @@ class DockerService:
                     status, error = await self._stream_process_output(process, log_tag)
         except TimeoutError:
             status = False
-            error = "Process timed out"
+            error = STREAM_TIMEOUT_STDERR
             await self.stream_log(error, "error", log_tag)
             logger.warning(
                 _m(
@@ -4341,13 +4436,14 @@ class DockerService:
         payload: ContainerCreateRequest,
         log_tag: str,
         default_extra: dict,
-    ) -> tuple[bool, str | None]:
+    ) -> CustomBuildOutcome:
         """Build a custom image from `payload.dockerfile_content` on the executor.
 
-        Returns (success, failure_step). On success returns (True, None); the
-        built image tag is `_custom_build_image_tag(pod_id)`. On failure returns
-        (False, failure_step) — caller routes through the same CCF
-        `UnknownError` path used by today's pull-failure.
+        Returns a CustomBuildOutcome. On success `ok` is True and the built image tag is
+        `_custom_build_image_tag(pod_id)`. On failure the caller raises CustomBuildFailed so the
+        CCF `UnknownError` path used by today's pull-failure carries `failure_step` and `log_tail`:
+        the last lines the build printed (docker_build), the timeout in seconds (build_timeout),
+        or a fixed one-line reason for build_export and the setup steps (never their stderr).
         """
         from core.config import settings
 
@@ -4373,7 +4469,7 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "size_bytes": len(content)}),
                 )
             )
-            return False, "build_input_oversize"
+            return CustomBuildOutcome(False, "build_input_oversize", f"Dockerfile exceeds {max_bytes} byte cap")
 
         # 1. Preflight: sysbox-runc MUST be available. Never fall back to runc —
         #    a silent fallback would run an internet-enabled build on the host
@@ -4394,7 +4490,7 @@ class DockerService:
                         ),
                     )
                 )
-                return False, "build_sysbox_unavailable"
+                return CustomBuildOutcome(False, "build_sysbox_unavailable", "sysbox-runc runtime unavailable on executor")
         except Exception as exc:
             logger.error(
                 _m(
@@ -4403,7 +4499,7 @@ class DockerService:
                 ),
                 exc_info=True,
             )
-            return False, "build_sysbox_unavailable"
+            return CustomBuildOutcome(False, "build_sysbox_unavailable", "sysbox-runc preflight failed on executor")
 
         dind_ip: str | None = None
         egress_applied = False
@@ -4429,7 +4525,7 @@ class DockerService:
                         ),
                     )
                 )
-                return False, "build_dind_start"
+                return CustomBuildOutcome(False, "build_dind_start", "isolated build container failed to start")
 
             # 3. Wait for the inner dockerd to accept connections.
             ready = False
@@ -4451,7 +4547,7 @@ class DockerService:
                         ),
                     )
                 )
-                return False, "build_dind_unready"
+                return CustomBuildOutcome(False, "build_dind_unready", f"isolated build container not ready after {ready_timeout_s} s")
 
             # 4. Resolve the DinD container IP and firewall its egress host-side
             #    (block cloud metadata + RFC1918; full public internet stays open).
@@ -4471,7 +4567,7 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "raw_ip": raw_ip}),
                     )
                 )
-                return False, "build_egress_setup"
+                return CustomBuildOutcome(False, "build_egress_setup", "could not resolve the build container address")
 
             apply_script = self._egress_filter_script(dind_ip, cidrs, apply=True)
             egress_cmd = (
@@ -4495,7 +4591,7 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "error": err}),
                     )
                 )
-                return False, "build_egress_setup"
+                return CustomBuildOutcome(False, "build_egress_setup", "build egress firewall could not be applied")
             egress_applied = True
 
             # 5. Write the Dockerfile into the DinD container (stdin, not argv).
@@ -4512,18 +4608,21 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
-                return False, "build_setup"
+                return CustomBuildOutcome(False, "build_setup", "could not write the Dockerfile into the build container")
 
             # 6. Build INSIDE the DinD container WITH network enabled (no
             #    --network=none). BuildKit streams progress to stderr and
             #    `execute_and_stream_logs` treats any stderr as failure, so we
-            #    redirect build output to stdout (streamed as success logs) and
+            #    redirect build output to stdout (streamed as success logs, and
+            #    kept in a log file under /tmp inside the DinD container) and
             #    emit to stderr ONLY on non-zero exit — the streamer's signal.
-            inner_build = (
-                f"docker build --progress=plain --pull "
-                f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; "
-                f"rc=$?; [ $rc -ne 0 ] && echo BUILD_FAILED_RC=$rc >&2; exit $rc"
-            )
+            #    The stderr then carries the last non-blank lines of the build
+            #    output, which is the only place the reason for the failure
+            #    exists once the DinD container is torn down: the streamer
+            #    returns stderr, not stdout. The log and rc files live outside
+            #    the build context (/build) so a `COPY .` in the renter's
+            #    Dockerfile never picks them up.
+            inner_build = custom_build_inner_command(image_tag, ctx)
             build_cmd = (
                 f"/usr/bin/docker exec {shlex.quote(dind_name)} "
                 f"sh -c {shlex.quote(inner_build)}"
@@ -4546,11 +4645,21 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
-                return False, "docker_build"
+                return CustomBuildOutcome(False, "docker_build", "build command could not be run on the executor")
             if not ok:
-                if "process timed out" in (err or "").lower():
-                    return False, "build_timeout"
-                return False, "docker_build"
+                # A build that printed "process timed out" and failed carries BUILD_FAILED_RC= too;
+                # only the streamer's bare sentinel is a timeout.
+                if stream_timed_out(err):
+                    return CustomBuildOutcome(False, "build_timeout", f"docker build exceeded {timeout_s} s")
+                if CUSTOM_BUILD_FAILED_MARKER not in (err or ""):
+                    logger.error(
+                        _m(
+                            "Custom build interrupted",
+                            extra=get_extra_info({**default_extra, "build_image_tag": image_tag, "error": err}),
+                        )
+                    )
+                    return CustomBuildOutcome(False, "docker_build", CUSTOM_BUILD_INTERRUPTED_REASON)
+                return CustomBuildOutcome(False, "docker_build", custom_build_log_tail(err))
 
             # 7. Export the image from DinD and load it onto the host daemon so
             #    the rental `docker run` (host-side) can use it.
@@ -4571,11 +4680,21 @@ class DockerService:
                 raise_exception=False,
             )
             if not ok:
-                if "process timed out" in (err or "").lower():
-                    return False, "build_timeout"
-                return False, "build_export"
+                if stream_timed_out(err):
+                    return CustomBuildOutcome(False, "build_timeout", f"image export exceeded {timeout_s} s")
+                # The stderr here is the HOST daemon's `docker load` (paths, disk state), not the
+                # renter's build: it goes to ops, the renter gets a fixed reason.
+                logger.error(
+                    _m(
+                        "Custom build export failed",
+                        extra=get_extra_info(
+                            {**default_extra, "build_image_tag": image_tag, "error": err}
+                        ),
+                    )
+                )
+                return CustomBuildOutcome(False, "build_export", CUSTOM_BUILD_EXPORT_FAILED_REASON)
 
-            return True, None
+            return CustomBuildOutcome(True, None, None)
         finally:
             # Always tear down the throwaway container + its egress rules. The
             # host-loaded image is removed later by _cleanup_custom_build_artifacts.
@@ -5071,7 +5190,7 @@ class DockerService:
                 # rental Docker SDK client.
                 if is_custom_build:
                     current_step = "docker_build"
-                    build_ok, build_failure_step = await self._custom_build_image(
+                    build_ok, build_failure_step, build_log_tail = await self._custom_build_image(
                         ssh_client=ssh_client,
                         payload=payload,
                         log_tag=log_tag,
@@ -5087,11 +5206,23 @@ class DockerService:
                         )
                         # Raise so the existing except-Exception block in
                         # create_container emits the CCF FailedContainerRequest
-                        # via the same path as today's pull failure.
+                        # via the same path as today's pull failure. The tail
+                        # stays out of `detail` because the backend runs the
+                        # GPU-quarantine classifier on it, and out of this log
+                        # line because BuildKit echoes the renter's secrets.
                         current_step = build_failure_step or "docker_build"
-                        raise Exception(
-                            f"Custom dockerfile build failed (failure_step={current_step})"
+                        logger.error(
+                            _m(
+                                "Custom build failed",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "failure_step": current_step,
+                                    "build_log_tail_lines": len((build_log_tail or "").splitlines()),
+                                    "build_log_tail_chars": len(build_log_tail or ""),
+                                }),
+                            )
                         )
+                        raise CustomBuildFailed(current_step, build_log_tail)
                     # Override docker_image so the downstream `docker run` uses
                     # the locally built tag for this branch only.
                     effective_image = self._custom_build_image_tag(payload.pod_id)
@@ -6054,6 +6185,8 @@ class DockerService:
                     }
                     else None
                 ),
+                # Renter-safe on its own: the output of the renter's Dockerfile, no executor host data.
+                build_log_tail=e.log_tail if isinstance(e, CustomBuildFailed) else None,
             )
 
     async def _run_bootstrap_restore(

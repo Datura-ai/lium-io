@@ -724,6 +724,11 @@ class FailedContainerRequest(ContainerBaseResponse):
     error_code: FailedContainerErrorCodes | None = None
     failure_step: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # DAH-2211 follow-up: for a custom-Dockerfile build that failed, the last lines the build printed
+    # (docker_build), the timeout (build_timeout) or a fixed one-line reason for build_export and the
+    # setup steps (never their stderr). Renter-safe: the renter's own Dockerfile output, never executor
+    # host data. None for every other failure and from old validators.
+    build_log_tail: str | None = Field(default=None, repr=False)
 
 
 class DuplicateExecutorsResponse(BaseModel):

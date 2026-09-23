@@ -370,6 +370,23 @@
       }
     },
     {
+      "expect": "FailedContainerRequest",
+      "note": "1.1.0 (DAH-3504): a custom-Dockerfile build failed at docker_build; build_log_tail is the renter's own build output, detail names the step only",
+      "message": {
+        "message_type": "FailedRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "error_type": "ContainerCreationFailed",
+        "msg": "Failed create_container",
+        "detail": "Failed create_container {'executor': '203.0.113.10:2200', 'error': 'Custom dockerfile build failed (failure_step=docker_build)', 'failure_step': 'docker_build'}",
+        "error_code": "UnknownError",
+        "failure_step": "docker_build",
+        "build_log_tail": "#5 [2/2] RUN apt-get install -y nonexistent-package\n#5 0.412 E: Unable to locate package nonexistent-package\n#5 ERROR: process \"/bin/sh -c apt-get install -y nonexistent-package\" did not complete successfully: exit code: 100"
+      }
+    },
+    {
       "expect": "PodLogsResponseToServer",
       "message": {
         "message_type": "PodLogsResponseToServer",
