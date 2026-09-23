@@ -393,7 +393,7 @@ def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
     unhealthy = RentedPodSshVerdict(
         pod_id=POD_ID, container_name="pod_1", ssh_port=SSH_PORT, healthy=False,
         faults=[FAULT_TCP_REFUSED], consecutive_cycles=2, report=True,
-        backend_accepted=True, accepted_faults=[FAULT_TCP_REFUSED],
+        backend_accepted=True, backend_accepted_faults=[FAULT_TCP_REFUSED],
     )
     with enforcement(enabled=False):
         assert rented_pod_ssh.is_enforced(unhealthy) is False
@@ -407,7 +407,7 @@ def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
         keys_only = replace(
             unhealthy,
             faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
-            accepted_faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
+            backend_accepted_faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
             boot_id_changed=False,
         )
         assert rented_pod_ssh.is_enforced(keys_only) is False
@@ -415,7 +415,7 @@ def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
         later_port = replace(
             unhealthy,
             faults=[FAULT_TCP_REFUSED],
-            accepted_faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
+            backend_accepted_faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE],
             boot_id_changed=False,
         )
         assert rented_pod_ssh.is_enforced(later_port) is False

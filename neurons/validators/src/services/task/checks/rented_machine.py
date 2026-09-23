@@ -271,7 +271,7 @@ class TenantEnforcementCheck:
         # an unreachable unrented node's cycle.
         enforced = [verdict for verdict in reported if is_enforced(verdict)]
         if enforced:
-            return self._rented_pod_ssh_enforced_result(
+            return self._failed_result_for_enforced_ssh_outage(
                 ctx, reported=reported, enforced=enforced, extra=extra
             )
 
@@ -337,7 +337,7 @@ class TenantEnforcementCheck:
             halt=True,
         )
 
-    def _rented_pod_ssh_enforced_result(
+    def _failed_result_for_enforced_ssh_outage(
         self,
         ctx: Context,
         *,

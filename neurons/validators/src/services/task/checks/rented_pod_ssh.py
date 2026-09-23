@@ -169,7 +169,7 @@ class RentedPodSshVerdict:
     # Backend accepted this outage (HTTP 200), including a ``notify_failed`` delivery.
     # Mail retry still queues; enforcement reads this, not ``reported``.
     backend_accepted: bool = False
-    accepted_faults: list[str] = field(default_factory=list)
+    backend_accepted_faults: list[str] = field(default_factory=list)
     # The last cycle-end gate held the reports as our own outage.
     last_gate_suppressed: bool = False
 
@@ -224,14 +224,14 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
         return False
     if not verdict.backend_accepted or verdict.last_gate_suppressed:
         return False
-    accepted_faults = set(verdict.accepted_faults) or set(verdict.faults)
-    if _PORT_FAULTS & accepted_faults:
+    backend_accepted_faults = set(verdict.backend_accepted_faults) or set(verdict.faults)
+    if _PORT_FAULTS & backend_accepted_faults:
         current_faults = set(verdict.faults)
         # The boot rule reads this cycle's faults too: keys alone and no reboot is the renter's doing.
         if FAULT_AUTHORIZED_KEYS_UNREADABLE in current_faults and not (_PORT_FAULTS & current_faults):
             return verdict.boot_id_changed is True
         return True
-    if FAULT_AUTHORIZED_KEYS_UNREADABLE in accepted_faults:
+    if FAULT_AUTHORIZED_KEYS_UNREADABLE in backend_accepted_faults:
         return verdict.boot_id_changed is True
     return False
 
@@ -315,13 +315,13 @@ class OkMark:
 class FailStreak:
     """The `fail` key: how many consecutive cycles the pod has failed, when the first one was,
     whether the backend accepted this outage (``backend_accepted``, any 200), which faults that accept
-    named, and whether the renter was told (``reported`` — not set on ``notify_failed``)."""
+    named (``backend_accepted_faults``), and whether the renter was told (``reported`` — not set on ``notify_failed``)."""
 
     count: int
     first_failed_at: str
     reported: bool = False
     backend_accepted: bool = False
-    accepted_faults: list[str] = field(default_factory=list)
+    backend_accepted_faults: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, raw: object, *, now_iso: str) -> FailStreak:
@@ -335,7 +335,9 @@ class FailStreak:
         count = value.get("count", 0)
         first_failed_at = value.get("first_failed_at")
         reported = value.get("reported") is True
-        accepted_faults = [item for item in (value.get("accepted_faults") or []) if isinstance(item, str)]
+        backend_accepted_faults = [
+            item for item in (value.get("accepted_faults") or []) if isinstance(item, str)
+        ]
         return cls(
             count=count
             if isinstance(count, int) and not isinstance(count, bool) and count >= 0
@@ -345,7 +347,7 @@ class FailStreak:
             else now_iso,
             reported=reported,
             backend_accepted=value.get("accepted") is True or reported,
-            accepted_faults=accepted_faults,
+            backend_accepted_faults=backend_accepted_faults,
         )
 
     def next(self) -> FailStreak:
@@ -359,7 +361,7 @@ class FailStreak:
                 "reported": self.reported,
                 # the stored key stays "accepted": streaks already in Redis keep enforcing across the deploy
                 "accepted": self.backend_accepted,
-                "accepted_faults": list(self.accepted_faults),
+                "accepted_faults": list(self.backend_accepted_faults),
             }
         )
 
@@ -588,7 +590,7 @@ async def _judge_with_streak(
         boot_id_changed=boot_id_changed,
         report=consecutive >= threshold,
         backend_accepted=streak.backend_accepted,
-        accepted_faults=list(streak.accepted_faults),
+        backend_accepted_faults=list(streak.backend_accepted_faults),
         last_gate_suppressed=bool(await store.get(RENTED_POD_SSH_LAST_GATE_KEY)),
     )
     if consecutive < threshold or streak.reported or settings.DRY_RUN:
@@ -876,7 +878,9 @@ async def _post_one(
                 extra=get_extra_info({**extra, "pod_id": pod_id, "recorded": response.recorded}),
             )
         )
-    accepted_faults = [item for item in (payload.get("faults") or []) if isinstance(item, str)]
+    backend_accepted_faults = [
+        item for item in (payload.get("faults") or []) if isinstance(item, str)
+    ]
     # Backend accepted (200). A Redis error on this write costs one duplicate POST next cycle,
     # which the backend dedupes; ``backend_accepted`` then stays off until that retry lands.
     try:
@@ -888,7 +892,7 @@ async def _post_one(
                 replace(
                     streak,
                     backend_accepted=True,
-                    accepted_faults=accepted_faults,
+                    backend_accepted_faults=backend_accepted_faults,
                     reported=not mail_failed,
                 ).dump(),
                 ex=settings.RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS,
