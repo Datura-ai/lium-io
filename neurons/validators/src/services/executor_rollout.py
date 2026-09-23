@@ -38,6 +38,7 @@ from services.task.messages import (
     PortCountMessages,
     RentalVerificationMessages,
     SCRAPE_HOST_SIDE_FAILURE_REASONS,
+    SCRAPE_UNDETERMINED_FAILURE_REASONS,
     SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS,
     TenantEnforcementMessages,
     UploadFilesMessages,
@@ -79,6 +80,7 @@ ROLLOUT_FAILURE_REASONS = frozenset(
         MachineSpecMessages.SCRAPE_FAILED.reason,
         # the codes SCRAPE_FAILED split into keep the grace it had
         *SCRAPE_HOST_SIDE_FAILURE_REASONS,
+        *SCRAPE_UNDETERMINED_FAILURE_REASONS,
         *SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS,
         PortCountMessages.INSUFFICIENT_PORTS.reason,
         ExecutorImageMessages.OUTDATED.reason,

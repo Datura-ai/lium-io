@@ -11,7 +11,12 @@ from neurons.validators.src.services.task.checks.machine_spec_scrape import (
     _normalize_gpu_details,
 )
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
-from neurons.validators.src.services.task.runner import SSHCommandResult
+from neurons.validators.src.services.task.messages import (
+    SCRAPE_HOST_SIDE_FAILURE_REASONS,
+    SCRAPE_UNDETERMINED_FAILURE_REASONS,
+    SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS,
+)
+from neurons.validators.src.services.task.runner import NO_EXIT_STATUS, SSHCommandResult
 
 from tests.helpers import (
     FERNET_TOKEN,
@@ -38,7 +43,7 @@ def make_command_result(
     """Helper to create mock SSH command results.
 
     Like SSHCommandRunner, `error_type` stays None when the host returned an exit status and names
-    the failure ("timeout", an asyncssh error class) when ssh.run raised.
+    the failure ("timeout", "no_exit_status", an asyncssh error class) when none came back.
     """
     return SSHCommandResult(
         command=command,
@@ -598,8 +603,9 @@ async def test_machine_spec_scrape_keeps_the_stdin_verdict_when_the_scrape_repor
     assert ssh_client.sftp_client.put_called_with is None
 
 
-# Which side failed, from what the scrape run returned (lium-platform#714 bills a running pod only
-# through a validator-side failure, and the penalty sweep skips only those).
+# Which side failed, from what the scrape run returned. Host side needs an exit status from the
+# host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
+# failure no host fault can produce, and none of these qualifies).
 NVML_DRIVER_ERROR = "NVMLError_DriverNotLoaded('Driver Not Loaded')"
 NO_GPU_REPORT = json.dumps({"error": "no_gpu_details", "data": {"data_gpu": {"gpu_count": 0, "gpu_details": []}}})
 DRIVER_REPORT = json.dumps(
@@ -645,9 +651,16 @@ async def _run_scrape(context_factory, scrape_run: SSHCommandResult, obfuscation
             id="channel-refused",
         ),
         pytest.param(
+            make_command_result(
+                success=False, exit_code=-1, stdout="gAAAAABcut", duration_ms=4_000, error_type=NO_EXIT_STATUS
+            ),
+            Msg.SCRAPE_TRANSPORT_FAILED.reason,
+            id="channel-closed-without-exit-status",
+        ),
+        pytest.param(
             make_command_result(success=False, exit_code=-1, duration_ms=5, error_type="RuntimeError"),
             Msg.SCRAPE_TRANSPORT_FAILED.reason,
-            id="runner-raised-on-the-validator",
+            id="runner-raised",
         ),
         pytest.param(
             make_command_result(success=False, exit_code=1, stdout=NO_GPU_REPORT),
@@ -780,3 +793,15 @@ async def test_machine_spec_scrape_no_gpu_on_stdin_keeps_its_host_side_code(cont
     assert result.event.reason_code == Msg.SCRAPE_FAILED_DRIVER.reason
     assert result.event.what_we_saw["delivery"] == "stdin"
     assert len(runner.calls) == 1
+
+
+def test_the_scrape_codes_split_into_host_undetermined_and_no_validator_side():
+    # A code is validator-side only if no host fault can produce it; every code without an exit
+    # status from the host can come from the host's link, sshd, disk or a hung GPU query.
+    assert SCRAPE_HOST_SIDE_FAILURE_REASONS == {
+        "SCRAPE_FAILED_NO_GPU",
+        "SCRAPE_FAILED_DRIVER",
+        "SCRAPE_FAILED_ON_HOST",
+    }
+    assert SCRAPE_UNDETERMINED_FAILURE_REASONS == {"SCRAPE_TIMEOUT", "SCRAPE_TRANSPORT_FAILED"}
+    assert SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS == frozenset()

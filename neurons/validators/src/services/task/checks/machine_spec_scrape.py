@@ -131,8 +131,9 @@ def _is_no_gpu_details(error: Any, obfuscation_keys: dict[str, str] | None) -> b
 def _scrape_failure(
     scrape_run: SSHCommandResult, obfuscation_keys: dict[str, str] | None
 ) -> tuple[MessageTemplate, dict[str, Any]]:
-    # which side failed, from what came back: the runner sets error_type only when ssh.run raised
-    # or timed out (runner.py), so there is no exit status from the host behind it
+    # which side failed, from what came back: the runner sets error_type exactly when no exit status
+    # came back from the host (timed out, raised, or the channel closed without one). Those stay
+    # undetermined; only an exit status the host sent puts the failure on the host.
     if scrape_run.error_type == "timeout":
         return Msg.SCRAPE_TIMEOUT, {"error_type": scrape_run.error_type}
     if scrape_run.error_type is not None:

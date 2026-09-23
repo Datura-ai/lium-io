@@ -164,7 +164,8 @@ class MachineSpecMessages:
             "\n  chmod +x <script>\nCheck stderr and environment on the executor."
         ),
     )
-    # Host side: the scrape ran on the executor and answered with a failure.
+    # Host side: the scrape ran on the executor and the host sent back an exit status (or a signal)
+    # with a failure.
     SCRAPE_FAILED_NO_GPU = MessageTemplate(
         event="Machine specs scrape found zero GPUs",
         reason="SCRAPE_FAILED_NO_GPU",
@@ -200,7 +201,8 @@ class MachineSpecMessages:
             " has free disk and memory."
         ),
     )
-    # Validator side: the validator got no exit status back from the scrape.
+    # Undetermined: no exit status came back from the host, and a host fault and a validator fault
+    # both end this way.
     SCRAPE_TIMEOUT = MessageTemplate(
         event="Machine specs scrape timed out",
         reason="SCRAPE_TIMEOUT",
@@ -208,21 +210,23 @@ class MachineSpecMessages:
         category="env",
         impact="Validation halted — GPU unverified",
         remediation=(
-            "The validator stopped waiting for the scrape at its timeout. A busy validator causes this,"
-            " and so does a GPU query that hangs on the host; if it repeats, check that `nvidia-smi`"
-            " answers within seconds on the host."
+            "The validator stopped waiting for the scrape at its timeout. Either side can cause this:"
+            " a GPU query that hangs on the host, a host link that drops packets, or a busy validator."
+            " If it repeats, check that `nvidia-smi` answers within seconds on the host."
         ),
     )
     SCRAPE_TRANSPORT_FAILED = MessageTemplate(
-        event="Machine specs scrape lost its SSH session",
+        event="Machine specs scrape returned no exit status",
         reason="SCRAPE_TRANSPORT_FAILED",
         severity="error",
         category="env",
         impact="Validation halted — GPU unverified",
         remediation=(
-            "The validator's SSH session to the executor dropped during the scrape, or the validator"
-            " could not deliver the scrape. The next cycle retries; a failure on every cycle points at"
-            " the network path between the validator and the host."
+            "The SSH session ended before the host sent the scrape's exit status, or the scrape could"
+            " not be delivered. Either side can cause this: the host's network, sshd or container going"
+            " down, a full disk on the host during the upload, or the validator's own network. The next"
+            " cycle retries; if it fails on every cycle, check that the host's SSH port answers from"
+            " outside and that the host has free disk."
         ),
     )
     SCRAPE_OK = MessageTemplate(
@@ -249,7 +253,11 @@ SCRAPE_HOST_SIDE_FAILURE_REASONS = frozenset(
         MachineSpecMessages.SCRAPE_FAILED_ON_HOST.reason,
     }
 )
-SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS = frozenset(
+# A code belongs here only if no host fault can produce it. None of the split codes qualifies: each
+# one without an exit status can come from the host's link, sshd, disk or a hung GPU query as much
+# as from the validator.
+SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS: frozenset[str] = frozenset()
+SCRAPE_UNDETERMINED_FAILURE_REASONS = frozenset(
     {
         MachineSpecMessages.SCRAPE_TIMEOUT.reason,
         MachineSpecMessages.SCRAPE_TRANSPORT_FAILED.reason,
