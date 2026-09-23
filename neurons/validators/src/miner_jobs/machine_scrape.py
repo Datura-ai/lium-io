@@ -630,17 +630,23 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         raise NVMLError(ret)
 
 
-def run_cmd(cmd):
+def run_cmd_status(cmd):
+    """(returncode, stdout, stderr) of a shell command; never raises on a non-zero exit."""
     # Strip LD_LIBRARY_PATH so PyInstaller's bundled libs don't leak into subprocesses
     # and conflict with system-linked shared libs (e.g. libssl vs libcrypto version mismatch).
     env = {**os.environ}
     env.pop("LD_LIBRARY_PATH", None)
     proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
-    if proc.returncode != 0:
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_cmd(cmd):
+    returncode, stdout, stderr = run_cmd_status(cmd)
+    if returncode != 0:
         raise RuntimeError(
-            f"run_cmd error {cmd=!r} {proc.returncode=} {proc.stdout=!r} {proc.stderr=!r}"
+            f"run_cmd error {cmd=!r} proc.returncode={returncode} proc.stdout={stdout!r} proc.stderr={stderr!r}"
         )
-    return proc.stdout
+    return stdout
 
 
 def get_network_speed():
@@ -686,28 +692,64 @@ def netmeasure_output():
         data["network_speed_error"] = repr(exc)
     return data
 
-def cloudflare_speed():
-    """Measure network speed using Cloudflare's speed endpoint via curl."""
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        # Download: 50 MB
-        out = run_cmd(
-            "curl -o /dev/null -s -w '%{speed_download}' "
-            "--max-time 15 "
-            "'https://speed.cloudflare.com/__down?bytes=50000000'"
-        )
-        data["download_speed"] = round(float(out) * 8 / 1_000_000, 2)  # bytes/s → Mbps
+CLOUDFLARE_DOWN_BYTES = 50_000_000
+CLOUDFLARE_UP_BYTES = 25 * 1024 * 1024
+CLOUDFLARE_MAX_SECONDS = 15
+CURL_EXIT_OPERATION_TIMEDOUT = 28
 
-        # Upload: 25 MB via stdin pipe (no temp file)
-        out = run_cmd(
-            "dd if=/dev/zero bs=1M count=25 2>/dev/null | "
-            "curl -o /dev/null -s -w '%{speed_upload}' "
-            "--max-time 15 -X POST --data-binary @- "
-            "'https://speed.cloudflare.com/__up'"
+
+def cloudflare_transfer_mbps(returncode, stdout, stderr, expected_bytes):
+    """Mbps from curl's `-w '%{http_code} <size> <speed>'`; raises when the answer is no measurement.
+
+    Cloudflare refuses what it will not serve with a tiny body (HTTP 403 and 1 byte for __down of
+    100 MB or more) and curl exits 0 on it, so reading the speed alone recorded a refusal as 0.0 Mbps.
+    A 200 transfer cut at --max-time is a measurement (its average), not a failure.
+    """
+    fields = stdout.split()
+    if returncode not in (0, CURL_EXIT_OPERATION_TIMEDOUT) or len(fields) != 3:
+        raise RuntimeError(f"curl exit {returncode}: {(stderr or stdout).strip()[-200:]}")
+    status, size, speed = fields
+    size = int(float(size))
+    if status != "200":
+        raise RuntimeError(f"HTTP {status}, {size} bytes")
+    if returncode == 0 and size < expected_bytes:
+        raise RuntimeError(f"{size} of {expected_bytes} bytes")
+    mbps = round(float(speed) * 8 / 1_000_000, 2)  # bytes/s → Mbps
+    if mbps <= 0:
+        raise RuntimeError(f"{size} bytes in {CLOUDFLARE_MAX_SECONDS} s")
+    return mbps
+
+
+def cloudflare_speed():
+    """Measure network speed using Cloudflare's speed endpoint via curl, each direction on its own."""
+    data = {"upload_speed": None, "download_speed": None}
+    errors = []
+    try:
+        data["download_speed"] = cloudflare_transfer_mbps(
+            *run_cmd_status(
+                "curl -o /dev/null -sS -w '%{http_code} %{size_download} %{speed_download}' "
+                f"--max-time {CLOUDFLARE_MAX_SECONDS} "
+                f"'https://speed.cloudflare.com/__down?bytes={CLOUDFLARE_DOWN_BYTES}'"
+            ),
+            CLOUDFLARE_DOWN_BYTES,
         )
-        data["upload_speed"] = round(float(out) * 8 / 1_000_000, 2)  # bytes/s → Mbps
     except Exception as exc:
-        data["network_speed_error"] = repr(exc)
+        errors.append(f"download: {exc!r}")
+    try:
+        # piped from dd, no temp file
+        data["upload_speed"] = cloudflare_transfer_mbps(
+            *run_cmd_status(
+                f"dd if=/dev/zero bs=1M count={CLOUDFLARE_UP_BYTES // (1024 * 1024)} 2>/dev/null | "
+                "curl -o /dev/null -sS -w '%{http_code} %{size_upload} %{speed_upload}' "
+                f"--max-time {CLOUDFLARE_MAX_SECONDS} -X POST --data-binary @- "
+                "'https://speed.cloudflare.com/__up'"
+            ),
+            CLOUDFLARE_UP_BYTES,
+        )
+    except Exception as exc:
+        errors.append(f"upload: {exc!r}")
+    if errors:
+        data["network_speed_error"] = "; ".join(errors)
     return data
 
 
