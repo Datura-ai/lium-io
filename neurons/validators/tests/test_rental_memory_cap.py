@@ -49,6 +49,12 @@ def _backend_memory_gb(host_kib: int, share: float = 1.0) -> int:
     return int((host_kib - 2 * KIB_PER_GIB) * share / KIB_PER_GIB)
 
 
+@pytest.fixture(autouse=True)
+def cap_on(monkeypatch):
+    """The cap ships off and is turned on per validator; these tests run with it on unless one says otherwise."""
+    monkeypatch.setattr(settings, "RENTAL_MEMORY_CAP_ENABLED", True)
+
+
 # --- the limit -------------------------------------------------------------------------------------
 
 
@@ -190,8 +196,8 @@ async def test_resolve_with_the_cap_off_reads_nothing_and_changes_nothing(monkey
     )
 
 
-def test_the_defaults_are_on_with_a_three_percent_four_gib_reserve_and_renter_first_oom():
-    assert settings.RENTAL_MEMORY_CAP_ENABLED is True
+def test_the_defaults_are_off_with_a_three_percent_four_gib_reserve_and_renter_first_oom():
+    assert type(settings).model_fields["RENTAL_MEMORY_CAP_ENABLED"].default is False
     assert settings.RENTAL_MEMORY_RESERVE_MIN_GB == 4
     assert settings.RENTAL_MEMORY_RESERVE_PERCENT == 3.0
     assert settings.RENTAL_CONTAINER_OOM_SCORE_ADJ == 500

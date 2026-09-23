@@ -241,8 +241,9 @@ class Settings(BaseSettings):
     # GPU share of (host RAM − reserve); the reserve is RENTAL_MEMORY_RESERVE_PERCENT of the host's RAM,
     # at least RENTAL_MEMORY_RESERVE_MIN_GB. Swap is off for the container (--memory-swap = --memory) and
     # its processes carry RENTAL_CONTAINER_OOM_SCORE_ADJ, so a host-wide OOM picks them before the
-    # executor. Off: the container gets the backend's memory_gb and nothing else, as before.
-    RENTAL_MEMORY_CAP_ENABLED: bool = Field(env="RENTAL_MEMORY_CAP_ENABLED", default=True)
+    # executor. Off (the default until the validator owner turns it on): the container gets the
+    # backend's memory_gb and nothing else.
+    RENTAL_MEMORY_CAP_ENABLED: bool = Field(env="RENTAL_MEMORY_CAP_ENABLED", default=False)
     RENTAL_MEMORY_RESERVE_MIN_GB: int = Field(env="RENTAL_MEMORY_RESERVE_MIN_GB", default=4)
     RENTAL_MEMORY_RESERVE_PERCENT: float = Field(env="RENTAL_MEMORY_RESERVE_PERCENT", default=3.0)
     RENTAL_CONTAINER_OOM_SCORE_ADJ: int = Field(env="RENTAL_CONTAINER_OOM_SCORE_ADJ", default=500)
