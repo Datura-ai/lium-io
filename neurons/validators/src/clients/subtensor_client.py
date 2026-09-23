@@ -300,7 +300,7 @@ class SubtensorClient:
         next entry, so the redial that follows skips the failing one."""
         if SubtensorClient._subtensor is None or len(self._endpoints.candidates) == 1:
             return
-        SubtensorClient._subtensor = None
+        self._drop_subtensor()
         previous, current = self._endpoints.advance()
         self._log_endpoint_switched(previous, current, "read failed", error)
 
@@ -310,7 +310,23 @@ class SubtensorClient:
         if self._endpoints.on_first:
             return
         self._endpoints.reset()
+        self._drop_subtensor()
+
+    def _drop_subtensor(self) -> None:
+        """Close the client before it is forgotten: its websocket is still open."""
+        subtensor = SubtensorClient._subtensor
         SubtensorClient._subtensor = None
+        if subtensor is None:
+            return
+        try:
+            subtensor.close()
+        except Exception as e:
+            logger.warning(
+                _m(
+                    "Failed to close subtensor cleanly",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                ),
+            )
 
     def _log_subtensor_connected(
         self, subtensor: bittensor.Subtensor, endpoint_source: EndpointSource

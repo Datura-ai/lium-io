@@ -62,7 +62,11 @@ class _RecordingSubtensor:
 
     def __init__(self, network=None, config=None, **_kwargs):
         self.chain_endpoint, self.network = Subtensor.setup_config(network, config)
+        self.closed = False
         _RecordingSubtensor.calls.append({"network": network, "config": config})
+
+    def close(self):
+        self.closed = True
 
 
 def _bare_client(settings: Settings) -> SubtensorClient:
@@ -238,6 +242,22 @@ def test_read_failure_switches_to_the_next_endpoint_and_the_next_sync_returns_to
         assert client.subtensor.chain_endpoint == OWN_ENDPOINT
 
     assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT, "finney", OWN_ENDPOINT]
+
+
+def test_switch_and_return_close_the_dropped_client(recording_subtensor):
+    """A dropped client still holds an open websocket; it must be closed, not just forgotten."""
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    client = _bare_client(settings)
+
+    with patch.object(subtensor_client_module, "settings", settings):
+        client.initialize_subtensor()
+        on_proxy = client.subtensor
+        client._switch_endpoint_after_read_failure(TimeoutError("read timed out"))
+        client.set_subtensor()
+        on_public = client.subtensor
+        client._return_to_first_endpoint()
+
+    assert on_proxy.closed and on_public.closed
 
 
 def test_read_failure_without_an_own_endpoint_does_not_switch(recording_subtensor, caplog):
