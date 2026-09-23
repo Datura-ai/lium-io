@@ -580,9 +580,7 @@ class RentalPriceIncentive(DefaultIncentive):
             return None
         if not result.is_split_remainder and min_count >= result.gpu_count:
             return None  # a whole node rented only whole: one pod, MIN_PORT_COUNT covers it
-        # a Lium filler runs on the free GPUs and holds their ports: filler revenue, not idle pay
-        if result.default_job_owner == DEFAULT_JOB_OWNER_LIUM:
-            return None
+        # a Lium filler does not exempt it: not rentable on Lium means no idle pay
         available: Any = result.spec.get("available_port_count")
         # bool is excluded explicitly - it passes isinstance(int) and would read True as 1
         if not isinstance(available, int) or isinstance(available, bool) or available < 0:

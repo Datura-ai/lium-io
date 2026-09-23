@@ -232,13 +232,17 @@ def test_rented_portion_is_never_measured():
     assert RentalPriceIncentive._port_budget_shortfall(rented_portion) is None
 
 
-def test_lium_filler_remainder_is_never_measured():
-    # Arrange — the free GPUs run a Lium filler, which holds their ports: filler revenue, not idle pay
+def test_lium_filler_remainder_is_measured_too():
+    # Arrange — a Lium filler on the free GPUs does not make them rentable on Lium
     remainder = _remainder_of(_build_incentive((SPLIT_HOTKEY, _make_job(available_port_count=5))))
     remainder.default_job_owner = DEFAULT_JOB_OWNER_LIUM
 
-    # Act / Assert
-    assert RentalPriceIncentive._port_budget_shortfall(remainder) is None
+    # Act
+    shortfall = RentalPriceIncentive._port_budget_shortfall(remainder)
+
+    # Assert — the unbacked GPUs earn no idle pay
+    assert shortfall is not None
+    assert (shortfall.backed_gpu_count, shortfall.unbacked_gpu_count) == (1, 3)
 
 
 @pytest.mark.parametrize(
