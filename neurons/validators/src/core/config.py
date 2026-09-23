@@ -662,9 +662,9 @@ class Settings(BaseSettings):
         if self.BITTENSOR_NETWORK:
             config.subtensor.network = self.BITTENSOR_NETWORK
 
-        own = self.get_chain_endpoints()[0]
-        if own.source != PUBLIC_NODE_SOURCE:
-            config.subtensor.chain_endpoint = own.value
+        first_endpoint = self.get_chain_endpoints()[0]
+        if first_endpoint.source != PUBLIC_NODE_SOURCE:
+            config.subtensor.chain_endpoint = first_endpoint.value
 
         return config
 

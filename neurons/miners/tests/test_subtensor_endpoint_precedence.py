@@ -7,6 +7,7 @@ validator. Resolution goes through the real `AsyncSubtensor.setup_config` so a b
 upgrade that changes the rule shows up here.
 """
 
+import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -183,6 +184,38 @@ async def test_initialize_subtensor_falls_back_to_the_public_node_when_our_endpo
     extra = _connected_extra(caplog)
     assert extra["chain_endpoint"] == PUBLIC_FINNEY
     assert extra["endpoint_source"] == "BITTENSOR_NETWORK (own endpoint failed)"
+    assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
+
+
+class _HangingThenRecordingAsyncSubtensor(_RecordingAsyncSubtensor):
+    """Our own endpoint's hostname does not resolve: async_substrate_interface retries the DNS
+    lookup forever, so `initialize()` never returns; later dials record."""
+
+    def __init__(self, network=None, config=None, **kwargs):
+        self._hang = network == OWN_ENDPOINT
+        if not self._hang:
+            super().__init__(network=network, config=config, **kwargs)
+
+    async def initialize(self):
+        if self._hang:
+            await asyncio.Event().wait()
+        return self
+
+
+@pytest.mark.asyncio
+async def test_initialize_subtensor_falls_back_when_our_endpoint_connect_hangs(monkeypatch, caplog):
+    _RecordingAsyncSubtensor.calls = []
+    monkeypatch.setattr(
+        miner_module.bittensor, "AsyncSubtensor", _HangingThenRecordingAsyncSubtensor
+    )
+    monkeypatch.setattr(miner_module, "CHAIN_CONNECT_TIMEOUT_SECONDS", 0.01)
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    miner = _make_miner(settings)
+
+    with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
+        await asyncio.wait_for(miner.initialize_subtensor(), timeout=5)
+
+    assert (miner.subtensor.chain_endpoint, miner.subtensor.network) == (PUBLIC_FINNEY, "finney")
     assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
 
 

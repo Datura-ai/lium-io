@@ -267,7 +267,7 @@ class SubtensorClient:
                         "from_source": previous.source,
                         "to_source": current.source,
                         "reason": reason,
-                        "error": str(error),
+                        "error": repr(error),  # a timeout has an empty str()
                     }
                 ),
             ),
@@ -292,7 +292,7 @@ class SubtensorClient:
                 previous, current = cursor.advance()
                 self._log_endpoint_switched(previous, current, "connect failed", e)
                 continue
-            return ChainConnection(subtensor, cursor.source_label())
+            return ChainConnection(subtensor, cursor.current_source_label())
         assert last_error is not None
         raise last_error
 
@@ -1011,8 +1011,6 @@ class SubtensorClient:
         backoff = SUBTENSOR_BACKOFF_INITIAL
         while True:
             try:
-                # every cycle, so a cycle that failed on a fallback node still returns once the first
-                # endpoint's retry window is over (our proxy may be back)
                 self._return_to_first_endpoint()
                 self.set_subtensor()
 
@@ -1043,7 +1041,6 @@ class SubtensorClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
             except Exception as e:
-                # a chain read on the connected endpoint failed: the retry after the backoff dials the next one
                 self._switch_endpoint_after_read_failure(e)
                 logger.error(
                     _m(

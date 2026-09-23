@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 VALIDATORS_LIMIT = 24
 RECONNECT_POLL_CYCLE = 2 * 60
+# async_substrate_interface retries an unresolvable hostname forever, so a dial needs a deadline
+CHAIN_CONNECT_TIMEOUT_SECONDS = 60
 
 
 class Miner:
@@ -74,7 +76,7 @@ class Miner:
                         "from_source": previous.source,
                         "to_source": current.source,
                         "reason": reason,
-                        "error": str(error),
+                        "error": repr(error),  # a timeout has an empty str()
                     }
                 ),
             ),
@@ -91,9 +93,10 @@ class Miner:
         for _attempt in range(len(cursor.candidates)):
             endpoint = cursor.current
             try:
-                subtensor = await bittensor.AsyncSubtensor(
-                    network=endpoint.value, config=self.config
-                ).initialize()
+                subtensor = await asyncio.wait_for(
+                    bittensor.AsyncSubtensor(network=endpoint.value, config=self.config).initialize(),
+                    timeout=CHAIN_CONNECT_TIMEOUT_SECONDS,
+                )
             except Exception as e:
                 last_error = e
                 if len(cursor.candidates) == 1:
@@ -101,7 +104,7 @@ class Miner:
                 previous, current = cursor.advance()
                 self._log_endpoint_switched(previous, current, "connect failed", e)
                 continue
-            return ChainConnection(subtensor, cursor.source_label())
+            return ChainConnection(subtensor, cursor.current_source_label())
         assert last_error is not None
         raise last_error
 

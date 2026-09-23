@@ -113,17 +113,17 @@ class EndpointCursor:
         previous = self.current
         self._resting_until[self.index] = monotonic() + self.retry_after_seconds
         next_index = (self.index + 1) % len(self.candidates)
-        ready = self._first_ready_index(start=next_index)
+        ready_index = self._first_ready_index(start=next_index)
         # every entry is resting: take the next one anyway, never stop dialling
-        self.index = next_index if ready is None else ready
+        self.index = next_index if ready_index is None else ready_index
         return EndpointAdvance(previous, self.current)
 
     def move_to_first_ready_endpoint(self) -> bool:
         """Move to the first entry that is not resting. True when the cursor moved."""
-        ready = self._first_ready_index(start=0)
-        if ready is None or ready == self.index:
+        ready_index = self._first_ready_index(start=0)
+        if ready_index is None or ready_index == self.index:
             return False
-        self.index = ready
+        self.index = ready_index
         return True
 
     def _first_ready_index(self, *, start: int) -> int | None:
@@ -135,7 +135,7 @@ class EndpointCursor:
                 return index
         return None
 
-    def source_label(self) -> EndpointSource:
+    def current_source_label(self) -> EndpointSource:
         """The `endpoint_source` for the current entry: plain on the first entry, marked when a switch
         brought the client here."""
         source = self.current.source
