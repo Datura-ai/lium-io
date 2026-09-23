@@ -41,12 +41,16 @@ _TAIL_CHARS = 600
 # does. The image is removed first so the pull reaches the registry or mirror instead of the local store,
 # and removed again after. Every docker call runs under `timeout` where the image has it; the pull's
 # 30 s is the verdict's bound. Exit 0 always: the marker lines are the answer.
+# The first line carries the image store next to the mirrors: `.Driver` is overlayfs on the containerd store
+# (Docker 29's default for a new install) and overlay2 on the classic store a host upgraded from 28 keeps.
+# The two pay a mirror's DNS wait differently (see REGISTRY_PULL_TIMEOUT_SECONDS and _IMAGE_STORES).
 REGISTRY_PULL_SCRIPT = (
     f"img={REGISTRY_PULL_IMAGE}; d=/usr/bin/docker; "
     'bounded() { s=$1; shift; if command -v timeout >/dev/null 2>&1; then timeout -k 5 "$s" "$@"; '
     'else "$@"; fi; }; '
-    "mirrors=$(bounded 10 $d info --format '{{json .RegistryConfig.Mirrors}}' 2>/dev/null | head -c 500); "
-    f'echo "{REGISTRY_PULL_MARKER} mirrors=${{mirrors:-unknown}}"; '
+    "info=$(bounded 10 $d info --format 'driver={{.Driver}} mirrors={{json .RegistryConfig.Mirrors}}' "
+    "2>/dev/null | head -c 500); "
+    f'echo "{REGISTRY_PULL_MARKER} ${{info:-mirrors=unknown}}"; '
     'if bounded 10 $d image inspect "$img" >/dev/null 2>&1; then cached=yes; else cached=no; fi; '
     'bounded 20 $d rmi -f "$img" >/dev/null 2>&1; '
     'if bounded 10 $d image inspect "$img" >/dev/null 2>&1; then '
@@ -63,14 +67,17 @@ Outcome = Literal[
     "ok",
     "timeout",
     "dns_error",
+    "unreachable",
     "manifest_unknown",
     "rate_limited",
     "auth_error",
     "other",
     "not_run",
 ]
-# what fails a node (twice in a row): the registry path is broken, the way it broke 14e704ba's rents
-FAILING_OUTCOMES = frozenset({"timeout", "dns_error", "manifest_unknown"})
+# what fails a node (twice in a row): the registry path is broken, the way it broke 14e704ba's rents.
+# `unreachable` is a firewall or proxy that rejects the connection rather than dropping it; a renter's
+# uncached pull fails on it just the same
+FAILING_OUTCOMES = frozenset({"timeout", "dns_error", "unreachable", "manifest_unknown"})
 # no verdict either way: a Docker Hub 429 says the IP's anonymous quota is spent, not that the path is
 # broken, and an auth or unclassified error, or a probe that did not run, measured nothing about it
 UNMEASURED_OUTCOMES = frozenset({"rate_limited", "auth_error", "other", "not_run"})
@@ -91,6 +98,13 @@ _MANIFEST_MARKERS = ("manifest unknown", "manifest_unknown")
 # the containerd image store's wording (Docker 29): `failed to resolve reference "<ref>": <ref>: not found`
 _NOT_FOUND_RX = re.compile(r"(failed to resolve reference|manifest for) .*not found")
 _AUTH_MARKERS = ("unauthorized", "authentication required", "is denied", "access denied")
+# a TCP connect to the registry, or to the daemon's proxy (`proxyconnect tcp: dial tcp ...`), that was
+# rejected: a REJECT --reject-with tcp-reset, icmp-host-unreachable or icmp-net-unreachable, or no route.
+# Only `dial tcp`: the CLI failing to reach dockerd's own socket is `dial unix ...`, which says nothing
+# about the registry path
+_UNREACHABLE_RX = re.compile(
+    r"dial tcp [^\s]+: connect: (connection refused|no route to host|network is unreachable)"
+)
 _TIMEOUT_MARKERS = (
     "i/o timeout",
     "tls handshake timeout",
@@ -98,6 +112,13 @@ _TIMEOUT_MARKERS = (
     "client.timeout exceeded",
     "timeout exceeded while awaiting headers",
 )
+
+
+# `docker info --format '{{.Driver}}'` → the image store. On the containerd store a mirror whose DNS lookups
+# time out costs 10-20 s per registry request (72 s for hello-world unbounded), so the 30 s bound fails it;
+# on the classic store it costs about 20 s once per pull, so the probe passes at about 20 s, and that is
+# right: a template pulls in about 22 s there too
+_IMAGE_STORES = {"overlayfs": "containerd", "overlay2": "classic"}
 
 
 @dataclass(frozen=True)
@@ -110,10 +131,15 @@ class PullReading:
     seconds: int | None = None
     cached_before: bool | None = None
     detail: str | None = None
+    driver: str | None = None
 
     @property
     def failed(self) -> bool:
         return self.outcome in FAILING_OUTCOMES
+
+    @property
+    def image_store(self) -> str | None:
+        return _IMAGE_STORES.get(self.driver or "")
 
     def as_record(self) -> dict[str, Any]:
         record: dict[str, Any] = {"outcome": self.outcome, "image": REGISTRY_PULL_IMAGE}
@@ -122,6 +148,8 @@ class PullReading:
             record["exit_code"] = self.exit_code
         if self.seconds is not None:
             record["seconds"] = self.seconds
+        record["driver"] = self.driver
+        record["image_store"] = self.image_store
         if self.cached_before is not None:
             record["cached_before"] = self.cached_before
         if self.detail:
@@ -146,6 +174,8 @@ def classify_pull_error(exit_code: int, output: str) -> Outcome:
         return "manifest_unknown"
     if any(marker in text for marker in _AUTH_MARKERS):
         return "auth_error"
+    if _UNREACHABLE_RX.search(text):
+        return "unreachable"
     if exit_code in _TIMEOUT_EXITS or any(marker in text for marker in _TIMEOUT_MARKERS):
         return "timeout"
     return "other"
@@ -167,10 +197,18 @@ def parse_pull_probe(stdout: str) -> PullReading:
     fields: dict[str, str] = {}
     other_lines: list[str] = []
     mirrors: list[str] | None = None
+    driver: str | None = None
     for line in (stdout or "").splitlines():
         stripped = line.strip()
-        if stripped.startswith(f"{REGISTRY_PULL_MARKER} mirrors="):
-            mirrors = _parse_mirrors(stripped.partition("mirrors=")[2])
+        if stripped.startswith(REGISTRY_PULL_MARKER) and "mirrors=" in stripped:
+            # `lium_pull driver=overlayfs mirrors=[...]`; a daemon the CLI cannot reach still prints the
+            # format's literal text, `driver= mirrors=`, which reads as unknown
+            head, _, raw_mirrors = stripped.partition("mirrors=")
+            mirrors = _parse_mirrors(raw_mirrors)
+            for token in head[len(REGISTRY_PULL_MARKER) :].split():
+                key, _, value = token.partition("=")
+                if key == "driver" and value:
+                    driver = value
         elif stripped.startswith(REGISTRY_PULL_MARKER):
             for token in stripped[len(REGISTRY_PULL_MARKER) :].split():
                 key, _, value = token.partition("=")
@@ -186,10 +224,13 @@ def parse_pull_probe(stdout: str) -> PullReading:
             mirrors=mirrors,
             cached_before=cached_before,
             detail="the image was still on the node after docker rmi; a pull would not reach the registry",
+            driver=driver,
         )
     exit_raw = fields.get("exit")
     if exit_raw is None or not exit_raw.lstrip("-").isdigit():
-        return PullReading("not_run", mirrors=mirrors, detail=detail or "no pull output")
+        return PullReading(
+            "not_run", mirrors=mirrors, detail=detail or "no pull output", driver=driver
+        )
     exit_code = int(exit_raw)
     seconds_raw = fields.get("seconds", "")
     return PullReading(
@@ -199,6 +240,7 @@ def parse_pull_probe(stdout: str) -> PullReading:
         seconds=int(seconds_raw) if seconds_raw.isdigit() else None,
         cached_before=cached_before,
         detail=None if exit_code == 0 else detail,
+        driver=driver,
     )
 
 

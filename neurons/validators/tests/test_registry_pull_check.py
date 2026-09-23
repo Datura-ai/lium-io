@@ -34,21 +34,48 @@ from tests.helpers import build_services, build_state, default_executor, make_co
 
 EXECUTOR = default_executor()
 MIRROR = '["https://docker.m.daocloud.io/"]'
+INFO = f"lium_pull driver=overlayfs mirrors={MIRROR}"
 # Docker 29.1.3 (containerd image store) with that mirror configured and its DNS answers dropped: the 2.4 KB
 # pull took 51 s on one run and over 60 s on another, and the 30 s bound ended it on both runs after; with the resolver refusing, the pull failed at once
-MIRROR_DNS_TIMEOUT = f"lium_pull mirrors={MIRROR}\nlium_pull cached=no cache=removed\nlium_pull exit=124 seconds=30\n"
+MIRROR_DNS_TIMEOUT = f"{INFO}\nlium_pull cached=no cache=removed\nlium_pull exit=124 seconds=30\n"
 MIRROR_DNS_REFUSED = (
-    f"lium_pull mirrors={MIRROR}\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=0\n"
+    f"{INFO}\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=0\n"
     f'Error response from daemon: failed to resolve reference "{REGISTRY_PULL_IMAGE}": failed to do request: '
     'Head "https://docker.m.daocloud.io/v2/library/hello-world/manifests/sha256:5e2309?ns=docker.io": dial tcp: '
     "lookup docker.m.daocloud.io on 127.0.0.53:53: read udp 127.0.0.1:43592->127.0.0.53:53: read: connection refused\n"
 )
-PULL_OK = f"lium_pull mirrors={MIRROR}\nlium_pull cached=no cache=removed\nlium_pull exit=0 seconds=2\n{REGISTRY_PULL_IMAGE}\n"
+PULL_OK = f"{INFO}\nlium_pull cached=no cache=removed\nlium_pull exit=0 seconds=2\n{REGISTRY_PULL_IMAGE}\n"
 RATE_LIMITED = (
-    "lium_pull mirrors=[]\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=1\n"
+    "lium_pull driver=overlayfs mirrors=[]\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=1\n"
     "Error response from daemon: toomanyrequests: You have reached your unauthenticated pull rate limit. "
     "https://www.docker.com/increase-rate-limit\n"
 )
+# Docker 29.8.1, 23 Sep 2026, a REJECT rule in OUTPUT for every address of registry-1.docker.io (or the daemon's
+# proxy), the committed hello-world digest pulled; the text is the daemon's own, verbatim
+_HEAD = (
+    f'Error response from daemon: failed to resolve reference "{REGISTRY_PULL_IMAGE}": failed to do request: '
+    'Head "https://registry-1.docker.io/v2/library/hello-world/manifests/sha256:5e23090353324d887c48ad5e5c56d294eab81588df9605b07d1afe895f9cc8f8": '
+)
+REJECTED_TEXTS = {
+    # containerd image store: --reject-with tcp-reset, icmp-host-unreachable, icmp-net-unreachable
+    "tcp-reset": _HEAD + "dial tcp 184.193.200.226:443: connect: connection refused",
+    "icmp-host-unreachable": _HEAD + "dial tcp 34.238.55.159:443: connect: no route to host",
+    "icmp-net-unreachable": _HEAD + "dial tcp 52.45.63.121:443: connect: network is unreachable",
+    # daemon.json "proxies": a proxy port nothing listens on, and a proxy host behind icmp-host-unreachable
+    "proxy refused": _HEAD + "proxyconnect tcp: dial tcp 127.0.0.1:3999: connect: connection refused",
+    "proxy no route": _HEAD + "proxyconnect tcp: dial tcp 192.0.2.10:3128: connect: no route to host",
+    # the classic overlay2 store words it from the registry root
+    "classic tcp-reset": 'Error response from daemon: Get "https://registry-1.docker.io/v2/": dial tcp 98.87.240.167:443: '
+    "connect: connection refused",
+    "classic icmp-net-unreachable": 'Error response from daemon: Get "https://registry-1.docker.io/v2/": dial tcp '
+    "184.193.200.226:443: connect: network is unreachable",
+}
+REJECTED = (
+    f"lium_pull driver=overlayfs mirrors=[]\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=0\n"
+    f"{REJECTED_TEXTS['tcp-reset']}\n"
+)
+HUB_UP = (True, "HTTP 401")
+HUB_DOWN = (False, "ClientConnectorError: Cannot connect to host registry-1.docker.io:443")
 
 
 def result(
@@ -209,10 +236,72 @@ def test_the_image_is_a_tiny_official_image_pinned_by_digest():
             "other",
         ),
         (1, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock", "other"),
+        # the CLI failing to reach dockerd's socket, not the registry: Docker 29.8.1's text with the daemon stopped,
+        # and the refused variant
+        (
+            1,
+            "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and "
+            "if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory",
+            "other",
+        ),
+        (1, "dial unix /var/run/docker.sock: connect: connection refused", "other"),
+        # a resolver the host cannot reach is still a DNS failure
+        (
+            1,
+            "dial tcp: lookup registry-1.docker.io on 10.0.0.2:53: dial udp 10.0.0.2:53: connect: network is unreachable",
+            "dns_error",
+        ),
+        # a connection reset mid-transfer is not a rejected connect: no verdict, as before
+        (1, "read tcp 10.0.0.5:51234->44.194.203.49:443: read: connection reset by peer", "other"),
     ],
 )
 def test_the_pull_error_is_classified(exit_code, output, outcome):
     assert classify_pull_error(exit_code, output) == outcome
+
+
+@pytest.mark.parametrize("name", sorted(REJECTED_TEXTS))
+def test_a_rejected_connection_to_docker_hub_or_its_proxy_is_unreachable_and_fails(name):
+    """Regression (r4 M1): a firewall REJECT of Docker Hub read as `other`, no verdict, so a node failing every
+    uncached rent never failed. Texts are Docker 29.8.1's own, under each REJECT flavour and store."""
+    assert classify_pull_error(1, REJECTED_TEXTS[name]) == "unreachable"
+    assert "unreachable" in module.FAILING_OUTCOMES
+
+
+@pytest.mark.asyncio
+async def test_a_node_whose_firewall_rejects_docker_hub_fails_twice_in_a_row():
+    ctx, _, _ = make_ctx(result(REJECTED), result(REJECTED))
+    check = RegistryPullCheck()
+    with flags() as clock:
+        first = await check.run(ctx)
+        clock.now += 30 * 60
+        second = await check.run(ctx)
+    assert first.passed and first.event.reason_code == Msg.REGISTRY_PULL_FAILED_ONCE.reason
+    assert second.passed is False and second.event.reason_code == Msg.REGISTRY_PULL_FAILED.reason
+    assert second.event.what_we_saw["pull"]["outcome"] == "unreachable"
+    assert "connect: connection refused" in second.event.what_we_saw["pull"]["detail"]
+
+
+@pytest.mark.parametrize(
+    "line,driver,store",
+    [
+        (f"lium_pull driver=overlayfs mirrors={MIRROR}", "overlayfs", "containerd"),
+        (f"lium_pull driver=overlay2 mirrors={MIRROR}", "overlay2", "classic"),
+        (f"lium_pull driver=zfs mirrors={MIRROR}", "zfs", None),
+        # Docker 29.8.1's CLI with the daemon down still prints the format's literal text
+        ("lium_pull driver= mirrors=", None, None),
+        ("lium_pull mirrors=unknown", None, None),
+    ],
+)
+def test_the_image_store_is_read_off_the_first_line(line, driver, store):
+    reading = parse_pull_probe(PULL_OK.replace(INFO, line))
+    assert (reading.driver, reading.image_store) == (driver, store)
+    record = reading.as_record()
+    assert (record["driver"], record["image_store"]) == (driver, store)
+    assert record["seconds"] == 2
+
+
+def test_a_daemon_the_cli_cannot_reach_leaves_the_mirrors_unknown():
+    assert parse_pull_probe(PULL_OK.replace(INFO, "lium_pull driver= mirrors=")).mirrors is None
 
 
 def test_the_event_records_the_mirrors_the_daemon_has():
@@ -252,7 +341,7 @@ def _docker_stub(tmp_path, *, pull: str, rmi_removes: bool = True, cached: bool 
     return (
         f'echo "$*" >> {log}\n'
         'case "$1" in\n'
-        f"  info) echo '{MIRROR}' ;;\n"
+        f"  info) echo 'driver=overlay2 mirrors={MIRROR}' ;;\n"
         f"  image) [ -e {store} ] ;;\n"
         f"  rmi) {rmi} ;;\n"
         f"  pull) {pull} ;;\n"
@@ -294,6 +383,19 @@ def test_the_cached_image_is_removed_before_the_pull_and_after_it(tmp_path):
     pull_args = (tmp_path / "docker.log").read_text().splitlines()[4].split()
     assert pull_args[-1] == REGISTRY_PULL_IMAGE
     assert not store.exists()
+    assert (reading.driver, reading.image_store) == ("overlay2", "classic")
+    info_args = (tmp_path / "docker.log").read_text().splitlines()[0]
+    assert "driver={{.Driver}} mirrors={{json .RegistryConfig.Mirrors}}" in info_args
+
+
+def test_a_docker_info_that_prints_nothing_leaves_store_and_mirrors_unknown(tmp_path):
+    body = _docker_stub(tmp_path, pull="echo pulled", cached=False).replace(
+        "  info) echo 'driver=overlay2 mirrors=", "  info) exit 1; echo '"
+    )
+    out = _run_script(tmp_path, body)
+    reading = parse_pull_probe(out.stdout)
+    assert out.stdout.splitlines()[0] == "lium_pull mirrors=unknown"
+    assert (reading.outcome, reading.driver, reading.mirrors) == ("ok", None, None)
 
 
 def test_an_image_rmi_cannot_remove_is_not_pulled(tmp_path):
