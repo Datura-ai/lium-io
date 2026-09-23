@@ -160,6 +160,214 @@ def test_pre_pull_is_on_by_default():
     assert Settings.model_fields["PRE_PULL_TEMPLATES_ENABLED"].default is True
 
 
+# --- on by default (DAH-3604): a node whose .env has no PRE_PULL_* line -----------------
+
+# Prod's answer for an H100 on driver 580 (GET /executors/default-docker-image?include_pre_pull=true,
+# 23 Sep 2026, backend PRE_PULL_TEMPLATES_TOP_N=2): the node's default image, then the top-2.
+LIUM1_DEFAULT_TAG = "2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind-lium1"
+LIUM1_CU128_TAG = "2.11.0-py3.12-cuda12.8-devel-ubuntu24.04-dind-lium1"
+CUDA_REPO, CUDA_TAG = "nvidia/cuda", "13.0.3-devel-ubuntu22.04"
+DIGEST_LIUM1_DEFAULT = "sha256:efcbc04991511200e4763069434aeb1daf7baf40a0376e3c3296aef929828d89"
+DIGEST_LIUM1_CU128 = "sha256:b3aa9c485c5e91c051a3ef21c45a1b0f68dd1e101495cd8ade57d12eef861eb4"
+DIGEST_CUDA = "sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8"
+PROD_H100_ANSWER = [
+    _entry(REPO, LIUM1_DEFAULT_TAG, DIGEST_LIUM1_DEFAULT, size=9_133_782_473, pre_pull=False),
+    _entry(REPO, LIUM1_CU128_TAG, DIGEST_LIUM1_CU128, size=6_491_891_139),
+    _entry(CUDA_REPO, CUDA_TAG, DIGEST_CUDA, size=3_961_262_240),
+]
+PRE_PULL_ENV = (
+    "PRE_PULL_TEMPLATES_ENABLED",
+    "PRE_PULL_MIN_FREE_GB",
+    "PRE_PULL_TIMEOUT_SECONDS",
+    "PRE_PULL_START_JITTER_SECONDS",
+    "CACHE_TEMPLATE_REFRESH_SECONDS",
+)
+
+
+def _node_settings(monkeypatch, **env: str):
+    """Settings the way a node builds them, with no PRE_PULL_* in its environment unless given."""
+    from core.config import Settings
+
+    for name in PRE_PULL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    return Settings(_env_file=None)
+
+
+def test_a_node_without_the_flag_in_its_env_pre_pulls_and_false_opts_it_out(monkeypatch):
+    assert _node_settings(monkeypatch).PRE_PULL_TEMPLATES_ENABLED is True
+    for off in ("false", "False", "0"):
+        node = _node_settings(monkeypatch, PRE_PULL_TEMPLATES_ENABLED=off)
+        assert node.PRE_PULL_TEMPLATES_ENABLED is False
+
+
+def test_the_fleet_wide_guards_keep_the_defaults_the_rollout_was_sized_for(monkeypatch):
+    # 200 GiB disk floor, 30-min pull cap, 15-min start spread, one refresh (and so one pull) per 15 min
+    node = _node_settings(monkeypatch)
+
+    assert (
+        node.PRE_PULL_MIN_FREE_GB,
+        node.PRE_PULL_TIMEOUT_SECONDS,
+        node.PRE_PULL_START_JITTER_SECONDS,
+        node.CACHE_TEMPLATE_REFRESH_SECONDS,
+    ) == (200, 1800, 900, 900)
+
+
+def test_by_default_the_loop_asks_for_the_top_n_and_hands_only_those_to_the_puller(monkeypatch):
+    monkeypatch.setattr(cache_template_service, "settings", _node_settings(monkeypatch))
+
+    seen = _one_loop_iteration(monkeypatch, PROD_H100_ANSWER)
+
+    assert seen["params"] == {
+        "gpu_model": "NVIDIA H100 80GB HBM3",
+        "driver_version": "580.65.06",
+        "include_pre_pull": "true",
+    }
+    # the default image stays on the mandatory path (validator-checked), its old-tag cleanup
+    # shielding the pre-pull tags; the puller gets the two top-N entries and nothing else
+    assert seen["ensured"] == [(LIUM1_DEFAULT_TAG, {LIUM1_CU128_TAG, CUDA_TAG})]
+    assert seen["swept"] == [[LIUM1_CU128_TAG, CUDA_TAG]]
+    assert seen["protected"] == [{f"{REPO}:{LIUM1_DEFAULT_TAG}"}]
+
+
+def test_by_default_an_idle_node_warms_the_top_n_one_image_per_sweep_then_stops(monkeypatch):
+    present: set[str] = set()
+    pulls: list[str] = []
+
+    def pull(client, repo, tag, digest, timeout_seconds):
+        pulls.append(f"{repo}:{tag}")
+        present.add(digest)
+        return "pull_ok", None
+
+    monkeypatch.setattr(pre_pull_service, "_pull_pinned", pull)
+    puller = PrePuller(_client(present_digests=present), state_path=None)
+    entries = [data for data in PROD_H100_ANSWER if data["pre_pull"]]
+
+    for _ in range(3):
+        _sweep(puller, entries)
+
+    assert pulls == [f"{REPO}:{LIUM1_CU128_TAG}", f"{CUDA_REPO}:{CUDA_TAG}"]
+    assert set(puller.state.images) == {f"{REPO}:{LIUM1_CU128_TAG}", f"{CUDA_REPO}:{CUDA_TAG}"}
+
+
+def test_by_default_the_first_pull_waits_a_random_delay_within_15_minutes(quiet_node, monkeypatch):
+    monkeypatch.setattr(pre_pull_service, "settings", _node_settings(monkeypatch))
+    drawn: list[tuple] = []
+    order: list[str] = []
+
+    def uniform(lo, hi):
+        drawn.append((lo, hi))
+        return hi
+
+    async def sleep(seconds):
+        order.append(f"sleep {seconds:.0f}")
+
+    def pull(client, repo, tag, digest, timeout_seconds):
+        order.append(f"pull {timeout_seconds:.0f}")
+        return "pull_ok", None
+
+    monkeypatch.setattr(pre_pull_service.random, "uniform", uniform)
+    monkeypatch.setattr(pre_pull_service.asyncio, "sleep", sleep)
+    monkeypatch.setattr(pre_pull_service, "_pull_pinned", pull)
+
+    _sweep(PrePuller(_client(), state_path=None), [PROD_H100_ANSWER[1]])
+
+    assert drawn == [(0, 900)]
+    assert order == ["sleep 900", "pull 1800"]
+
+
+@pytest.mark.parametrize("headroom_bytes, pulled", [(-1, False), (0, True)])
+def test_by_default_a_pull_must_leave_200_gib_free_after_three_times_its_size(
+    quiet_node, monkeypatch, headroom_bytes, pulled
+):
+    monkeypatch.setattr(pre_pull_service, "settings", _node_settings(monkeypatch))
+    monkeypatch.setattr(pre_pull_service.random, "uniform", lambda lo, hi: 0.0)
+    entry = PROD_H100_ANSWER[1]
+    need = int(entry["docker_image_size"] * pre_pull_service.ON_DISK_MULTIPLIER)
+    free = 200 * GIB + need + headroom_bytes
+    monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=free))
+    client = _client()
+
+    _sweep(PrePuller(client, state_path=None), [entry])
+
+    assert bool(quiet_node) is pulled
+    # nothing tracked yet, so nothing to evict: the default image and rental images never are
+    client.images.remove.assert_not_called()
+
+
+def test_by_default_a_sweep_that_raises_never_stops_the_default_image_refresh(monkeypatch, caplog):
+    monkeypatch.setattr(cache_template_service, "settings", _node_settings(monkeypatch))
+    sweeps: list[int] = []
+    outcomes: list[str] = []
+    real_record = cache_template_service.CachePrefetchState.record_loop_outcome
+
+    class BrokenPuller:
+        def __init__(self, client, state_path=None):
+            pass
+
+        async def sweep(self, entries, protected=frozenset(), deadline=None):
+            sweeps.append(len(entries))
+            raise RuntimeError("registry unreachable")
+
+    def record(self, outcome, error=None):
+        outcomes.append(outcome)
+        real_record(self, outcome, error=error)
+
+    monkeypatch.setattr(cache_template_service.CachePrefetchState, "record_loop_outcome", record)
+    with caplog.at_level(logging.WARNING):
+        seen = _one_loop_iteration(monkeypatch, PROD_H100_ANSWER, puller=BrokenPuller, iterations=2)
+
+    assert [tag for tag, _ in seen["ensured"]] == [LIUM1_DEFAULT_TAG, LIUM1_DEFAULT_TAG]
+    assert sweeps == [2, 2]  # the failed sweep is over, so the next refresh starts a new one
+    assert outcomes == [cache_template_service.Outcome.SWEEP_OK] * 2
+    failures = [r for r in caplog.records if "sweep failed: registry unreachable" in r.getMessage()]
+    assert len(failures) == 2
+
+
+@pytest.fixture
+def executor_app():
+    """The app module. Its import chain (bittensor) re-levels and re-handles every logger that
+    already exists, which would silence caplog in the tests that run after this one; put them back."""
+    loggers = [logging.root] + [
+        lg for lg in logging.root.manager.loggerDict.values() if isinstance(lg, logging.Logger)
+    ]
+    saved = [(lg, lg.level, list(lg.handlers), lg.propagate, lg.disabled) for lg in loggers]
+    import executor
+
+    for lg, level, handlers, propagate, disabled in saved:
+        lg.handlers[:] = handlers
+        lg.setLevel(level)
+        lg.propagate, lg.disabled = propagate, disabled
+    return executor
+
+
+@pytest.mark.parametrize("failure", ["still warming", "crashed"])
+def test_the_executor_serves_whatever_the_prefetch_loop_does(monkeypatch, executor_app, failure):
+    executor = executor_app
+
+    async def prefetch():
+        if failure == "crashed":
+            raise RuntimeError("docker socket gone")
+        await asyncio.Event().wait()
+
+    async def purge():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(executor, "run_cache_template_prefetch", prefetch)
+    monkeypatch.setattr(executor, "run_uploaded_key_purge", purge)
+    served: list[bool] = []
+
+    async def main():
+        async with executor.lifespan(executor.app):
+            await asyncio.sleep(0)
+            served.append(True)
+
+    asyncio.run(asyncio.wait_for(main(), timeout=5))
+
+    assert served == [True]
+
+
 def test_flag_off_does_not_ask_for_or_touch_pre_pull_entries(monkeypatch):
     monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", False)
     default = _entry(REPO, DEFAULT_TAG, DIGEST_DEFAULT, pre_pull=False)
