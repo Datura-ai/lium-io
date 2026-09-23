@@ -986,6 +986,45 @@ class PortCountMessages:
     )
 
 
+NO_OUTBOUND_INTERNET_REMEDIATION = (
+    "containers on this host cannot reach the internet; check the docker bridge / FORWARD chain and DNS"
+)
+
+
+class OutboundInternetMessages:
+    NO_OUTBOUND_INTERNET = MessageTemplate(
+        event="Containers cannot reach the internet",
+        reason="NO_OUTBOUND_INTERNET",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0",
+        remediation=NO_OUTBOUND_INTERNET_REMEDIATION,
+    )
+    # the same finding while NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off: logged, score unchanged
+    NO_OUTBOUND_INTERNET_OBSERVED = MessageTemplate(
+        event="Containers cannot reach the internet (not enforced)",
+        reason="NO_OUTBOUND_INTERNET_OBSERVED",
+        severity="warning",
+        category="runtime",
+        impact="None: NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off",
+        remediation=NO_OUTBOUND_INTERNET_REMEDIATION,
+    )
+    OUTBOUND_INTERNET_OK = MessageTemplate(
+        event="Outbound internet verified",
+        reason="OUTBOUND_INTERNET_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="Outbound internet check skipped",
+        reason="OUTBOUND_INTERNET_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+
+
 VERIFYX_DEBUG_DOC_URL = (
     "https://github.com/Datura-ai/lium-io/blob/main/docs/lium-io/verifyx-debug.md"
 )

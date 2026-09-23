@@ -17,6 +17,7 @@ from neurons.validators.src.services.task import pipeline_factory
 from neurons.validators.src.services.task.checks import rental_probe as module
 from neurons.validators.src.services.task.checks.rental_probe import (
     STEP_CONTAINER_START,
+    STEP_EGRESS,
     STEP_GPU_COUNT,
     STEP_SSH_LOGIN,
     STEP_SSHD_LISTEN,
@@ -66,11 +67,20 @@ SMI_TWO_GPUS = (
 
 
 @contextmanager
-def probe_settings(*, enabled: bool = True, interval_hours: float = 6.0, deadline: int = 1):
+def probe_settings(
+    *,
+    enabled: bool = True,
+    interval_hours: float = 6.0,
+    deadline: int = 1,
+    egress_check: bool = False,
+    egress_enforced: bool = False,
+):
     with patch("neurons.validators.src.services.task.checks.rental_probe.settings") as s:
         s.RENTAL_PROBE_ENABLED = enabled
         s.RENTAL_PROBE_INTERVAL_HOURS = interval_hours
         s.RENTAL_PROBE_SSH_DEADLINE_SECONDS = deadline
+        s.NO_OUTBOUND_INTERNET_CHECK_ENABLED = egress_check
+        s.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED = egress_enforced
         yield s
 
 
@@ -286,10 +296,18 @@ def make_probe_context(
 class FakeSSHConnection:
     """What `await asyncssh.connect(...)` gives back: an async context manager with `run`."""
 
-    def __init__(self, stdout: str, exit_status: int, command_error: Exception | None):
+    def __init__(
+        self,
+        stdout: str,
+        exit_status: int,
+        command_error: Exception | None,
+        egress_stdout: str | None = None,
+    ):
         self.stdout = stdout
         self.exit_status = exit_status
         self.command_error = command_error
+        self.egress_stdout = egress_stdout
+        self.commands: list[str] = []
 
     async def __aenter__(self):
         return self
@@ -298,8 +316,11 @@ class FakeSSHConnection:
         return False
 
     async def run(self, command, *, check=False, timeout=None):
+        self.commands.append(command)
         if self.command_error is not None:
             raise self.command_error
+        if command.startswith("sh -c ") and self.egress_stdout is not None:
+            return MagicMock(stdout=self.egress_stdout, stderr="", exit_status=0)
         return MagicMock(stdout=self.stdout, stderr="", exit_status=self.exit_status)
 
 
@@ -323,6 +344,7 @@ def renter_path(
     command_error: Exception | None = None,
     smi_stdout: str = SMI_TWO_GPUS,
     smi_exit: int = 0,
+    egress_stdout: str | None = None,
 ):
     """What the probe sees from the validator's side of the network: the TCP port and the login.
 
@@ -356,7 +378,8 @@ def renter_path(
             error = login_error
         if error is not None:
             raise error
-        return FakeSSHConnection(smi_stdout, smi_exit, command_error)
+        seen["conn"] = FakeSSHConnection(smi_stdout, smi_exit, command_error, egress_stdout)
+        return seen["conn"]
 
     with (
         patch.object(module.asyncio, "open_connection", open_connection),
@@ -1428,3 +1451,90 @@ async def test_the_real_redis_service_accepts_the_stamps_lifetime(monkeypatch):
         ("rental_probe_ok:x", "1.0", module._REDIS_STAMP_TTL_SECONDS),
         ("plain", "v", None),
     ]
+
+
+EGRESS_OK = "lium_egress dns=ok\nlium_egress tool=curl http=200\n"
+EGRESS_DNS_FAIL = "lium_egress dns=fail\n"
+EGRESS_NO_ANSWER = (
+    "lium_egress dns=ok\nlium_egress tool=curl http=000\n"
+    "curl: (28) Failed to connect to pypi.org port 443 after 10001 ms: Timeout was reached\n"
+)
+
+
+def _steps(result) -> dict[str, dict]:
+    return {record["step"]: record for record in result.event.what_we_saw["probe_steps"]}
+
+
+@pytest.mark.asyncio
+async def test_egress_step_runs_the_script_inside_the_renter_container_and_passes_on_an_http_answer():
+    """Regression: the egress script runs on the host instead of in the renter's container over its SSH
+    session, so a pod network that drops the pod's traffic (ticket-0361) still passes."""
+    ctx, _, _ = make_probe_context()
+    with probe_settings(egress_check=True), renter_path(egress_stdout=EGRESS_OK) as seen:
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
+    assert _steps(result)[STEP_EGRESS]["ok"] is True
+    egress_command = seen["conn"].commands[1]
+    assert egress_command.startswith("sh -c ") and "getent hosts pypi.org" in egress_command
+    assert "https://pypi.org/simple/" in egress_command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("egress_stdout", [EGRESS_DNS_FAIL, EGRESS_NO_ANSWER])
+async def test_egress_failure_fails_the_probe_with_no_outbound_internet_when_enforced(
+    egress_stdout,
+):
+    """Regression: a renter container with no DNS or no route out passes the probe, or fails it under the
+    generic RENTAL_PROBE_FAILED instead of the reason the provider's panel explains."""
+    redis = FakeRedis()
+    ctx, _, _ = make_probe_context(redis=redis)
+    with (
+        probe_settings(egress_check=True, egress_enforced=True),
+        renter_path(egress_stdout=egress_stdout),
+    ):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.reason_code == "NO_OUTBOUND_INTERNET"
+    assert result.event.what_we_saw["failed_step"] == STEP_EGRESS
+    assert "FORWARD chain and DNS" in result.event.remediation
+    assert result.updates["clear_verified_job_info"] is True
+    assert redis.standing_failure() == STEP_EGRESS
+
+
+@pytest.mark.asyncio
+async def test_egress_failure_only_logs_while_enforcement_is_off():
+    """Regression: the egress step hides hosts before anyone read the shadow rows, or the failure is not
+    recorded at all."""
+    redis = FakeRedis()
+    ctx, _, _ = make_probe_context(redis=redis)
+    with probe_settings(egress_check=True), renter_path(egress_stdout=EGRESS_DNS_FAIL):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
+    assert _steps(result)[STEP_EGRESS]["ok"] is False
+    assert "dns_failed" in _steps(result)[STEP_EGRESS]["detail"]
+    assert redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_egress_step_without_a_reading_records_nothing():
+    """Regression: an image without curl or wget (no reading) fails the node as if it had no internet."""
+    ctx, _, _ = make_probe_context()
+    with (
+        probe_settings(egress_check=True, egress_enforced=True),
+        renter_path(egress_stdout="lium_egress dns=ok\nlium_egress tool=none http=000\n"),
+    ):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
+    assert STEP_EGRESS not in _steps(result)
+
+
+@pytest.mark.asyncio
+async def test_a_standing_egress_failure_is_dropped_once_enforcement_is_off():
+    """Regression: switching NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED off leaves nodes failing on the
+    egress step they failed while it was on, until a probe passes."""
+    ctx, _, _ = make_probe_context(
+        redis=FakeRedis(failed_step=STEP_EGRESS), rented=rented_data(fillers=1)
+    )
+    with probe_settings(egress_check=True):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed and result.event.reason_code == Msg.SKIPPED.reason

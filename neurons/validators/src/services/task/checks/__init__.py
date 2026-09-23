@@ -20,6 +20,7 @@ from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
+from .outbound_internet import OutboundInternetCheck
 from .port_connectivity import PortConnectivityCheck
 from .provider_side_load import ProviderSideLoadCheck
 from .rental_probe import RentalProbeCheck
@@ -58,6 +59,7 @@ __all__ = [
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
     "NvmlDigestCheck",
+    "OutboundInternetCheck",
     "PortConnectivityCheck",
     "PortCountCheck",
     "ProviderSideLoadCheck",
