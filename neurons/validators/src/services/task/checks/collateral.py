@@ -20,6 +20,27 @@ class CollateralCheck:
         enable_no_collateral = ctx.config.enable_no_collateral
         self.fatal = not enable_no_collateral
 
+        if ctx.config.designated_hotkey_first_pass:
+            # Designated-hotkey profile: the node's first, unscored pass skips the on-chain collateral
+            # read (a network round trip); the first scored cycle reads it and enforces the gate.
+            # Recorded as "not deposited" so the published row says what is true; calculate_scores
+            # waives the gate for this profile only.
+            event = render_message(
+                Msg.DESIGNATED_HOTKEY_SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"collateral_deposited": False, "skipped": True, "reason": "designated_hotkey_first_pass"},
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={
+                    "collateral_deposited": False,
+                    "collateral_error_message": None,
+                    "contract_version": None,
+                },
+            )
+
         specs = ctx.state.specs
         gpu_count = ctx.state.gpu_count
         if gpu_count is None:

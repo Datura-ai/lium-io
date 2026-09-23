@@ -64,6 +64,27 @@ class VerifyXCheck:
             )
             return CheckResult(passed=False, event=event)
 
+        if ctx.config.designated_hotkey_first_pass:
+            # Designated-hotkey profile: VerifyX proves the RAM, disk and bandwidth a node claims (75 %
+            # of RAM written and read back, 5 GB of disk, a 263–501 MB CDN download; p50 80 s, p90
+            # 149 s, 11.6 % of runs fail and cost the node a cycle). On the first, unscored pass of a
+            # designated-hotkey node it is deferred: the pass publishes the scrape's readings
+            # (specs.ram / hard_disk / network from the speedtest) as they are and leaves the VerifyX
+            # EMA unseeded: the first scored cycle measures it and enforces the
+            # gate as on any node. State is untouched on purpose — nothing here is measured.
+            event = render_message(
+                Msg.DESIGNATED_HOTKEY_SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "skipped": True,
+                    "reason": "designated_hotkey_first_pass",
+                    "network": specs.get("network", {}) or {},
+                    "bandwidth_gate": "deferred_to_first_scored_cycle",
+                },
+            )
+            return CheckResult(passed=True, event=event)
+
         filler_container = _get_filler_only_container(ctx)
         if filler_container:
             updated_specs = _with_last_known_verifyx_ema(ctx)

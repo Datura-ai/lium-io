@@ -695,6 +695,7 @@ def test_score_gate_zeroes_on_a_failed_inspector_verdict():
             cpu_truth_passed=True,
             provider_side_load_passed=True,
             inspector_passed=inspector_passed,
+            config=SimpleNamespace(designated_hotkey_first_pass=False),
         )
 
     actual, job, warning = calculate_scores(ctx(False), rented=False)

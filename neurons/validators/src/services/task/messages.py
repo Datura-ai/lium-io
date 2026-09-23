@@ -591,6 +591,13 @@ class CollateralMessages:
         impact="Score may be reduced or set to 0 based on policy",
         remediation="Deposit collateral for this executor.",
     )
+    DESIGNATED_HOTKEY_SKIPPED = MessageTemplate(
+        event="Collateral check skipped (designated hotkey, first pass)",
+        reason="COLLATERAL_SKIPPED_DESIGNATED_HOTKEY",
+        severity="info",
+        category="policy",
+        impact="Proceed; the first scored cycle reads collateral and enforces the gate",
+    )
 
 
 class StaleContainerCleanupMessages:
@@ -994,6 +1001,13 @@ class VerifyXMessages:
         severity="info",
         category="policy",
         impact="Active filler runtime preserved; reused last-known VerifyX EMA when available",
+    )
+    DESIGNATED_HOTKEY_SKIPPED = MessageTemplate(
+        event="VerifyX validation skipped (designated hotkey, first pass)",
+        reason="VERIFYX_SKIPPED_DESIGNATED_HOTKEY",
+        severity="info",
+        category="policy",
+        impact="Proceed on the scrape's RAM/disk/speed readings; the first scored cycle runs VerifyX",
     )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",

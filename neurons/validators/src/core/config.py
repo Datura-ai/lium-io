@@ -553,6 +553,37 @@ class Settings(BaseSettings):
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
 
+    # Designated-hotkey fast validation. The collateral read, VerifyX's RAM/disk/bandwidth proof and
+    # the full-card matmul are the bulk of a first verification's wall time (VerifyX p50 80 s / p90
+    # 149 s, matmul p50 26.5 s, collateral 3.5 s; 11.6 % of VerifyX runs fail and cost the node a
+    # whole cycle). With the flag on, the FIRST, unscored verification (the express lane's
+    # `first_pass=True` call) of an executor whose miner hotkey is in the operator-set allowlist
+    # DESIGNATED_MINER_HOTKEYS runs the fast-validation profile: collateral and VerifyX are skipped
+    # and the matmul is sized from FIRST_PASS_MATMUL_VRAM_MB; every check that catches a BROKEN node
+    # (scrape, GPU count/model/VRAM, disk, NVML digest, ports, sysbox, GPU compute probe, the
+    # backend's rental verification) is unchanged. Every scored cycle, and every other miner's every
+    # verification, is today's; the first scored cycle runs collateral and VerifyX and enforces
+    # both gates. Off by default; an empty hotkey list selects nobody even with the flag on.
+    #
+    # The list must hold DEDICATED hotkeys only. A miner hotkey names an account, not a
+    # person: the platform's custodied (wallet-free) provider accounts all list their nodes under one
+    # shared Lium pool hotkey (the portal's LIUM_POOL_HOTKEYS), so putting that pool hotkey here would
+    # hand the profile to every custodied provider's first pass. Nothing a provider sets on a node is
+    # read — only the operator's list decides — which is exactly why the list must never contain a
+    # shared hotkey. `validate_designated_hotkeys` refuses that at config load when the pool mirror
+    # below is filled; `designated_hotkey_startup_warnings()` names the gap when it is not.
+    DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED: bool = Field(
+        env="DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED", default=False
+    )
+    # Comma-separated ss58 miner hotkeys whose nodes' first pass takes the fast-validation profile.
+    # Operator-set; never read from a miner or an executor; never a pool hotkey custodied provider
+    # accounts share.
+    DESIGNATED_MINER_HOTKEYS: str = Field(env="DESIGNATED_MINER_HOTKEYS", default="")
+    # Comma-separated mirror of the portal's LIUM_POOL_HOTKEYS (the shared hotkey(s) custodied
+    # provider accounts list under). Read for one purpose: refusing a designated list that names
+    # one of them. Operator-set; empty means the refusal cannot check and the startup warning says so.
+    LIUM_POOL_HOTKEYS: str = Field(env="LIUM_POOL_HOTKEYS", default="")
+
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
     # is authoritative for the size cap but the validator double-checks it as
@@ -623,6 +654,41 @@ class Settings(BaseSettings):
                 )
         return self
 
+    @model_validator(mode="after")
+    def validate_designated_hotkeys(self) -> "Settings":
+        """Refuse a designated list that names a shared pool hotkey: the profile would then apply to
+        every custodied provider's first pass, not only to the designated accounts' nodes. Checked
+        whenever both lists are set, flag on or off, so a bad pair never waits for the flag flip to
+        surface."""
+        shared = self.designated_miner_hotkeys() & self.lium_pool_hotkeys()
+        if shared:
+            raise ValueError(
+                f"DESIGNATED_MINER_HOTKEYS names {len(shared)} hotkey(s) that are also in "
+                "LIUM_POOL_HOTKEYS; the designated list needs a dedicated hotkey — a pool hotkey is shared "
+                "by every custodied provider account"
+            )
+        return self
+
+    def designated_hotkey_startup_warnings(self) -> list[str]:
+        """What the operator should hear at startup about the fast-validation profile: with the flag on and
+        the pool mirror empty the config-load refusal cannot compare the lists, so the dedicated-hotkey
+        rule rests on the operator alone. Empty when there is nothing to say."""
+        if not self.DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED:
+            return []
+        warnings: list[str] = []
+        if not self.designated_miner_hotkeys():
+            warnings.append(
+                "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED is on with an empty DESIGNATED_MINER_HOTKEYS: "
+                "no node takes the profile"
+            )
+        elif not self.lium_pool_hotkeys():
+            warnings.append(
+                "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED is on and LIUM_POOL_HOTKEYS is empty: the "
+                "dedicated-hotkey rule is not checked — confirm no designated hotkey is a pool hotkey "
+                "custodied provider accounts list under"
+            )
+        return warnings
+
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
@@ -641,6 +707,27 @@ class Settings(BaseSettings):
 
     def get_latest_contract_version(self) -> str:
         return max(self.CONTRACT_VERSIONS.keys())
+
+    @staticmethod
+    def _hotkey_list(raw: str) -> frozenset[str]:
+        return frozenset(h.strip() for h in raw.split(",") if h.strip())
+
+    def designated_miner_hotkeys(self) -> frozenset[str]:
+        """The designated miner hotkeys whose nodes' first pass gets the fast-validation profile."""
+        return self._hotkey_list(self.DESIGNATED_MINER_HOTKEYS)
+
+    def lium_pool_hotkeys(self) -> frozenset[str]:
+        """The shared pool hotkey(s) custodied provider accounts list under (mirror of the portal's)."""
+        return self._hotkey_list(self.LIUM_POOL_HOTKEYS)
+
+    def is_designated_hotkey_first_pass(self, miner_hotkey: str | None, first_pass: bool) -> bool:
+        """True only for the FIRST, unscored verification of a node registered under a designated
+        hotkey, with DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED on. The wave never passes ``first_pass``,
+        so a scored verification never takes the profile; an empty DESIGNATED_MINER_HOTKEYS selects
+        nobody."""
+        if not first_pass or not self.DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED or not miner_hotkey:
+            return False
+        return miner_hotkey in self.designated_miner_hotkeys()
 
     def get_referral_feed_url(self) -> str:
         """Referral-weights feed URL, derived from COMPUTE_REST_API_URL unless overridden.
