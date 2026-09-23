@@ -16,7 +16,9 @@ from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 
-DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
+# 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
+# A stuck pull looks like a slow pull, so only this deadline stops it.
+DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 60 * 60
 _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
 _DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
 _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
