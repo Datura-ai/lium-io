@@ -23,6 +23,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 
 from ...const import MIN_PORT_COUNT, POD_CONTAINER_PREFIX
+from ...rental_dind import dind_companion_volume_names
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -1052,6 +1053,13 @@ async def _remove_over_shell(ctx: Context, *, container_name: str, volume_name: 
         # review: DockerCommand.volume_remove masks its exit with `|| true`; the probe needs the answer
         volume_removed = await asyncio.wait_for(
             ctx.ssh.run(DockerCommand.volume_remove_strict(volume_name), check=False),
+            timeout=_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+        # DAH-3796: absent unless the DinD volume flags were on for this probe
+        await asyncio.wait_for(
+            ctx.ssh.run(
+                DockerCommand.volume_remove(*dind_companion_volume_names(volume_name)), check=False
+            ),
             timeout=_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
     except (TimeoutError, asyncssh.Error, OSError) as exc:

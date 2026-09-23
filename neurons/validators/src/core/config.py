@@ -237,6 +237,21 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
+    # DAH-3796: Docker-in-Docker on a sysbox rental (services/rental_dind.py). Each applies when a
+    # container is created — a new pod, a reboot, an edit — never to a running one.
+    # Seed `default-address-pools` into the pod's /etc/docker/daemon.json before its first start, so
+    # the inner daemon has 1024 networks instead of 29. Kept when the image names its own pools.
+    RENTAL_DIND_ADDRESS_POOLS_ENABLED: bool = Field(env="RENTAL_DIND_ADDRESS_POOLS_ENABLED", default=False)
+    RENTAL_DIND_ADDRESS_POOLS: str = Field(
+        env="RENTAL_DIND_ADDRESS_POOLS", default='[{"base": "10.200.0.0/14", "size": 24}]',
+        description="dockerd default-address-pools JSON; must stay clear of 172.16/12, 192.168/16, 10.42.0.0/24.",
+    )
+    # A per-pod volume at /var/lib/docker: inner images, containers and volumes survive a reboot or
+    # an edit of the pod instead of starting empty. Removed with the pod.
+    RENTAL_DIND_PERSISTENT_STORE_ENABLED: bool = Field(env="RENTAL_DIND_PERSISTENT_STORE_ENABLED", default=False)
+    # A per-pod volume at /workspace on an encrypted pod, whose /root (FUSE) cannot be bind-mounted
+    # into inner containers: the path that can be survives a reboot or an edit. Removed with the pod.
+    RENTAL_DIND_WORKSPACE_VOLUME_ENABLED: bool = Field(env="RENTAL_DIND_WORKSPACE_VOLUME_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a

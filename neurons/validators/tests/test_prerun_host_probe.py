@@ -547,7 +547,8 @@ async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_n
         == live_cmds
         == [
             "/usr/bin/docker rm -fv pod_new pod_old filler_x",
-            "/usr/bin/docker volume rm volume_new volume_x 2>/dev/null || true",
+            "/usr/bin/docker volume rm volume_new volume_x volume_new_docker volume_new_workspace"
+            " volume_x_docker volume_x_workspace 2>/dev/null || true",
         ]
     )
     assert _cmds(live) == ['/usr/bin/docker ps -a --format "{{.Names}}"']

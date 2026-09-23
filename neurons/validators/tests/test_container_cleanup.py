@@ -521,3 +521,18 @@ async def test_cleanup_reports_container_that_survives_the_direct_kill():
     assert removed_count == 0 and removed_names == []
     assert unremovable == [name]
     assert sum(1 for c in calls if "docker rm -f" in c and name in c) == 2  # one retry, no loop
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drops_a_stale_pods_dind_volumes_with_its_volume():
+    """DAH-3796: a stale pod_* leaves no inner Docker store or /workspace volume behind."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+
+    removed_count, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [name]
+    volume = "volume_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    assert f"/usr/bin/docker volume rm {volume} {volume}_docker {volume}_workspace 2>/dev/null || true" in rm_calls

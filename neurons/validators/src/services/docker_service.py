@@ -99,6 +99,16 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
+from services.rental_dind import (
+    DIND_STORE_TARGET,
+    DIND_WORKSPACE_TARGET,
+    AddressPool,
+    dind_companion_volume_names,
+    dind_store_volume_name,
+    dind_workspace_volume_name,
+    parse_address_pools,
+    with_dind_companion_volumes,
+)
 from services.rental_docker_observability import (
     exec_logged_rental_docker_sdk_operation,
     rental_run_spec_log_fields,
@@ -844,6 +854,57 @@ def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets
     return mounts
 
 
+def _wants_dind_defaults(payload: ContainerCreateRequest) -> bool:
+    # A customer rental under sysbox is where an inner dockerd runs; a filler never runs one.
+    return bool(payload.is_sysbox) and payload.workload_kind != WorkloadKind.FILLER
+
+
+def _build_dind_volume_mounts(
+    payload: ContainerCreateRequest,
+    *,
+    local_volume: str,
+    encrypted_local_volume: bool,
+    occupied_targets: set[str],
+) -> list[VolumeMount]:
+    """DAH-3796: the per-pod inner Docker store and, on an encrypted pod, a bind-mountable /workspace.
+
+    Named after the pod's own volume, so a reboot or an edit (same volume, new container) mounts the
+    same ones again. Docker creates them with the local driver on first use. A target the rental
+    already mounts (a custom volume path, `/mnt`, a cache) is left alone.
+    """
+    if not _wants_dind_defaults(payload):
+        return []
+    mounts: list[VolumeMount] = []
+    if settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED and DIND_STORE_TARGET not in occupied_targets:
+        mounts.append(VolumeMount(source=dind_store_volume_name(local_volume), target=DIND_STORE_TARGET))
+        occupied_targets.add(DIND_STORE_TARGET)
+    # A plain pod's /root already bind-mounts into inner containers and persists.
+    if (
+        settings.RENTAL_DIND_WORKSPACE_VOLUME_ENABLED
+        and encrypted_local_volume
+        and DIND_WORKSPACE_TARGET not in occupied_targets
+    ):
+        mounts.append(VolumeMount(source=dind_workspace_volume_name(local_volume), target=DIND_WORKSPACE_TARGET))
+        occupied_targets.add(DIND_WORKSPACE_TARGET)
+    return mounts
+
+
+def _dind_address_pools(payload: ContainerCreateRequest) -> tuple[AddressPool, ...]:
+    if not (settings.RENTAL_DIND_ADDRESS_POOLS_ENABLED and _wants_dind_defaults(payload)):
+        return ()
+    try:
+        return parse_address_pools(settings.RENTAL_DIND_ADDRESS_POOLS)
+    except ValueError as exc:
+        # a bad env value must not stop rentals; the pod gets Docker's own pools, as before
+        logger.error(
+            _m(
+                "RENTAL_DIND_ADDRESS_POOLS is invalid; inner Docker keeps its default pools",
+                extra=get_extra_info({"pod_id": payload.pod_id, "error": str(exc)}),
+            )
+        )
+        return ()
+
+
 def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> bool:
     # customer rentals on a dstack CVM guest; a FILLER (DPHN/PEARL) has no attestation use and a
     # bare-metal node has no guest agent to broker
@@ -1331,6 +1392,14 @@ class DockerService:
             occupied_targets.add("/mnt")
         # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
         volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
+        volumes.extend(
+            _build_dind_volume_mounts(
+                payload,
+                local_volume=local_volume,
+                encrypted_local_volume=encrypted_local_volume,
+                occupied_targets=occupied_targets,
+            )
+        )
         # DAH-2828: the quote-only broker socket at the dstack SDK's default path, so a TEE
         # workload on a CVM node can take its own TDX quote from inside the pod.
         if quote_socket:
@@ -1362,6 +1431,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            inner_daemon_address_pools=_dind_address_pools(payload),
         )
 
     async def _ensure_pod_quote_socket(
@@ -2144,7 +2214,9 @@ class DockerService:
                     if volume_name not in active_volume_set:
                         volumes_to_remove.append(volume_name)
                 if volumes_to_remove:
-                    volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
+                    volumes = " ".join(
+                        shlex.quote(volume) for volume in with_dind_companion_volumes(volumes_to_remove)
+                    )
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             return stale_containers
@@ -2609,10 +2681,10 @@ class DockerService:
             )
 
             if remove_volume and volume_name:
-                volume = shlex.quote(volume_name)
+                volumes = " ".join(shlex.quote(volume) for volume in with_dind_companion_volumes([volume_name]))
                 await retry_ssh_command(
                     ssh_client,
-                    f"/usr/bin/docker volume rm {volume} 2>/dev/null || true",
+                    f"/usr/bin/docker volume rm {volumes} 2>/dev/null || true",
                     "cleanup_failed_container_creation",
                 )
         except asyncio.CancelledError:
@@ -6827,6 +6899,13 @@ class DockerService:
                             ),
                             volume_name=payload.local_volume,
                             volume_role="local",
+                        )
+                    # DAH-3796: the pod's inner Docker store and /workspace, whichever it has
+                    with _best_effort_delete_step(
+                        log, "remove_volume_dind", volume_name=payload.local_volume
+                    ):
+                        await ssh_client.run(
+                            DockerCommand.volume_remove(*dind_companion_volume_names(payload.local_volume))
                         )
 
                 if payload.external_volume:

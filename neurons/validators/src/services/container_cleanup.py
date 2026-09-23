@@ -8,6 +8,7 @@ import asyncssh
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
 from core.utils import _m
+from services.rental_dind import with_dind_companion_volumes
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_VOLUME_PREFIX,
@@ -563,7 +564,7 @@ class ContainerCleanup:
             # Remove associated volume if it's a pod container
             if container_name.startswith(POD_CONTAINER_PREFIX):
                 pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
-                await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
+                await ssh_client.run(DockerCommand.volume_remove(*with_dind_companion_volumes([f"volume_{pod_id}"])))
 
             return True
 
