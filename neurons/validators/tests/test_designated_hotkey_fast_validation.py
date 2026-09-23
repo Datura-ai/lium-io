@@ -58,7 +58,9 @@ PROVIDER_HOTKEY = "provider-hotkey-fixture"
 @pytest.fixture
 def profile_on(monkeypatch):
     monkeypatch.setattr(settings, "DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED", True)
-    monkeypatch.setattr(settings, "DESIGNATED_MINER_HOTKEYS", f"{DESIGNATED_HOTKEY}, {OTHER_DESIGNATED_HOTKEY}")
+    monkeypatch.setattr(
+        settings, "DESIGNATED_MINER_HOTKEYS", f"{DESIGNATED_HOTKEY}, {OTHER_DESIGNATED_HOTKEY}"
+    )
 
 
 # --- who gets the profile ---------------------------------------------------------------------
@@ -75,7 +77,9 @@ def test_hotkey_list_is_parsed_trimmed_and_ignores_blanks(profile_on, monkeypatc
     monkeypatch.setattr(
         settings, "DESIGNATED_MINER_HOTKEYS", f" {DESIGNATED_HOTKEY} ,, {OTHER_DESIGNATED_HOTKEY},"
     )
-    assert settings.designated_miner_hotkeys() == frozenset({DESIGNATED_HOTKEY, OTHER_DESIGNATED_HOTKEY})
+    assert settings.designated_miner_hotkeys() == frozenset(
+        {DESIGNATED_HOTKEY, OTHER_DESIGNATED_HOTKEY}
+    )
 
 
 # --- the dedicated-hotkey rule ----------------------------------------------------------------
@@ -390,7 +394,9 @@ async def test_designated_hotkey_first_pass_skips_verifyx_and_publishes_the_scra
 @pytest.mark.asyncio
 async def test_provider_node_still_runs_verifyx(context_factory):
     service = DummyVerifyXService(success=False, error_msg="probe failed")
-    result = await VerifyXCheck().run(_verifyx_ctx(context_factory, designated=False, service=service))
+    result = await VerifyXCheck().run(
+        _verifyx_ctx(context_factory, designated=False, service=service)
+    )
 
     assert result.passed is False
     assert service.called_with is not None
@@ -568,7 +574,9 @@ def _score_ctx(
     )
 
 
-def test_designated_hotkey_first_pass_scores_positive_without_verifyx_ema_or_collateral(monkeypatch):
+def test_designated_hotkey_first_pass_scores_positive_without_verifyx_ema_or_collateral(
+    monkeypatch,
+):
     monkeypatch.setattr(
         settings, "ENABLE_NO_COLLATERAL", False
     )  # the strict setting: collateral fatal for providers
