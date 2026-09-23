@@ -1,6 +1,6 @@
 """A customer's create removes every `filler_*` on the host and confirms the removal.
 
-rel-box-34 (20 Sep 2026): 6 of 459 rented nodes carried a live `filler_*` container beside a paying
+DAH-3706 (20 Sep 2026): 6 of 459 rented nodes carried a live `filler_*` container beside a paying
 pod. The backend's filler stop is best-effort, and a stop that did not confirm left the filler on the
 create's `active_container_names` — the names `clean_existing_containers` preserves. The backend no
 longer lists a filler on a customer create (lium-platform, same ticket); this is the validator's half:
@@ -132,7 +132,7 @@ async def test_a_filler_that_survives_the_removal_is_logged_as_filler_still_runn
     # the create goes on (no raise) and the survivor is reported with typed fields
     assert "filler_stuck" in removed
     [event] = _events(caplog)
-    # the create path's default_extra keys the executor as `executor_uuid` (create_container); compute-app's
+    # the create path's default_extra keys the executor as `executor_uuid` (create_container); the backend's
     # rent-path event carries `executor_uuid` too (its `executor_id` is the DB row id) — one Loki query joins on it
     assert event.msg.extra["executor_uuid"] == "exec-1"
     assert event.msg.extra["pod_name"] == "pod_target"

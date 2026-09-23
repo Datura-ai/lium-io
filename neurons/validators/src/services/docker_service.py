@@ -163,16 +163,16 @@ CONTAINER_STOP_GRACE_SECONDS = 30
 
 # Fillers get a shorter grace window than customer workloads. The backend preempts a filler
 # before a customer rent with a total budget of FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s in
-# compute-app) and starts the rent anyway on timeout. This grace must stay strictly below that
+# the backend) and starts the rent anyway on timeout. This grace must stay strictly below that
 # budget with room for the forced removal and the stopped-callback, so a SIGTERM-ignoring filler
 # can never burn the whole budget inside docker stop and hold the GPUs into the customer rent.
 # Half the budget leaves ~15s of headroom while still letting a well-behaved filler exit cleanly
-# and avoid the containerd/sysbox wedge. Keep in sync with compute-app FILLER_STOP_WAIT_TIMEOUT_SECONDS.
+# and avoid the containerd/sysbox wedge. Keep in sync with the backend FILLER_STOP_WAIT_TIMEOUT_SECONDS.
 FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
 
-# rel-box-34: typed event written when a `filler_*` container is still on the host after a
-# customer create's `docker rm -fv`. Same name as compute-app's FILLER_STILL_RUNNING_EVENT so one
-# log query counts both halves. Join key: `executor_uuid` (the validator-side id; compute-app's rent
+# DAH-3706: typed event written when a `filler_*` container is still on the host after a
+# customer create's `docker rm -fv`. Same name as the backend's FILLER_STILL_RUNNING_EVENT so one
+# log query counts both halves. Join key: `executor_uuid` (the validator-side id; the backend's rent
 # path writes it too -- its `executor_id` is the backend's DB row id), plus pod_name, container_names, reason.
 FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 
@@ -2042,7 +2042,7 @@ class DockerService:
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
 
-        rel-box-34: ``remove_every_filler`` (a customer's create) treats every `filler_*` as stale
+        DAH-3706: ``remove_every_filler`` (a customer's create) treats every `filler_*` as stale
         whatever ``active_container_names`` says -- a paying pod never shares the node with a
         filler, and a backend whose stop did not confirm may still list one. The removal is then
         re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
@@ -2174,7 +2174,7 @@ class DockerService:
         default_extra: dict,
         stale_containers: list[str],
     ) -> None:
-        """`docker rm -fv` for a customer create (rel-box-34): one attempt, then the host decides.
+        """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
 
         A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
         non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
@@ -5206,7 +5206,7 @@ class DockerService:
                     active_container_names=protected_container_names,
                     active_volume_names=payload.active_volume_names,
                     host_probe=docker_listing_probe,
-                    # rel-box-34: a customer's pod never shares the node with a filler, so its
+                    # DAH-3706: a customer's pod never shares the node with a filler, so its
                     # create removes every filler_* whatever the backend listed; a filler create
                     # keeps protecting its listed sibling bundle (DAH-2465).
                     remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
