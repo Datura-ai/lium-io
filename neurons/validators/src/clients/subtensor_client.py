@@ -253,12 +253,6 @@ class SubtensorClient:
     def subtensor(self):
         return SubtensorClient._subtensor
 
-    @property
-    def _endpoints(self) -> EndpointCursor:
-        """Where in the ordered dial list (`settings.get_chain_endpoints()`: our proxy first, the
-        public node last) this client is."""
-        return self._endpoint_cursor
-
     def _log_endpoint_switched(
         self, previous: ChainEndpoint, current: ChainEndpoint, reason: str, error: Exception
     ) -> None:
@@ -285,7 +279,7 @@ class SubtensorClient:
         leaves the validator without a chain client (metagraph sync and set_weights would stop).
         Raises the last error when every entry failed. Returns the client and which setting chose
         the endpoint."""
-        cursor = self._endpoints
+        cursor = self._endpoint_cursor
         last_error: Exception | None = None
         for _attempt in range(len(cursor.candidates)):
             endpoint = cursor.current
@@ -308,10 +302,10 @@ class SubtensorClient:
         error leaves the cursor on the healthy endpoint."""
         if not is_chain_error(error):
             return
-        if SubtensorClient._subtensor is None or len(self._endpoints.candidates) == 1:
+        if SubtensorClient._subtensor is None or len(self._endpoint_cursor.candidates) == 1:
             return
         self._drop_subtensor()
-        previous, current = self._endpoints.advance()
+        previous, current = self._endpoint_cursor.advance()
         self._log_endpoint_switched(previous, current, "read failed", error)
 
     def _return_to_first_endpoint(self) -> None:
@@ -319,7 +313,7 @@ class SubtensorClient:
         fallback node, once the failed endpoint's retry window is over, the client is dropped and
         the next dial tries it again (the proxy may be back). Inside the window the fallback client
         stays, so a dead proxy is not redialled every cycle."""
-        if not self._endpoints.reset():
+        if not self._endpoint_cursor.move_to_first_ready_endpoint():
             return
         self._drop_subtensor()
 
@@ -1015,13 +1009,11 @@ class SubtensorClient:
     async def _warm_up_subtensor(self):
         count = 0
         backoff = SUBTENSOR_BACKOFF_INITIAL
-        last_cycle_ran_on_fallback = False
         while True:
             try:
-                if last_cycle_ran_on_fallback:
-                    # back to the first endpoint once its retry window is over (our proxy may be back)
-                    last_cycle_ran_on_fallback = False
-                    self._return_to_first_endpoint()
+                # every cycle, so a cycle that failed on a fallback node still returns once the first
+                # endpoint's retry window is over (our proxy may be back)
+                self._return_to_first_endpoint()
                 self.set_subtensor()
 
                 if SubtensorClient._subtensor is None:
@@ -1038,7 +1030,6 @@ class SubtensorClient:
                     count = 1
 
                 backoff = SUBTENSOR_BACKOFF_INITIAL
-                last_cycle_ran_on_fallback = not self._endpoints.on_first
                 await asyncio.sleep(SYNC_CYCLE)
             except ProviderPortalDataUnavailable as exc:
                 logger.error(

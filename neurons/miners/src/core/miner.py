@@ -56,16 +56,9 @@ class Miner:
             settings.get_chain_endpoints(),
             retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
         )
-        self.last_cycle_ran_on_fallback = False
 
         self.should_exit = False
         self.bootstrap_complete = False
-
-    @property
-    def _endpoints(self) -> EndpointCursor:
-        """Where in the ordered dial list (`settings.get_chain_endpoints()`: our proxy first, the
-        public node last) this miner is."""
-        return self._endpoint_cursor
 
     def _log_endpoint_switched(
         self, previous: ChainEndpoint, current: ChainEndpoint, reason: str, error: Exception
@@ -93,7 +86,7 @@ class Miner:
         leaves the central miner without a chain client. Providers set no endpoint and dial the
         network name as before. Raises the last error when every entry failed. Returns the client
         and which setting chose the endpoint."""
-        cursor = self._endpoints
+        cursor = self._endpoint_cursor
         last_error: Exception | None = None
         for _attempt in range(len(cursor.candidates)):
             endpoint = cursor.current
@@ -118,10 +111,10 @@ class Miner:
         other local error leaves the cursor on the healthy proxy."""
         if not is_chain_error(error):
             return
-        if self.subtensor is None or len(self._endpoints.candidates) == 1:
+        if self.subtensor is None or len(self._endpoint_cursor.candidates) == 1:
             return
         await self.close_subtensor()
-        previous, current = self._endpoints.advance()
+        previous, current = self._endpoint_cursor.advance()
         self._log_endpoint_switched(previous, current, "read failed", error)
 
     async def _return_to_first_endpoint(self) -> None:
@@ -129,7 +122,7 @@ class Miner:
         fallback node, once the failed endpoint's retry window is over, the client is closed and
         the next dial tries it again (the proxy may be back). Inside the window the fallback client
         stays, so a dead proxy is not redialled every cycle."""
-        if not self._endpoints.reset():
+        if not self._endpoint_cursor.move_to_first_ready_endpoint():
             return
         await self.close_subtensor()
 
@@ -388,14 +381,12 @@ class Miner:
 
     async def sync(self):
         try:
-            if self.last_cycle_ran_on_fallback:
-                # back to the first endpoint once its retry window is over (our proxy may be back)
-                self.last_cycle_ran_on_fallback = False
-                await self._return_to_first_endpoint()
+            # every cycle, so a cycle that failed on a fallback node (a database error in
+            # save_validators) still returns once the first endpoint's retry window is over
+            await self._return_to_first_endpoint()
             await self.set_subtensor()
             if not self.bootstrap_complete:
                 await self.bootstrap()
-            self.last_cycle_ran_on_fallback = not self._endpoints.on_first
         except Exception as e:
             logger.error(
                 _m(

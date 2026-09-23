@@ -72,7 +72,6 @@ def _make_miner(settings: Settings) -> Miner:
         settings.get_chain_endpoints(),
         retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
     )
-    miner.last_cycle_ran_on_fallback = False
     miner.bootstrap_complete = False
     miner.should_exit = False
     miner.default_extra = {"external_ip": "203.0.113.10", "external_port": 8000}
@@ -217,7 +216,7 @@ async def test_sync_read_failure_rests_the_endpoint_for_the_retry_window_then_re
 
         await miner.sync()  # completes on the public node
         on_public = miner.subtensor
-        assert miner.last_cycle_ran_on_fallback
+        assert not miner._endpoint_cursor.on_first
 
         clock[0] += settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS - 1
         await miner.sync()  # inside the window: stays on the public node
@@ -226,11 +225,35 @@ async def test_sync_read_failure_rests_the_endpoint_for_the_retry_window_then_re
         clock[0] += 1
         await miner.sync()  # the window is over: back to the proxy
         assert miner.subtensor.chain_endpoint == OWN_ENDPOINT
-        assert not miner.last_cycle_ran_on_fallback
+        assert miner._endpoint_cursor.on_first
 
     assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT, "finney", OWN_ENDPOINT]
     assert _switch_lines(caplog) == [f"Subtensor endpoint switched from={OWN_ENDPOINT} to=finney"]
 
+
+
+@pytest.mark.asyncio
+async def test_syncs_that_keep_failing_on_the_public_node_still_return_to_the_proxy_after_the_window(
+    recording_subtensor, clock, caplog
+):
+    """taiberium on #1393: a database error in save_validators fails every cycle, and the old
+    `last_cycle_ran_on_fallback` flag was set only by a cycle that completed, so the miner stayed on the
+    public node. The return is tried at the start of every sync now."""
+    settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=OWN_ENDPOINT)
+    miner = _make_miner(settings)
+    disk_full = RuntimeError("save_validators: disk full")
+    miner.bootstrap = AsyncMock(side_effect=[TimeoutError("metagraph read timed out"), disk_full, disk_full, disk_full])
+
+    with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
+        await miner.sync()  # the read fails on the proxy → switched to the public node
+        await miner.sync()  # fails on the public node (not a chain fault: no switch)
+        assert miner.subtensor.chain_endpoint == PUBLIC_FINNEY
+
+        clock[0] += settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS
+        await miner.sync()  # still failing, but the window is over: back to the proxy
+        assert miner.subtensor.chain_endpoint == OWN_ENDPOINT and miner._endpoint_cursor.on_first
+
+    assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT, "finney", OWN_ENDPOINT]
 
 @pytest.mark.asyncio
 async def test_sync_read_failure_without_an_own_endpoint_redials_the_same_node(
@@ -238,7 +261,6 @@ async def test_sync_read_failure_without_an_own_endpoint_redials_the_same_node(
 ):
     settings = Settings(BITTENSOR_NETWORK="finney", BITTENSOR_CHAIN_ENDPOINT=None)
     miner = _make_miner(settings)
-    miner.last_cycle_ran_on_fallback = False
     miner.bootstrap = AsyncMock(side_effect=[TimeoutError("read timed out"), None])
 
     with patch.object(miner_module, "settings", settings), caplog.at_level(logging.INFO):
@@ -281,6 +303,6 @@ async def test_sync_database_error_leaves_a_healthy_proxy_in_place(
         await miner.sync()
 
     assert miner.subtensor.chain_endpoint == OWN_ENDPOINT
-    assert miner._endpoints.on_first
+    assert miner._endpoint_cursor.on_first
     assert [c["network"] for c in recording_subtensor.calls] == [OWN_ENDPOINT]
     assert _switch_lines(caplog) == []

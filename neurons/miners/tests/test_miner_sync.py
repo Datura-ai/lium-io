@@ -21,7 +21,6 @@ def _make_miner() -> Miner:
         settings.get_chain_endpoints(),
         retry_after_seconds=settings.BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS,
     )
-    miner.last_cycle_ran_on_fallback = False
     miner.bootstrap_complete = False
     miner.should_exit = False
     miner.default_extra = {"external_ip": "127.0.0.1", "external_port": 8000}

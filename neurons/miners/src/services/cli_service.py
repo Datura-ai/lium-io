@@ -71,29 +71,25 @@ class CliService:
         node last) so a down proxy does not fail the command.
         :return: SubstrateInterface instance
         """
-        last_error: Exception | None = None
         endpoints = settings.get_chain_endpoints()
         for index, endpoint in enumerate(endpoints):
             try:
                 self.subtensor = bt.Subtensor(network=endpoint.value, config=self.config)
                 return self.subtensor.substrate
             except Exception as e:
-                last_error = e
-                if len(endpoints) == 1 or index == len(endpoints) - 1:
+                if index == len(endpoints) - 1:
                     raise
-                nxt = endpoints[index + 1]
+                next_endpoint = endpoints[index + 1]
                 self.logger.warning(_m(
-                    f"Subtensor endpoint switched from={endpoint.value} to={nxt.value}",
+                    f"Subtensor endpoint switched from={endpoint.value} to={next_endpoint.value}",
                     extra={
                         **self.default_extra,
                         "from": endpoint.value,
-                        "to": nxt.value,
+                        "to": next_endpoint.value,
                         "reason": "connect failed",
                         "error": str(e),
                     },
                 ))
-        assert last_error is not None
-        raise last_error
 
     def print_extrinsic_receipt(self, receipt) -> dict:
         """

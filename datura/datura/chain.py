@@ -51,6 +51,13 @@ class ChainEndpoint(NamedTuple):
     source: EndpointSource
 
 
+class EndpointAdvance(NamedTuple):
+    """What `EndpointCursor.advance()` did: the entry that failed and the one the cursor is on now."""
+
+    previous: ChainEndpoint
+    current: ChainEndpoint
+
+
 class ChainConnection(NamedTuple, Generic[SubtensorT]):
     subtensor: SubtensorT
     endpoint_source: EndpointSource
@@ -79,8 +86,8 @@ def chain_endpoint_candidates(
 class EndpointCursor:
     """Which entry of the dial list a client is on. `advance()` marks the current entry as failed
     and moves to the next entry that is not resting (wrapping to the first when the last one fails
-    too). A failed entry rests for `retry_after_seconds`. `reset()` moves to the first entry that
-    is not resting, at the start of a sync cycle."""
+    too). A failed entry rests for `retry_after_seconds`. `move_to_first_ready_endpoint()` moves to
+    the first entry that is not resting, at the start of a sync cycle."""
 
     def __init__(self, candidates: list[ChainEndpoint], *, retry_after_seconds: float):
         if not candidates:
@@ -98,16 +105,16 @@ class EndpointCursor:
     def on_first(self) -> bool:
         return self.index == 0
 
-    def advance(self) -> tuple[ChainEndpoint, ChainEndpoint]:
+    def advance(self) -> EndpointAdvance:
         previous = self.current
         self._resting_until[self.index] = monotonic() + self.retry_after_seconds
         next_index = (self.index + 1) % len(self.candidates)
         ready = self._first_ready_index(start=next_index)
         # every entry is resting: take the next one anyway, never stop dialling
         self.index = next_index if ready is None else ready
-        return previous, self.current
+        return EndpointAdvance(previous, self.current)
 
-    def reset(self) -> bool:
+    def move_to_first_ready_endpoint(self) -> bool:
         """Move to the first entry that is not resting. True when the cursor moved."""
         ready = self._first_ready_index(start=0)
         if ready is None or ready == self.index:

@@ -230,7 +230,7 @@ def test_endpoint_list_walks_every_own_node_before_the_public_one(monkeypatch, c
         f"Subtensor endpoint switched from={OWN_ENDPOINT} to={SECOND_ENDPOINT}",
         f"Subtensor endpoint switched from={SECOND_ENDPOINT} to=finney",
     ]
-    assert client._endpoints.current.value == "finney"
+    assert client._endpoint_cursor.current.value == "finney"
 
 
 def test_read_failure_rests_the_endpoint_for_the_retry_window_then_returns_to_it(
@@ -260,7 +260,7 @@ def test_read_failure_rests_the_endpoint_for_the_retry_window_then_returns_to_it
 
         clock[0] += 1
         client._return_to_first_endpoint()
-        assert client.subtensor is None and client._endpoints.on_first
+        assert client.subtensor is None and client._endpoint_cursor.on_first
         client.set_subtensor()
         assert client.subtensor.chain_endpoint == OWN_ENDPOINT
 
@@ -366,7 +366,7 @@ def test_redis_or_portal_error_leaves_a_healthy_endpoint_in_place(recording_subt
         )
 
     assert client.subtensor is on_proxy
-    assert client._endpoints.on_first
+    assert client._endpoint_cursor.on_first
     assert _switch_lines(caplog) == []
     assert not is_chain_error(RedisError("redis down"))
     assert not is_chain_error(ProviderPortalDataUnavailable("no snapshot"))
