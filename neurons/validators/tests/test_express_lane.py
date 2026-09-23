@@ -697,17 +697,28 @@ async def test_the_lane_waits_for_the_waves_list_of_the_nodes_miner(monkeypatch,
     """The wave asks every miner for its list as the cycle starts. Until it has the list of the
     node's miner the lane does not launch the node: a check that fails in seconds would publish
     under the cycle's id, and the wave could then list, verify and publish the node under the
-    same id. Waiting spends no attempt. A cycle that starts during the tick's awaits holds too."""
-    early, late = str(uuid4()), str(uuid4())
-    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(early)]}, [_Neuron("miner-a")])
+    same id. Waiting spends no attempt and takes no in-flight slot from another miner's node. A
+    cycle that starts during the tick's awaits holds too."""
+    early, other, late = str(uuid4()), str(uuid4()), str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {
+            "miner-a": [_portal_executor(early, registered_seconds_ago=60)],
+            "miner-b": [_portal_executor(other, registered_seconds_ago=40)],
+        },
+        [_Neuron("miner-a"), _Neuron("miner-b")],
+    )
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_MAX_IN_FLIGHT", 1)
     harness.miner_service.awaiting_wave_list = {"miner-a": CYCLE_BATCH_ID}
 
-    assert await harness.tick_and_settle() == 0
-    harness.miner_service.request_job_to_miner.assert_not_awaited()
+    assert await harness.tick_and_settle() == 1
+    requests = harness.miner_service.request_job_to_miner.await_args_list
+    assert [c.kwargs["executor_id"] for c in requests] == [other]
     assert harness.lane._pending[early].attempts == 0
 
     del harness.miner_service.awaiting_wave_list["miner-a"]  # the wave's claim: the list arrived
     assert await harness.tick_and_settle() == 1
+    assert harness.miner_service.request_job_to_miner.await_args.kwargs["executor_id"] == early
 
     async def miners_while_a_cycle_starts():
         harness.inputs = _cycle_inputs(job_batch_id=NEXT_CYCLE_BATCH_ID)
@@ -717,7 +728,7 @@ async def test_the_lane_waits_for_the_waves_list_of_the_nodes_miner(monkeypatch,
     harness.lane.subtensor_client.get_miners = AsyncMock(side_effect=miners_while_a_cycle_starts)
     harness.portal_api.get_all_executors.return_value = {"miner-a": [_portal_executor(late)]}
     assert await harness.tick_and_settle() == 0
-    assert harness.miner_service.request_job_to_miner.await_count == 1
+    assert harness.miner_service.request_job_to_miner.await_count == 2
     assert harness.lane._pending[late].attempts == 0
 
 
