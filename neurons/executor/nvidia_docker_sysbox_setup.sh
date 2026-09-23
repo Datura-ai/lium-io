@@ -6,8 +6,9 @@ set -e
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
-# After sysbox works, install mode also sets up the vloopback volume plugin (DATA_DIR=<Docker data-root>/loopback)
-# and mounts a 1 GB test volume into a sysbox container; the run exits 1 with a doc link when that fails.
+# After sysbox works, install mode also sets up the vloopback volume plugin (pinned by digest,
+# DATA_DIR=<Docker data-root>/loopback) and mounts a 1 GB test volume into a sysbox container; the run exits 1
+# with a doc link when that fails.
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
 #   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
@@ -19,11 +20,16 @@ SYSBOX_SHA="87cfa5cad97dc5dc1a243d6d88be1393be75b93a517dc1580ecd8a2801c2777a"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
 # the validators' _LOOPBACK_PLUGIN_ALIAS / _LOOPBACK_PLUGIN_IMAGE (neurons/validators/src/services/docker_service.py):
-# a rental with a disk limit gets a volume from this plugin, mounted into its sysbox container
+# a rental with a disk limit gets a volume from this plugin, mounted into its sysbox container. The plugin runs
+# as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13),
+# the image the validators install by tag.
 VLOOPBACK_PLUGIN="vloopback"
-VLOOPBACK_PLUGIN_IMAGE="ashald/docker-volume-loopback"
-VLOOPBACK_PROBE_IMAGE="alpine"
+VLOOPBACK_PLUGIN_IMAGE="ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170"
 VLOOPBACK_DOC_URL="https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"
+VLOOPBACK_INSTALL_TIMEOUT=300
+VLOOPBACK_RUN_TIMEOUT=120
+VLOOPBACK_CLEANUP_TIMEOUT=30
+VLOOPBACK_TEST_NAME=""
 
 G='\033[0;32m' Y='\033[1;33m' R='\033[0;31m' B='\033[1;34m' N='\033[0m'
 ok()   { echo -e "  ${G}✓${N} $1"; }
@@ -33,7 +39,10 @@ step() { echo -e "\n${B}[$1/$2]${N} $3"; }
 
 # an `if`, not `[ … ] && rm`: under `set -e` the failing test made the EXIT trap end every run
 # with status 1, including "Nothing to do." and SUCCESS
-cleanup() { if [ -n "$DOWNLOADED_DEB" ]; then rm -f "$DOWNLOADED_DEB"; fi; }
+cleanup() {
+    if [ -n "$DOWNLOADED_DEB" ]; then rm -f "$DOWNLOADED_DEB"; fi
+    if [ -n "$VLOOPBACK_TEST_NAME" ]; then vloopback_remove_test_objects >/dev/null 2>&1 || true; fi
+}
 trap cleanup EXIT
 
 version_ge() {
@@ -515,7 +524,9 @@ ensure_vloopback_plugin() {
     wanted="${root%/}/loopback"
     state=$(vloopback_plugin_state)
     if [ "$state" = "absent" ]; then
-        out=$(docker plugin install "$VLOOPBACK_PLUGIN_IMAGE" --alias "$VLOOPBACK_PLUGIN" --grant-all-permissions "DATA_DIR=$wanted" 2>&1) || {
+        out=$(timeout "$VLOOPBACK_INSTALL_TIMEOUT" docker plugin install "$VLOOPBACK_PLUGIN_IMAGE" --alias "$VLOOPBACK_PLUGIN" \
+            --grant-all-permissions "DATA_DIR=$wanted" 2>&1) || {
+            [ -n "$out" ] || out="timed out after ${VLOOPBACK_INSTALL_TIMEOUT}s"
             VLOOPBACK_REASON="docker plugin install $VLOOPBACK_PLUGIN_IMAGE failed: $(echo "$out" | vloopback_last_line)"
             return 1
         }
@@ -551,33 +562,52 @@ ensure_vloopback_plugin() {
     fi
 }
 
-vloopback_mount_test() {
-    # what a rental with a disk limit does: create a volume, mount it into a sysbox container, write and read
-    # a file, unmount (the container exits), remove the volume. Removes the volume whatever step failed.
-    local volume="lium_vloopback_check_$$" mountpoint out rc=0
-    VLOOPBACK_REASON=""
-    out=$(docker volume create -d "$VLOOPBACK_PLUGIN" -o size=1G "$volume" 2>&1) || {
-        VLOOPBACK_REASON="docker volume create -d $VLOOPBACK_PLUGIN -o size=1G failed: $(echo "$out" | vloopback_last_line)"
+vloopback_remove_test_objects() {
+    # the test container first: a `docker run` killed by its timeout leaves it running with the volume attached
+    local out
+    timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker rm -f "$VLOOPBACK_TEST_NAME" &>/dev/null || true
+    out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume rm -f "$VLOOPBACK_TEST_NAME" 2>&1) || {
+        [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+        echo "$out" | vloopback_last_line
         return 1
     }
-    mountpoint=$(docker volume inspect --format '{{.Mountpoint}}' "$volume" 2>/dev/null)
-    case "$mountpoint" in
-        /*) ;;
-        *) VLOOPBACK_REASON="the $VLOOPBACK_PLUGIN plugin reports the Mountpoint '${mountpoint}', not an absolute path; Docker cannot mount it into a container."
-           rc=1 ;;
-    esac
+}
+
+vloopback_mount_test() {
+    # what a rental with a disk limit does: create a volume, mount it into a sysbox container, write and read
+    # a file, unmount (the container exits), remove the volume. Container and volume share one name; they are
+    # removed whatever step failed, and by the EXIT trap when the script is interrupted.
+    local mountpoint out rc=0 remove_error
+    VLOOPBACK_REASON=""
+    VLOOPBACK_TEST_NAME="lium_vloopback_check_$$"
+    out=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume create -d "$VLOOPBACK_PLUGIN" -o size=1G "$VLOOPBACK_TEST_NAME" 2>&1) || {
+        [ -n "$out" ] || out="timed out after ${VLOOPBACK_CLEANUP_TIMEOUT}s"
+        VLOOPBACK_REASON="docker volume create -d $VLOOPBACK_PLUGIN -o size=1G failed: $(echo "$out" | vloopback_last_line)"
+        rc=1
+    }
     if [ "$rc" -eq 0 ]; then
-        out=$(docker run --rm --runtime=sysbox-runc -v "$volume:/lium-vol" "$VLOOPBACK_PROBE_IMAGE" \
-            sh -c 'echo lium-vloopback-ok > /lium-vol/probe && cat /lium-vol/probe' 2>&1)
+        mountpoint=$(timeout "$VLOOPBACK_CLEANUP_TIMEOUT" docker volume inspect --format '{{.Mountpoint}}' "$VLOOPBACK_TEST_NAME" 2>/dev/null)
+        case "$mountpoint" in
+            /*) ;;
+            *) VLOOPBACK_REASON="the $VLOOPBACK_PLUGIN plugin reports the Mountpoint '${mountpoint}', not an absolute path; Docker cannot mount it into a container."
+               rc=1 ;;
+        esac
+    fi
+    if [ "$rc" -eq 0 ]; then
+        out=$(timeout "$VLOOPBACK_RUN_TIMEOUT" docker run --rm --name "$VLOOPBACK_TEST_NAME" --runtime=sysbox-runc \
+            -v "$VLOOPBACK_TEST_NAME:/lium-vol" "$VERIFY_IMAGE" \
+            sh -c 'echo lium-vloopback-ok > /lium-vol/probe && cat /lium-vol/probe' 2>&1) || true
         if ! echo "$out" | grep -qx 'lium-vloopback-ok'; then
+            [ -n "$out" ] || out="the container did not finish within ${VLOOPBACK_RUN_TIMEOUT}s"
             VLOOPBACK_REASON="a $VLOOPBACK_PLUGIN volume does not mount into a sysbox container: $(echo "$out" | vloopback_last_line)"
             rc=1
         fi
     fi
-    if ! out=$(docker volume rm -f "$volume" 2>&1); then
-        [ "$rc" -ne 0 ] || VLOOPBACK_REASON="the test volume $volume did not unmount and remove: $(echo "$out" | vloopback_last_line)"
+    if ! remove_error=$(vloopback_remove_test_objects); then
+        [ "$rc" -ne 0 ] || VLOOPBACK_REASON="the test volume $VLOOPBACK_TEST_NAME did not unmount and remove: $remove_error"
         rc=1
     fi
+    VLOOPBACK_TEST_NAME=""
     return "$rc"
 }
 
@@ -606,6 +636,10 @@ check_vloopback() {
         pf_fix "The $VLOOPBACK_PLUGIN plugin is installed but disabled — rentals with a disk limit cannot start." \
             "docker plugin enable $VLOOPBACK_PLUGIN"
         return 1
+    fi
+    if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
+        pf_skip "vloopback volumes — the test runs $VERIFY_IMAGE, which is not on this host yet (install mode pulls it)."
+        return 0
     fi
     if ! vloopback_mount_test; then
         pf_fix "vloopback volumes fail on this host: $VLOOPBACK_REASON" "See $VLOOPBACK_DOC_URL"
