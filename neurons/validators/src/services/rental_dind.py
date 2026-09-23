@@ -38,6 +38,10 @@ DIND_WORKSPACE_SUFFIX = "_workspace"
 # In the store volume: the `dockerd --version` line of the last pod dockerd that used the store.
 DIND_STORE_VERSION_MARKER = ".lium-dockerd-version"
 _POD_VOLUME_PREFIX = "volume_"
+_COMPANION_VOLUME_RE = re.compile(
+    rf"({_POD_VOLUME_PREFIX}[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}})"
+    rf"(?:{DIND_STORE_SUFFIX}|{DIND_WORKSPACE_SUFFIX})"
+)
 
 # Ranges an inner network must never shadow inside the pod: the host daemon's own pools and bridge
 # (Docker's defaults, the sysbox installer's 172.20/172.25, neurons/executor/daemon.json's 172.24
@@ -154,14 +158,14 @@ def with_dind_companion_volumes(volume_names: Iterable[str]) -> list[str]:
 
 
 def dind_base_volume_name(volume_name: str) -> str | None:
-    """The pod volume a companion volume belongs to; None for any other volume."""
-    if not volume_name.startswith(_POD_VOLUME_PREFIX):
-        return None
-    for suffix in (DIND_STORE_SUFFIX, DIND_WORKSPACE_SUFFIX):
-        base = volume_name.removesuffix(suffix)
-        if base != volume_name and len(base) > len(_POD_VOLUME_PREFIX):
-            return base
-    return None
+    """The pod volume a companion volume belongs to; None for any other volume.
+
+    Only `volume_<pod uuid>_docker` / `volume_<pod uuid>_workspace` count, so no pod volume (and no
+    other volume) is ever read as a companion. A companion of a non-uuid pod volume is removed with
+    its pod but never swept as an orphan.
+    """
+    match = _COMPANION_VOLUME_RE.fullmatch(volume_name)
+    return None if match is None else match.group(1)
 
 
 def orphaned_dind_companion_volumes(

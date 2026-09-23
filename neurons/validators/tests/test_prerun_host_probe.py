@@ -643,6 +643,10 @@ async def test_clean_stale_vloopback_probe_without_vloopback_volumes_runs_nothin
     assert _cmds(ssh) == []
 
 
+_GONE_COMPANION = "volume_00000000-0000-4000-8000-000000000001_docker"
+_NEW_POD_VOLUME = "volume_00000000-0000-4000-8000-000000000002"
+
+
 @pytest.mark.asyncio
 async def test_clean_stale_vloopback_takes_a_stale_pods_dind_volumes_and_orphans_along(
     docker_service, monkeypatch
@@ -661,8 +665,8 @@ async def test_clean_stale_vloopback_takes_a_stale_pods_dind_volumes_and_orphans
         ("volume_a_workspace", "local"),
         ("volume_live", "vloopback"),  # its pod runs
         ("volume_live_docker", "local"),
-        ("volume_gone_docker", "local"),  # pod volume already gone
-        ("volume_new_docker", "local"),  # the pod being created (protected)
+        (_GONE_COMPANION, "local"),  # pod volume already gone
+        (f"{_NEW_POD_VOLUME}_docker", "local"),  # the pod being created (protected)
         ("volume_plain", "local"),  # a local pod volume this sweep never touches
         ("volume_plain_docker", "local"),
     ]
@@ -672,7 +676,7 @@ async def test_clean_stale_vloopback_takes_a_stale_pods_dind_volumes_and_orphans
         _ssh_result(stdout="\n".join(mounted)),
     )
     removed_live = await docker_service.clean_stale_vloopback_volumes(
-        ssh_client=live, default_extra={}, skip_volume_names={"volume_new"}
+        ssh_client=live, default_extra={}, skip_volume_names={_NEW_POD_VOLUME}
     )
     live_cmds = list(ran)
     ran.clear()
@@ -681,10 +685,10 @@ async def test_clean_stale_vloopback_takes_a_stale_pods_dind_volumes_and_orphans
         mounted_volume_names=tuple(mounted),
     )
     removed_probed = await docker_service.clean_stale_vloopback_volumes(
-        ssh_client=_ssh(), default_extra={}, skip_volume_names={"volume_new"}, host_probe=probe
+        ssh_client=_ssh(), default_extra={}, skip_volume_names={_NEW_POD_VOLUME}, host_probe=probe
     )
 
-    expected = ["volume_a", "volume_a_docker", "volume_a_workspace", "volume_gone_docker"]
+    expected = ["volume_a", _GONE_COMPANION, "volume_a_docker", "volume_a_workspace"]
     assert removed_live == removed_probed == expected
     assert (
         ran == live_cmds == [f"/usr/bin/docker volume rm {' '.join(expected)} 2>/dev/null || true"]
@@ -698,7 +702,7 @@ async def test_clean_stale_vloopback_sweeps_orphaned_dind_volumes_on_a_host_with
     retry = AsyncMock()
     monkeypatch.setattr("services.docker_service.retry_ssh_command", retry)
     probe = _probe(
-        volumes=(ProbedVolume("volume_gone_docker", "local"), ProbedVolume("volume_c", "local")),
+        volumes=(ProbedVolume(_GONE_COMPANION, "local"), ProbedVolume("volume_c", "local")),
         mounted_volume_names=(),
     )
 
@@ -706,10 +710,10 @@ async def test_clean_stale_vloopback_sweeps_orphaned_dind_volumes_on_a_host_with
         ssh_client=_ssh(), default_extra={}, host_probe=probe
     )
 
-    assert removed == ["volume_gone_docker"]
+    assert removed == [_GONE_COMPANION]
     assert (
         retry.await_args.args[1]
-        == "/usr/bin/docker volume rm volume_gone_docker 2>/dev/null || true"
+        == f"/usr/bin/docker volume rm {_GONE_COMPANION} 2>/dev/null || true"
     )
 
 

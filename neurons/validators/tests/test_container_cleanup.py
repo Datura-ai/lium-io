@@ -552,28 +552,34 @@ def _dind_volume_ssh_mock(*, all_volumes: list[str], dangling: list[str], list_s
     return _ssh_mock_from_calls(handler), calls
 
 
+def _pod_volume(n: int) -> str:
+    return f"volume_00000000-0000-4000-8000-{n:012d}"
+
+
+_GONE, _RENTED_ID, _KEPT, _LIVE = _pod_volume(1), "00000000-0000-4000-8000-000000000002", _pod_volume(3), _pod_volume(4)
 _DIND_HOST_VOLUMES = [
-    "volume_gone_docker",  # its pod volume and container are gone
-    "volume_gone_workspace",
-    "volume_rented_docker",  # the backend still lists pod_rented here
-    "volume_kept",  # a pod volume nothing sweeps: its companion stays with it
-    "volume_kept_docker",
-    "volume_live_docker",  # referenced by a container, so not dangling
+    f"{_GONE}_docker",  # its pod volume and container are gone
+    f"{_GONE}_workspace",
+    f"volume_{_RENTED_ID}_docker",  # the backend still lists this pod here
+    _KEPT,  # a pod volume nothing sweeps: its companion stays with it
+    f"{_KEPT}_docker",
+    f"{_LIVE}_docker",  # referenced by a container, so not dangling
+    "volume_legacy_docker",  # not a pod uuid: never read as a companion
     ANON_VOLUME_A,
 ]
 
 
 @pytest.mark.asyncio
 async def test_orphaned_dind_volumes_of_pods_that_no_longer_exist_are_removed():
-    dangling = [name for name in _DIND_HOST_VOLUMES if name != "volume_live_docker"]
+    dangling = [name for name in _DIND_HOST_VOLUMES if name != f"{_LIVE}_docker"]
     ssh, calls = _dind_volume_ssh_mock(all_volumes=_DIND_HOST_VOLUMES, dangling=dangling)
 
     removed = await ContainerCleanup().prune_orphaned_dind_volumes(
-        ssh, _rented_data(EXECUTOR_UUID, ["pod_rented"]), EXECUTOR_UUID
+        ssh, _rented_data(EXECUTOR_UUID, [f"pod_{_RENTED_ID}"]), EXECUTOR_UUID
     )
 
     assert removed == 2
-    assert calls[-1] == "/usr/bin/docker volume rm volume_gone_docker volume_gone_workspace 2>/dev/null || true"
+    assert calls[-1] == f"/usr/bin/docker volume rm {_GONE}_docker {_GONE}_workspace 2>/dev/null || true"
 
 
 @pytest.mark.parametrize(
@@ -586,7 +592,7 @@ async def test_the_dind_orphan_sweep_removes_nothing_when_it_cannot_be_sure(rent
     ssh, calls = _dind_volume_ssh_mock(
         all_volumes=_DIND_HOST_VOLUMES, dangling=_DIND_HOST_VOLUMES, list_status=list_status
     )
-    rented_data = _rented_data(EXECUTOR_UUID, ["pod_rented"]) if rented else None
+    rented_data = _rented_data(EXECUTOR_UUID, [f"pod_{_RENTED_ID}"]) if rented else None
 
     removed = await ContainerCleanup(dry_run=dry_run).prune_orphaned_dind_volumes(ssh, rented_data, EXECUTOR_UUID)
 
@@ -596,10 +602,10 @@ async def test_the_dind_orphan_sweep_removes_nothing_when_it_cannot_be_sure(rent
 
 @pytest.mark.asyncio
 async def test_cleanup_runs_the_dind_orphan_sweep():
-    ssh, calls = _dind_volume_ssh_mock(all_volumes=["volume_gone_docker"], dangling=["volume_gone_docker"])
+    ssh, calls = _dind_volume_ssh_mock(all_volumes=[f"{_GONE}_docker"], dangling=[f"{_GONE}_docker"])
 
     await ContainerCleanup(stale_threshold_minutes=15).cleanup(
         ssh_client=ssh, rented_data=_rented_data(EXECUTOR_UUID, []), executor_uuid=EXECUTOR_UUID
     )
 
-    assert "/usr/bin/docker volume rm volume_gone_docker 2>/dev/null || true" in calls
+    assert f"/usr/bin/docker volume rm {_GONE}_docker 2>/dev/null || true" in calls

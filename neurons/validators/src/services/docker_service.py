@@ -2409,12 +2409,23 @@ class DockerService:
                     name.strip() for name in (mounted_result.stdout or "").splitlines() if name.strip()
                 }
             stale_pod_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
-            orphaned_dind_volumes = orphaned_dind_companion_volumes(
-                all_volumes,
-                unreferenced=all_volumes - mounted_volumes,
-                protected=skip_set,
-                removing=stale_pod_volumes,
+            unreferenced_volumes = all_volumes - mounted_volumes - skip_set
+            # a stale pod volume's own companions by name, then companions of pod volumes already gone
+            companions = {
+                name
+                for pod_volume in stale_pod_volumes
+                for name in dind_companion_volume_names(pod_volume)
+                if name in unreferenced_volumes
+            }
+            companions.update(
+                orphaned_dind_companion_volumes(
+                    all_volumes,
+                    unreferenced=all_volumes - mounted_volumes,
+                    protected=skip_set,
+                    removing=stale_pod_volumes,
+                )
             )
+            orphaned_dind_volumes = sorted(companions)
             stale_volumes = stale_pod_volumes + orphaned_dind_volumes
             if not stale_volumes:
                 return []

@@ -471,15 +471,22 @@ def test_invalid_pools_in_the_env_leave_docker_its_own_and_say_so(
 # --- companion volumes whose pod is gone ------------------------------------------------------
 
 
+def _vol(n: int) -> str:
+    return f"volume_00000000-0000-4000-8000-{n:012d}"
+
+
 @pytest.mark.parametrize(
     ("name", "base"),
     [
-        ("volume_a_docker", "volume_a"),
-        ("volume_a_workspace", "volume_a"),
-        ("volume_a", None),
+        (f"{_vol(1)}_docker", _vol(1)),
+        (f"{_vol(1)}_workspace", _vol(1)),
+        (_vol(1), None),
+        (f"{_vol(1)}_docker_docker", None),  # a pod volume named like a companion is not one
+        (f"{_vol(1)}_docker_x", None),
+        (f"{_vol(1).upper()}_docker", None),
+        ("volume_a_docker", None),  # not a pod uuid
         ("volume__docker", None),
         ("dphn_cache_docker", None),
-        ("volume_a_docker_x", None),
     ],
 )
 def test_a_companion_names_its_pod_volume(name, base):
@@ -487,31 +494,33 @@ def test_a_companion_names_its_pod_volume(name, base):
 
 
 def test_orphans_are_unreferenced_companions_whose_pod_volume_is_gone_or_going():
+    gone, going, kept, live, backend = (_vol(n) for n in range(1, 6))
     names = {
-        "volume_gone_docker",  # pod volume gone, nothing references it
-        "volume_going",
-        "volume_going_docker",
-        "volume_going_workspace",  # pod volume removed now
-        "volume_kept",
-        "volume_kept_docker",  # pod volume still there: kept with it
-        "volume_live_docker",  # a container (running or stopped) references it
-        "volume_backend_docker",  # the backend still lists its pod
-        "volume_plain",
+        f"{gone}_docker",  # pod volume gone, nothing references it
+        going,
+        f"{going}_docker",
+        f"{going}_workspace",  # pod volume removed now
+        kept,
+        f"{kept}_docker",  # pod volume still there: kept with it
+        f"{live}_docker",  # a container (running or stopped) references it
+        f"{backend}_docker",  # the backend still lists its pod
+        "volume_plain_docker",  # not a pod uuid: never swept
         "dphn_cache_x",
     }
-    unreferenced = names - {"volume_live_docker"}
+    unreferenced = names - {f"{live}_docker"}
 
     orphans = orphaned_dind_companion_volumes(
-        names, unreferenced=unreferenced, protected={"volume_backend"}, removing={"volume_going"}
+        names, unreferenced=unreferenced, protected={backend}, removing={going}
     )
 
-    assert orphans == ["volume_going_docker", "volume_going_workspace", "volume_gone_docker"]
+    assert orphans == [f"{gone}_docker", f"{going}_docker", f"{going}_workspace"]
 
 
 def test_a_protected_companion_is_never_an_orphan():
+    companion = f"{_vol(9)}_docker"
     assert (
         orphaned_dind_companion_volumes(
-            ["volume_x_docker"], unreferenced=["volume_x_docker"], protected=["volume_x_docker"]
+            [companion], unreferenced=[companion], protected=[companion]
         )
         == []
     )
