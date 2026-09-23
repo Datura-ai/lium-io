@@ -204,21 +204,21 @@ sudo systemctl restart docker
 
 A rental with a disk limit gets its volume from the `vloopback` Docker volume plugin ([`ashald/docker-volume-loopback`](https://github.com/ashald/docker-volume-loopback)), mounted into the pod's Sysbox container. Once Sysbox runs a GPU container, `nvidia_docker_sysbox_setup.sh` does this itself, and re-running it on a working host changes nothing:
 
-1. installs the plugin when it is missing, with `DATA_DIR=<Docker data-root>/loopback` (the data-root is `docker info --format '{{.DockerRootDir}}'`), the same way the validators install it on the first rental;
+1. installs the plugin when it is missing, with `DATA_DIR=<Docker data-root>/loopback` (the data-root is `docker info --format '{{.DockerRootDir}}'`). It installs by digest, `ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170`: the `:latest` image the validators install on the first rental, pushed 2019-02-13;
 2. on a plugin whose `DATA_DIR` is not an absolute path, stops if a rental is running, then sets `DATA_DIR=<Docker data-root>/loopback` and enables the plugin;
-3. creates a 1 GB test volume, checks that `docker volume inspect` shows a `Mountpoint` starting with `/`, mounts the volume into a Sysbox container, writes a file and reads it back, lets the container exit (which unmounts the volume) and removes the volume.
+3. creates a 1 GB test volume, checks that `docker volume inspect` shows a `Mountpoint` starting with `/`, mounts the volume into a Sysbox container (`daturaai/compute-subnet-executor:latest`), writes a file and reads it back, lets the container exit (which unmounts the volume) and removes the container and the volume.
 
-When a step fails, the installer prints one message with the cause and this link, restarts the executor it stopped, and exits `1`. `--check` runs step 3 on an installed plugin and prints `FIX` lines for steps 1 and 2 without changing the plugin.
+The install has 300 seconds, the test container 120 and every other Docker command 30. When a step fails, the installer prints one message with the cause and this link, restarts the executor it stopped, and exits `1`; an interrupted run removes its test container and volume on exit. `--check` runs step 3 on an installed plugin and prints `FIX` lines for steps 1 and 2 without changing the plugin.
 
 The same commands by hand:
 
 ```shell
 root=$(docker info --format '{{.DockerRootDir}}')
-docker plugin install ashald/docker-volume-loopback --alias vloopback --grant-all-permissions DATA_DIR=$root/loopback   # when the plugin is missing
+docker plugin install ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170 --alias vloopback --grant-all-permissions DATA_DIR=$root/loopback   # when the plugin is missing
 docker plugin disable vloopback && docker plugin set vloopback DATA_DIR=$root/loopback && docker plugin enable vloopback   # when DATA_DIR is not absolute; stop rentals first
 docker volume create -d vloopback -o size=10G t && docker volume inspect t --format '{{.Mountpoint}}'   # must start with /
-docker run --rm --runtime=sysbox-runc -v t:/lium-vol alpine sh -c 'echo ok > /lium-vol/probe && cat /lium-vol/probe'   # prints ok
-docker volume rm t
+docker run --rm --name t --runtime=sysbox-runc -v t:/lium-vol daturaai/compute-subnet-executor:latest sh -c 'echo ok > /lium-vol/probe && cat /lium-vol/probe'   # prints ok
+docker rm -f t; docker volume rm t
 ```
 
 Causes the installer names:
@@ -227,7 +227,7 @@ Causes the installer names:
 - **`error setting up ID-mapped mount on path …`**, or a `Mountpoint` that does not start with `/`: Sysbox mounts volumes through ID-mapped mounts, and the filesystem under Docker's data-root does not support them. Put the data-root on ext4 or XFS ([Docker Storage Setup](https://docs.lium.io/providers/nodes/docker-storage)), then run the installer again.
 - **`docker plugin install` fails**: the host cannot pull `ashald/docker-volume-loopback` from Docker Hub. Check the host's proxy or DNS, then run the installer again.
 
-Validators run the same test (plugin, `Mountpoint`, a volume mounted into a Sysbox container) in every machine scrape. A node that fails it reports `storage_limit_supported: false` with a reason code such as `VLOOPBACK_SYSBOX_MOUNT_FAILED` in `storage_limit_scrape_error`, and its rentals start without a disk limit.
+Validators run the same test in the machine scrape: plugin, `Mountpoint`, and a volume mounted into a container under the runtime this node's rentals get (Sysbox when the scrape's Sysbox GPU test passes, Docker's default runtime otherwise). They only read the plugin, never install or change it. The test has 60 seconds in all, a pass is reused for six hours on the same boot, plugin and runtime, and test containers and volumes (`lium_storage_check_*`) older than an hour are removed. The verdict and a reason code such as `VLOOPBACK_MOUNT_FAILED` go to `vloopback_check` in the node's specs. Validators report it first; once a validator turns on `VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED`, a node that fails reports `storage_limit_supported: false` with that reason in `storage_limit_scrape_error`, and its rentals start without a disk limit.
 
 ## The executor image
 
