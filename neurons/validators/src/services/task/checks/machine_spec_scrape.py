@@ -9,6 +9,7 @@ from typing import Any, Literal
 from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
+from core.config import settings
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import normalize_gpu_model
 from .network_ema import compute_ema
@@ -161,19 +162,34 @@ def _interconnect_summary(specs: dict[str, Any]) -> dict[str, Any] | None:
     return summary
 
 
-def _storage_limit_summary(specs: dict[str, Any]) -> dict[str, Any]:
-    # the scrape's storage-limit verdict with its reason code ("VLOOPBACK_SYSBOX_MOUNT_FAILED: …"), so a
-    # node that reports storage_limit_supported=false says why in the validator's own log
+VLOOPBACK_CHECK_FIELDS = ("verdict", "reason_code", "detail", "runtime", "cached")
+
+
+def _with_vloopback_verdict(specs: dict[str, Any], enforce: bool) -> dict[str, Any]:
+    # ticket-0331: report-only until VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED; then a failed mount test
+    # also takes the disk limit off this node's rentals, with the test's reason in storage_limit_scrape_error
+    vloopback = specs.get("vloopback_check")
+    if not enforce or not isinstance(vloopback, dict) or vloopback.get("verdict") != "fail":
+        return specs
+    if not specs.get("storage_limit_supported"):
+        return specs
+    return {
+        **specs,
+        "storage_limit_supported": False,
+        "storage_limit_scrape_error": f"{vloopback.get('reason_code')}: {vloopback.get('detail')}",
+    }
+
+
+def _storage_limit_summary(specs: dict[str, Any], enforced: bool) -> dict[str, Any]:
+    # the storage-limit verdict and the vloopback mount test behind it, in the validator's own log
     supported = bool(specs.get("storage_limit_supported", False))
-    summary: dict[str, Any] = {"supported": supported}
+    summary: dict[str, Any] = {"supported": supported, "vloopback_enforced": enforced}
     scrape_error = specs.get("storage_limit_scrape_error")
     if not supported and scrape_error:
-        code, separator, detail = str(scrape_error).partition(": ")
-        if separator and code.isupper() and " " not in code:
-            summary["reason_code"] = code
-            summary["detail"] = detail
-        else:
-            summary["detail"] = str(scrape_error)
+        summary["detail"] = str(scrape_error)
+    vloopback = specs.get("vloopback_check")
+    if isinstance(vloopback, dict):
+        summary["vloopback"] = {field: vloopback.get(field) for field in VLOOPBACK_CHECK_FIELDS}
     return summary
 
 
@@ -343,6 +359,8 @@ class MachineSpecScrapeCheck:
             gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
             gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
             supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
+            enforce_vloopback = settings.VLOOPBACK_SCRAPE_CHECK_ENFORCEMENT_ENABLED
+            specs = _with_vloopback_verdict(specs, enforce_vloopback)
 
             prev_ema = (
                 ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
@@ -377,7 +395,7 @@ class MachineSpecScrapeCheck:
                     # DAH-2922: the NVLink/P2P verdict per cycle, without the 8x8 matrix
                     "interconnect": _interconnect_summary(specs),
                     # ticket-0331: why rentals with a disk limit will not get one on this node
-                    "storage_limit": _storage_limit_summary(specs),
+                    "storage_limit": _storage_limit_summary(specs, enforce_vloopback),
                 },
                 extra=extra_info,
             )
