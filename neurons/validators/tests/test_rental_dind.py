@@ -15,8 +15,10 @@ from services.docker_service import DockerService
 from services.rental_dind import (
     RESERVED_POD_RANGES,
     AddressPool,
+    dind_base_volume_name,
     dind_companion_volume_names,
     merge_inner_daemon_config,
+    orphaned_dind_companion_volumes,
     parse_address_pools,
     with_dind_companion_volumes,
 )
@@ -416,3 +418,52 @@ def test_invalid_pools_in_the_env_leave_docker_its_own_and_say_so(
 
     assert spec.inner_daemon_address_pools == ()
     assert "RENTAL_DIND_ADDRESS_POOLS is invalid" in caplog.text
+
+
+# --- companion volumes whose pod is gone ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "base"),
+    [
+        ("volume_a_docker", "volume_a"),
+        ("volume_a_workspace", "volume_a"),
+        ("volume_a", None),
+        ("volume__docker", None),
+        ("dphn_cache_docker", None),
+        ("volume_a_docker_x", None),
+    ],
+)
+def test_a_companion_names_its_pod_volume(name, base):
+    assert dind_base_volume_name(name) == base
+
+
+def test_orphans_are_unreferenced_companions_whose_pod_volume_is_gone_or_going():
+    names = {
+        "volume_gone_docker",  # pod volume gone, nothing references it
+        "volume_going",
+        "volume_going_docker",
+        "volume_going_workspace",  # pod volume removed now
+        "volume_kept",
+        "volume_kept_docker",  # pod volume still there: kept with it
+        "volume_live_docker",  # a container (running or stopped) references it
+        "volume_backend_docker",  # the backend still lists its pod
+        "volume_plain",
+        "dphn_cache_x",
+    }
+    unreferenced = names - {"volume_live_docker"}
+
+    orphans = orphaned_dind_companion_volumes(
+        names, unreferenced=unreferenced, protected={"volume_backend"}, removing={"volume_going"}
+    )
+
+    assert orphans == ["volume_going_docker", "volume_going_workspace", "volume_gone_docker"]
+
+
+def test_a_protected_companion_is_never_an_orphan():
+    assert (
+        orphaned_dind_companion_volumes(
+            ["volume_x_docker"], unreferenced=["volume_x_docker"], protected=["volume_x_docker"]
+        )
+        == []
+    )

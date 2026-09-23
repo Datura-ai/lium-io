@@ -30,6 +30,7 @@ DIND_STORE_TARGET = "/var/lib/docker"
 DIND_STORE_SUFFIX = "_docker"
 DIND_WORKSPACE_TARGET = "/workspace"
 DIND_WORKSPACE_SUFFIX = "_workspace"
+_POD_VOLUME_PREFIX = "volume_"
 
 # Ranges an inner network must never shadow inside the pod: the host daemon's own pools and bridge
 # (Docker's defaults, the sysbox installer's 172.20/172.25, neurons/executor/daemon.json's 172.24
@@ -140,3 +141,45 @@ def with_dind_companion_volumes(volume_names: Iterable[str]) -> list[str]:
     """`volume_names` followed by their companions, for a teardown that removes a pod's volumes."""
     names = [name for name in volume_names if name]
     return names + [companion for name in names for companion in dind_companion_volume_names(name)]
+
+
+def dind_base_volume_name(volume_name: str) -> str | None:
+    """The pod volume a companion volume belongs to; None for any other volume."""
+    if not volume_name.startswith(_POD_VOLUME_PREFIX):
+        return None
+    for suffix in (DIND_STORE_SUFFIX, DIND_WORKSPACE_SUFFIX):
+        base = volume_name.removesuffix(suffix)
+        if base != volume_name and len(base) > len(_POD_VOLUME_PREFIX):
+            return base
+    return None
+
+
+def orphaned_dind_companion_volumes(
+    volume_names: Iterable[str],
+    *,
+    unreferenced: Iterable[str],
+    protected: Iterable[str] = (),
+    removing: Iterable[str] = (),
+) -> list[str]:
+    """Companion volumes whose pod is gone, sorted.
+
+    A companion is orphaned when no container (running or stopped) references it, neither it nor
+    its pod volume is protected (the backend's active volumes, the pod being created), and its pod
+    volume is no longer on the host or is being removed in the same pass. A companion whose pod
+    volume is still there is left with it: whatever keeps that volume keeps its companions.
+    """
+    names = set(volume_names)
+    unreferenced_set = set(unreferenced)
+    protected_set = set(protected)
+    removing_set = set(removing)
+    orphans = []
+    for name in sorted(names):
+        base = dind_base_volume_name(name)
+        if base is None or name not in unreferenced_set:
+            continue
+        if name in protected_set or base in protected_set:
+            continue
+        if base in names and base not in removing_set:
+            continue
+        orphans.append(name)
+    return orphans

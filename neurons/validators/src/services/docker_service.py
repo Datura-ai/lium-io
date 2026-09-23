@@ -103,9 +103,11 @@ from services.rental_dind import (
     DIND_STORE_TARGET,
     DIND_WORKSPACE_TARGET,
     AddressPool,
+    dind_base_volume_name,
     dind_companion_volume_names,
     dind_store_volume_name,
     dind_workspace_volume_name,
+    orphaned_dind_companion_volumes,
     parse_address_pools,
     with_dind_companion_volumes,
 )
@@ -2231,6 +2233,9 @@ class DockerService:
     ) -> list[str]:
         """Remove vloopback `volume_*` volumes no container mounts (minus ``skip_volume_names``).
 
+        DAH-3796: with them go their `_docker`/`_workspace` companions, and any companion no
+        container references whose pod volume is gone (orphaned_dind_companion_volumes).
+
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
         failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
         caller passes it only while nothing has removed a container since the probe ran.
@@ -2263,6 +2268,7 @@ class DockerService:
                     if len(parts) == 2:
                         volume_rows.append((parts[0], parts[1]))
 
+            all_volumes = {name for name, _driver in volume_rows}
             vloopback_volumes = set()
             for name, driver in volume_rows:
                 if not (
@@ -2271,7 +2277,7 @@ class DockerService:
                 ):
                     continue
                 vloopback_volumes.add(name)
-            if not vloopback_volumes:
+            if not vloopback_volumes and not any(dind_base_volume_name(name) for name in all_volumes):
                 return []
 
             if host_probe is not None and host_probe.mounted_volume_names is not None:
@@ -2293,7 +2299,14 @@ class DockerService:
                 mounted_volumes = {
                     name.strip() for name in (mounted_result.stdout or "").splitlines() if name.strip()
                 }
-            stale_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
+            stale_pod_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
+            orphaned_dind_volumes = orphaned_dind_companion_volumes(
+                all_volumes,
+                unreferenced=all_volumes - mounted_volumes,
+                protected=skip_set,
+                removing=stale_pod_volumes,
+            )
+            stale_volumes = stale_pod_volumes + orphaned_dind_volumes
             if not stale_volumes:
                 return []
 
@@ -2302,7 +2315,8 @@ class DockerService:
                     "Cleaning stale vloopback Docker volumes",
                     extra=get_extra_info({
                         **default_extra,
-                        "stale_volumes": stale_volumes,
+                        "stale_volumes": stale_pod_volumes,
+                        "orphaned_dind_volumes": orphaned_dind_volumes,
                         "skipped_volumes": sorted(skip_set),
                     }),
                 )
