@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services.container_cleanup import VOLUME_RM_MAX_PER_PASS, ContainerCleanup
+from services.rental_dind import stale_dind_probe_list_command
 
 
 def _ssh_mock_from_calls(call_handler):
@@ -609,3 +610,45 @@ async def test_cleanup_runs_the_dind_orphan_sweep():
     )
 
     assert f"/usr/bin/docker volume rm {_GONE}_docker 2>/dev/null || true" in calls
+    assert stale_dind_probe_list_command() in calls
+
+
+def _probe_listing_ssh_mock(listing: str, list_status: int = 0):
+    calls: list[str] = []
+
+    async def handler(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if cmd == stale_dind_probe_list_command():
+            return MagicMock(exit_status=list_status, stdout=listing, stderr="")
+        return MagicMock(exit_status=0, stdout="", stderr="")
+
+    return _ssh_mock_from_calls(handler), calls
+
+
+# the host's now is 2026-09-23T14:00:00Z
+_PROBE_LISTING = (
+    "1790172000\n"
+    "abc123 /lium-dind-probe-pod_a-dockerd 2026-09-23T13:00:00.5Z\n"
+    "def456 /lium-dind-probe-pod_b-marker 2026-09-23T13:59:30Z\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_store_probe_containers_left_behind_are_removed_once_stale():
+    ssh, calls = _probe_listing_ssh_mock(_PROBE_LISTING)
+
+    removed = await ContainerCleanup().prune_stale_dind_probe_containers(ssh, EXECUTOR_UUID)
+
+    assert removed == 1
+    assert calls[-1] == "/usr/bin/docker rm -f abc123 >/dev/null 2>&1"
+
+
+@pytest.mark.parametrize(("dry_run", "list_status"), [(True, 0), (False, 1)], ids=["dry-run", "listing-failed"])
+@pytest.mark.asyncio
+async def test_the_probe_container_sweep_removes_nothing_when_it_cannot_act(dry_run, list_status):
+    ssh, calls = _probe_listing_ssh_mock(_PROBE_LISTING, list_status=list_status)
+
+    removed = await ContainerCleanup(dry_run=dry_run).prune_stale_dind_probe_containers(ssh, EXECUTOR_UUID)
+
+    assert removed == 0
+    assert not any("rm -f" in c for c in calls)

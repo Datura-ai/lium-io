@@ -13,10 +13,12 @@ from core.config import settings
 from payload_models.payloads import ContainerCreateRequest, CustomOptions, WorkloadKind
 from services.docker_service import DockerService
 from services.rental_dind import (
+    DIND_VERSION_MAX_BYTES,
     RESERVED_POD_RANGES,
     AddressPool,
     dind_base_volume_name,
     dind_companion_volume_names,
+    dind_probe_cleanup_command,
     dind_store_reset_command,
     dind_store_version_probe_command,
     dind_store_version_record_command,
@@ -27,6 +29,8 @@ from services.rental_dind import (
     parse_dind_store_version_probe,
     parse_dockerd_version,
     pool_network_conflicts,
+    stale_dind_probe_containers,
+    stale_dind_probe_list_command,
     with_dind_companion_volumes,
 )
 from services.rental_docker_sdk import (
@@ -577,7 +581,17 @@ async def test_a_host_whose_rental_network_overlaps_the_pools_keeps_dockers_own(
     [
         ("Docker version 27.3.1, build ce12230", (27, 3, 1)),
         ("Docker version 20.10.24+dfsg1, build 297e128", (20, 10, 24)),
-        ("Docker version v28.0, build x", (28, 0, 0)),
+        ("Docker version 24.0.7, build 24.0.7-0ubuntu4.1", (24, 0, 7)),
+        ("Docker version 29.1.3", (29, 1, 3)),
+        ("  Docker version 27.3.1, build ce12230  ", (27, 3, 1)),
+        ("Docker version v28.0, build x", None),
+        ("Docker version 28.0, build x", None),
+        ("Docker version 99999.0.0, build x", None),
+        ("xDocker version 27.3.1, build ce12230", None),
+        ("Docker version 27.3.1, build ce12230; rm -rf /", None),
+        ("Docker version 27.3.1, build ce12230\nDocker version 99.0.0", None),
+        ("Docker version 27.3.1, build " + "a" * 65, None),
+        ("Docker version 27.3.1, build ce12230" + " " * 300, None),
         ("", None),
         (None, None),
         ("dockerd: not found", None),
@@ -602,19 +616,27 @@ def test_only_an_older_dockerd_than_the_stores_is_a_downgrade(recorded, current,
     assert is_dind_store_downgrade(recorded, current) is downgrade
 
 
-def test_the_version_probe_runs_the_images_dockerd_under_the_pods_runtime_without_network():
-    command = dind_store_version_probe_command(
+def _probe_command() -> str:
+    return dind_store_version_probe_command(
         store_volume="volume_x_docker",
         image="img:1",
         runtime="sysbox-runc",
         helper_image="alpine:3.19",
+        container_name="pod_x",
     )
+
+
+def test_the_version_probe_runs_the_images_dockerd_under_the_pods_runtime_without_network():
+    command = _probe_command()
 
     assert command.startswith(
         "/usr/bin/docker volume inspect volume_x_docker >/dev/null 2>&1 || exit 0; "
+        "/usr/bin/docker rm -f lium-dind-probe-pod_x-marker lium-dind-probe-pod_x-dockerd >/dev/null 2>&1; "
     )
-    assert "-v volume_x_docker:/store:ro alpine:3.19 cat /store/.lium-dockerd-version" in command
-    assert "--network none --runtime sysbox-runc --entrypoint dockerd img:1 --version" in command
+    assert (
+        "run -d --name lium-dind-probe-pod_x-dockerd --network none" in command
+        and "--runtime sysbox-runc --entrypoint dockerd img:1 --version" in command
+    )
     assert parse_dind_store_version_probe(
         "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
     ) == ("Docker version 28.1.0, build a", "Docker version 27.3.1, build b")
@@ -622,15 +644,86 @@ def test_the_version_probe_runs_the_images_dockerd_under_the_pods_runtime_withou
     assert parse_dind_store_version_probe("") == (None, None)
 
 
+def test_the_probes_helpers_are_named_labelled_limited_and_deadlined():
+    command = _probe_command()
+    limits = (
+        "--network none --label io.lium.purpose=dind-store-probe "
+        "--memory 128m --memory-swap 128m --cpus 0.5 --pids-limit 32"
+    )
+
+    assert (
+        f"run --rm --name lium-dind-probe-pod_x-marker {limits} -v volume_x_docker:/store:ro"
+        in command
+    )
+    assert f"run -d --name lium-dind-probe-pod_x-dockerd {limits}" in command
+    assert "--log-driver json-file --log-opt max-size=64k --log-opt max-file=1" in command
+    # the marker is read only as a regular file, by our helper, with a deadline and a byte cap
+    assert '[ -f "$m" ] && [ ! -h "$m" ] || exit 0; timeout 10 head -c 256 "$m"' in command
+    # the image's dockerd gets 20 s, then its log is cut and the container removed either way
+    assert "while [ $i -lt 20 ]" in command
+    assert command.count("head -c 256 | head -n 1 | tr -cd '[:print:]'") == 2
+    assert command.endswith(
+        "fi; /usr/bin/docker rm -f lium-dind-probe-pod_x-dockerd >/dev/null 2>&1; "
+        'printf "current=%s\\n" "$current"'
+    )
+    assert dind_probe_cleanup_command("pod_x") == (
+        "/usr/bin/docker rm -f lium-dind-probe-pod_x-marker lium-dind-probe-pod_x-dockerd "
+        "lium-dind-probe-pod_x-reset >/dev/null 2>&1 || true"
+    )
+
+
+def test_the_probes_output_is_cut_before_it_is_parsed():
+    huge = (
+        "recorded=Docker version 28.1.0, build a"
+        + "x" * 10_000_000
+        + "\ncurrent=Docker version 27.3.1\n"
+    )
+
+    recorded, current = parse_dind_store_version_probe(huge)
+
+    assert len(recorded) == DIND_VERSION_MAX_BYTES
+    assert current is None  # beyond the first 1 KiB
+    assert parse_dockerd_version(recorded) is None
+
+
 def test_the_reset_empties_the_volume_and_the_record_writes_from_inside_the_pod():
-    assert dind_store_reset_command(store_volume="volume_x_docker", helper_image="alpine:3.19") == (
-        "/usr/bin/docker run --rm --network none -v volume_x_docker:/store alpine:3.19 "
-        "sh -c 'rm -rf /store/* /store/.[!.]* /store/..?*'"
+    assert dind_store_reset_command(
+        store_volume="volume_x_docker", helper_image="alpine:3.19", container_name="pod_x"
+    ) == (
+        "/usr/bin/docker rm -f lium-dind-probe-pod_x-reset >/dev/null 2>&1; "
+        "/usr/bin/docker run --rm --name lium-dind-probe-pod_x-reset --network none "
+        "--label io.lium.purpose=dind-store-probe --memory 128m --memory-swap 128m --cpus 0.5 "
+        "--pids-limit 32 -v volume_x_docker:/store alpine:3.19 "
+        "sh -c 'timeout 300 rm -rf /store/* /store/.[!.]* /store/..?*' >/dev/null 2>&1"
     )
     record = dind_store_version_record_command("pod_x")
     assert record.startswith("/usr/bin/docker exec pod_x sh -c ")
+    assert record.endswith(" >/dev/null 2>&1")
     assert "command -v dockerd >/dev/null 2>&1 || exit 0" in record
+    assert "dockerd --version 2>/dev/null | head -c 256 | head -n 1" in record
     assert "> /var/lib/docker/.lium-dockerd-version" in record
+
+
+@pytest.mark.parametrize(
+    ("listing", "stale"),
+    [
+        (
+            "1790172000\n"  # the host's now: 2026-09-23T14:00:00Z
+            "id1 /lium-dind-probe-pod_a-dockerd 2026-09-23T13:49:59.123456789Z\n"  # 10 min 1 s old
+            "id2 /lium-dind-probe-pod_b-marker 2026-09-23T13:55:00Z\n"  # 5 min old
+            "id3 /pod_c 2026-09-23T10:00:00Z\n"  # not a probe name
+            "id4 /lium-dind-probe-pod_d-reset not-a-date\n"
+            "garbage\n",
+            ["id1"],
+        ),
+        ("", []),
+        ("not-a-number\nid1 /lium-dind-probe-pod_a-dockerd 2020-01-01T00:00:00Z\n", []),
+    ],
+    ids=["mixed", "empty", "no-host-clock"],
+)
+def test_only_probe_containers_older_than_the_window_are_stale(listing, stale):
+    assert stale_dind_probe_containers(listing) == stale
+    assert "--filter label=io.lium.purpose=dind-store-probe" in stale_dind_probe_list_command()
 
 
 class _Result:
@@ -648,9 +741,7 @@ class _Ssh:
         if self.error is not None:
             raise self.error
         if "rm -rf /store" in command:
-            return _Result(
-                exit_status=self.reset_status, stderr="denied" if self.reset_status else ""
-            )
+            return _Result(exit_status=self.reset_status)
         if "volume inspect" in command:
             return _Result(stdout=self.probe_stdout)
         return _Result()
@@ -688,10 +779,30 @@ def _store_outcome(caplog) -> str:
             "kept",
             False,
         ),
-        ("recorded=Docker version 28.1.0, build a\ncurrent=\n", "kept", False),
+        ("recorded=Docker version 28.1.0, build a\ncurrent=\n", "unknown_version", False),
+        (
+            "recorded=Docker version 99.0.0; exploit\ncurrent=Docker version 27.3.1, build b\n",
+            "unknown_version",
+            False,
+        ),
+        (
+            "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 1.0.0"
+            + "x" * 5000
+            + "\n",
+            "unknown_version",
+            False,
+        ),
         ("", "no_marker", False),
     ],
-    ids=["downgrade", "same", "upgrade", "image-without-dockerd", "new-store"],
+    ids=[
+        "downgrade",
+        "same",
+        "upgrade",
+        "image-without-dockerd",
+        "renter-marker",
+        "oversized",
+        "new-store",
+    ],
 )
 @pytest.mark.asyncio
 async def test_the_store_is_emptied_only_on_a_dockerd_downgrade(
@@ -706,17 +817,38 @@ async def test_the_store_is_emptied_only_on_a_dockerd_downgrade(
     assert _store_outcome(caplog) == outcome
     assert any("rm -rf /store" in c for c in ssh.commands) is reset
     assert "--runtime sysbox-runc --entrypoint dockerd img:1 --version" in ssh.commands[0]
+    # the helpers are removed whatever happened, as the last command
+    assert ssh.commands[-1] == dind_probe_cleanup_command("pod_x")
+
+
+@pytest.mark.asyncio
+async def test_only_parsed_versions_reach_the_log(docker_service, caplog):
+    renter_text = "Docker version 28.1.0, build a"
+    ssh = _Ssh(probe_stdout=f"recorded={renter_text}\ncurrent=Docker version 27.3.1, build b\n")
+
+    await docker_service._reset_dind_store_on_downgrade(
+        ssh, run_spec=_store_spec(), local_volume="volume_x", default_extra={}
+    )
+
+    [record] = [r for r in caplog.records if r.getMessage() == "Inner Docker store version"]
+    assert record.msg.extra["recorded_dockerd"] == "28.1.0"
+    assert record.msg.extra["image_dockerd"] == "27.3.1"
+    assert renter_text not in str(record.msg.extra)
 
 
 @pytest.mark.asyncio
 async def test_a_failed_version_probe_or_reset_keeps_the_create_going(docker_service, caplog):
+    failing = _Ssh(error=OSError("ssh channel died"))
     await docker_service._reset_dind_store_on_downgrade(
-        _Ssh(error=OSError("ssh channel died")),
+        failing,
         run_spec=_store_spec(),
         local_volume="volume_x",
         default_extra={},
     )
     assert _store_outcome(caplog) == "failed: OSError: ssh channel died"
+    # the cleanup is still attempted, and its own failure is only logged
+    assert failing.commands[-1] == dind_probe_cleanup_command("pod_x")
+    assert "Inner Docker store probe containers not removed" in caplog.text
     caplog.clear()
 
     downgrade = "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
@@ -726,7 +858,34 @@ async def test_a_failed_version_probe_or_reset_keeps_the_create_going(docker_ser
         local_volume="volume_x",
         default_extra={},
     )
-    assert _store_outcome(caplog) == "reset_failed: denied"
+    assert _store_outcome(caplog) == "reset_failed: exit 1"
+
+
+@pytest.mark.asyncio
+async def test_each_store_check_call_has_its_own_bounded_timeout(docker_service):
+    timeouts = []
+
+    class _TimedSsh(_Ssh):
+        async def run(self, command, timeout=None):
+            timeouts.append(timeout)
+            return await super().run(command, timeout)
+
+    downgrade = "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
+    await docker_service._reset_dind_store_on_downgrade(
+        _TimedSsh(probe_stdout=downgrade),
+        run_spec=_store_spec(),
+        local_volume="volume_x",
+        default_extra={},
+    )
+    await docker_service._record_dind_store_version(
+        _TimedSsh(),
+        run_spec=_store_spec(),
+        local_volume="volume_x",
+        container_name="pod_x",
+        default_extra={},
+    )
+
+    assert timeouts == [90, 360, 30, 30]  # probe, reset, cleanup, record
 
 
 @pytest.mark.asyncio

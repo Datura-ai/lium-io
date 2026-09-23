@@ -8,7 +8,12 @@ import asyncssh
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
 from core.utils import _m
-from services.rental_dind import orphaned_dind_companion_volumes, with_dind_companion_volumes
+from services.rental_dind import (
+    orphaned_dind_companion_volumes,
+    stale_dind_probe_containers,
+    stale_dind_probe_list_command,
+    with_dind_companion_volumes,
+)
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_VOLUME_PREFIX,
@@ -153,12 +158,47 @@ class ContainerCleanup:
                 )
             )
 
+        await self.prune_stale_dind_probe_containers(ssh_client, executor_uuid)
         # DAH-2375: reap anonymous volumes orphaned by historical `docker rm`
         # without -v. Best-effort — never raises, never changes this return.
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
         await self.prune_orphaned_dind_volumes(ssh_client, rented_data, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    async def prune_stale_dind_probe_containers(self, ssh_client, executor_uuid: str) -> int:
+        """DAH-3796: remove store-check helper containers a validator left behind (its SSH session
+        died mid-check), by label and name prefix, once older than DIND_PROBE_STALE_AFTER_SEC by the
+        host's clock. Best-effort: never raises; returns how many it asked docker to remove.
+        """
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            listed = await ssh_client.run(stale_dind_probe_list_command())
+            if listed.exit_status != 0:
+                logger.warning(_m("Listing DinD store probe containers failed", extra=extra))
+                return 0
+            stale = stale_dind_probe_containers(listed.stdout)[:VOLUME_RM_MAX_PER_PASS]
+            if not stale:
+                return 0
+            if self.dry_run:
+                logger.info(
+                    _m(
+                        f"[DRY RUN] Would remove {len(stale)} stale DinD store probe container(s)",
+                        extra=extra | {"containers": stale, "dry_run": True},
+                    )
+                )
+                return 0
+            await ssh_client.run(f"/usr/bin/docker rm -f {' '.join(shlex.quote(c) for c in stale)} >/dev/null 2>&1")
+            logger.info(
+                _m(
+                    f"Removed {len(stale)} stale DinD store probe container(s)",
+                    extra=extra | {"containers": stale},
+                )
+            )
+            return len(stale)
+        except Exception as e:
+            logger.warning(_m("DinD store probe container sweep failed", extra=extra | {"error": str(e)}))
+            return 0
 
     async def prune_orphaned_dind_volumes(
         self,

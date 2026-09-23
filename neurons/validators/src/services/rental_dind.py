@@ -27,6 +27,7 @@ import re
 import shlex
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 INNER_DAEMON_CONFIG_PATH = "/etc/docker/daemon.json"
 DEFAULT_ADDRESS_POOLS_KEY = "default-address-pools"
@@ -215,16 +216,43 @@ def pool_network_conflicts(pools: Sequence[AddressPool], subnets: Iterable[str])
     return conflicts
 
 
-_DOCKERD_VERSION_RE = re.compile(r"\bversion\s+v?(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
+# The marker and the image's `dockerd --version` are both renter-controlled text: every read is cut
+# to this many bytes on the host, and only a strict version line is ever acted on.
+DIND_VERSION_MAX_BYTES = 256
+_DOCKERD_VERSION_RE = re.compile(
+    r"Docker version (\d{1,4})\.(\d{1,4})\.(\d{1,4})(?:[-+~][0-9A-Za-z.+~_-]{1,64})?"
+    r"(?:, build [0-9A-Za-z.+~_-]{1,64})?"
+)
+
+# Helper containers of the store check: named per pod, labelled for the stale sweep, limited.
+DIND_PROBE_CONTAINER_PREFIX = "lium-dind-probe-"
+DIND_PROBE_LABEL = "io.lium.purpose=dind-store-probe"
+DIND_PROBE_RESOURCE_FLAGS = "--memory 128m --memory-swap 128m --cpus 0.5 --pids-limit 32"
+# The image's dockerd gets this long to print its version before it is killed and removed.
+DIND_PROBE_DOCKERD_DEADLINE_SEC = 20
+# The marker read (our helper image, a regular file, 256 bytes) is killed inside the helper after this.
+DIND_PROBE_MARKER_DEADLINE_SEC = 10
+DIND_STORE_RESET_DEADLINE_SEC = 300
+# A probe container older than this is left over from a validator that lost its SSH session.
+DIND_PROBE_STALE_AFTER_SEC = 600
 
 
 def parse_dockerd_version(text: str | None) -> tuple[int, int, int] | None:
-    """(major, minor, patch) from a `dockerd --version` line ("Docker version 27.3.1, build …")."""
-    match = _DOCKERD_VERSION_RE.search(text or "")
+    """(major, minor, patch) from a `dockerd --version` line ("Docker version 27.3.1, build …").
+
+    Anything but that exact line, in at most DIND_VERSION_MAX_BYTES, is unknown (None).
+    """
+    if not text or len(text) > DIND_VERSION_MAX_BYTES:
+        return None
+    match = _DOCKERD_VERSION_RE.fullmatch(text.strip())
     if match is None:
         return None
     major, minor, patch = match.groups()
-    return int(major), int(minor), int(patch or 0)
+    return int(major), int(minor), int(patch)
+
+
+def format_dockerd_version(version: tuple[int, int, int] | None) -> str | None:
+    return None if version is None else ".".join(str(part) for part in version)
 
 
 def is_dind_store_downgrade(recorded: str | None, current: str | None) -> bool:
@@ -238,51 +266,133 @@ def is_dind_store_downgrade(recorded: str | None, current: str | None) -> bool:
     )
 
 
+def dind_probe_container_names(container_name: str) -> tuple[str, str, str]:
+    """(marker read, image dockerd, store reset) helper names for one pod."""
+    base = f"{DIND_PROBE_CONTAINER_PREFIX}{container_name}"
+    return f"{base}-marker", f"{base}-dockerd", f"{base}-reset"
+
+
 def dind_store_version_probe_command(
-    *, store_volume: str, image: str, runtime: str | None, helper_image: str
+    *, store_volume: str, image: str, runtime: str | None, helper_image: str, container_name: str
 ) -> str:
     """Prints `recorded=<marker>` and, when a marker exists, `current=<the image's dockerd --version>`.
 
-    A store volume that does not exist yet prints nothing. The image's dockerd runs under the pod's
-    own runtime with no network and no mounts, the way the pod itself would run it.
+    A store volume that does not exist yet prints nothing. Each value is at most
+    DIND_VERSION_MAX_BYTES printable bytes. The marker is read only if it is a regular file, by our
+    helper, with a deadline inside it. The image's dockerd runs detached under the pod's own runtime,
+    named, labelled and limited, with no network and no mounts; it gets
+    DIND_PROBE_DOCKERD_DEADLINE_SEC to exit, then its first bytes of log are read and it is removed
+    whether it exited or not.
     """
     store = shlex.quote(store_volume)
+    marker_name, dockerd_name, _ = (
+        shlex.quote(name) for name in dind_probe_container_names(container_name)
+    )
     runtime_flag = f" --runtime {shlex.quote(runtime)}" if runtime else ""
+    common = f"--network none --label {DIND_PROBE_LABEL} {DIND_PROBE_RESOURCE_FLAGS}"
+    marker = f"/store/{DIND_STORE_VERSION_MARKER}"
+    read_marker = (
+        f'm={marker}; [ -f "$m" ] && [ ! -h "$m" ] || exit 0; '
+        f'timeout {DIND_PROBE_MARKER_DEADLINE_SEC} head -c {DIND_VERSION_MAX_BYTES} "$m"'
+    )
+    cut = f"head -c {DIND_VERSION_MAX_BYTES} | head -n 1 | tr -cd '[:print:]'"
     return (
         f"/usr/bin/docker volume inspect {store} >/dev/null 2>&1 || exit 0; "
-        f"recorded=$(/usr/bin/docker run --rm --network none -v {store}:/store:ro {helper_image} "
-        f"cat /store/{DIND_STORE_VERSION_MARKER} 2>/dev/null | head -n 1); "
+        f"/usr/bin/docker rm -f {marker_name} {dockerd_name} >/dev/null 2>&1; "
+        f"recorded=$(/usr/bin/docker run --rm --name {marker_name} {common} -v {store}:/store:ro "
+        f"{helper_image} sh -c {shlex.quote(read_marker)} 2>/dev/null | {cut}); "
         'printf "recorded=%s\\n" "$recorded"; [ -n "$recorded" ] || exit 0; '
-        f"current=$(/usr/bin/docker run --rm --network none{runtime_flag} --entrypoint dockerd "
-        f"{shlex.quote(image)} --version 2>/dev/null | head -n 1); "
+        f"current=; if /usr/bin/docker run -d --name {dockerd_name} {common}"
+        " --log-driver json-file --log-opt max-size=64k --log-opt max-file=1"
+        f"{runtime_flag} --entrypoint dockerd {shlex.quote(image)} --version >/dev/null 2>&1; then "
+        f"i=0; while [ $i -lt {DIND_PROBE_DOCKERD_DEADLINE_SEC} ] && "
+        f"[ \"$(/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {dockerd_name} 2>/dev/null)\" = true ]; "
+        "do sleep 1; i=$((i+1)); done; "
+        f"current=$(/usr/bin/docker logs {dockerd_name} 2>&1 | {cut}); fi; "
+        f"/usr/bin/docker rm -f {dockerd_name} >/dev/null 2>&1; "
         'printf "current=%s\\n" "$current"'
     )
 
 
+def dind_probe_cleanup_command(container_name: str) -> str:
+    """Remove every helper container of one pod's store check, whatever state it is in."""
+    names = " ".join(shlex.quote(name) for name in dind_probe_container_names(container_name))
+    return f"/usr/bin/docker rm -f {names} >/dev/null 2>&1 || true"
+
+
 def parse_dind_store_version_probe(stdout: str | None) -> tuple[str | None, str | None]:
-    """(recorded, current) from dind_store_version_probe_command's output; a missing line is None."""
+    """(recorded, current) from dind_store_version_probe_command's output; a missing line is None.
+
+    Reads at most the first 4 * DIND_VERSION_MAX_BYTES characters, and each value is cut to
+    DIND_VERSION_MAX_BYTES, whatever the host sent.
+    """
     values: dict[str, str] = {}
-    for line in (stdout or "").splitlines():
+    for line in (stdout or "")[: 4 * DIND_VERSION_MAX_BYTES].splitlines():
         key, sep, value = line.partition("=")
-        if sep and key in ("recorded", "current") and value.strip():
-            values[key] = value.strip()
+        value = value[:DIND_VERSION_MAX_BYTES].strip()
+        if sep and key in ("recorded", "current") and value:
+            values[key] = value
     return values.get("recorded"), values.get("current")
 
 
-def dind_store_reset_command(*, store_volume: str, helper_image: str) -> str:
+def dind_store_reset_command(*, store_volume: str, helper_image: str, container_name: str) -> str:
     """Empty the store volume, keeping the volume itself (a parked container may still name it)."""
+    _, _, reset_name = dind_probe_container_names(container_name)
+    script = f"timeout {DIND_STORE_RESET_DEADLINE_SEC} rm -rf /store/* /store/.[!.]* /store/..?*"
     return (
-        f"/usr/bin/docker run --rm --network none -v {shlex.quote(store_volume)}:/store {helper_image} "
-        "sh -c 'rm -rf /store/* /store/.[!.]* /store/..?*'"
+        f"/usr/bin/docker rm -f {shlex.quote(reset_name)} >/dev/null 2>&1; "
+        f"/usr/bin/docker run --rm --name {shlex.quote(reset_name)} --network none "
+        f"--label {DIND_PROBE_LABEL} {DIND_PROBE_RESOURCE_FLAGS} "
+        f"-v {shlex.quote(store_volume)}:/store {helper_image} sh -c {shlex.quote(script)} >/dev/null 2>&1"
     )
 
 
 def dind_store_version_record_command(container_name: str) -> str:
     """Record the pod's dockerd version in its store, from inside the pod; an image without dockerd
-    records nothing and succeeds."""
+    records nothing and succeeds. The pod's output is discarded; only docker exec's status counts."""
     marker = f"{DIND_STORE_TARGET}/{DIND_STORE_VERSION_MARKER}"
     script = (
         "command -v dockerd >/dev/null 2>&1 || exit 0; "
-        f'v=$(dockerd --version 2>/dev/null) && [ -n "$v" ] && printf "%s\\n" "$v" > {marker}'
+        f"v=$(dockerd --version 2>/dev/null | head -c {DIND_VERSION_MAX_BYTES} | head -n 1) && "
+        f'[ -n "$v" ] && printf "%s\\n" "$v" > {marker}'
     )
-    return f"/usr/bin/docker exec {shlex.quote(container_name)} sh -c {shlex.quote(script)}"
+    return f"/usr/bin/docker exec {shlex.quote(container_name)} sh -c {shlex.quote(script)} >/dev/null 2>&1"
+
+
+_DOCKER_CREATED_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z")
+
+
+def stale_dind_probe_containers(listing: str | None) -> list[str]:
+    """Probe container ids created more than DIND_PROBE_STALE_AFTER_SEC before the host's now.
+
+    `listing` is stale_dind_probe_list_command's output: the host's epoch, then
+    `<id> <name> <created RFC 3339 UTC>` per container. A line that does not parse, or a name
+    without the probe prefix, is left alone; without the host's epoch nothing is stale.
+    """
+    lines = (listing or "").splitlines()
+    try:
+        now = int(lines[0].strip())
+    except (IndexError, ValueError):
+        return []
+    stale = []
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) != 3 or not parts[1].lstrip("/").startswith(DIND_PROBE_CONTAINER_PREFIX):
+            continue
+        match = _DOCKER_CREATED_RE.fullmatch(parts[2])
+        if match is None:
+            continue
+        created = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+        if now - created.timestamp() > DIND_PROBE_STALE_AFTER_SEC:
+            stale.append(parts[0])
+    return stale
+
+
+def stale_dind_probe_list_command() -> str:
+    """The host's epoch on the first line, then `<id> <name> <created>` per probe container."""
+    return (
+        f"date +%s; /usr/bin/docker ps -aq --filter label={DIND_PROBE_LABEL} "
+        "| xargs -r /usr/bin/docker inspect -f '{{.Id}} {{.Name}} {{.Created}}' 2>/dev/null"
+    )
