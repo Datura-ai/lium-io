@@ -1083,6 +1083,7 @@ def test_A17b_rendered_build_command_runs_under_sh(tmp_path, monkeypatch):
     NON-blank lines then `BUILD_FAILED_RC=7`, the exit code is 7 without pipefail."""
     import subprocess
 
+    from services import docker_service
     from services.docker_service import custom_build_inner_command
 
     bindir = tmp_path / "bin"
@@ -1095,12 +1096,9 @@ def test_A17b_rendered_build_command_runs_under_sh(tmp_path, monkeypatch):
         "exit 7\n"
     )
     stub.chmod(0o755)
-    inner = custom_build_inner_command(
-        "lium-custom-test:latest",
-        "/build",
-        log_file=str(tmp_path / "lium-build.log"),
-        rc_file=str(tmp_path / "lium-build.rc"),
-    )
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_LOG_FILE", str(tmp_path / "lium-build.log"))
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_RC_FILE", str(tmp_path / "lium-build.rc"))
+    inner = custom_build_inner_command("lium-custom-test:latest", "/build")
     run = subprocess.run(
         ["sh", "-c", inner],
         capture_output=True,
@@ -1114,12 +1112,14 @@ def test_A17b_rendered_build_command_runs_under_sh(tmp_path, monkeypatch):
     assert "" not in stderr_lines
 
 
-def test_A17c_an_unwritable_rc_file_is_a_failure_with_a_reason(tmp_path):
-    """The exit code round-trips through `rc_file` in the DinD container's /tmp. When that file
-    cannot be written (the overlay is full or read-only) the build is not reported as a success by
-    a bare `exit`: rc is 1, the tail is printed and ends with the fixed reason, then the marker."""
+def test_A17c_an_unwritable_rc_file_is_a_failure_with_a_reason(tmp_path, monkeypatch):
+    """The exit code round-trips through `CUSTOM_BUILD_RC_FILE` in the DinD container's /tmp. When
+    that file cannot be written (the overlay is full or read-only) the build is not reported as a
+    success by a bare `exit`: rc is 1, the tail is printed and ends with the fixed reason, then
+    the marker."""
     import subprocess
 
+    from services import docker_service
     from services.docker_service import (
         CUSTOM_BUILD_RC_UNREADABLE_REASON,
         custom_build_inner_command,
@@ -1131,12 +1131,9 @@ def test_A17c_an_unwritable_rc_file_is_a_failure_with_a_reason(tmp_path):
     stub = bindir / "docker"
     stub.write_text("#!/bin/sh\necho step one\necho step two\nexit 0\n")
     stub.chmod(0o755)
-    inner = custom_build_inner_command(
-        "lium-custom-test:latest",
-        "/build",
-        log_file=str(tmp_path / "lium-build.log"),
-        rc_file=str(tmp_path / "no-such-dir" / "lium-build.rc"),
-    )
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_LOG_FILE", str(tmp_path / "lium-build.log"))
+    monkeypatch.setattr(docker_service, "CUSTOM_BUILD_RC_FILE", str(tmp_path / "no-such-dir" / "lium-build.rc"))
+    inner = custom_build_inner_command("lium-custom-test:latest", "/build")
     run = subprocess.run(
         ["sh", "-c", inner],
         capture_output=True,
@@ -1283,3 +1280,17 @@ async def test_B1_log_emit_to_publish_p95_under_2s(svc):
     )
     p95 = latencies_ms[int(0.95 * len(latencies_ms))]
     assert p95 <= 2000, f"p95 emit→publish latency={p95:.1f}ms exceeds 2000ms budget"
+
+
+def test_A16e_str_of_a_failed_request_leaves_out_the_build_tail():
+    """compute_client logs `str(response)` at INFO; the tail must stay out of it and stay on the wire."""
+    request = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        msg="Custom build failed",
+        build_log_tail="#3 ARG HF_TOKEN=abc",
+    )
+
+    assert "HF_TOKEN=abc" not in str(request)
+    assert request.model_dump()["build_log_tail"] == "#3 ARG HF_TOKEN=abc"
