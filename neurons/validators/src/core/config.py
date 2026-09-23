@@ -378,10 +378,27 @@ class Settings(BaseSettings):
     # fetches pypi.org inside its renter container. Slow is not this check's business. CHECK logs the
     # verdict (NO_OUTBOUND_INTERNET_OBSERVED); ENFORCEMENT fails the node with NO_OUTBOUND_INTERNET (score
     # 0, like INSUFFICIENT_PORTS) and the rental probe's egress step with it. Off by default, same review
-    # and decider as before: on after a 48 h log-only window; taiberium, backup pixel29913 from 28 Sep 2026.
+    # and decider as REGISTRY_PULL_ENFORCEMENT_ENABLED below.
     NO_OUTBOUND_INTERNET_CHECK_ENABLED: bool = Field(env="NO_OUTBOUND_INTERNET_CHECK_ENABLED", default=True)
     NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED: bool = Field(
         env="NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED", default=False
+    )
+    # ticket-0361: 14e704ba failed 16 rents in 24 h, every one a template it did not have cached; its
+    # dockerd pulls through the mirror docker.m.daocloud.io, whose DNS lookup times out, while cached
+    # templates start fine. RegistryPullCheck removes and pulls a digest-pinned hello-world through the
+    # daemon (registry-mirrors apply) under a 60 s bound on idle nodes, at most once per INTERVAL_HOURS
+    # (RETRY_MINUTES after a failed pull, so the confirming pull comes soon). A Docker Hub 429 is no
+    # verdict. Two failed pulls in a row (timeout, DNS error, manifest unknown) are the finding: logged as
+    # REGISTRY_PULL_FAILED_OBSERVED, or with ENFORCEMENT a fail (REGISTRY_PULL_FAILED, score 0).
+    # Enforcement is off by default: it goes on after a 48 h log-only window with the OBSERVED rows
+    # reviewed. Decider: taiberium; backup pixel29913 from 28 Sep 2026.
+    REGISTRY_PULL_CHECK_ENABLED: bool = Field(env="REGISTRY_PULL_CHECK_ENABLED", default=True)
+    REGISTRY_PULL_ENFORCEMENT_ENABLED: bool = Field(env="REGISTRY_PULL_ENFORCEMENT_ENABLED", default=False)
+    REGISTRY_PULL_PROBE_INTERVAL_HOURS: float = Field(
+        env="REGISTRY_PULL_PROBE_INTERVAL_HOURS", default=6.0, gt=0
+    )
+    REGISTRY_PULL_PROBE_RETRY_MINUTES: float = Field(
+        env="REGISTRY_PULL_PROBE_RETRY_MINUTES", default=30.0, gt=0
     )
     # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
     # wave writes nothing about it: no report row, no availability error, no evidence for the
