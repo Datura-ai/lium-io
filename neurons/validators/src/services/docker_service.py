@@ -6222,6 +6222,9 @@ class DockerService:
             # DAH-3593: an expected outcome is one line with a reason and no traceback. The renter
             # deleted the pod while it was being built, or the workload image exits at start on this
             # node; neither is a validator fault. ERROR with the traceback stays for everything else.
+            # The restarting case stays an ERROR "Failed create_container" line: lium-platform's
+            # pod_creation_failure_events ETL ingests only that message at ERROR (and classifies its
+            # "is restarting" error text as container.crash_looping).
             if isinstance(e, _CreateCancelledByDelete):
                 logger.info(
                     _m(
@@ -6234,14 +6237,14 @@ class DockerService:
                     )
                 )
             elif isinstance(_last_attempt_exception(e), RentalDockerContainerRestartingError):
-                logger.warning(
+                logger.error(
                     _m(
-                        "workload container keeps restarting; create failed",
+                        "Failed create_container",
                         extra=get_extra_info({
                             **default_extra,
-                            "reason": "workload_container_restarting",
-                            "failure_step": current_step,
                             "error": "; ".join(_exception_texts(e)),
+                            "failure_step": current_step,
+                            "reason": "workload_container_restarting",
                         }),
                     )
                 )

@@ -5,12 +5,14 @@ Nine validator and central-miner templates were 96 % of the 247k ERROR/WARNING l
 miner that is offline, a provider with no collateral, port and DinD retries, a node failing the
 inspector check, a delete finding nothing to delete. Each test here has two halves: the expected
 outcome no longer logs at ERROR (fails on the old code), and a real failure on the same path still
-does.
+does. One exception: a create that fails on a restarting workload container stays one ERROR
+`Failed create_container` line (no traceback), the event the pod-creation-failure ETL ingests.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -20,6 +22,7 @@ from uuid import uuid4
 import aiohttp
 import pytest
 import services.rental_docker_sdk as sdk_module
+from core.utils import JSONFormatter
 from payload_models.payloads import (
     ContainerCreateRequest,
     MinerJobRequestPayload,
@@ -135,21 +138,33 @@ async def test_create_cancelled_by_delete_logs_one_info_line_without_traceback(c
 
 
 @pytest.mark.asyncio
-async def test_create_on_restarting_workload_container_logs_warning_with_the_cause(caplog):
+async def test_create_on_restarting_workload_container_keeps_the_pod_creation_failure_event(caplog):
+    """Regression: the line moves off `Failed create_container` at ERROR, and lium-platform's
+    pod_creation_failure_events ETL (LogQL `|= "Failed create_container" |= "\\"level\\": \\"ERROR\\""`,
+    then `message == "Failed create_container"` and a non-empty `extra.error`) stops counting
+    restarting-workload create failures on the Pod Creation Failure dashboard."""
     _, result = await _create_failing_with(
         RentalDockerContainerRestartingError(
-            "container restarting, exit_code=1; Docker SDK exec failed: 409 Client Error"
+            "container restarting, exit_code=1; Docker SDK exec failed: 409 Client Error: Conflict "
+            '("Container abc is restarting, wait until the container is running")'
         ),
         caplog,
     )
 
-    lines = _records(caplog, "workload container keeps restarting; create failed")
+    lines = _records(caplog, "Failed create_container")
     assert len(lines) == 1
-    assert lines[0].levelno == logging.WARNING
-    assert lines[0].exc_info is None
+    assert lines[0].levelno == logging.ERROR
+    assert lines[0].exc_info is None, "one line, no traceback"
     assert _extra(lines[0])["reason"] == "workload_container_restarting"
-    assert "exit_code=1" in _extra(lines[0])["error"]
-    assert logging.ERROR not in _levels(caplog)
+
+    rendered = JSONFormatter(include_validator_hotkey=False).format(lines[0])
+    assert "Failed create_container" in rendered and '"level": "ERROR"' in rendered
+    event = json.loads(rendered)
+    assert event["message"] == "Failed create_container"
+    # the ETL classifies this text as container.crash_looping (actor: user_template)
+    assert "is restarting, wait until" in event["extra"]["error"]
+    assert "exit_code=1" in event["extra"]["error"]
+    assert event["extra"]["failure_step"]
     assert result.msg == "Failed create_container"
 
 
