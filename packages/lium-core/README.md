@@ -20,8 +20,8 @@ CI: `.github/workflows/lium-core-ci.yml` runs the tests and builds the wheel on 
 
 ## Release
 
-Bump `version` in `pyproject.toml`, merge, then tag that commit `lium-core-vX.Y.Z` with the same version and push the
-tag. `.github/workflows/lium-core-release.yml` builds from this directory, refuses a tag whose version is not the
+Bump `version` in `pyproject.toml`, merge, then a human on the tag ruleset's bypass list tags that commit
+`lium-core-vX.Y.Z` with the same version and pushes the tag. `.github/workflows/lium-core-release.yml` builds from this directory, refuses a tag whose version is not the
 one in `pyproject.toml`, runs `twine check`, and then waits in the **`pypi` environment** until its required reviewer
 approves the run (Actions → the run → **Review deployments**). The upload is PyPI trusted publishing with PEP 740
 attestations: pypi.org's publisher for `lium-core` names this repository, this workflow file and the `pypi`
@@ -31,8 +31,14 @@ shows a *Provenance* link on pypi.org; `https://pypi.org/integrity/lium-core/X.Y
 the signed statement.
 
 Who may tag: the `lium-core-release-tags` ruleset (`.github/rulesets/lium-core-release-tags.json`) lets only its
-bypass list create, move or delete a `lium-core-v*` tag. Both guards are repository settings a repository admin
-applies once:
+bypass list create, move or delete a `lium-core-v*` tag. The list is humans only: 10954604 (taiberium, who ran the last
+release). A human creates each release tag; the loop's account (114649324, `surcyf123`) is not on the list and never
+creates, moves or deletes a release tag. Add a human by appending
+`{ "actor_id": <human-id>, "actor_type": "User", "bypass_mode": "always" }` (never 114649324) and re-applying with
+`gh api "repos/$R/rulesets/<id>" --method PUT --input .github/rulesets/lium-core-release-tags.json`. Today (read
+23 Sep 2026) no tag ruleset is applied to this repository, so any account with write access, the loop's account
+included, can create a `lium-core-v*` tag until an admin applies this file. Both guards are repository settings a
+repository admin applies once:
 
 ```bash
 R=Datura-ai/lium-io
@@ -79,7 +85,7 @@ publish with no click. The environment and its tag policy exist today; what step
 `PUT` with human ids.
 (2) Register the `pypi` publisher on pypi.org
 (Manage → Publishing → Add a new publisher → GitHub: owner `Datura-ai`, repository `lium-io`, workflow
-`lium-core-release.yml`, environment `pypi`). (3) Merge. (4) Proof release, approved by a human reviewer. (5) **Delete
+`lium-core-release.yml`, environment `pypi`). (3) Merge. (4) Proof release: a human pushes the tag, and a human reviewer approves the publish job. (5) **Delete
 the old publishers** on pypi.org: `Datura-ai/lium-io · lium-core-release.yml · release` and the archived
 `Datura-ai/lium-core · release.yml · release`. Until they are gone a branch whose edited `lium-core-release.yml`
 keeps `environment: release` (no reviewer, no branch policy), run by hand, still uploads — any of the 7 accounts
