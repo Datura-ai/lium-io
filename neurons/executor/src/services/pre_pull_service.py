@@ -9,11 +9,13 @@ top-N official templates as well (entries carrying ``pre_pull: true``) and hands
 to :func:`PrePuller.sweep` once per refresh sweep, which pulls AT MOST ONE missing image,
 digest-pinned, and only if
 
-* the node is idle — no ``pod_*`` container exists and no validator docker-over-ssh
-  session is open (that is how a rental's own pull and ``docker run`` reach this host);
-  a pull already running is cancelled the moment either appears;
-* the docker root keeps ``PRE_PULL_MIN_FREE_GB`` free afterwards — least-recently-used
-  pre-pulled images are evicted first to make room, nothing else is ever removed;
+* the node is idle — no ``pod_*`` container exists (in any state), no validator docker-over-ssh
+  session is open (that is how a rental's own pull and ``docker run`` reach this host) and the
+  validator's VerifyX bandwidth sample is not running; a pull already running is cancelled
+  within 10 s when any of them appears (2 s for the bandwidth sample);
+* the docker root keeps ``PRE_PULL_MIN_FREE_GB`` free afterwards — pre-pulled images that left
+  the current top-N are evicted, least recently used first, to make room; nothing else is ever
+  removed, and a pull that would not fit without evicting a served image is skipped;
 * it finishes within ``PRE_PULL_TIMEOUT_SECONDS`` and before the next mandatory refresh
   is due: the start delay and the pull are both capped at the refresh deadline the loop
   hands in, and a pull that would not fit waits for the next sweep. The loop starts the
@@ -59,6 +61,13 @@ RENTAL_CONTAINER_PREFIX = "pod_"
 # The validator drives rental docker operations through docker-py over SSH, which runs
 # this on the executor for the whole operation (visible thanks to `pid: host`).
 DOCKER_OVER_SSH_MARKER = "dial-stdio"
+# The validator's VerifyX probe, whose download sample feeds the 100 Mbps EMA gate: it runs as
+# `python …/verifyx_executor.py --seed …`, over SSH or as the `/verify` subprocess
+# (local_verify_service). A pull sharing the link would lower that sample.
+BANDWIDTH_TEST_MARKER = "verifyx_executor.py"
+# How often a running pull re-checks for the probe alone (a process scan, no docker call): a
+# sample lasts tens of seconds, so the full idle check's cadence would share too much of it.
+BANDWIDTH_TEST_CHECK_SECONDS = 2
 # Compressed size → on-disk estimate; same factor cache_template_service uses.
 ON_DISK_MULTIPLIER = 3.0
 DISK_PATH = "/"
@@ -75,15 +84,24 @@ GIB = 1024**3
 def rental_activity(client: "docker.DockerClient") -> str | None:
     """Why the node is not idle right now, or ``None``.
 
-    A rental container that is not finished counts, whatever its state: one still in
-    ``created`` is a rental starting. Exited/dead leftovers awaiting cleanup do not.
+    Any rental container counts until it is removed, whatever its state: ``created`` is a
+    rental starting, ``exited`` may be a stopped rental that can start again. The validator
+    removes an ended rental's container (orphans at its next cleanup cycle).
     """
     for container in client.containers.list(all=True):
-        if (container.name or "").startswith(RENTAL_CONTAINER_PREFIX) and container.status not in ("exited", "dead"):
+        if (container.name or "").startswith(RENTAL_CONTAINER_PREFIX):
             return f"rental container {container.name}"
+    return host_activity()
+
+
+def host_activity() -> str | None:
+    """Validator work on this host that a pull must not overlap, or ``None``."""
     for proc in psutil.process_iter(["cmdline"]):
-        if any(DOCKER_OVER_SSH_MARKER in part for part in (proc.info.get("cmdline") or [])):
+        cmdline = proc.info.get("cmdline") or []
+        if any(DOCKER_OVER_SSH_MARKER in part for part in cmdline):
             return "docker-over-ssh session"
+        if any(part.endswith(BANDWIDTH_TEST_MARKER) for part in cmdline):
+            return "validator bandwidth test"
     return None
 
 
@@ -166,8 +184,10 @@ def _pull_pinned(
     registry, _ = docker.auth.resolve_repository_name(repo)
     auth_header = docker.auth.get_config_header(api, registry)
     headers = {"X-Registry-Auth": auth_header} if auth_header else {}
-    deadline = time.monotonic() + timeout_seconds
-    next_check = time.monotonic() + ACTIVITY_CHECK_SECONDS
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    next_check = started + ACTIVITY_CHECK_SECONDS
+    next_probe_check = started + BANDWIDTH_TEST_CHECK_SECONDS
     # The deadline and the idle check run per stream event, so the read timeout is what
     # bounds a stream that goes silent: without it a stalled registry would hold this thread
     # (and the pull lock) for the whole budget past the caller's refresh deadline.
@@ -186,11 +206,16 @@ def _pull_pinned(
             now = time.monotonic()
             if now > deadline:
                 return "timeout", f"exceeded {timeout_seconds:.0f}s"
+            busy = None
             if now >= next_check:
                 next_check = now + ACTIVITY_CHECK_SECONDS
+                next_probe_check = now + BANDWIDTH_TEST_CHECK_SECONDS
                 busy = rental_activity(client)
-                if busy:
-                    return "preempted", busy
+            elif now >= next_probe_check:
+                next_probe_check = now + BANDWIDTH_TEST_CHECK_SECONDS
+                busy = host_activity()
+            if busy:
+                return "preempted", busy
     except (requests.exceptions.Timeout, urllib3.exceptions.TimeoutError):
         # docker-py reads the chunked stream off `response.raw`, so a silent stream surfaces as
         # urllib3's ReadTimeoutError, not requests' (requests only remaps inside iter_content).
@@ -284,7 +309,8 @@ class PrePuller:
                 break
 
             started = time.monotonic()
-            room, detail = await self._make_room(image_ref, int(size * ON_DISK_MULTIPLIER))
+            served = {f"{e.get('docker_image')}:{e.get('docker_image_tag')}" for e in entries}
+            room, detail = await self._make_room(image_ref, int(size * ON_DISK_MULTIPLIER), served)
             # The budget is measured after eviction, which takes time of its own: the pull's
             # clock starts below, so this is what cuts it at the deadline.
             budget = float(settings.PRE_PULL_TIMEOUT_SECONDS)
@@ -332,10 +358,16 @@ class PrePuller:
             if await asyncio.to_thread(_remove_ref, self.client, f"{repo}@{old}"):
                 logger.info(f"pre-pull: retired superseded {repo}@{old} for {image_ref}")
 
-    async def _make_room(self, keep_ref: str, need_bytes: int) -> tuple[bool, str | None]:
-        """Keep ``PRE_PULL_MIN_FREE_GB`` free after the pull, evicting LRU pre-pulled images first."""
+    async def _make_room(
+        self, keep_ref: str, need_bytes: int, served: set[str]
+    ) -> tuple[bool, str | None]:
+        """Keep ``PRE_PULL_MIN_FREE_GB`` free after the pull, evicting LRU pre-pulled images first.
+
+        Only images that left the backend's current top-N (``served``) are evictable: evicting a
+        served one to fit another would re-pull the two alternately every sweep on a node whose
+        free space fits either but not both. Such a node keeps what it has and skips the pull."""
         floor = settings.PRE_PULL_MIN_FREE_GB * GIB
-        skip = {keep_ref}
+        skip = served | {keep_ref}
         while True:
             free = psutil.disk_usage(DISK_PATH).free
             if free - need_bytes >= floor:
