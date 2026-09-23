@@ -1476,7 +1476,8 @@ async def test_egress_step_runs_the_script_inside_the_renter_container_and_passe
     assert _steps(result)[STEP_EGRESS]["ok"] is True
     egress_command = seen["conn"].commands[1]
     assert egress_command.startswith("sh -c ") and "getent hosts pypi.org" in egress_command
-    assert "https://pypi.org/simple/" in egress_command
+    # headers of a 325-byte file, not the 46 MB index (self-review)
+    assert "https://pypi.org/robots.txt" in egress_command and "/simple" not in egress_command
 
 
 @pytest.mark.asyncio

@@ -23,25 +23,32 @@ from ..pipeline import CheckResult, Context
 logger = logging.getLogger(__name__)
 
 EGRESS_PROBE_HOST = "pypi.org"
-EGRESS_PROBE_URL = "https://pypi.org/simple/"
+# 325 bytes, asked for headers only: https://pypi.org/simple/ is 46 MB, and busybox wget's -T is a read
+# timeout, so fetching it pulled the whole index from every idle node every cycle
+EGRESS_PROBE_URL = "https://pypi.org/robots.txt"
+EGRESS_FETCH_TIMEOUT_SECONDS = 10
 EGRESS_PROBE_MARKER = "lium_egress"
 EGRESS_PROBE_CONTAINER_PREFIX = "lium_egress_probe_"
-# getent's resolver timeouts plus the 10 s fetch, plus a `docker run` of a 3 MB image that may be pulled
+# getent's resolver timeouts plus the fetch's 10 s total bound, plus a `docker run` of a 3 MB image that
+# may be pulled
 POD_PROBE_TIMEOUT_SECONDS = 90
 _TAIL_CHARS = 300
 
-# `getent hosts pypi.org && curl -sS -m 10 -o /dev/null -w '%{http_code}' https://pypi.org/simple/`, in stages
-# so the verdict says which one failed. POSIX sh: the host-side probe runs it in alpine (busybox wget, no
-# curl), the rental probe in the renter image (curl). An image without getent goes straight to the fetch,
-# whose own resolution then decides. Exit 0 always: the marker lines are the answer.
+# `getent hosts pypi.org && curl -sS -m 10 -o /dev/null -I -w '%{http_code}' https://pypi.org/robots.txt`, in
+# stages so the verdict says which one failed. POSIX sh: the host-side probe runs it in alpine (busybox wget,
+# no curl), the rental probe in the renter image (curl). curl's -m is a total deadline; wget has none (-T is
+# per read), so it runs under `timeout` wherever the image has one. An image without getent goes straight
+# to the fetch, whose own resolution then decides. Exit 0 always: the marker lines are the answer.
 EGRESS_PROBE_SCRIPT = (
     "if command -v getent >/dev/null 2>&1; then "
     f"if ! getent hosts {EGRESS_PROBE_HOST} >/dev/null 2>&1; then echo '{EGRESS_PROBE_MARKER} dns=fail'; exit 0; fi; "
     f"echo '{EGRESS_PROBE_MARKER} dns=ok'; fi; "
     "if command -v curl >/dev/null 2>&1; then tool=curl; "
-    f"code=$(curl -sS -m 10 -o /dev/null -w '%{{http_code}}' {EGRESS_PROBE_URL} 2>/tmp/lium_egress.err); "
+    f"code=$(curl -sS -m {EGRESS_FETCH_TIMEOUT_SECONDS} -o /dev/null -I -w '%{{http_code}}' {EGRESS_PROBE_URL} "
+    "2>/tmp/lium_egress.err); "
     "elif command -v wget >/dev/null 2>&1; then tool=wget; "
-    f"code=$(wget -S -T 10 -O /dev/null {EGRESS_PROBE_URL} 2>/tmp/lium_egress.err; "
+    f"bound=; if command -v timeout >/dev/null 2>&1; then bound='timeout {EGRESS_FETCH_TIMEOUT_SECONDS}'; fi; "
+    f"code=$($bound wget -S --spider -T {EGRESS_FETCH_TIMEOUT_SECONDS} {EGRESS_PROBE_URL} 2>/tmp/lium_egress.err; "
     "awk '/^ *HTTP\\//{c=$2} END{print c}' /tmp/lium_egress.err); "
     "else tool=none; fi; "
     f'echo "{EGRESS_PROBE_MARKER} tool=$tool http=${{code:-000}}"; '
