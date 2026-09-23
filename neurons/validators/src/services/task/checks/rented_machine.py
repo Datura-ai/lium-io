@@ -232,6 +232,10 @@ class TenantEnforcementCheck:
                 # Just recovered: judged from the renter's side next cycle, not on the way up.
                 continue
 
+            if ssh_pub_keys is None:
+                # dockerd refused the keys read: not judged from the renter's side this cycle.
+                ssh_pub_keys = []
+                continue
             verdict = await probe_rented_pod_ssh(ctx, pod, ssh_pub_keys)
             if verdict is not None:
                 ssh_verdicts.append(verdict)
@@ -433,7 +437,8 @@ class TenantEnforcementCheck:
                 ):
                     # Re-read the pod, so the recovered container's own SSH keys are what gets
                     # reported and a start that did not stick still lands on POD_NOT_RUNNING.
-                    pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
+                    pod_running, read_keys = await _check_pod_running(ctx.ssh, container_name)
+                    ssh_pub_keys = read_keys or []
                     container_finished_at = diagnostics.get("container_finished_at")
                     if pod_running and isinstance(container_finished_at, str):
                         await _report_host_reboot_recovery(ctx, pod_id, container_finished_at)
@@ -588,10 +593,14 @@ async def _recover_pod_after_stale_vloopback_mount(
         return False
 
 
-async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str]]:
+_DOCKER_DAEMON_ERROR = "Error response from daemon"
+
+
+async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str] | None]:
     # asyncssh.Error / OSError mean the SSH session itself is dead -> caller must
     # treat this as "pod state unknown", not "pod down". Other exceptions are
     # genuine docker / business failures and keep the legacy fall-through.
+    # Keys None: dockerd refused the exec (a restarting or paused container), so they are unknown.
     try:
         ps_result = await ssh_client.run(DockerCommand.ps_running(container_name))
         pod_running = bool(ps_result.stdout.strip())
@@ -605,7 +614,12 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
         keys_result = await ssh_client.run(
             DockerCommand.exec_command(container_name, "cat /root/.ssh/authorized_keys")
         )
-        ssh_keys = keys_result.stdout.strip().split("\n") if keys_result.stdout else []
+        # `cat` finding no file exits 1 too: that is the missing-keys case, so only dockerd's own
+        # refusal reads as unknown.
+        if keys_result.exit_status != 0 and _DOCKER_DAEMON_ERROR in str(keys_result.stderr):
+            ssh_keys = None
+        else:
+            ssh_keys = keys_result.stdout.strip().split("\n") if keys_result.stdout else []
     except (asyncssh.Error, OSError):
         raise
     except Exception:
