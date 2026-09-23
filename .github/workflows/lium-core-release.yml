@@ -81,8 +81,10 @@ jobs:
     # required reviewer is set; the loop's account (LOOP_ACCOUNT_ID, surcyf123) is not one of them — GitHub lets any
     # one listed reviewer approve, and prevent_self_review only blocks the account that started the run; every
     # reviewer is a user (this job's token cannot read team membership, which needs the organization "Members"
-    # permission, so a team could hide the loop's account); prevent_self_review is true. The guard cannot tell a
-    # human from another machine account; the admin lists humans.
+    # permission, so a team could hide the loop's account); prevent_self_review is true; can_admins_bypass is false
+    # (with it true, a repository admin — the loop's account is one — can start this job with no reviewer's approval,
+    # and a missing field counts as true). The guard cannot tell a human from another machine account; the admin
+    # lists humans.
     # What this cannot prove: that pypi.org's old `release`-bound publisher is gone (until it is, an edited copy
     # of this file on a branch that keeps `environment: release`, run by hand, still uploads — README "Release").
     - name: Environment pypi must require a reviewer other than the loop's account
@@ -95,10 +97,12 @@ jobs:
           echo "nothing published (packages/lium-core/README.md 'Release', step 1)" >&2
           exit 1
         }
+        [[ "$LOOP_ACCOUNT_ID" =~ ^[0-9]+$ ]] || fail "LOOP_ACCOUNT_ID is not a user id; this step cannot rule out the loop's account"
         env_json="$(gh api "repos/$GITHUB_REPOSITORY/environments/pypi")" || fail "could not be read"
         rule="$(jq -c '[.protection_rules[]? | select(.type == "required_reviewers")] | first // {}' <<<"$env_json")" ||
           fail "could not be parsed"
         echo "required reviewers on environment pypi: $(jq -r '[.reviewers[]? | "\(.type) \(.reviewer.login // .reviewer.slug) (id \(.reviewer.id))"] | join(", ") | if . == "" then "none" else . end' <<<"$rule")"
+        echo "can_admins_bypass on environment pypi: $(jq -r '.can_admins_bypass | tostring' <<<"$env_json")"
         jq -e '(.reviewers // []) | length > 0' <<<"$rule" >/dev/null ||
           fail "no required reviewer; an admin adds at least one human"
         jq -e --argjson loop "$LOOP_ACCOUNT_ID" 'all(.reviewers[]; .reviewer.id != $loop)' <<<"$rule" >/dev/null ||
@@ -107,6 +111,8 @@ jobs:
           fail "a team is a required reviewer; this job cannot read team membership, so an admin lists people by user id"
         jq -e '.prevent_self_review == true' <<<"$rule" >/dev/null ||
           fail "prevent_self_review is not true"
+        jq -e '.can_admins_bypass == false' <<<"$env_json" >/dev/null ||
+          fail "can_admins_bypass is not false; a repository admin could start this job without a reviewer's approval"
 
     - name: Download artifact
       uses: actions/download-artifact@v4
