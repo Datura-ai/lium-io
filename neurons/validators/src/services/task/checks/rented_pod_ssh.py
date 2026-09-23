@@ -78,7 +78,7 @@ from core.utils import _m, get_extra_info
 from ...redis_service import RedisWrites
 from ..availability import SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
 from ..messages import TenantEnforcementMessages
-from ..models import JobResult, build_msg
+from ..models import JobResult, ValidationEvent, build_msg
 from ..pipeline import Context
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
 
@@ -201,7 +201,7 @@ def _decode_hash(raw: object) -> dict[str, str]:
     return out
 
 
-def _decode(raw: object) -> dict | None:
+def _decode(raw: object) -> dict[str, object] | None:
     if raw is None:
         return None
     if isinstance(raw, bytes):
@@ -279,7 +279,7 @@ class FailStreak:
             reported=value.get("reported") is True,
         )
 
-    def next(self) -> FailStreak:
+    def plus_one_cycle(self) -> FailStreak:
         return replace(self, count=self.count + 1)
 
     def dump(self) -> str:
@@ -448,23 +448,7 @@ async def _judge_with_streak(
     # the probe skips the cycle (REDIS_UNAVAILABLE, below) instead of leaving a fresh ok mark next
     # to the old streak, or a counted streak next to a stale ok mark.
     if not faults:
-        healthy = RedisWrites()
-        healthy_mark = OkMark(
-            at=now_iso,
-            boot_id=boot_id_now,
-            banner_seen=pod.ssh_port is not None and settings.RENTED_POD_SSH_BANNER_FAULT_ENABLED,
-        )
-        healthy.set(_ok_key(pod.pod_id), healthy_mark.dump(), ex=ttl)
-        healthy.delete(_fail_key(pod.pod_id))
-        if pod.ssh_port is not None:
-            _mark_fleet(ctx, healthy, pod.pod_id, FLEET_MARK_OK)
-        await store.write_atomically(healthy)
-        return RentedPodSshVerdict(
-            pod_id=pod.pod_id,
-            container_name=pod.container_name,
-            ssh_port=pod.ssh_port,
-            healthy=True,
-        )
+        return await _record_healthy_cycle(ctx, pod, boot_id_now, now_iso)
 
     ok_mark = OkMark.load(await store.get(_ok_key(pod.pod_id)))
     if ok_mark is None or (port_fault == FAULT_SSH_BANNER_MISSING and not ok_mark.banner_seen):
@@ -481,19 +465,21 @@ async def _judge_with_streak(
             faults=faults,
         )
 
-    streak = FailStreak.load(await store.get(_fail_key(pod.pod_id)), now_iso=now_iso).next()
+    streak = FailStreak.load(
+        await store.get(_fail_key(pod.pod_id)), now_iso=now_iso
+    ).plus_one_cycle()
     consecutive = streak.count
     first_failed_at = streak.first_failed_at
-    unhealthy = RedisWrites()
+    unhealthy_writes = RedisWrites()
     if pod.ssh_port is not None:
         # The cycle-end gate reads every counted pod, healthy or not: the share is what tells a
         # validator-side outage (most ports refuse at once) from one pod's. A pod whose port
         # answered but whose authorized_keys is unreadable is a pod fault, not a port fault.
-        _mark_fleet(ctx, unhealthy, pod.pod_id, port_fault or FLEET_MARK_OK)
+        _mark_fleet(ctx, unhealthy_writes, pod.pod_id, port_fault or FLEET_MARK_OK)
     # The ok mark is what makes the streak count; renew its TTL so an outage longer than the TTL
     # keeps naming the pod in the event instead of silently falling back to RENTED.
-    unhealthy.set(_ok_key(pod.pod_id), ok_mark.dump(), ex=ttl)
-    unhealthy.set(_fail_key(pod.pod_id), streak.dump(), ex=ttl)
+    unhealthy_writes.set(_ok_key(pod.pod_id), ok_mark.dump(), ex=ttl)
+    unhealthy_writes.set(_fail_key(pod.pod_id), streak.dump(), ex=ttl)
 
     boot_id_at_ok = ok_mark.boot_id
     boot_id_changed = boot_id_at_ok != boot_id_now if boot_id_at_ok and boot_id_now else None
@@ -513,12 +499,37 @@ async def _judge_with_streak(
         # Under the threshold, or the backend already acknowledged this outage. DRY_RUN validates
         # without publishing: the event is logged, the backend is not told, and `reported` stays
         # False, so the first live cycle at or past the threshold queues (a dry run consumes nothing).
-        await store.write_atomically(unhealthy)
+        await store.write_atomically(unhealthy_writes)
         return verdict
 
-    _queue_report_for_fleet_gate(ctx, unhealthy, verdict, boot_id_at_ok, boot_id_now)
-    await store.write_atomically(unhealthy)
+    _queue_report_for_fleet_gate(ctx, unhealthy_writes, verdict, boot_id_at_ok, boot_id_now)
+    await store.write_atomically(unhealthy_writes)
     return replace(verdict, report_queued=True)
+
+
+async def _record_healthy_cycle(
+    ctx: Context, pod: RentedPod, boot_id_now: str | None, now_iso: str
+) -> RentedPodSshVerdict:
+    """Renew the ok mark and end any streak: the pod counts from here on."""
+    healthy_mark = OkMark(
+        at=now_iso,
+        boot_id=boot_id_now,
+        banner_seen=pod.ssh_port is not None and settings.RENTED_POD_SSH_BANNER_FAULT_ENABLED,
+    )
+    healthy_writes = RedisWrites()
+    healthy_writes.set(
+        _ok_key(pod.pod_id), healthy_mark.dump(), ex=settings.RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS
+    )
+    healthy_writes.delete(_fail_key(pod.pod_id))
+    if pod.ssh_port is not None:
+        _mark_fleet(ctx, healthy_writes, pod.pod_id, FLEET_MARK_OK)
+    await ctx.services.redis.write_atomically(healthy_writes)
+    return RentedPodSshVerdict(
+        pod_id=pod.pod_id,
+        container_name=pod.container_name,
+        ssh_port=pod.ssh_port,
+        healthy=True,
+    )
 
 
 def _queue_report_for_fleet_gate(
@@ -692,62 +703,70 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     """
     if gate is None or not gate.suppressed_by:
         return 0
-    held = set(gate.due)
-    unreachable = TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE.reason
-    rented = TenantEnforcementMessages.ALREADY_RENTED
+    held_pod_ids = set(gate.due)
     rewritten = 0
     for result in job_results:
-        event = result.validation_event
-        if event is None or event.reason_code != unreachable:
+        rewritten_event = _event_without_held_pods(result.validation_event, gate, held_pod_ids)
+        if rewritten_event is None:
             continue
-        pods = [
-            pod for pod in event.what_we_saw.get("unreachable_pods") or [] if isinstance(pod, dict)
-        ]
-        held_pods = [pod for pod in pods if pod.get("pod_id") in held]
-        if not held_pods:
-            continue
-        already_reported_pods = [pod for pod in pods if pod.get("pod_id") not in held]
-        what = {key: value for key, value in event.what_we_saw.items() if key != "unreachable_pods"}
-        suppressed = {
-            "suppressed_by": gate.suppressed_by,
-            "probed": gate.probed,
-            "failed": gate.failed,
-            "fail_share": round(gate.fail_share, 3),
-            "unreachable_pods": held_pods,
-        }
-        if already_reported_pods:
-            # Mixed: one pod of this executor was reported in an earlier cycle, another is held now.
-            # The event keeps its reason for the pod whose outage stands and stops naming the rest;
-            # nothing was queued for that pod (it was never due), so the impact says so too.
-            rewritten_event = event.model_copy(
-                update={
-                    "impact": TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT,
-                    "what_we_saw": {
-                        **what,
-                        "unreachable_pods": already_reported_pods,
-                        PROBE_SUPPRESSED_FLEET: suppressed,
-                    },
-                }
-            )
-        else:
-            rewritten_event = build_msg(
-                event=rented.event,
-                reason=rented.reason,
-                severity=rented.severity,
-                category=rented.category,
-                impact=f"Reported rented score={what.get('job_score')} (actual={what.get('actual_score')})",
-                remediation="No action needed.",
-                what={**what, PROBE_SUPPRESSED_FLEET: suppressed},
-                check_id=event.check_id or "",
-                pipeline_id=event.pipeline_id,
-                ctx=event.context,
-            ).model_copy(update={"trace_id": event.trace_id, "when": event.when})
         result.validation_event = rewritten_event
         result.log_text = _m(
             rewritten_event.event, extra=rewritten_event.model_dump()
         ).to_full_string()
         rewritten += 1
     return rewritten
+
+
+def _event_without_held_pods(
+    event: ValidationEvent | None, gate: FleetGate, held_pod_ids: set[str]
+) -> ValidationEvent | None:
+    """The RENTED_POD_SSH_UNREACHABLE event with the gate's held pods moved under
+    ``probe_suppressed_fleet``, or None when the event names no held pod."""
+    if (
+        event is None
+        or event.reason_code != TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE.reason
+    ):
+        return None
+    pods = [pod for pod in event.what_we_saw.get("unreachable_pods") or [] if isinstance(pod, dict)]
+    held_pods = [pod for pod in pods if pod.get("pod_id") in held_pod_ids]
+    if not held_pods:
+        return None
+    already_reported_pods = [pod for pod in pods if pod.get("pod_id") not in held_pod_ids]
+    what = {key: value for key, value in event.what_we_saw.items() if key != "unreachable_pods"}
+    gate_verdict = {
+        "suppressed_by": gate.suppressed_by,
+        "probed": gate.probed,
+        "failed": gate.failed,
+        "fail_share": round(gate.fail_share, 3),
+        "unreachable_pods": held_pods,
+    }
+    if already_reported_pods:
+        # Mixed: one pod of this executor was reported in an earlier cycle, another is held now.
+        # The event keeps its reason for the pod whose outage stands and stops naming the rest;
+        # nothing was queued for that pod (it was never due), so the impact says so too.
+        return event.model_copy(
+            update={
+                "impact": TenantEnforcementMessages.RENTED_POD_SSH_UNREACHABLE_NOT_QUEUED_IMPACT,
+                "what_we_saw": {
+                    **what,
+                    "unreachable_pods": already_reported_pods,
+                    PROBE_SUPPRESSED_FLEET: gate_verdict,
+                },
+            }
+        )
+    rented = TenantEnforcementMessages.ALREADY_RENTED
+    return build_msg(
+        event=rented.event,
+        reason=rented.reason,
+        severity=rented.severity,
+        category=rented.category,
+        impact=f"Reported rented score={what.get('job_score')} (actual={what.get('actual_score')})",
+        remediation="No action needed.",
+        what={**what, PROBE_SUPPRESSED_FLEET: gate_verdict},
+        check_id=event.check_id or "",
+        pipeline_id=event.pipeline_id,
+        ctx=event.context,
+    ).model_copy(update={"trace_id": event.trace_id, "when": event.when})
 
 
 async def _post_one(

@@ -1,7 +1,7 @@
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import asyncssh
 
@@ -173,7 +173,7 @@ class TenantEnforcementCheck:
             pod_container_name = pod.container_name
             pod_id = pod.pod_id
             try:
-                pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_container_name)
+                pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(ctx.ssh, pod_container_name)
             except (asyncssh.Error, OSError) as exc:
                 return _executor_transport_unreachable_result(
                     ctx=ctx,
@@ -350,7 +350,7 @@ class TenantEnforcementCheck:
                 ):
                     # Re-read the pod, so the recovered container's own SSH keys are what gets
                     # reported and a start that did not stick still lands on POD_NOT_RUNNING.
-                    pod_running, read_keys = await _check_pod_running(ctx.ssh, container_name)
+                    pod_running, read_keys = await _check_pod_running_and_read_authorized_keys(ctx.ssh, container_name)
                     ssh_pub_keys = read_keys or []
                     container_finished_at = diagnostics.get("container_finished_at")
                     if pod_running and isinstance(container_finished_at, str):
@@ -509,11 +509,18 @@ async def _recover_pod_after_stale_vloopback_mount(
 _DOCKER_DAEMON_ERROR = "Error response from daemon"
 
 
-async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str] | None]:
+class PodRunningAndAuthorizedKeys(NamedTuple):
+    running: bool
+    # None: dockerd refused the exec (a restarting or paused container), so the keys are unknown.
+    authorized_keys: list[str] | None
+
+
+async def _check_pod_running_and_read_authorized_keys(
+    ssh_client, container_name: str
+) -> PodRunningAndAuthorizedKeys:
     # asyncssh.Error / OSError mean the SSH session itself is dead -> caller must
     # treat this as "pod state unknown", not "pod down". Other exceptions are
     # genuine docker / business failures and keep the legacy fall-through.
-    # Keys None: dockerd refused the exec (a restarting or paused container), so they are unknown.
     try:
         ps_result = await ssh_client.run(DockerCommand.ps_running(container_name))
         pod_running = bool(ps_result.stdout.strip())
@@ -538,7 +545,7 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
     except Exception:
         ssh_keys = []
 
-    return pod_running, ssh_keys
+    return PodRunningAndAuthorizedKeys(running=pod_running, authorized_keys=ssh_keys)
 
 
 # The diagnostics fields that decide whether a not-running container is the provider's fault (host lost the

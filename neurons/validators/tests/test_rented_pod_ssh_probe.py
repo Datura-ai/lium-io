@@ -1296,7 +1296,7 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
     stored = rented_pod_ssh.FailStreak(count=2, first_failed_at="2026-09-15T14:30:00+00:00")
     loaded = rented_pod_ssh.FailStreak.load(stored.dump().encode(), now_iso=now)
     assert loaded == stored
-    assert loaded.next() == rented_pod_ssh.FailStreak(
+    assert loaded.plus_one_cycle() == rented_pod_ssh.FailStreak(
         count=3, first_failed_at=stored.first_failed_at
     )
     assert json.loads(stored.dump()) == {
@@ -1307,7 +1307,7 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
     reported = rented_pod_ssh.FailStreak.load(
         b'{"count": 2, "first_failed_at": "x", "reported": true}', now_iso=now
     )
-    assert reported.reported is True and reported.next().reported is True
+    assert reported.reported is True and reported.plus_one_cycle().reported is True
     assert (
         rented_pod_ssh.FailStreak.load(b'{"count": 2, "reported": "yes"}', now_iso=now).reported
         is False
