@@ -41,6 +41,7 @@ STUBS = {
         case "$1 $2" in
             "version --format") echo "${STUB_DOCKER_VERSION:-28.5.2}" ;;
             "ps ") exit 0 ;;
+            "ps -a") echo "${STUB_STOPPED_POD:-}" ;;   # every container, stopped ones too
             "ps --filter") echo "${STUB_PORT_CONTAINER:-executor-1}" ;;
             "info ") echo " Runtimes: io.containerd.runc.v2 nvidia runc sysbox-runc" ;;   # the "already working?" probe of install mode
             "info --format")
@@ -633,6 +634,15 @@ def test_install_mode_upgrades_an_older_working_sysbox(tmp_path, installed):
     assert f"Sysbox {installed} is installed; upgrading to 0.7.1." in proc.stdout
     assert "Sysbox is already working. Nothing to do." not in proc.stdout
     assert "Checking running containers" in proc.stdout
+
+
+def test_install_mode_stops_on_a_stopped_rental(tmp_path):
+    # a renter's stopped pod is still a rental; the upgrade path removes every stopped container
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_STOPPED_POD": "pod_abc123"})
+    assert proc.returncode == 1
+    assert "Active rentals found (pod_* containers). Cannot proceed." in proc.stdout
+    assert "pod_abc123" in proc.stdout
+    assert "Removing stopped containers" not in proc.stdout
 
 
 def test_install_mode_keeps_a_newer_sysbox(tmp_path):

@@ -137,10 +137,11 @@ failure_diagnostics() {
 }
 
 abort_on_active_rentals() {
-    # a rental blocks every path below, so check before anything that costs the node time or bandwidth
-    docker ps --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
+    # a rental blocks every path below, so check before anything that costs the node time or bandwidth;
+    # -a: a renter's stopped pod is still a rental, and the install removes every stopped container
+    docker ps -a --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
     fail "Active rentals found (pod_* containers). Cannot proceed."
-    docker ps --filter "name=pod_" --format "    - {{.Names}}" 2>/dev/null
+    docker ps -a --filter "name=pod_" --format "    - {{.Names}}" 2>/dev/null
     exit 1
 }
 
