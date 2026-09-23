@@ -455,7 +455,10 @@ class Settings(BaseSettings):
     # the GPUs this validator capped (a restore record for the GPU). When True, a GPU below
     # MIN_POWER_LIMIT_RATIO x default with no such record while a Lium filler runs is the host's
     # own limit and zero-scores the node like any below-floor node. When False the breach is only
-    # logged (shadow mode) and the node passes, as before.
+    # logged (shadow mode) and the node passes, as before. The records live only in the Redis of
+    # the validator that capped the GPU: enable only on that validator, and turn it off before
+    # a Redis wipe or migration (lost records read as the host's own limit on every GPU Lium
+    # caps) until every filler capped before it has been replaced.
     ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS: bool = Field(
         env="ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", default=False
     )
