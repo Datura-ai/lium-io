@@ -540,14 +540,14 @@ async def test_both_marks_carry_the_ttl_and_every_probe_renews_it(context_factor
     h = Harness(context_factory)
     ok_key = f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"
     fail_key = f"{rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX}:{POD_ID}"
-    gate_key = rented_pod_ssh.RENTED_POD_SSH_LAST_GATE_KEY
+    # With enforcement off (the default) the last gate's verdict is neither stored nor read.
     with patch.object(rented_pod_ssh.settings, "RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS", 3600):
         await h.cycle(tcp_fault=None, ssh_keys=KEYS)
-        assert h.redis.ttl == {ok_key: 3600, gate_key: 3600}
+        assert h.redis.ttl == {ok_key: 3600}
         h.redis.ttl.clear()
         await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
 
-    assert h.redis.ttl == {fail_key: 3600, ok_key: 3600, gate_key: 3600}
+    assert h.redis.ttl == {fail_key: 3600, ok_key: 3600}
     assert json.loads(h.redis.store[ok_key])["boot_id"] == "boot-a"
 
 

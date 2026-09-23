@@ -106,8 +106,9 @@ RENTED_POD_SSH_FAIL_KEY_PREFIX = "rented_pod_ssh_fail"
 RENTED_POD_SSH_FLEET_KEY_PREFIX = "rented_pod_ssh_fleet"
 RENTED_POD_SSH_DUE_KEY_PREFIX = "rented_pod_ssh_due"
 FLEET_KEY_TTL_SECONDS = 3600
-# The last cycle-end gate's `suppressed_by` ("" when it held nothing). `is_enforced` reads it: a
-# validator the last gate judged to be the outage does not zero a pod. Expires with the fleet keys.
+# The last cycle-end gate's `suppressed_by` ("" when it held nothing), kept only with enforcement on.
+# `is_enforced` reads it: a validator the last gate judged to be the outage does not zero a pod.
+# Expires with the fleet keys.
 RENTED_POD_SSH_LAST_GATE_KEY = "rented_pod_ssh_last_gate"
 FLEET_MARK_OK = "ok"
 # A cycle whose reports the gate held back: the field every suppressed log line carries.
@@ -570,7 +571,10 @@ async def _judge_with_streak(
         report=consecutive >= threshold,
         backend_accepted=streak.backend_accepted,
         backend_accepted_faults=list(streak.backend_accepted_faults),
-        last_gate_suppressed=bool(await store.get(RENTED_POD_SSH_LAST_GATE_KEY)),
+        last_gate_suppressed=(
+            settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED
+            and bool(await store.get(RENTED_POD_SSH_LAST_GATE_KEY))
+        ),
     )
     if consecutive < threshold or streak.reported or settings.DRY_RUN:
         # Under the threshold, or the backend already acknowledged this outage. DRY_RUN validates
@@ -690,8 +694,8 @@ async def flush_rented_pod_ssh_reports(
     ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` with the pods it names; nothing is lost, because the
     streaks still read ``reported`` False and queue again next cycle.
 
-    The verdict is also stored under ``RENTED_POD_SSH_LAST_GATE_KEY`` for the next cycle's
-    ``is_enforced``. Returns None when the probe is off or Redis failed (logged), else what the gate
+    With enforcement on, the verdict is also stored under ``RENTED_POD_SSH_LAST_GATE_KEY`` for the
+    next cycle's ``is_enforced``. Returns None when the probe is off or Redis failed (logged), else what the gate
     saw and posted.
     Never raises: a backend or Redis error here is one more cycle of waiting, not a failed cycle.
     """
@@ -703,9 +707,10 @@ async def flush_rented_pod_ssh_reports(
         fleet = _decode_hash(await redis.hgetall(fleet_key))
         due = _decode_hash(await redis.hgetall(due_key))
         gate = judge_fleet_gate(fleet, due, job_batch_id, validator_outage=validator_outage)
-        await redis.set(
-            RENTED_POD_SSH_LAST_GATE_KEY, gate.suppressed_by or "", ex=FLEET_KEY_TTL_SECONDS
-        )
+        if settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED:
+            await redis.set(
+                RENTED_POD_SSH_LAST_GATE_KEY, gate.suppressed_by or "", ex=FLEET_KEY_TTL_SECONDS
+            )
         # Deleted before posting: a crash below costs one cycle (the streaks re-queue), a crash
         # after a post would otherwise post the same outage twice.
         await redis.delete(fleet_key)
