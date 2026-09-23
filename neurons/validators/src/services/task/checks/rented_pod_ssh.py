@@ -40,13 +40,12 @@ judged the validator to be the outage (DAH-2748), the queued reports are logged 
 ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` and no report is POSTed, so no renter is told. The
 streaks keep ``reported`` False, so the outage is queued again next cycle and reported once the
 fleet reads clean. Enforcement follows the backend accept, not the mail: ``is_enforced`` is true
-only when the streak is ``backend_accepted`` (a 200, including ``notify_failed``), so a held cycle never
-zeroes the node and a refused mail does not protect the provider. The gate also stores its verdict
-(``RENTED_POD_SSH_LAST_GATE_KEY``): while the last gate held the reports as our own outage, an
-accepted outage is not enforced either, so our outage zeroes a node for one cycle at most (the gate
-runs after the cycle's checks). The per-executor
-``RENTED_POD_SSH_UNREACHABLE`` events of a suppressed cycle
-were rendered before the gate ran and name a pod outage the gate then judged to be ours; the sync
+only when the streak is ``backend_accepted`` (a 200, including ``notify_failed``), so a held cycle
+never zeroes the node and a refused mail does not protect the provider. The gate also stores its
+verdict (``RENTED_POD_SSH_LAST_GATE_KEY``): while the last gate held the reports as our own outage,
+an accepted outage is not enforced either, so our outage zeroes a node for one cycle at most (the
+gate runs after the cycle's checks). The per-executor ``RENTED_POD_SSH_UNREACHABLE`` events of a
+suppressed cycle were rendered before the gate ran and name a pod outage the gate then judged to be ours; the sync
 loop passes the gate to
 ``silence_rented_pod_ssh_reports_on_our_own_outage`` before the specs publish, which rewrites them
 to RENTED with the gate's verdict under ``what_we_saw``, as DAH-2748 rewrites availability errors.
@@ -121,6 +120,7 @@ FAULT_TCP_TIMEOUT = "tcp_timeout"
 # only with RENTED_POD_SSH_BANNER_FAULT_ENABLED on (after lium-platform#429 is deployed).
 FAULT_SSH_BANNER_MISSING = "ssh_banner_missing"
 FAULT_AUTHORIZED_KEYS_UNREADABLE = "authorized_keys_unreadable"
+_PORT_FAULTS = frozenset({FAULT_TCP_REFUSED, FAULT_TCP_TIMEOUT, FAULT_SSH_BANNER_MISSING})
 # RFC 4253 §4.2: `SSH-protoversion-softwareversion SP comments CR LF`, at most 255 bytes including
 # CR LF. Only protoversion 2.0 counts: `SSH-1.5-` is a 1.x-only server; `SSH-1.99-` (RFC 4253
 # §5.1) marks a server that also speaks 1.x, and both are refused.
@@ -206,17 +206,17 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
     """True when this verdict fails the rented-state check for the cycle (DAH-2255).
 
     Only with ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on, only for an unhealthy pod, only once its
-    streak has reached ``enforce_after_cycles()``, and only after the backend accepted the outage
-    report (``verdict.backend_accepted``), and not while the last cycle-end gate held the reports as our own
-    outage (``verdict.last_gate_suppressed``). Mail delivery is separate: a ``notify_failed`` 200 still accepts,
-    and a cycle that only queued the notice — including a validator-side outage the fleet gate
-    holds — does not zero the node. Enforce only when the accepted fault was a port fault; a
-    keys-only accept does not let a later port fault zero the node. A renter who deletes
-    ``authorized_keys`` (that fault alone, host ``boot_id`` unchanged) is not enforced, whether that is the
-    accepted report's fault or this cycle's after a port-fault accept: the provider cannot restore the keys.
-    A pod never seen healthy carries no streak
-    (``consecutive_cycles`` 0), a Redis outage yields no verdict at all, and the flag off leaves the
-    check with DAH-2870's record-and-report behaviour: none of those is enforced.
+    streak has reached ``enforce_after_cycles()``, only after the backend accepted the outage report
+    (``verdict.backend_accepted``), and not while the last cycle-end gate held the reports as our
+    own outage (``verdict.last_gate_suppressed``). Mail delivery is separate: a ``notify_failed``
+    200 still accepts, and a cycle that only queued the notice — including a validator-side outage
+    the fleet gate holds — does not zero the node. Enforce only when the accepted fault was a port
+    fault; a keys-only accept does not let a later port fault zero the node. A renter who deletes
+    ``authorized_keys`` (that fault alone, host ``boot_id`` unchanged) is not enforced, whether that
+    is the accepted report's fault or this cycle's after a port-fault accept: the provider cannot
+    restore the keys. A pod never seen healthy carries no streak (``consecutive_cycles`` 0), a Redis
+    outage yields no verdict at all, and the flag off leaves the check with DAH-2870's
+    record-and-report behaviour: none of those is enforced.
     """
     if not settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED or verdict.healthy:
         return False
@@ -227,18 +227,13 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
     accepted_faults = set(verdict.accepted_faults) or set(verdict.faults)
     if _PORT_FAULTS & accepted_faults:
         current_faults = set(verdict.faults)
-        # the boot rule applies to this cycle's faults too: keys alone and no reboot is the renter's doing
+        # The boot rule reads this cycle's faults too: keys alone and no reboot is the renter's doing.
         if FAULT_AUTHORIZED_KEYS_UNREADABLE in current_faults and not (_PORT_FAULTS & current_faults):
             return verdict.boot_id_changed is True
         return True
     if FAULT_AUTHORIZED_KEYS_UNREADABLE in accepted_faults:
         return verdict.boot_id_changed is True
     return False
-
-
-_PORT_FAULTS = frozenset(
-    {FAULT_TCP_REFUSED, FAULT_TCP_TIMEOUT, FAULT_SSH_BANNER_MISSING}
-)
 
 
 def _ok_key(pod_id: str) -> str:
@@ -787,9 +782,8 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     accepted the report: it failed at score 0 and is never rewritten to RENTED. It keeps reason,
     impact and pods and gains the gate's verdict under ``probe_suppressed_fleet``. The stored gate
     verdict stops enforcement from the next cycle on, so this is at most the first cycle of our
-    outage. A first-threshold
-    cycle the gate holds is not enforced (``is_enforced`` needs the accept), so it takes the RENTED
-    rewrite. Returns how many results were rewritten, for the caller's log line.
+    outage. A first-threshold cycle the gate holds is not enforced (``is_enforced`` needs the
+    accept), so it takes the RENTED rewrite. Returns how many results were rewritten, for the caller's log line.
     """
     if gate is None or not gate.suppressed_by:
         return 0

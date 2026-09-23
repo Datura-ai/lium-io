@@ -352,9 +352,8 @@ class TenantEnforcementCheck:
         and the portal know the code from lium-platform#429) with the enforced impact; its
         ``unreachable_pods`` name every pod at the notify threshold. The reset evidence is one pod's —
         the first enforced one; the log line names them all. The renter's report is the probe's and
-        was queued as usual. Like the
-        POD_NOT_RUNNING failure of this check, the result carries no ``ssh_pub_keys``: nothing the
-        check read off the pod travels with a failure.
+        was queued as usual. Like the POD_NOT_RUNNING failure of this check, the result carries no
+        ``ssh_pub_keys``: nothing the check read off the pod travels with a failure.
         """
         threshold = enforce_after_cycles()
         evidence_verdict = enforced[0]
