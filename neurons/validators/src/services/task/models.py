@@ -70,6 +70,8 @@ class JobResult(BaseModel):
     # G1 — NVIDIA CC GPU attestation outcome (None = not performed)
     gpu_attestation_passed: bool | None = None
     executor_image_report: dict[str, Any] | None = None
+    # DAH-2977: PrePullCachedCheck's measurement this cycle (None = not measured)
+    pre_pull_images: dict[str, Any] | None = None
 
     inspector_outcome: str = "SKIPPED"
 
@@ -89,6 +91,7 @@ class JobResult(BaseModel):
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
     driver_multiplier: float | None = None              # Multiplier for the minimum NVIDIA driver requirement
+    pre_pull_multiplier: float = 1.0                    # DAH-2977: pre-pull requirement on the unrented share
     uptime_multiplier: float | None = None              # Multiplier for uptime
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
@@ -199,6 +202,7 @@ class JobResult(BaseModel):
                 "unrented_cap_multiplier": self.unrented_cap_multiplier,
                 "sysbox_multiplier": self.sysbox_multiplier,
                 "driver_multiplier": self.driver_multiplier,
+                "pre_pull_multiplier": self.pre_pull_multiplier,
                 "effective_rate": self.effective_rate,
                 "total_rental_cost": self.total_rental_cost,
                 "count_bucket": self.count_bucket,

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from incentive.config import IncentiveConfig
     from services.redis_service import RedisService
 from incentive.utils import get_hourly_rate
-from incentive.default import DefaultIncentive, get_min_driver_multiplier
+from incentive.default import DefaultIncentive, get_min_driver_multiplier, get_pre_pull_multiplier
 from incentive.price_provider import PriceProvider
 from services.const import (
     DEFAULT_JOB_OWNER_MINER,
@@ -735,6 +735,9 @@ class RentalPriceIncentive(DefaultIncentive):
             # Minimum NVIDIA driver penalty: applied later via effective_rate
             result.driver_multiplier = get_min_driver_multiplier(result.nvidia_driver_version)
 
+            # DAH-2977 pre-pull requirement: 1.0 unless PRE_PULL_REQUIRED_CUTOFF is set and past
+            result.pre_pull_multiplier = get_pre_pull_multiplier(result.pre_pull_images)
+
             cap_spec = self.config.max_unrented_gpus.get(base_model, {})
             bucket = self._resolve_bucket(result, cap_spec)
             max_cap = cap_spec.get(bucket, 0)
@@ -753,6 +756,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     * result.hourly_rate
                     * result.sysbox_multiplier
                     * result.driver_multiplier
+                    * result.pre_pull_multiplier
                 )
 
                 # DAH-2528: a split-capable node pinned to its gpu_count bucket may
@@ -809,6 +813,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 * result.hourly_rate
                 * result.sysbox_multiplier
                 * result.driver_multiplier
+                * result.pre_pull_multiplier
             )
             self.unrented_count_by_bucket[src_key] = src_count - result.gpu_count
             self._weighted_rate_sum_by_bucket[src_key] -= weighted_rate
@@ -908,6 +913,7 @@ class RentalPriceIncentive(DefaultIncentive):
             * result.unrented_cap_multiplier
             * result.sysbox_multiplier
             * result.driver_multiplier
+            * result.pre_pull_multiplier
         )
         self._set_cycle_formula_context(result)
 

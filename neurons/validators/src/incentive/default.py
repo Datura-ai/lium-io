@@ -65,6 +65,38 @@ def get_min_driver_multiplier(
     return 0.0
 
 
+def get_pre_pull_multiplier(
+    pre_pull_images: dict | None,
+    is_rented: bool = False,
+    reference_time: datetime | None = None,
+) -> float:
+    """Pre-pull requirement multiplier on the unrented share (DAH-2977).
+
+    ``1 - PORTION_FOR_PRE_PULL_UNRENTED * missing_past_grace / expected``, where ``pre_pull_images``
+    is what ``PrePullCachedCheck`` measured this cycle. 1.0 whenever the requirement cannot apply:
+    no ``PRE_PULL_REQUIRED_CUTOFF`` (the default), before it, a rented node, nothing measured,
+    nothing served, or every missing image still inside its grace window.
+    """
+    cutoff = settings.PRE_PULL_REQUIRED_CUTOFF
+    if cutoff is None or is_rented or not pre_pull_images:
+        return 1.0
+    now = reference_time or datetime.now(UTC)
+    if now.tzinfo is not None:
+        now = now.astimezone(UTC).replace(tzinfo=None)
+    if cutoff.tzinfo is not None:
+        cutoff = cutoff.astimezone(UTC).replace(tzinfo=None)
+    if now < cutoff:
+        return 1.0
+    try:
+        expected = int(pre_pull_images.get("expected") or 0)
+        missing = len(pre_pull_images.get("missing_past_grace") or [])
+    except (TypeError, ValueError):
+        return 1.0
+    if expected <= 0 or missing <= 0:
+        return 1.0
+    return max(0.0, 1.0 - settings.PORTION_FOR_PRE_PULL_UNRENTED * min(missing, expected) / expected)
+
+
 class DefaultIncentive(BaseIncentive):
     """Default incentive algorithm.
 

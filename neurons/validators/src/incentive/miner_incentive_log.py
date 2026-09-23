@@ -500,6 +500,8 @@ class MinerLogLine(BaseModel):
                 "provider_discord_connected": result.provider_discord_connected,
                 "nvidia_driver_version": result.nvidia_driver_version,
                 "driver_multiplier": result.driver_multiplier,
+                "pre_pull_multiplier": result.pre_pull_multiplier,
+                "pre_pull_images": result.pre_pull_images,
                 "unrented_cap_multiplier": result.unrented_cap_multiplier,
                 "effective_rate": result.effective_rate,
                 "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,

@@ -231,6 +231,7 @@ class ResultHandler:
             tdx_attestation_passed=context.tdx_attestation_passed,
             gpu_attestation_passed=context.gpu_attestation_passed,
             executor_image_report=executor_image_report,
+            pre_pull_images=context.state.pre_pull_images,
             inspector_outcome=inspector_outcome,
         )
 

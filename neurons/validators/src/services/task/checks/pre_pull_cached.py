@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+import time
 from dataclasses import replace
 
 from core.config import settings
@@ -10,6 +11,9 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
 _DOCKER = "/usr/bin/docker"
+# A first-missing record outlives the grace by this much, so a node checked a few cycles apart
+# keeps its clock; one that stops being checked (rented, gone) is forgotten a day after.
+_MISSING_TTL_SLACK_SECONDS = 24 * 3600
 
 
 class PrePullCachedCheck:
@@ -22,10 +26,12 @@ class PrePullCachedCheck:
     ``docker image inspect <repo>@<digest>`` for every pre-pull entry: exit 0 means the node
     holds exactly the content a rental of that template would otherwise pull.
 
-    Advisory: always ``passed=True``, never fatal, never changes score. The count and the
-    missing refs go into ``executor.specs["pre_pull_images"]`` through pipeline state, so the
-    fleet's coverage per node and per template is readable from the backend and Loki. The
-    node's default image stays with ``CachedTemplateVerificationCheck``.
+    Always ``passed=True`` and never fatal. The count, the missing refs and the refs missing
+    past their grace window go into ``executor.specs["pre_pull_images"]`` through pipeline state,
+    so the fleet's coverage per node and per template is readable from the backend and Loki.
+    Score reads ``missing_past_grace`` in ``incentive.default.get_pre_pull_multiplier``, which is
+    1.0 unless ``PRE_PULL_REQUIRED_CUTOFF`` is set and past. The node's default image stays with
+    ``CachedTemplateVerificationCheck``.
 
     Fails open on every uncertainty (flag off, unknown GPU/driver, backend unreachable, no
     pre-pull entries, SSH error, unparseable output): a skip event, nothing published.
@@ -39,6 +45,31 @@ class PrePullCachedCheck:
             Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what={"reason": reason, **what}
         )
         return CheckResult(passed=True, event=event)
+
+    async def _missing_past_grace(self, ctx: Context, entries: list, statuses: list[str]) -> list[str]:
+        """Missing refs whose grace window is over. The window starts per node and per
+        ``repo@digest`` at the first cycle that sees it missing, and ends when the node holds it.
+        Any Redis error fails open to an empty list: no image counts against the node."""
+        redis = ctx.services.redis
+        if redis is None:
+            return []
+        grace = settings.PRE_PULL_REQUIRED_GRACE_SECONDS
+        now = time.time()
+        past: list[str] = []
+        try:
+            for image, status in zip(entries, statuses):
+                pinned_ref = f"{image.docker_image}@{image.docker_image_digest}"
+                if status == "0":
+                    await redis.clear_pre_pull_missing(ctx.executor.uuid, pinned_ref)
+                    continue
+                since = await redis.pre_pull_missing_since(
+                    ctx.executor.uuid, pinned_ref, now, ttl_seconds=grace + _MISSING_TTL_SLACK_SECONDS
+                )
+                if now - since >= grace:
+                    past.append(image.image_ref)
+        except Exception:
+            return []
+        return past
 
     async def run(self, ctx: Context) -> CheckResult:
         if not settings.PRE_PULL_CACHED_CHECK_ENABLED:
@@ -94,7 +125,12 @@ class PrePullCachedCheck:
 
         cached = [image.image_ref for image, status in zip(entries, statuses) if status == "0"]
         missing = [image.image_ref for image, status in zip(entries, statuses) if status != "0"]
-        report = {"expected": len(entries), "cached": len(cached), "missing": missing}
+        report = {
+            "expected": len(entries),
+            "cached": len(cached),
+            "missing": missing,
+            "missing_past_grace": await self._missing_past_grace(ctx, entries, statuses),
+        }
 
         event = render_message(
             Msg.MISSING if missing else Msg.ALL_CACHED,

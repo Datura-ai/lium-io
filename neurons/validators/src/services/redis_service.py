@@ -45,6 +45,7 @@ CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 # DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
+PRE_PULL_MISSING_PREFIX = "pre_pull_missing"
 # One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
 # ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
 FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
@@ -284,6 +285,29 @@ class RedisService:
     async def clear_dind_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
         """Forget the recorded miss: the probe reached its container again."""
         await self.delete(self._dind_probe_miss_key(miner_hotkey, executor_id))
+
+    @staticmethod
+    def _pre_pull_missing_key(executor_id: str, pinned_ref: str) -> str:
+        return f"{PRE_PULL_MISSING_PREFIX}:{executor_id}:{pinned_ref}"
+
+    async def pre_pull_missing_since(
+        self, executor_id: str, pinned_ref: str, now: float, ttl_seconds: int
+    ) -> float:
+        """When this node was first seen without ``pinned_ref`` (repo@digest), recording ``now`` if
+        this is the first sighting. SET NX keeps the earliest sighting; every call renews the TTL."""
+        key = self._pre_pull_missing_key(executor_id, pinned_ref)
+        async with self.lock:
+            await self.redis.set(key, str(now), ex=ttl_seconds, nx=True)
+            await self.redis.expire(key, ttl_seconds)
+            value = await self.redis.get(key)
+        try:
+            return float(value.decode() if isinstance(value, bytes) else value)
+        except (TypeError, ValueError):
+            return now
+
+    async def clear_pre_pull_missing(self, executor_id: str, pinned_ref: str) -> None:
+        """The node holds ``pinned_ref`` again: the next miss starts a fresh grace window."""
+        await self.delete(self._pre_pull_missing_key(executor_id, pinned_ref))
 
     async def set(self, key: str, value: str, ex: int | None = None):
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""

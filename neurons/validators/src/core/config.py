@@ -161,6 +161,18 @@ class Settings(BaseSettings):
     # DAH-2977: advisory probe of the backend's pre-pull images on idle executors; publishes
     # executor.specs["pre_pull_images"], never changes score. Off = the check only records a skip.
     PRE_PULL_CACHED_CHECK_ENABLED: bool = Field(env="PRE_PULL_CACHED_CHECK_ENABLED", default=True)
+    # DAH-2977 requirement: on/after this instant an unrented node's idle share is scaled by
+    # 1 - PORTION_FOR_PRE_PULL_UNRENTED * (pre-pull images missing past the grace / images served).
+    # None (the default) keeps the multiplier at 1.0 for everyone. The grace clock starts per node
+    # and per image@digest the first cycle the image is seen missing, so a new node, a new list
+    # entry and a rebuilt image each get the full window.
+    PRE_PULL_REQUIRED_CUTOFF: datetime | None = Field(env="PRE_PULL_REQUIRED_CUTOFF", default=None)
+    PRE_PULL_REQUIRED_GRACE_SECONDS: int = Field(
+        env="PRE_PULL_REQUIRED_GRACE_SECONDS", default=6 * 3600, gt=0
+    )
+    PORTION_FOR_PRE_PULL_UNRENTED: float = Field(
+        env="PORTION_FOR_PRE_PULL_UNRENTED", default=0.1, ge=0.0, le=1.0
+    )
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that

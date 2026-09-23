@@ -90,7 +90,12 @@ async def test_all_cached(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.ALL_CACHED.reason
-    assert result.updates["state"].pre_pull_images == {"expected": 2, "cached": 2, "missing": []}
+    assert result.updates["state"].pre_pull_images == {
+        "expected": 2,
+        "cached": 2,
+        "missing": [],
+        "missing_past_grace": [],
+    }
     backend.get_default_docker_image.assert_awaited_once_with(_GPU, _DRIVER, include_pre_pull=True)
     # One round trip; each probe is pinned to the digest the executor pulls, never the tag,
     # and the default image (no pre_pull) is not probed here.
@@ -115,6 +120,8 @@ async def test_one_missing_is_advisory(context_factory):
         "expected": 2,
         "cached": 1,
         "missing": [_CU128.image_ref],
+        # no Redis in these tests: the grace clock fails open, nothing counts against the node
+        "missing_past_grace": [],
     }
     assert result.event.what_we_saw["cached_refs"] == [_CUDA.image_ref]
 
