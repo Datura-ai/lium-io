@@ -230,6 +230,40 @@ async def test_other_nvml_failure_gets_the_generic_hook_code(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_load_library_hook_error_gets_the_hook_code_not_sysbox_missing(context_factory):
+    stderr = (
+        "docker: Error response from daemon: OCI runtime create failed: error running prestart hook #0: exit status 1, "
+        "stdout: , stderr: nvidia-container-cli: initialization error: load library failed: "
+        "libnvidia-ml.so.1: cannot open shared object file: no such file or directory: unknown"
+    )
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=_cause(stderr)))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.event.reason_code == "NVIDIA_CONTAINER_HOOK_FAILED"
+    assert "load library failed" in result.event.remediation
+    assert "Install the sysbox runtime" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_sysbox_mount_error_keeps_sysbox_required_missing(context_factory):
+    """sysbox's shiftfs fallback breaks the hook's mount step: that is a sysbox problem."""
+    stderr = (
+        "docker: Error response from daemon: OCI runtime create failed: error running hook #0: exit status 1, "
+        "stdout: , stderr: nvidia-container-cli: mount error: file lookup failed: "
+        "/var/lib/sysbox/shiftfs/0a1b2c3d/merged/proc/driver/nvidia: no such file or directory"
+    )
+    cause = diagnose_docker_run_error(stderr)
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert cause is None
+    assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
+    assert result.event.remediation == Msg.SYSBOX_MISSING.remediation
+
+
+@pytest.mark.asyncio
 async def test_nvidia_hook_refusal_on_a_rented_executor_still_passes(context_factory):
     """Live rentals are never disrupted, whatever the probe's cause."""
     ctx = context_factory(

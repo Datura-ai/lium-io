@@ -62,11 +62,12 @@ DIND_SSHD_NOT_READY_MESSAGE = (
 DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
 
 
-# DAH-3634: `docker run` itself refused. A hook `mount error` is sysbox's shiftfs fallback
-# (nvidia_docker_sysbox_setup.sh --check) and stays unclassified. Match only
-# `initialization error:` and `detection error:` so other hook lines (and `mount error`)
-# keep SYSBOX_REQUIRED_MISSING. `NVIDIA_RUNTIME_MISMATCH` is the executor updater's name
+# DAH-3634: `docker run` itself refused by the NVIDIA container hook. Every hook line counts
+# except `mount error`: that is sysbox's shiftfs fallback (nvidia_docker_sysbox_setup.sh --check)
+# and keeps SYSBOX_REQUIRED_MISSING. `NVIDIA_RUNTIME_MISMATCH` is the executor updater's name
 # for the same host condition (DAH-3481).
+_HOOK_LINE_START = "nvidia-container-cli:"
+_SYSBOX_HOOK_ERROR = "nvidia-container-cli: mount error:"
 DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
     (
         "nvml error: driver/library version mismatch",
@@ -77,41 +78,35 @@ DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
         ),
     ),
     (
-        "initialization error:",
+        _HOOK_LINE_START,
         DindLogCause(
             "NVIDIA_CONTAINER_HOOK_FAILED",
-            "the NVIDIA container hook cannot start a GPU container: NVML failed on the host",
-        ),
-    ),
-    (
-        "detection error:",
-        DindLogCause(
-            "NVIDIA_CONTAINER_HOOK_FAILED",
-            "the NVIDIA container hook cannot start a GPU container: NVML failed on the host",
+            "the NVIDIA container hook cannot start a GPU container on the host",
         ),
     ),
 )
 DOCKER_RUN_ERROR_LINE_MAX_CHARS = 400
-_HOOK_LINE_START = "nvidia-container-cli:"
 
 
 def diagnose_docker_run_error(stderr: str | None) -> DindLogCause | None:
-    """Name the cause when `docker run` of the DinD container was refused for an NVML reason the
-    provider can act on; None for anything else (a bound host port, a name conflict, a sysbox
-    mount error).
+    """Name the cause when the NVIDIA container hook refused `docker run` of the DinD container;
+    None for anything else (a bound host port, a name conflict, a sysbox mount error).
 
     The message quotes the hook's own line (from `nvidia-container-cli:` on, capped), so the
     provider sees the hook's error in the event and not only the validator's reading of it.
     """
-    text = stderr or ""
+    hook_lines = [
+        line[line.find(_HOOK_LINE_START) :].strip()
+        for line in (stderr or "").splitlines()
+        if _HOOK_LINE_START in line and _SYSBOX_HOOK_ERROR not in line
+    ]
     for pattern, cause in DOCKER_RUN_CAUSES:
-        if pattern in text:
-            line = next((ln for ln in text.splitlines() if pattern in ln), "")
-            start = line.find(_HOOK_LINE_START)
-            line = line[start if start >= 0 else 0 :].strip()[:DOCKER_RUN_ERROR_LINE_MAX_CHARS]
-            if line:
-                return DindLogCause(cause.code, f"{cause.message}. docker said: {line}")
-            return cause
+        line = next((ln for ln in hook_lines if pattern in ln), None)
+        if line is not None:
+            return DindLogCause(
+                cause.code,
+                f"{cause.message}. docker said: {line[:DOCKER_RUN_ERROR_LINE_MAX_CHARS]}",
+            )
     return None
 
 

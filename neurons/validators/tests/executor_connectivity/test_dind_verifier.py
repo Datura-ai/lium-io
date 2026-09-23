@@ -615,6 +615,34 @@ def test_diagnose_docker_run_error_generic_nvml_failure_and_none_for_the_rest():
     assert load_cause is not None and load_cause.code == "NVIDIA_CONTAINER_HOOK_FAILED"
 
 
+@pytest.mark.parametrize(
+    "hook_line",
+    [
+        "nvidia-container-cli: initialization error: load library failed: libnvidia-ml.so.1: "
+        "cannot open shared object file: no such file or directory: unknown",
+        "nvidia-container-cli: initialization error: nvml error: driver not loaded: unknown",
+        "nvidia-container-cli: initialization error: driver error: failed to process request",
+        "nvidia-container-cli: device error: GPU-d2d12cfb-eb9e-03f0-b007-785d32aed1b2: unknown device",
+        "nvidia-container-cli: container error: cgroup subsystem devices not found: unknown",
+    ],
+)
+def test_diagnose_docker_run_error_names_every_nvidia_hook_error(hook_line: str):
+    stderr = (
+        "docker: Error response from daemon: OCI runtime create failed: error running prestart hook #0: "
+        f"exit status 1, stdout: , stderr: Auto-detected mode as 'legacy'\n{hook_line}\n\n"
+        "Run 'docker run --help' for more information"
+    )
+
+    cause = diagnose_docker_run_error(stderr)
+
+    assert cause is not None and cause.code == "NVIDIA_CONTAINER_HOOK_FAILED"
+    assert cause.message.endswith(f"docker said: {hook_line}")
+
+
+def test_diagnose_docker_run_error_leaves_sysbox_mount_error_to_the_sysbox_advice():
+    assert diagnose_docker_run_error(SYSBOX_SHIFTFS_MOUNT_STDERR) is None
+
+
 def test_diagnose_docker_run_error_quotes_from_the_hook_and_caps_head_first():
     # a daemon prefix longer than the cap on the same line must not push the hook's words out
     stderr = "docker: " + "p" * 1000 + " stderr: nvidia-container-cli: detection error: nvml error: " + "x" * 2000
