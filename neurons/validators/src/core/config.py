@@ -390,7 +390,7 @@ class Settings(BaseSettings):
     # verdict. Two failed pulls in a row (timeout, DNS error, manifest unknown) are the finding: logged as
     # REGISTRY_PULL_FAILED_OBSERVED, or with ENFORCEMENT a fail (REGISTRY_PULL_FAILED, score 0).
     # Enforcement is off by default: it goes on after a 48 h log-only window with the OBSERVED rows
-    # reviewed. Decider: taiberium; backup pixel29913 from 28 Sep 2026.
+    # reviewed. Decider: taiberium; backup jam6099 (Muhammad) from 28 Sep 2026.
     REGISTRY_PULL_CHECK_ENABLED: bool = Field(env="REGISTRY_PULL_CHECK_ENABLED", default=True)
     REGISTRY_PULL_ENFORCEMENT_ENABLED: bool = Field(env="REGISTRY_PULL_ENFORCEMENT_ENABLED", default=False)
     REGISTRY_PULL_PROBE_INTERVAL_HOURS: float = Field(
