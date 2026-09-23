@@ -1,9 +1,8 @@
-"""NO_OUTBOUND_INTERNET: a node whose renter pods cannot reach the internet fails validation.
+"""NO_OUTBOUND_INTERNET: an idle node whose scrape ran its speed tests and measured neither direction fails.
 
-ticket-0361: provider 5GUBuA7k's Tokyo 8x RTX 5090 nodes shipped pods with no outbound internet (4 of the
-provider's 13 rent_failed in 24 h on one node) while every check passed: the speed rule is behind
-FeatureFlag.VERIFYX_NETWORK_VALIDATION (off), a scrape whose every speed test failed only recorded the error,
-and the scrape measures from the executor container, not from the rental network a pod runs on.
+ticket-0361: a scrape whose every speed test failed only recorded the error while every check passed (the speed
+rule is behind FeatureFlag.VERIFYX_NETWORK_VALIDATION, off). The registry path that actually broke 14e704ba's
+rents is RegistryPullCheck's (test_registry_pull_check.py); EGRESS_PROBE_SCRIPT is the rental probe's egress step.
 """
 
 from __future__ import annotations
@@ -12,32 +11,24 @@ import os
 import shutil
 import subprocess
 from contextlib import contextmanager
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
-from services.docker_service import DockerService
-from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 from services.task.checks import outbound_internet as module
 from services.task.checks.outbound_internet import (
     EGRESS_PROBE_SCRIPT,
     OutboundInternetCheck,
     parse_egress_probe,
-    pod_probe_command,
     scrape_egress_finding,
 )
 from services.task.messages import OutboundInternetMessages as Msg
 from services.task.pipeline_factory import PipelineFactory
-from services.task.runner import SSHCommandResult
 from tests.helpers import build_state, default_executor, make_context
 
 EXECUTOR = default_executor()
-POD_OK = "lium_egress dns=ok\nlium_egress tool=wget http=200\n"
-POD_DNS_FAIL = "lium_egress dns=fail\n"
-POD_NO_ANSWER = "lium_egress dns=ok\nlium_egress tool=wget http=000\nwget: can't connect to remote host: Timed out\n"
 
 
 def network(download, upload=None, **measurements) -> dict:
@@ -70,33 +61,13 @@ CURL_FAILED = network(
 )
 
 
-def result(
-    stdout: str = "", *, exit_code: int = 0, error_type: str | None = None
-) -> SSHCommandResult:
-    now = datetime.now(UTC)
-    return SSHCommandResult(
-        command="",
-        command_id="c",
-        exit_code=exit_code,
-        stdout=stdout,
-        stderr="",
-        duration_ms=10,
-        started_at=now,
-        finished_at=now,
-        success=exit_code == 0 and error_type is None,
-        error_type=error_type,
-        error_message="timed out" if error_type else None,
-    )
-
-
 class FakeRunner:
-    def __init__(self, *answers: SSHCommandResult):
-        self.answers = list(answers)
+    def __init__(self):
         self.commands: list[str] = []
 
     async def run(self, cmd, *, timeout=60, check=False, retryable=True, stdin_text=None):
         self.commands.append(cmd)
-        return self.answers.pop(0) if self.answers else result()
+        raise AssertionError(f"OutboundInternetCheck ran a command on the executor: {cmd}")
 
 
 def rented() -> RentedExecutorsResponse:
@@ -112,22 +83,10 @@ def rented() -> RentedExecutorsResponse:
     )
 
 
-def make_ctx(
-    net: dict | None = HEALTHY,
-    *,
-    pod: SSHCommandResult | None = None,
-    pod_rerun: SSHCommandResult | None = None,
-    sysbox=False,
-    rented_data=None,
-):
-    """`pod` answers the pod probe; a re-run (after a no_egress reading) gets `pod_rerun`, or `pod` again."""
-    pod = pod if pod is not None else result(POD_OK)
-    runner = FakeRunner(pod, pod_rerun if pod_rerun is not None else pod)
+def make_ctx(net: dict | None = HEALTHY, *, rented_data=None):
+    runner = FakeRunner()
     specs = {"network": net} if net is not None else {}
-    ctx = make_context(
-        state=build_state(specs=specs, sysbox_runtime=sysbox, rented_data=rented_data),
-        runner=runner,
-    )
+    ctx = make_context(state=build_state(specs=specs, rented_data=rented_data), runner=runner)
     return ctx, runner
 
 
@@ -150,7 +109,9 @@ def test_defaults_log_only():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("download,upload", [(None, None), (0, 0), (0.0, None), (None, 0.0)])
-async def test_a_scrape_that_measured_neither_direction_fails_with_no_outbound_internet(download, upload):
+async def test_a_scrape_that_measured_neither_direction_fails_with_no_outbound_internet(
+    download, upload
+):
     """Regression: a scrape with neither a download nor an upload measured (None) or a zero passes."""
     ctx, _ = make_ctx(network(download, upload))
     with flags():
@@ -177,37 +138,16 @@ async def test_every_speed_test_erroring_fails_and_carries_the_errors():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("download", [None, 0.0])
-async def test_a_null_download_with_a_working_upload_and_a_passing_pod_probe_passes(download):
+async def test_a_null_download_with_a_working_upload_passes(download):
     """Regression: 24 of one provider's 27 active nodes had no download (a Cloudflare download recorded as
     0) and fail NO_OUTBOUND_INTERNET for it once enforcement is on, although their pods reach out."""
-    ctx, _ = make_ctx(network(download, 90.0, cloudflare={"download_speed": None, "upload_speed": 90.0}))
+    ctx, _ = make_ctx(
+        network(download, 90.0, cloudflare={"download_speed": None, "upload_speed": 90.0})
+    )
     with flags():
         res = await OutboundInternetCheck().run(ctx)
     assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_OK.reason
     assert res.event.what_we_saw["scrape"]["no_egress"] is False
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "enforced,passed,reason",
-    [
-        (True, False, Msg.NO_OUTBOUND_INTERNET.reason),
-        (False, True, Msg.NO_OUTBOUND_INTERNET_OBSERVED.reason),
-    ],
-)
-async def test_14e704ba_null_download_working_upload_and_a_pod_network_without_egress(
-    enforced, passed, reason
-):
-    """Regression: 14e704ba (no download, upload 77-105 Mbps, 3 renters' pods without internet) is a
-    pod-network-only fault; the scrape measured an upload, so only the in-pod probe can fail it."""
-    net = network(None, 90.0, cloudflare={"download_speed": None, "upload_speed": 90.0})
-    ctx, runner = make_ctx(net, pod=result(POD_NO_ANSWER))
-    with flags(enforced=enforced):
-        res = await OutboundInternetCheck().run(ctx)
-    assert res.passed is passed and res.event.reason_code == reason
-    assert res.event.what_we_saw["failed_by"] == ["pod_probe"]
-    assert res.event.what_we_saw["scrape"]["no_egress"] is False
-    assert len(runner.commands) == 2
 
 
 @pytest.mark.asyncio
@@ -230,59 +170,6 @@ async def test_an_error_from_a_method_a_fallback_measured_past_is_not_a_finding(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "pod_stdout,reason", [(POD_DNS_FAIL, "dns_failed"), (POD_NO_ANSWER, "no_http_response")]
-)
-async def test_a_pod_network_that_cannot_resolve_or_reach_out_fails_although_the_scrape_measured(
-    pod_stdout, reason
-):
-    """Regression: the scrape measures from the executor container, so a host whose rental bridge drops
-    FORWARD traffic or whose pod DNS is broken reports 800 Mbps and still ships pods without internet."""
-    ctx, runner = make_ctx(HEALTHY, pod=result(pod_stdout))
-    with flags():
-        res = await OutboundInternetCheck().run(ctx)
-    assert res.passed is False and res.event.reason_code == Msg.NO_OUTBOUND_INTERNET.reason
-    assert res.event.what_we_saw["failed_by"] == ["pod_probe"]
-    assert res.event.what_we_saw["pod_probe"]["reason"] == reason
-    assert res.event.what_we_saw["pod_probe"]["first_reading"]["reason"] == reason
-    assert len(runner.commands) == 2
-
-
-@pytest.mark.asyncio
-async def test_one_transient_pod_probe_miss_is_re_run_and_the_re_run_decides():
-    """Regression (self-review): once enforcement is on, a single DNS or HTTP miss zeroes an idle node for
-    the cycle; there is no second reading."""
-    ctx, runner = make_ctx(HEALTHY, pod=result(POD_NO_ANSWER), pod_rerun=result(POD_OK))
-    with flags():
-        res = await OutboundInternetCheck().run(ctx)
-    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_OK.reason
-    pod_probe = res.event.what_we_saw["pod_probe"]
-    assert pod_probe["verdict"] == "ok"
-    assert pod_probe["first_reading"]["reason"] == "no_http_response"
-    names = [command.split("--name ")[1].split()[0] for command in runner.commands]
-    assert len(names) == 2 and names[0] != names[1]
-
-
-@pytest.mark.asyncio
-async def test_a_re_run_that_reaches_no_verdict_does_not_confirm_the_miss():
-    ctx, _ = make_ctx(HEALTHY, pod=result(POD_DNS_FAIL), pod_rerun=result("", exit_code=125))
-    with flags():
-        res = await OutboundInternetCheck().run(ctx)
-    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_UNMEASURED.reason
-    assert res.event.what_we_saw["pod_probe"]["first_reading"]["reason"] == "dns_failed"
-
-
-@pytest.mark.asyncio
-async def test_a_healthy_node_starts_one_probe_container():
-    """Regression: the re-run fires on every reading, doubling the containers started on every idle node."""
-    ctx, runner = make_ctx(HEALTHY)
-    with flags():
-        res = await OutboundInternetCheck().run(ctx)
-    assert res.passed and len(runner.commands) == 1
-    assert "first_reading" not in res.event.what_we_saw["pod_probe"]
-
-
-@pytest.mark.asyncio
 async def test_a_slow_but_working_host_passes():
     """Regression: this check re-imposes a speed floor (VERIFYX_NETWORK_VALIDATION's rule, which is off)."""
     ctx, _ = make_ctx(network(3.2, 1.1, cloudflare={"download_speed": 3.2, "upload_speed": 1.1}))
@@ -292,12 +179,9 @@ async def test_a_slow_but_working_host_passes():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "net,pod", [(network(None), result(POD_OK)), (HEALTHY, result(POD_DNS_FAIL))]
-)
-async def test_enforcement_off_only_logs(net, pod):
+async def test_enforcement_off_only_logs():
     """Regression: the finding fails the node while NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off."""
-    ctx, _ = make_ctx(net, pod=pod)
+    ctx, _ = make_ctx(network(None))
     with flags(enforced=False):
         res = await OutboundInternetCheck().run(ctx)
     assert res.passed is True
@@ -307,34 +191,8 @@ async def test_enforcement_off_only_logs(net, pod):
 
 
 @pytest.mark.asyncio
-async def test_a_pod_probe_that_did_not_run_is_no_verdict():
-    """Regression: docker refusing the probe container (exit 125, image pull blocked) fails the node, or
-    (self-review) is logged as OUTBOUND_INTERNET_OK, so the enforcement flip's counts include nodes the pod
-    probe never measured."""
-    ctx, _ = make_ctx(HEALTHY, pod=result("", exit_code=125))
-    with flags():
-        res = await OutboundInternetCheck().run(ctx)
-    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_UNMEASURED.reason
-    assert res.event.reason_code != Msg.OUTBOUND_INTERNET_OK.reason
-    assert res.event.what_we_saw["pod_probe"]["verdict"] == "unmeasured"
-    assert res.event.what_we_saw["pod_probe"]["reason"] == "docker_run_failed"
-
-
-@pytest.mark.asyncio
-async def test_a_timed_out_pod_probe_removes_its_container_and_is_no_verdict():
-    """Regression: an SSH timeout leaves the probe container running on the host."""
-    ctx, runner = make_ctx(HEALTHY, pod=result(error_type="timeout", exit_code=-1))
-    with flags():
-        res = await OutboundInternetCheck().run(ctx)
-    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_UNMEASURED.reason
-    assert res.event.what_we_saw["pod_probe"]["reason"] == "command_failed"
-    name = runner.commands[0].split("--name ")[1].split()[0]
-    assert runner.commands[1].startswith(f"/usr/bin/docker rm -f {name}")
-
-
-@pytest.mark.asyncio
 async def test_a_rented_node_is_left_alone():
-    """Regression: a container starts next to a renter's pod, or a rented node is failed for its scrape."""
+    """Regression: a rented node is failed for its scrape."""
     ctx, runner = make_ctx(network(None), rented_data=rented())
     with flags():
         res = await OutboundInternetCheck().run(ctx)
@@ -352,77 +210,6 @@ async def test_check_off_starts_nothing():
     assert runner.commands == []
 
 
-@pytest.mark.asyncio
-async def test_dry_run_reads_the_scrape_without_a_container():
-    ctx, runner = make_ctx(network(None))
-    with flags():
-        res = await OutboundInternetCheck(run_pod_probe=False).run(ctx)
-    assert res.passed is False and res.event.what_we_saw["pod_probe"] is None
-    assert runner.commands == []
-
-
-@pytest.mark.asyncio
-async def test_dry_run_passes_a_null_download_with_a_working_upload():
-    ctx, _ = make_ctx(network(None, 90.0))
-    with flags():
-        res = await OutboundInternetCheck(run_pod_probe=False).run(ctx)
-    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_OK.reason
-
-
-def _rental_run_spec(*, is_sysbox: bool):
-    payload = SimpleNamespace(
-        is_sysbox=is_sysbox,
-        cluster_membership=None,
-        docker_image="daturaai/pytorch:2.7.0",
-        memory_gb=None,
-        workload_kind=None,
-        cache_volumes=[],
-    )
-    custom_options = SimpleNamespace(
-        environment={}, startup_commands=None, shm_size=None, entrypoint=None
-    )
-    gpu_devices = SimpleNamespace(device_mounts=[], device_requests=())
-    with patch("services.docker_service._build_cache_volume_mounts", return_value=[]):
-        return DockerService._build_rental_container_run_spec(
-            DockerService.__new__(DockerService),
-            payload=payload,
-            container_name="pod_x",
-            custom_options=custom_options,
-            port_maps=[],
-            local_volume="volume_x",
-            local_volume_path="/root",
-            encrypted_local_volume=False,
-            external_volume_name=None,
-            gpu_devices=gpu_devices,
-            effective_storage_limit_gb=None,
-            cpu_count=None,
-        )
-
-
-@pytest.mark.parametrize("sysbox", [False, True])
-def test_pod_probe_container_is_networked_like_a_rental_pod(sysbox):
-    """Regression: the probe runs on docker0 or the host network (where the scrape already measures), or with
-    a DNS override the rental path does not set, so it cannot see the pod network's fault."""
-    spec = _rental_run_spec(is_sysbox=sysbox)
-    command = pod_probe_command("lium_egress_probe_abc", sysbox=sysbox)
-    assert spec.network == RENTAL_NETWORK_NAME
-    assert f"--network {spec.network} " in command
-    assert ("--runtime=sysbox-runc" in command) is (spec.runtime == "sysbox-runc")
-    assert "--dns" not in command and "--network=host" not in command
-    assert (
-        "docker network create --driver bridge -o com.docker.network.bridge.enable_icc=false"
-        in command
-    )
-
-
-@pytest.mark.asyncio
-async def test_the_check_sends_the_node_runtime_to_the_pod_probe():
-    ctx, runner = make_ctx(HEALTHY, sysbox=True)
-    with flags():
-        await OutboundInternetCheck().run(ctx)
-    assert "--runtime=sysbox-runc" in runner.commands[0]
-
-
 def test_scrape_without_a_network_block_is_no_reading():
     assert scrape_egress_finding({}) is None
     nan = network(float("nan"), cloudflare={"download_speed": float("nan")})
@@ -434,7 +221,11 @@ def test_scrape_without_a_network_block_is_no_reading():
 
 @pytest.mark.parametrize(
     "net",
-    [{}, {"download_speed": None, "upload_speed": None}, {"download_speed": None, "measurements": {}}],
+    [
+        {},
+        {"download_speed": None, "upload_speed": None},
+        {"download_speed": None, "measurements": {}},
+    ],
     ids=["empty_block", "no_measurements", "empty_measurements"],
 )
 def test_a_scrape_that_ran_no_speed_test_is_no_reading(net):
@@ -444,15 +235,13 @@ def test_a_scrape_that_ran_no_speed_test_is_no_reading(net):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pod,passed", [(POD_OK, True), (POD_NO_ANSWER, False)])
-async def test_without_speed_tests_the_pod_probe_alone_decides(pod, passed):
-    ctx, _ = make_ctx({}, pod=result(pod))
+async def test_a_scrape_without_speed_tests_is_logged_unmeasured_and_passes():
+    """Regression: lium-io#1419's `network: {}` fails every idle node, or is logged as verified."""
+    ctx, _ = make_ctx({})
     with flags():
         res = await OutboundInternetCheck().run(ctx)
-    assert res.passed is passed
+    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_UNMEASURED.reason
     assert res.event.what_we_saw["scrape"] is None
-    if not passed:
-        assert res.event.what_we_saw["failed_by"] == ["pod_probe"]
 
 
 def _stub(directory, name: str, body: str) -> None:
@@ -572,9 +361,5 @@ def test_pipeline_runs_the_check_after_the_port_checks_and_before_the_rented_hal
     index = ids.index(OutboundInternetCheck.check_id)
     assert ids[index - 1] == "executor.validate.port_count"
     assert index < ids.index("executor.validate.rented_state")
-    dry = [
-        c
-        for c in PipelineFactory.build_dry_run_checks()
-        if c.check_id == OutboundInternetCheck.check_id
-    ]
-    assert len(dry) == 1 and dry[0].run_pod_probe is False
+    dry = [c.check_id for c in PipelineFactory.build_dry_run_checks()]
+    assert OutboundInternetCheck.check_id in dry

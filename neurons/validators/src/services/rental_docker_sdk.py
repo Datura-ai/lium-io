@@ -551,15 +551,11 @@ class RentalDockerSdkClient:
         network = self._inspect_network_or_none(name)
         if network is None:
             try:
-                # the SDK sends CheckDuplicate null, and a daemon older than Engine 25 then creates a second
-                # network of the same name (every later `--network` is ambiguous); the docker CLI, which
-                # the outbound-internet probe creates it with, always sends true
                 self._api_client.create_network(
                     name,
                     driver="bridge",
                     options=dict(RENTAL_NETWORK_OPTIONS),
                     labels=dict(RENTAL_NETWORK_LABELS),
-                    check_duplicate=True,
                 )
             except Exception as exc:
                 network = self._inspect_network_or_none(name)

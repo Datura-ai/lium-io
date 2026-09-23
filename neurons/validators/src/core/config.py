@@ -370,20 +370,15 @@ class Settings(BaseSettings):
     RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
-    # A node whose renter pods cannot reach the internet (ticket-0361: 4 Tokyo 8x RTX 5090 nodes, 4 of one
-    # provider's 13 rent_failed in 24 h) passed every check: the speed rule is behind
+    # A node whose containers cannot reach the internet passed every check: the speed rule is behind
     # FeatureFlag.VERIFYX_NETWORK_VALIDATION (off) and a scrape whose every speed test failed only records
-    # the error. OutboundInternetCheck starts one `alpine` container on the rental network
-    # (`lium-rentals`, the renter's runtime) that resolves and fetches pypi.org; the rental probe runs
-    # the same check inside its renter container. That in-pod verdict is the reading: a pod-only fault
-    # (14e704ba: no download, upload 77-105 Mbps) only shows there. The scrape counts only when its speed
-    # tests ran and neither direction was measured; a null download alone is not a finding (24 of one
-    # provider's 27 nodes), and a scrape without speed tests (lium-io#1419) is no reading.
-    # Slow is not this check's business: any HTTP answer passes. CHECK runs it on idle nodes and logs
-    # the verdict (NO_OUTBOUND_INTERNET_OBSERVED); ENFORCEMENT fails the node with NO_OUTBOUND_INTERNET
-    # (score 0, like INSUFFICIENT_PORTS) and the rental probe's egress step with it. Enforcement is off
-    # by default: it goes on after a 48 h log-only window with the OBSERVED rows reviewed. Decider:
-    # taiberium; backup pixel29913 from 28 Sep 2026.
+    # the error. OutboundInternetCheck fails an idle node whose scrape ran its speed tests and measured
+    # neither direction (a null download alone is not a finding: 24 of one provider's 27 nodes; a scrape
+    # without speed tests, lium-io#1419, is no reading); the rental probe's `egress` step resolves and
+    # fetches pypi.org inside its renter container. Slow is not this check's business. CHECK logs the
+    # verdict (NO_OUTBOUND_INTERNET_OBSERVED); ENFORCEMENT fails the node with NO_OUTBOUND_INTERNET (score
+    # 0, like INSUFFICIENT_PORTS) and the rental probe's egress step with it. Off by default, same review
+    # and decider as before: on after a 48 h log-only window; taiberium, backup pixel29913 from 28 Sep 2026.
     NO_OUTBOUND_INTERNET_CHECK_ENABLED: bool = Field(env="NO_OUTBOUND_INTERNET_CHECK_ENABLED", default=True)
     NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED: bool = Field(
         env="NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED", default=False

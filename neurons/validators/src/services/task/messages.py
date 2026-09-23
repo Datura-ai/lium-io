@@ -1016,10 +1016,9 @@ class OutboundInternetMessages:
         category="runtime",
         impact="Proceed",
     )
-    # the scrape measured a download but the container on the rental network reached no verdict (image
-    # pull refused, no fetch tool, SSH timeout): neither verified nor a finding
+    # the scrape ran no speed test (lium-io#1419's `network: {}`): neither verified nor a finding
     OUTBOUND_INTERNET_UNMEASURED = MessageTemplate(
-        event="Outbound internet not measured from the rental network",
+        event="Outbound internet not measured: the scrape ran no speed test",
         reason="OUTBOUND_INTERNET_UNMEASURED",
         severity="info",
         category="runtime",

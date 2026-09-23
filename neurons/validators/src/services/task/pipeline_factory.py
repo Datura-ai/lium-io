@@ -331,9 +331,7 @@ class PipelineFactory:
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
-                # After the port checks: PortConnectivityCheck settles ctx.state.sysbox_runtime, the
-                # runtime the pod probe's container starts under. Before the rented short-circuit, which
-                # this check leaves alone itself (no container beside a renter's pod).
+                # Before the rented short-circuit, which this check leaves alone itself.
                 OutboundInternetCheck(),
                 # DAH-2313: require sysbox before an unrented executor is allowed on the network.
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
@@ -413,8 +411,7 @@ class PipelineFactory:
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),
                 PortCountCheck(),
-                # run_pod_probe=False: reads the scrape only; the pod probe starts a container.
-                OutboundInternetCheck(run_pod_probe=False),
+                OutboundInternetCheck(),
                 # DAH-2313: require sysbox before an unrented executor is allowed on the network.
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
