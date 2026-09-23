@@ -1,8 +1,9 @@
 """DAH-3630: a PEARL filler whose GPU power cap does not take.
 
-``apply_filler_gpu_power_limits`` is all-or-nothing and undoes its own partial work, so after a
-False the host is exactly as it was. The create then fails (flag off, as before) or starts the
-filler at the host's own power limit (``ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS``).
+``apply_filler_gpu_power_limits`` is all-or-nothing and undoes its own partial work; only a GPU
+whose undo restore failed stays capped, with its record. The create then fails (flag off, as
+before) or starts the filler (``ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS``) at the host's own power
+limit on the GPUs the undo restored.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from core.config import settings
 from payload_models.payloads import FailedContainerRequest, GpuPowerLimit, WorkloadKind
 from services import docker_service as ds_module
 from services.docker_service import DockerService
+from services.gpu_power_limit import GpuPowerRestoreReadResult, GpuPowerRestoreRecord
 from test_deploy_optimizations import (
     _payload as _deploy_payload,
     _run as _run_create_container,
@@ -30,7 +32,10 @@ def svc() -> DockerService:
 def _pearl_payload():
     return _deploy_payload(
         workload_kind=WorkloadKind.FILLER,
-        gpu_power_limits=[GpuPowerLimit(gpu_uuid="GPU-test", watts=300)],
+        gpu_power_limits=[
+            GpuPowerLimit(gpu_uuid="GPU-test", watts=300),
+            GpuPowerLimit(gpu_uuid="GPU-undo-failed", watts=300),
+        ],
     )
 
 
@@ -39,6 +44,17 @@ def _wire_failed_cap(svc: DockerService, monkeypatch: pytest.MonkeyPatch) -> Moc
     _wire(svc, monkeypatch, _deploy_ssh_client(), probe_result=_probe())
     monkeypatch.setattr(
         "services.docker_service.apply_filler_gpu_power_limits", AsyncMock(return_value=False)
+    )
+    left_capped = GpuPowerRestoreRecord(
+        gpu_uuid="GPU-undo-failed",
+        watts=350,
+        pod_id="pod-1",
+        executor_id="executor-1",
+        capped_at=0.0,
+    )
+    monkeypatch.setattr(
+        "services.docker_service.read_gpu_power_restore_records",
+        AsyncMock(return_value=GpuPowerRestoreReadResult(records=[left_capped], read_failed=False)),
     )
     mock_logger = Mock()
     monkeypatch.setattr(ds_module, "logger", mock_logger)
@@ -49,7 +65,8 @@ def _uncapped_start_warnings(mock_logger: Mock) -> list:
     return [
         call
         for call in mock_logger.warning.call_args_list
-        if call.args and (getattr(call.args[0], "extra", None) or {}).get("reason") == "pearl_started_uncapped"
+        if call.args
+        and (getattr(call.args[0], "extra", None) or {}).get("reason") == "pearl_started_uncapped"
     ]
 
 
@@ -68,10 +85,13 @@ async def test_failed_cap_still_refuses_the_filler_while_the_flag_is_off(svc, mo
 
 
 @pytest.mark.asyncio
-async def test_failed_cap_starts_the_filler_at_the_hosts_own_limit_with_the_flag_on(svc, monkeypatch) -> None:
+async def test_failed_cap_starts_the_filler_at_the_hosts_own_limit_with_the_flag_on(
+    svc, monkeypatch
+) -> None:
     """Regression: PEARL still refused on a host whose cap does not take, leaving the GPU idle while
-    it draws the unrented incentive. The start is logged at WARNING with the GPUs it left uncapped,
-    and the customer-path restore/raise (for containers with no cap of their own) does not run."""
+    it draws the unrented incentive. The start is logged at WARNING with the GPUs it asked to cap
+    and the ones a failed undo left capped, and the customer-path restore/raise (for containers
+    with no cap of their own) does not run."""
     monkeypatch.setattr(settings, "ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS", True)
     mock_logger = _wire_failed_cap(svc, monkeypatch)
 
@@ -81,6 +101,7 @@ async def test_failed_cap_starts_the_filler_at_the_hosts_own_limit_with_the_flag
     svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
     warnings = _uncapped_start_warnings(mock_logger)
     assert len(warnings) == 1
-    assert warnings[0].args[0].extra["gpu_uuids"] == ["GPU-test"]
+    assert warnings[0].args[0].extra["gpu_uuids"] == ["GPU-test", "GPU-undo-failed"]
+    assert warnings[0].args[0].extra["gpu_uuids_with_restore_record"] == ["GPU-undo-failed"]
     ds_module.raise_low_power_limits_to_default.assert_not_awaited()
     ds_module.restore_tracked_gpu_power_limits.assert_not_awaited()

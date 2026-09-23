@@ -442,8 +442,9 @@ class Settings(BaseSettings):
     ENABLE_UNRENTED_POWER_CAP_LIMIT: bool = Field(env="ENABLE_UNRENTED_POWER_CAP_LIMIT", default=True)
 
     # DAH-3630 — PEARL runs on a host whose GPU power cap does not take. When True, a failed
-    # ``apply_filler_gpu_power_limits`` (already undone: no GPU left capped, no restore record)
-    # is logged at WARNING and the filler starts at the host's own power limit. When False the
+    # ``apply_filler_gpu_power_limits`` (already undone, except a GPU whose undo restore failed:
+    # that one stays capped with its record) is logged at WARNING and the filler starts at the
+    # host's own power limit on the GPUs the undo restored. When False the
     # create fails as before. Turn on only together with the backend half of DAH-3630
     # (lium-platform: the PEARL power-limit guard stops a run at default power and arms the 12 h
     # hard-ban backoff); with the guard still on, an uncapped start is stopped after 30 min and

@@ -29,7 +29,8 @@ is the hard gate — a cap that cannot be observed on the GPU does not exist.
 not be fully applied, after undoing whatever it already capped or stored. The caller refuses to start
 the PEARL filler, unless ``ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS`` (DAH-3630) starts it at the host's
 own limit (the cap spares the host's power bill and heat; a renter runs the same GPU at full power).
-Either way no record is left, so teardown restores nothing.
+The undo drops the pod index, so that filler's teardown restores nothing: a GPU whose undo restore
+failed stays capped with its record, and only the safety nets below restore it.
 **Restore stays best-effort**: teardown must never be blocked by a power-limit hiccup; a record
 whose restore failed is kept and retried by the safety nets. Restores and raises run several GPUs
 at a time (``POWER_LIMIT_SET_CONCURRENCY``): both sit between a customer's rent request and the
@@ -732,9 +733,10 @@ async def apply_filler_gpu_power_limits(
     """Record each GPU's pre-cap limit (frozen), then cap it at the target watts (clamped to hw [min, max]).
 
     All-or-nothing: returns True only when EVERY requested GPU was capped; on failure any partial work
-    (records, pod index, already-capped GPUs) is undone first, so False leaves the host exactly as it
-    was and the caller decides whether the filler starts uncapped (DAH-3630). Every failure path logs
-    an error so it is diagnosable/alertable — no silent skips.
+    (records, pod index, already-capped GPUs) is undone first, and the caller decides whether the
+    filler starts uncapped (DAH-3630). The undo is best-effort: a GPU whose restore fails stays capped
+    and keeps its record. Every failure path logs an error so it is diagnosable/alertable — no silent
+    skips.
     """
     try:
         state_by_uuid = await _query_power_state(ssh)

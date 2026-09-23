@@ -79,6 +79,7 @@ from services.gpu_power_limit import (
     NVIDIA_SMI_TIMEOUT_SECONDS,
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
+    read_gpu_power_restore_records,
     restore_all_host_gpu_power_limits,
     restore_filler_pod_gpu_power_limits,
     restore_tracked_gpu_power_limits,
@@ -5705,10 +5706,11 @@ class DockerService:
                     await self._assert_cluster_overlay_port_free(ssh_client, default_extra)
 
                 # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
-                # gpu_power_limits). A failed apply has already undone its partial work (no GPU
-                # left capped, no restore record). DAH-3630: with ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS
-                # the filler then starts at the host's own limit; without it the raise records this
-                # create FAILED and the backend backs the node off.
+                # gpu_power_limits). A failed apply has already undone its partial work, except a
+                # GPU whose undo restore failed: it stays capped with its record. DAH-3630: with
+                # ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS the filler then starts, at the host's own
+                # limit on the GPUs the undo restored; without it the raise records this create
+                # FAILED and the backend backs the node off.
                 if payload.workload_kind == WorkloadKind.FILLER and payload.gpu_power_limits:
                     current_step = "gpu_power_cap"
                     cap_applied = await apply_filler_gpu_power_limits(
@@ -5724,14 +5726,23 @@ class DockerService:
                             raise RuntimeError(
                                 "GPU power cap could not be applied; refusing to start PEARL filler uncapped"
                             )
+                        requested_uuids = [limit.gpu_uuid for limit in payload.gpu_power_limits]
+                        left_capped = await read_gpu_power_restore_records(
+                            self.redis_service, requested_uuids, log_extra=default_extra
+                        )
                         logger.warning(
                             _m(
-                                "GPU power cap could not be applied; starting PEARL filler at the host's own power limit",
+                                "GPU power cap could not be applied; starting PEARL filler at the host's own "
+                                "power limit, except on GPUs still holding a restore record (their undo failed)",
                                 extra=get_extra_info(
                                     {
                                         **default_extra,
                                         "reason": "pearl_started_uncapped",
-                                        "gpu_uuids": [limit.gpu_uuid for limit in payload.gpu_power_limits],
+                                        "gpu_uuids": requested_uuids,
+                                        "gpu_uuids_with_restore_record": [
+                                            record.gpu_uuid for record in left_capped.records
+                                        ],
+                                        "restore_record_read_failed": left_capped.read_failed,
                                     }
                                 ),
                             )
