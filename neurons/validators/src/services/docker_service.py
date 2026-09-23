@@ -872,12 +872,16 @@ def _build_dind_volume_mounts(
 
     Named after the pod's own volume, so a reboot or an edit (same volume, new container) mounts the
     same ones again. Docker creates them with the local driver on first use. A target the rental
-    already mounts (a custom volume path, `/mnt`, a cache) is left alone.
+    already mounts (a custom volume path, `/mnt`, a cache) is left alone. Both are plaintext on the
+    host, so an encrypted pod gets the store only when its own setting allows it.
     """
     if not _wants_dind_defaults(payload):
         return []
     mounts: list[VolumeMount] = []
-    if settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED and DIND_STORE_TARGET not in occupied_targets:
+    wants_store = settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED and (
+        not encrypted_local_volume or settings.RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED
+    )
+    if wants_store and DIND_STORE_TARGET not in occupied_targets:
         mounts.append(VolumeMount(source=dind_store_volume_name(local_volume), target=DIND_STORE_TARGET))
         occupied_targets.add(DIND_STORE_TARGET)
     # A plain pod's /root already bind-mounts into inner containers and persists.

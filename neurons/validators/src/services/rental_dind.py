@@ -14,6 +14,9 @@ Three things every renter who runs Docker inside a pod hits:
   container: `docker run -v /root/x:/x` fails with "error mounting ... change mount propagation
   through procfd". /workspace is a plain path that bind-mounts fine; a per-pod volume there keeps it
   across reboots and edits, so a compose project can live somewhere its bind mounts work.
+
+Both per-pod volumes are plain local volumes: on an encrypted pod their contents are plaintext on
+the host disk until the pod is deleted (docs/lium-io/rental-dind.md).
 """
 
 from __future__ import annotations

@@ -309,9 +309,14 @@ def docker_service() -> DockerService:
 
 @pytest.fixture
 def dind_flags(monkeypatch):
-    def set_flags(*, pools=False, store=False, workspace=False, pools_json=None):
+    def set_flags(
+        *, pools=False, store=False, store_encrypted=False, workspace=False, pools_json=None
+    ):
         monkeypatch.setattr(settings, "RENTAL_DIND_ADDRESS_POOLS_ENABLED", pools)
         monkeypatch.setattr(settings, "RENTAL_DIND_PERSISTENT_STORE_ENABLED", store)
+        monkeypatch.setattr(
+            settings, "RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED", store_encrypted
+        )
         monkeypatch.setattr(settings, "RENTAL_DIND_WORKSPACE_VOLUME_ENABLED", workspace)
         if pools_json is not None:
             monkeypatch.setattr(settings, "RENTAL_DIND_ADDRESS_POOLS", pools_json)
@@ -375,8 +380,20 @@ def test_the_flags_on_give_a_plain_pod_the_pools_and_a_persistent_store(docker_s
     ]
 
 
-def test_an_encrypted_pod_also_gets_a_bind_mountable_workspace(docker_service, dind_flags):
+def test_an_encrypted_pod_gets_a_bind_mountable_workspace_and_no_plaintext_store_by_default(
+    docker_service, dind_flags
+):
     dind_flags(store=True, workspace=True)
+
+    spec = _run_spec(docker_service, _payload(), encrypted=True)
+
+    assert _mounts(spec) == [("volume_pod", "/lium-cipher"), ("volume_pod_workspace", "/workspace")]
+
+
+def test_an_encrypted_pod_gets_the_store_only_when_its_own_setting_allows_it(
+    docker_service, dind_flags
+):
+    dind_flags(store=True, store_encrypted=True, workspace=True)
 
     spec = _run_spec(docker_service, _payload(), encrypted=True)
 
@@ -385,6 +402,14 @@ def test_an_encrypted_pod_also_gets_a_bind_mountable_workspace(docker_service, d
         ("volume_pod_docker", "/var/lib/docker"),
         ("volume_pod_workspace", "/workspace"),
     ]
+
+
+def test_the_encrypted_store_setting_alone_mounts_nothing(docker_service, dind_flags):
+    dind_flags(store_encrypted=True)
+
+    spec = _run_spec(docker_service, _payload(), encrypted=True)
+
+    assert _mounts(spec) == [("volume_pod", "/lium-cipher")]
 
 
 def test_a_pod_whose_own_volume_is_at_workspace_keeps_it(docker_service, dind_flags):
@@ -401,7 +426,7 @@ def test_a_pod_whose_own_volume_is_at_workspace_keeps_it(docker_service, dind_fl
     ids=["runc-host", "filler"],
 )
 def test_no_inner_docker_no_dind_defaults(docker_service, dind_flags, payload):
-    dind_flags(pools=True, store=True, workspace=True)
+    dind_flags(pools=True, store=True, store_encrypted=True, workspace=True)
 
     spec = _run_spec(docker_service, payload, encrypted=True)
 

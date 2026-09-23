@@ -249,8 +249,13 @@ class Settings(BaseSettings):
     # A per-pod volume at /var/lib/docker: inner images, containers and volumes survive a reboot or
     # an edit of the pod instead of starting empty. Removed with the pod.
     RENTAL_DIND_PERSISTENT_STORE_ENABLED: bool = Field(env="RENTAL_DIND_PERSISTENT_STORE_ENABLED", default=False)
+    # The store is a plaintext local volume, so an encrypted pod gets it only when this is on too.
+    RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED: bool = Field(
+        env="RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED", default=False
+    )
     # A per-pod volume at /workspace on an encrypted pod, whose /root (FUSE) cannot be bind-mounted
     # into inner containers: the path that can be survives a reboot or an edit. Removed with the pod.
+    # Plaintext on the host disk, like the rootfs /workspace it replaces, but kept until delete.
     RENTAL_DIND_WORKSPACE_VOLUME_ENABLED: bool = Field(env="RENTAL_DIND_WORKSPACE_VOLUME_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
