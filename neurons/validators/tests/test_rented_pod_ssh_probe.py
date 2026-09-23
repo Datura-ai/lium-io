@@ -23,8 +23,11 @@ from neurons.validators.src.services.task.checks.rented_pod_ssh import (
     FAULT_SSH_BANNER_MISSING,
     FAULT_TCP_REFUSED,
     FAULT_TCP_TIMEOUT,
-    is_ssh2_identification,
     tcp_connect_fault,
+)
+from neurons.validators.src.services.task.checks.ssh_identification import (
+    SSH_PRE_BANNER_LINES_MAX,
+    is_ssh2_identification,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from neurons.validators.src.services.task.models import JobResult
@@ -84,6 +87,7 @@ class Harness:
         boot_id: object = "boot-a",
         validator_outage: bool = False,
         status: str | None = None,
+        ssh: DummySSHClient | None = None,
     ):
         """One cycle as the validator runs it: the rented check, then the cycle-end fleet gate."""
         services = build_services(
@@ -98,7 +102,7 @@ class Harness:
             state=build_state(
                 rented_data=rented_data(self.ssh_port, status), specs={"boot_id": boot_id}
             ),
-            ssh=DummySSHClient(pod_running=True, ssh_keys=ssh_keys),
+            ssh=ssh or DummySSHClient(pod_running=True, ssh_keys=ssh_keys),
             collateral_deposited=True,
         )
         with patch(TCP_PATH, new=AsyncMock(return_value=tcp_fault)) as tcp:
@@ -115,6 +119,25 @@ class Harness:
 
 
 KEYS = ["ssh-ed25519 AAAA renter"]
+# `docker exec … cat /root/.ssh/authorized_keys` exits 1 with empty stdout in both cases below.
+DAEMON_REFUSED_EXEC = (
+    "Error response from daemon: Container 3f2a is restarting, wait until the container is running\n"
+)
+NO_AUTHORIZED_KEYS_FILE = "cat: /root/.ssh/authorized_keys: No such file or directory\n"
+
+
+class KeysReadFailsSSHClient(DummySSHClient):
+    """A running container whose authorized_keys read exits 1 with the given stderr."""
+
+    def __init__(self, stderr: str):
+        super().__init__(pod_running=True)
+        self.stderr = stderr
+
+    async def run(self, command: str):
+        result = await super().run(command)
+        if "authorized_keys" in command:
+            result.stdout, result.stderr, result.exit_status = "", self.stderr, 1
+        return result
 
 
 @pytest.mark.asyncio
@@ -143,7 +166,7 @@ async def test_second_consecutive_refused_cycle_raises_the_event_and_tells_the_b
     assert result.passed is True and result.halt is True
     assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
     assert result.event.severity == "error"
-    # Score is the rented score: this verdict is reported, not scored (Rustam's call).
+    # Score is the rented score: this verdict is reported, not scored.
     assert result.updates["score"] == 0.9 and result.updates["job_score"] == 0.9
     assert "clear_verified_job_info" not in result.updates
     [pod] = result.event.what_we_saw["unreachable_pods"]
@@ -224,6 +247,39 @@ async def test_open_port_with_unreadable_authorized_keys_is_the_ticket_0247_faul
     assert h.backend.report_pod_ssh_unreachable.await_args.kwargs["faults"] == [
         FAULT_AUTHORIZED_KEYS_UNREADABLE
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_keys_read_the_docker_daemon_refused_is_skipped_not_counted(context_factory):
+    # A restarting or paused container is still listed by `docker ps`, but the daemon refuses the
+    # exec: the keys are unknown this cycle, not missing, so the pod is not judged at all.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    for _ in range(3):
+        result = await h.cycle(
+            tcp_fault=FAULT_TCP_REFUSED,
+            ssh_keys=[],
+            ssh=KeysReadFailsSSHClient(DAEMON_REFUSED_EXEC),
+        )
+
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert h.tcp_calls == [] and h.streak() is None
+    h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_missing_authorized_keys_file_is_still_the_keys_fault(context_factory):
+    # ticket-0247: the volume was not remounted, so `cat` finds no file and exits 1 as well.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    for _ in range(2):
+        result = await h.cycle(
+            tcp_fault=None, ssh_keys=[], ssh=KeysReadFailsSSHClient(NO_AUTHORIZED_KEYS_FILE)
+        )
+
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    [pod] = result.event.what_we_saw["unreachable_pods"]
+    assert pod["faults"] == [FAULT_AUTHORIZED_KEYS_UNREADABLE]
 
 
 @pytest.mark.asyncio
@@ -344,7 +400,7 @@ async def test_redis_down_mid_outage_does_not_report_and_the_streak_resumes_afte
 async def test_a_redis_error_on_either_write_of_the_threshold_cycle_still_posts_once(
     context_factory, failing_write
 ):
-    # Regression (fresh review of #1372): the count was written before the ok mark was renewed, so
+    # Regression: the count was written before the ok mark was renewed, so
     # a Redis error on the renewal left `count == threshold` stored with no POST; the next cycle
     # read count 3, `consecutive != threshold`, and the backend was never told for that outage.
     # The count is now the last write before the report decision: whichever write fails, the
@@ -406,7 +462,7 @@ async def test_a_healthy_cycle_whose_redis_write_is_lost_leaves_no_half_state(
 async def test_a_notify_failed_answer_keeps_the_outage_unacknowledged_and_posts_again(
     context_factory,
 ):
-    # taiberium's review (21 Sep): lium-platform#429 answers `delivery`; a 200 whose mail was refused
+    # lium-platform#429 answers `delivery`; a 200 whose mail was refused
     # (`notify_failed`) must not mark the streak reported, so the next cycle posts once more and the
     # renter's mail is re-sent. Once the mail is accepted the streak is marked and the posting stops.
     h = Harness(context_factory)
@@ -439,7 +495,7 @@ async def test_a_notify_failed_answer_keeps_the_outage_unacknowledged_and_posts_
 async def test_a_redis_blip_on_the_reported_mark_keeps_the_verdict_and_costs_one_more_post(
     context_factory,
 ):
-    # Fresh review of round 3: the `reported` write comes after a 200; a Redis error there must not
+    # Regression: the `reported` write comes after a 200; a Redis error there must not
     # drop the verdict the POST already went out for. It is caught on its own, the event still says
     # reported, `reported` stays False, and the next cycle posts once more (the backend dedupes).
     h = Harness(context_factory)
@@ -698,7 +754,7 @@ async def test_a_fleet_wide_port_outage_holds_every_report_back_until_the_fleet_
 
 @pytest.mark.asyncio
 async def test_pods_never_seen_healthy_are_not_in_the_fleet_share(context_factory):
-    # Fresh review of round 5: three no-sshd templates refusing from the start read as 3 of 5
+    # Regression: three no-sshd templates refusing from the start read as 3 of 5
     # failing, and a real outage on one healthy pod was held back for ever. A pod this validator
     # never saw healthy is not counted (as before) and not in the share either.
     fleet = Fleet(context_factory, SIX_PODS)
@@ -915,6 +971,63 @@ def test_judge_fleet_gate_holds_on_the_share_first_and_the_validator_verdict_sec
 
 
 @pytest.mark.asyncio
+async def test_a_queued_report_that_fails_the_typed_model_is_not_posted():
+    # The due hash is Redis data read back before the request: an entry the backend would refuse
+    # (a port out of range, a boot_id over 64 chars, no faults, not JSON) is dropped, not posted.
+    valid = {
+        "ssh_port": SSH_PORT,
+        "faults": [FAULT_TCP_REFUSED],
+        "first_failed_at": "2026-09-21T04:00:00+00:00",
+        "consecutive_cycles": 2,
+        "boot_id_changed": None,
+        "boot_id_at_ok": "boot-a",
+        "boot_id_now": "boot-a",
+    }
+    due = {
+        "pod-ok": json.dumps(valid),
+        "pod-port": json.dumps({**valid, "ssh_port": 70000}),
+        "pod-boot": json.dumps({**valid, "boot_id_now": "b" * 65}),
+        "pod-faults": json.dumps({**valid, "faults": []}),
+        "pod-junk": "not json",
+    }
+    redis = FakeRedis()
+    redis.hashes[f"{rented_pod_ssh.RENTED_POD_SSH_DUE_KEY_PREFIX}:b"] = due
+    backend = AsyncMock()
+    backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(recorded=True)
+
+    gate = await rented_pod_ssh.flush_rented_pod_ssh_reports(redis, backend, "b")
+
+    assert gate.posted == ["pod-ok"]
+    backend.report_pod_ssh_unreachable.assert_awaited_once_with("pod-ok", **valid)
+
+
+@pytest.mark.asyncio
+async def test_an_ok_mark_from_the_connect_only_rule_does_not_count_a_banner_fault(context_factory):
+    # With the banner flag off, docker-proxy's accept is health, so a pod whose image ships no sshd
+    # gets an ok mark. Turning the flag on must not report that pod: its first banner-rule cycle
+    # would read ssh_banner_missing against a mark that never saw sshd.
+    h = Harness(context_factory)
+    await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+    with patch.object(rented_pod_ssh.settings, "RENTED_POD_SSH_BANNER_FAULT_ENABLED", True):
+        for _ in range(3):
+            result = await h.cycle(tcp_fault=FAULT_SSH_BANNER_MISSING, ssh_keys=KEYS)
+        assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+        assert h.streak() is None
+        h.backend.report_pod_ssh_unreachable.assert_not_awaited()
+
+        # A connect fault still counts against the old mark: the connect-only rule saw that port.
+        await h.cycle(tcp_fault=FAULT_TCP_REFUSED, ssh_keys=KEYS)
+        assert h.streak()["count"] == 1
+
+        # Once the banner rule has seen sshd, a banner fault is an outage like any other.
+        await h.cycle(tcp_fault=None, ssh_keys=KEYS)
+        await h.cycle(tcp_fault=FAULT_SSH_BANNER_MISSING, ssh_keys=KEYS)
+        result = await h.cycle(tcp_fault=FAULT_SSH_BANNER_MISSING, ssh_keys=KEYS)
+    assert result.event.reason_code == Msg.RENTED_POD_SSH_UNREACHABLE.reason
+    h.backend.report_pod_ssh_unreachable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_flush_with_the_probe_off_touches_nothing():
     redis = FakeRedis()
     with patch(SETTINGS_PATH) as settings:
@@ -1023,9 +1136,9 @@ async def test_lines_before_the_identification_are_skipped_within_bounds():
     cases = [
         (banner + [ssh2], None),
         # up to SSH_PRE_BANNER_LINES_MAX lines are skipped; one more and the identification is not read
-        ([b"x\r\n"] * rented_pod_ssh.SSH_PRE_BANNER_LINES_MAX + [ssh2], None),
+        ([b"x\r\n"] * SSH_PRE_BANNER_LINES_MAX + [ssh2], None),
         (
-            [b"x\r\n"] * (rented_pod_ssh.SSH_PRE_BANNER_LINES_MAX + 1) + [ssh2],
+            [b"x\r\n"] * (SSH_PRE_BANNER_LINES_MAX + 1) + [ssh2],
             FAULT_SSH_BANNER_MISSING,
         ),
         # a pre-banner line is bounded like the identification: past 255 bytes the probe stops reading

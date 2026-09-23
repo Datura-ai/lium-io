@@ -19,9 +19,10 @@ This module judges what the renter sees, from outside the container, each cycle:
 * the ``authorized_keys`` read the check already does (empty = the mount is missing).
 
 State lives in Redis, one key pair per pod. A pod is judged only after this validator has seen it
-healthy once (both signals good), so a template that ships no sshd, or a pod that never came up,
-is never reported here. ``RENTED_POD_SSH_PROBE_CYCLES`` consecutive unhealthy cycles (default 2,
-about 30 min) after that raise ``RENTED_POD_SSH_UNREACHABLE`` and one POST to the backend per
+healthy once (both signals good; for a banner fault, healthy by the banner rule), so a template
+that ships no sshd, or a pod that never came up, is never reported here.
+``RENTED_POD_SSH_PROBE_CYCLES`` consecutive unhealthy cycles (default 2, about 30 min) after that
+raise ``RENTED_POD_SSH_UNREACHABLE`` and one POST to the backend per
 outage: the POST is repeated each cycle until the backend answers 200 (``recorded`` true or false)
 with a ``delivery`` other than ``notify_failed`` (lium-platform#429: the renter's mail was refused,
 so the next cycle posts again and it is re-sent), and that answer is kept in the streak so the
@@ -69,6 +70,7 @@ from protocol.vc_protocol.compute_requests import (
     PodSshUnreachableResponse,
     RentedPod,
 )
+from pydantic import BaseModel, Field, ValidationError
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -78,6 +80,7 @@ from ..availability import SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE
 from ..messages import TenantEnforcementMessages
 from ..models import JobResult, build_msg
 from ..pipeline import Context
+from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
 
 if TYPE_CHECKING:
     from clients.backend_client import BackendClient
@@ -110,18 +113,6 @@ FAULT_TCP_TIMEOUT = "tcp_timeout"
 # only with RENTED_POD_SSH_BANNER_FAULT_ENABLED on (after lium-platform#429 is deployed).
 FAULT_SSH_BANNER_MISSING = "ssh_banner_missing"
 FAULT_AUTHORIZED_KEYS_UNREADABLE = "authorized_keys_unreadable"
-# RFC 4253 §4.2: `SSH-protoversion-softwareversion SP comments CR LF`, at most 255 bytes including
-# CR LF. Only protoversion 2.0 counts: `SSH-1.5-` is a 1.x-only server; `SSH-1.99-` (RFC 4253
-# §5.1) marks a server that also speaks 1.x, and both are refused.
-SSH_ID_PREFIX = b"SSH-2.0-"
-SSH_ID_LINE_MAX = 255
-# The same section lets the server send other lines before its identification (each ending in CR LF,
-# none starting with `SSH-`) and a client MUST be able to skip them. The scan is bounded: OpenSSH's
-# client gives up after 1024 such lines; 64 is more than any pre-banner an sshd is configured to
-# print, and a peer that is not sshd at all runs out of lines (or of the shared deadline) long
-# before it can hold the probe. Each skipped line is bounded to SSH_ID_LINE_MAX bytes as well.
-SSH_PRE_BANNER_LINES_MAX = 64
-SSH_ID_ANY_VERSION_PREFIX = b"SSH-"
 # The one pod status the probe judges: the backend lists rebooting, failed and pending pods too, and
 # its ssh-unreachable route answers 409 for any of them (lium-platform#429). A backend that predates
 # the field sends no status, and every listed pod is judged as before.
@@ -233,10 +224,15 @@ def bounded_boot_id(value: object) -> str | None:
 
 @dataclass(frozen=True)
 class OkMark:
-    """The `ok` key: when this validator last saw the pod healthy, and the host's boot_id then."""
+    """The `ok` key: when this validator last saw the pod healthy, and the host's boot_id then.
+
+    ``banner_seen``: that healthy cycle judged the port by the SSH-2.0 line
+    (RENTED_POD_SSH_BANNER_FAULT_ENABLED on), not by the connect alone.
+    """
 
     at: str
     boot_id: str | None
+    banner_seen: bool = False
 
     @classmethod
     def load(cls, raw: object) -> OkMark | None:
@@ -244,10 +240,14 @@ class OkMark:
         value = _decode(raw)
         if value is None:
             return None
-        return cls(at=str(value.get("at") or ""), boot_id=bounded_boot_id(value.get("boot_id")))
+        return cls(
+            at=str(value.get("at") or ""),
+            boot_id=bounded_boot_id(value.get("boot_id")),
+            banner_seen=value.get("banner_seen") is True,
+        )
 
     def dump(self) -> str:
-        return json.dumps({"at": self.at, "boot_id": self.boot_id})
+        return json.dumps({"at": self.at, "boot_id": self.boot_id, "banner_seen": self.banner_seen})
 
 
 @dataclass(frozen=True)
@@ -292,38 +292,24 @@ class FailStreak:
         )
 
 
-def is_ssh2_identification(line: bytes) -> bool:
-    """True for a complete RFC 4253 identification line of protocol version 2.0.
+class DueReport(BaseModel):
+    """One queued report in the cycle's `due` hash, validated when read back before the POST, with
+    the backend's own bounds, so a corrupt entry is dropped instead of answered with a 422."""
 
-    Complete means terminated by LF (sshd sends CR LF) and no longer than 255 bytes; 2.0 means the
-    line starts with ``SSH-2.0-`` and names a software version after it. ``SSH-1.99-``, ``SSH-1.5-``,
-    a bare ``SSH-2.0-``, a line cut before its LF, or anything else is not the sshd a renter logs in to.
-    """
-    if not line.endswith(b"\n") or len(line) > SSH_ID_LINE_MAX:
-        return False
-    body = line.rstrip(b"\r\n")
-    return body.startswith(SSH_ID_PREFIX) and len(body) > len(SSH_ID_PREFIX)
+    ssh_port: int | None = Field(ge=1, le=65535)
+    faults: list[str] = Field(min_length=1)
+    first_failed_at: str = Field(min_length=1)
+    consecutive_cycles: int = Field(ge=1)
+    boot_id_changed: bool | None
+    boot_id_at_ok: str | None = Field(max_length=BOOT_ID_MAX)
+    boot_id_now: str | None = Field(max_length=BOOT_ID_MAX)
 
-
-async def read_ssh_identification(reader: asyncio.StreamReader) -> bytes:
-    """The server's identification line, or b"" when none arrives within the bounds.
-
-    RFC 4253 §4.2 lets a server send other lines before ``SSH-...``; they are skipped, up to
-    ``SSH_PRE_BANNER_LINES_MAX`` of them (reading the first line alone flagged compliant servers).
-    The reader's ``limit`` bounds every line: a peer whose LF sits past byte 255 raises
-    LimitOverrunError instead of growing memory (an LF exactly at index 255 returns 256 bytes, which
-    ``is_ssh2_identification`` refuses); EOF before the LF raises IncompleteReadError (docker-proxy's
-    accept-then-close, or a line cut short). Both are "no identification line". The caller holds
-    the deadline.
-    """
-    for _ in range(SSH_PRE_BANNER_LINES_MAX + 1):
+    @classmethod
+    def load(cls, raw: str) -> DueReport | None:
         try:
-            line = await reader.readuntil(b"\n")
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError):
-            return b""
-        if line.startswith(SSH_ID_ANY_VERSION_PREFIX):
-            return line
-    return b""
+            return cls.model_validate_json(raw)
+        except ValidationError:
+            return None
 
 
 async def tcp_connect_fault(
@@ -463,7 +449,12 @@ async def _judge_with_streak(
     # to the old streak, or a counted streak next to a stale ok mark.
     if not faults:
         healthy = RedisWrites()
-        healthy.set(_ok_key(pod.pod_id), OkMark(at=now_iso, boot_id=boot_id_now).dump(), ex=ttl)
+        healthy_mark = OkMark(
+            at=now_iso,
+            boot_id=boot_id_now,
+            banner_seen=pod.ssh_port is not None and settings.RENTED_POD_SSH_BANNER_FAULT_ENABLED,
+        )
+        healthy.set(_ok_key(pod.pod_id), healthy_mark.dump(), ex=ttl)
         healthy.delete(_fail_key(pod.pod_id))
         if pod.ssh_port is not None:
             _mark_fleet(ctx, healthy, pod.pod_id, FLEET_MARK_OK)
@@ -476,10 +467,12 @@ async def _judge_with_streak(
         )
 
     ok_mark = OkMark.load(await store.get(_ok_key(pod.pod_id)))
-    if ok_mark is None:
+    if ok_mark is None or (port_fault == FAULT_SSH_BANNER_MISSING and not ok_mark.banner_seen):
         # Never seen healthy by this validator: a template without sshd, a pod still coming up, or
         # a deploy that never worked. Not this outage class; nothing is counted, and the pod is not
         # in the fleet share either (three no-sshd templates would otherwise read as an outage).
+        # A mark written by the connect-only rule never saw sshd either: docker-proxy accepts
+        # without it, so a banner fault against that mark is the same no-sshd template.
         return RentedPodSshVerdict(
             pod_id=pod.pod_id,
             container_name=pod.container_name,
@@ -542,21 +535,18 @@ def _queue_report_for_fleet_gate(
     count, so a streak at the threshold is never stored without its report waiting for the gate.
     """
     due_key = _due_key(_cycle_id(ctx))
-    writes.hset(
-        due_key,
-        verdict.pod_id,
-        json.dumps(
-            {
-                "ssh_port": verdict.ssh_port,
-                "faults": list(verdict.faults),
-                "first_failed_at": verdict.first_failed_at or "",
-                "consecutive_cycles": verdict.consecutive_cycles,
-                "boot_id_changed": verdict.boot_id_changed,
-                "boot_id_at_ok": boot_id_at_ok,
-                "boot_id_now": boot_id_now,
-            }
-        ),
-    ).expire(due_key, FLEET_KEY_TTL_SECONDS)
+    report = DueReport(
+        ssh_port=verdict.ssh_port,
+        faults=list(verdict.faults),
+        first_failed_at=verdict.first_failed_at or "",
+        consecutive_cycles=verdict.consecutive_cycles,
+        boot_id_changed=verdict.boot_id_changed,
+        boot_id_at_ok=boot_id_at_ok,
+        boot_id_now=boot_id_now,
+    )
+    writes.hset(due_key, verdict.pod_id, report.model_dump_json()).expire(
+        due_key, FLEET_KEY_TTL_SECONDS
+    )
 
 
 def _mark_fleet(ctx: Context, writes: RedisWrites, pod_id: str, mark: str) -> None:
@@ -767,10 +757,10 @@ async def _post_one(
     was due) — the streak is then marked reported. A ``notify_failed`` answer (lium-platform#429:
     the mail was refused) leaves ``reported`` False so the next cycle posts again and the mail is
     re-sent."""
-    payload = _decode(raw)
-    if payload is None:
+    report = DueReport.load(raw)
+    if report is None:
         return False
-    response = await _report_to_backend(backend, pod_id, payload, extra)
+    response = await _report_to_backend(backend, pod_id, report, extra)
     if response is None:
         return False
     if response.delivery == SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED:
@@ -805,20 +795,20 @@ async def _post_one(
 
 
 async def _report_to_backend(
-    backend: BackendClient, pod_id: str, payload: dict, extra: dict[str, object]
+    backend: BackendClient, pod_id: str, report: DueReport, extra: dict[str, object]
 ) -> PodSshUnreachableResponse | None:
     # Never fatal: the verdict is already in the cycle event; a backend that is down or too old
     # (404) must not turn a renter-facing outage report into a validator failure.
     try:
         response = await backend.report_pod_ssh_unreachable(
             pod_id,
-            ssh_port=payload.get("ssh_port"),
-            faults=list(payload.get("faults") or []),
-            first_failed_at=str(payload.get("first_failed_at") or ""),
-            consecutive_cycles=int(payload.get("consecutive_cycles") or 0),
-            boot_id_changed=payload.get("boot_id_changed"),
-            boot_id_at_ok=payload.get("boot_id_at_ok"),
-            boot_id_now=payload.get("boot_id_now"),
+            ssh_port=report.ssh_port,
+            faults=report.faults,
+            first_failed_at=report.first_failed_at,
+            consecutive_cycles=report.consecutive_cycles,
+            boot_id_changed=report.boot_id_changed,
+            boot_id_at_ok=report.boot_id_at_ok,
+            boot_id_now=report.boot_id_now,
         )
     except Exception:
         logger.warning(
