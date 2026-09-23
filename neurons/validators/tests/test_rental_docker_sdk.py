@@ -603,6 +603,8 @@ async def test_run_container_creates_the_icc_off_network_before_the_container():
             "driver": "bridge",
             "options": {RENTAL_NETWORK_ICC_OPTION: "false"},
             "labels": RENTAL_NETWORK_LABELS,
+            # a pre-25 daemon otherwise makes a second network of the same name when two creates race
+            "check_duplicate": True,
         }
     ]
     assert api_client.host_config_kwargs["network_mode"] == RENTAL_NETWORK_NAME
