@@ -7,7 +7,6 @@ from neurons.validators.src.services.task.messages import (
     VERIFYX_DEBUG_DOC_URL,
     VerifyXMessages as Msg,
 )
-from neurons.validators.src.services.verifyx_validation_service import settings
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
 from tests.helpers import build_context_config, build_services, build_state
