@@ -4,7 +4,7 @@ import logging
 import math
 import shlex
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from core.config import settings
@@ -67,6 +67,8 @@ class EgressProbe:
     tool: str | None = None
     http_code: str | None = None
     detail: str | None = None
+    # the reading a re-run replaced: a no_egress is only a verdict once a second run says it too
+    first_reading: dict[str, Any] | None = None
 
     def as_record(self) -> dict[str, Any]:
         record: dict[str, Any] = {"verdict": self.verdict, "reason": self.reason}
@@ -76,6 +78,8 @@ class EgressProbe:
             record["http_code"] = self.http_code
         if self.detail:
             record["detail"] = self.detail[-_TAIL_CHARS:]
+        if self.first_reading:
+            record["first_reading"] = self.first_reading
         return record
 
     def summary(self) -> str:
@@ -179,7 +183,10 @@ class OutboundInternetCheck:
     Two readings, either one is enough: the scrape measured no download at all, or a container on the
     rental network (`pod_probe_command`) could not resolve pypi.org or got no HTTP answer from it. A
     slow host passes: speed stays behind FeatureFlag.VERIFYX_NETWORK_VALIDATION. A pod probe that did
-    not run (docker refused it, the SSH command timed out) reaches no verdict and never fails the node.
+    not run (docker refused it, the SSH command timed out) reaches no verdict, never fails the node and
+    is logged as OUTBOUND_INTERNET_UNMEASURED, not as verified. A pod probe that says no_egress is run
+    a second time (only then, so a healthy node still starts one container per cycle) and the second
+    run decides.
 
     Under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED the finding fails the node the way INSUFFICIENT_PORTS
     does; without it the check logs NO_OUTBOUND_INTERNET_OBSERVED and passes. A rented node is left
@@ -201,7 +208,7 @@ class OutboundInternetCheck:
         if _is_rented(ctx):
             return self._skipped(ctx, "rented", scrape=scrape)
 
-        pod_probe = await self._pod_probe(ctx) if self.run_pod_probe else None
+        pod_probe = await self._pod_probe_twice_on_no_egress(ctx) if self.run_pod_probe else None
         what: dict[str, Any] = {
             "scrape": scrape,
             "pod_probe": pod_probe.as_record() if pod_probe else None,
@@ -213,9 +220,12 @@ class OutboundInternetCheck:
         if pod_probe is not None and pod_probe.verdict == "no_egress":
             failed_by.append("pod_probe")
         if not failed_by:
-            event = render_message(
-                Msg.OUTBOUND_INTERNET_OK, ctx=ctx, check_id=self.check_id, what=what
+            template = (
+                Msg.OUTBOUND_INTERNET_UNMEASURED
+                if pod_probe is not None and pod_probe.verdict == "unmeasured"
+                else Msg.OUTBOUND_INTERNET_OK
             )
+            event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=True, event=event)
 
         what["failed_by"] = failed_by
@@ -228,6 +238,15 @@ class OutboundInternetCheck:
             Msg.NO_OUTBOUND_INTERNET_OBSERVED, ctx=ctx, check_id=self.check_id, what=what
         )
         return CheckResult(passed=True, event=event)
+
+    async def _pod_probe_twice_on_no_egress(self, ctx: Context) -> EgressProbe:
+        """One transient DNS or HTTP miss must not zero an idle node: a no_egress reading is re-run once
+        and the second run is the verdict (a second run that reaches none is no verdict either)."""
+        first = await self._pod_probe(ctx)
+        if first.verdict != "no_egress":
+            return first
+        second = await self._pod_probe(ctx)
+        return replace(second, first_reading=first.as_record())
 
     async def _pod_probe(self, ctx: Context) -> EgressProbe:
         container_name = f"{EGRESS_PROBE_CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"

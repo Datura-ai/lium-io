@@ -1016,6 +1016,15 @@ class OutboundInternetMessages:
         category="runtime",
         impact="Proceed",
     )
+    # the scrape measured a download but the container on the rental network reached no verdict (image
+    # pull refused, no fetch tool, SSH timeout): neither verified nor a finding
+    OUTBOUND_INTERNET_UNMEASURED = MessageTemplate(
+        event="Outbound internet not measured from the rental network",
+        reason="OUTBOUND_INTERNET_UNMEASURED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     SKIPPED = MessageTemplate(
         event="Outbound internet check skipped",
         reason="OUTBOUND_INTERNET_SKIPPED",

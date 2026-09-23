@@ -112,10 +112,13 @@ def make_ctx(
     net: dict | None = HEALTHY,
     *,
     pod: SSHCommandResult | None = None,
+    pod_rerun: SSHCommandResult | None = None,
     sysbox=False,
     rented_data=None,
 ):
-    runner = FakeRunner(pod if pod is not None else result(POD_OK))
+    """`pod` answers the pod probe; a re-run (after a no_egress reading) gets `pod_rerun`, or `pod` again."""
+    pod = pod if pod is not None else result(POD_OK)
+    runner = FakeRunner(pod, pod_rerun if pod_rerun is not None else pod)
     specs = {"network": net} if net is not None else {}
     ctx = make_context(
         state=build_state(specs=specs, sysbox_runtime=sysbox, rented_data=rented_data),
@@ -196,12 +199,48 @@ async def test_a_pod_network_that_cannot_resolve_or_reach_out_fails_although_the
 ):
     """Regression: the scrape measures from the executor container, so a host whose rental bridge drops
     FORWARD traffic or whose pod DNS is broken reports 800 Mbps and still ships pods without internet."""
-    ctx, _ = make_ctx(HEALTHY, pod=result(pod_stdout))
+    ctx, runner = make_ctx(HEALTHY, pod=result(pod_stdout))
     with flags():
         res = await OutboundInternetCheck().run(ctx)
     assert res.passed is False and res.event.reason_code == Msg.NO_OUTBOUND_INTERNET.reason
     assert res.event.what_we_saw["failed_by"] == ["pod_probe"]
     assert res.event.what_we_saw["pod_probe"]["reason"] == reason
+    assert res.event.what_we_saw["pod_probe"]["first_reading"]["reason"] == reason
+    assert len(runner.commands) == 2
+
+
+@pytest.mark.asyncio
+async def test_one_transient_pod_probe_miss_is_re_run_and_the_re_run_decides():
+    """Regression (self-review): once enforcement is on, a single DNS or HTTP miss zeroes an idle node for
+    the cycle; there is no second reading."""
+    ctx, runner = make_ctx(HEALTHY, pod=result(POD_NO_ANSWER), pod_rerun=result(POD_OK))
+    with flags():
+        res = await OutboundInternetCheck().run(ctx)
+    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_OK.reason
+    pod_probe = res.event.what_we_saw["pod_probe"]
+    assert pod_probe["verdict"] == "ok"
+    assert pod_probe["first_reading"]["reason"] == "no_http_response"
+    names = [command.split("--name ")[1].split()[0] for command in runner.commands]
+    assert len(names) == 2 and names[0] != names[1]
+
+
+@pytest.mark.asyncio
+async def test_a_re_run_that_reaches_no_verdict_does_not_confirm_the_miss():
+    ctx, _ = make_ctx(HEALTHY, pod=result(POD_DNS_FAIL), pod_rerun=result("", exit_code=125))
+    with flags():
+        res = await OutboundInternetCheck().run(ctx)
+    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_UNMEASURED.reason
+    assert res.event.what_we_saw["pod_probe"]["first_reading"]["reason"] == "dns_failed"
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_node_starts_one_probe_container():
+    """Regression: the re-run fires on every reading, doubling the containers started on every idle node."""
+    ctx, runner = make_ctx(HEALTHY)
+    with flags():
+        res = await OutboundInternetCheck().run(ctx)
+    assert res.passed and len(runner.commands) == 1
+    assert "first_reading" not in res.event.what_we_saw["pod_probe"]
 
 
 @pytest.mark.asyncio
@@ -230,11 +269,14 @@ async def test_enforcement_off_only_logs(net, pod):
 
 @pytest.mark.asyncio
 async def test_a_pod_probe_that_did_not_run_is_no_verdict():
-    """Regression: docker refusing the probe container (exit 125, image pull blocked) fails the node."""
+    """Regression: docker refusing the probe container (exit 125, image pull blocked) fails the node, or
+    (self-review) is logged as OUTBOUND_INTERNET_OK, so the enforcement flip's counts include nodes the pod
+    probe never measured."""
     ctx, _ = make_ctx(HEALTHY, pod=result("", exit_code=125))
     with flags():
         res = await OutboundInternetCheck().run(ctx)
-    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_OK.reason
+    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_UNMEASURED.reason
+    assert res.event.reason_code != Msg.OUTBOUND_INTERNET_OK.reason
     assert res.event.what_we_saw["pod_probe"]["verdict"] == "unmeasured"
     assert res.event.what_we_saw["pod_probe"]["reason"] == "docker_run_failed"
 
@@ -245,7 +287,7 @@ async def test_a_timed_out_pod_probe_removes_its_container_and_is_no_verdict():
     ctx, runner = make_ctx(HEALTHY, pod=result(error_type="timeout", exit_code=-1))
     with flags():
         res = await OutboundInternetCheck().run(ctx)
-    assert res.passed
+    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_UNMEASURED.reason
     assert res.event.what_we_saw["pod_probe"]["reason"] == "command_failed"
     name = runner.commands[0].split("--name ")[1].split()[0]
     assert runner.commands[1].startswith(f"/usr/bin/docker rm -f {name}")

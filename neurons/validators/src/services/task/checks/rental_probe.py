@@ -960,7 +960,8 @@ def _step_egress(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
     """Step 5: the renter container resolved pypi.org and got an HTTP answer from it.
 
     No step is recorded when the script did not run (NO_OUTBOUND_INTERNET_CHECK_ENABLED off, the
-    session failed, the image has no curl or wget): that is no reading, not a failed one.
+    session failed, the image has no curl or wget): that is no reading, not a failed one. A no_egress
+    reading was re-run once over the same session, and the re-run is the reading.
     """
     if not login.egress_attempted:
         return
@@ -970,6 +971,8 @@ def _step_egress(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
     else:
         probe = parse_egress_probe(login.egress_result.stdout or "")
         reason = probe.summary()
+    if login.egress_first_reading is not None:
+        reason = f"{reason} (first run: {login.egress_first_reading})"
     if probe is None or probe.verdict == "unmeasured":
         logger.info(
             _m(
@@ -1202,6 +1205,8 @@ class _Login:
     egress_error: str | None = None
     egress_result: Any = None
     egress_seconds: float = 0.0
+    # the no_egress reading the re-run replaced
+    egress_first_reading: str | None = None
 
     def login_detail(self) -> str | None:
         if self.login_error is not None:
@@ -1270,11 +1275,12 @@ async def _login_and_list_gpus(
                 login.egress_attempted = True
                 egress_started = time.perf_counter()
                 try:
-                    login.egress_result = await conn.run(
-                        f"sh -c {shlex.quote(EGRESS_PROBE_SCRIPT)}",
-                        check=False,
-                        timeout=_EGRESS_TIMEOUT_SECONDS,
-                    )
+                    login.egress_result = await _run_egress_script(conn)
+                    first = parse_egress_probe(login.egress_result.stdout or "")
+                    if first.verdict == "no_egress":
+                        # one transient miss is not a verdict: the second run decides
+                        login.egress_first_reading = first.summary()
+                        login.egress_result = await _run_egress_script(conn)
                 except (TimeoutError, asyncssh.Error, OSError) as exc:
                     login.egress_error = repr(exc)
                 login.egress_seconds = time.perf_counter() - egress_started
@@ -1286,6 +1292,14 @@ async def _login_and_list_gpus(
     if not login.command_seconds:
         login.command_seconds = time.perf_counter() - command_started
     return login
+
+
+async def _run_egress_script(conn: Any) -> Any:
+    return await conn.run(
+        f"sh -c {shlex.quote(EGRESS_PROBE_SCRIPT)}",
+        check=False,
+        timeout=_EGRESS_TIMEOUT_SECONDS,
+    )
 
 
 def _count_gpus(nvidia_smi_output: str) -> int:

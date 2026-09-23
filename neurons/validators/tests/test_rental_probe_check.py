@@ -301,12 +301,15 @@ class FakeSSHConnection:
         stdout: str,
         exit_status: int,
         command_error: Exception | None,
-        egress_stdout: str | None = None,
+        egress_stdout: str | list[str] | None = None,
     ):
         self.stdout = stdout
         self.exit_status = exit_status
         self.command_error = command_error
-        self.egress_stdout = egress_stdout
+        # a list answers successive runs of the egress script, the last entry repeating
+        self.egress_stdout = (
+            list(egress_stdout) if isinstance(egress_stdout, list) else egress_stdout
+        )
         self.commands: list[str] = []
 
     async def __aenter__(self):
@@ -320,7 +323,10 @@ class FakeSSHConnection:
         if self.command_error is not None:
             raise self.command_error
         if command.startswith("sh -c ") and self.egress_stdout is not None:
-            return MagicMock(stdout=self.egress_stdout, stderr="", exit_status=0)
+            stdout = self.egress_stdout
+            if isinstance(stdout, list):
+                stdout = stdout.pop(0) if len(stdout) > 1 else stdout[0]
+            return MagicMock(stdout=stdout, stderr="", exit_status=0)
         return MagicMock(stdout=self.stdout, stderr="", exit_status=self.exit_status)
 
 
@@ -344,7 +350,7 @@ def renter_path(
     command_error: Exception | None = None,
     smi_stdout: str = SMI_TWO_GPUS,
     smi_exit: int = 0,
-    egress_stdout: str | None = None,
+    egress_stdout: str | list[str] | None = None,
 ):
     """What the probe sees from the validator's side of the network: the TCP port and the login.
 
@@ -1478,6 +1484,24 @@ async def test_egress_step_runs_the_script_inside_the_renter_container_and_passe
     assert egress_command.startswith("sh -c ") and "getent hosts pypi.org" in egress_command
     # headers of a 325-byte file, not the 46 MB index (self-review)
     assert "https://pypi.org/robots.txt" in egress_command and "/simple" not in egress_command
+    assert len(seen["conn"].commands) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_transient_egress_miss_is_re_run_and_the_re_run_decides():
+    """Regression (self-review): once enforcement is on, one DNS or HTTP miss in the renter container
+    fails the probe and stamps a standing failure; there is no second reading."""
+    redis = FakeRedis()
+    ctx, _, _ = make_probe_context(redis=redis)
+    with (
+        probe_settings(egress_check=True, egress_enforced=True),
+        renter_path(egress_stdout=[EGRESS_NO_ANSWER, EGRESS_OK]) as seen,
+    ):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
+    assert _steps(result)[STEP_EGRESS]["ok"] is True
+    assert [c.startswith("sh -c ") for c in seen["conn"].commands] == [False, True, True]
+    assert redis.standing_failure() is None
 
 
 @pytest.mark.asyncio
@@ -1491,12 +1515,14 @@ async def test_egress_failure_fails_the_probe_with_no_outbound_internet_when_enf
     ctx, _, _ = make_probe_context(redis=redis)
     with (
         probe_settings(egress_check=True, egress_enforced=True),
-        renter_path(egress_stdout=egress_stdout),
+        renter_path(egress_stdout=egress_stdout) as seen,
     ):
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False
     assert result.event.reason_code == "NO_OUTBOUND_INTERNET"
     assert result.event.what_we_saw["failed_step"] == STEP_EGRESS
+    assert len(seen["conn"].commands) == 3
+    assert "(first run: " in _steps(result)[STEP_EGRESS]["detail"]
     assert "FORWARD chain and DNS" in result.event.remediation
     assert result.updates["clear_verified_job_info"] is True
     assert redis.standing_failure() == STEP_EGRESS
