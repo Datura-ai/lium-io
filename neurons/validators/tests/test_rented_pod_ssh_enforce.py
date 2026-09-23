@@ -419,6 +419,10 @@ def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
             boot_id_changed=False,
         )
         assert rented_pod_ssh.is_enforced(later_port) is False
+        # a reboot does not turn the keys-only accept into an accept of the later port outage
+        assert rented_pod_ssh.is_enforced(replace(later_port, boot_id_changed=True)) is False
+        # a streak with no stored accept faults enforces nothing: its accepted report is unknown
+        assert rented_pod_ssh.is_enforced(replace(unhealthy, backend_accepted_faults=[])) is False
         # a port-fault accept, then a cycle with only the keys unreadable: the boot rule reads this cycle too
         later_keys_only = replace(unhealthy, faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE], boot_id_changed=False)
         assert rented_pod_ssh.is_enforced(later_keys_only) is False

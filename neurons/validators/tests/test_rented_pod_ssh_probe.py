@@ -1202,8 +1202,8 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
         b'{"count": 2, "first_failed_at": "x", "reported": true}', now_iso=now
     )
     assert reported.reported is True and reported.next().reported is True
-    # pre-field streaks that already told the renter stay accepted
-    assert reported.backend_accepted is True
+    # a streak stored before the accept fields does not count as accepted: its faults are unknown
+    assert reported.backend_accepted is False
     assert (
         rented_pod_ssh.FailStreak.load(b'{"count": 2, "reported": "yes"}', now_iso=now).reported
         is False

@@ -210,13 +210,14 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
     (``verdict.backend_accepted``), and not while the last cycle-end gate held the reports as our
     own outage (``verdict.last_gate_suppressed``). Mail delivery is separate: a ``notify_failed``
     200 still accepts, and a cycle that only queued the notice — including a validator-side outage
-    the fleet gate holds — does not zero the node. Enforce only when the accepted fault was a port
-    fault; a keys-only accept does not let a later port fault zero the node. A renter who deletes
-    ``authorized_keys`` (that fault alone, host ``boot_id`` unchanged) is not enforced, whether that
-    is the accepted report's fault or this cycle's after a port-fault accept: the provider cannot
-    restore the keys. A pod never seen healthy carries no streak (``consecutive_cycles`` 0), a Redis
-    outage yields no verdict at all, and the flag off leaves the check with DAH-2870's
-    record-and-report behaviour: none of those is enforced.
+    the fleet gate holds — does not zero the node. A port-fault accept enforces; a keys-only accept
+    enforces only a keys-only cycle, never a later port fault the backend did not accept; a streak
+    with no stored accept faults enforces nothing. A renter who deletes ``authorized_keys`` (that
+    fault alone, host ``boot_id`` unchanged) is not enforced, whether that is the accepted report's
+    fault or this cycle's after a port-fault accept: the provider cannot restore the keys. A pod
+    never seen healthy carries no streak (``consecutive_cycles`` 0), a Redis outage yields no
+    verdict at all, and the flag off leaves the check with DAH-2870's record-and-report behaviour:
+    none of those is enforced.
     """
     if not settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED or verdict.healthy:
         return False
@@ -224,14 +225,16 @@ def is_enforced(verdict: RentedPodSshVerdict) -> bool:
         return False
     if not verdict.backend_accepted or verdict.last_gate_suppressed:
         return False
-    backend_accepted_faults = set(verdict.backend_accepted_faults) or set(verdict.faults)
+    backend_accepted_faults = set(verdict.backend_accepted_faults)
+    current_faults = set(verdict.faults)
+    keys_only_now = FAULT_AUTHORIZED_KEYS_UNREADABLE in current_faults and not (
+        _PORT_FAULTS & current_faults
+    )
     if _PORT_FAULTS & backend_accepted_faults:
-        current_faults = set(verdict.faults)
         # The boot rule reads this cycle's faults too: keys alone and no reboot is the renter's doing.
-        if FAULT_AUTHORIZED_KEYS_UNREADABLE in current_faults and not (_PORT_FAULTS & current_faults):
-            return verdict.boot_id_changed is True
-        return True
-    if FAULT_AUTHORIZED_KEYS_UNREADABLE in backend_accepted_faults:
+        return verdict.boot_id_changed is True if keys_only_now else True
+    # A keys-only accept covers a keys-only outage, never a later port fault.
+    if FAULT_AUTHORIZED_KEYS_UNREADABLE in backend_accepted_faults and keys_only_now:
         return verdict.boot_id_changed is True
     return False
 
@@ -328,13 +331,11 @@ class FailStreak:
         """The stored streak, or an empty one (count 0, started now) when the key is absent or unreadable.
 
         A count that is not a non-negative int is treated as 0, so a corrupt value restarts the streak
-        instead of raising inside the check. A pre-field streak with ``reported`` true is treated as
-        accepted so an in-flight outage keeps enforcing after deploy.
+        instead of raising inside the check.
         """
         value = _decode(raw) or {}
         count = value.get("count", 0)
         first_failed_at = value.get("first_failed_at")
-        reported = value.get("reported") is True
         backend_accepted_faults = [
             item for item in (value.get("accepted_faults") or []) if isinstance(item, str)
         ]
@@ -345,8 +346,8 @@ class FailStreak:
             first_failed_at=first_failed_at
             if isinstance(first_failed_at, str) and first_failed_at
             else now_iso,
-            reported=reported,
-            backend_accepted=value.get("accepted") is True or reported,
+            reported=value.get("reported") is True,
+            backend_accepted=value.get("accepted") is True,
             backend_accepted_faults=backend_accepted_faults,
         )
 
@@ -359,7 +360,6 @@ class FailStreak:
                 "count": self.count,
                 "first_failed_at": self.first_failed_at,
                 "reported": self.reported,
-                # the stored key stays "accepted": streaks already in Redis keep enforcing across the deploy
                 "accepted": self.backend_accepted,
                 "accepted_faults": list(self.backend_accepted_faults),
             }
