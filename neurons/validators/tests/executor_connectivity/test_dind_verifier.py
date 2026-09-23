@@ -606,6 +606,13 @@ def test_diagnose_docker_run_error_generic_nvml_failure_and_none_for_the_rest():
     assert diagnose_docker_run_error(SYSBOX_SHIFTFS_MOUNT_STDERR) is None
     assert diagnose_docker_run_error("unknown error") is None
     assert diagnose_docker_run_error(None) is None
+    # other hook errors used to miss `nvml error:` and keep the install-sysbox advice
+    load_library = (
+        "nvidia-container-cli: initialization error: load library failed: "
+        "libnvidia-ml.so.1: cannot open shared object file"
+    )
+    load_cause = diagnose_docker_run_error(load_library)
+    assert load_cause is not None and load_cause.code == "NVIDIA_CONTAINER_HOOK_FAILED"
 
 
 def test_diagnose_docker_run_error_quotes_from_the_hook_and_caps_head_first():

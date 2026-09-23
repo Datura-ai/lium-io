@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from core.config import settings
-from services.executor_connectivity.models import DIND_INNER_DOCKERD_CODES, DindLogCause
+from services.executor_connectivity.models import DIND_INNER_DOCKERD_CODES
 
-from ..messages import MessageTemplate, render_message
+from ..messages import render_message
 from ..messages import SysboxRequiredMessages as Msg
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
@@ -14,13 +14,6 @@ _NVIDIA_HOOK_TEMPLATES = {
     Msg.NVIDIA_RUNTIME_MISMATCH.reason: Msg.NVIDIA_RUNTIME_MISMATCH,
     Msg.NVIDIA_CONTAINER_HOOK_FAILED.reason: Msg.NVIDIA_CONTAINER_HOOK_FAILED,
 }
-
-
-def _nvidia_hook_template(cause: DindLogCause | None) -> MessageTemplate | None:
-    """The NVIDIA_* template for a probe cause whose code is one of ours; None otherwise."""
-    if cause is None:
-        return None
-    return _NVIDIA_HOOK_TEMPLATES.get(cause.code)
 
 
 class SysboxRequiredCheck:
@@ -70,7 +63,7 @@ class SysboxRequiredCheck:
         remediation = None
         cause = ctx.state.dind_probe_error
         template = Msg.SYSBOX_MISSING
-        nvidia_template = _nvidia_hook_template(cause)
+        nvidia_template = _NVIDIA_HOOK_TEMPLATES.get(cause.code) if cause else None
         if nvidia_template is not None:
             # DAH-3634: the probe's `docker run` was refused by the NVIDIA container hook, so
             # no sysbox verdict was measured and the node cannot start any GPU container;

@@ -62,15 +62,11 @@ DIND_SSHD_NOT_READY_MESSAGE = (
 DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
 
 
-# DAH-3634: `docker run` itself refused. 534 of 694 SYSBOX_REQUIRED_MISSING zero cycles in 7 d
-# (10 to 17 Sep, 21 executors) were the NVIDIA container hook refusing the probe's container —
-# the node cannot start any GPU container, sysbox or not, and "install sysbox" was the advice.
-# (pattern in docker's stderr, the cause it names), same shape as DIND_LOG_CAUSES; first match
-# wins. Only NVML failures are classified: a hook `mount error` is sysbox's shiftfs fallback
-# (nvidia_docker_sysbox_setup.sh --check) and a bound host port says nothing about the GPU stack,
-# so both keep the plain SYSBOX_REQUIRED_MISSING. The fix text lives on the matching
-# SysboxRequiredMessages template, keyed by the code. `NVIDIA_RUNTIME_MISMATCH` is the executor
-# updater's name for the same host condition (DAH-3481).
+# DAH-3634: `docker run` itself refused. A hook `mount error` is sysbox's shiftfs fallback
+# (nvidia_docker_sysbox_setup.sh --check) and stays unclassified. Match only
+# `initialization error:` and `detection error:` so other hook lines (and `mount error`)
+# keep SYSBOX_REQUIRED_MISSING. `NVIDIA_RUNTIME_MISMATCH` is the executor updater's name
+# for the same host condition (DAH-3481).
 DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
     (
         "nvml error: driver/library version mismatch",
@@ -81,7 +77,14 @@ DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
         ),
     ),
     (
-        "nvml error:",
+        "initialization error:",
+        DindLogCause(
+            "NVIDIA_CONTAINER_HOOK_FAILED",
+            "the NVIDIA container hook cannot start a GPU container: NVML failed on the host",
+        ),
+    ),
+    (
+        "detection error:",
         DindLogCause(
             "NVIDIA_CONTAINER_HOOK_FAILED",
             "the NVIDIA container hook cannot start a GPU container: NVML failed on the host",
@@ -169,7 +172,7 @@ class DindVerifier:
                     _m(
                         "DinD creation failed",
                         extra=get_extra_info(
-                            {**log_ctx, "error": error_msg, **({"cause": cause.code} if cause else {})}
+                            {**log_ctx, "error": error_msg, "cause": cause.code if cause else None}
                         ),
                     )
                 )
