@@ -921,6 +921,21 @@
           "default": null,
           "title": "Restore Path"
         },
+        "secrets": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Secrets"
+        },
         "ships_sshd": {
           "anyOf": [
             {
@@ -5300,7 +5315,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.1.0",
+  "protocol_version": "1.2.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import shlex
 import socket as socket_module
 import tempfile
 import threading
@@ -41,6 +43,14 @@ RENTAL_NETWORK_NAME = "lium-rentals"
 RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
+# DAH-1482: renter secrets live on a tmpfs, so a value exists only in the container's memory — never in
+# an image layer, `docker commit`, a volume backup, `docker inspect` Env or /etc/environment. The pod
+# runs as root (keys go to /root/.ssh), so the directory and every file stay root-owned.
+POD_SECRETS_DIR = "/run/lium/secrets"
+POD_SECRETS_TMPFS_OPTIONS = "rw,noexec,nosuid,nodev,size=1m,mode=0700"
+POD_SECRET_FILE_MODE = "0400"
+# The name becomes a file name and appears in exec argv/logs; only the value is secret.
+POD_SECRET_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 logger = logging.getLogger(__name__)
 
 
@@ -133,6 +143,8 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # container path -> mount options; empty sends no `Tmpfs` key at all
+    tmpfs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -846,6 +858,55 @@ def build_environment_exec_spec(
     )
 
 
+def valid_pod_secrets(secrets: dict[str, str] | None) -> dict[str, str]:
+    """The secrets to deliver; raises ValueError naming (never showing) a bad entry."""
+    valid: dict[str, str] = {}
+    for name, value in (secrets or {}).items():
+        if not isinstance(name, str) or not POD_SECRET_NAME_PATTERN.fullmatch(name):
+            raise ValueError(f"invalid secret name {name!r}: letters, digits and _ only, not starting with a digit")
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"secret {name} has an empty value")
+        valid[name] = value
+    return valid
+
+
+def build_pod_secrets_tmpfs(secrets: dict[str, str] | None) -> dict[str, str]:
+    return {POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS} if secrets else {}
+
+
+def build_secret_file_exec_specs(
+    *,
+    container_name: str,
+    secrets: dict[str, str] | None,
+) -> list[ContainerExecSpec]:
+    """One exec per secret; the value travels on stdin only, so it is never in argv or the exec logs.
+
+    The script refuses to write unless the directory is the tmpfs mount, so a missing mount can never
+    put a value on the container's disk layer.
+    """
+    secrets_dir = shlex.quote(POD_SECRETS_DIR)
+    specs = []
+    for name, value in valid_pod_secrets(secrets).items():
+        target = shlex.quote(f"{POD_SECRETS_DIR}/{name}")
+        partial_target = shlex.quote(f"{POD_SECRETS_DIR}/.{name}.partial")
+        script = (
+            "set -eu; umask 077; "
+            f"grep -qs ' '{secrets_dir}' tmpfs ' /proc/mounts "
+            f"|| {{ echo {secrets_dir} is not a tmpfs mount >&2; exit 1; }}; "
+            f"cat > {partial_target}; "
+            f"chmod {POD_SECRET_FILE_MODE} {partial_target}; "
+            f"mv -f {partial_target} {target}"
+        )
+        specs.append(
+            ContainerExecSpec(
+                container_name=container_name,
+                argv=("sh", "-c", script),
+                stdin=value,
+            )
+        )
+    return specs
+
+
 def _default_docker_api_client_factory(**kwargs):
     import docker
 
@@ -947,6 +1008,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         ),
         "shm_size": spec.shm_size,
         "network_mode": spec.network,
+        "tmpfs": dict(spec.tmpfs) or None,
     }
     return {key: value for key, value in kwargs.items() if value is not None}
 

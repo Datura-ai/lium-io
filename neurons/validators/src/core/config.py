@@ -228,6 +228,10 @@ class Settings(BaseSettings):
     # the inspector event, no renter is told, the score is untouched.
     INSPECTOR_ENFORCE_ENABLED: bool = Field(env="INSPECTOR_ENFORCE_ENABLED", default=False)
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
+    # DAH-1482: a rent's `secrets` are written one file each (0400) onto a tmpfs at /run/lium/secrets,
+    # never into the container env, /etc/environment or a disk layer. Off: `secrets` is ignored and the
+    # container is created exactly as before (no tmpfs mount, no extra exec).
+    POD_SECRETS_TMPFS_ENABLED: bool = Field(env="POD_SECRETS_TMPFS_ENABLED", default=False)
     # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
     # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the
     # plugin is already enabled — instead of five serial commands. Off: the per-command path.

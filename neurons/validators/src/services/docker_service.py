@@ -120,8 +120,11 @@ from services.rental_docker_sdk import (
     build_authorized_keys_exec_spec,
     build_container_command_argv,
     build_environment_exec_spec,
+    build_pod_secrets_tmpfs,
     build_remove_authorized_keys_exec_spec,
+    build_secret_file_exec_specs,
     require_rental_docker_ssh_host_key,
+    valid_pod_secrets,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
@@ -1005,6 +1008,13 @@ def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> boo
     )
 
 
+def _pod_secrets(payload: ContainerCreateRequest) -> dict[str, str]:
+    # DAH-1482: with the flag off a sent `secrets` is ignored, so the rent is exactly today's
+    if not settings.POD_SECRETS_TMPFS_ENABLED:
+        return {}
+    return valid_pod_secrets(payload.secrets)
+
+
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
@@ -1513,6 +1523,7 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            tmpfs=build_pod_secrets_tmpfs(_pod_secrets(payload)),
         )
 
     async def _ensure_pod_quote_socket(
@@ -3668,6 +3679,40 @@ class DockerService:
             )
             return f"exit_status={result.exit_status}; stderr={result.stderr}; stdout={result.stdout}"
 
+        return None
+
+    async def add_pod_secrets_with_rental_docker(
+        self,
+        docker_client: RentalDockerSdkClient,
+        *,
+        container_name: str,
+        secrets: dict[str, str],
+        log_tag: str,
+        log_extra: dict,
+    ) -> str | None:
+        # returns the failure cause, or None when every secret file was written; names only in logs
+        for name, exec_spec in zip(secrets, build_secret_file_exec_specs(container_name=container_name, secrets=secrets)):
+            try:
+                result = await exec_logged_rental_docker_sdk_operation(
+                    docker_client=docker_client,
+                    operation="exec_write_pod_secret",
+                    exec_spec=exec_spec,
+                    log_extra={**log_extra, "secret_name": name},
+                )
+            except Exception as exc:
+                cause = f"secret {name}: {exc}"
+            else:
+                if result.exit_status == 0:
+                    continue
+                cause = f"secret {name}: exit_status={result.exit_status}; stderr={result.stderr}"
+            await self.stream_log(f"Failed to write secret {name}", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to write pod secret",
+                    extra=get_extra_info({**log_extra, "container_name": container_name, "error": cause}),
+                )
+            )
+            return cause
         return None
 
     async def resolve_sysbox_subuid_base(
@@ -6056,6 +6101,19 @@ class DockerService:
                     )
                     if environment_error:
                         raise RuntimeError(f"Failed to set environment variables: {environment_error}")
+
+                    pod_secrets = _pod_secrets(payload)
+                    if pod_secrets:
+                        current_step = "write_pod_secrets"
+                        secrets_error = await self.add_pod_secrets_with_rental_docker(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            secrets=pod_secrets,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                        if secrets_error:
+                            raise RuntimeError(f"Failed to write pod secrets: {secrets_error}")
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.
