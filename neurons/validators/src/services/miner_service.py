@@ -1146,7 +1146,7 @@ class MinerService:
                         # DAH-3338: None when the cycle observed no rented pod and reaped nothing.
                         # The spec carries at most the backend's bound; the rest of the list goes
                         # in PodStatesReport chunks below, or waits for the next cycle.
-                        "pod_states": self._spec_pod_states(result, default_extra),
+                        "pod_states": self._pod_states_capped_for_spec(result, default_extra),
                     },
                 )
             except Exception as e:
@@ -1162,7 +1162,7 @@ class MinerService:
                 await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
 
     @staticmethod
-    def _spec_pod_states(result: JobResult, default_extra: dict) -> list[dict] | None:
+    def _pod_states_capped_for_spec(result: JobResult, default_extra: dict) -> list[dict] | None:
         if result.pod_states is None:
             return None
         bounded = bound_pod_states(result.pod_states)
