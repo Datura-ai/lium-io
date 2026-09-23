@@ -1605,6 +1605,25 @@ class DockerService:
             return f"volume inspect exit {result.exit_status}"
         return warm_pool.volume_mismatch(slot, result.stdout or "")
 
+    async def _warm_slot_volume_not_empty(
+        self, ssh_client: asyncssh.SSHClientConnection, slot: warm_pool.WarmSlot
+    ) -> str | None:
+        """Why the slot volume has files (`warm_pool.volume_not_empty`); a failed listing is a
+        mismatch too — a volume that cannot be read is never handed to a renter."""
+        try:
+            result = await ssh_client.run(
+                warm_pool.list_volume_files_command(slot.volume_name),
+                check=False,
+                timeout=_WARM_POOL_COMMAND_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return f"volume_list_failed:{type(exc).__name__}"
+        if result.exit_status != 0:
+            return f"volume list exit {result.exit_status}"
+        return warm_pool.volume_not_empty(result.stdout or "")
+
     async def _warm_slot_network_mismatch(
         self, ssh_client: asyncssh.SSHClientConnection, network_name: str
     ) -> str | None:
@@ -1651,9 +1670,9 @@ class DockerService:
         image_doc: dict,
     ) -> str | None:
         """Why `slot` must not become `run_spec`'s container, or None when it may: its settings
-        (`warm_pool.slot_matches`), then the live rental network, then its writable layer. Each read
-        happens only when the one before passed; the layer diff is last so it is the final read
-        before the rename."""
+        (`warm_pool.slot_matches`), then the live rental network, then the volume files, then its
+        writable layer. Each read happens only when the one before passed; the layer diff is last
+        so it is the final read before the rename."""
         try:
             reason = warm_pool.slot_matches(slot, run_spec, image_doc)
         except Exception as exc:
@@ -1668,6 +1687,9 @@ class DockerService:
             reason = await self._warm_slot_network_mismatch(ssh_client, run_spec.network)
             if reason is not None:
                 return reason
+        reason = await self._warm_slot_volume_not_empty(ssh_client, slot)
+        if reason is not None:
+            return reason
         # The settings matched; the filesystem is the miner's until the rename. A
         # created-never-started container's `docker diff` is empty, anything else is a layer the
         # renter must not start on.
@@ -1758,7 +1780,7 @@ class DockerService:
             await self._sweep_stale_warm_slots(
                 ssh_client=ssh_client, now=now, max_age=max_age, default_extra=default_extra
             )
-            images = await self._warm_pool_images(ssh_client)
+            images = await self._prepulled_image_refs(ssh_client)
             if not images:
                 return
             # one host-wide slot listing, shared by every image's sweep; each image is inspected alone
@@ -1773,7 +1795,7 @@ class DockerService:
                 )
                 return
             for image in images:
-                image_doc = await self._sweep_slots_and_image_to_fill(
+                image_doc = await self._sweep_slots_and_get_image_doc_if_no_slot(
                     ssh_client=ssh_client,
                     image=image,
                     slot_docs=slot_docs,
@@ -1803,7 +1825,7 @@ class DockerService:
         finally:
             self._warm_pool_maintaining.discard(executor_id)
 
-    async def _sweep_slots_and_image_to_fill(
+    async def _sweep_slots_and_get_image_doc_if_no_slot(
         self,
         *,
         ssh_client: asyncssh.SSHClientConnection,
@@ -1881,7 +1903,7 @@ class DockerService:
             )
             logger.info(_m("warm_pool slot=remove reason=stale", extra=get_extra_info({**default_extra, "slot": name})))
 
-    async def _warm_pool_images(self, ssh_client: asyncssh.SSHClientConnection) -> list[str]:
+    async def _prepulled_image_refs(self, ssh_client: asyncssh.SSHClientConnection) -> list[str]:
         """Image refs the executor's prefetch loop reports as pulled (DAH-2470 state file)."""
         result = await ssh_client.run(
             f"head -c {_WARM_POOL_STATE_READ_BYTES} {shlex.quote(PREFETCH_STATE_PATH)}",

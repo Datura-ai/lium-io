@@ -22,7 +22,7 @@ network, namespaces, capabilities, sysctls, ulimits, cgroup limits, restart poli
 cmd, entrypoint) and requires
 `State.Status == created` with a zero `StartedAt` — a container that ever ran is not a slot. The
 slot's volume is inspected as well (`volume_mismatch`): the size the rental is granted is the one
-the volume plugin recorded, never the label alone.
+the volume plugin recorded, never the label alone, and the volume must be empty (`volume_not_empty`).
 """
 
 from __future__ import annotations
@@ -347,6 +347,29 @@ def volume_mismatch(slot: WarmSlot, inspect_output: str) -> str | None:
     return None
 
 
+def list_volume_files_command(volume_name: str) -> str:
+    """Names of files in the slot volume. Empty stdout means the volume has no files."""
+    quoted = shlex.quote(volume_name)
+    return (
+        f"mp=$(/usr/bin/docker volume inspect {quoted} --format '{{{{.Mountpoint}}}}') && "
+        'ls -A -- "$mp"'
+    )
+
+
+VOLUME_NOT_EMPTY = "volume_not_empty"
+
+
+def volume_not_empty(listing: str) -> str | None:
+    """Why the slot volume is not empty; None when it has no files.
+
+    `volume_mismatch` reads the plugin's size record, not the files. The miner can write into
+    `/root` on the mounted volume before adoption; a renter would then start on that data.
+    """
+    if any(line.strip() for line in (listing or "").splitlines()):
+        return VOLUME_NOT_EMPTY
+    return None
+
+
 def inspect_network_command(network_name: str) -> str:
     """Driver and inter-container-traffic option of one docker network."""
     return (
@@ -457,11 +480,19 @@ def slot_matches(slot: WarmSlot, spec: ContainerRunSpec, image_doc: dict) -> str
     # The slot sits on the network the rental would run on — the ICC-off `lium-rentals` bridge
     # (DAH-3199, `spec.network`); a slot on docker0 or `host` would put the pod back on the network
     # that bridge exists to end. A spec without a network expects dockerd's default bridge.
+    # NetworkMode is only the first network; `docker network connect` can add another without
+    # changing it, so the attached names must be exactly the spec's network too.
     network_mode = host.get("NetworkMode") or "default"
     expected_network = spec.network or "default"
     if network_mode != expected_network and not (
         expected_network == "default" and network_mode == "bridge"
     ):
+        return "network"
+    attached = set(((doc.get("NetworkSettings") or {}).get("Networks") or {}).keys())
+    if spec.network:
+        if attached != {spec.network}:
+            return "network"
+    elif attached - {"bridge", "default"}:
         return "network"
     if (default_reason := _slot_keeps_dockerd_defaults(host)) is not None:
         return default_reason
@@ -692,7 +723,7 @@ def _expected_device_requests(requests: tuple[GpuDeviceRequest, ...]) -> list[De
     return sorted(out)
 
 
-def _load_json(text: str):
+def _load_json(text: str) -> object:
     if not text:
         return None
     try:

