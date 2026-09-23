@@ -247,7 +247,8 @@ class Settings(BaseSettings):
         description="dockerd default-address-pools JSON; must stay clear of 172.16/12, 192.168/16, 10.42.0.0/24.",
     )
     # A per-pod volume at /var/lib/docker: inner images, containers and volumes survive a reboot or
-    # an edit of the pod instead of starting empty. Removed with the pod.
+    # an edit of the pod instead of starting empty. Removed with the pod. Reset when an edit moves
+    # the pod to an older dockerd than the one that wrote it.
     RENTAL_DIND_PERSISTENT_STORE_ENABLED: bool = Field(env="RENTAL_DIND_PERSISTENT_STORE_ENABLED", default=False)
     # The store is a plaintext local volume, so an encrypted pod gets it only when this is on too.
     RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED: bool = Field(

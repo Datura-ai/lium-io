@@ -17,9 +17,15 @@ from services.rental_dind import (
     AddressPool,
     dind_base_volume_name,
     dind_companion_volume_names,
+    dind_store_reset_command,
+    dind_store_version_probe_command,
+    dind_store_version_record_command,
+    is_dind_store_downgrade,
     merge_inner_daemon_config,
     orphaned_dind_companion_volumes,
     parse_address_pools,
+    parse_dind_store_version_probe,
+    parse_dockerd_version,
     pool_network_conflicts,
     with_dind_companion_volumes,
 )
@@ -28,6 +34,7 @@ from services.rental_docker_sdk import (
     ContainerRunSpec,
     GpuDockerConfig,
     RentalDockerSdkClient,
+    VolumeMount,
 )
 
 # computenet-docker-images templates/pytorch/daemon.json, the /etc/docker/daemon.json of every
@@ -551,3 +558,205 @@ async def test_a_host_whose_rental_network_overlaps_the_pools_keeps_dockers_own(
         record.msg.extra["outcome"]
         == "skipped_pod_network_overlap: 10.200.0.0/14 overlaps 10.200.7.0/24"
     )
+
+
+# --- the store across a dockerd downgrade --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "version"),
+    [
+        ("Docker version 27.3.1, build ce12230", (27, 3, 1)),
+        ("Docker version 20.10.24+dfsg1, build 297e128", (20, 10, 24)),
+        ("Docker version v28.0, build x", (28, 0, 0)),
+        ("", None),
+        (None, None),
+        ("dockerd: not found", None),
+    ],
+)
+def test_the_dockerd_version_is_read_from_its_version_line(text, version):
+    assert parse_dockerd_version(text) == version
+
+
+@pytest.mark.parametrize(
+    ("recorded", "current", "downgrade"),
+    [
+        ("Docker version 28.1.0, build a", "Docker version 27.3.1, build b", True),
+        ("Docker version 27.3.1, build a", "Docker version 27.3.1, build b", False),
+        ("Docker version 27.3.1, build a", "Docker version 28.1.0, build b", False),
+        ("Docker version 28.1.0, build a", None, False),
+        (None, "Docker version 27.3.1, build b", False),
+        ("garbage", "Docker version 27.3.1, build b", False),
+    ],
+)
+def test_only_an_older_dockerd_than_the_stores_is_a_downgrade(recorded, current, downgrade):
+    assert is_dind_store_downgrade(recorded, current) is downgrade
+
+
+def test_the_version_probe_runs_the_images_dockerd_under_the_pods_runtime_without_network():
+    command = dind_store_version_probe_command(
+        store_volume="volume_x_docker",
+        image="img:1",
+        runtime="sysbox-runc",
+        helper_image="alpine:3.19",
+    )
+
+    assert command.startswith(
+        "/usr/bin/docker volume inspect volume_x_docker >/dev/null 2>&1 || exit 0; "
+    )
+    assert "-v volume_x_docker:/store:ro alpine:3.19 cat /store/.lium-dockerd-version" in command
+    assert "--network none --runtime sysbox-runc --entrypoint dockerd img:1 --version" in command
+    assert parse_dind_store_version_probe(
+        "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
+    ) == ("Docker version 28.1.0, build a", "Docker version 27.3.1, build b")
+    assert parse_dind_store_version_probe("recorded=\n") == (None, None)
+    assert parse_dind_store_version_probe("") == (None, None)
+
+
+def test_the_reset_empties_the_volume_and_the_record_writes_from_inside_the_pod():
+    assert dind_store_reset_command(store_volume="volume_x_docker", helper_image="alpine:3.19") == (
+        "/usr/bin/docker run --rm --network none -v volume_x_docker:/store alpine:3.19 "
+        "sh -c 'rm -rf /store/* /store/.[!.]* /store/..?*'"
+    )
+    record = dind_store_version_record_command("pod_x")
+    assert record.startswith("/usr/bin/docker exec pod_x sh -c ")
+    assert "command -v dockerd >/dev/null 2>&1 || exit 0" in record
+    assert "> /var/lib/docker/.lium-dockerd-version" in record
+
+
+class _Result:
+    def __init__(self, exit_status=0, stdout="", stderr=""):
+        self.exit_status, self.stdout, self.stderr = exit_status, stdout, stderr
+
+
+class _Ssh:
+    def __init__(self, probe_stdout="", reset_status=0, error=None):
+        self.commands: list[str] = []
+        self.probe_stdout, self.reset_status, self.error = probe_stdout, reset_status, error
+
+    async def run(self, command, timeout=None):
+        self.commands.append(command)
+        if self.error is not None:
+            raise self.error
+        if "rm -rf /store" in command:
+            return _Result(
+                exit_status=self.reset_status, stderr="denied" if self.reset_status else ""
+            )
+        if "volume inspect" in command:
+            return _Result(stdout=self.probe_stdout)
+        return _Result()
+
+
+def _store_spec(with_store=True) -> ContainerRunSpec:
+    volumes = [VolumeMount(source="volume_x", target="/root")]
+    if with_store:
+        volumes.append(VolumeMount(source="volume_x_docker", target="/var/lib/docker"))
+    return ContainerRunSpec(
+        image="img:1", name="pod_x", runtime="sysbox-runc", volumes=tuple(volumes)
+    )
+
+
+def _store_outcome(caplog) -> str:
+    [record] = [r for r in caplog.records if r.getMessage() == "Inner Docker store version"]
+    return record.msg.extra["outcome"]
+
+
+@pytest.mark.parametrize(
+    ("probe_stdout", "outcome", "reset"),
+    [
+        (
+            "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n",
+            "reset_on_downgrade",
+            True,
+        ),
+        (
+            "recorded=Docker version 27.3.1, build a\ncurrent=Docker version 27.3.1, build b\n",
+            "kept",
+            False,
+        ),
+        (
+            "recorded=Docker version 27.3.1, build a\ncurrent=Docker version 28.1.0, build b\n",
+            "kept",
+            False,
+        ),
+        ("recorded=Docker version 28.1.0, build a\ncurrent=\n", "kept", False),
+        ("", "no_marker", False),
+    ],
+    ids=["downgrade", "same", "upgrade", "image-without-dockerd", "new-store"],
+)
+@pytest.mark.asyncio
+async def test_the_store_is_emptied_only_on_a_dockerd_downgrade(
+    docker_service, caplog, probe_stdout, outcome, reset
+):
+    ssh = _Ssh(probe_stdout=probe_stdout)
+
+    await docker_service._reset_dind_store_on_downgrade(
+        ssh, run_spec=_store_spec(), local_volume="volume_x", default_extra={}
+    )
+
+    assert _store_outcome(caplog) == outcome
+    assert any("rm -rf /store" in c for c in ssh.commands) is reset
+    assert "--runtime sysbox-runc --entrypoint dockerd img:1 --version" in ssh.commands[0]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_version_probe_or_reset_keeps_the_create_going(docker_service, caplog):
+    await docker_service._reset_dind_store_on_downgrade(
+        _Ssh(error=OSError("ssh channel died")),
+        run_spec=_store_spec(),
+        local_volume="volume_x",
+        default_extra={},
+    )
+    assert _store_outcome(caplog) == "failed: OSError: ssh channel died"
+    caplog.clear()
+
+    downgrade = "recorded=Docker version 28.1.0, build a\ncurrent=Docker version 27.3.1, build b\n"
+    await docker_service._reset_dind_store_on_downgrade(
+        _Ssh(probe_stdout=downgrade, reset_status=1),
+        run_spec=_store_spec(),
+        local_volume="volume_x",
+        default_extra={},
+    )
+    assert _store_outcome(caplog) == "reset_failed: denied"
+
+
+@pytest.mark.asyncio
+async def test_a_pod_without_the_store_runs_no_store_commands(docker_service):
+    ssh = _Ssh()
+
+    await docker_service._reset_dind_store_on_downgrade(
+        ssh, run_spec=_store_spec(with_store=False), local_volume="volume_x", default_extra={}
+    )
+    await docker_service._record_dind_store_version(
+        ssh,
+        run_spec=_store_spec(with_store=False),
+        local_volume="volume_x",
+        container_name="pod_x",
+        default_extra={},
+    )
+
+    assert ssh.commands == []
+
+
+@pytest.mark.asyncio
+async def test_the_running_pods_dockerd_version_is_recorded_in_its_store(docker_service, caplog):
+    ssh = _Ssh()
+
+    await docker_service._record_dind_store_version(
+        ssh,
+        run_spec=_store_spec(),
+        local_volume="volume_x",
+        container_name="pod_x",
+        default_extra={},
+    )
+    assert ssh.commands == [dind_store_version_record_command("pod_x")]
+    assert "Inner Docker store version not recorded" not in caplog.text
+
+    await docker_service._record_dind_store_version(
+        _Ssh(error=OSError("gone")),
+        run_spec=_store_spec(),
+        local_volume="volume_x",
+        container_name="pod_x",
+        default_extra={},
+    )
+    assert "Inner Docker store version not recorded" in caplog.text

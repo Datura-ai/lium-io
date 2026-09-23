@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
+import shlex
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
@@ -33,6 +35,8 @@ DIND_STORE_TARGET = "/var/lib/docker"
 DIND_STORE_SUFFIX = "_docker"
 DIND_WORKSPACE_TARGET = "/workspace"
 DIND_WORKSPACE_SUFFIX = "_workspace"
+# In the store volume: the `dockerd --version` line of the last pod dockerd that used the store.
+DIND_STORE_VERSION_MARKER = ".lium-dockerd-version"
 _POD_VOLUME_PREFIX = "volume_"
 
 # Ranges an inner network must never shadow inside the pod: the host daemon's own pools and bridge
@@ -205,3 +209,76 @@ def pool_network_conflicts(pools: Sequence[AddressPool], subnets: Iterable[str])
             f"{pool.base} overlaps {subnet}" for pool in pools if pool.base.overlaps(subnet)
         )
     return conflicts
+
+
+_DOCKERD_VERSION_RE = re.compile(r"\bversion\s+v?(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
+
+
+def parse_dockerd_version(text: str | None) -> tuple[int, int, int] | None:
+    """(major, minor, patch) from a `dockerd --version` line ("Docker version 27.3.1, build …")."""
+    match = _DOCKERD_VERSION_RE.search(text or "")
+    if match is None:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch or 0)
+
+
+def is_dind_store_downgrade(recorded: str | None, current: str | None) -> bool:
+    """The pod's dockerd is older than the one that last wrote its store; unknown is not older."""
+    recorded_version = parse_dockerd_version(recorded)
+    current_version = parse_dockerd_version(current)
+    return (
+        recorded_version is not None
+        and current_version is not None
+        and current_version < recorded_version
+    )
+
+
+def dind_store_version_probe_command(
+    *, store_volume: str, image: str, runtime: str | None, helper_image: str
+) -> str:
+    """Prints `recorded=<marker>` and, when a marker exists, `current=<the image's dockerd --version>`.
+
+    A store volume that does not exist yet prints nothing. The image's dockerd runs under the pod's
+    own runtime with no network and no mounts, the way the pod itself would run it.
+    """
+    store = shlex.quote(store_volume)
+    runtime_flag = f" --runtime {shlex.quote(runtime)}" if runtime else ""
+    return (
+        f"/usr/bin/docker volume inspect {store} >/dev/null 2>&1 || exit 0; "
+        f"recorded=$(/usr/bin/docker run --rm --network none -v {store}:/store:ro {helper_image} "
+        f"cat /store/{DIND_STORE_VERSION_MARKER} 2>/dev/null | head -n 1); "
+        'printf "recorded=%s\\n" "$recorded"; [ -n "$recorded" ] || exit 0; '
+        f"current=$(/usr/bin/docker run --rm --network none{runtime_flag} --entrypoint dockerd "
+        f"{shlex.quote(image)} --version 2>/dev/null | head -n 1); "
+        'printf "current=%s\\n" "$current"'
+    )
+
+
+def parse_dind_store_version_probe(stdout: str | None) -> tuple[str | None, str | None]:
+    """(recorded, current) from dind_store_version_probe_command's output; a missing line is None."""
+    values: dict[str, str] = {}
+    for line in (stdout or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("recorded", "current") and value.strip():
+            values[key] = value.strip()
+    return values.get("recorded"), values.get("current")
+
+
+def dind_store_reset_command(*, store_volume: str, helper_image: str) -> str:
+    """Empty the store volume, keeping the volume itself (a parked container may still name it)."""
+    return (
+        f"/usr/bin/docker run --rm --network none -v {shlex.quote(store_volume)}:/store {helper_image} "
+        "sh -c 'rm -rf /store/* /store/.[!.]* /store/..?*'"
+    )
+
+
+def dind_store_version_record_command(container_name: str) -> str:
+    """Record the pod's dockerd version in its store, from inside the pod; an image without dockerd
+    records nothing and succeeds."""
+    marker = f"{DIND_STORE_TARGET}/{DIND_STORE_VERSION_MARKER}"
+    script = (
+        "command -v dockerd >/dev/null 2>&1 || exit 0; "
+        f'v=$(dockerd --version 2>/dev/null) && [ -n "$v" ] && printf "%s\\n" "$v" > {marker}'
+    )
+    return f"/usr/bin/docker exec {shlex.quote(container_name)} sh -c {shlex.quote(script)}"

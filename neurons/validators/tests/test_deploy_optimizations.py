@@ -971,3 +971,51 @@ async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
         {"username": "renter", "password": "renter-secret", "image": _DEFAULT_IMAGE}
     ]
     assert _login_step(result).skipped is False
+
+
+# ------------------------------------------------------------------
+# DAH-3796 — the inner Docker store's dockerd version around the create
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("running", [True, False], ids=["running", "not-running"])
+@pytest.mark.asyncio
+async def test_the_store_is_checked_before_the_create_and_recorded_once_the_pod_runs(svc, monkeypatch, running):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "RENTAL_DIND_PERSISTENT_STORE_ENABLED", True)
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+    events: list[tuple[str, object]] = []
+
+    async def _reset(ssh_client, *, run_spec, local_volume, default_extra):
+        events.append(("reset_on_downgrade", local_volume))
+
+    async def _record(ssh_client, *, run_spec, local_volume, container_name, default_extra):
+        events.append(("record_version", container_name))
+
+    async def _docker_run(**kwargs):
+        events.append(("docker_run", [(v.source, v.target) for v in kwargs["run_spec"].volumes][-1]))
+
+    async def _running(*args, **kwargs):
+        events.append(("health_check", running))
+        return running
+
+    monkeypatch.setattr(svc, "_reset_dind_store_on_downgrade", _reset)
+    monkeypatch.setattr(svc, "_record_dind_store_version", _record)
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", _docker_run)
+    monkeypatch.setattr(svc, "check_container_running", _running)
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation", AsyncMock(return_value=False))
+    payload = _payload(is_sysbox=True)
+
+    await _run(svc, payload)
+
+    volume = f"volume_{payload.pod_id}"
+    expected = [
+        ("reset_on_downgrade", volume),
+        ("docker_run", (f"{volume}_docker", "/var/lib/docker")),
+        ("health_check", running),
+    ]
+    if running:
+        expected.append(("record_version", f"pod_{payload.pod_id}"))
+    assert events[: len(expected)] == expected
+    assert ("record_version", f"pod_{payload.pod_id}") not in events[len(expected) :]
