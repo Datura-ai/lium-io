@@ -161,7 +161,7 @@ class DindVerifier:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                 # carried whether or not the probe asked for sysbox-runc: the executor's own sysbox
                 # self-report (machine_scrape.check_sysbox_gpu_compatibility) runs the same hook on the
-                # same host, so on 530 of 533 refused zero cycles sysbox_requested was already False
+                # same host, so a refusal without sysbox-runc has the same cause
                 cause = diagnose_docker_run_error(error_msg)
                 logger.error(
                     _m(

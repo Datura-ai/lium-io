@@ -18,7 +18,8 @@ class PortProbeResult:
 
 @dataclass(frozen=True)
 class DindLogCause:
-    """Why the DinD container's sshd never answered: a stable code and the words the provider reads."""
+    """Why the DinD probe failed — the container's sshd never answered, or `docker run` itself was refused
+    by the NVIDIA container hook: a stable code and the words the provider reads."""
 
     code: str
     message: str
