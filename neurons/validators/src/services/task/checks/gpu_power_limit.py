@@ -12,6 +12,7 @@ from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
     STALE_CAP_GRACE_SECONDS,
     GpuPowerRestoreRecord,
+    query_gpu_power_state,
     read_gpu_power_restore_records,
     restore_tracked_gpu_power_limits,
 )
@@ -170,15 +171,28 @@ class GpuPowerLimitCheck:
         """DAH-3630: the verdict while a Lium filler runs on this node.
 
         A GPU at or above the floor passes, whatever the host did to our cap: a host that raised
-        the limit back keeps PEARL and its unrented incentive. A below-floor GPU passes only when
-        this validator holds a restore record for it, i.e. Lium capped it. Any executor's record
-        counts here: a record frozen by an earlier failed restore keeps the executor id of the job
-        that first capped the GPU, and an executor that re-registers under a new id would otherwise
-        be charged for Lium's own cap. A below-floor GPU without a record is the host's own limit
-        (the cap failed and PEARL started uncapped, or a filler that never caps): it earns nothing
-        under the floor rule, so with ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS the node is
-        scored like any below-floor node; without it the breach is logged and the node passes.
-        Unknowns pass (a GPU without a uuid, a failed Redis read). Never restores: the filler is live.
+        the limit back keeps PEARL and its unrented incentive. A below-floor GPU passes when this
+        validator holds a restore record for it, i.e. Lium capped it. Any executor's record counts
+        here: a record frozen by an earlier failed restore keeps the executor id of the job that
+        first capped the GPU, and an executor that re-registers under a new id would otherwise be
+        charged for Lium's own cap. Any record also passes the GPU however far below Lium's cap the
+        host has since pushed it: the record holds the pre-cap limit, not the cap Lium applied, so
+        there is nothing to bound the reading by. A below-floor GPU without a record is the host's
+        own limit (the cap failed and PEARL started uncapped, or a filler that never caps): it earns
+        nothing under the floor rule, so with ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS the
+        node is scored like any below-floor node; without it the breach is logged and the node passes.
+
+        The scrape and ``rented_data`` are older than this check, so a filler teardown in between
+        (a customer rental pre-empting PEARL) leaves a capped reading whose record is already gone.
+        A GPU is charged only when it has no record before and after a live nvidia-smi read that
+        still shows it below the floor. Teardown restores the limit before it deletes the record,
+        and apply writes the record before it caps; so a live reading that is Lium's cap has its
+        record in one of the two reads, unless a whole cap and restore ran between them.
+
+        Records exist only in this validator's Redis and never expire: records lost to a wipe, a
+        migration or a second validator's Redis would read as the host's own limit on every GPU
+        Lium caps. Unknowns pass: a GPU without a uuid, a failed Redis read, a failed live read.
+        Never restores: the filler is live.
         """
         skipped = render_message(
             Msg.SKIPPED_ACTIVE_LIUM_FILLER,
@@ -188,18 +202,17 @@ class GpuPowerLimitCheck:
         )
         if not rejected or any(measurement.uuid is None for measurement in rejected):
             return CheckResult(passed=True, event=skipped)
-        read_result = await read_gpu_power_restore_records(
-            ctx.services.redis,
-            [measurement.uuid for measurement in rejected if measurement.uuid],
-            log_extra=ctx.default_extra,
-        )
-        capped_by_lium: set[str] = {record.gpu_uuid for record in read_result.records}
-        host_limited: list[GpuPowerMeasurement] = [
-            measurement for measurement in rejected if measurement.uuid not in capped_by_lium
-        ]
+        enforced: bool = settings.ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS
+        host_limited, read_failed = await self._without_lium_record(ctx, rejected)
+        if host_limited and not read_failed:
+            host_limited = await self._still_below_floor_now(ctx, host_limited)
+            if host_limited:
+                host_limited, read_failed = await self._without_lium_record(ctx, host_limited)
         if not host_limited:
             return CheckResult(passed=True, event=skipped)
-        if read_result.read_failed:
+        if read_failed:
+            if not enforced:
+                return CheckResult(passed=True, event=skipped)
             return CheckResult(
                 passed=True,
                 event=render_message(
@@ -212,7 +225,6 @@ class GpuPowerLimitCheck:
                     },
                 ),
             )
-        enforced: bool = settings.ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS
         logger.info(
             _m(
                 "Lium filler runs on a GPU the host holds below the power floor, not capped by Lium"
@@ -232,6 +244,59 @@ class GpuPowerLimitCheck:
         if not enforced:
             return CheckResult(passed=True, event=skipped)
         return self._below_floor_result(ctx, host_limited, measurements, incomplete)
+
+    async def _without_lium_record(
+        self, ctx: Context, below_floor: list[GpuPowerMeasurement]
+    ) -> tuple[list[GpuPowerMeasurement], bool]:
+        """The GPUs among ``below_floor`` with no restore record, and whether the Redis read failed."""
+        read_result = await read_gpu_power_restore_records(
+            ctx.services.redis,
+            [measurement.uuid for measurement in below_floor if measurement.uuid],
+            log_extra=ctx.default_extra,
+        )
+        capped_by_lium: set[str] = {record.gpu_uuid for record in read_result.records}
+        without_record = [
+            measurement for measurement in below_floor if measurement.uuid not in capped_by_lium
+        ]
+        return without_record, read_result.read_failed
+
+    async def _still_below_floor_now(
+        self, ctx: Context, suspects: list[GpuPowerMeasurement]
+    ) -> list[GpuPowerMeasurement]:
+        """The suspects a live nvidia-smi read still shows below the floor, carrying that reading.
+        A GPU the read does not report, or a failed read, clears the suspect for this cycle."""
+        try:
+            live_by_uuid = await query_gpu_power_state(ctx.ssh)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    f"Live GPU power read failed under a Lium filler; no power-floor charge this cycle: {exc}",
+                    extra=get_extra_info({**ctx.default_extra, "executor_uuid": ctx.executor.uuid}),
+                )
+            )
+            return []
+        still_below: list[GpuPowerMeasurement] = []
+        for suspect in suspects:
+            live = live_by_uuid.get(suspect.uuid or "")
+            if live is None:
+                continue
+            default_limit = (
+                float(live.default_watts) if live.default_watts else suspect.power_default_limit
+            )
+            if not default_limit:
+                continue
+            ratio = live.current_watts / default_limit
+            if ratio < MIN_POWER_LIMIT_RATIO:
+                still_below.append(
+                    suspect.model_copy(
+                        update={
+                            "power_limit": float(live.current_watts),
+                            "power_default_limit": default_limit,
+                            "power_limit_ratio": round(ratio, 4),
+                        }
+                    )
+                )
+        return still_below
 
     async def _rescue_stale_lium_caps(
         self, ctx: Context, rejected: list[GpuPowerMeasurement]

@@ -11,6 +11,7 @@ from services.gpu_power_limit import (
     STALE_CAP_GRACE_SECONDS,
     GpuPowerRestoreReadResult,
     GpuPowerRestoreRecord,
+    GpuPowerState,
 )
 from services.task.checks import gpu_power_limit as check_module
 from services.task.checks.gpu_power_limit import GpuPowerLimitCheck
@@ -48,6 +49,26 @@ def read_records_mock(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     # own stale filler caps. Tests drive it through this mock (ctx.services.redis is None here).
     mock = AsyncMock(return_value=_read_result())
     monkeypatch.setattr(check_module, "read_gpu_power_restore_records", mock)
+    return mock
+
+
+def _live_state(
+    current_watts: int, *gpu_uuids: str, default_watts: int = 350
+) -> dict[str, GpuPowerState]:
+    return {
+        gpu_uuid: GpuPowerState(
+            current_watts=current_watts, min_watts=100, max_watts=450, default_watts=default_watts
+        )
+        for gpu_uuid in gpu_uuids
+    }
+
+
+@pytest.fixture
+def live_power_mock(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    # DAH-3630: the live nvidia-smi read the check takes before charging a GPU under a Lium filler.
+    # By default the host still holds both test GPUs below the floor.
+    mock = AsyncMock(return_value=_live_state(105, "GPU-abc", "GPU-abc-1"))
+    monkeypatch.setattr(check_module, "query_gpu_power_state", mock)
     return mock
 
 
@@ -189,7 +210,7 @@ async def test_host_that_reverted_the_cap_keeps_its_score_under_a_lium_filler(
 
 @pytest.mark.asyncio
 async def test_host_held_limit_under_a_lium_filler_is_only_logged_while_the_flag_is_off(
-    context_factory, read_records_mock, monkeypatch
+    context_factory, read_records_mock, live_power_mock, monkeypatch
 ) -> None:
     """DAH-3630 regression: the floor for uncapped filler GPUs leaking out of its flag. Off, a below-floor
     GPU with no Lium record passes as before and the breach is one shadow log line."""
@@ -211,12 +232,13 @@ async def test_host_held_limit_under_a_lium_filler_is_only_logged_while_the_flag
 
 @pytest.mark.asyncio
 async def test_host_held_limit_under_a_lium_filler_earns_nothing_with_the_flag_on(
-    context_factory, read_records_mock, restore_mock, monkeypatch
+    context_factory, read_records_mock, live_power_mock, restore_mock, monkeypatch
 ) -> None:
     """DAH-3630 regression: the live-filler pass paying for a limit Lium never set. PEARL started uncapped
     (its cap failed) or a filler that never caps runs, and the host holds the GPU below the floor: that
-    node is scored like any below-floor node."""
+    node is scored like any below-floor node, on the live reading it was charged for."""
     monkeypatch.setattr(settings, "ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", True)
+    live_power_mock.return_value = _live_state(100, "GPU-abc")
     ctx = context_factory(state=_state(current_limit=105, default_limit=350, default_job_owner="lium"))
 
     result = await GpuPowerLimitCheck().run(ctx)
@@ -225,7 +247,67 @@ async def test_host_held_limit_under_a_lium_filler_earns_nothing_with_the_flag_o
     assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
     assert result.updates["score"] == 0.0
     assert result.updates["job_score"] == 0.0
+    assert result.event.what_we_saw["rejected_gpus"][0]["power_limit"] == 100
+    assert read_records_mock.await_count == 2  # before and after the live read
     restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_filler_teardown_after_the_scrape_never_charges_lium_own_cap(
+    context_factory, read_records_mock, live_power_mock, restore_mock, monkeypatch
+) -> None:
+    """DAH-3630 regression: a customer rental pre-empts PEARL after the scrape read GPU-abc at Lium's
+    cap and before this check reads Redis. The teardown restored the limit and then deleted the record,
+    so the check sees owner lium, a capped reading and no record. The live read shows the restored
+    limit, so the node passes instead of scoring 0 for a cap Lium set."""
+    monkeypatch.setattr(settings, "ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", True)
+    mock_logger = Mock()
+    monkeypatch.setattr(check_module, "logger", mock_logger)
+    live_power_mock.return_value = _live_state(350, "GPU-abc")
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350, default_job_owner="lium"))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == "GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER"
+    assert not result.updates
+    live_power_mock.assert_awaited_once()
+    mock_logger.info.assert_not_called()  # not counted in the shadow log either
+    restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_filler_capped_after_the_first_record_read_is_not_charged(
+    context_factory, read_records_mock, live_power_mock, monkeypatch
+) -> None:
+    """DAH-3630: a fresh PEARL apply writes its record, then caps, between the first Redis read and the
+    live read. The live read sees Lium's cap; the second Redis read finds its record."""
+    monkeypatch.setattr(settings, "ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", True)
+    read_records_mock.side_effect = [_read_result(), _read_result(_restore_record(age_seconds=1))]
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350, default_job_owner="lium"))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == "GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER"
+    assert not result.updates
+
+
+@pytest.mark.asyncio
+async def test_failed_live_read_never_zeroes_a_node_under_a_lium_filler(
+    context_factory, read_records_mock, live_power_mock, monkeypatch
+) -> None:
+    """DAH-3630: without a live reading the scrape's may predate a teardown; pass this cycle."""
+    monkeypatch.setattr(settings, "ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", True)
+    live_power_mock.side_effect = RuntimeError("nvidia-smi power-state query failed")
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350, default_job_owner="lium"))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == "GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER"
+    assert not result.updates
+    read_records_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -250,7 +332,7 @@ async def test_frozen_record_from_an_earlier_executor_id_still_proves_the_cap_un
 
 @pytest.mark.asyncio
 async def test_only_the_gpu_lium_did_not_cap_is_charged_under_a_lium_filler(
-    context_factory, read_records_mock, monkeypatch
+    context_factory, read_records_mock, live_power_mock, monkeypatch
 ) -> None:
     """DAH-3630: GPU-abc carries our cap record, GPU-abc-1 sits below the floor without one. The node
     fails on GPU-abc-1 alone, so the provider sees the GPU to fix, not the one Lium capped."""
@@ -282,6 +364,24 @@ async def test_unreadable_records_never_zero_a_node_under_a_lium_filler(
     assert result.event.reason_code == "GPU_POWER_LIMIT_STATE_UNAVAILABLE"
     assert not result.updates
     restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unreadable_records_keep_main_skip_event_while_the_flag_is_off(
+    context_factory, read_records_mock, live_power_mock, monkeypatch
+) -> None:
+    """DAH-3630 regression: with the flag off the event stream stays main's. A Redis error under a live
+    filler emits the skip, not GPU_POWER_LIMIT_STATE_UNAVAILABLE."""
+    monkeypatch.setattr(settings, "ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", False)
+    read_records_mock.return_value = _read_result(read_failed=True)
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350, default_job_owner="lium"))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == "GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER"
+    assert not result.updates
+    live_power_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

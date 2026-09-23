@@ -245,6 +245,12 @@ async def _query_power_state(
     return _parse_power_state_csv(result.stdout)
 
 
+async def query_gpu_power_state(ssh: asyncssh.SSHClientConnection) -> dict[str, GpuPowerState]:
+    """Every host GPU's power limits right now, keyed by uuid: one read-only nvidia-smi call, never
+    the pre-run probe. Raises when nvidia-smi fails."""
+    return await _query_power_state(ssh)
+
+
 async def _enable_persistence_mode(
     ssh: asyncssh.SSHClientConnection,
     uuid: str,
