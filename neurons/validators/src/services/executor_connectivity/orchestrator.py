@@ -3,7 +3,8 @@ import logging
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import BATCH_PORT_VERIFICATION_SIZE
+from core.config import settings
+from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
@@ -43,6 +44,7 @@ class ConnectivityOrchestrator:
         ports = self.port_selector.select(
             executor_info, BATCH_PORT_VERIFICATION_SIZE, set(unavailable_ports or [])
         )
+        declared_port_count = self.port_selector.declared_count(executor_info)
 
         if not ports:
             return PortVerificationResult(
@@ -53,6 +55,7 @@ class ConnectivityOrchestrator:
                 dind_ok=False,
                 sysbox_runtime=sysbox_runtime,
                 status="no_ports",
+                declared_port_count=declared_port_count,
             )
 
         probe_result = await self.port_probe.probe(
@@ -82,6 +85,17 @@ class ConnectivityOrchestrator:
             failed.append(dind_port)
             sysbox_runtime = False
 
+        # After DinD, not before: a batch of exactly MIN_PORT_COUNT whose DinD port fails publishes one fewer.
+        tier = probe_result.tier
+        if tier == "batch" and len(successful) < MIN_PORT_COUNT and settings.PORT_PROBE_TOPUP_BELOW_FLOOR:
+            successful, failed, tier = await self.port_probe.top_up(
+                successful,
+                failed,
+                ssh_client=ssh_client,
+                host=executor_info.address,
+                log_ctx=log_ctx,
+            )
+
         status = "ok" if successful else "no_working_ports"
         return PortVerificationResult(
             selected_ports=tuple(ports),
@@ -92,5 +106,6 @@ class ConnectivityOrchestrator:
             sysbox_runtime=sysbox_runtime,
             status=status,
             dind_error=dind_result.error,
-            probe_tier=probe_result.tier,
+            probe_tier=tier,
+            declared_port_count=declared_port_count,
         )

@@ -144,7 +144,8 @@ class ContextState:
     verified_port_count: int = 0
     # verified_port_count is out of the ports probed this cycle (at most BATCH_PORT_VERIFICATION_SIZE,
     # the lowest free ones), never the declared range: declared - probed were not probed at all,
-    # probed - verified were probed and did not answer. None until PortConnectivityCheck runs.
+    # probed - verified were probed and did not answer. None until PortConnectivityCheck runs;
+    # declared_port_count also stays None when the declared range or mappings could not be parsed.
     probed_port_count: int | None = None
     declared_port_count: int | None = None
     # DAH-2991: orphaned rental containers the stale cleanup could not remove this cycle; they still

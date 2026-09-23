@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from services.const import MIN_PORT_COUNT, UNRENTED_MULTIPLIER
+from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT, UNRENTED_MULTIPLIER
 
 from ..messages import FinalizeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -40,10 +40,12 @@ class FinalizeCheck:
         if shortfall is not None:
             impact = f"{hidden_from_renters_text(shortfall)}. {impact}"
             what["port_floor"] = port_floor_what(ctx.state, shortfall)
-            remediation = (
-                f"Make at least {MIN_PORT_COUNT} ports of the declared range reachable from the internet "
-                "through Docker published ports; the next cycle probes them again."
+            port_floor_fix = (
+                f"Only ports that answer among the lowest {BATCH_PORT_VERIFICATION_SIZE} free ports of the "
+                f"declared range count: allow at least {MIN_PORT_COUNT} of them through the host firewall and "
+                "any port forwarding, or declare only open ports; the next cycle probes them again."
             )
+            remediation = f"{remediation} {port_floor_fix}" if ctx.score_warning else port_floor_fix
 
         event = render_message(
             Msg.COMPLETED,

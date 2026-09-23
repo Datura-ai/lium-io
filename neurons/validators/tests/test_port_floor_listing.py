@@ -19,6 +19,7 @@ from neurons.validators.src.services.task.checks.port_count import PortCountChec
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import (
     FinalizeMessages,
+    PortConnectivityMessages,
     PortCountMessages,
     TenantEnforcementMessages,
 )
@@ -37,7 +38,7 @@ DECLARED_RANGE = "40000-65535"
 EXECUTOR_UUID = "executor-123"
 
 
-def executor() -> ExecutorSSHInfo:
+def executor(port_range: str = DECLARED_RANGE) -> ExecutorSSHInfo:
     return ExecutorSSHInfo(
         uuid=EXECUTOR_UUID,
         address="127.0.0.1",
@@ -46,7 +47,7 @@ def executor() -> ExecutorSSHInfo:
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
-        port_range=DECLARED_RANGE,
+        port_range=port_range,
     )
 
 
@@ -79,9 +80,68 @@ class DindOk:
         return DindProbeResult(success=True, sysbox_runtime=True, port=port)
 
 
-def connectivity(batch, semi, fallback) -> ExecutorConnectivityService:
+class DindFails:
+    async def verify(self, port, *, ssh_client, host, container_name_prefix, sysbox_runtime, log_ctx=None):
+        return DindProbeResult(success=False, sysbox_runtime=False, port=port)
+
+
+def connectivity(batch, semi, fallback, dind=None) -> ExecutorConnectivityService:
     return ExecutorConnectivityService(
-        orchestrator=ConnectivityOrchestrator(PortSelector(), PortProbe(batch, semi, fallback), DindOk())
+        orchestrator=ConnectivityOrchestrator(PortSelector(), PortProbe(batch, semi, fallback), dind or DindOk())
+    )
+
+
+class PerPodSSHClient(DummySSHClient):
+    """`docker ps` answers per container: running only for the names in `running`."""
+
+    def __init__(self, running: set[str]):
+        super().__init__(pod_running=False)
+        self.running = running
+
+    async def run(self, command: str):
+        result = await super().run(command)
+        if "docker ps" in command:
+            result.stdout = "container_id_123" if any(name in command for name in self.running) else ""
+        return result
+
+
+class PerPodBackendClient(DummyBackendClient):
+    """get_pod_rental_active answers per pod: active only for the ids in `active`."""
+
+    def __init__(self, active: set[str]):
+        super().__init__(active=False)
+        self.active_pods = active
+
+    async def get_pod_rental_active(self, pod_id: str):
+        record = await super().get_pod_rental_active(pod_id)
+        record.active = pod_id in self.active_pods
+        return record
+
+
+class RentalsBackendClient(DummyBackendClient):
+    """Answers the fresh rented-executors read PortConnectivityCheck makes after a failed verification."""
+
+    def __init__(self, rented_data: RentedExecutorsResponse | None, **kwargs):
+        super().__init__(**kwargs)
+        self.rented_data = rented_data
+
+    async def get_all_rented_executors(self):
+        return self.rented_data
+
+
+def rented_with_pods(*pod_ids: str) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            EXECUTOR_UUID: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8001",
+                pods=[
+                    RentedPod(pod_id=pod_id, container_name=f"container_{pod_id}", rented_ports=[65000 + i])
+                    for i, pod_id in enumerate(pod_ids)
+                ],
+            )
+        }
     )
 
 
@@ -98,7 +158,16 @@ def rented_with_one_pod() -> RentedExecutorsResponse:
     )
 
 
-def run_context(context_factory, connectivity_service, *, rented_data=None, ssh=None, backend=None):
+def run_context(
+    context_factory,
+    connectivity_service,
+    *,
+    rented_data=None,
+    ssh=None,
+    backend=None,
+    port_range=DECLARED_RANGE,
+    score_warning=None,
+):
     redis = AsyncMock()
     redis.renting_in_progress.return_value = False
     redis.record_dind_probe_miss.return_value = True
@@ -108,14 +177,14 @@ def run_context(context_factory, connectivity_service, *, rented_data=None, ssh=
         **({"backend": backend} if backend is not None else {}),
     )
     return context_factory(
-        executor=executor(),
+        executor=executor(port_range),
         services=services,
         config=build_context_config(job_batch_id="batch-1"),
         state=build_state(rented_data=rented_data, gpu_processes=[], gpu_details=[]),
         ssh=ssh,
         score=1.0,
         job_score=1.0,
-        score_warning=None,
+        score_warning=score_warning,
         contract_version="1.0.3",
         collateral_deposited=True,
     )
@@ -286,3 +355,172 @@ async def test_topup_falls_through_to_the_sequential_tier_when_semi_batch_reache
     assert len(fallback.calls[0]) == 10
     assert ctx.state.verified_port_count == 11
     assert ctx.default_extra["probe_tier"] == "batch+fallback"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pod_order",
+    [("pod-live", "pod-stale"), ("pod-stale", "pod-live")],
+    ids=["live-then-stale", "stale-then-live"],
+)
+async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enforcement_flag(
+    context_factory, monkeypatch, pod_order
+):
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods(*pod_order),
+        ssh=PerPodSSHClient(running={"container_pod-live"}),
+        backend=PerPodBackendClient(active={"pod-live"}),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert ctx.state.specs["available_port_count"] == 2
+    assert count_result.passed is True
+    # main's verdict for this node, flag or no flag: the stale pod is reported and the run goes on
+    assert tenant_result.passed is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    assert tenant_result.event.what_we_saw["pod_id"] == "pod-stale"
+
+
+@pytest.mark.asyncio
+async def test_every_listed_pod_stale_fails_insufficient_ports_with_the_enforcement_flag(
+    context_factory, monkeypatch
+):
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods("pod-a", "pod-b"),
+        ssh=PerPodSSHClient(running=set()),
+        backend=PerPodBackendClient(active=set()),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is False
+    assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+    assert tenant_result.event.what_we_saw["stale_pod"]["pod_id"] == "pod-a"
+
+
+@pytest.mark.asyncio
+async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods("pod-stale", "pod-down"),
+        ssh=PerPodSSHClient(running=set()),
+        backend=PerPodBackendClient(active={"pod-down"}),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_port_range_is_a_non_fatal_verify_failure_on_an_unrented_node(context_factory):
+    """Flags off, `40000:65535` (a colon, not a dash): main's verdicts, never an exception out of the check."""
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        backend=RentalsBackendClient(None),
+        port_range="40000:65535",
+    )
+
+    connectivity_result, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, ctx = await apply(ctx, PortCountCheck())
+
+    assert PortConnectivityCheck.fatal is False
+    assert connectivity_result.passed is False
+    assert connectivity_result.event.reason_code == PortConnectivityMessages.VERIFY_FAILED.reason
+    assert connectivity_result.event.what_we_saw["verification_status"] == "error"
+    assert ctx.state.verified_port_count == 0
+    assert ctx.state.declared_port_count is None
+    assert count_result.passed is False
+    assert count_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_port_range_keeps_a_rented_node_on_its_rented_score(context_factory):
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_one_pod(),
+        ssh=DummySSHClient(pod_running=True),
+        backend=RentalsBackendClient(rented_with_one_pod(), active=True),
+        port_range="40000:65535",
+    )
+
+    connectivity_result, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert connectivity_result.event.reason_code == PortConnectivityMessages.VERIFY_FAILED.reason
+    assert count_result.passed is True
+    assert tenant_result.passed is True
+    assert tenant_result.halt is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
+
+
+@pytest.mark.asyncio
+async def test_topup_runs_when_the_dind_miss_takes_a_batch_of_three_below_the_floor(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", True)
+    batch, semi = HostNetworkBatch(reachable=MIN_PORT_COUNT), PublishedPorts()
+    ctx = run_context(context_factory, connectivity(batch, semi, PublishedPorts(), dind=DindFails()))
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+
+    # the DinD port (the batch's first) failed, so 2 were left and the -p tiers got the failed ports
+    assert len(semi.calls) == 1
+    assert semi.calls[0][0] == PortPair(40003, 40003)
+    assert ctx.state.verified_port_count == 2 + 50
+    assert ctx.default_extra["probe_tier"] == "batch+semi_batch"
+    assert ctx.default_extra["dind_ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_dind_miss_on_a_batch_of_three_publishes_two_with_the_topup_flag_off(context_factory):
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=MIN_PORT_COUNT), PublishedPorts(), PublishedPorts(), dind=DindFails()),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+
+    assert ctx.state.specs["available_port_count"] == MIN_PORT_COUNT - 1
+    assert ctx.default_extra["probe_tier"] == "batch"
+    assert ctx.default_extra["dind_ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_the_score_warning_and_adds_the_port_floor_fix(context_factory):
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_one_pod(),
+        ssh=DummySSHClient(pod_running=False),
+        backend=DummyBackendClient(active=False),
+        score_warning="GPU runtime NVML driver/library mismatch",
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    _, ctx = await apply(ctx, TenantEnforcementCheck())
+    final_result, _ = await apply(ctx, FinalizeCheck())
+
+    remediation = final_result.event.remediation
+    assert remediation.startswith("No action needed.GPU runtime NVML driver/library mismatch ")
+    assert f"lowest {BATCH_PORT_VERIFICATION_SIZE} free ports of the declared range" in remediation
+    assert f"allow at least {MIN_PORT_COUNT} of them through the host firewall" in remediation

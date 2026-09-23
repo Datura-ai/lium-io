@@ -1,6 +1,5 @@
 import logging
 
-from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.models import PortPair, PortProbeResult
@@ -65,25 +64,24 @@ class PortProbe:
             )
             tier = "fallback"
 
-        # A host-network batch can reach only a few listeners (a ufw INPUT policy drops them, or a
-        # probe lands before its nc has bound) while published ports, the path a renter's pod uses,
-        # would answer; below the floor that partial count hides the node, so the -p tiers get a turn.
-        if tier == "batch" and len(successful) < MIN_PORT_COUNT and settings.PORT_PROBE_TOPUP_BELOW_FLOOR:
-            successful, failed, tier = await self._top_up(
-                successful, failed, ssh_client=ssh_client, host=host, log_ctx=log_ctx
-            )
-
         return PortProbeResult(tuple(successful), tuple(failed), tier)
 
-    async def _top_up(
+    async def top_up(
         self,
         successful: list[PortPair],
         failed: list[PortPair],
         *,
         ssh_client,
         host: str,
-        log_ctx: dict,
+        log_ctx: dict | None = None,
     ) -> tuple[list[PortPair], list[PortPair], str]:
+        """Re-probe `failed` through the published-port (-p) tiers until MIN_PORT_COUNT answer.
+
+        A host-network batch can reach only a few listeners (a ufw INPUT policy drops them, or a
+        probe lands before its nc has bound) while published ports, the path a renter's pod uses,
+        would answer; below the floor that partial count hides the node, so the -p tiers get a turn.
+        """
+        log_ctx = log_ctx or {}
         logger.warning(
             _m(
                 f"batch verified {len(successful)}/{len(successful) + len(failed)}, below the floor of "

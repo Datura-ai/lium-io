@@ -12,9 +12,10 @@ from ..pipeline import CheckResult, Context, ContextState
 def listing_port_shortfall(state: ContextState) -> int | None:
     """The published `available_port_count` when it is below MIN_PORT_COUNT, else None.
 
-    The backend lists and rents a node only at `available_port_count >= MIN_PORT_COUNT` (lium-platform
-    `daos/executor.py` get_available_executors, `services/executor.py` rent path), with no exemption for
-    a rented node, so any run that publishes a lower count leaves the node's free GPUs hidden from renters.
+    The backend lists a node only at `available_port_count >= MIN_PORT_COUNT` (lium-platform
+    `daos/executor.py` get_available_executors), with no exemption for a rented node, so any run that
+    publishes a lower count leaves the node's free GPUs hidden from renters. The rent path gates
+    separately, on MIN_PORT_COUNT free `verified_ports` (`services/executor.py`).
     None before PortCountCheck has written the count.
     """
     available: Any = state.specs.get("available_port_count")

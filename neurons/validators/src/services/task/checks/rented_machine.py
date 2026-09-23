@@ -7,6 +7,7 @@ import asyncssh
 
 from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
+from protocol.vc_protocol.compute_requests import RentedPod
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ...const import (
@@ -164,7 +165,7 @@ class TenantEnforcementCheck:
         if rented_pods and len(known_pod_gpu_counts) == len(rented_pods):
             extra["rented_gpu_count"] = sum(known_pod_gpu_counts)
 
-        for pod in rented_pods:
+        for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.container_name
             pod_id = pod.pod_id
             try:
@@ -193,11 +194,16 @@ class TenantEnforcementCheck:
                         ),
                         "diagnostics": diagnostics,
                     }
-                    # PortCountCheck exempted this node from the port floor for this pod alone (it reads
-                    # the batch-start rented list); the pod is gone, so the node goes on as unrented
-                    # with a count the backend will not list.
+                    # PortCountCheck exempted this node from the port floor because the batch-start rented
+                    # list named a pod; the node goes on as unrented with a count the backend will not list.
+                    # The floor is enforced only when every listed pod is stale: a live rental on the same
+                    # node is a real exemption, and this loop returns before it would reach later pods.
                     shortfall = listing_port_shortfall(ctx.state)
-                    if shortfall is not None and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD:
+                    if (
+                        shortfall is not None
+                        and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
+                        and await _every_listed_pod_stale(ctx, rented_pods, pod_index)
+                    ):
                         event = render_message(
                             PortCountMessages.INSUFFICIENT_PORTS,
                             ctx=ctx,
@@ -483,6 +489,28 @@ async def _recover_pod_after_stale_vloopback_mount(
             )
         )
         return False
+
+
+async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_index: int) -> bool:
+    """True only when every listed pod is not running and its rental is closed.
+
+    `rented_pods[stale_index]` is already known stale. The loop only gets past a pod that is running
+    (or was recovered), so any pod before it is live. Anything unknown (no rental record, a dead SSH
+    transport) counts as live, so the floor is never enforced on a guess.
+    """
+    if stale_index > 0:
+        return False
+    for other in rented_pods[1:]:
+        try:
+            running, _ = await _check_pod_running(ctx.ssh, other.container_name)
+        except (asyncssh.Error, OSError):
+            return False
+        if running:
+            return False
+        rental_active = await ctx.services.backend.get_pod_rental_active(other.pod_id)
+        if not rental_active or rental_active.active:
+            return False
+    return True
 
 
 async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str]]:
