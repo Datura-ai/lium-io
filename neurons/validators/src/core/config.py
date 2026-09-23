@@ -460,6 +460,7 @@ class Settings(BaseSettings):
     # True: a run whose only exemption from the port floor was a pod that TenantEnforcementCheck
     # then finds stale (STALE_POD_NOT_RUNNING) fails INSUFFICIENT_PORTS, the verdict PortCountCheck
     # gives an unrented node. False: the run completes and its events say the node is hidden.
+    # It stops idle pay on those nodes, so it stays off until the validator owner turns it on.
     ENFORCE_PORT_FLOOR_ON_STALE_POD: bool = Field(env="ENFORCE_PORT_FLOOR_ON_STALE_POD", default=False)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
