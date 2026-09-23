@@ -590,6 +590,56 @@ def custom_build_inner_command(image_tag: str, ctx: str) -> str:
     )
 
 
+# DAH-3505: the create steps whose exception text is the Docker daemon's own reason for the
+# volume (size, plugin, disk, or the SDK's transport) and carries no executor host data.
+VOLUME_STEP_NAMES = frozenset({"volume_sizing", "volume_creation"})
+VOLUME_STEP_DETAIL_MAX_CHARS = 300
+# docker-py's SSH transport stack (urllib3 over a paramiko channel) raises these once the session
+# under the Docker SDK client is gone; the text alone reads like a code bug, so the detail says what
+# it means.
+DEAD_DOCKER_SSH_SESSION_MARKERS = (
+    "has no attribute 'settimeout'",
+    "SSH session not active",
+    "Socket is closed",
+)
+DEAD_DOCKER_SSH_SESSION_HINT = (
+    "the Docker connection to the executor dropped while the pod was being prepared"
+)
+
+
+def _exception_text_on_one_line(exc: BaseException) -> str:
+    """The exception's text on one line, whitespace collapsed."""
+    return " ".join(str(exc).split())
+
+
+def _is_dead_docker_ssh_session(exc: BaseException) -> bool:
+    text = _exception_text_on_one_line(exc)
+    return any(marker in text for marker in DEAD_DOCKER_SSH_SESSION_MARKERS)
+
+
+def volume_step_detail(exc: BaseException) -> str | None:
+    """One bounded line saying why the volume step failed, or None when the exception has no text.
+    A dead Docker SDK transport gets a plain-language hint in front of the raw error."""
+    text = _exception_text_on_one_line(exc)
+    if not text:
+        return None
+    if _is_dead_docker_ssh_session(exc):
+        text = f"{DEAD_DOCKER_SSH_SESSION_HINT}: {text}"
+    return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
+
+
+def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
+    """Volume steps return the daemon reason via volume_step_detail. Other steps return
+    DEAD_DOCKER_SSH_SESSION_HINT on a dead Docker SSH session, else None."""
+    if current_step in VOLUME_STEP_NAMES:
+        return volume_step_detail(exc)
+    if isinstance(exc, CustomBuildFailed):
+        return None
+    if _is_dead_docker_ssh_session(exc):
+        return DEAD_DOCKER_SSH_SESSION_HINT
+    return None
+
+
 class CustomBuildFailed(Exception):
     """A custom-Dockerfile build did not produce an image. `failure_step` is the CCF step
     (docker_build, build_timeout, build_dind_start, ...); `log_tail` is what the build printed last,
@@ -6187,6 +6237,9 @@ class DockerService:
                 ),
                 # Renter-safe on its own: the output of the renter's Dockerfile, no executor host data.
                 build_log_tail=e.log_tail if isinstance(e, CustomBuildFailed) else None,
+                # The Docker daemon's reason for a volume failure; the dead-transport hint alone for
+                # any other step it surfaces at (docker_run on a template switch); else None.
+                step_detail=failure_step_detail(e, current_step),
             )
 
     async def _run_bootstrap_restore(

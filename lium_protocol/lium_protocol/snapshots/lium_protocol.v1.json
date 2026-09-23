@@ -2813,6 +2813,18 @@
           "default": null,
           "title": "Sent At"
         },
+        "step_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Step Detail"
+        },
         "volume_encryption_status": {
           "anyOf": [
             {
