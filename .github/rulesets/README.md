@@ -54,7 +54,8 @@ gh api "repos/$R/rulesets" --method POST --input .github/rulesets/release-tags.j
 
 `release-tags.json` targets the four release tag patterns with the rules `creation`, `update`
 and `deletion`; the bypass list is the release role, given as GitHub user ids
-(`gh api users/<login> --jq .id`): `114649324` = `surcyf123`, `4623096` = `arhangel66`.
+(`gh api users/<login> --jq .id`): `114649324` = `surcyf123`, `4623096` = `arhangel66`,
+`10954604` = `taiberium`, `231022467` = `jam6099` (the members who push release tags today).
 Add a person by appending `{ "actor_id": <id>, "actor_type": "User", "bypass_mode": "always" }`.
 
 Check: `gh api "repos/$R/rulesets?targets=tag" --jq '.[]|.name+" "+.enforcement'` → `release-tags active`.
