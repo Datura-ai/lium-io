@@ -45,6 +45,7 @@ def network(download, upload=None, **measurements) -> dict:
         "download_speed": download,
         "upload_speed": upload,
         "download_source": "cloudflare" if download else None,
+        "upload_source": "cloudflare" if upload else None,
         "measurements": measurements,
         "ema_download_speed": 480.0,
     }
@@ -145,10 +146,10 @@ def test_defaults_log_only():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("download", [None, 0, 0.0])
-async def test_no_measured_download_fails_with_no_outbound_internet(download):
-    """Regression: a scrape with no download measured (None) or a zero passes."""
-    ctx, _ = make_ctx(network(download))
+@pytest.mark.parametrize("download,upload", [(None, None), (0, 0), (0.0, None), (None, 0.0)])
+async def test_a_scrape_that_measured_neither_direction_fails_with_no_outbound_internet(download, upload):
+    """Regression: a scrape with neither a download nor an upload measured (None) or a zero passes."""
+    ctx, _ = make_ctx(network(download, upload))
     with flags():
         res = await OutboundInternetCheck().run(ctx)
     assert res.passed is False
@@ -169,6 +170,41 @@ async def test_every_speed_test_erroring_fails_and_carries_the_errors():
     errors = res.event.what_we_saw["scrape"]["speed_errors"]
     assert set(errors) == {"speedtest_cli", "cloudflare", "netmeasure", "speedcheck"}
     assert "curl" in errors["cloudflare"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("download", [None, 0.0])
+async def test_a_null_download_with_a_working_upload_and_a_passing_pod_probe_passes(download):
+    """Regression: 24 of one provider's 27 active nodes had no download (a Cloudflare download recorded as
+    0) and fail NO_OUTBOUND_INTERNET for it once enforcement is on, although their pods reach out."""
+    ctx, _ = make_ctx(network(download, 90.0, cloudflare={"download_speed": None, "upload_speed": 90.0}))
+    with flags():
+        res = await OutboundInternetCheck().run(ctx)
+    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_OK.reason
+    assert res.event.what_we_saw["scrape"]["no_egress"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "enforced,passed,reason",
+    [
+        (True, False, Msg.NO_OUTBOUND_INTERNET.reason),
+        (False, True, Msg.NO_OUTBOUND_INTERNET_OBSERVED.reason),
+    ],
+)
+async def test_14e704ba_null_download_working_upload_and_a_pod_network_without_egress(
+    enforced, passed, reason
+):
+    """Regression: 14e704ba (no download, upload 77-105 Mbps, 3 renters' pods without internet) is a
+    pod-network-only fault; the scrape measured an upload, so only the in-pod probe can fail it."""
+    net = network(None, 90.0, cloudflare={"download_speed": None, "upload_speed": 90.0})
+    ctx, runner = make_ctx(net, pod=result(POD_NO_ANSWER))
+    with flags(enforced=enforced):
+        res = await OutboundInternetCheck().run(ctx)
+    assert res.passed is passed and res.event.reason_code == reason
+    assert res.event.what_we_saw["failed_by"] == ["pod_probe"]
+    assert res.event.what_we_saw["scrape"]["no_egress"] is False
+    assert len(runner.commands) == 2
 
 
 @pytest.mark.asyncio
@@ -322,6 +358,14 @@ async def test_dry_run_reads_the_scrape_without_a_container():
     assert runner.commands == []
 
 
+@pytest.mark.asyncio
+async def test_dry_run_passes_a_null_download_with_a_working_upload():
+    ctx, _ = make_ctx(network(None, 90.0))
+    with flags():
+        res = await OutboundInternetCheck(run_pod_probe=False).run(ctx)
+    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_OK.reason
+
+
 def _rental_run_spec(*, is_sysbox: bool):
     payload = SimpleNamespace(
         is_sysbox=is_sysbox,
@@ -379,6 +423,9 @@ async def test_the_check_sends_the_node_runtime_to_the_pod_probe():
 def test_scrape_without_a_network_block_is_no_reading():
     assert scrape_egress_finding({}) is None
     assert scrape_egress_finding({"network": {"download_speed": float("nan")}})["no_egress"] is True
+    measured_up = {"network": {"download_speed": None, "upload_speed": 90.0, "upload_source": "cloudflare"}}
+    assert scrape_egress_finding(measured_up)["no_egress"] is False
+    assert scrape_egress_finding(measured_up)["upload_source"] == "cloudflare"
 
 
 def _stub(directory, name: str, body: str) -> None:

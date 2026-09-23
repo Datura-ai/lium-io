@@ -147,10 +147,11 @@ def _is_positive_number(value: Any) -> bool:
 def scrape_egress_finding(specs: dict[str, Any] | None) -> dict[str, Any] | None:
     """What the scrape's speed tests say about egress; None when the scrape carried no network block.
 
-    benchmark_network_speed keeps the first download any method measured and each method's
-    `network_speed_error` under `measurements`. An error from a method a later one measured past is not
-    a finding (speedtest-cli missing, Cloudflare answered); a scrape where no method measured a
-    download is: every test failed to leave the executor container.
+    benchmark_network_speed keeps the first download and upload any method measured and each method's
+    `network_speed_error` under `measurements`. A finding only when neither direction was measured: a
+    missing download alone is not one (ticket-0361: 24 of one provider's 27 active nodes had no download,
+    most of them a Cloudflare download recorded as 0, and 14e704ba's upload measured 77-105 Mbps), nor
+    is an error from a method a later one measured past.
     """
     network = (specs or {}).get("network")
     if not isinstance(network, dict):
@@ -162,11 +163,13 @@ def scrape_egress_finding(specs: dict[str, Any] | None) -> dict[str, Any] | None
         if isinstance(measurement, dict) and measurement.get("network_speed_error"):
             errors[method] = str(measurement["network_speed_error"])[:_TAIL_CHARS]
     download = network.get("download_speed")
+    upload = network.get("upload_speed")
     return {
-        "no_egress": not _is_positive_number(download),
+        "no_egress": not _is_positive_number(download) and not _is_positive_number(upload),
         "download_speed": download,
-        "upload_speed": network.get("upload_speed"),
+        "upload_speed": upload,
         "download_source": network.get("download_source"),
+        "upload_source": network.get("upload_source"),
         "speed_errors": errors,
     }
 
@@ -180,8 +183,10 @@ def _is_rented(ctx: Context) -> bool:
 class OutboundInternetCheck:
     """Fail an idle node whose containers cannot reach the internet (NO_OUTBOUND_INTERNET).
 
-    Two readings, either one is enough: the scrape measured no download at all, or a container on the
-    rental network (`pod_probe_command`) could not resolve pypi.org or got no HTTP answer from it. A
+    Two readings, either one is enough: a container on the rental network (`pod_probe_command`, the
+    pod's network and runtime) could not resolve pypi.org or got no HTTP answer from it, or the scrape
+    measured neither a download nor an upload. The pod probe is the one that sees a pod-network-only
+    fault (14e704ba: no download, 77-105 Mbps upload, 3 renters without internet). A
     slow host passes: speed stays behind FeatureFlag.VERIFYX_NETWORK_VALIDATION. A pod probe that did
     not run (docker refused it, the SSH command timed out) reaches no verdict, never fails the node and
     is logged as OUTBOUND_INTERNET_UNMEASURED, not as verified. A pod probe that says no_egress is run
