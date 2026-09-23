@@ -65,7 +65,7 @@ DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_ME
 # DAH-3634: `docker run` itself refused by the NVIDIA container hook. Every hook line counts
 # except `mount error`: that is sysbox's shiftfs fallback (nvidia_docker_sysbox_setup.sh --check)
 # and keeps SYSBOX_REQUIRED_MISSING. `NVIDIA_RUNTIME_MISMATCH` is the executor updater's name
-# for the same host condition (DAH-3481).
+# for the same host condition (watchtower/src/watchtower.py RUNTIME_PROBE_NVIDIA_MISMATCH).
 _HOOK_LINE_START = "nvidia-container-cli:"
 _SYSBOX_HOOK_ERROR = "nvidia-container-cli: mount error:"
 DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (

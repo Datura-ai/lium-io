@@ -196,9 +196,8 @@ def test_every_docker_run_cause_has_a_template_and_no_template_lacks_a_cause():
 
 @pytest.mark.asyncio
 async def test_nvidia_driver_mismatch_gets_its_own_reason_code_not_sysbox_missing(context_factory):
-    """534 of 694 SYSBOX_REQUIRED_MISSING zero cycles in 7 d were this hook refusal on 21 executors: the
-    node cannot start any GPU container and "install sysbox" cannot fix it. Scoring is unchanged: the
-    check still fails."""
+    """The hook refused the probe: the node cannot start any GPU container and "install sysbox"
+    cannot fix it. Scoring is unchanged: the check still fails."""
     cause = _cause(NVIDIA_MISMATCH_STDERR)
     ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
 

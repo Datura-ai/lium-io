@@ -555,7 +555,7 @@ async def test_dind_verifier_diagnosis_read_failure_still_returns_a_cause(mocker
 
 # DAH-3634 — `docker run` refused by the NVIDIA container hook names the real cause.
 
-# verbatim from the validator log (`DinD creation failed`, 10 to 17 Sep 2026; 1,990 lines on 42 executors)
+# verbatim from the validator log (`DinD creation failed`)
 NVIDIA_MISMATCH_STDERR = (
     "docker: Error response from daemon: failed to create task for container: failed to create shim task: "
     "OCI runtime create failed: runc create failed: unable to start container process: error during container "
@@ -674,8 +674,7 @@ async def test_dind_verifier_docker_run_refused_by_the_nvidia_hook_carries_the_c
 async def test_dind_verifier_carries_the_cause_when_sysbox_was_not_requested(mocker):
     """The executor's own sysbox self-report (machine_scrape.check_sysbox_gpu_compatibility) runs
     the same hook on the same host and is refused too, so the probe runs without sysbox-runc on
-    exactly these nodes: 530 of 533 refused zero cycles had sysbox_requested=False. The cause must
-    be carried either way or the fix reaches nobody."""
+    exactly these nodes. The cause must be carried either way or the fix reaches nobody."""
     port = PortPair(9000, 9000)
     ssh_service = mocker.Mock()
     ssh_service.generate_keypair.return_value = ("priv", "pub")
