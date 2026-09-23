@@ -56,33 +56,24 @@ class VerifyXSettings(BaseSettings):
         default=120,
         description="Timeout for network tests in seconds"
     )
-    # DAH-2774: which library and which download reading is THE network number (the published
-    # verifyx_download_speed, the 100 Mbps EMA floor in checks/verifyx.py,
-    # NETWORK_MIN_DOWNLOAD_SPEED_MBPS). Both images ship two builds: libverifyx.so, the one every
-    # executor runs today, and libverifyx_capacity.so (celium-gpu-verifier#25, the Cloudflare
-    # capacity probe).
-    #   off     libverifyx.so and its package download, as before DAH-2774.
-    #   shadow  exactly off; then one light libverifyx_capacity.so run whose capacity reading is
-    #           recorded next to it (event `network_gate`, the per-cycle "VerifyX network gate
-    #           summary" log line) and scores nothing.
-    #   enforce libverifyx_capacity.so gates on its capacity reading, with the package download
-    #           under its own floor; an executor without that library fails VerifyX as outdated.
-    # A value outside the three refuses to start the validator.
-    NETWORK_GATE_MODE: Literal["off", "shadow", "enforce"] = Field(
-        default="shadow",
-        description="Network gate reading: off | shadow (package gates, capacity recorded) | enforce",
-    )
+    # DAH-2774: one library, one number. libverifyx.so's Cloudflare capacity is the gated
+    # and published download (verifyx_download_speed, the 100 Mbps EMA floor in checks/verifyx.py).
+    # There is no off/shadow/enforce flag. A Cloudflare probe failure (429, timeout, outage)
+    # falls back to the package download instead of feeding the EMA a zero.
     NETWORK_MIN_DOWNLOAD_SPEED_MBPS: float = Field(
         default=50.0,
-        description="Minimum gated download speed in Mbps (package in off/shadow, capacity in enforce)"
+        description="Minimum Cloudflare capacity download speed in Mbps",
     )
-    # DAH-2774: the package download (one 251–478 MB HuggingFace/PyPI object, celium-gpu-verifier
-    # pkg_verify/verified_pkg_list.json) is an integrity check first; its speed follows the CDN edge
-    # more than the host's pipe, so under enforce its floor is a separate knob and can be lowered
-    # without touching the capacity floor.
     NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS: float = Field(
         default=50.0,
-        description="Minimum package (integrity object) download speed in Mbps under enforce"
+        description="Minimum package (integrity object) download speed in Mbps; also the Cloudflare fallback floor",
+    )
+    # When the executor's libverifyx.so hash does not match the validator, curl this URL once,
+    # install, check the hash, and retry. The validator's own file is the source of truth if
+    # the fetch hash differs.
+    LIBRARY_FETCH_URL: str = Field(
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libverifyx.so",
+        description="Raw GitHub URL the executor curls when its libverifyx.so hash does not match",
     )
     ENABLE_XET_CHALLENGE: bool = Field(
         default=True,

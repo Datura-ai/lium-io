@@ -86,7 +86,6 @@ COPY . .
 
 RUN mv /root/app/libdmcompverify.so /usr/lib/ \
   && mv /root/app/libverifyx.so /usr/lib/ \
-  && mv /root/app/libverifyx_capacity.so /usr/lib/ \
   && mv /root/app/libinspector.so /usr/lib/
 
 # Remove existing SSH host keys

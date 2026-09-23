@@ -21,7 +21,6 @@ COPY . .
 
 RUN mv libdmcompverify.so /usr/lib/
 RUN mv libverifyx.so /usr/lib/
-RUN mv libverifyx_capacity.so /usr/lib/
 RUN mv libinspector.so /usr/lib/
 
 ENV ENV=prod

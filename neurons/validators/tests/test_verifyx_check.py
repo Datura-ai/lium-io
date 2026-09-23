@@ -73,15 +73,6 @@ class DummyVerifyXService:
                 data = {"success": False, "errors": "Verification failed"}
                 return MockVerifyXResponse(data=data)
 
-    async def measure_capacity_shadow(
-        self, *, shell, executor_info, default_extra: dict, machine_spec: dict, timeout_seconds: float
-    ) -> dict:
-        """The shadow libverifyx_capacity.so run (VERIFYX_NETWORK_GATE_MODE=shadow): `capacity_run`
-        when a test sets one, else an executor without that library."""
-        self.capacity_timeout_seconds = timeout_seconds
-        return dict(getattr(self, "capacity_run", None) or {"status": "library_missing"})
-
-
 @pytest.mark.parametrize(
     "verifyx_enabled,has_specs,verify_success,error_msg,updated_specs,expected_pass,expected_reason",
     [
@@ -251,10 +242,9 @@ async def test_verifyx_failure_without_diagnostics_falls_back_to_generic_templat
 
 
 @pytest.fixture
-def enforce_gate(monkeypatch):
-    # The malformed-reading guard is enforce-only; off/shadow feed the EMA as main does
-    # (test_verifyx_network_gate_mode.py).
-    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "enforce")
+def enforce_gate():
+    """Kept so existing usefixtures names still collect. Capacity is the only gated number."""
+    return None
 
 
 def _rented_data_with_ema(executor_uuid: str, *, download: float | None = None, upload: float | None = None) -> RentedExecutorsResponse:

@@ -11,8 +11,8 @@ asserted is what reaches `specs.network` — the keys lium-platform's `best_down
 Three properties:
 1. the capacity, not the single-stream figure, is published and gated (the B300 SXM6 PC hosts,
    owner 22 Sep 2026: "show the accurate total bandwidth capacity of all the nodes");
-2. a probe that could not reach Cloudflare publishes no download sample and decays the EMA —
-   one outage never fails a host that was above the gate, repeated ones do;
+2. a probe that could not reach Cloudflare falls back to the package download instead of
+   feeding the EMA a zero, so an outage does not delist an honest host;
 3. the EMA handoff: a host whose stored EMA came from the single-stream era moves toward the
    capacity on its first parallel-stream sample, and the scrape's empty `network` block leaves
    only VerifyX keys behind.
@@ -50,10 +50,7 @@ B300_PC_UPLOAD_MBPS = 1900.0
 PACKAGE = {"pkg": "distilbert-base-uncased.tar", "size": 268_000_000, "hash": "sha256:abc"}
 
 
-@pytest.fixture(autouse=True)
-def _enforce_the_capacity_gate(monkeypatch):
-    # Everything here is VERIFYX_NETWORK_GATE_MODE=enforce; off/shadow: test_verifyx_network_gate_mode.py.
-    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "enforce")
+# Capacity is the only gated number. There is no off/shadow/enforce flag.
 
 
 def _challenge_data() -> dict:
@@ -228,19 +225,17 @@ def test_package_floor_reads_the_single_stream_figure_only():
 # 2. Cloudflare unreachable ---------------------------------------------------------------------
 
 
-def test_cloudflare_unreachable_keeps_the_package_reading_and_reports_no_capacity():
+def test_cloudflare_unreachable_falls_back_to_the_package_reading():
     stats, errors = _verify_network_test(
         _challenge_data(), {"network_execution": _cloudflare_unreachable_payload()}
     )
 
-    assert stats == {
-        "download_speed": None,  # no capacity sample — never 0.0 published as a speed
-        "upload_speed": 0.0,  # the failed direction, as the probe reports it
-        "package_download_speed": B300_PC_SINGLE_STREAM_MBPS,
-        "capacity_download_speed": None,
-        "success": False,
-        "execution_time_ms": 131_200,
-    }
+    assert stats["download_speed"] == B300_PC_SINGLE_STREAM_MBPS
+    assert stats["package_download_speed"] == B300_PC_SINGLE_STREAM_MBPS
+    assert stats["capacity_download_speed"] is None
+    assert stats["cloudflare_fallback"] is True
+    assert stats["success"] is True
+    assert stats["upload_speed"] == 0.0
     assert errors == [
         "Network execution failed: Cloudflare download failed: error sending request for url "
         "(https://speed.cloudflare.com/__down?bytes=75000000): connection refused"
@@ -248,33 +243,33 @@ def test_cloudflare_unreachable_keeps_the_package_reading_and_reports_no_capacit
 
 
 @pytest.mark.asyncio
-async def test_cloudflare_unreachable_once_decays_the_ema_and_the_host_stays_above_the_gate(
+async def test_cloudflare_unreachable_uses_the_package_reading_and_does_not_feed_the_ema_a_zero(
     context_factory,
 ):
-    """Flag off (today's fleet): the probe's failure is recorded, the host passes, no raw download
-    is published (the platform's `verifyx_download_speed` rung keeps its last value), and the
-    EMA takes one 0.0 sample: 2400 → 1200, still over 100."""
+    """A Cloudflare outage is our probe's third party, not the host's. The package download
+    becomes the gated number (180), never a zero: 2400 → 1290, still over 100."""
     verification = _judge(_cloudflare_unreachable_payload())
-    assert verification["success"] is True  # network is not required while the flag is off
-    assert verification["network"]["success"] is False
+    assert verification["success"] is True
+    assert verification["network"]["success"] is True
+    assert verification["network"]["cloudflare_fallback"] is True
 
     result = await _run_check(context_factory, verification, prev_ema=B300_PC_CAPACITY_MBPS)
 
     assert result.passed is True
-    assert result.event.what_we_saw["verifyx_network_success"] is False
     net = result.updates["state"].specs["network"]
-    assert "verifyx_download_speed" not in net
+    assert net["verifyx_download_speed"] == B300_PC_SINGLE_STREAM_MBPS
     assert net["ema_verifyx_download_speed"] == pytest.approx(
-        compute_ema(B300_PC_CAPACITY_MBPS, 0.0)
+        compute_ema(B300_PC_CAPACITY_MBPS, B300_PC_SINGLE_STREAM_MBPS)
     )
-    assert net["ema_verifyx_download_speed"] == pytest.approx(1200.0)
+    assert net["ema_verifyx_download_speed"] == pytest.approx(1290.0)
     assert net["ema_verifyx_download_speed"] > MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
 @pytest.mark.asyncio
-async def test_cloudflare_unreachable_for_five_cycles_fails_the_gate(context_factory):
-    """The outage rule is unchanged from before this PR: 2400 × 0.5⁵ = 75 < 100 → fatal on the
-    fifth cycle, and the event names the EMA that tripped it."""
+async def test_cloudflare_unreachable_for_five_cycles_does_not_delist_an_honest_host(
+    context_factory,
+):
+    """Five Cloudflare outages feed the package reading, not zeros. The host stays above the gate."""
     ema = B300_PC_CAPACITY_MBPS
     outcomes = []
     for _ in range(5):
@@ -283,27 +278,25 @@ async def test_cloudflare_unreachable_for_five_cycles_fails_the_gate(context_fac
         ema = result.updates["state"].specs["network"]["ema_verifyx_download_speed"]
         outcomes.append(result.passed)
 
-    assert outcomes == [True, True, True, True, False]
-    assert ema == pytest.approx(75.0)
-    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
-    assert result.event.what_we_saw["ema_verifyx_download_speed"] == pytest.approx(75.0)
+    assert all(outcomes)
+    assert ema > MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
 @pytest.mark.asyncio
-async def test_cloudflare_unreachable_rejects_the_host_when_the_network_flag_is_on(
+async def test_cloudflare_unreachable_still_passes_when_the_network_flag_is_on(
     context_factory,
 ):
-    """With `verifyx_network_validation` on, an unreachable Cloudflare is a failed verification
-    (the check's failure path, `errors` carried) — not a pass with a decayed EMA."""
+    """The package fallback is the gated number, so the network flag does not fail an honest host
+    for a Cloudflare outage."""
     verification = _judge(_cloudflare_unreachable_payload(), network_flag=True)
-    assert verification["success"] is False
+    assert verification["success"] is True
+    assert verification["network"]["cloudflare_fallback"] is True
 
     result = await _run_check(context_factory, verification, prev_ema=B300_PC_CAPACITY_MBPS)
 
-    assert result.passed is False
-    assert result.event.reason_code == Msg.VERIFY_FAILED.reason
-    assert result.event.what_we_saw["errors"] == verification["errors"]
-    assert result.updates == {}
+    assert result.passed is True
+    net = result.updates["state"].specs["network"]
+    assert net["verifyx_download_speed"] == B300_PC_SINGLE_STREAM_MBPS
 
 
 # 3. EMA handoff -----------------------------------------------------------------------------

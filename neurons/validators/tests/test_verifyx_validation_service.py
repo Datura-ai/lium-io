@@ -29,11 +29,6 @@ from neurons.validators.src.services.verifyx_validation_service import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _enforce_the_capacity_gate(monkeypatch):
-    # The network tests here pin VERIFYX_NETWORK_GATE_MODE=enforce; off/shadow:
-    # test_verifyx_network_gate_mode.py.
-    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "enforce")
 
 
 def _executor_info() -> SimpleNamespace:
@@ -340,7 +335,7 @@ def test_format_mbps_and_network_speed_log_line(caplog):
         "cloudflare_download_mbps=125.50 "
         "cloudflare_upload_mbps=20.25 "
         "success=True "
-        "gate_mode=enforce "
+        "cloudflare_fallback=False "
         "exec=exec-abc" in rec.getMessage()
         for rec in caplog.records
     )
@@ -450,8 +445,6 @@ async def test_the_library_digest_is_read_once_per_service(tmp_path, monkeypatch
     lib = tmp_path / "libverifyx.so"
     lib.write_bytes(b"first build")
     first_digest = hashlib.sha256(b"first build").hexdigest()
-    # off gates on libverifyx.so (enforce on libverifyx_capacity.so, read the same way)
-    monkeypatch.setattr(settings.verifyx, "NETWORK_GATE_MODE", "off")
     service = VerifyXValidationService()
     service.lib_name = str(lib)
     with patch(

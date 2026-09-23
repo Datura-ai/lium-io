@@ -986,37 +986,6 @@ async def test_outdated_libverifyx_on_the_executor_falls_back_like_the_ssh_check
 
 
 @pytest.mark.asyncio
-async def test_under_enforce_the_local_verifyx_step_falls_back_to_ssh_on_todays_library(
-    keypair, monkeypatch, local_verify_on, verifyx_service
-):
-    """DAH-2774: `/verify` runs the executor's libverifyx.so; enforce gates on
-    libverifyx_capacity.so, so the digest the answer carries is not the one the challenge expects
-    and the step goes to SSH (which names the capacity library) by the rule above."""
-    monkeypatch.setattr(vvs.settings.verifyx, "NETWORK_GATE_MODE", "enforce")
-    monkeypatch.setattr(
-        vvs,
-        "sha256_from_path",
-        lambda path: "capacity-lib-sha" if path == vvs.CAPACITY_LIB_PATH else "lib-sha",
-    )
-    validation = matmul_service(monkeypatch)
-    validation.validate_gpu_model_and_process_job = AsyncMock(
-        return_value=mvs.ValidationResult(success=True)
-    )
-    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
-        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
-    )
-    async with FakeExecutor(keypair, lib_sha="lib-sha") as executor:
-        ctx = context(
-            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
-        )
-        local, verifyx, _ = await run_local_then_consumers(
-            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
-        )
-    assert local.event.what_we_saw["fallbacks"] == {"verifyx": "lib_mismatch"}
-    assert verifyx.event.what_we_saw["transport"] == "ssh"
-
-
-@pytest.mark.asyncio
 async def test_a_verifyx_response_the_library_rejects_is_left_to_ssh(
     keypair, monkeypatch, local_verify_on, verifyx_service
 ):
