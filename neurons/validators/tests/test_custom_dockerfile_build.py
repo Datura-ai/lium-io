@@ -679,7 +679,7 @@ async def test_A15_export_failure_classifies_build_export(svc, monkeypatch):
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
-    ok, step, _tail = await svc._custom_build_image(
+    ok, step, tail = await svc._custom_build_image(
         ssh_client=ssh_client,
         payload=payload,
         log_tag="t",
@@ -688,16 +688,12 @@ async def test_A15_export_failure_classifies_build_export(svc, monkeypatch):
     assert ok is False
     assert step == "build_export"
     # the export's stderr is the HOST daemon's `docker load`: never the renter's tail
-    assert _tail == "built image could not be loaded onto the executor"
-    assert "no space left" not in _tail
+    assert tail == "built image could not be loaded onto the executor"
+    assert "no space left" not in tail
 
 
 # ------------------------------------------------------------------
-# A.16–A.19 — the failure says WHY, not only WHERE. Regression: in the 14 d to
-# 15 Sep 2026 every one of the 22 docker_build failures reached the backend as
-# "Custom dockerfile build failed (failure_step=docker_build)" and nothing else;
-# the build output only ever went to the live log stream, which is deleted with
-# the pod 3 min later.
+# A.16–A.19 — a failed build says WHY (its last output lines), not only WHERE.
 # ------------------------------------------------------------------
 
 _BUILD_ERROR_OUTPUT = (
@@ -1196,6 +1192,28 @@ async def test_A18b_a_build_that_prints_process_timed_out_is_not_a_timeout(svc, 
     assert (ok, step) == (False, "docker_build")
     assert "download process timed out after 10s" in tail
     assert "BUILD_FAILED_RC" not in tail
+
+
+@pytest.mark.asyncio
+async def test_A18c_stderr_without_the_marker_is_host_text_not_the_build_tail(svc, monkeypatch):
+    """No BUILD_FAILED_RC= marker means the build script never finished: the stderr is the host
+    daemon's `docker exec` error, so the renter gets a fixed reason instead of that text."""
+    from services.docker_service import CUSTOM_BUILD_INTERRUPTED_REASON
+
+    ssh_client = _make_dind_ssh()
+    daemon_error = "Error response from daemon: container 3f2a9c is not running\n"
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, daemon_error)))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step, tail = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert (ok, step) == (False, "docker_build")
+    assert tail == CUSTOM_BUILD_INTERRUPTED_REASON
 
 
 def test_A19_log_tail_is_bounded_and_keeps_the_end():
