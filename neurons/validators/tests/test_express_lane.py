@@ -75,7 +75,9 @@ def _executor_info(executor_id: str) -> ExecutorSSHInfo:
     )
 
 
-def _job_result(executor_id: str, score: float = 1.0, job_batch_id: str = "2026-09-06 16:40:00") -> JobResult:
+def _job_result(
+    executor_id: str, score: float = 1.0, job_batch_id: str = "2026-09-06 16:40:00"
+) -> JobResult:
     return JobResult(
         spec={"gpu": {"count": 1}},
         executor_info=_executor_info(executor_id),
@@ -113,7 +115,9 @@ def job_files_root(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _cycle_inputs(tmp_directory: str | None = None, job_batch_id: str = CYCLE_BATCH_ID) -> CycleInputs:
+def _cycle_inputs(
+    tmp_directory: str | None = None, job_batch_id: str = CYCLE_BATCH_ID
+) -> CycleInputs:
     if tmp_directory is None:
         tmp_directory = tempfile.mkdtemp(prefix="cycle-", dir=file_encrypt_service.JOB_FILES_ROOT)
     return CycleInputs(
