@@ -1,8 +1,8 @@
 """DAH-2774: one libverifyx.so. The Cloudflare capacity build is that file.
 
-The SSH path fails VerifyX (`OUTDATED_LIBRARY_ERROR`) when the executor hash still differs
-after one fetch-and-install. Providers update on their own schedule, so a mismatch curls the
-raw GitHub URL, installs, checks the hash, and retries once.
+Library refresh is off by default. When VERIFYX_LIBRARY_REFRESH_ENABLED is on, a mismatch
+checks that /usr/lib is writable, then curls the raw GitHub URL, installs, and retries
+once. A read-only root does not take the fatal outdated path after a failed write.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from neurons.validators.src.services.verifyx_validation_service import (
     MIN_CIPHER_LEN,
     OUTDATED_LIBRARY_ERROR,
     VerifyXValidationService,
+    settings,
 )
 from tests.test_verifyx_capacity_probe import _challenge_data, _probe_payload
 
@@ -141,6 +142,43 @@ async def test_matching_hash_runs_libverifyx_so_with_no_lib_flag(libraries):
     assert [record.lib_name for record in libraries.built] == [LIB_PATH]
 
 
+def _refresh_on():
+    return patch.object(settings.verifyx, "LIBRARY_REFRESH_ENABLED", True)
+
+
+@pytest.mark.asyncio
+async def test_hash_mismatch_does_not_refresh_when_opt_in_is_off(libraries):
+    shell = executor_shell({LIB_PATH: STALE_SHA256})
+    with patch.object(
+        VerifyXValidationService, "_refresh_executor_library", AsyncMock(return_value=True)
+    ) as refresh:
+        result = await gated_run(shell)
+    assert refresh.await_count == 0
+    assert result.error == OUTDATED_LIBRARY_ERROR
+    assert (result.diagnostics or {}).get("event") == "VERIFYX_LIBRARY_MISMATCH_NO_REFRESH"
+    assert commands(shell) == []
+
+
+@pytest.mark.asyncio
+async def test_hash_mismatch_does_not_refresh_when_usr_lib_is_not_writable(libraries):
+    shell = executor_shell({LIB_PATH: STALE_SHA256})
+    with (
+        _refresh_on(),
+        patch.object(
+            VerifyXValidationService, "_executor_can_write_lib", AsyncMock(return_value=False)
+        ) as writable,
+        patch.object(
+            VerifyXValidationService, "_refresh_executor_library", AsyncMock(return_value=True)
+        ) as refresh,
+    ):
+        result = await gated_run(shell)
+    assert writable.await_count == 1
+    assert refresh.await_count == 0
+    assert result.error != OUTDATED_LIBRARY_ERROR
+    assert "not writable" in result.error
+    assert (result.diagnostics or {}).get("event") == "VERIFYX_LIBRARY_WRITE_DENIED"
+
+
 @pytest.mark.asyncio
 async def test_hash_mismatch_fetches_then_retries(libraries):
     digests = {LIB_PATH: STALE_SHA256}
@@ -150,9 +188,15 @@ async def test_hash_mismatch_fetches_then_retries(libraries):
         return True
 
     shell = executor_shell(digests)
-    with patch.object(
-        VerifyXValidationService, "_refresh_executor_library", side_effect=after_refresh
-    ) as refresh:
+    with (
+        _refresh_on(),
+        patch.object(
+            VerifyXValidationService, "_executor_can_write_lib", AsyncMock(return_value=True)
+        ),
+        patch.object(
+            VerifyXValidationService, "_refresh_executor_library", side_effect=after_refresh
+        ) as refresh,
+    ):
         result = await gated_run(shell)
     assert refresh.await_count == 1
     assert result.error is None and result.data["success"] is True
@@ -162,9 +206,15 @@ async def test_hash_mismatch_fetches_then_retries(libraries):
 @pytest.mark.asyncio
 async def test_hash_mismatch_and_failed_fetch_stays_outdated(libraries):
     shell = executor_shell({LIB_PATH: STALE_SHA256})
-    with patch.object(
-        VerifyXValidationService, "_refresh_executor_library", AsyncMock(return_value=False)
-    ) as refresh:
+    with (
+        _refresh_on(),
+        patch.object(
+            VerifyXValidationService, "_executor_can_write_lib", AsyncMock(return_value=True)
+        ),
+        patch.object(
+            VerifyXValidationService, "_refresh_executor_library", AsyncMock(return_value=False)
+        ) as refresh,
+    ):
         result = await gated_run(shell)
     assert refresh.await_count == 1
     assert result.error == OUTDATED_LIBRARY_ERROR
@@ -188,6 +238,19 @@ async def test_curl_installs_when_the_fetched_hash_matches():
     ran = commands(shell)
     assert any("curl -fsSL" in cmd for cmd in ran)
     assert any(cmd.startswith("mv ") and LIB_PATH in cmd for cmd in ran)
+
+
+@pytest.mark.asyncio
+async def test_executor_can_write_lib_reads_the_probe():
+    shell = executor_shell({LIB_PATH: STALE_SHA256})
+    shell.ssh_client.run = AsyncMock(
+        return_value=SimpleNamespace(stdout="WRITE_OK:1\n", stderr="", exit_status=0)
+    )
+    assert await VerifyXValidationService()._executor_can_write_lib(shell) is True
+    shell.ssh_client.run = AsyncMock(
+        return_value=SimpleNamespace(stdout="WRITE_OK:0\n", stderr="", exit_status=0)
+    )
+    assert await VerifyXValidationService()._executor_can_write_lib(shell) is False
 
 
 @pytest.mark.asyncio

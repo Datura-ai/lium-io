@@ -33,8 +33,10 @@ VERIFYX_COMMAND_TIMEOUT_SECONDS = 600
 
 # DAH-2774: one library. LIB_PATH is the Cloudflare capacity build (celium-gpu-verifier#25).
 LIB_PATH = "/usr/lib/libverifyx.so"
+# Transport / Cloudflare-side faults only. The word "cloudflare" in an error is not enough:
+# a host that failed the probe for its own reason can mention that URL.
 _CLOUDFLARE_PROBE_FAIL_RX = re.compile(
-    r"429|timeout|timed out|outage|connection refused|rate.?limit|cloudflare",
+    r"429|timeout|timed out|outage|connection refused|rate.?limit",
     re.I,
 )
 
@@ -361,6 +363,36 @@ class VerifyXValidationService:
             executor_checksum = await sha256_from_executor(shell, lib_name)
 
             if local_checksum != executor_checksum:
+                mismatch_extra = {
+                    **default_extra,
+                    "local_sha256": local_checksum,
+                    "executor_sha256": executor_checksum,
+                }
+                if not settings.verifyx.LIBRARY_REFRESH_ENABLED:
+                    logger.warning(
+                        _m(
+                            "VERIFYX_LIBRARY_MISMATCH_NO_REFRESH",
+                            extra=get_extra_info(mismatch_extra),
+                        )
+                    )
+                    return VerifyXResponse(
+                        error=OUTDATED_LIBRARY_ERROR,
+                        diagnostics={"event": "VERIFYX_LIBRARY_MISMATCH_NO_REFRESH"},
+                    )
+                if not await self._executor_can_write_lib(shell):
+                    logger.warning(
+                        _m(
+                            "VERIFYX_LIBRARY_WRITE_DENIED",
+                            extra=get_extra_info(mismatch_extra),
+                        )
+                    )
+                    return VerifyXResponse(
+                        error=(
+                            "Executor libverifyx.so hash mismatch and /usr/lib is not writable; "
+                            "library was not replaced"
+                        ),
+                        diagnostics={"event": "VERIFYX_LIBRARY_WRITE_DENIED"},
+                    )
                 refreshed = await self._refresh_executor_library(
                     shell, local_checksum, default_extra
                 )
@@ -403,13 +435,36 @@ class VerifyXValidationService:
             logger.error(_m("VerifyX validation failed", extra=get_extra_info({**default_extra, **diagnostics})))
             return VerifyXResponse(error=f"unexpected error ({e})", diagnostics=diagnostics)
 
+    async def _executor_can_write_lib(self, shell) -> bool:
+        """True when the SSH user can replace LIB_PATH. Checked before a mismatch is fatal
+        under LIBRARY_REFRESH_ENABLED, so a read-only root does not go through a failed mv."""
+        lib = shlex.quote(LIB_PATH)
+        parent = shlex.quote(os.path.dirname(LIB_PATH))
+        cmd = (
+            f"if [ -w {parent} ] && {{ [ ! -e {lib} ] || [ -w {lib} ]; }}; "
+            f"then echo WRITE_OK:1; else echo WRITE_OK:0; fi"
+        )
+        capture = await self._run_ssh_command(shell, cmd, timeout=15)
+        if capture.transport_error is not None:
+            return False
+        return "WRITE_OK:1" in (capture.stdout or "")
+
+    def _log_library_replaced(self, default_extra: dict, **fields) -> None:
+        logger.warning(
+            _m(
+                "VERIFYX_LIBRARY_REPLACED",
+                extra=get_extra_info({**default_extra, **fields}),
+            )
+        )
+
     async def _refresh_executor_library(
         self, shell, expected_sha256: str, default_extra: dict
     ) -> bool:
         """One attempt to put the validator's libverifyx.so on the executor.
 
-        Curl the raw GitHub URL, install, check the hash. If the fetch fails or the hash
-        differs, upload the validator's own file (the source of truth). Log every outcome,
+        Caller must have LIBRARY_REFRESH_ENABLED and a passing write check. Curl the raw
+        GitHub URL, install, check the hash. If the fetch fails or the hash differs,
+        upload the validator's own file (the source of truth). Log every outcome,
         including the fetch error. Returns True when the executor hash matches.
         """
         url = settings.verifyx.LIBRARY_FETCH_URL
@@ -440,13 +495,8 @@ class VerifyXValidationService:
                 timeout=30,
             )
             if move.transport_error is None and (move.exit_status in (None, 0)):
-                logger.info(
-                    _m(
-                        "VerifyX library fetched from GitHub and installed on the executor",
-                        extra=get_extra_info(
-                            {**default_extra, "sha256": fetched_sha, "url": url}
-                        ),
-                    )
+                self._log_library_replaced(
+                    default_extra, sha256=fetched_sha, url=url, method="curl"
                 )
                 return True
             fetch_error = move.transport_error or f"mv exit {move.exit_status}"
@@ -486,6 +536,9 @@ class VerifyXValidationService:
                 )
             )
             return False
+        self._log_library_replaced(
+            default_extra, sha256=expected_sha256, url=url, method="sftp"
+        )
         return True
 
     async def _put_validator_library(self, shell) -> str | None:
@@ -660,13 +713,18 @@ def _verify_network_package_test(challenge_data: dict, response_data: dict) -> T
 
 
 def _is_cloudflare_probe_failure(network_execution: dict) -> bool:
-    """True when the Cloudflare probe did not produce a capacity reading for a probe-side reason
-    (429, timeout, outage, connection refused), not because the host is slow."""
+    """True only for a probe-side transport or Cloudflare fault in the probe's own error.
+
+    A failed probe with no error, or an error that only names the Cloudflare URL, is a
+    host-caused failure and does not fall back to the package download.
+    """
     capacity = (network_execution.get("speedtest") or {}).get("download_mbps")
     if _is_positive_number(capacity):
         return False
-    err = str(network_execution.get("error") or "")
-    return bool(_CLOUDFLARE_PROBE_FAIL_RX.search(err)) or not network_execution.get("success")
+    err = str(network_execution.get("error") or "").strip()
+    if not err:
+        return False
+    return bool(_CLOUDFLARE_PROBE_FAIL_RX.search(err))
 
 
 def _package_fallback_stats(

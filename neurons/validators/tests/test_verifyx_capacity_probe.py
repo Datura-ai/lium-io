@@ -32,6 +32,7 @@ from neurons.validators.src.services.task.checks.verifyx import (
 )
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from neurons.validators.src.services.verifyx_validation_service import (
+    _is_cloudflare_probe_failure,
     _perform_verification_checks,
     _verify_network_test,
     settings,
@@ -297,6 +298,43 @@ async def test_cloudflare_unreachable_still_passes_when_the_network_flag_is_on(
     assert result.passed is True
     net = result.updates["state"].specs["network"]
     assert net["verifyx_download_speed"] == B300_PC_SINGLE_STREAM_MBPS
+
+
+def _host_caused_probe_failure_payload() -> dict:
+    """The package downloaded; the Cloudflare probe failed for a host reason (blocked,
+    or a generic fail) with no transport token in the probe error."""
+    return {
+        "speedtest": {"download_mbps": 0.0, "upload_mbps": 0.0},
+        "download": {
+            **PACKAGE,
+            "status": "success",
+            "speed_mbps": B300_PC_SINGLE_STREAM_MBPS,
+            "time_ms": 11_900,
+            "error": None,
+        },
+        "success": False,
+        "error": "speed.cloudflare.com blocked by host firewall",
+        "execution_time_ms": 8_000,
+    }
+
+
+def test_host_caused_probe_failure_does_not_fall_back_to_the_package_reading():
+    payload = _host_caused_probe_failure_payload()
+    assert _is_cloudflare_probe_failure(payload) is False
+    stats, errors = _verify_network_test(_challenge_data(), {"network_execution": payload})
+    assert stats.get("cloudflare_fallback") is not True
+    assert stats["success"] is False
+    assert stats["download_speed"] is None
+    assert any("Network execution failed" in error for error in errors)
+
+
+def test_failed_probe_with_no_error_does_not_fall_back():
+    payload = _cloudflare_unreachable_payload()
+    payload["error"] = ""
+    assert _is_cloudflare_probe_failure(payload) is False
+    stats, _errors = _verify_network_test(_challenge_data(), {"network_execution": payload})
+    assert stats.get("cloudflare_fallback") is not True
+    assert stats["success"] is False
 
 
 # 3. EMA handoff -----------------------------------------------------------------------------
