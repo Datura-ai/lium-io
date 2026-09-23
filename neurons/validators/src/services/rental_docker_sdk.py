@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import posixpath
 import socket as socket_module
+import tarfile
 import tempfile
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
@@ -14,6 +18,12 @@ from pathlib import Path
 
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
+from services.rental_dind import (
+    INNER_DAEMON_CONFIG_PATH,
+    AddressPool,
+    merge_inner_daemon_config,
+    pool_network_conflicts,
+)
 
 
 # 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
@@ -133,6 +143,8 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # DAH-3796: merged into the container's /etc/docker/daemon.json between create and start
+    inner_daemon_address_pools: tuple[AddressPool, ...] = ()
 
 
 @dataclass(slots=True)
@@ -521,8 +533,7 @@ class RentalDockerSdkClient:
         return None
 
     def _run_container_sync(self, spec: ContainerRunSpec) -> None:
-        if spec.network:
-            self._ensure_rental_network_sync(spec.network)
+        pod_network = self._ensure_rental_network_sync(spec.network) if spec.network else None
         host_config = self._api_client.create_host_config(
             **_build_host_config_kwargs(spec)
         )
@@ -537,9 +548,81 @@ class RentalDockerSdkClient:
             entrypoint=spec.entrypoint or None,
             host_config=host_config,
         )
+        if spec.inner_daemon_address_pools:
+            self._seed_inner_daemon_config_sync(
+                spec.name, spec.inner_daemon_address_pools, pod_network_subnets=_network_subnets(pod_network)
+            )
         self._api_client.start(spec.name)
 
-    def _ensure_rental_network_sync(self, name: str) -> None:
+    def _seed_inner_daemon_config_sync(
+        self,
+        container_name: str,
+        pools: tuple[AddressPool, ...],
+        *,
+        pod_network_subnets: tuple[str, ...] = (),
+    ) -> None:
+        """Merge the pools into the created container's daemon.json; never fails the create.
+
+        Runs before the first start because the image's entrypoint starts the inner dockerd, which
+        reads the file once. A pod whose daemon.json cannot be read or written still rents, with
+        Docker's own pools, and the log says why. So does a pod whose own network (the host daemon's
+        `lium-rentals`) overlaps the pools: an inner network there would shadow the pod's address.
+        """
+        conflicts = pool_network_conflicts(pools, pod_network_subnets)
+        if conflicts:
+            outcome = f"skipped_pod_network_overlap: {'; '.join(conflicts)}"
+        else:
+            outcome = self._write_inner_daemon_pools_sync(container_name, pools)
+        log = logger.warning if outcome.startswith(("failed", "skipped")) else logger.info
+        log(
+            _m(
+                "Inner Docker daemon address pools",
+                extra=get_extra_info(
+                    {
+                        "container_name": container_name,
+                        "outcome": outcome,
+                        "pools": [pool.as_daemon_json() for pool in pools],
+                    }
+                ),
+            )
+        )
+
+    def _write_inner_daemon_pools_sync(self, container_name: str, pools: tuple[AddressPool, ...]) -> str:
+        try:
+            existing = self._read_container_file_sync(container_name, INNER_DAEMON_CONFIG_PATH)
+            merged = merge_inner_daemon_config(existing, pools)
+            if merged is None:
+                return "kept_image_config"
+            if existing is None:
+                self._api_client.put_archive(
+                    container_name, "/", _single_file_archive(INNER_DAEMON_CONFIG_PATH, merged, with_parent=True)
+                )
+            else:
+                self._api_client.put_archive(
+                    container_name,
+                    posixpath.dirname(INNER_DAEMON_CONFIG_PATH),
+                    _single_file_archive(INNER_DAEMON_CONFIG_PATH, merged, with_parent=False),
+                )
+            return "seeded"
+        except Exception as exc:  # noqa: BLE001 — the pod rents without the pools
+            return f"failed: {_wrap_error_message(type(exc).__name__, exc)}"
+
+    def _read_container_file_sync(self, container_name: str, path: str) -> bytes | None:
+        """A regular file's bytes from a container's filesystem; None when the path does not exist."""
+        try:
+            chunks, _ = self._api_client.get_archive(container_name, path)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise
+        with tarfile.open(fileobj=io.BytesIO(b"".join(chunks))) as archive:
+            member = next(iter(archive.getmembers()), None)
+            if member is None or not member.isfile():
+                raise RentalDockerOperationError(f"{path} in {container_name} is not a regular file")
+            handle = archive.extractfile(member)
+            return handle.read() if handle is not None else b""
+
+    def _ensure_rental_network_sync(self, name: str) -> dict:
         """The container's network exists on the host and has inter-container traffic off.
 
         Runs before every rental `create_container`, so the isolation holds on a host that has never
@@ -570,6 +653,7 @@ class RentalDockerSdkClient:
                         f"Docker network {name} was created but cannot be inspected"
                     )
         _require_icc_off(name, network)
+        return network
 
     def _inspect_network_or_none(self, name: str) -> dict | None:
         try:
@@ -925,6 +1009,37 @@ def _build_rental_ssh_http_adapter_class(
 
     RentalSSHHTTPAdapter.__name__ = "RentalSSHHTTPAdapter"
     return RentalSSHHTTPAdapter
+
+
+def _network_subnets(network: dict | None) -> tuple[str, ...]:
+    """The IPAM subnets of an inspected Docker network."""
+    ipam = network.get("IPAM") if isinstance(network, dict) else None
+    configs = ipam.get("Config") if isinstance(ipam, dict) else None
+    if not isinstance(configs, list):
+        return ()
+    return tuple(config["Subnet"] for config in configs if isinstance(config, dict) and config.get("Subnet"))
+
+
+def _single_file_archive(path: str, content: bytes, *, with_parent: bool) -> bytes:
+    """A tar for `put_archive`: the file alone (extracted into its directory), or with the
+    directory as well (extracted at `/`), for an image that has no such directory."""
+    now = int(time.time())
+    parent, name = posixpath.split(path)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        if with_parent:
+            directory = tarfile.TarInfo(parent.lstrip("/"))
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            directory.mtime = now
+            archive.addfile(directory)
+            name = path.lstrip("/")
+        entry = tarfile.TarInfo(name)
+        entry.size = len(content)
+        entry.mode = 0o644
+        entry.mtime = now
+        archive.addfile(entry, io.BytesIO(content))
+    return buffer.getvalue()
 
 
 def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:

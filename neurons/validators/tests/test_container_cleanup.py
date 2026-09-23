@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services.container_cleanup import VOLUME_RM_MAX_PER_PASS, ContainerCleanup
+from services.rental_dind import stale_dind_probe_list_command
 
 
 def _ssh_mock_from_calls(call_handler):
@@ -521,3 +522,133 @@ async def test_cleanup_reports_container_that_survives_the_direct_kill():
     assert removed_count == 0 and removed_names == []
     assert unremovable == [name]
     assert sum(1 for c in calls if "docker rm -f" in c and name in c) == 2  # one retry, no loop
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drops_a_stale_pods_dind_volumes_with_its_volume():
+    """DAH-3796: a stale pod_* leaves no inner Docker store or /workspace volume behind."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, rm_calls = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+
+    removed_count, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=None, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [name]
+    volume = "volume_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    assert f"/usr/bin/docker volume rm {volume} {volume}_docker {volume}_workspace 2>/dev/null || true" in rm_calls
+
+
+def _dind_volume_ssh_mock(*, all_volumes: list[str], dangling: list[str], list_status: int = 0):
+    calls: list[str] = []
+
+    async def handler(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if cmd == "/usr/bin/docker volume ls -q":
+            return MagicMock(exit_status=list_status, stdout="\n".join(all_volumes), stderr="")
+        if "docker volume ls -qf dangling=true" in cmd:
+            return MagicMock(exit_status=0, stdout="\n".join(dangling), stderr="")
+        return MagicMock(exit_status=0, stdout="", stderr="")
+
+    return _ssh_mock_from_calls(handler), calls
+
+
+def _pod_volume(n: int) -> str:
+    return f"volume_00000000-0000-4000-8000-{n:012d}"
+
+
+_GONE, _RENTED_ID, _KEPT, _LIVE = _pod_volume(1), "00000000-0000-4000-8000-000000000002", _pod_volume(3), _pod_volume(4)
+_DIND_HOST_VOLUMES = [
+    f"{_GONE}_docker",  # its pod volume and container are gone
+    f"{_GONE}_workspace",
+    f"volume_{_RENTED_ID}_docker",  # the backend still lists this pod here
+    _KEPT,  # a pod volume nothing sweeps: its companion stays with it
+    f"{_KEPT}_docker",
+    f"{_LIVE}_docker",  # referenced by a container, so not dangling
+    "volume_legacy_docker",  # not a pod uuid: never read as a companion
+    ANON_VOLUME_A,
+]
+
+
+@pytest.mark.asyncio
+async def test_orphaned_dind_volumes_of_pods_that_no_longer_exist_are_removed():
+    dangling = [name for name in _DIND_HOST_VOLUMES if name != f"{_LIVE}_docker"]
+    ssh, calls = _dind_volume_ssh_mock(all_volumes=_DIND_HOST_VOLUMES, dangling=dangling)
+
+    removed = await ContainerCleanup().prune_orphaned_dind_volumes(
+        ssh, _rented_data(EXECUTOR_UUID, [f"pod_{_RENTED_ID}"]), EXECUTOR_UUID
+    )
+
+    assert removed == 2
+    assert calls[-1] == f"/usr/bin/docker volume rm {_GONE}_docker {_GONE}_workspace 2>/dev/null || true"
+
+
+@pytest.mark.parametrize(
+    ("rented", "dry_run", "list_status"),
+    [(False, False, 0), (True, True, 0), (True, False, 1)],
+    ids=["no-rented-data", "dry-run", "listing-failed"],
+)
+@pytest.mark.asyncio
+async def test_the_dind_orphan_sweep_removes_nothing_when_it_cannot_be_sure(rented, dry_run, list_status):
+    ssh, calls = _dind_volume_ssh_mock(
+        all_volumes=_DIND_HOST_VOLUMES, dangling=_DIND_HOST_VOLUMES, list_status=list_status
+    )
+    rented_data = _rented_data(EXECUTOR_UUID, [f"pod_{_RENTED_ID}"]) if rented else None
+
+    removed = await ContainerCleanup(dry_run=dry_run).prune_orphaned_dind_volumes(ssh, rented_data, EXECUTOR_UUID)
+
+    assert removed == 0
+    assert not any("volume rm" in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_runs_the_dind_orphan_sweep():
+    ssh, calls = _dind_volume_ssh_mock(all_volumes=[f"{_GONE}_docker"], dangling=[f"{_GONE}_docker"])
+
+    await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=_rented_data(EXECUTOR_UUID, []), executor_uuid=EXECUTOR_UUID
+    )
+
+    assert f"/usr/bin/docker volume rm {_GONE}_docker 2>/dev/null || true" in calls
+    assert stale_dind_probe_list_command() in calls
+
+
+def _probe_listing_ssh_mock(listing: str, list_status: int = 0):
+    calls: list[str] = []
+
+    async def handler(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if cmd == stale_dind_probe_list_command():
+            return MagicMock(exit_status=list_status, stdout=listing, stderr="")
+        return MagicMock(exit_status=0, stdout="", stderr="")
+
+    return _ssh_mock_from_calls(handler), calls
+
+
+# the host's now is 2026-09-23T14:00:00Z
+_PROBE_LISTING = (
+    "1790172000\n"
+    "abc123 /lium-dind-probe-pod_a-dockerd 2026-09-23T13:00:00.5Z\n"
+    "def456 /lium-dind-probe-pod_b-marker 2026-09-23T13:59:30Z\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_store_probe_containers_left_behind_are_removed_once_stale():
+    ssh, calls = _probe_listing_ssh_mock(_PROBE_LISTING)
+
+    removed = await ContainerCleanup().prune_stale_dind_probe_containers(ssh, EXECUTOR_UUID)
+
+    assert removed == 1
+    assert calls[-1] == "/usr/bin/docker rm -f abc123 >/dev/null 2>&1"
+
+
+@pytest.mark.parametrize(("dry_run", "list_status"), [(True, 0), (False, 1)], ids=["dry-run", "listing-failed"])
+@pytest.mark.asyncio
+async def test_the_probe_container_sweep_removes_nothing_when_it_cannot_act(dry_run, list_status):
+    ssh, calls = _probe_listing_ssh_mock(_PROBE_LISTING, list_status=list_status)
+
+    removed = await ContainerCleanup(dry_run=dry_run).prune_stale_dind_probe_containers(ssh, EXECUTOR_UUID)
+
+    assert removed == 0
+    assert not any("rm -f" in c for c in calls)

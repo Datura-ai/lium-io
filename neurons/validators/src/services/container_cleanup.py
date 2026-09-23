@@ -8,6 +8,12 @@ import asyncssh
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
 from core.utils import _m
+from services.rental_dind import (
+    orphaned_dind_companion_volumes,
+    stale_dind_probe_containers,
+    stale_dind_probe_list_command,
+    with_dind_companion_volumes,
+)
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_VOLUME_PREFIX,
@@ -54,6 +60,10 @@ DOWNLOAD_TEMPORARY_MAX_SEARCH_DEPTH = 8
 # The whole helper run is bounded: the walk itself takes hundreds of ms on a real cache, so anything
 # near a minute means a wedged docker daemon rather than work in progress.
 DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
+
+
+def _names(stdout: Optional[str]) -> list[str]:
+    return [line.strip() for line in (stdout or "").splitlines() if line.strip()]
 
 
 class ContainerCleanup:
@@ -148,11 +158,96 @@ class ContainerCleanup:
                 )
             )
 
+        await self.prune_stale_dind_probe_containers(ssh_client, executor_uuid)
         # DAH-2375: reap anonymous volumes orphaned by historical `docker rm`
         # without -v. Best-effort — never raises, never changes this return.
         await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
+        await self.prune_orphaned_dind_volumes(ssh_client, rented_data, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    async def prune_stale_dind_probe_containers(self, ssh_client, executor_uuid: str) -> int:
+        """DAH-3796: remove store-check helper containers a validator left behind (its SSH session
+        died mid-check), by label and name prefix, once older than DIND_PROBE_STALE_AFTER_SEC by the
+        host's clock. Best-effort: never raises; returns how many it asked docker to remove.
+        """
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            listed = await ssh_client.run(stale_dind_probe_list_command())
+            if listed.exit_status != 0:
+                logger.warning(_m("Listing DinD store probe containers failed", extra=extra))
+                return 0
+            stale = stale_dind_probe_containers(listed.stdout)[:VOLUME_RM_MAX_PER_PASS]
+            if not stale:
+                return 0
+            if self.dry_run:
+                logger.info(
+                    _m(
+                        f"[DRY RUN] Would remove {len(stale)} stale DinD store probe container(s)",
+                        extra=extra | {"containers": stale, "dry_run": True},
+                    )
+                )
+                return 0
+            await ssh_client.run(f"/usr/bin/docker rm -f {' '.join(shlex.quote(c) for c in stale)} >/dev/null 2>&1")
+            logger.info(
+                _m(
+                    f"Removed {len(stale)} stale DinD store probe container(s)",
+                    extra=extra | {"containers": stale},
+                )
+            )
+            return len(stale)
+        except Exception as e:
+            logger.warning(_m("DinD store probe container sweep failed", extra=extra | {"error": str(e)}))
+            return 0
+
+    async def prune_orphaned_dind_volumes(
+        self,
+        ssh_client,
+        rented_data: Optional[RentedExecutorsResponse],
+        executor_uuid: str,
+    ) -> int:
+        """DAH-3796: remove `volume_*_docker` / `volume_*_workspace` volumes whose pod is gone.
+
+        Orphaned = no container references it (dangling), its pod volume is no longer on the host,
+        and the backend does not list its pod on this executor. Covers a pod volume removed by a
+        path that predates the companions, or by hand. Without rented data nothing is removed.
+        Best-effort: never raises; returns how many it asked docker to remove.
+        """
+        extra = {"executor_uuid": executor_uuid}
+        if rented_data is None:
+            return 0
+        try:
+            listed = await ssh_client.run(DockerCommand.volume_ls_names())
+            dangling = await ssh_client.run(DockerCommand.volume_ls_dangling())
+            if listed.exit_status != 0 or dangling.exit_status != 0:
+                logger.warning(_m("Listing volumes for the DinD orphan sweep failed", extra=extra))
+                return 0
+            protected = {
+                f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}"
+                for name in self._get_rented_containers(rented_data, executor_uuid)
+                if name.startswith(POD_CONTAINER_PREFIX)
+            }
+            orphans = orphaned_dind_companion_volumes(
+                _names(listed.stdout), unreferenced=_names(dangling.stdout), protected=protected
+            )[:VOLUME_RM_MAX_PER_PASS]
+            if not orphans:
+                return 0
+            if self.dry_run:
+                logger.info(
+                    _m(
+                        f"[DRY RUN] Would remove {len(orphans)} orphaned DinD volume(s)",
+                        extra=extra | {"volumes": orphans, "dry_run": True},
+                    )
+                )
+                return 0
+            await ssh_client.run(DockerCommand.volume_remove(*orphans))
+            logger.info(
+                _m(f"Removed {len(orphans)} orphaned DinD volume(s)", extra=extra | {"volumes": orphans})
+            )
+            return len(orphans)
+        except Exception as e:
+            logger.warning(_m("DinD orphan volume sweep failed", extra=extra | {"error": str(e)}))
+            return 0
 
     async def prune_dangling_anonymous_volumes(
         self,
@@ -563,7 +658,7 @@ class ContainerCleanup:
             # Remove associated volume if it's a pod container
             if container_name.startswith(POD_CONTAINER_PREFIX):
                 pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
-                await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
+                await ssh_client.run(DockerCommand.volume_remove(*with_dind_companion_volumes([f"volume_{pod_id}"])))
 
             return True
 

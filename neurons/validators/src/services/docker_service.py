@@ -99,6 +99,27 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
+from services.rental_dind import (
+    DIND_STORE_RESET_DEADLINE_SEC,
+    DIND_STORE_TARGET,
+    DIND_WORKSPACE_TARGET,
+    AddressPool,
+    dind_base_volume_name,
+    dind_companion_volume_names,
+    dind_probe_cleanup_command,
+    dind_store_reset_command,
+    dind_store_version_probe_command,
+    dind_store_version_record_command,
+    dind_store_volume_name,
+    dind_workspace_volume_name,
+    format_dockerd_version,
+    is_dind_store_downgrade,
+    orphaned_dind_companion_volumes,
+    parse_address_pools,
+    parse_dind_store_version_probe,
+    parse_dockerd_version,
+    with_dind_companion_volumes,
+)
 from services.rental_docker_observability import (
     exec_logged_rental_docker_sdk_operation,
     rental_run_spec_log_fields,
@@ -240,6 +261,12 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # Shared with core.docker_utils so exactly one helper image lands on nodes.
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
+# DAH-3796: the store check's SSH calls. The probe command's own deadlines (the marker read, the
+# image's dockerd) fit well inside its timeout; the finally removes its containers either way.
+_DIND_STORE_PROBE_TIMEOUT_SEC = 90
+_DIND_STORE_RESET_TIMEOUT_SEC = DIND_STORE_RESET_DEADLINE_SEC + 60
+_DIND_PROBE_CLEANUP_TIMEOUT_SEC = 30
+_DIND_STORE_RECORD_TIMEOUT_SEC = 30
 # dockerd's default data-root; the repair reads the real one from `docker info` and uses this only
 # when that lookup fails (DAH-3217).
 _DEFAULT_DOCKER_ROOT_DIR = "/var/lib/docker"
@@ -995,6 +1022,72 @@ def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets
     return mounts
 
 
+def _wants_dind_defaults(payload: ContainerCreateRequest) -> bool:
+    # A customer rental under sysbox is where an inner dockerd runs; a filler never runs one.
+    return bool(payload.is_sysbox) and payload.workload_kind != WorkloadKind.FILLER
+
+
+def _build_dind_volume_mounts(
+    payload: ContainerCreateRequest,
+    *,
+    local_volume: str,
+    encrypted_local_volume: bool,
+    occupied_targets: set[str],
+) -> list[VolumeMount]:
+    """DAH-3796: the per-pod inner Docker store and, on an encrypted pod, a bind-mountable /workspace.
+
+    Named after the pod's own volume, so a reboot or an edit (same volume, new container) mounts the
+    same ones again. Docker creates them with the local driver on first use. A target the rental
+    already mounts (a custom volume path, `/mnt`, a cache) is left alone. Both are plaintext on the
+    host, so an encrypted pod gets the store only when its own setting allows it.
+    """
+    if not _wants_dind_defaults(payload):
+        return []
+    mounts: list[VolumeMount] = []
+    wants_store = settings.RENTAL_DIND_PERSISTENT_STORE_ENABLED and (
+        not encrypted_local_volume or settings.RENTAL_DIND_PERSISTENT_STORE_ENCRYPTED_PODS_ENABLED
+    )
+    if wants_store and DIND_STORE_TARGET not in occupied_targets:
+        mounts.append(VolumeMount(source=dind_store_volume_name(local_volume), target=DIND_STORE_TARGET))
+        occupied_targets.add(DIND_STORE_TARGET)
+    # A plain pod's /root already bind-mounts into inner containers and persists.
+    if (
+        settings.RENTAL_DIND_WORKSPACE_VOLUME_ENABLED
+        and encrypted_local_volume
+        and DIND_WORKSPACE_TARGET not in occupied_targets
+    ):
+        mounts.append(VolumeMount(source=dind_workspace_volume_name(local_volume), target=DIND_WORKSPACE_TARGET))
+        occupied_targets.add(DIND_WORKSPACE_TARGET)
+    return mounts
+
+
+def _dind_address_pools(payload: ContainerCreateRequest) -> tuple[AddressPool, ...]:
+    if not (settings.RENTAL_DIND_ADDRESS_POOLS_ENABLED and _wants_dind_defaults(payload)):
+        return ()
+    try:
+        return parse_address_pools(settings.RENTAL_DIND_ADDRESS_POOLS)
+    except ValueError as exc:
+        # a bad env value must not stop rentals; the pod gets Docker's own pools, as before
+        logger.error(
+            _m(
+                "RENTAL_DIND_ADDRESS_POOLS is invalid; inner Docker keeps its default pools",
+                extra=get_extra_info({"pod_id": payload.pod_id, "error": str(exc)}),
+            )
+        )
+        return ()
+
+
+def _dind_store_volume(run_spec: ContainerRunSpec, local_volume: str | None) -> str | None:
+    """The pod's own inner Docker store volume when the spec mounts it; None otherwise."""
+    if not local_volume:
+        return None
+    store = dind_store_volume_name(local_volume)
+    for volume in run_spec.volumes:
+        if volume.target == DIND_STORE_TARGET and volume.source == store:
+            return store
+    return None
+
+
 def _wants_quote_socket(payload: ContainerCreateRequest, *, in_cvm: bool) -> bool:
     # customer rentals on a dstack CVM guest; a FILLER (DPHN/PEARL) has no attestation use and a
     # bare-metal node has no guest agent to broker
@@ -1482,6 +1575,14 @@ class DockerService:
             occupied_targets.add("/mnt")
         # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
         volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
+        volumes.extend(
+            _build_dind_volume_mounts(
+                payload,
+                local_volume=local_volume,
+                encrypted_local_volume=encrypted_local_volume,
+                occupied_targets=occupied_targets,
+            )
+        )
         # DAH-2828: the quote-only broker socket at the dstack SDK's default path, so a TEE
         # workload on a CVM node can take its own TDX quote from inside the pod.
         if quote_socket:
@@ -1513,7 +1614,129 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
+            inner_daemon_address_pools=_dind_address_pools(payload),
         )
+
+    async def _reset_dind_store_on_downgrade(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        *,
+        run_spec: ContainerRunSpec,
+        local_volume: str | None,
+        default_extra: dict,
+    ) -> None:
+        """DAH-3796: empty the pod's inner Docker store when its image's dockerd is older than the
+        one that last wrote it (an edit to an older template); an older dockerd may not start on a
+        newer store. Best-effort: on any failure the pod keeps its store, as it would without this.
+
+        Both versions are renter-controlled text (the marker in the pod's store, the image's
+        dockerd): only a strict version line, cut to a few hundred bytes, is acted on or logged;
+        anything else is `unknown_version` and the store is kept. The helper containers are
+        limited and deadlined in the command itself and always removed afterwards.
+        """
+        store_volume = _dind_store_volume(run_spec, local_volume)
+        if store_volume is None:
+            return
+        recorded_version = current_version = None
+        outcome = "kept"
+        try:
+            probe = await ssh_client.run(
+                dind_store_version_probe_command(
+                    store_volume=store_volume,
+                    image=run_spec.image,
+                    runtime=run_spec.runtime,
+                    helper_image=ALPINE_HELPER_IMAGE,
+                    container_name=run_spec.name,
+                ),
+                timeout=_DIND_STORE_PROBE_TIMEOUT_SEC,
+            )
+            recorded, current = parse_dind_store_version_probe(getattr(probe, "stdout", ""))
+            recorded_version, current_version = parse_dockerd_version(recorded), parse_dockerd_version(current)
+            if recorded is None:
+                outcome = "no_marker"
+            elif recorded_version is None or current_version is None:
+                outcome = "unknown_version"
+            elif is_dind_store_downgrade(recorded, current):
+                reset = await ssh_client.run(
+                    dind_store_reset_command(
+                        store_volume=store_volume, helper_image=ALPINE_HELPER_IMAGE, container_name=run_spec.name
+                    ),
+                    timeout=_DIND_STORE_RESET_TIMEOUT_SEC,
+                )
+                exit_status = getattr(reset, "exit_status", 0)
+                outcome = "reset_on_downgrade" if exit_status == 0 else f"reset_failed: exit {exit_status}"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            outcome = f"failed: {type(exc).__name__}: {str(exc)[:200]}"
+        finally:
+            await self._remove_dind_probe_containers(ssh_client, run_spec.name, default_extra)
+        log = logger.warning if outcome.startswith(("failed", "reset_failed")) else logger.info
+        log(
+            _m(
+                "Inner Docker store version",
+                extra=get_extra_info({
+                    **default_extra,
+                    "store_volume": store_volume,
+                    "recorded_dockerd": format_dockerd_version(recorded_version),
+                    "image_dockerd": format_dockerd_version(current_version),
+                    "outcome": outcome,
+                }),
+            )
+        )
+
+    async def _remove_dind_probe_containers(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict
+    ) -> None:
+        try:
+            await ssh_client.run(
+                dind_probe_cleanup_command(container_name), timeout=_DIND_PROBE_CLEANUP_TIMEOUT_SEC
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # the periodic cleanup removes a probe container this leaves (prune_stale_dind_probe_containers)
+            logger.warning(
+                _m(
+                    "Inner Docker store probe containers not removed",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": container_name,
+                        "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                    }),
+                )
+            )
+
+    async def _record_dind_store_version(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        *,
+        run_spec: ContainerRunSpec,
+        local_volume: str | None,
+        container_name: str,
+        default_extra: dict,
+    ) -> None:
+        """DAH-3796: write the running pod's dockerd version into its store, for the next create."""
+        if _dind_store_volume(run_spec, local_volume) is None:
+            return
+        try:
+            result = await ssh_client.run(
+                dind_store_version_record_command(container_name), timeout=_DIND_STORE_RECORD_TIMEOUT_SEC
+            )
+            exit_status = getattr(result, "exit_status", 0)
+            error = None if exit_status == 0 else f"exit {exit_status}"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if error is not None:
+            # the next create finds no marker and keeps the store, as it would without this
+            logger.warning(
+                _m(
+                    "Inner Docker store version not recorded",
+                    extra=get_extra_info({**default_extra, "container_name": container_name, "error": error}),
+                )
+            )
 
     async def _ensure_pod_quote_socket(
         self,
@@ -2306,7 +2529,9 @@ class DockerService:
                     if volume_name not in active_volume_set:
                         volumes_to_remove.append(volume_name)
                 if volumes_to_remove:
-                    volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
+                    volumes = " ".join(
+                        shlex.quote(volume) for volume in with_dind_companion_volumes(volumes_to_remove)
+                    )
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             return stale_containers
@@ -2463,6 +2688,9 @@ class DockerService:
     ) -> list[str]:
         """Remove vloopback `volume_*` volumes no container mounts (minus ``skip_volume_names``).
 
+        DAH-3796: with them go their `_docker`/`_workspace` companions, and any companion no
+        container references whose pod volume is gone (orphaned_dind_companion_volumes).
+
         Returns the volumes it asked docker to remove (empty when nothing was stale or the listing
         failed). DAH-3257: ``host_probe`` supplies the volume and mounted-volume listings; the
         caller passes it only while nothing has removed a container since the probe ran.
@@ -2495,6 +2723,7 @@ class DockerService:
                     if len(parts) == 2:
                         volume_rows.append((parts[0], parts[1]))
 
+            all_volumes = {name for name, _driver in volume_rows}
             vloopback_volumes = set()
             for name, driver in volume_rows:
                 if not (
@@ -2503,7 +2732,7 @@ class DockerService:
                 ):
                     continue
                 vloopback_volumes.add(name)
-            if not vloopback_volumes:
+            if not vloopback_volumes and not any(dind_base_volume_name(name) for name in all_volumes):
                 return []
 
             if host_probe is not None and host_probe.mounted_volume_names is not None:
@@ -2525,7 +2754,25 @@ class DockerService:
                 mounted_volumes = {
                     name.strip() for name in (mounted_result.stdout or "").splitlines() if name.strip()
                 }
-            stale_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
+            stale_pod_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
+            unreferenced_volumes = all_volumes - mounted_volumes - skip_set
+            # a stale pod volume's own companions by name, then companions of pod volumes already gone
+            companions = {
+                name
+                for pod_volume in stale_pod_volumes
+                for name in dind_companion_volume_names(pod_volume)
+                if name in unreferenced_volumes
+            }
+            companions.update(
+                orphaned_dind_companion_volumes(
+                    all_volumes,
+                    unreferenced=all_volumes - mounted_volumes,
+                    protected=skip_set,
+                    removing=stale_pod_volumes,
+                )
+            )
+            orphaned_dind_volumes = sorted(companions)
+            stale_volumes = stale_pod_volumes + orphaned_dind_volumes
             if not stale_volumes:
                 return []
 
@@ -2534,7 +2781,8 @@ class DockerService:
                     "Cleaning stale vloopback Docker volumes",
                     extra=get_extra_info({
                         **default_extra,
-                        "stale_volumes": stale_volumes,
+                        "stale_volumes": stale_pod_volumes,
+                        "orphaned_dind_volumes": orphaned_dind_volumes,
                         "skipped_volumes": sorted(skip_set),
                     }),
                 )
@@ -2913,10 +3161,10 @@ class DockerService:
             )
 
             if remove_volume and volume_name:
-                volume = shlex.quote(volume_name)
+                volumes = " ".join(shlex.quote(volume) for volume in with_dind_companion_volumes([volume_name]))
                 await retry_ssh_command(
                     ssh_client,
-                    f"/usr/bin/docker volume rm {volume} 2>/dev/null || true",
+                    f"/usr/bin/docker volume rm {volumes} 2>/dev/null || true",
                     "cleanup_failed_container_creation",
                 )
         except asyncio.CancelledError:
@@ -5825,6 +6073,10 @@ class DockerService:
                 prev_timestamp = now_ms()
 
                 try:
+                    current_step = "dind_store_version"
+                    await self._reset_dind_store_on_downgrade(
+                        ssh_client, run_spec=run_spec, local_volume=local_volume, default_extra=default_extra
+                    )
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
@@ -5893,6 +6145,13 @@ class DockerService:
                             logger.error(_m("docker run failed", extra=log_extra))
 
                         raise Exception("Run docker run command but container is not running")
+                    await self._record_dind_store_version(
+                        ssh_client,
+                        run_spec=run_spec,
+                        local_volume=local_volume,
+                        container_name=container_name,
+                        default_extra=default_extra,
+                    )
                 except Exception:
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
@@ -7176,6 +7435,13 @@ class DockerService:
                             ),
                             volume_name=payload.local_volume,
                             volume_role="local",
+                        )
+                    # DAH-3796: the pod's inner Docker store and /workspace, whichever it has
+                    with _best_effort_delete_step(
+                        log, "remove_volume_dind", volume_name=payload.local_volume
+                    ):
+                        await ssh_client.run(
+                            DockerCommand.volume_remove(*dind_companion_volume_names(payload.local_volume))
                         )
 
                 if payload.external_volume:

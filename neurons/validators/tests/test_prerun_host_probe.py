@@ -547,7 +547,8 @@ async def test_clean_existing_containers_with_probe_removes_the_same_and_lists_n
         == live_cmds
         == [
             "/usr/bin/docker rm -fv pod_new pod_old filler_x",
-            "/usr/bin/docker volume rm volume_new volume_x 2>/dev/null || true",
+            "/usr/bin/docker volume rm volume_new volume_x volume_new_docker volume_new_workspace"
+            " volume_x_docker volume_x_workspace 2>/dev/null || true",
         ]
     )
     assert _cmds(live) == ['/usr/bin/docker ps -a --format "{{.Names}}"']
@@ -640,6 +641,80 @@ async def test_clean_stale_vloopback_probe_without_vloopback_volumes_runs_nothin
         == []
     )
     assert _cmds(ssh) == []
+
+
+_GONE_COMPANION = "volume_00000000-0000-4000-8000-000000000001_docker"
+_NEW_POD_VOLUME = "volume_00000000-0000-4000-8000-000000000002"
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_vloopback_takes_a_stale_pods_dind_volumes_and_orphans_along(
+    docker_service, monkeypatch
+):
+    """DAH-3796: a stale vloopback pod volume goes with its _docker/_workspace companions, and a
+    companion whose pod volume is already gone is swept too; the live listing and the probe agree."""
+    ran: list[str] = []
+
+    async def _retry(ssh, command, _tag):
+        ran.append(command)
+
+    monkeypatch.setattr("services.docker_service.retry_ssh_command", _retry)
+    rows = [
+        ("volume_a", "vloopback"),  # stale: no container mounts it
+        ("volume_a_docker", "local"),
+        ("volume_a_workspace", "local"),
+        ("volume_live", "vloopback"),  # its pod runs
+        ("volume_live_docker", "local"),
+        (_GONE_COMPANION, "local"),  # pod volume already gone
+        (f"{_NEW_POD_VOLUME}_docker", "local"),  # the pod being created (protected)
+        ("volume_plain", "local"),  # a local pod volume this sweep never touches
+        ("volume_plain_docker", "local"),
+    ]
+    mounted = ["volume_live", "volume_live_docker"]
+    live = _ssh(
+        _ssh_result(stdout="".join(f"{name} {driver}\n" for name, driver in rows)),
+        _ssh_result(stdout="\n".join(mounted)),
+    )
+    removed_live = await docker_service.clean_stale_vloopback_volumes(
+        ssh_client=live, default_extra={}, skip_volume_names={_NEW_POD_VOLUME}
+    )
+    live_cmds = list(ran)
+    ran.clear()
+    probe = _probe(
+        volumes=tuple(ProbedVolume(name, driver) for name, driver in rows),
+        mounted_volume_names=tuple(mounted),
+    )
+    removed_probed = await docker_service.clean_stale_vloopback_volumes(
+        ssh_client=_ssh(), default_extra={}, skip_volume_names={_NEW_POD_VOLUME}, host_probe=probe
+    )
+
+    expected = ["volume_a", _GONE_COMPANION, "volume_a_docker", "volume_a_workspace"]
+    assert removed_live == removed_probed == expected
+    assert (
+        ran == live_cmds == [f"/usr/bin/docker volume rm {' '.join(expected)} 2>/dev/null || true"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_vloopback_sweeps_orphaned_dind_volumes_on_a_host_without_vloopback(
+    docker_service, monkeypatch
+):
+    retry = AsyncMock()
+    monkeypatch.setattr("services.docker_service.retry_ssh_command", retry)
+    probe = _probe(
+        volumes=(ProbedVolume(_GONE_COMPANION, "local"), ProbedVolume("volume_c", "local")),
+        mounted_volume_names=(),
+    )
+
+    removed = await docker_service.clean_stale_vloopback_volumes(
+        ssh_client=_ssh(), default_extra={}, host_probe=probe
+    )
+
+    assert removed == [_GONE_COMPANION]
+    assert (
+        retry.await_args.args[1]
+        == f"/usr/bin/docker volume rm {_GONE_COMPANION} 2>/dev/null || true"
+    )
 
 
 @pytest.mark.asyncio
