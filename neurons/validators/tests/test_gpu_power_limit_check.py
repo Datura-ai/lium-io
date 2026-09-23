@@ -210,21 +210,13 @@ async def test_host_held_limit_under_a_lium_filler_is_only_logged_while_the_flag
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "records",
-    [
-        pytest.param((), id="no-record"),
-        pytest.param((_restore_record(executor_id="executor-other"),), id="another-executors-record"),
-    ],
-)
 async def test_host_held_limit_under_a_lium_filler_earns_nothing_with_the_flag_on(
-    context_factory, read_records_mock, restore_mock, monkeypatch, records
+    context_factory, read_records_mock, restore_mock, monkeypatch
 ) -> None:
     """DAH-3630 regression: the live-filler pass paying for a limit Lium never set. PEARL started uncapped
     (its cap failed) or a filler that never caps runs, and the host holds the GPU below the floor: that
-    node is scored like any below-floor node. Another executor's record grants nothing either."""
+    node is scored like any below-floor node."""
     monkeypatch.setattr(settings, "ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", True)
-    read_records_mock.return_value = _read_result(*records)
     ctx = context_factory(state=_state(current_limit=105, default_limit=350, default_job_owner="lium"))
 
     result = await GpuPowerLimitCheck().run(ctx)
@@ -233,6 +225,26 @@ async def test_host_held_limit_under_a_lium_filler_earns_nothing_with_the_flag_o
     assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
     assert result.updates["score"] == 0.0
     assert result.updates["job_score"] == 0.0
+    restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_frozen_record_from_an_earlier_executor_id_still_proves_the_cap_under_a_lium_filler(
+    context_factory, read_records_mock, restore_mock, monkeypatch
+) -> None:
+    """DAH-3630 regression: a restore that failed (the GPU handle gone) freezes the record with the executor
+    id of the job that first capped the GPU; the next PEARL run keeps that record. A provider whose
+    executors re-register under new ids would be zeroed for Lium's own cap if only this executor's
+    records counted."""
+    monkeypatch.setattr(settings, "ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS", True)
+    read_records_mock.return_value = _read_result(_restore_record(executor_id="executor-before-reregister"))
+    ctx = context_factory(state=_state(current_limit=105, default_limit=350, default_job_owner="lium"))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == "GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER"
+    assert not result.updates
     restore_mock.assert_not_awaited()
 
 

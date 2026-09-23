@@ -451,7 +451,7 @@ class Settings(BaseSettings):
     ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS: bool = Field(env="ENABLE_PEARL_UNCAPPED_WHEN_CAP_FAILS", default=False)
 
     # DAH-3630 — the power-floor pass a live Lium filler gives GpuPowerLimitCheck covers only
-    # the GPUs this validator capped (a restore record for this executor). When True, a GPU below
+    # the GPUs this validator capped (a restore record for the GPU). When True, a GPU below
     # MIN_POWER_LIMIT_RATIO x default with no such record while a Lium filler runs is the host's
     # own limit and zero-scores the node like any below-floor node. When False the breach is only
     # logged (shadow mode) and the node passes, as before.

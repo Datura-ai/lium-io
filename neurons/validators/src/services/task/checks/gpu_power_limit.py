@@ -23,6 +23,7 @@ from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
 
+
 class GpuPowerMeasurement(BaseModel):
     index: int
     name: str | None
@@ -170,12 +171,14 @@ class GpuPowerLimitCheck:
 
         A GPU at or above the floor passes, whatever the host did to our cap: a host that raised
         the limit back keeps PEARL and its unrented incentive. A below-floor GPU passes only when
-        this validator holds a restore record for it on this executor, i.e. Lium capped it. A
-        below-floor GPU without one is the host's own limit (the cap failed and PEARL started
-        uncapped, or a filler that never caps): it earns nothing under the floor rule, so with
-        ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS the node is scored like any below-floor
-        node; without it the breach is logged and the node passes. Unknowns pass (a GPU without a
-        uuid, a failed Redis read). Never restores: the filler is live.
+        this validator holds a restore record for it, i.e. Lium capped it. Any executor's record
+        counts here: a record frozen by an earlier failed restore keeps the executor id of the job
+        that first capped the GPU, and an executor that re-registers under a new id would otherwise
+        be charged for Lium's own cap. A below-floor GPU without a record is the host's own limit
+        (the cap failed and PEARL started uncapped, or a filler that never caps): it earns nothing
+        under the floor rule, so with ENABLE_POWER_FLOOR_FOR_UNCAPPED_LIUM_FILLER_GPUS the node is
+        scored like any below-floor node; without it the breach is logged and the node passes.
+        Unknowns pass (a GPU without a uuid, a failed Redis read). Never restores: the filler is live.
         """
         skipped = render_message(
             Msg.SKIPPED_ACTIVE_LIUM_FILLER,
@@ -190,9 +193,7 @@ class GpuPowerLimitCheck:
             [measurement.uuid for measurement in rejected if measurement.uuid],
             log_extra=ctx.default_extra,
         )
-        capped_by_lium: set[str] = {
-            record.gpu_uuid for record in read_result.records if record.executor_id == ctx.executor.uuid
-        }
+        capped_by_lium: set[str] = {record.gpu_uuid for record in read_result.records}
         host_limited: list[GpuPowerMeasurement] = [
             measurement for measurement in rejected if measurement.uuid not in capped_by_lium
         ]
