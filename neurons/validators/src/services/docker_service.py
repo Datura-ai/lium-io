@@ -508,15 +508,6 @@ CUSTOM_BUILD_FAILED_MARKER = "BUILD_FAILED_RC="
 # process's own stderr is dropped with the cancelled stream. A failed build that PRINTED "process timed
 # out" comes back with its tail and the BUILD_FAILED_RC= marker around it, so it is not a timeout.
 STREAM_TIMEOUT_STDERR = "Process timed out"
-
-
-class CustomBuildOutcome(NamedTuple):
-    """What `_custom_build_image` returns: `ok`, the `failure_step` name and the renter-facing `log_tail`
-    (None, None on success)."""
-
-    ok: bool
-    failure_step: str | None
-    log_tail: str | None
 # `docker save | docker load` fails on the HOST daemon's side (its paths, its disk); that stderr is
 # for ops, the renter's tail gets this fixed line.
 CUSTOM_BUILD_EXPORT_FAILED_REASON = "built image could not be loaded onto the executor"
@@ -527,6 +518,18 @@ CUSTOM_BUILD_RC_UNREADABLE_REASON = (
     "build exit code could not be read back (the build container could not write to /tmp); "
     "the build is treated as failed"
 )
+# Paths inside the DinD container. Tests patch these; production keeps them under /tmp, outside /build.
+CUSTOM_BUILD_LOG_FILE = "/tmp/lium-build.log"
+CUSTOM_BUILD_RC_FILE = "/tmp/lium-build.rc"
+
+
+class CustomBuildOutcome(NamedTuple):
+    """What `_custom_build_image` returns: `ok`, the `failure_step` name and the renter-facing `log_tail`
+    (None, None on success)."""
+
+    ok: bool
+    failure_step: str | None
+    log_tail: str | None
 
 
 def custom_build_log_tail(output: str | None) -> str | None:
@@ -550,19 +553,16 @@ def stream_timed_out(err: str | None) -> bool:
     return (err or "").strip().lower() == STREAM_TIMEOUT_STDERR.lower()
 
 
-def custom_build_inner_command(
-    image_tag: str,
-    ctx: str,
-    log_file: str = "/tmp/lium-build.log",
-    rc_file: str = "/tmp/lium-build.rc",
-) -> str:
+def custom_build_inner_command(image_tag: str, ctx: str) -> str:
     """The `sh -c` body that runs `docker build` inside the DinD container. Build output goes to
-    stdout (the streamer's success lines) and to `log_file`; on a non-zero exit the last
+    stdout (the streamer's success lines) and to CUSTOM_BUILD_LOG_FILE; on a non-zero exit the last
     CUSTOM_BUILD_LOG_TAIL_LINES non-blank lines of that file go to stderr, then the
     BUILD_FAILED_RC=<rc> marker; the exit code is the build's (no pipefail needed: it is read
-    back from `rc_file`). An `rc_file` that cannot be written or read makes the build a failure
-    (rc 1) whose tail ends with CUSTOM_BUILD_RC_UNREADABLE_REASON — never a bare `exit` that
-    reads as success. No single quotes, so the caller's shlex.quote keeps the text verbatim."""
+    back from CUSTOM_BUILD_RC_FILE). An rc file that cannot be written or read makes the build a
+    failure (rc 1) whose tail ends with CUSTOM_BUILD_RC_UNREADABLE_REASON — never a bare `exit`
+    that reads as success. No single quotes, so the caller's shlex.quote keeps the text verbatim."""
+    log_file = CUSTOM_BUILD_LOG_FILE
+    rc_file = CUSTOM_BUILD_RC_FILE
     return (
         f"{{ docker build --progress=plain --pull "
         f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; echo $? > {rc_file}; }} "
