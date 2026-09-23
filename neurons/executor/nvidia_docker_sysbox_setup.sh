@@ -11,11 +11,12 @@ set -e
 #   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
 #   SYSBOX_SETUP_HOST_ROOT      test-only: prefix for the host files the preflight reads (/proc/modules, /etc/os-release, ...)
 
-# 0.6.7, not 0.6.6: under Docker 29's containerd image store, 0.6.6 cannot start an image with 44+ layers (DAH-3833)
-SYSBOX_VERSION="0.6.7"
+# 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
+# and 0.7.0 brings the runc container-escape fixes (CVE-2025-52565, CVE-2025-52881)
+SYSBOX_VERSION="0.7.1"
 SYSBOX_DEB_NAME="sysbox-ce_${SYSBOX_VERSION}.linux_amd64.deb"
 SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/${SYSBOX_DEB_NAME}"
-SYSBOX_SHA="b7ac389e5a19592cadf16e0ca30e40919516128f6e1b7f99e1cb4ff64554172e"
+SYSBOX_SHA="9d6d5484f980d0a17f86c492c1262015c2afb66280bdb97215b79fde6a0261c5"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
 
@@ -104,7 +105,7 @@ sysbox_idmapped_report() {
 }
 
 sysbox_runc_version() {
-    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.6.7" is one of the
+    # `sysbox-runc --version` prints its name alone on line 1; "version: 0.7.1" is one of the
     # tab-indented lines after it (edition, version, commit, ...), so the first line is never the
     # version. Prints the number; exit 1 when the binary is missing or prints no version.
     sysbox-runc --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | grep .
