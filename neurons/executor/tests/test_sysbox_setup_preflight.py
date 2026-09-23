@@ -634,7 +634,6 @@ def test_install_mode_upgrades_an_older_working_sysbox(tmp_path):
 
 
 def test_install_mode_keeps_a_newer_sysbox(tmp_path):
-    # a provider on a newer sysbox is never downgraded
     proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.7.1"})
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Sysbox is already working. Nothing to do." in proc.stdout
