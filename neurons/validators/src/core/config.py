@@ -372,13 +372,12 @@ class Settings(BaseSettings):
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
     # A node whose containers cannot reach the internet passed every check: the speed rule is behind
     # FeatureFlag.VERIFYX_NETWORK_VALIDATION (off) and a scrape whose every speed test failed only records
-    # the error. OutboundInternetCheck fails an idle node whose scrape ran its speed tests and measured
-    # neither direction (a null download alone is not a finding: 24 of one provider's 27 nodes; a scrape
-    # without speed tests, lium-io#1419, is no reading); the rental probe's `egress` step resolves and
-    # fetches pypi.org inside its renter container. Slow is not this check's business. CHECK logs the
-    # verdict (NO_OUTBOUND_INTERNET_OBSERVED); ENFORCEMENT fails the node with NO_OUTBOUND_INTERNET (score
-    # 0, like INSUFFICIENT_PORTS) and the rental probe's egress step with it. Off by default, same review
-    # and decider as REGISTRY_PULL_ENFORCEMENT_ENABLED below.
+    # the error. The rental probe's `egress` step resolves and fetches pypi.org inside its renter
+    # container; ENFORCEMENT fails the probe on it with NO_OUTBOUND_INTERNET (score 0). CHECK also turns
+    # on OutboundInternetCheck, which logs a scrape that measured neither direction
+    # (OUTBOUND_INTERNET_NO_SPEED) and never fails a node: the speed tests measure third-party endpoints,
+    # and a Cloudflare 429 in both directions reads the same. Slow is not this check's business.
+    # Enforcement is off by default, same review and decider as REGISTRY_PULL_ENFORCEMENT_ENABLED below.
     NO_OUTBOUND_INTERNET_CHECK_ENABLED: bool = Field(env="NO_OUTBOUND_INTERNET_CHECK_ENABLED", default=True)
     NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED: bool = Field(
         env="NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED", default=False

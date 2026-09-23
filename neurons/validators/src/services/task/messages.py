@@ -992,6 +992,7 @@ NO_OUTBOUND_INTERNET_REMEDIATION = (
 
 
 class OutboundInternetMessages:
+    # the rental probe's egress step, under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED
     NO_OUTBOUND_INTERNET = MessageTemplate(
         event="Containers cannot reach the internet",
         reason="NO_OUTBOUND_INTERNET",
@@ -1000,14 +1001,14 @@ class OutboundInternetMessages:
         impact="Score set to 0",
         remediation=NO_OUTBOUND_INTERNET_REMEDIATION,
     )
-    # the same finding while NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off: logged, score unchanged
-    NO_OUTBOUND_INTERNET_OBSERVED = MessageTemplate(
-        event="Containers cannot reach the internet (not enforced)",
-        reason="NO_OUTBOUND_INTERNET_OBSERVED",
-        severity="warning",
+    # the scrape's speed tests measured neither direction: a signal, never a fail (a Cloudflare 429 reads
+    # the same); the registry pull and the rental probe's egress step decide
+    OUTBOUND_INTERNET_NO_SPEED = MessageTemplate(
+        event="The scrape's speed tests measured neither download nor upload",
+        reason="OUTBOUND_INTERNET_NO_SPEED",
+        severity="info",
         category="runtime",
-        impact="None: NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off",
-        remediation=NO_OUTBOUND_INTERNET_REMEDIATION,
+        impact="Proceed",
     )
     OUTBOUND_INTERNET_OK = MessageTemplate(
         event="Outbound internet verified",

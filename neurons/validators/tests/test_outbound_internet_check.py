@@ -1,8 +1,9 @@
-"""NO_OUTBOUND_INTERNET: an idle node whose scrape ran its speed tests and measured neither direction fails.
+"""OutboundInternetCheck: what the scrape's speed tests say about egress, logged and never a fail.
 
-ticket-0361: a scrape whose every speed test failed only recorded the error while every check passed (the speed
-rule is behind FeatureFlag.VERIFYX_NETWORK_VALIDATION, off). The registry path that actually broke 14e704ba's
-rents is RegistryPullCheck's (test_registry_pull_check.py); EGRESS_PROBE_SCRIPT is the rental probe's egress step.
+ticket-0361: a scrape whose every speed test failed only recorded the error. Those tests measure third-party
+endpoints, so a Cloudflare 429 in both directions reads like a host that cannot reach out; the fail signals are
+the paths a renter takes, RegistryPullCheck's real pull (test_registry_pull_check.py) and the rental probe's egress
+step (EGRESS_PROBE_SCRIPT, below).
 """
 
 from __future__ import annotations
@@ -24,9 +25,14 @@ from services.task.checks.outbound_internet import (
     parse_egress_probe,
     scrape_egress_finding,
 )
+from services.task.checks.registry_pull import RegistryPullCheck
 from services.task.messages import OutboundInternetMessages as Msg
+from services.task.messages import RegistryPullMessages
 from services.task.pipeline_factory import PipelineFactory
-from tests.helpers import build_state, default_executor, make_context
+from tests.helpers import build_services, build_state, default_executor, make_context
+from tests.test_registry_pull_check import PULL_OK, FakeRedis, result
+from tests.test_registry_pull_check import FakeRunner as PullRunner
+from tests.test_registry_pull_check import flags as pull_flags
 
 EXECUTOR = default_executor()
 
@@ -55,6 +61,23 @@ CURL_FAILED = network(
     cloudflare={
         "download_speed": None,
         "network_speed_error": "RuntimeError(\"run_cmd error cmd='curl ...' proc.returncode=6\")",
+    },
+    netmeasure={"download_speed": None, "network_speed_error": "RuntimeError('netmeasure')"},
+    speedcheck={"download_speed": None, "network_speed_error": "RuntimeError('speedcheck')"},
+)
+# every method failed, Cloudflare with a 429 to both directions (cloudflare_transfer_mbps's error text)
+CLOUDFLARE_429_BOTH = network(
+    None,
+    None,
+    speedtest_cli={
+        "download_speed": None,
+        "network_speed_error": "ConfigRetrievalError('HTTP Error 403: Forbidden')",
+    },
+    cloudflare={
+        "download_speed": None,
+        "upload_speed": None,
+        "network_speed_error": "download: RuntimeError('HTTP 429, 0 bytes'); "
+        "upload: RuntimeError('HTTP 429, 0 bytes')",
     },
     netmeasure={"download_speed": None, "network_speed_error": "RuntimeError('netmeasure')"},
     speedcheck={"download_speed": None, "network_speed_error": "RuntimeError('speedcheck')"},
@@ -108,32 +131,66 @@ def test_defaults_log_only():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "log_only"])
 @pytest.mark.parametrize("download,upload", [(None, None), (0, 0), (0.0, None), (None, 0.0)])
-async def test_a_scrape_that_measured_neither_direction_fails_with_no_outbound_internet(
-    download, upload
+async def test_a_scrape_that_measured_neither_direction_is_logged_and_never_fails(
+    download, upload, enforced
 ):
-    """Regression: a scrape with neither a download nor an upload measured (None) or a zero passes."""
+    """Regression (r3): under enforcement the scrape rule failed a node with NO_OUTBOUND_INTERNET whatever
+    its real registry pull or rental-probe egress step said."""
     ctx, _ = make_ctx(network(download, upload))
-    with flags():
+    with flags(enforced=enforced):
         res = await OutboundInternetCheck().run(ctx)
-    assert res.passed is False
-    assert res.event.reason_code == Msg.NO_OUTBOUND_INTERNET.reason
-    assert res.event.what_we_saw["failed_by"] == ["scrape"]
-    assert res.event.remediation == (
-        "containers on this host cannot reach the internet; check the docker bridge / FORWARD chain and DNS"
-    )
+    assert res.passed is True
+    assert res.event.reason_code == Msg.OUTBOUND_INTERNET_NO_SPEED.reason
+    assert res.event.what_we_saw["scrape"]["no_egress"] is True
+    assert "failed_by" not in res.event.what_we_saw
 
 
 @pytest.mark.asyncio
-async def test_every_speed_test_erroring_fails_and_carries_the_errors():
-    """Regression: a curl to speed.cloudflare.com that errors (only network_speed_error recorded) passes."""
+async def test_every_speed_test_erroring_is_logged_with_the_errors():
+    """Regression: a curl to speed.cloudflare.com that errors (only network_speed_error recorded) is lost."""
     ctx, _ = make_ctx(CURL_FAILED)
     with flags():
         res = await OutboundInternetCheck().run(ctx)
-    assert res.passed is False and res.event.reason_code == Msg.NO_OUTBOUND_INTERNET.reason
+    assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_NO_SPEED.reason
     errors = res.event.what_we_saw["scrape"]["speed_errors"]
     assert set(errors) == {"speedtest_cli", "cloudflare", "netmeasure", "speedcheck"}
     assert "curl" in errors["cloudflare"]
+
+
+async def _scrape_then_real_pull(net: dict):
+    """OutboundInternetCheck then RegistryPullCheck on one context, both under enforcement, the pull ok."""
+    runner = PullRunner(result(PULL_OK))
+    ctx = make_context(
+        state=build_state(specs={"network": net}),
+        runner=runner,
+        services=build_services(redis=FakeRedis()),
+    )
+    with flags(enforced=True), pull_flags(enforced=True):
+        scrape = await OutboundInternetCheck().run(ctx)
+        pull = await RegistryPullCheck().run(ctx)
+    assert len(runner.commands) == 1
+    return scrape, pull
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("download,upload", [(None, None), (0, 0)])
+async def test_scrape_measured_neither_direction_and_the_real_pull_ok_passes(download, upload):
+    """Regression (r3): a node whose real Docker Hub pull is ok failed on the speed-test scrape rule."""
+    scrape, pull = await _scrape_then_real_pull(network(download, upload))
+    assert scrape.passed and scrape.event.reason_code == Msg.OUTBOUND_INTERNET_NO_SPEED.reason
+    assert pull.passed and pull.event.reason_code == RegistryPullMessages.REGISTRY_PULL_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_429_in_both_directions_and_the_real_pull_ok_passes():
+    """Regression (r3): Cloudflare rate-limiting both directions (every other method failing too) failed a
+    node with NO_OUTBOUND_INTERNET although its pull through the registry path worked."""
+    scrape, pull = await _scrape_then_real_pull(CLOUDFLARE_429_BOTH)
+    assert scrape.passed and scrape.event.reason_code == Msg.OUTBOUND_INTERNET_NO_SPEED.reason
+    assert "HTTP 429" in scrape.event.what_we_saw["scrape"]["speed_errors"]["cloudflare"]
+    assert pull.passed and pull.event.reason_code == RegistryPullMessages.REGISTRY_PULL_OK.reason
 
 
 @pytest.mark.asyncio
@@ -176,18 +233,6 @@ async def test_a_slow_but_working_host_passes():
     with flags():
         res = await OutboundInternetCheck().run(ctx)
     assert res.passed and res.event.reason_code == Msg.OUTBOUND_INTERNET_OK.reason
-
-
-@pytest.mark.asyncio
-async def test_enforcement_off_only_logs():
-    """Regression: the finding fails the node while NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off."""
-    ctx, _ = make_ctx(network(None))
-    with flags(enforced=False):
-        res = await OutboundInternetCheck().run(ctx)
-    assert res.passed is True
-    assert res.event.reason_code == Msg.NO_OUTBOUND_INTERNET_OBSERVED.reason
-    assert res.event.severity == "warning"
-    assert res.event.what_we_saw["enforced"] is False
 
 
 @pytest.mark.asyncio

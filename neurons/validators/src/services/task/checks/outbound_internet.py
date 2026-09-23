@@ -144,16 +144,18 @@ def _is_rented(ctx: Context) -> bool:
 
 
 class OutboundInternetCheck:
-    """Fail an idle node whose scrape ran its speed tests and measured neither direction (NO_OUTBOUND_INTERNET).
+    """Log what an idle node's scrape speed tests say about egress; never fail the node for it.
 
-    A null download alone is not a finding (ticket-0361: 24 of one provider's 27 active nodes had one), nor
-    is a scrape that ran no speed test (lium-io#1419), which is logged as OUTBOUND_INTERNET_UNMEASURED. A
-    slow host passes: speed stays behind FeatureFlag.VERIFYX_NETWORK_VALIDATION. The in-pod view is the
-    rental probe's `egress` step; a registry path that cannot pull is RegistryPullCheck's.
+    A scrape that measured neither direction is logged as OUTBOUND_INTERNET_NO_SPEED and passes, under
+    either NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED setting. The speed tests measure third-party endpoints
+    (speedtest.net servers, speed.cloudflare.com), not the node: Cloudflare answering 429 to both directions
+    reads the same as a host that cannot reach out, and 14e704ba, whose renters could not start, measured
+    77-105 Mbps up. The fail signals are the paths a renter takes: RegistryPullCheck's real Docker Hub pull
+    and the rental probe's `egress` step, both under their own enforcement flags.
 
-    Under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED the finding fails the node the way INSUFFICIENT_PORTS
-    does; without it the check logs NO_OUTBOUND_INTERNET_OBSERVED and passes. A rented node is left
-    alone like PortCountCheck leaves it.
+    A null download alone is no finding (ticket-0361: 24 of one provider's 27 active nodes had one), and a
+    scrape that ran no speed test (lium-io#1419) is logged as OUTBOUND_INTERNET_UNMEASURED. A rented node
+    is left alone like PortCountCheck leaves it.
     """
 
     check_id = "executor.validate.outbound_internet"
@@ -167,26 +169,13 @@ class OutboundInternetCheck:
         if _is_rented(ctx):
             return self._skipped(ctx, "rented", scrape=scrape)
 
-        what: dict[str, Any] = {
-            "scrape": scrape,
-            "enforced": settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED,
-        }
-        if scrape is None or not scrape["no_egress"]:
-            template = (
-                Msg.OUTBOUND_INTERNET_UNMEASURED if scrape is None else Msg.OUTBOUND_INTERNET_OK
-            )
-            event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=True, event=event)
-
-        what["failed_by"] = ["scrape"]
-        if settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:
-            event = render_message(
-                Msg.NO_OUTBOUND_INTERNET, ctx=ctx, check_id=self.check_id, what=what
-            )
-            return CheckResult(passed=False, event=event)
-        event = render_message(
-            Msg.NO_OUTBOUND_INTERNET_OBSERVED, ctx=ctx, check_id=self.check_id, what=what
-        )
+        if scrape is None:
+            template = Msg.OUTBOUND_INTERNET_UNMEASURED
+        elif scrape["no_egress"]:
+            template = Msg.OUTBOUND_INTERNET_NO_SPEED
+        else:
+            template = Msg.OUTBOUND_INTERNET_OK
+        event = render_message(template, ctx=ctx, check_id=self.check_id, what={"scrape": scrape})
         return CheckResult(passed=True, event=event)
 
     def _skipped(
