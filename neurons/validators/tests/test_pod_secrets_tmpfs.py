@@ -5,12 +5,16 @@ the flag off a rent is exactly today's."""
 import dataclasses
 import logging
 import subprocess
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import pytest
 
 from core.config import settings
+from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import ContainerCreateRequest
 from services import rental_docker_sdk
+from services.docker_service import DockerService
 from services.rental_docker_sdk import (
     POD_SECRETS_DIR,
     POD_SECRETS_TMPFS_OPTIONS,
@@ -19,17 +23,52 @@ from services.rental_docker_sdk import (
     build_secret_file_exec_specs,
     valid_pod_secrets,
 )
-from test_docker_service_rental_security import (  # noqa: F401 — fixtures
+from test_docker_service_rental_security import (
+    RecordingRentalDockerFactory,
     RecordingSSHClient,
     _base_create_payload,
     _patch_create_harness,
-    docker_service,
-    executor_info,
-    keypair,
 )
 
-SECRETS = {"HF_TOKEN": "hf_SECRET_VALUE_MARKER", "WANDB_API_KEY": "wandb'; echo SECRET_SHELL_MARKER; $(id)"}
+SECRETS = {
+    "HF_TOKEN": "hf_SECRET_VALUE_MARKER",
+    "WANDB_API_KEY": "wandb'; echo SECRET_SHELL_MARKER; $(id)",
+}
 SECRET_VALUES = tuple(SECRETS.values())
+
+
+@pytest.fixture
+def docker_service():
+    lock = AsyncMock()
+    lock.__aenter__ = AsyncMock(return_value=lock)
+    lock.__aexit__ = AsyncMock(return_value=None)
+    redis_service = Mock()
+    redis_service.acquire_executor_lock = Mock(return_value=lock)
+    return DockerService(
+        ssh_service=Mock(),
+        redis_service=redis_service,
+        attestation_service=Mock(),
+        rental_docker_client_factory=RecordingRentalDockerFactory(),
+    )
+
+
+@pytest.fixture
+def executor_info():
+    return ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
+    )
+
+
+@pytest.fixture
+def keypair():
+    return Mock(ss58_address="validator-hotkey")
 
 
 def _secret_specs(docker_client):
@@ -42,7 +81,10 @@ async def _create(docker_service, executor_info, keypair, monkeypatch, *, flag: 
     _patch_create_harness(monkeypatch, docker_service, RecordingSSHClient())
     payload = _base_create_payload(secrets=secrets)
     await docker_service.create_container(
-        payload=payload, executor_info=executor_info, keypair=keypair, private_key="encrypted-private-key"
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
     )
     return payload, docker_service.rental_docker_client_factory.client
 
@@ -88,9 +130,13 @@ def test_the_write_refuses_a_directory_that_is_not_a_tmpfs(tmp_path, monkeypatch
     plain_dir = tmp_path / "secrets"
     plain_dir.mkdir()
     monkeypatch.setattr(rental_docker_sdk, "POD_SECRETS_DIR", str(plain_dir))
-    spec = build_secret_file_exec_specs(container_name="pod", secrets={"HF_TOKEN": "hf_SECRET_VALUE_MARKER"})[0]
+    spec = build_secret_file_exec_specs(
+        container_name="pod", secrets={"HF_TOKEN": "hf_SECRET_VALUE_MARKER"}
+    )[0]
 
-    run = subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, timeout=30)
+    run = subprocess.run(
+        list(spec.argv), input=spec.stdin, capture_output=True, text=True, timeout=30
+    )
 
     assert run.returncode == 1
     assert "is not a tmpfs mount" in run.stderr
@@ -114,16 +160,22 @@ async def test_flag_on_mounts_the_tmpfs_and_writes_files_with_no_env_leak(
     docker_service, executor_info, keypair, monkeypatch, caplog
 ):
     caplog.set_level(logging.DEBUG)
-    payload, docker_client = await _create(docker_service, executor_info, keypair, monkeypatch, flag=True, secrets=SECRETS)
+    payload, docker_client = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=True, secrets=SECRETS
+    )
 
     run_spec = docker_client.run_specs[0]
     assert run_spec.tmpfs == {POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS}
-    assert _build_host_config_kwargs(run_spec)["tmpfs"] == {POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS}
+    assert _build_host_config_kwargs(run_spec)["tmpfs"] == {
+        POD_SECRETS_DIR: POD_SECRETS_TMPFS_OPTIONS
+    }
     # `docker inspect` Env is exactly create_container's environment
     assert not set(SECRETS) & set(run_spec.environment)
     assert not set(SECRET_VALUES) & set(run_spec.environment.values())
 
-    env_specs = [spec for spec in docker_client.exec_specs if "/etc/environment" in " ".join(spec.argv)]
+    env_specs = [
+        spec for spec in docker_client.exec_specs if "/etc/environment" in " ".join(spec.argv)
+    ]
     assert len(env_specs) == 1
     for value in SECRET_VALUES:
         assert value not in env_specs[0].stdin
@@ -134,7 +186,9 @@ async def test_flag_on_mounts_the_tmpfs_and_writes_files_with_no_env_leak(
         for value in SECRET_VALUES:
             assert value not in " ".join(spec.argv)
 
-    logged = "\n".join(f"{record.getMessage()} {getattr(record.msg, 'extra', '')}" for record in caplog.records)
+    logged = "\n".join(
+        f"{record.getMessage()} {getattr(record.msg, 'extra', '')}" for record in caplog.records
+    )
     assert "exec_write_pod_secret" in logged
     for value in SECRET_VALUES:
         assert value not in logged
@@ -144,12 +198,16 @@ async def test_flag_on_mounts_the_tmpfs_and_writes_files_with_no_env_leak(
 async def test_flag_off_is_todays_rent_even_when_the_backend_sends_secrets(
     docker_service, executor_info, keypair, monkeypatch
 ):
-    _, with_secrets = await _create(docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=SECRETS)
+    _, with_secrets = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=SECRETS
+    )
     with_secrets_run = dataclasses.asdict(with_secrets.run_specs[0])
     with_secrets_host = _build_host_config_kwargs(with_secrets.run_specs[0])
     with_secrets_execs = [dataclasses.asdict(spec) for spec in with_secrets.exec_specs]
 
-    _, today = await _create(docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=None)
+    _, today = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=None
+    )
 
     assert with_secrets_run == dataclasses.asdict(today.run_specs[0])
     assert with_secrets_host == _build_host_config_kwargs(today.run_specs[0])
@@ -159,12 +217,18 @@ async def test_flag_off_is_todays_rent_even_when_the_backend_sends_secrets(
 
 
 @pytest.mark.asyncio
-async def test_flag_on_without_secrets_adds_nothing(docker_service, executor_info, keypair, monkeypatch):
-    _, flag_on = await _create(docker_service, executor_info, keypair, monkeypatch, flag=True, secrets=None)
+async def test_flag_on_without_secrets_adds_nothing(
+    docker_service, executor_info, keypair, monkeypatch
+):
+    _, flag_on = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=True, secrets=None
+    )
     flag_on_host = _build_host_config_kwargs(flag_on.run_specs[0])
     flag_on_execs = [dataclasses.asdict(spec) for spec in flag_on.exec_specs]
 
-    _, flag_off = await _create(docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=None)
+    _, flag_off = await _create(
+        docker_service, executor_info, keypair, monkeypatch, flag=False, secrets=None
+    )
 
     assert flag_on_host == _build_host_config_kwargs(flag_off.run_specs[0])
     assert flag_on_execs == [dataclasses.asdict(spec) for spec in flag_off.exec_specs]
@@ -183,7 +247,9 @@ async def test_a_failed_secret_write_fails_the_rent_naming_only_the_secret(
     async def failing_secret_exec(spec):
         result = await original_exec(spec)
         if POD_SECRETS_DIR in " ".join(spec.argv):
-            return rental_docker_sdk.ContainerExecResult(exit_status=1, stderr=f"{POD_SECRETS_DIR} is not a tmpfs mount")
+            return rental_docker_sdk.ContainerExecResult(
+                exit_status=1, stderr=f"{POD_SECRETS_DIR} is not a tmpfs mount"
+            )
         return result
 
     monkeypatch.setattr(docker_client, "exec_in_container", failing_secret_exec)
