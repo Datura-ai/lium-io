@@ -36,11 +36,12 @@ applies once:
 
 ```bash
 R=Datura-ai/lium-io
-# the environment, with the owner as the one required reviewer (GitHub user id 114649324 = surcyf123);
+# the environment, with self-approval blocked; required reviewers: GitHub user id 114649324 = surcyf123 (the loop's
+# account, which the publish job checks for) plus at least one human (`gh api users/<login> --jq .id`);
 # only lium-core-v* tags may enter it
 gh api -X PUT "repos/$R/environments/pypi" --input - <<'JSON'
 { "reviewers": [ { "type": "User", "id": 114649324 } ],
-  "prevent_self_review": false,
+  "prevent_self_review": true,
   "deployment_branch_policy": { "protected_branches": false, "custom_branch_policies": true } }
 JSON
 gh api -X POST "repos/$R/environments/pypi/deployment-branch-policies" -f name='lium-core-v*' -f type=tag
@@ -49,15 +50,23 @@ gh api "repos/$R/rulesets" --method POST --input .github/rulesets/lium-core-rele
 ```
 
 Check: `gh api "repos/$R/environments/pypi" --jq '.protection_rules[]|.type'` → `required_reviewers`,
-`branch_policy`; `gh api "repos/$R/rulesets?targets=tag" --jq '.[]|.name+" "+.enforcement'` →
+`branch_policy`;
+`gh api "repos/$R/environments/pypi" --jq '.protection_rules[]|select(.type=="required_reviewers")|.prevent_self_review'`
+→ `true`; `gh api "repos/$R/rulesets?targets=tag" --jq '.[]|.name+" "+.enforcement'` →
 `lium-core-release-tags active`. Other publishers in this repository that later use the same environment add their
 tag pattern with one more `deployment-branch-policies` call.
 
-**Order — it matters.** (1) Create the `pypi` environment with its reviewer and policy, as above, **before the
-workflow change merges**: a workflow that names an environment that does not exist makes GitHub create it with no
-protection, and the first tagged run would publish with no click. (2) Register the `pypi` publisher on pypi.org
+Self-approval is blocked (`prevent_self_review: true`): GitHub refuses an approval from the account that started the
+run. A human reviewer approves each release. The loop's account (`surcyf123`) must not be the approving reviewer on
+any run. Today `surcyf123` is the only required reviewer, so at least one human must be a required reviewer on the
+`pypi` environment before any release can ship: add their id to `reviewers` in the command above and re-run the `PUT`.
+
+**Order — it matters.** (1) Create the `pypi` environment with its reviewers (at least one human), self-approval
+blocked and the policy, as above, **before the workflow change merges**: a workflow that names an environment that
+does not exist makes GitHub create it with no protection, and the first tagged run would publish with no click.
+(2) Register the `pypi` publisher on pypi.org
 (Manage → Publishing → Add a new publisher → GitHub: owner `Datura-ai`, repository `lium-io`, workflow
-`lium-core-release.yml`, environment `pypi`). (3) Merge. (4) Proof release, approved by the reviewer. (5) **Delete
+`lium-core-release.yml`, environment `pypi`). (3) Merge. (4) Proof release, approved by a human reviewer. (5) **Delete
 the old publishers** on pypi.org: `Datura-ai/lium-io · lium-core-release.yml · release` and the archived
 `Datura-ai/lium-core · release.yml · release`. Until they are gone a branch whose edited `lium-core-release.yml`
 keeps `environment: release` (no reviewer, no branch policy), run by hand, still uploads — any of the 7 accounts
@@ -65,5 +74,5 @@ with write access can do that today. (6) Apply the tag ruleset. The publish job 
 `repos/$R/environments/pypi` back and stops with `environment pypi has no required reviewer` when none is set
 (an unauthenticated read for a public repository; the job holds `actions: read` for it). It cannot check step (5)
 — pypi.org's side is the owner's click. With no `pypi` publisher registered, PyPI rejects the `pypi`-environment
-token (the current publisher is bound to `release`), so between (3) and (2) a tag fails closed — that is the only
-state that does.
+token (the current publisher is bound to `release`), so if (3) runs before (2), a tag pushed after (3) and before (2)
+fails closed — that is the only state that does.
