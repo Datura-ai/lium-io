@@ -20,13 +20,16 @@ logger = logging.getLogger(__name__)
 
 # library/hello-world's multi-arch index, pinned by digest (linux/amd64: one 2,415-byte layer). A digest
 # never changes what it names, so every node pulls the same bytes, and a tag moving upstream cannot turn
-# into a fleet-wide manifest_unknown on a Tuesday. Unqualified `docker.io`, so dockerd sends it through
+# into a fleet-wide manifest_unknown. Unqualified `docker.io`, so dockerd sends it through
 # the registry-mirrors in daemon.json first, the way it sends a renter's template image.
 REGISTRY_PULL_IMAGE = "docker.io/library/hello-world@sha256:5e23090353324d887c48ad5e5c56d294eab81588df9605b07d1afe895f9cc8f8"
-REGISTRY_PULL_TIMEOUT_SECONDS = 60
+# a healthy pull of this image takes 1-4 s. Behind a mirror whose DNS lookups time out, dockerd waits out
+# the lookup before each registry request and then falls back to Docker Hub: measured 51 s and over 60 s
+# on two runs of the same setup, so a 60 s bound would pass the broken mirror about half the time
+REGISTRY_PULL_TIMEOUT_SECONDS = 30
 REGISTRY_PULL_MARKER = "lium_pull"
-# the script's own bounds (10 + 20 + 10 + 10 + 60 + 20 s, each plus timeout's 5 s kill grace) and SSH
-REGISTRY_PULL_COMMAND_TIMEOUT_SECONDS = 180
+# the script's own bounds (10 + 10 + 20 + 10 + 30 + 20 s, each plus timeout's 5 s kill grace) and SSH
+REGISTRY_PULL_COMMAND_TIMEOUT_SECONDS = 150
 # a node fails once this many measured pulls in a row failed; a no-verdict pull neither counts nor resets
 REGISTRY_PULL_FAILURES_BEFORE_VERDICT = 2
 _REDIS_PREFIX = "registry_pull_probe"
@@ -37,7 +40,7 @@ _TAIL_CHARS = 600
 # node's configured registry path (registry-mirrors, then registry-1.docker.io) exactly as a rental's pull
 # does. The image is removed first so the pull reaches the registry or mirror instead of the local store,
 # and removed again after. Every docker call runs under `timeout` where the image has it; the pull's
-# 60 s is the verdict's bound. Exit 0 always: the marker lines are the answer.
+# 30 s is the verdict's bound. Exit 0 always: the marker lines are the answer.
 REGISTRY_PULL_SCRIPT = (
     f"img={REGISTRY_PULL_IMAGE}; d=/usr/bin/docker; "
     'bounded() { s=$1; shift; if command -v timeout >/dev/null 2>&1; then timeout -k 5 "$s" "$@"; '
@@ -258,7 +261,7 @@ class RegistryPullCheck:
     have cached: its dockerd pulls through the registry mirror docker.m.daocloud.io, whose DNS lookup times
     out, while cached templates started fine. The speed tests and the other checks never pull, so they
     passed it. This check runs a real `docker pull` of a tiny digest-pinned image (REGISTRY_PULL_IMAGE)
-    after removing it, under a 60 s bound, and records the outcome and the daemon's registry mirrors.
+    after removing it, under a 30 s bound, and records the outcome and the daemon's registry mirrors.
 
     Bounded: only on idle nodes, at most once per REGISTRY_PULL_PROBE_INTERVAL_HOURS while no failure is
     open, and once per REGISTRY_PULL_PROBE_RETRY_MINUTES while one is (so the second reading, or a fixed

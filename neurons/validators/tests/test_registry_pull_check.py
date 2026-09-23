@@ -35,8 +35,8 @@ from tests.helpers import build_services, build_state, default_executor, make_co
 EXECUTOR = default_executor()
 MIRROR = '["https://docker.m.daocloud.io/"]'
 # Docker 29.1.3 (containerd image store) with that mirror configured and its DNS answers dropped: the 2.4 KB
-# pull was still running at 60 s and timeout(1) ended it; with the resolver refusing, the pull failed at once
-MIRROR_DNS_TIMEOUT = f"lium_pull mirrors={MIRROR}\nlium_pull cached=no cache=removed\nlium_pull exit=124 seconds=60\n"
+# pull took 51 s on one run and over 60 s on another, and the 30 s bound ended it on both runs after; with the resolver refusing, the pull failed at once
+MIRROR_DNS_TIMEOUT = f"lium_pull mirrors={MIRROR}\nlium_pull cached=no cache=removed\nlium_pull exit=124 seconds=30\n"
 MIRROR_DNS_REFUSED = (
     f"lium_pull mirrors={MIRROR}\nlium_pull cached=no cache=removed\nlium_pull exit=1 seconds=0\n"
     f'Error response from daemon: failed to resolve reference "{REGISTRY_PULL_IMAGE}": failed to do request: '
@@ -302,7 +302,7 @@ def test_an_image_rmi_cannot_remove_is_not_pulled(tmp_path):
     assert "pull" not in (tmp_path / "docker.log").read_text()
 
 
-def test_the_pull_runs_under_a_60_s_total_bound(tmp_path):
+def test_the_pull_runs_under_a_30_s_total_bound(tmp_path):
     out = _run_script(
         tmp_path,
         _docker_stub(tmp_path, pull="echo pulled", cached=False),
@@ -311,13 +311,13 @@ def test_the_pull_runs_under_a_60_s_total_bound(tmp_path):
     assert parse_pull_probe(out.stdout).outcome == "ok"
     bounds = (tmp_path / "timeout.log").read_text().splitlines()
     pull_bound = next(line for line in bounds if " pull " in line)
-    assert pull_bound.split()[:3] == ["-k", "5", "60"]
+    assert pull_bound.split()[:3] == ["-k", "5", "30"]
     assert all(line.startswith("-k 5 ") for line in bounds)
 
 
 def test_a_pull_that_hangs_is_cut_off_and_reads_as_timeout(tmp_path):
     """The bound is real: a pull still waiting on the mirror's lookup is killed and the outcome is timeout.
-    The stubbed `timeout` shortens the 60 s to 1 s."""
+    The stubbed `timeout` shortens the 30 s to 1 s."""
     out = _run_script(
         tmp_path,
         _docker_stub(tmp_path, pull="exec sleep 30", cached=False),

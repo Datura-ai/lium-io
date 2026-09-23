@@ -386,7 +386,7 @@ class Settings(BaseSettings):
     # ticket-0361: 14e704ba failed 16 rents in 24 h, every one a template it did not have cached; its
     # dockerd pulls through the mirror docker.m.daocloud.io, whose DNS lookup times out, while cached
     # templates start fine. RegistryPullCheck removes and pulls a digest-pinned hello-world through the
-    # daemon (registry-mirrors apply) under a 60 s bound on idle nodes, at most once per INTERVAL_HOURS
+    # daemon (registry-mirrors apply) under a 30 s bound on idle nodes, at most once per INTERVAL_HOURS
     # (RETRY_MINUTES after a failed pull, so the confirming pull comes soon). A Docker Hub 429 is no
     # verdict. Two failed pulls in a row (timeout, DNS error, manifest unknown) are the finding: logged as
     # REGISTRY_PULL_FAILED_OBSERVED, or with ENFORCEMENT a fail (REGISTRY_PULL_FAILED, score 0).
