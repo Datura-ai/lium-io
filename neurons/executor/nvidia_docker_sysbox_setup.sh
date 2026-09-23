@@ -13,7 +13,8 @@ set -e
 
 # 0.6.7, not 0.6.6: under Docker 29's containerd image store, 0.6.6 cannot start an image with 44+ layers (DAH-3833)
 SYSBOX_VERSION="0.6.7"
-SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}.linux_amd64.deb"
+SYSBOX_DEB_NAME="sysbox-ce_${SYSBOX_VERSION}.linux_amd64.deb"
+SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/${SYSBOX_DEB_NAME}"
 SYSBOX_SHA="b7ac389e5a19592cadf16e0ca30e40919516128f6e1b7f99e1cb4ff64554172e"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 DOWNLOADED_DEB=""
@@ -568,14 +569,14 @@ fi
 # ── 2. Already working? ─────────────────────────────────
 
 INSTALLED_SYSBOX=$(sysbox_runc_version || true)
-SYSBOX_IS_OLDER=false
-if [ -n "$INSTALLED_SYSBOX" ] && [ "$INSTALLED_SYSBOX" != "$SYSBOX_VERSION" ] \
-    && [ "$(printf '%s\n' "$INSTALLED_SYSBOX" "$SYSBOX_VERSION" | sort -V | head -1)" = "$INSTALLED_SYSBOX" ]; then
-    SYSBOX_IS_OLDER=true
+SYSBOX_UP_TO_DATE=false
+if [ -n "$INSTALLED_SYSBOX" ] && ! version3_ge "$INSTALLED_SYSBOX" "$SYSBOX_VERSION"; then
     warn "Sysbox $INSTALLED_SYSBOX is installed; upgrading to $SYSBOX_VERSION."
+elif command -v sysbox-runc &>/dev/null; then
+    SYSBOX_UP_TO_DATE=true
 fi
 
-if [ "$SYSBOX_IS_OLDER" = false ] && command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc; then
+if [ "$SYSBOX_UP_TO_DATE" = true ] && docker info 2>/dev/null | grep -q sysbox-runc; then
     # pull first: without the image the real test cannot run and the host would be judged on kernel version alone
     if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
         abort_on_active_rentals
@@ -600,7 +601,7 @@ elif [ "$(sysbox_idmapped_report)" = "no" ]; then
 fi
 
 SKIP_INSTALL=false
-[ "$SYSBOX_IS_OLDER" = false ] && command -v sysbox-runc &>/dev/null && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
+[ "$SYSBOX_UP_TO_DATE" = true ] && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
 
 # ── 3. Check running containers ─────────────────────────
 
@@ -697,7 +698,7 @@ apt_install install -y -qq nvidia-container-toolkit jq || exit 1
 ok "nvidia-container-toolkit, jq"
 
 if [ "$SKIP_INSTALL" = false ]; then
-    LOCAL_DEB="./sysbox-ce_${SYSBOX_VERSION}.linux_amd64.deb"
+    LOCAL_DEB="./${SYSBOX_DEB_NAME}"
     if [ -f "$LOCAL_DEB" ]; then
         SYSBOX_DEB="$LOCAL_DEB"
     else

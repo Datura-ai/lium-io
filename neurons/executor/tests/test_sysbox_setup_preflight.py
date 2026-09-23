@@ -24,7 +24,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "sort"]
+REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm"]
 
 STUBS = {
     "id": '#!/bin/bash\necho "${STUB_UID:-0}"\n',
