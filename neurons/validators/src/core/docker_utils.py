@@ -48,6 +48,21 @@ class DockerCommand:
         return f"/usr/bin/docker rm -fv {name}"
 
     @staticmethod
+    def dind_diagnostics(name: str, lines: int = 40) -> str:
+        """What a DinD container whose sshd never answered has to say (DAH-2856).
+
+        The image's entrypoint waits for the inner dockerd before it runs the validator's
+        `service ssh start`; when that dockerd cannot start, sshd never does. supervisord in the
+        image writes dockerd's stderr to /var/log/dockerd.err.log, not to the container log, so
+        both are read: the container log first, then that file. Exit 0 always; the text is data.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"/usr/bin/docker logs --tail {lines} {quoted} 2>&1; "
+            f"/usr/bin/docker exec {quoted} tail -n {lines} /var/log/dockerd.err.log 2>&1; true"
+        )
+
+    @staticmethod
     def kill_container_processes(name: str) -> str:
         """SIGKILL a container's init and its containerd shim directly (DAH-2991).
 

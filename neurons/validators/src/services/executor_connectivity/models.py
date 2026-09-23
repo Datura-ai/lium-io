@@ -17,11 +17,37 @@ class PortProbeResult:
 
 
 @dataclass(frozen=True)
+class DindLogCause:
+    """Why the DinD container's sshd never answered: a stable code and the words the provider reads."""
+
+    code: str
+    message: str
+    # dockerd's own line when the cause was read from the container log. None when the code was
+    # named without one, so the event must not claim the fix is on the host and not in sysbox.
+    dockerd_line: str | None = None
+
+    @property
+    def text(self) -> str:
+        """`CODE: message`, the one-line form for logs and the event's what-we-saw."""
+        return f"{self.code}: {self.message}"
+
+
+# DAH-2856: the cause codes read from the inner dockerd's own log. The fix for these is on the
+# host, sysbox is not the cause; the sysbox check reads the set to word its remediation.
+DIND_INNER_DOCKERD_IPTABLES = "DIND_INNER_DOCKERD_IPTABLES"
+DIND_INNER_DOCKERD_DOWN = "DIND_INNER_DOCKERD_DOWN"
+DIND_INNER_DOCKERD_CODES = frozenset({DIND_INNER_DOCKERD_IPTABLES, DIND_INNER_DOCKERD_DOWN})
+
+
+@dataclass(frozen=True)
 class DindProbeResult:
     success: bool
     sysbox_runtime: bool
     port: PortPair | None
     log_text: str | None = None
+    # DAH-2856: the cause when the container started but sshd never answered, read from the
+    # container's own logs before removal (None when the probe passed or never got that far).
+    error: DindLogCause | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +61,8 @@ class PortVerificationResult:
     status: str
     error: str | None = None
     elapsed_sec: float | None = None
+    # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
+    dind_error: DindLogCause | None = None
 
 
 @dataclass(frozen=True)
