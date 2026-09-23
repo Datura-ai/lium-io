@@ -163,12 +163,18 @@ CONTAINER_STOP_GRACE_SECONDS = 30
 
 # Fillers get a shorter grace window than customer workloads. The backend preempts a filler
 # before a customer rent with a total budget of FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s in
-# compute-app) and starts the rent anyway on timeout. This grace must stay strictly below that
+# the backend) and starts the rent anyway on timeout. This grace must stay strictly below that
 # budget with room for the forced removal and the stopped-callback, so a SIGTERM-ignoring filler
 # can never burn the whole budget inside docker stop and hold the GPUs into the customer rent.
 # Half the budget leaves ~15s of headroom while still letting a well-behaved filler exit cleanly
-# and avoid the containerd/sysbox wedge. Keep in sync with compute-app FILLER_STOP_WAIT_TIMEOUT_SECONDS.
+# and avoid the containerd/sysbox wedge. Keep in sync with the backend FILLER_STOP_WAIT_TIMEOUT_SECONDS.
 FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
+
+# DAH-3706: typed event written when a `filler_*` container is still on the host after a
+# customer create's `docker rm -fv`. Same name as the backend's FILLER_STILL_RUNNING_EVENT so one
+# log query counts both halves. Join key: `executor_uuid` (the validator-side id; the backend's rent
+# path writes it too -- its `executor_id` is the backend's DB row id), plus pod_name, container_names, reason.
+FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 
 # In-container port the cache-template images' start.sh hardcodes for Jupyter
 # (`jupyter lab --port=8888`). It reads no port from the environment, so the
@@ -2081,10 +2087,17 @@ class DockerService:
         active_container_names: list[str] | None = None,
         active_volume_names: list[str] | None = None,
         host_probe: PrerunHostProbe | None = None,
+        remove_every_filler: bool = False,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-3257: ``host_probe`` supplies the `docker ps -a` listing; the removals still run here.
+
+        DAH-3706: ``remove_every_filler`` (a customer's create) treats every `filler_*` as stale
+        whatever ``active_container_names`` says -- a paying pod never shares the node with a
+        filler, and a backend whose stop did not confirm may still list one. The removal is then
+        re-read from `docker ps -a`; a filler that survived is reported as FILLER_STILL_RUNNING
+        (typed fields, countable) and the create goes on.
         """
         if host_probe is not None and host_probe.container_names is not None:
             all_names: list[str] = list(host_probe.container_names)
@@ -2099,6 +2112,8 @@ class DockerService:
                 await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
+            if remove_every_filler:
+                active_set = {name for name in active_set if not name.startswith(FILLER_CONTAINER_PREFIX)}
             # DAH-2740: a sibling create on the same host sweeps while an edit's parked container is
             # the customer's only copy; the parked twin of every active pod name is protected too
             active_set |= {f"{name}{EDIT_PARKED_SUFFIX}" for name in active_set if name.startswith(POD_CONTAINER_PREFIX)}
@@ -2125,12 +2140,14 @@ class DockerService:
                         **default_extra,
                         "container_names": container_names,
                         "active_containers": list(active_set),
+                        "remove_every_filler": remove_every_filler,
                     }),
                 ),
             )
 
-            command = f'/usr/bin/docker rm -fv {container_names}'
-            await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            await self._remove_stale_containers(
+                ssh_client, default_extra, pod_name, stale_containers, remove_every_filler
+            )
 
             if clear_volume:
                 volumes_to_remove = []
@@ -2149,6 +2166,148 @@ class DockerService:
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
             return stale_containers
         return []
+
+    async def _remove_stale_containers(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        stale_containers: list[str],
+        remove_every_filler: bool,
+    ) -> None:
+        """`docker rm -fv` the stale containers. A customer create (DAH-3706) uses the tolerant rm
+        and then confirms that no filler survived."""
+        if not remove_every_filler:
+            names = " ".join(shlex.quote(name) for name in stale_containers)
+            await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+            return
+
+        await self._remove_stale_containers_tolerantly(ssh_client, default_extra, stale_containers)
+        removed_fillers = [name for name in stale_containers if name.startswith(FILLER_CONTAINER_PREFIX)]
+        if removed_fillers:
+            await self._confirm_fillers_removed(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                pod_name=pod_name,
+                removed_fillers=removed_fillers,
+            )
+
+    async def _confirm_fillers_removed(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        pod_name: str,
+        removed_fillers: list[str],
+    ) -> None:
+        """Re-read `docker ps -a` after a customer create's filler removal; log any survivor.
+
+        A listing that fails, times out or exits non-zero is logged as well -- the confirmation
+        never fails the create.
+        """
+        names_after = await self._list_all_container_names(ssh_client)
+        if names_after is None:
+            logger.warning(
+                _m(
+                    "Unable to confirm the filler removal before the customer's create",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "pod_name": pod_name,
+                        "container_names": removed_fillers,
+                    }),
+                )
+            )
+            return
+        survivors = [name for name in names_after if name.startswith(FILLER_CONTAINER_PREFIX)]
+        if survivors:
+            logger.warning(
+                _m(
+                    "Filler still running on a node a customer rents after docker rm -fv",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "event": FILLER_STILL_RUNNING_EVENT,
+                        "reason": "validator_rm_survived",
+                        "pod_name": pod_name,
+                        "container_names": survivors,
+                        "removed_fillers": removed_fillers,
+                    }),
+                )
+            )
+
+    async def _remove_stale_containers_tolerantly(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        stale_containers: list[str],
+    ) -> None:
+        """`docker rm -fv` for a customer create (DAH-3706): one attempt, then the host decides.
+
+        A filler whose backend delete landed between the listing and the rm makes `docker rm -f` exit
+        non-zero for a name that is already gone; retrying that 5x10 s would stall the customer's create
+        for nothing. So: one attempt; on an error re-read `docker ps -a`; names already gone are not an
+        error; names still there get retry_ssh_command's full budget (and raise as before). A re-read
+        that cannot be made re-raises the rm error.
+        """
+        names = " ".join(shlex.quote(name) for name in stale_containers)
+        try:
+            await retry_ssh_command(
+                ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers', max_attempts=1
+            )
+            return
+        except Exception:
+            still_present = await self._names_still_on_host(ssh_client, stale_containers)
+            if still_present is None:
+                raise
+        if not still_present:
+            logger.info(
+                _m(
+                    "docker rm -fv reported an error but every stale container is gone; continuing",
+                    extra=get_extra_info({**default_extra, "container_names": stale_containers}),
+                ),
+            )
+            return
+        logger.info(
+            _m(
+                "docker rm -fv failed with containers still on the host; retrying those",
+                extra=get_extra_info({**default_extra, "container_names": still_present}),
+            ),
+        )
+        names = " ".join(shlex.quote(name) for name in still_present)
+        await retry_ssh_command(ssh_client, f'/usr/bin/docker rm -fv {names}', 'clean_existing_containers')
+
+    @staticmethod
+    async def _list_all_container_names(ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
+        """`docker ps -a` names with the prerun probe's timeout; None when the listing raised, timed out
+        or exited non-zero (a wedged dockerd is the very condition a survivor lives under -- the
+        caller must not hang or read an empty listing as 'confirmed')."""
+        try:
+            result = await ssh_client.run(
+                DOCKER_PS_ALL_NAMES_CMD, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            # typed fields only: an asyncssh error's text can carry the host's banner
+            logger.warning(
+                _m("docker ps -a listing failed", extra={"error_type": exc.__class__.__name__, "timeout_s": _PRERUN_HOST_PROBE_TIMEOUT_SECONDS})
+            )
+            return None
+        if result.exit_status != 0:
+            logger.warning(
+                _m(
+                    "docker ps -a listing exited non-zero",
+                    extra={"exit_status": result.exit_status, "stderr": (result.stderr or "").strip()[:500]},
+                )
+            )
+            return None
+        return [name for name in (result.stdout or "").strip().split("\n") if name]
+
+    async def _names_still_on_host(
+        self, ssh_client: asyncssh.SSHClientConnection, names: list[str]
+    ) -> list[str] | None:
+        """Which of ``names`` `docker ps -a` still lists; None when the listing could not be read."""
+        all_names = await self._list_all_container_names(ssh_client)
+        if all_names is None:
+            return None
+        wanted = set(names)
+        return [name for name in all_names if name in wanted]
 
     async def clean_stale_vloopback_volumes(
         self,
@@ -5112,6 +5271,10 @@ class DockerService:
                     active_container_names=protected_container_names,
                     active_volume_names=payload.active_volume_names,
                     host_probe=docker_listing_probe,
+                    # DAH-3706: a customer's pod never shares the node with a filler, so its
+                    # create removes every filler_* whatever the backend listed; a filler create
+                    # keeps protecting its listed sibling bundle (DAH-2465).
+                    remove_every_filler=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                 )
                 if removed_containers:
                     docker_listing_probe = None
