@@ -534,3 +534,38 @@ def test_pass_two_block_anywhere_above_pass_one(port_range, picks, width):
 
     assert fewest(width) == picks
     assert fewest(width - 1) == picks - 1
+
+
+# A partly rented host: 8 GPUs, 6 rented, 10 declared ports, and the 6 rented GPUs' pods hold 8 of them.
+PARTLY_RENTED_HELD = frozenset(range(20000, 20008))
+
+
+@pytest.mark.asyncio
+async def test_partly_rented_host_probes_only_its_free_ports_and_counts_no_held_port_as_failed():
+    info = _info(port_range="20000-20009")
+    host = Host(open_ports=set(range(20000, 20010)))
+    main, _, new, new_host = await _both(host, info, PARTLY_RENTED_HELD)
+    probed = {e for _, _, ports in new_host.probes for e in ports}
+    assert probed == {20008, 20009}
+    assert {p.external for p in new.selected_ports} == {20008, 20009}
+    assert new.failed_ports == ()
+    assert {p.external for p in new.successful_ports} == {p.external for p in main.successful} == {20008, 20009}
+    assert new.second_pass == SECOND_PASS_NO_PORTS_LEFT
+    assert [r.as_dict() for r in new.port_ranges] == [
+        {"pass": 1, "range": "20000-20009", "declared": 10, "probed": 2, "answered": 2}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_partly_rented_wide_range_never_probes_a_held_port_in_either_pass():
+    held = set(range(40000, 40300))
+    info = _info(port_range="40000-65535")
+    host = Host(open_ports=held | set(range(65000, 65536)))
+    main, _, new, new_host = await _both(host, info, held)
+    probed = {e for _, _, ports in new_host.probes for e in ports}
+    assert not probed & held
+    assert min(p.external for p in new.selected_ports) == 40300
+    assert new.second_pass == SECOND_PASS_RAN
+    assert len(main.successful) == 0
+    assert len(new.successful_ports) >= MIN_PORT_COUNT
+    assert not {p.external for p in new.successful_ports + new.failed_ports} & held
