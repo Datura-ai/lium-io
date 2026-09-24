@@ -41,6 +41,25 @@ class RentedPod(BaseModel):
     # GPUs this pod holds (DAH-2467). None = backend predates the field; the validator then
     # treats the whole executor as rented (no per-GPU split scoring).
     gpu_count: int | None = None
+    # DAH-2870: the external port the renter's `ssh -p` uses (container port 22 in the pod's port
+    # map). None = backend predates the field or the pod maps no port 22; the renter-side probe then
+    # judges the pod by its authorized_keys read alone.
+    ssh_port: int | None = None
+    # DAH-2870: the pod's status as the backend records it (`RUNNING`, `REBOOT_PENDING`, ...). The
+    # rented list carries every status but BROKEN and DELETING, and the renter-side probe judges
+    # RUNNING pods only (the backend's ssh-unreachable route answers 409 for any other). None =
+    # backend predates the field; the probe then judges every listed pod.
+    status: str | None = None
+
+    @field_validator("ssh_port")
+    @classmethod
+    def _ssh_port_in_range(cls, value: int | None) -> int | None:
+        # A port outside 1-65535 is not one a renter can `ssh -p` to, and `asyncio.open_connection`
+        # raises OverflowError (not OSError) on it, which would end the executor's whole run with
+        # no verdict. Read as "no mapped port": the probe judges the pod by authorized_keys alone.
+        if value is not None and not 1 <= value <= 65535:
+            return None
+        return value
 
 
 class RentedExecutor(BaseModel):
@@ -209,6 +228,18 @@ class PodRentalActiveResponse(BaseModel):
 
 class PodHostRebootRecoveredResponse(BaseModel):
     recorded: bool
+
+
+class PodSshUnreachableResponse(BaseModel):
+    # DAH-2870: False when the backend already holds an event for this outage of the pod.
+    recorded: bool
+    # lium-platform#429: was the renter told — "notified", "recorded" (nothing was due) or
+    # "notify_failed" (the mail was refused; the outage stays unacknowledged and is reported again
+    # next cycle so the mail is re-sent). None from a backend older than #429: treated as delivered.
+    delivery: str | None = None
+
+
+SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED = "notify_failed"
 
 
 class VerificationStartedResponse(BaseModel):

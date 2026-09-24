@@ -885,6 +885,10 @@ def _create_docker_api_client_with_rental_ssh_adapter(
         docker_api_client.SSHHTTPAdapter = original_adapter
 
 
+# The Docker SDK SSH session idles through a long build, so it needs a keepalive.
+RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC = 30
+
+
 def _build_rental_ssh_http_adapter_class(
     *,
     key_path: Path,
@@ -893,6 +897,12 @@ def _build_rental_ssh_http_adapter_class(
     from docker.transport.sshconn import SSHHTTPAdapter
 
     class RentalSSHHTTPAdapter(SSHHTTPAdapter):
+        def _connect(self) -> None:
+            super()._connect()
+            transport = self.ssh_client.get_transport() if self.ssh_client else None
+            if transport is not None:
+                transport.set_keepalive(RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC)
+
         def _create_paramiko_client(self, base_url):
             import logging
             import urllib.parse
