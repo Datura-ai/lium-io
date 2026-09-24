@@ -3,10 +3,15 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 from services.executor_connectivity.dind_probe import DindProbe
-from services.executor_connectivity.models import DindProbeResult, PortPair, PortProbeResult
+from services.executor_connectivity.models import (
+    DindProbeResult,
+    PortPair,
+    PortProbeResult,
+    PortRangeResult,
+)
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
-from services.executor_connectivity.port_selector import PortSelector, sample_ports
+from services.executor_connectivity.port_selector import PortSelector, sample_ports, tally_port_ranges
 from services.port_utils import get_all_ports
 
 
@@ -134,6 +139,13 @@ async def test_reston_regression_orchestrator_verifies_high_ports(mocker):
     assert len(result.successful_ports) >= MIN_PORT_COUNT
     assert all(p.external in open_ports for p in result.successful_ports)
 
+    ranges = {r.first: r for r in result.port_ranges}
+    assert sum(r.declared for r in result.port_ranges) == 65535 - 40000 + 1
+    assert sum(r.probed for r in result.port_ranges) == BATCH_PORT_VERIFICATION_SIZE
+    assert sum(r.answered for r in result.port_ranges) == len(result.successful_ports)
+    assert all(ranges[first].answered == 0 for first in (40000, 45000, 50000, 55000))
+    assert ranges[60000].answered > 0 and ranges[65000].answered > 0
+
 
 @pytest.mark.parametrize(
     "kwargs",
@@ -215,3 +227,50 @@ def test_sample_tiny_budgets_match_lowest_cut(size):
 
 def test_sample_empty_list():
     assert sample_ports([], BATCH_PORT_VERIFICATION_SIZE) == []
+
+
+def test_tally_small_range_is_one_entry():
+    declared = [PortPair(p, p) for p in range(9000, 9101)]
+    probed = declared[:50]
+    answered = declared[:3]
+
+    assert tally_port_ranges(declared, probed, answered) == (
+        PortRangeResult(first=9000, last=9100, declared=101, probed=50, answered=3),
+    )
+
+
+def test_tally_wide_range_splits_at_bucket_boundaries_by_external_port():
+    declared = [PortPair(8000 + i, 38000 + i) for i in range(12001)]
+
+    tallies = tally_port_ranges(declared, declared[-2:], declared[-1:])
+
+    assert [(t.first, t.last, t.declared) for t in tallies] == [
+        (38000, 39999, 2000),
+        (40000, 44999, 5000),
+        (45000, 49999, 5000),
+        (50000, 50000, 1),
+    ]
+    assert [(t.probed, t.answered) for t in tallies] == [(0, 0), (0, 0), (1, 0), (1, 1)]
+    assert tallies[-1].as_dict() == {"range": "50000", "declared": 1, "probed": 1, "answered": 1}
+
+
+def test_tally_nothing_declared():
+    assert tally_port_ranges([], [], []) == ()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker):
+    info = _executor_info(port_range="9000-9001")
+    port_probe = mocker.Mock(spec=PortProbe)
+    dind_probe = mocker.Mock(spec=DindProbe)
+
+    result = await ConnectivityOrchestrator(PortSelector(), port_probe, dind_probe).verify(
+        executor_info=info,
+        miner_hotkey="miner",
+        sysbox_runtime=False,
+        unavailable_ports=[9000, 9001],
+        ssh_client=mocker.Mock(),
+    )
+
+    assert result.status == "no_ports"
+    assert result.port_ranges == (PortRangeResult(first=9000, last=9001, declared=2, probed=0, answered=0),)

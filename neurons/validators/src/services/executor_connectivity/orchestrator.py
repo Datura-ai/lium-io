@@ -7,7 +7,7 @@ from services.const import BATCH_PORT_VERIFICATION_SIZE
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
-from services.executor_connectivity.port_selector import PortSelector
+from services.executor_connectivity.port_selector import PortSelector, declared_ports, tally_port_ranges
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ class ConnectivityOrchestrator:
         ports = self.port_selector.select(
             executor_info, BATCH_PORT_VERIFICATION_SIZE, set(unavailable_ports or [])
         )
+        declared = declared_ports(executor_info)
 
         if not ports:
             return PortVerificationResult(
@@ -53,6 +54,7 @@ class ConnectivityOrchestrator:
                 dind_ok=False,
                 sysbox_runtime=sysbox_runtime,
                 status="no_ports",
+                port_ranges=tally_port_ranges(declared, (), ()),
             )
 
         probe_result = await self.port_probe.probe(
@@ -92,4 +94,5 @@ class ConnectivityOrchestrator:
             sysbox_runtime=sysbox_runtime,
             status=status,
             dind_error=dind_result.error,
+            port_ranges=tally_port_ranges(declared, ports, successful),
         )

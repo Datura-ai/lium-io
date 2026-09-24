@@ -1,7 +1,46 @@
+from collections.abc import Iterable
+
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.executor_connectivity.models import PortPair
+from services.const import PORT_RANGE_BUCKET_WIDTH
+from services.executor_connectivity.models import PortPair, PortRangeResult
 from services.port_utils import get_all_ports
+
+
+def declared_ports(executor_info: ExecutorSSHInfo) -> list[PortPair]:
+    """Every port pair the executor declares, ssh port excluded, sorted by internal port."""
+    return [
+        PortPair(internal, external)
+        for internal, external in get_all_ports(
+            executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port
+        )
+    ]
+
+
+def tally_port_ranges(
+    declared: Iterable[PortPair], probed: Iterable[PortPair], answered: Iterable[PortPair]
+) -> tuple[PortRangeResult, ...]:
+    """Declared, probed and answered counts per declared range, ascending.
+
+    Ports are grouped by external port into PORT_RANGE_BUCKET_WIDTH-wide buckets, and each tally
+    names the lowest and highest declared port in its bucket: a range narrower than a bucket is
+    one tally, a wide range is split so a forward that covers only part of it shows which part.
+    """
+    probed_ext = {p.external for p in probed}
+    answered_ext = {p.external for p in answered}
+    buckets: dict[int, list[int]] = {}
+    for p in declared:
+        buckets.setdefault(p.external // PORT_RANGE_BUCKET_WIDTH, []).append(p.external)
+    return tuple(
+        PortRangeResult(
+            first=min(ports),
+            last=max(ports),
+            declared=len(ports),
+            probed=sum(e in probed_ext for e in ports),
+            answered=sum(e in answered_ext for e in ports),
+        )
+        for _, ports in sorted(buckets.items())
+    )
 
 
 def sample_ports(ports: list[PortPair], size: int) -> list[PortPair]:

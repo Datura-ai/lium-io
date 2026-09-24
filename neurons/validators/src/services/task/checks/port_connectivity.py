@@ -64,6 +64,8 @@ class PortConnectivityCheck:
         }
         if result.dind_error:
             extra_info["dind_error"] = result.dind_error.text
+        # event-only: kept out of default_extra so later checks' log lines stay small
+        port_ranges = [r.as_dict() for r in result.port_ranges]
         updated_state = replace(
             ctx.state,
             specs={
@@ -153,9 +155,10 @@ class PortConnectivityCheck:
                     "total_ports_tested": len(result.successful_ports) + len(result.failed_ports),
                     "successful_ports": len(result.successful_ports),
                     "failed_ports": len(result.failed_ports),
+                    "port_ranges": port_ranges,
                     **rental_info,
                 },
-                extra=extra_info,
+                extra={**extra_info, "port_ranges": port_ranges},
             )
             return CheckResult(
                 passed=False,
@@ -168,7 +171,7 @@ class PortConnectivityCheck:
             ctx=ctx,
             check_id=self.check_id,
             what={"message": msg},
-            extra=extra_info,
+            extra={**extra_info, "port_ranges": port_ranges},
         )
         return CheckResult(
             passed=True,

@@ -5,6 +5,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedE
 from neurons.validators.src.services.executor_connectivity.models import (
     DindLogCause,
     PortPair,
+    PortRangeResult,
     PortVerificationResult,
 )
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
@@ -57,6 +58,7 @@ class DummyConnectivityService:
         status: str | None = None,
         dind_ok: bool | None = None,
         dind_error: DindLogCause | None = None,
+        port_ranges: tuple[PortRangeResult, ...] = (),
     ):
         """
         Args:
@@ -68,6 +70,7 @@ class DummyConnectivityService:
             dind_ok: Override whether the DinD probe reached its container (default: success)
         """
         self.dind_error = dind_error
+        self.port_ranges = port_ranges
         self.success = success
         self.log_text = log_text
         self.sysbox_runtime = sysbox_runtime
@@ -124,6 +127,7 @@ class DummyConnectivityService:
             error=error,
             elapsed_sec=1.0,
             dind_error=self.dind_error,
+            port_ranges=self.port_ranges,
         )
 
 
@@ -448,3 +452,33 @@ async def test_port_connectivity_carries_the_dind_probe_cause_into_state(context
     result = await PortConnectivityCheck().run(ctx)
     assert result.updates["state"].dind_probe_error is None
     assert "dind_error" not in result.updates["default_extra"]
+
+
+@pytest.mark.parametrize("success", [True, False])
+@pytest.mark.asyncio
+async def test_port_connectivity_event_carries_the_per_range_tallies(context_factory, success):
+    ranges = (
+        PortRangeResult(first=40000, last=44999, declared=5000, probed=209, answered=0),
+        PortRangeResult(first=60000, last=64999, declared=5000, probed=30, answered=30),
+    )
+    services = build_services(
+        redis=DummyRedis(renting_in_progress=False),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=success, verified_port_count=30 if success else 0, port_ranges=ranges
+        ),
+    )
+    ctx = context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=build_state(), rented=False
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    expected = [
+        {"range": "40000-44999", "declared": 5000, "probed": 209, "answered": 0},
+        {"range": "60000-64999", "declared": 5000, "probed": 30, "answered": 30},
+    ]
+    assert result.event.context["port_ranges"] == expected
+    assert "port_ranges" not in result.updates["default_extra"]
+    if not success:
+        assert result.event.what_we_saw["port_ranges"] == expected

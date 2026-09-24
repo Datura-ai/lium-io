@@ -53,6 +53,22 @@ class DindProbeResult:
 
 
 @dataclass(frozen=True)
+class PortRangeResult:
+    """One declared port range's tally for a cycle: how many ports it declares, how many were probed
+    and how many answered, so a partial forward shows where it sits."""
+
+    first: int
+    last: int
+    declared: int
+    probed: int
+    answered: int
+
+    def as_dict(self) -> dict[str, object]:
+        label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
+        return {"range": label, "declared": self.declared, "probed": self.probed, "answered": self.answered}
+
+
+@dataclass(frozen=True)
 class PortVerificationResult:
     selected_ports: tuple[PortPair, ...]
     successful_ports: tuple[PortPair, ...]
@@ -65,6 +81,8 @@ class PortVerificationResult:
     elapsed_sec: float | None = None
     # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
     dind_error: DindLogCause | None = None
+    # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending.
+    port_ranges: tuple[PortRangeResult, ...] = ()
 
 
 @dataclass(frozen=True)
