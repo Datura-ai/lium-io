@@ -20,7 +20,7 @@ from services.ssh_ready_gate import (
     ssh_ready_gate_mode,
     wait_for_ssh_banner,
 )
-from test_deploy_optimizations import _patch_happy, _payload, _run, _ssh_client
+from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _run, _ssh_client
 
 BANNER = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n"
 
@@ -502,3 +502,48 @@ async def test_log_mode_probe_error_never_escapes(svc, monkeypatch):
         for c in mock_logger.warning.call_args_list
         if c.args
     )
+
+
+@pytest.mark.asyncio
+async def test_the_rental_probes_create_is_not_gated_in_enforce(svc, monkeypatch):
+    _patch_happy(svc, monkeypatch, _ssh_client())
+    _set_mode(monkeypatch, "enforce")
+    wait = AsyncMock()
+    monkeypatch.setattr(ds_module, "wait_for_ssh_banner", wait)
+    mock_logger = Mock()
+    monkeypatch.setattr(ds_module, "logger", mock_logger)
+    payload = _payload(ships_sshd=True)
+
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+        ssh_ready_gate=False,
+    )
+
+    assert isinstance(result, ContainerCreated)
+    wait.assert_not_awaited()
+    assert not ds_module._SSH_READY_LOG_TASKS
+    assert _gate_lines(mock_logger, "info") == [] and _gate_lines(mock_logger, "warning") == []
+
+
+@pytest.mark.asyncio
+async def test_the_rental_probes_create_writes_no_log_mode_line(svc, monkeypatch):
+    _patch_happy(svc, monkeypatch, _ssh_client())
+    _set_mode(monkeypatch, "log")
+    wait = AsyncMock()
+    monkeypatch.setattr(ds_module, "wait_for_ssh_banner", wait)
+    payload = _payload(ships_sshd=True)
+
+    result = await svc.create_container(
+        payload=payload,
+        executor_info=_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+        ssh_ready_gate=False,
+    )
+
+    assert isinstance(result, ContainerCreated)
+    assert not ds_module._SSH_READY_LOG_TASKS
+    wait.assert_not_awaited()

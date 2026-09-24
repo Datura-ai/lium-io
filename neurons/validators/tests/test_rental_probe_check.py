@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncssh
 import pytest
+from core.config import settings as core_settings
 from neurons.validators.src.services.task import pipeline_factory
 from neurons.validators.src.services.task.checks import rental_probe as module
 from neurons.validators.src.services.task.checks.rental_probe import (
@@ -110,10 +111,12 @@ class FakeDocker:
             else ContainerDeleted(miner_hotkey=MINER, executor_id=EXECUTOR.uuid, pod_id="pod")
         )
         self.create_calls: list[tuple] = []
+        self.ssh_ready_gate_calls: list[bool] = []
         self.delete_calls: list[tuple] = []
 
-    async def create_container(self, payload, executor_info, keypair, private_key):
+    async def create_container(self, payload, executor_info, keypair, private_key, *, ssh_ready_gate=True):
         self.create_calls.append((payload, executor_info, keypair, private_key))
+        self.ssh_ready_gate_calls.append(ssh_ready_gate)
         if isinstance(self.create_result, Exception):
             raise self.create_result
         return self.create_result
@@ -579,9 +582,11 @@ async def test_the_probe_holds_the_create_lock_from_the_idleness_re_read_until_i
     events: list[str] = []
 
     class RecordingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, *, ssh_ready_gate=True):
             events.append("create")
-            return await super().create_container(payload, executor_info, keypair, private_key)
+            return await super().create_container(
+                payload, executor_info, keypair, private_key, ssh_ready_gate=ssh_ready_gate
+            )
 
         async def delete_container(self, payload, executor_info, keypair, private_key):
             events.append("delete")
@@ -649,7 +654,7 @@ async def test_the_create_lock_is_released_when_the_create_is_cut_short():
     its TTL, and a renter's create waits that long."""
 
     class RaisingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, *, ssh_ready_gate=True):
             raise RuntimeError("redis down")
 
     ctx, _, redis = make_probe_context(docker=RaisingDocker())
@@ -659,7 +664,7 @@ async def test_the_create_lock_is_released_when_the_create_is_cut_short():
     assert redis.create_lock_events == ["acquired", "released"]
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, *, ssh_ready_gate=True):
             await asyncio.sleep(30)
 
     ctx, _, redis = make_probe_context(docker=HangingDocker())
@@ -735,6 +740,34 @@ async def test_create_payload_is_what_a_renter_gets():
         login_key.export_public_key().decode().split()[:2]
         == payload.user_public_keys[0].split()[:2]
     )
+
+
+@pytest.mark.asyncio
+async def test_the_probes_create_is_not_ssh_ready_gated(monkeypatch):
+    """Review (lium-io#1467): with RENTAL_PROBE_ENABLED and SSH_READY_GATE_MODE=enforce both on, the gate would
+    cut the probe's sshd allowance from RENTAL_PROBE_SSH_DEADLINE_SECONDS to its own grace, hold the create
+    lock through the wait, and record a silent sshd as a container_start failure. The probe waits itself."""
+    monkeypatch.setattr(core_settings, "SSH_READY_GATE_MODE", "enforce")
+    ctx, docker, _ = make_probe_context()
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
+    assert docker.ssh_ready_gate_calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_a_create_that_fails_at_ssh_ready_fails_at_sshd_listen():
+    """Safety net for the skip above: a create that still ends at `ssh_ready` is sshd, not Docker or NVIDIA."""
+    ctx, docker, _ = make_probe_context(docker=FakeDocker(create_result=create_failed("ssh_ready")))
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["failed_step"] == STEP_SSHD_LISTEN
+    assert result.event.what_we_saw["create_step"] == "ssh_ready"
+    assert "sshd did not answer" in result.event.remediation
+    assert "NVIDIA" not in result.event.remediation
 
 
 @pytest.mark.asyncio
@@ -1060,7 +1093,7 @@ async def test_the_cycles_cancellation_mid_create_still_removes_the_container_by
     mark, and the container binds the verified ports into the next cycle."""
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, *, ssh_ready_gate=True):
             self.create_calls.append((payload, executor_info, keypair, private_key))
             await asyncio.sleep(30)
             return created()
@@ -1212,7 +1245,7 @@ async def test_a_create_that_hangs_is_cut_off_and_its_container_removed_by_name(
     the node."""
 
     class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key):
+        async def create_container(self, payload, executor_info, keypair, private_key, *, ssh_ready_gate=True):
             self.create_calls.append((payload, executor_info, keypair, private_key))
             await asyncio.sleep(30)
             return created()

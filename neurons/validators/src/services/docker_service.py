@@ -4974,7 +4974,11 @@ class DockerService:
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
+        *,
+        ssh_ready_gate: bool = True,
     ):
+        """`ssh_ready_gate=False`: the rental probe's own create, which runs its own banner wait with its own
+        deadline and step; the SSH-ready gate neither waits nor logs for it."""
         warnings = []
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
@@ -6136,7 +6140,9 @@ class DockerService:
                     # A delete that lands during the grace period ends the wait at the next dial or sleep,
                     # and the checkpoint below turns the create into `cancelled_by_delete`: the renter's
                     # cancel is never reported as an `ssh_ready` failure.
-                    ssh_ready_mode = ssh_ready_gate_mode(settings.SSH_READY_GATE_MODE)
+                    ssh_ready_mode = (
+                        ssh_ready_gate_mode(settings.SSH_READY_GATE_MODE) if ssh_ready_gate else SshReadyMode.OFF
+                    )
                     ssh_external_port = self._ssh_external_port(port_maps)
                     ssh_ready_extra = {
                         **default_extra,
