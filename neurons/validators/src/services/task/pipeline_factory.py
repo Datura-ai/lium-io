@@ -35,6 +35,7 @@ from .checks import (
     CollateralCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
+    DiskHealthCheck,
     DuplicateExecutorCheck,
     ExecutorImageCheck,
     FinalizeCheck,
@@ -277,12 +278,22 @@ class PipelineFactory:
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-3484: a regex over specs.cpu.model, no SSH, never fatal. It has to run before
+                # TenantEnforcementCheck halts the pipeline for a rented executor: after that halt
+                # the published specs had no tdx_host_supported key and the backend stored false,
+                # so every rented TDX-capable host read as not capable.
+                TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 # Pure-data model<->VRAM gate. No SSH/GPU dependency, so it runs
                 # here — before the rented short-circuit (TenantEnforcementCheck)
                 # — to gate rented and idle executors alike.
                 GpuVramPrecheck(),
+                # DAH-2928: pure-data, non-fatal report on specs.disk_health from the scrape. A
+                # docker root that refuses writes cannot start a container; placed before the rented
+                # short-circuit so a rented host that has just lost its disk is reported too. The
+                # score is not changed until the reading is proven on live executors.
+                DiskHealthCheck(),
                 # DAH-2671 item 2a: non-fatal, observe-only CPU-count corroboration. Placed right
                 # after the GPU spec-check group (and before the rented short-circuit) so it reads
                 # advertised specs already populated by the scrape; it only reads over SSH, mutates
@@ -332,7 +343,6 @@ class PipelineFactory:
                 # passing answer and run over SSH otherwise. Off by default, never fatal.
                 LocalVerifyCheck(),
                 VerifyXCheck(),
-                TdxHostCheck(),
                 CapabilityCheck(),
                 # DAH-3035: the kernel-fault probe right after the matmul it complements — same idle,
                 # capability-verified population, same filler skip. Flag-gated, shadow-first, off by default.
@@ -372,9 +382,13 @@ class PipelineFactory:
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-3484: before the rented halt, same as build_checks().
+                TdxHostCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
+                # DAH-2928: pure-data report on specs.disk_health, same place as in build_checks.
+                DiskHealthCheck(),
                 # DAH-2671 item 2a: read-only SSH corroboration, safe in dry run (mutates nothing).
                 CpuTruthCheck(),
                 # DAH-2734: specs arithmetic plus a read-only SSH reading — safe in dry run.
@@ -406,7 +420,6 @@ class PipelineFactory:
                 # executor and leaves the shared wedge timers the production pipeline relies on.
                 GpuUsageCheck(dry_run=True),
                 # VerifyXCheck(),
-                TdxHostCheck(),
                 CapabilityCheck(),
                 GpuFaultProbeCheck(),
                 RentalVerificationCheck(),

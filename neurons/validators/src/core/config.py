@@ -140,6 +140,12 @@ class Settings(BaseSettings):
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-2313: reject unrented executors without sysbox so they never appear on the network.
     REQUIRE_SYSBOX_FOR_UNRENTED: bool = Field(env="REQUIRE_SYSBOX_FOR_UNRENTED", default=True)
+    # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
+    # in PortConnectivityCheck, the TTL bounds the window between two misses.
+    DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
+    DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS: int = Field(
+        env="DIND_PROBE_FIRST_MISS_GRACE_TTL_SECONDS", default=3600, gt=0
+    )
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
     # DAH-2265: cached-template requirement. Before the cutoff the CachedTemplateVerificationCheck
@@ -231,11 +237,6 @@ class Settings(BaseSettings):
     # encryption label) in ONE ssh command instead of ~8; every removal and write still runs its
     # own command, and a probe that fails leaves every step on its own commands. Off: as before.
     RENTAL_PRERUN_HOST_PROBE_ENABLED: bool = Field(env="RENTAL_PRERUN_HOST_PROBE_ENABLED", default=False)
-    # DAH-3258: after `docker run`, start the inspector collector concurrently with the encrypted
-    # volume mount (a host-side process, independent of the container's filesystem) and write
-    # authorized_keys and /etc/environment in ONE `docker exec` after the mount. Every step still
-    # completes before ContainerCreated is returned. Off: the serial order as before.
-    RENTAL_POSTRUN_CONCURRENT_ENABLED: bool = Field(env="RENTAL_POSTRUN_CONCURRENT_ENABLED", default=False)
     # DAH-3011: a never-validated executor's FIRST verification (the express lane's, DAH-2958 —
     # published spec-only, never scored) proves "this GPU exists, is the model claimed, the host is
     # reachable and rentable"; the VRAM-filling matmul and the 128 GB RAM proof exist to make a
@@ -272,6 +273,14 @@ class Settings(BaseSettings):
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
     # services. On by default: a fabric nobody measured is one nobody should be selling.
     ROCE_LINK_PROBE_ENABLED: bool = Field(env="ROCE_LINK_PROBE_ENABLED", default=True)
+    # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
+    # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
+    # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the
+    # backend accepts the message (lium-platform#312); a backend without it logs and drops each
+    # report. Off: the spec is the only carrier, with a floor of REAPED_POD_STATES_FLOOR slots for
+    # reaped ids; on a node with more than 224 rented pods the last rented pods' states are cut
+    # until the queue drains.
+    POD_STATES_REPORT_ENABLED: bool = Field(env="POD_STATES_REPORT_ENABLED", default=False)
     # ISSUE-050 filler liveness. CHECK_ENABLED is the master switch: shadow mode runs the SSH
     # probe + backend re-check and logs the verdict, but never withholds incentive; switching it
     # off disables the probe entirely. ENFORCEMENT (only effective while CHECK_ENABLED is on)
@@ -290,6 +299,11 @@ class Settings(BaseSettings):
     # away, and refuse the spoofable nvidia-smi XML fallback when it disagrees with the kernel map.
     KERNEL_GPU_VERDICT_CHECK_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_CHECK_ENABLED", default=True)
     KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_VERDICT_ENFORCEMENT_ENABLED", default=False)
+    # DAH-2662 — match provider/GPU bans against the kernel's GPU UUIDs (/proc/driver/nvidia) as well
+    # as the host-reported ones. Shadow by default: the kernel list is read, recorded on specs and
+    # `kernel_view_would_ban` is emitted on every banned_provider/banned event; the ban itself is
+    # matched on the reported list until this is flipped from a week of clean fleet data.
+    KERNEL_GPU_BAN_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_BAN_ENFORCEMENT_ENABLED", default=False)
     # Item 2a — corroborate the advertised CPU(s) count against sources the lscpu wrapper does not
     # author (/proc/cpuinfo, /sys present population, docker NCPU).
     CPU_TRUTH_CHECK_ENABLED: bool = Field(env="CPU_TRUTH_CHECK_ENABLED", default=True)
@@ -402,6 +416,14 @@ class Settings(BaseSettings):
     RENTAL_PROBE_ENABLED: bool = Field(env="RENTAL_PROBE_ENABLED", default=False)
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
+    # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
+    # wave writes nothing about it: no report row, no availability error, no evidence for the
+    # backend's staleness sweep. On, the wave writes one failed result per rented executor of that
+    # miner that the backend lists and the miner did not return (RENTED_EXECUTOR_NOT_LISTED,
+    # score 0, availability error). Manual rentals keep their forced pass. Off = today's behaviour.
+    RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED: bool = Field(
+        env="RENTED_EXECUTOR_NOT_LISTED_REPORT_ENABLED", default=False
+    )
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
@@ -469,6 +491,12 @@ class Settings(BaseSettings):
     # the mining pool and the free GPUs in the unrented pool. Set to False to fall back to
     # scoring the whole box as rented.
     ENABLE_SPLIT_PARTIAL_RENTAL_SCORING: bool = Field(env="ENABLE_SPLIT_PARTIAL_RENTAL_SCORING", default=True)
+
+    # DAH-3698 — True withholds the unrented incentive from a split remainder below the
+    # marketplace port floor (the rented GPUs keep earning); False only logs it (shadow mode).
+    ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER: bool = Field(
+        env="ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER", default=False
+    )
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
@@ -595,7 +623,7 @@ class Settings(BaseSettings):
     # unprivileged-on-host (user-namespaced) container. Egress is firewalled
     # host-side to block cloud metadata + RFC1918. See the DAH-2211 build flow.
     CUSTOM_DOCKERFILE_DIND_IMAGE: str = Field(
-        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.1",
+        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.3",
         description="Sysbox DinD image used to build custom-dockerfile pods in isolation.",
     )
     CUSTOM_DOCKERFILE_DIND_CPUS: str = Field(

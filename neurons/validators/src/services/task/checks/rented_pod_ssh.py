@@ -46,8 +46,8 @@ never zeroes the node and a refused mail does not protect the provider. The gate
 verdict (``RENTED_POD_SSH_LAST_GATE_KEY``): while the last gate held the reports as our own outage,
 an accepted outage is not enforced either, so our outage zeroes a node for one cycle at most (the
 gate runs after the cycle's checks). The per-executor ``RENTED_POD_SSH_UNREACHABLE`` events of a
-suppressed cycle were rendered before the gate ran and name a pod outage the gate then judged to be ours; the sync
-loop passes the gate to
+suppressed cycle were rendered before the gate ran and name a pod outage the gate then judged to
+be ours; the sync loop passes the gate to
 ``silence_rented_pod_ssh_reports_on_our_own_outage`` before the specs publish, which rewrites them
 to RENTED with the gate's verdict under ``what_we_saw``, as DAH-2748 rewrites availability errors.
 
@@ -69,7 +69,7 @@ import json
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import redis.exceptions
 from protocol.vc_protocol.compute_requests import (
@@ -257,13 +257,13 @@ def _cycle_id(ctx: Context) -> str:
 def _decode_hash(raw: object) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, str] = {}
+    decoded: dict[str, str] = {}
     for key, value in raw.items():
         key = key.decode() if isinstance(key, bytes) else key
         value = value.decode() if isinstance(value, bytes) else value
         if isinstance(key, str) and isinstance(value, str):
-            out[key] = value
-    return out
+            decoded[key] = value
+    return decoded
 
 
 def _decode(raw: object) -> dict[str, object] | None:
@@ -318,8 +318,9 @@ class OkMark:
 @dataclass(frozen=True)
 class FailStreak:
     """The `fail` key: how many consecutive cycles the pod has failed, when the first one was,
-    whether the backend accepted this outage (``backend_accepted``, any 200), which faults that accept
-    named (``backend_accepted_faults``), and whether the renter was told (``reported`` — not set on ``notify_failed``)."""
+    whether the backend accepted this outage (``backend_accepted``, any 200), which faults that
+    accept named (``backend_accepted_faults``), and whether the renter was told (``reported``, not
+    set on ``notify_failed``)."""
 
     count: int
     first_failed_at: str
@@ -675,6 +676,23 @@ def judge_fleet_gate(
     return gate
 
 
+class CycleGateHashes(NamedTuple):
+    fleet: dict[str, str]  # pod_id -> mapped-port mark
+    due: dict[str, str]  # pod_id -> queued DueReport JSON
+
+
+async def _take_cycle_hashes(redis: RedisService, job_batch_id: str) -> CycleGateHashes:
+    """Read and delete the cycle's fleet marks and queued reports; raises the Redis error."""
+    fleet_key, due_key = _fleet_key(job_batch_id), _due_key(job_batch_id)
+    fleet = _decode_hash(await redis.hgetall(fleet_key))
+    due = _decode_hash(await redis.hgetall(due_key))
+    # Deleted before posting: a crash after this costs one cycle (the streaks re-queue), a crash
+    # after a post would otherwise post the same outage twice.
+    await redis.delete(fleet_key)
+    await redis.delete(due_key)
+    return CycleGateHashes(fleet, due)
+
+
 async def flush_rented_pod_ssh_reports(
     redis: RedisService,
     backend: BackendClient,
@@ -695,26 +713,20 @@ async def flush_rented_pod_ssh_reports(
     streaks still read ``reported`` False and queue again next cycle.
 
     With enforcement on, the verdict is also stored under ``RENTED_POD_SSH_LAST_GATE_KEY`` for the
-    next cycle's ``is_enforced``. Returns None when the probe is off or Redis failed (logged), else what the gate
-    saw and posted.
+    next cycle's ``is_enforced``. Returns None when the probe is off or Redis failed (logged), else
+    what the gate saw and posted.
     Never raises: a backend or Redis error here is one more cycle of waiting, not a failed cycle.
     """
     if not settings.RENTED_POD_SSH_PROBE_ENABLED:
         return None
-    fleet_key, due_key = _fleet_key(job_batch_id), _due_key(job_batch_id)
     extra = {"job_batch_id": job_batch_id}
     try:
-        fleet = _decode_hash(await redis.hgetall(fleet_key))
-        due = _decode_hash(await redis.hgetall(due_key))
+        fleet, due = await _take_cycle_hashes(redis, job_batch_id)
         gate = judge_fleet_gate(fleet, due, job_batch_id, validator_outage=validator_outage)
         if settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED:
             await redis.set(
                 RENTED_POD_SSH_LAST_GATE_KEY, gate.suppressed_by or "", ex=FLEET_KEY_TTL_SECONDS
             )
-        # Deleted before posting: a crash below costs one cycle (the streaks re-queue), a crash
-        # after a post would otherwise post the same outage twice.
-        await redis.delete(fleet_key)
-        await redis.delete(due_key)
     except REDIS_ERRORS:
         logger.warning(
             _m(
@@ -751,7 +763,18 @@ async def flush_rented_pod_ssh_reports(
             )
         )
         return gate
+    return await _post_due_reports(redis, backend, gate, due, gate_log_fields)
 
+
+async def _post_due_reports(
+    redis: RedisService,
+    backend: BackendClient,
+    gate: FleetGate,
+    due: dict[str, str],
+    gate_log_fields: dict[str, object],
+) -> FleetGate:
+    """POST every report the gate let through; the gate comes back with the pods the backend answered for."""
+    extra = {"job_batch_id": gate.job_batch_id}
     # Side by side, as the executor tasks posted them before this gate: this runs on the sync loop
     # ahead of the specs publish, and a backend that is down would otherwise cost one timeout per pod.
     outcomes = await asyncio.gather(
@@ -855,12 +878,12 @@ def _event_without_held_pods(
                 },
             }
         )
-    rented = TenantEnforcementMessages.ALREADY_RENTED
+    already_rented_template = TenantEnforcementMessages.ALREADY_RENTED
     return build_msg(
-        event=rented.event,
-        reason=rented.reason,
-        severity=rented.severity,
-        category=rented.category,
+        event=already_rented_template.event,
+        reason=already_rented_template.reason,
+        severity=already_rented_template.severity,
+        category=already_rented_template.category,
         impact=f"Reported rented score={what.get('job_score')} (actual={what.get('actual_score')})",
         remediation="No action needed.",
         what={**what, PROBE_SUPPRESSED_FLEET: gate_verdict},

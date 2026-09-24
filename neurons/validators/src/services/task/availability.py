@@ -22,12 +22,15 @@ class ReachSource(StrEnum):
 
     VALIDATOR = "validator"
     CONTAINER = "container"
+    MINER = "miner"
 
 
 class ReachTarget(StrEnum):
     """What could not be reached. Add a member for every new reachability check."""
 
     EXECUTOR_SSH = "executor_ssh"
+    # The executor's HTTP API, the miner's side of the node.
+    EXECUTOR_API = "executor_api"
 
 
 # The longest peer-supplied text a reading may keep: the node writes it, the portal shows it.
@@ -44,6 +47,8 @@ class AvailabilityErrorCode(StrEnum):
     """The code the backend stores and the portal shows. One per check."""
 
     EXECUTOR_SSH_UNREACHABLE = "EXECUTOR_SSH_UNREACHABLE"
+    # DAH-3558: the backend lists the executor as rented, the miner answered the wave without it.
+    RENTED_EXECUTOR_NOT_LISTED = "RENTED_EXECUTOR_NOT_LISTED"
 
 
 def build_availability_event(
@@ -133,6 +138,38 @@ def build_ssh_unreachable_event(
     )
 
 
+def build_rented_executor_not_listed_event(
+    *, executor_uuid: str, host: str, port: int | None, miner_hotkey: str
+) -> ValidationEvent:
+    """DAH-3558: a rented node the miner left out of its answer to the wave.
+
+    No pipeline runs for a node the miner does not list, so without this event the wave writes
+    nothing about it. This event is the wave's record: the backend lists the executor as rented,
+    the miner did not return it. Why the miner left it out is the miner's business (it may drop
+    a node before it ever tries to reach it), so the text says only that.
+    """
+    return build_availability_event(
+        code=AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED,
+        reach_source=ReachSource.MINER,
+        reach_target=ReachTarget.EXECUTOR_API,
+        event_text="Rented node missing from the miner's answer",
+        impact=(
+            "Score 0 for this cycle; the node is hidden from the market until a cycle lists it "
+            "again. The backend's staleness sweep reads this row as the node not answering."
+        ),
+        remediation=(
+            "The miner did not return this node in its answer to the validator. Check that the "
+            "node is up and that the miner lists it."
+        ),
+        what_we_saw={
+            "executor_uuid": executor_uuid,
+            "executor_ip_address": host,
+            "executor_port": port,
+            "miner_hotkey": miner_hotkey,
+        },
+    )
+
+
 def is_our_own_outage(unreachable_count: int, checked_count: int) -> bool:
     """True when so much of one cycle failed at the connect that the validator is the suspect.
 
@@ -149,13 +186,28 @@ def is_our_own_outage(unreachable_count: int, checked_count: int) -> bool:
     return unreachable_count / checked_count > FLEET_SHARE_THAT_MEANS_OUR_OWN_OUTAGE
 
 
+def _is_the_validators_own_reading(job_result: JobResult) -> bool:
+    """False for a result the validator wrote without contacting the node.
+
+    A RENTED_EXECUTOR_NOT_LISTED row (DAH-3558) is the miner's answer, not a connect the validator
+    made, so it says nothing about our egress, DNS or keys: it is left out of the outage ratio on
+    both sides, and the silencer leaves it alone. A wave-wide drop by one miner would otherwise
+    read as our outage and silence real SSH failures on the rest of the cycle.
+    """
+    errors = job_result.availability_errors
+    if errors is None:
+        return False
+    return not errors or any(error.get("reach_source") != ReachSource.MINER for error in errors)
+
+
 def silence_availability_errors_on_our_own_outage(job_results: list[JobResult]) -> int:
     """Report nothing about reachability when the cycle looks like our own outage.
 
     Returns how many results were silenced, so the caller can log it; 0 means the cycle is
-    trusted and every result keeps what it found.
+    trusted and every result keeps what it found. Only the validator's own readings count and
+    are silenced (``_is_the_validators_own_reading``).
     """
-    checked_results = [result for result in job_results if result.availability_errors is not None]
+    checked_results = [result for result in job_results if _is_the_validators_own_reading(result)]
     unreachable_results = [result for result in checked_results if result.availability_errors]
     if not is_our_own_outage(len(unreachable_results), len(checked_results)):
         return 0

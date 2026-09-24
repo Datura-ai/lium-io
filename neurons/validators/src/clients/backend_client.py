@@ -236,7 +236,20 @@ class BackendClient:
         retry=retry_if_result(lambda x: x is None),
     )
     async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
-        """Fetch all rented executors with their ports from the backend."""
+        """Fetch all rented executors with their ports from the backend.
+
+        Retried three times, 30 s apart: this is the cycle's snapshot, and a cycle without it
+        cannot start. A check that asks mid-cycle uses `get_rented_executors_now` instead.
+        """
+        return await self.get_rented_executors_now()
+
+    async def get_rented_executors_now(self) -> RentedExecutorsResponse | None:
+        """One un-retried read of the rented executors and fillers as the backend sees them now.
+
+        For a check that re-asks after the cycle snapshot (DAH-3480): a backend that does not
+        answer within the 30 s timeout returns None, and the caller decides what that means;
+        nothing waits 60 s for two more attempts inside a running pipeline.
+        """
         return await self.get(
             "/internal/executors/rented",
             RentedExecutorsResponse,

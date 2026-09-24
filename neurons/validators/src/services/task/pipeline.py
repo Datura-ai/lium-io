@@ -16,12 +16,14 @@ from services.collateral_contract_service import CollateralContractService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
+from services.executor_connectivity.models import DindLogCause
 from services.executor_image_policy import ExecutorImageReport, ExpectedImageSnapshot
 from services.local_verify_client import LocalVerifyOutcome
 from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.validator_requests import PodContainerState
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
 
@@ -132,6 +134,14 @@ class ContextState:
     gpu_splitting_min_count: int | None = None
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
+    # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
+    # None = unreadable or not read; `kernel_gpu_uuids_read_attempted` tells the two apart so a failed read is
+    # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    kernel_gpu_uuids: list[str] | None = None
+    kernel_gpu_uuids_read_attempted: bool = False
+    # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
+    # non-empty = the kernel list above was withheld because it was read through them
+    kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
     verified_port_count: int = 0
     # DAH-2991: orphaned rental containers the stale cleanup could not remove this cycle; they still
     # hold their published ports, so PortCountCheck names them in INSUFFICIENT_PORTS.
@@ -140,6 +150,16 @@ class ContextState:
     # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
     # needs both to hand create_container the ports as the backend would.
     verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
+    # DAH-2856: why the DinD probe's container never answered on sshd this cycle (a code and plain
+    # words), read from the container's logs; DAH-3634: or why `docker run` refused it (the NVIDIA
+    # hook, from docker's stderr). None when the probe passed or the cause is unknown.
+    # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
+    # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause.
+    dind_probe_error: DindLogCause | None = None
+    # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
+    # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
+    # ExecutorSpecRequest.pod_states.
+    pod_states: list[PodContainerState] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None

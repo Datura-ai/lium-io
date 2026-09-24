@@ -129,9 +129,10 @@ async def test_flag_on_and_streak_at_the_threshold_fails_the_check(context_facto
         "boot_id_changed": True,
         "enforce_after_cycles": 2,
     }
-    assert updates_with_clear_verified_job_evidence(result, CHECK_ID)[
-        "clear_verified_job_evidence"
-    ] == evidence
+    assert (
+        updates_with_clear_verified_job_evidence(result, CHECK_ID)["clear_verified_job_evidence"]
+        == evidence
+    )
     what = result.event.what_we_saw
     assert what["enforced"] is True and what["enforce_after_cycles"] == 2
     [pod] = what["unreachable_pods"]
@@ -391,16 +392,25 @@ async def test_a_keys_only_accept_does_not_enforce_a_later_port_fault(context_fa
 
 def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
     unhealthy = RentedPodSshVerdict(
-        pod_id=POD_ID, container_name="pod_1", ssh_port=SSH_PORT, healthy=False,
-        faults=[FAULT_TCP_REFUSED], consecutive_cycles=2, report=True,
-        backend_accepted=True, backend_accepted_faults=[FAULT_TCP_REFUSED],
+        pod_id=POD_ID,
+        container_name="pod_1",
+        ssh_port=SSH_PORT,
+        healthy=False,
+        faults=[FAULT_TCP_REFUSED],
+        consecutive_cycles=2,
+        report=True,
+        backend_accepted=True,
+        backend_accepted_faults=[FAULT_TCP_REFUSED],
     )
     with enforcement(enabled=False):
         assert rented_pod_ssh.is_enforced(unhealthy) is False
     with enforcement(enabled=True):
         assert rented_pod_ssh.is_enforced(unhealthy) is True
         assert rented_pod_ssh.is_enforced(replace(unhealthy, consecutive_cycles=1)) is False
-        assert rented_pod_ssh.is_enforced(replace(unhealthy, healthy=True, consecutive_cycles=0)) is False
+        assert (
+            rented_pod_ssh.is_enforced(replace(unhealthy, healthy=True, consecutive_cycles=0))
+            is False
+        )
         # mail retry still queues; accept is what enforcement reads
         assert rented_pod_ssh.is_enforced(replace(unhealthy, report_queued=True)) is True
         assert rented_pod_ssh.is_enforced(replace(unhealthy, backend_accepted=False)) is False
@@ -424,10 +434,14 @@ def test_is_enforced_reads_the_flag_the_streak_and_the_threshold():
         # a streak with no stored accept faults enforces nothing: its accepted report is unknown
         assert rented_pod_ssh.is_enforced(replace(unhealthy, backend_accepted_faults=[])) is False
         # a port-fault accept, then a cycle with only the keys unreadable: the boot rule reads this cycle too
-        later_keys_only = replace(unhealthy, faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE], boot_id_changed=False)
+        later_keys_only = replace(
+            unhealthy, faults=[FAULT_AUTHORIZED_KEYS_UNREADABLE], boot_id_changed=False
+        )
         assert rented_pod_ssh.is_enforced(later_keys_only) is False
         assert rented_pod_ssh.is_enforced(replace(later_keys_only, boot_id_changed=True)) is True
-        both = replace(later_keys_only, faults=[FAULT_TCP_REFUSED, FAULT_AUTHORIZED_KEYS_UNREADABLE])
+        both = replace(
+            later_keys_only, faults=[FAULT_TCP_REFUSED, FAULT_AUTHORIZED_KEYS_UNREADABLE]
+        )
         assert rented_pod_ssh.is_enforced(both) is True
     with enforcement(enabled=True, after_cycles=3):
         assert rented_pod_ssh.is_enforced(unhealthy) is False
