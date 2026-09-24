@@ -244,8 +244,8 @@ class Settings(BaseSettings):
     # off | log | enforce. `log` probes after the create returns and only logs; `enforce` fails the
     # create at step `ssh_ready` when no banner arrives within the grace period.
     SSH_READY_GATE_MODE: str = Field(env="SSH_READY_GATE_MODE", default="off")
-    SSH_READY_GATE_GRACE_SECONDS: float = Field(env="SSH_READY_GATE_GRACE_SECONDS", default=60.0)
-    SSH_READY_GATE_POLL_SECONDS: float = Field(env="SSH_READY_GATE_POLL_SECONDS", default=2.0)
+    SSH_READY_GATE_GRACE_SECONDS: float = Field(env="SSH_READY_GATE_GRACE_SECONDS", default=60.0, gt=0)
+    SSH_READY_GATE_POLL_SECONDS: float = Field(env="SSH_READY_GATE_POLL_SECONDS", default=2.0, gt=0)
     # DAH-3240: on a rent, learn DockerRootDir / free disk / vloopback volumes / loopback plugin
     # state in ONE ssh command and skip `docker plugin install` (a Docker Hub round trip) when the
     # plugin is already enabled — instead of five serial commands. Off: the per-command path.

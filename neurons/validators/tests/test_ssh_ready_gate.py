@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import socket
+import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -108,6 +109,25 @@ async def test_probe_accepts_but_sends_no_banner():
 
 
 @pytest.mark.asyncio
+async def test_probe_connect_and_banner_read_share_one_deadline(monkeypatch):
+    async def _silent(reader, writer):
+        await asyncio.sleep(2)
+
+    server, port = await _server(_silent)
+    real_open_connection = asyncio.open_connection
+
+    async def _slow_connect(*args, **kwargs):
+        await asyncio.sleep(0.3)
+        return await real_open_connection(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "open_connection", _slow_connect)
+    async with server:
+        started = time.monotonic()
+        assert await probe_ssh_banner("127.0.0.1", port, 0.4) is SshReadyOutcome.NO_BANNER
+        assert time.monotonic() - started < 0.6
+
+
+@pytest.mark.asyncio
 async def test_probe_accept_then_close_is_no_banner():
     """docker-proxy accepts on the host port even when nothing listens in the container."""
 
@@ -177,7 +197,32 @@ async def test_wait_fails_with_last_outcome_when_refused_throughout():
     assert not result.ready
     assert result.outcome is SshReadyOutcome.REFUSED
     assert result.elapsed_ms == 60_000
-    assert result.attempts == 31
+    assert result.attempts == 30
+
+
+@pytest.mark.asyncio
+async def test_wait_never_runs_past_the_grace_even_when_every_dial_uses_its_whole_timeout():
+    clock = _FakeClock()
+    timeouts = []
+
+    async def _slow(host, port, timeout):
+        timeouts.append(timeout)
+        clock.now += timeout
+        return SshReadyOutcome.TIMED_OUT
+
+    result = await wait_for_ssh_banner(
+        "1.2.3.4",
+        2222,
+        grace_seconds=60,
+        poll_seconds=2,
+        probe=_slow,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.elapsed_ms == 60_000
+    assert max(timeouts) == 5.0
+    assert result.outcome is SshReadyOutcome.TIMED_OUT
 
 
 def test_not_ready_error_names_port_grace_and_outcome():

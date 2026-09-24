@@ -74,7 +74,9 @@ class SshNotReady(Exception):
 
 
 async def probe_ssh_banner(host: str, port: int, timeout: float) -> SshReadyOutcome:
-    """One dial: READY when the peer sends an SSH-2.0 identification line within `timeout`."""
+    """One dial: READY when the peer sends an SSH-2.0 identification line. `timeout` covers the
+    connect and the banner read together."""
+    deadline = time.monotonic() + timeout
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, limit=SSH_ID_LINE_MAX), timeout
@@ -87,7 +89,9 @@ async def probe_ssh_banner(host: str, port: int, timeout: float) -> SshReadyOutc
         return SshReadyOutcome.UNREACHABLE
     try:
         try:
-            line = await asyncio.wait_for(read_ssh_identification(reader), timeout)
+            line = await asyncio.wait_for(
+                read_ssh_identification(reader), max(0.0, deadline - time.monotonic())
+            )
         except asyncio.TimeoutError:
             return SshReadyOutcome.NO_BANNER
         return SshReadyOutcome.READY if is_ssh2_identification(line) else SshReadyOutcome.NO_BANNER
@@ -108,16 +112,24 @@ async def wait_for_ssh_banner(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> SshReadyResult:
-    """Dial until the banner arrives or `grace_seconds` pass; the result carries the last outcome."""
+    """Dial until the banner arrives or `grace_seconds` pass; the result carries the last outcome.
+
+    Each dial is capped at what is left of the grace period, so the whole wait never exceeds it."""
     started = clock()
     attempts = 0
+    outcome = SshReadyOutcome.TIMED_OUT
     while True:
         remaining = grace_seconds - (clock() - started)
-        outcome = await probe(host, port, max(0.5, min(attempt_timeout_seconds, remaining)))
+        if remaining <= 0:
+            break
+        outcome = await probe(host, port, min(attempt_timeout_seconds, remaining))
         attempts += 1
-        elapsed = clock() - started
-        if outcome is SshReadyOutcome.READY or elapsed >= grace_seconds:
-            return SshReadyResult(
-                outcome=outcome, attempts=attempts, elapsed_ms=int(elapsed * 1000)
-            )
-        await sleep(min(poll_seconds, grace_seconds - elapsed))
+        if outcome is SshReadyOutcome.READY:
+            break
+        remaining = grace_seconds - (clock() - started)
+        if remaining <= 0:
+            break
+        await sleep(min(poll_seconds, remaining))
+    return SshReadyResult(
+        outcome=outcome, attempts=attempts, elapsed_ms=int((clock() - started) * 1000)
+    )
