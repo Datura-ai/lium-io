@@ -59,10 +59,11 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
+from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService, inflight_creates
 from services.executor_image_policy import ExpectedImageSnapshot
-from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
+from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.roce_link_probe import measure_and_attach
 from services.ssh_service import SSHService
 from services.task.availability import (
@@ -105,6 +106,30 @@ def _storage_repository_spec(
         "session_token": volume_info.session_token,
         "password": password,
     }
+
+
+def _missing_executor_failure(
+    msg: AcceptSSHKeyRequest, executor_id: str, default_extra: dict
+) -> tuple[_StructuredMessage, FailedContainerErrorCodes]:
+    """Log text and code for an AcceptSSHKeyRequest that does not carry the requested executor.
+
+    DAH-3338: the miner now says which executors it KNOWS (known_executor_ids) apart from which
+    ACCEPTED the key (executors). An id the miner lists but did not return is a node it could not
+    reach, ExecutorUnreachable; an id the miner does not list is InvalidExecutorId, worded by
+    `_ssh_key_not_accepted_text` (DAH-3508: "no executor accepted the SSH key" / "the miner
+    returned a different executor id", never the old "Invalid executor id"). A miner that predates
+    known_executor_ids sends None, and every miss stays InvalidExecutorId as before.
+    Both twins of the container flow (websocket and REST) call this, so they cannot drift apart.
+    """
+    if msg.known_executor_ids is not None and executor_id in msg.known_executor_ids:
+        return (
+            _m(
+                "Error: Executor unreachable",
+                extra=get_extra_info({**default_extra, "executors_returned": len(msg.executors)}),
+            ),
+            FailedContainerErrorCodes.ExecutorUnreachable,
+        )
+    return _ssh_key_not_accepted_text(msg.executors, default_extra), FailedContainerErrorCodes.InvalidExecutorId
 
 
 def _parse_miner_response(response_data: dict) -> AcceptSSHKeyRequest | FailedRequest | PodLogsResponse:
@@ -1118,6 +1143,10 @@ class MinerService:
                         "sent_at": time.time(),
                         "batch_total": batch_total,
                         "availability_errors": result.availability_errors,
+                        # DAH-3338: None when the cycle observed no rented pod and reaped nothing.
+                        # The spec carries at most the backend's bound; the rest of the list goes
+                        # in PodStatesReport chunks below, or waits for the next cycle.
+                        "pod_states": self._pod_states_capped_for_spec(result, default_extra),
                     },
                 )
             except Exception as e:
@@ -1125,6 +1154,76 @@ class MinerService:
                     _m(
                         f"Error publishing machine specs of {miner_hotkey} to compute app connector process",
                         extra=get_extra_info({**default_extra, "error": str(e)}),
+                    ),
+                    exc_info=True,
+                )
+                continue
+            if settings.POD_STATES_REPORT_ENABLED:
+                await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
+
+    @staticmethod
+    def _pod_states_capped_for_spec(result: JobResult, default_extra: dict) -> list[dict] | None:
+        if result.pod_states is None:
+            return None
+        bounded = bound_pod_states(result.pod_states)
+        if len(bounded) < len(result.pod_states):
+            logger.warning(
+                _m(
+                    "pod_states over the spec's bound"
+                    + (
+                        "; every state goes in the PodStatesReport chunks"
+                        if settings.POD_STATES_REPORT_ENABLED
+                        else "; the observed states past it are cut until the reaped queue drains"
+                    ),
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "executor_uuid": result.executor_info.uuid,
+                            "pod_states": len(result.pod_states),
+                            "in_spec": len(bounded),
+                        }
+                    ),
+                )
+            )
+        return [state.model_dump(mode="json") for state in bounded]
+
+    async def _publish_pod_states_report(self, result: JobResult, *, miner_hotkey: str, default_extra: dict) -> None:
+        """DAH-3338: every state of the cycle, in chunks of POD_STATES_MAX_ITEMS, right after the spec.
+
+        The chunks carry what the spec carries and what did not fit it; the backend's write is
+        idempotent, so the overlap changes nothing. A publish that fails loses that chunk for this
+        cycle only: a reaped id is re-sent from its queue, an observed state is observed again.
+        """
+        if not result.pod_states:
+            return
+        chunks = chunk_pod_states(result.pod_states)
+        for index, chunk in enumerate(chunks):
+            try:
+                await self.redis_service.publish(
+                    POD_STATES_CHANNEL,
+                    {
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": result.executor_info.uuid,
+                        "job_batch_id": result.job_batch_id,
+                        "chunk_index": index,
+                        "chunk_total": len(chunks),
+                        "pod_states": [state.model_dump(mode="json") for state in chunk],
+                        "sent_at": time.time(),
+                    },
+                )
+            except Exception as e:
+                logger.error(
+                    _m(
+                        "Error publishing pod states report chunk to compute app connector process",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "executor_uuid": result.executor_info.uuid,
+                                "chunk_index": index,
+                                "chunk_total": len(chunks),
+                                "error": str(e),
+                            }
+                        ),
                     ),
                     exc_info=True,
                 )
@@ -1302,7 +1401,7 @@ class MinerService:
                         executor = None
 
                     if executor is None or executor.uuid != payload.executor_id:
-                        log_text = _ssh_key_not_accepted_text(msg.executors, default_extra)
+                        log_text, error_code = _missing_executor_failure(msg, payload.executor_id, default_extra)
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
@@ -1325,7 +1424,7 @@ class MinerService:
                         return self._handle_container_error(
                             payload=payload,
                             msg=log_text,
-                            error_code=FailedContainerErrorCodes.InvalidExecutorId
+                            error_code=error_code,
                         )
 
                     renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id, payload.pod_id)
@@ -2481,7 +2580,7 @@ class MinerService:
                     executor = None
 
                 if executor is None or executor.uuid != payload.executor_id:
-                    log_text = _ssh_key_not_accepted_text(msg.executors, default_extra)
+                    log_text, error_code = _missing_executor_failure(msg, payload.executor_id, default_extra)
 
                     # Remove SSH key only if it was accepted
                     if ssh_key_accepted:
@@ -2506,7 +2605,7 @@ class MinerService:
                     return self._handle_container_error(
                         payload=payload,
                         msg=log_text,
-                        error_code=FailedContainerErrorCodes.InvalidExecutorId
+                        error_code=error_code,
                     )
 
                 renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id, payload.pod_id)
