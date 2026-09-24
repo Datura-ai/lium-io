@@ -14,6 +14,7 @@ from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, Vali
 from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
+from core.config import settings
 from core.utils import _m, get_extra_info
 
 from .checks.verifyx import hold_verifyx_ema, verifyx_ema_hold_reason
@@ -162,10 +163,13 @@ class ResultHandler:
         ema_hold_reason = verifyx_ema_hold_reason(context, failed_check_id)
         if ema_hold_reason:
             held_specs = hold_verifyx_ema(context, specs)
+            hold_enabled = settings.VERIFYX_EMA_HOLD_ENABLED
             if held_specs is not specs:
                 logger.info(
                     _m(
-                        "VerifyX EMA held: this cycle's sample does not move it",
+                        "VerifyX EMA held: this cycle's sample does not move it"
+                        if hold_enabled
+                        else "VerifyX EMA hold is off: this cycle's sample would not have moved it",
                         extra=get_extra_info(
                             {
                                 "executor_id": executor_info.uuid,
@@ -176,7 +180,8 @@ class ResultHandler:
                         ),
                     )
                 )
-            specs = held_specs
+            if hold_enabled:
+                specs = held_specs
         # G1 — NVIDIA CC GPU attestation outcome. Only added when a verification
         # was actually performed (None → key omitted), mirroring gpu_metrics.
         # Rides executor.specs to the backend like tdx_attestation_passed.

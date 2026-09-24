@@ -8,13 +8,14 @@ EMA the backend held before it, so a never-measured node stays never-measured an
 gets the DAH-2959 cold-sample retry.
 """
 
+import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 
-from core.config import settings
-from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
+from core.config import Settings, settings
+from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck, hold_verifyx_ema
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
@@ -26,6 +27,12 @@ from tests.test_verifyx_check import MockVerifyXResponse
 
 EXECUTOR = "executor-123"  # tests.helpers.default_executor().uuid
 IMAGE_CHECK = "executor.validate.cached_template"
+
+
+@pytest.fixture(autouse=True)
+def _hold_enabled(monkeypatch):
+    # The hold ships off; every test below runs it on unless it says otherwise.
+    monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", True)
 
 
 def _never_measured() -> RentedExecutorsResponse:
@@ -275,3 +282,112 @@ async def test_without_the_hold_the_same_two_cycles_fail_on_the_seeded_ema(conte
     assert ok is False
     assert last_event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
     assert last_event.what_we_saw["ema_verifyx_download_speed"] == pytest.approx(86.7)
+
+
+# --- the flag ------------------------------------------------------------------------------
+
+
+def test_the_ema_hold_flag_is_off_by_default():
+    assert Settings.model_fields["VERIFYX_EMA_HOLD_ENABLED"].default is False
+
+
+@pytest.mark.asyncio
+async def test_with_the_flag_off_a_failed_cycle_seeds_the_ema_as_before(
+    monkeypatch, context_factory, caplog
+):
+    monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", False)
+
+    with caplog.at_level(logging.INFO):
+        network = await _publish(
+            context_factory,
+            specs=_measured_specs(120.0, 120.0, 40.0),
+            rented_data=_never_measured(),
+            event=_event(IMAGE_CHECK, failed=True),
+            success=False,
+        )
+
+    assert network["ema_verifyx_download_speed"] == 120.0
+    assert network["ema_verifyx_upload_speed"] == 40.0
+    assert any("would not have moved it" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_with_the_flag_off_the_two_cycles_play_out_as_before(monkeypatch, context_factory):
+    monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", False)
+    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
+
+    ok, _, network = await _cycle(
+        context_factory, _ProbeSequence(120.0), _never_measured(), image_check=True
+    )
+    assert ok is False
+    assert network["ema_verifyx_download_speed"] == pytest.approx(120.0)
+
+    probes = _ProbeSequence(53.4)
+    ok, last_event, _ = await _cycle(
+        context_factory, probes, _as_backend_would_store(network), image_check=False
+    )
+
+    assert probes.calls == 1
+    assert ok is False
+    assert last_event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+    assert last_event.what_we_saw["ema_verifyx_download_speed"] == pytest.approx(86.7)
+
+
+# --- composition with an upstream step that already keeps the previous EMA -----------------
+# With the scrape's own speed test removed (lium-io#1419), `network` holds only what VerifyX
+# adds, and VerifyX itself republishes the stored EMA on a probe fallback or a malformed
+# reading; a node VerifyX does not run on carries only its stored ema_verifyx_*. The hold
+# restores from the same stored value, so whichever lands first it never compounds.
+
+
+def _hold(context_factory, specs, rented_data):
+    ctx = context_factory(state=build_state(specs=specs, rented_data=rented_data), ssh_pub_keys=[])
+    return hold_verifyx_ema(ctx, specs)
+
+
+def test_holding_an_ema_already_kept_upstream_changes_nothing(context_factory):
+    specs = {
+        "network": {"ema_verifyx_download_speed": 200.0, "ema_verifyx_upload_speed": 50.0}
+    }
+
+    once = _hold(context_factory, specs, _known(200.0, 50.0))
+    twice = _hold(context_factory, once, _known(200.0, 50.0))
+
+    assert once["network"] == twice["network"] == specs["network"]
+
+
+@pytest.mark.asyncio
+async def test_a_node_carrying_only_its_stored_ema_publishes_it_unchanged(context_factory):
+    stored = {"ema_verifyx_download_speed": 200.0, "ema_verifyx_upload_speed": 50.0}
+    network = await _publish(
+        context_factory,
+        specs={"gpu": {"count": 1}, "network": dict(stored)},
+        rented_data=_known(200.0, 50.0),
+        event=_event(IMAGE_CHECK, failed=True),
+        success=False,
+    )
+
+    assert network == stored
+
+
+@pytest.mark.asyncio
+async def test_a_held_node_moves_again_on_its_next_passing_cycle(context_factory):
+    # The hold is per cycle: a failed cycle keeps the stored EMA, the next passing cycle moves it.
+    held = await _publish(
+        context_factory,
+        specs=_measured_specs(50.0, 125.0, 45.0),
+        rented_data=_known(200.0, 50.0),
+        event=_event(IMAGE_CHECK, failed=True),
+        success=False,
+    )
+    assert held["ema_verifyx_download_speed"] == 200.0
+
+    moved = await _publish(
+        context_factory,
+        specs=_measured_specs(100.0, 150.0, 45.0),
+        rented_data=_as_backend_would_store(held),
+        event=_event("pipeline.finalize", failed=False),
+        success=True,
+        image_cached=True,
+    )
+    assert moved["ema_verifyx_download_speed"] == 150.0
