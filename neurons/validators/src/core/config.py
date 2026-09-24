@@ -382,7 +382,7 @@ class Settings(BaseSettings):
     NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED: bool = Field(
         env="NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED", default=False
     )
-    # ticket-0361: 14e704ba failed 16 rents in 24 h, every one a template it did not have cached; its
+    # ticket-0361: a node failed 16 rents in 24 h, every one a template it did not have cached; its
     # dockerd pulls through the mirror docker.m.daocloud.io, whose DNS lookup times out, while cached
     # templates start fine. RegistryPullCheck removes and pulls a digest-pinned hello-world through the
     # daemon (registry-mirrors apply) under a 30 s bound on idle nodes, once per INTERVAL_HOURS at a
@@ -392,7 +392,7 @@ class Settings(BaseSettings):
     # (REGISTRY_PULL_FAILED, score 0). A failed pull counts only if the validator itself reaches Docker
     # Hub. Nothing guards an outage only the nodes see (a CDN region, a shared mirror), so enforcement
     # is off by default: it goes on after a 48 h log-only window with the OBSERVED rows reviewed
-    # (count, outcomes, mirrors, fleet-wide pattern). Decider: taiberium; backup jam6099 (Muhammad).
+    # (count, outcomes, mirrors, fleet-wide pattern). Decider: taiberium; backup jam6099.
     REGISTRY_PULL_CHECK_ENABLED: bool = Field(env="REGISTRY_PULL_CHECK_ENABLED", default=True)
     REGISTRY_PULL_ENFORCEMENT_ENABLED: bool = Field(env="REGISTRY_PULL_ENFORCEMENT_ENABLED", default=False)
     REGISTRY_PULL_PROBE_INTERVAL_HOURS: float = Field(

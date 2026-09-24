@@ -1,6 +1,6 @@
 """cloudflare_speed() in machine_scrape.py: a refusal is an error, not a measured 0 Mbps.
 
-ticket-0361 follow-up: 24 of one provider's 27 active nodes reported no download (14e704ba's upload measured
+ticket-0361 follow-up: 24 of one provider's 27 active nodes reported no download (the ticket-0361 node's upload measured
 77-105 Mbps). Cloudflare answers a request it will not serve with HTTP 403 and a 1-byte body (seen for
 __down?bytes=100000000 on 23 Sep 2026) and curl exits 0 on it, so the speed read alone was 0.0 Mbps, which
 benchmark_network_speed then drops as "no figure" without any error saying why.

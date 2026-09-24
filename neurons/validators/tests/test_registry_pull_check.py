@@ -1,6 +1,6 @@
 """REGISTRY_PULL_FAILED: an idle node whose Docker daemon cannot pull a Docker Hub image through its own registry path.
 
-ticket-0361 root cause (Muhammad, #loop-muhammad 23 Sep 18:46Z): 14e704ba failed 16 rents in 24 h, every one of
+ticket-0361 root cause (reported 23 Sep 18:46Z): a node failed 16 rents in 24 h, every one of
 them a template image the node did not have cached. Its dockerd pulls through the registry mirror
 docker.m.daocloud.io, whose DNS lookup times out; cached templates started fine. No check pulled anything, so the
 node passed every one.
@@ -419,7 +419,7 @@ def _run_script(
 
 def test_the_cached_image_is_removed_before_the_pull_and_after_it(tmp_path):
     """Regression: a node that already has the image answers the pull from its own store, so a broken mirror
-    passes (14e704ba's cached templates started fine)."""
+    passes (the ticket-0361 node's cached templates started fine)."""
     store = tmp_path / "hello-world.present"
     out = _run_script(tmp_path, _docker_stub(tmp_path, pull=f"touch {store}; echo pulled"))
     reading = parse_pull_probe(out.stdout)
@@ -493,8 +493,8 @@ def test_the_script_runs_without_timeout_on_the_path(tmp_path):
         (False, True, Msg.REGISTRY_PULL_FAILED_OBSERVED.reason),
     ],
 )
-async def test_14e704ba_mirror_dns_timeout_twice_in_a_row(enforced, passed, reason):
-    """Regression: 14e704ba's dockerd pulls through docker.m.daocloud.io, whose lookup times out; 16 rents of
+async def test_ticket_0361_mirror_dns_timeout_twice_in_a_row(enforced, passed, reason):
+    """Regression: the ticket-0361 node's dockerd pulls through docker.m.daocloud.io, whose lookup times out; 16 rents of
     uncached templates failed in 24 h while the node passed every check."""
     ctx, runner, _ = make_ctx(result(MIRROR_DNS_TIMEOUT), result(MIRROR_DNS_TIMEOUT))
     check = RegistryPullCheck()
@@ -765,7 +765,7 @@ async def test_the_control_is_fetched_once_per_window_for_every_node(caplog):
 
 @pytest.mark.asyncio
 async def test_with_docker_hub_up_a_node_whose_mirror_fails_still_counts():
-    """The control guards against Docker Hub's outages, not the node's own mirror: 14e704ba still fails."""
+    """The control guards against Docker Hub's outages, not the node's own mirror: the ticket-0361 node still fails."""
     ctx, _, _ = make_ctx(result(MIRROR_DNS_TIMEOUT), result(MIRROR_DNS_TIMEOUT))
     hub = FakeHub(HUB_UP)
     check = RegistryPullCheck()
@@ -1063,7 +1063,7 @@ async def test_27_broken_nodes_of_one_provider_and_stragglers_all_fail(straggler
         broken = [
             _node(
                 f"ticket-s{seed}-{i:02d}",
-                "provider-14e704ba",
+                "provider-ticket-0361",
                 OutageRunner(clock, 0, 0, broken=True),
                 redis,
             )
@@ -1094,8 +1094,8 @@ async def test_27_broken_nodes_of_one_provider_and_stragglers_all_fail(straggler
 def test_the_phase_is_stable_per_node_and_spreads_the_fleet_over_the_interval():
     with flags(phase_at_start=False):
         interval = 6 * 3600
-        phase = module.pull_phase_seconds("14e704ba-96d8-45b0-a334-c12da67bd516")
-        assert phase == module.pull_phase_seconds("14e704ba-96d8-45b0-a334-c12da67bd516")
+        phase = module.pull_phase_seconds("0d6c1a52-3f1e-4b7a-9c2e-5a8f7b1d4e60")
+        assert phase == module.pull_phase_seconds("0d6c1a52-3f1e-4b7a-9c2e-5a8f7b1d4e60")
         assert 0 <= phase < interval
         hours = Counter(int(module.pull_phase_seconds(f"exec-{i}") // 3600) for i in range(600))
     assert sorted(hours) == [0, 1, 2, 3, 4, 5]
@@ -1105,7 +1105,7 @@ def test_the_phase_is_stable_per_node_and_spreads_the_fleet_over_the_interval():
 @pytest.mark.asyncio
 async def test_a_node_first_seen_waits_for_its_phase_then_pulls_every_interval():
     """r5: every idle node pulled in the first cycle after deploy and every 6 h after, in the same cycle."""
-    uuid = "14e704ba-96d8-45b0-a334-c12da67bd516"
+    uuid = "0d6c1a52-3f1e-4b7a-9c2e-5a8f7b1d4e60"
     ctx, runner, _ = make_ctx(result(PULL_OK), result(PULL_OK), uuid=uuid)
     check = RegistryPullCheck()
     with flags(phase_at_start=False) as clock:

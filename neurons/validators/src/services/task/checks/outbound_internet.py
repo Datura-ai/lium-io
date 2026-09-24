@@ -110,7 +110,7 @@ def scrape_egress_finding(specs: dict[str, Any] | None) -> dict[str, Any] | None
     result under `measurements`; with neither measured, all four methods ran. A finding only when
     neither direction was measured: a missing download alone is not one (ticket-0361: 24 of one
     provider's 27 active nodes had no download, most of them a Cloudflare download recorded as 0, and
-    14e704ba's upload measured 77-105 Mbps), nor is an error from a method a later one measured past.
+    the ticket-0361 node's upload measured 77-105 Mbps), nor is an error from a method a later one measured past.
     A network block without `measurements` is no reading: lium-io#1419 (DAH-2774) removes the scrape's
     speed tests and leaves `{}`, which must not read as every node without egress.
     """
@@ -149,7 +149,7 @@ class OutboundInternetCheck:
     A scrape that measured neither direction is logged as OUTBOUND_INTERNET_NO_SPEED and passes, under
     either NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED setting. The speed tests measure third-party endpoints
     (speedtest.net servers, speed.cloudflare.com), not the node: Cloudflare answering 429 to both directions
-    reads the same as a host that cannot reach out, and 14e704ba, whose renters could not start, measured
+    reads the same as a host that cannot reach out, and the ticket-0361 node, whose renters could not start, measured
     77-105 Mbps up. The fail signals are the paths a renter takes: RegistryPullCheck's real Docker Hub pull
     and the rental probe's `egress` step, both under their own enforcement flags.
 

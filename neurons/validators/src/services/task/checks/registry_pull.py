@@ -93,7 +93,7 @@ Outcome = Literal[
     "other",
     "not_run",
 ]
-# what fails a node (twice in a row): the registry path is broken, the way it broke 14e704ba's rents.
+# what fails a node (twice in a row): the registry path is broken, the way it broke the ticket-0361 node's rents.
 # `unreachable` is a firewall or proxy that rejects the connection rather than dropping it; a renter's
 # uncached pull fails on it just the same
 FAILING_OUTCOMES = frozenset({"timeout", "dns_error", "unreachable", "manifest_unknown"})
@@ -180,7 +180,7 @@ def classify_pull_error(exit_code: int, output: str) -> Outcome:
     """The outcome of a finished `docker pull`: ok on exit 0, else read off the daemon's error text.
 
     A DNS failure is named before a timeout: a mirror whose lookup times out reads
-    `lookup docker.m.daocloud.io on 127.0.0.53:53: read udp ...: i/o timeout` (14e704ba).
+    `lookup docker.m.daocloud.io on 127.0.0.53:53: read udp ...: i/o timeout` (the ticket-0361 node).
     """
     if exit_code == 0:
         return "ok"
@@ -367,7 +367,7 @@ async def probe_docker_hub() -> tuple[bool, str]:
 class RegistryPullCheck:
     """Fail an idle node that cannot pull a Docker Hub image through its own registry path (REGISTRY_PULL_FAILED).
 
-    14e704ba (ticket-0361) failed 16 rents in 24 h, every one of them a template image the node did not
+    The ticket-0361 node failed 16 rents in 24 h, every one of them a template image the node did not
     have cached: its dockerd pulls through the registry mirror docker.m.daocloud.io, whose DNS lookup times
     out, while cached templates started fine. The speed tests and the other checks never pull, so they
     passed it. This check runs a real `docker pull` of a tiny digest-pinned image (REGISTRY_PULL_IMAGE)
