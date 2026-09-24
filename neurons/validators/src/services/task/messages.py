@@ -883,6 +883,12 @@ class TenantEnforcementMessages:
         "Outage detected; no notice queued this cycle (DRY_RUN, or the backend already "
         "acknowledged this outage); score unchanged"
     )
+    # DAH-2255: the same event when ``is_enforced`` holds (flag on, streak at the enforce threshold,
+    # outage accepted by the backend) — the check fails the cycle instead of halting on it.
+    RENTED_POD_SSH_UNREACHABLE_ENFORCED_IMPACT = (
+        "Outage past the enforcement threshold: the rented-state check fails this cycle, "
+        "score 0 and the verified job cleared, until a cycle finds the pod reachable again"
+    )
 
 
 class GpuUsageMessages:

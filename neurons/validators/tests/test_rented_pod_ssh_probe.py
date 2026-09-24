@@ -364,6 +364,8 @@ async def test_a_report_the_backend_did_not_answer_is_posted_again_until_it_does
         "count": 4,
         "first_failed_at": h.streak()["first_failed_at"],
         "reported": True,
+        "accepted": True,
+        "accepted_faults": [FAULT_TCP_REFUSED],
     }
     [pod] = after.event.what_we_saw["unreachable_pods"]
     assert pod["report_queued"] is False
@@ -489,6 +491,8 @@ async def test_a_notify_failed_answer_keeps_the_outage_unacknowledged_and_posts_
     [pod] = refused.event.what_we_saw["unreachable_pods"]
     assert pod["report_queued"] is True
     assert h.streak()["reported"] is False
+    assert h.streak()["accepted"] is True
+    assert h.streak()["accepted_faults"] == [FAULT_TCP_REFUSED]
     assert h.backend.report_pod_ssh_unreachable.await_count == 1
 
     h.backend.report_pod_ssh_unreachable.return_value = PodSshUnreachableResponse(
@@ -536,6 +540,7 @@ async def test_both_marks_carry_the_ttl_and_every_probe_renews_it(context_factor
     h = Harness(context_factory)
     ok_key = f"{rented_pod_ssh.RENTED_POD_SSH_OK_KEY_PREFIX}:{POD_ID}"
     fail_key = f"{rented_pod_ssh.RENTED_POD_SSH_FAIL_KEY_PREFIX}:{POD_ID}"
+    # With enforcement off (the default) the last gate's verdict is neither stored nor read.
     with patch.object(rented_pod_ssh.settings, "RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS", 3600):
         await h.cycle(tcp_fault=None, ssh_keys=KEYS)
         assert h.redis.ttl == {ok_key: 3600}
@@ -1316,11 +1321,15 @@ def test_streak_state_round_trips_and_a_corrupt_count_restarts_at_zero():
         "count": 2,
         "first_failed_at": stored.first_failed_at,
         "reported": False,
+        "accepted": False,
+        "accepted_faults": [],
     }
     reported = rented_pod_ssh.FailStreak.load(
         b'{"count": 2, "first_failed_at": "x", "reported": true}', now_iso=now
     )
     assert reported.reported is True and reported.plus_one_cycle().reported is True
+    # a streak stored before the accept fields does not count as accepted: its faults are unknown
+    assert reported.backend_accepted is False
     assert (
         rented_pod_ssh.FailStreak.load(b'{"count": 2, "reported": "yes"}', now_iso=now).reported
         is False

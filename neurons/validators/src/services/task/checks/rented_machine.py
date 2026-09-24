@@ -24,7 +24,9 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .rented_pod_ssh import (
     RentedPodSshVerdict,
+    enforce_after_cycles,
     forget_rented_pod_ssh,
+    is_enforced,
     probe_rented_pod_ssh,
     verdict_log_fields,
 )
@@ -293,6 +295,17 @@ class TenantEnforcementCheck:
                     )
                 )
 
+        reported = [verdict for verdict in ssh_verdicts if verdict.report]
+        # DAH-2255: with RENTED_POD_SSH_ENFORCEMENT_ENABLED on, a pod whose streak reached the
+        # enforce threshold AND whose outage the backend already accepted fails the check for this
+        # cycle. Judged before the score: the cycle ends here at 0, the way the rental probe ends
+        # an unreachable unrented node's cycle.
+        enforced = [verdict for verdict in reported if is_enforced(verdict)]
+        if enforced:
+            return self._failed_result_for_enforced_ssh_outage(
+                ctx, reported=reported, enforced=enforced, extra=extra
+            )
+
         score_calculator = ctx.services.score_calculator
         actual_score, job_score, warning_message = score_calculator(ctx, True)
 
@@ -303,9 +316,8 @@ class TenantEnforcementCheck:
             "job_score": job_score,
         }
         # A pod that just crossed the unhealthy threshold owns this cycle's event, so the outage is
-        # what the backend stores and the portal shows. The score is the rented score regardless:
-        # whether this verdict should cost the provider is a separate decision (DAH-2255), not this check's.
-        reported = [verdict for verdict in ssh_verdicts if verdict.report]
+        # what the backend stores and the portal shows. The score is the rented score: with the
+        # enforcement flag off (the default) this verdict is reported, not scored (DAH-2870).
         if reported:
             # The template's impact says the notice is queued for the cycle-end gate. When no pod
             # queued one this cycle (DRY_RUN, or the backend already acknowledged the outage) say so.
@@ -356,6 +368,81 @@ class TenantEnforcementCheck:
                 },
                 halt=True,
             )
+        )
+
+    def _failed_result_for_enforced_ssh_outage(
+        self,
+        ctx: Context,
+        *,
+        reported: list[RentedPodSshVerdict],
+        enforced: list[RentedPodSshVerdict],
+        extra: dict[str, Any],
+    ) -> CheckResult:
+        """The cycle's failing result when a rented pod's SSH outage is past the enforce threshold (DAH-2255).
+
+        Score 0, verified job cleared with the outage as the DAH-3386 evidence: what the rental probe
+        does to an unreachable unrented node. The event stays RENTED_POD_SSH_UNREACHABLE (the backend
+        and the portal know the code from lium-platform#429) with the enforced impact; its
+        ``unreachable_pods`` name every pod at the notify threshold. The reset evidence is one pod's —
+        the first enforced one; the log line names them all. The renter's report is the probe's and
+        was queued as usual. Like the POD_NOT_RUNNING failure of this check, the result carries no
+        ``ssh_pub_keys``: nothing the check read off the pod travels with a failure.
+        """
+        threshold = enforce_after_cycles()
+        evidence_verdict = enforced[0]
+        event = render_message(
+            Msg.RENTED_POD_SSH_UNREACHABLE,
+            ctx=ctx,
+            check_id=self.check_id,
+            impact=Msg.RENTED_POD_SSH_UNREACHABLE_ENFORCED_IMPACT,
+            what={
+                "enforced": True,
+                "enforce_after_cycles": threshold,
+                "unreachable_pods": [verdict_log_fields(verdict) for verdict in reported],
+            },
+            extra=extra,
+        )
+        # The one log line of the enforcement: which pod, what faults, how long, at what threshold.
+        # The event itself is the pipeline sink's. No key material — the fields are the verdict's.
+        logger.warning(
+            _m(
+                "RENTED_POD_SSH_UNREACHABLE_ENFORCED",
+                extra=get_extra_info(
+                    {
+                        **ctx.default_extra,
+                        "enforce_after_cycles": threshold,
+                        "enforced_pods": [verdict_log_fields(verdict) for verdict in enforced],
+                    }
+                ),
+            )
+        )
+        return CheckResult(
+            passed=False,
+            event=event,
+            updates={
+                "default_extra": extra,
+                "score": 0.0,
+                "job_score": 0.0,
+                "score_warning": (
+                    f"Rented pod {evidence_verdict.pod_id} unreachable over SSH for "
+                    f"{evidence_verdict.consecutive_cycles} cycles"
+                ),
+                "clear_verified_job_info": True,
+                # The backend's penalty row shows the outage the way it shows a pod's death diagnostics
+                # (DAH-3386): the check, the pod, its faults and the streak. Every value is the probe's
+                # own (fault names from its vocabulary, ints, an ISO time, a bool), none the host's.
+                "clear_verified_job_evidence": {
+                    "reason_code": event.reason_code,
+                    "check_id": self.check_id,
+                    "pod_id": evidence_verdict.pod_id,
+                    "ssh_port": evidence_verdict.ssh_port,
+                    "faults": list(evidence_verdict.faults),
+                    "consecutive_cycles": evidence_verdict.consecutive_cycles,
+                    "first_failed_at": evidence_verdict.first_failed_at,
+                    "boot_id_changed": evidence_verdict.boot_id_changed,
+                    "enforce_after_cycles": threshold,
+                },
+            },
         )
 
     async def _recover_downed_pod(

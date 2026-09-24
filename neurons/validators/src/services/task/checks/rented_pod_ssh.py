@@ -26,7 +26,9 @@ raise ``RENTED_POD_SSH_UNREACHABLE`` and one POST to the backend per
 outage: the POST is repeated each cycle until the backend answers 200 (``recorded`` true or false)
 with a ``delivery`` other than ``notify_failed`` (lium-platform#429: the renter's mail was refused,
 so the next cycle posts again and it is re-sent), and that answer is kept in the streak so the
-outage is reported once. The score is not changed by this module.
+outage is reported once. The score is not changed by this module: with
+``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` on (DAH-2255, off by default) the check reads ``is_enforced``
+and fails the cycle itself once the streak reaches ``enforce_after_cycles()``.
 
 The POST is deferred to the end of the cycle and gated by the fleet: a validator whose own network
 fails sees every mapped port refuse at once, and per-pod reporting would tell every healthy renter
@@ -38,9 +40,14 @@ least ``SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE`` pods), or the cycle's executor-
 judged the validator to be the outage (DAH-2748), the queued reports are logged as
 ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` and no report is POSTed, so no renter is told. The
 streaks keep ``reported`` False, so the outage is queued again next cycle and reported once the
-fleet reads clean. The per-executor ``RENTED_POD_SSH_UNREACHABLE`` events of a suppressed cycle
-were rendered before the gate ran and name a pod outage the gate then judged to be ours; the sync
-loop passes the gate to
+fleet reads clean. Enforcement follows the backend accept, not the mail: ``is_enforced`` is true
+only when the streak is ``backend_accepted`` (a 200, including ``notify_failed``), so a held cycle
+never zeroes the node and a refused mail does not protect the provider. The gate also stores its
+verdict (``RENTED_POD_SSH_LAST_GATE_KEY``): while the last gate held the reports as our own outage,
+an accepted outage is not enforced either, so our outage zeroes a node for one cycle at most (the
+gate runs after the cycle's checks). The per-executor ``RENTED_POD_SSH_UNREACHABLE`` events of a
+suppressed cycle were rendered before the gate ran and name a pod outage the gate then judged to
+be ours; the sync loop passes the gate to
 ``silence_rented_pod_ssh_reports_on_our_own_outage`` before the specs publish, which rewrites them
 to RENTED with the gate's verdict under ``what_we_saw``, as DAH-2748 rewrites availability errors.
 
@@ -99,6 +106,10 @@ RENTED_POD_SSH_FAIL_KEY_PREFIX = "rented_pod_ssh_fail"
 RENTED_POD_SSH_FLEET_KEY_PREFIX = "rented_pod_ssh_fleet"
 RENTED_POD_SSH_DUE_KEY_PREFIX = "rented_pod_ssh_due"
 FLEET_KEY_TTL_SECONDS = 3600
+# The last cycle-end gate's `suppressed_by` ("" when it held nothing), kept only with enforcement on.
+# `is_enforced` reads it: a validator the last gate judged to be the outage does not zero a pod.
+# Expires with the fleet keys.
+RENTED_POD_SSH_LAST_GATE_KEY = "rented_pod_ssh_last_gate"
 FLEET_MARK_OK = "ok"
 # A cycle whose reports the gate held back: the field every suppressed log line carries.
 PROBE_SUPPRESSED_FLEET = "probe_suppressed_fleet"
@@ -113,6 +124,7 @@ FAULT_TCP_TIMEOUT = "tcp_timeout"
 # only with RENTED_POD_SSH_BANNER_FAULT_ENABLED on (after lium-platform#429 is deployed).
 FAULT_SSH_BANNER_MISSING = "ssh_banner_missing"
 FAULT_AUTHORIZED_KEYS_UNREADABLE = "authorized_keys_unreadable"
+_PORT_FAULTS = frozenset({FAULT_TCP_REFUSED, FAULT_TCP_TIMEOUT, FAULT_SSH_BANNER_MISSING})
 # The one pod status the probe judges: the backend lists rebooting, failed and pending pods too, and
 # its ssh-unreachable route answers 409 for any of them (lium-platform#429). A backend that predates
 # the field sends no status, and every listed pod is judged as before.
@@ -146,6 +158,12 @@ class RentedPodSshVerdict:
     # is the flush's log line, not the verdict's.
     report: bool = False
     report_queued: bool = False
+    # Backend accepted this outage (HTTP 200), including a ``notify_failed`` delivery.
+    # Mail retry still queues; enforcement reads this, not ``reported``.
+    backend_accepted: bool = False
+    backend_accepted_faults: list[str] = field(default_factory=list)
+    # The last cycle-end gate held the reports as our own outage.
+    last_gate_suppressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -164,6 +182,41 @@ class FleetGate:
     @property
     def fail_share(self) -> float:
         return self.failed / self.probed if self.probed else 0.0
+
+
+def enforce_after_cycles() -> int:
+    """The streak at which ``RENTED_POD_SSH_ENFORCEMENT_ENABLED`` fails the rented-state check (DAH-2255).
+
+    ``RENTED_POD_SSH_ENFORCE_AFTER_CYCLES`` when set, else the notify threshold
+    ``RENTED_POD_SSH_PROBE_CYCLES``; the settings refuse a value below the notify threshold at startup.
+    """
+    configured = settings.RENTED_POD_SSH_ENFORCE_AFTER_CYCLES
+    return settings.RENTED_POD_SSH_PROBE_CYCLES if configured is None else configured
+
+
+def is_enforced(verdict: RentedPodSshVerdict) -> bool:
+    """True when this verdict fails the rented-state check for the cycle (DAH-2255)."""
+    if not settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED or verdict.healthy:
+        return False
+    if verdict.consecutive_cycles < enforce_after_cycles():
+        return False
+    if not verdict.backend_accepted or verdict.last_gate_suppressed:
+        return False
+    backend_accepted_faults = set(verdict.backend_accepted_faults)
+    current_faults = set(verdict.faults)
+    only_keys_unreadable_this_cycle = FAULT_AUTHORIZED_KEYS_UNREADABLE in current_faults and not (
+        _PORT_FAULTS & current_faults
+    )
+    if _PORT_FAULTS & backend_accepted_faults:
+        # The boot rule reads this cycle's faults too: keys alone and no reboot is the renter's doing.
+        return verdict.boot_id_changed is True if only_keys_unreadable_this_cycle else True
+    # A keys-only accept covers a keys-only outage, never a later port fault.
+    if (
+        FAULT_AUTHORIZED_KEYS_UNREADABLE in backend_accepted_faults
+        and only_keys_unreadable_this_cycle
+    ):
+        return verdict.boot_id_changed is True
+    return False
 
 
 def _ok_key(pod_id: str) -> str:
@@ -252,12 +305,16 @@ class OkMark:
 
 @dataclass(frozen=True)
 class FailStreak:
-    """The `fail` key: how many consecutive cycles the pod has failed, when the first one was, and
-    whether the backend has acknowledged this outage's report (``reported``)."""
+    """The `fail` key: how many consecutive cycles the pod has failed, when the first one was,
+    whether the backend accepted this outage (``backend_accepted``, any 200), which faults that
+    accept named (``backend_accepted_faults``), and whether the renter was told (``reported``, not
+    set on ``notify_failed``)."""
 
     count: int
     first_failed_at: str
     reported: bool = False
+    backend_accepted: bool = False
+    backend_accepted_faults: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, raw: object, *, now_iso: str) -> FailStreak:
@@ -269,6 +326,9 @@ class FailStreak:
         value = _decode(raw) or {}
         count = value.get("count", 0)
         first_failed_at = value.get("first_failed_at")
+        backend_accepted_faults = [
+            item for item in (value.get("accepted_faults") or []) if isinstance(item, str)
+        ]
         return cls(
             count=count
             if isinstance(count, int) and not isinstance(count, bool) and count >= 0
@@ -277,6 +337,8 @@ class FailStreak:
             if isinstance(first_failed_at, str) and first_failed_at
             else now_iso,
             reported=value.get("reported") is True,
+            backend_accepted=value.get("accepted") is True,
+            backend_accepted_faults=backend_accepted_faults,
         )
 
     def plus_one_cycle(self) -> FailStreak:
@@ -288,6 +350,8 @@ class FailStreak:
                 "count": self.count,
                 "first_failed_at": self.first_failed_at,
                 "reported": self.reported,
+                "accepted": self.backend_accepted,
+                "accepted_faults": list(self.backend_accepted_faults),
             }
         )
 
@@ -494,6 +558,12 @@ async def _judge_with_streak(
         first_failed_at=first_failed_at,
         boot_id_changed=boot_id_changed,
         report=consecutive >= threshold,
+        backend_accepted=streak.backend_accepted,
+        backend_accepted_faults=list(streak.backend_accepted_faults),
+        last_gate_suppressed=(
+            settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED
+            and bool(await store.get(RENTED_POD_SSH_LAST_GATE_KEY))
+        ),
     )
     if consecutive < threshold or streak.reported or settings.DRY_RUN:
         # Under the threshold, or the backend already acknowledged this outage. DRY_RUN validates
@@ -630,7 +700,9 @@ async def flush_rented_pod_ssh_reports(
     ``RENTED_POD_SSH_PROBE_SUPPRESSED_FLEET`` with the pods it names; nothing is lost, because the
     streaks still read ``reported`` False and queue again next cycle.
 
-    Returns None when the probe is off or Redis failed (logged), else what the gate saw and posted.
+    With enforcement on, the verdict is also stored under ``RENTED_POD_SSH_LAST_GATE_KEY`` for the
+    next cycle's ``is_enforced``. Returns None when the probe is off or Redis failed (logged), else
+    what the gate saw and posted.
     Never raises: a backend or Redis error here is one more cycle of waiting, not a failed cycle.
     """
     if not settings.RENTED_POD_SSH_PROBE_ENABLED:
@@ -638,6 +710,11 @@ async def flush_rented_pod_ssh_reports(
     extra = {"job_batch_id": job_batch_id}
     try:
         fleet, due = await _take_cycle_hashes(redis, job_batch_id)
+        gate = judge_fleet_gate(fleet, due, job_batch_id, validator_outage=validator_outage)
+        if settings.RENTED_POD_SSH_ENFORCEMENT_ENABLED:
+            await redis.set(
+                RENTED_POD_SSH_LAST_GATE_KEY, gate.suppressed_by or "", ex=FLEET_KEY_TTL_SECONDS
+            )
     except REDIS_ERRORS:
         logger.warning(
             _m(
@@ -648,7 +725,6 @@ async def flush_rented_pod_ssh_reports(
         )
         return None
 
-    gate = judge_fleet_gate(fleet, due, job_batch_id, validator_outage=validator_outage)
     gate_log_fields = {
         **extra,
         "probed": gate.probed,
@@ -721,6 +797,12 @@ def silence_rented_pod_ssh_reports_on_our_own_outage(
     cycle, so ``reported`` is set and it was never due) stays in ``unreachable_pods``, because that
     pod's outage is real and already on record. When nothing stays, the event becomes RENTED; when
     something stays, it keeps its reason and names only the pods whose outage stands.
+    An enforced event (DAH-2255, ``what_we_saw.enforced``) is a later cycle whose backend already
+    accepted the report: it failed at score 0 and is never rewritten to RENTED. It keeps reason,
+    impact and pods and gains the gate's verdict under ``probe_suppressed_fleet``. The stored gate
+    verdict stops enforcement from the next cycle on, so this is at most the first cycle of our
+    outage. A first-threshold cycle the gate holds is not enforced (``is_enforced`` needs the
+    accept), so it takes the RENTED rewrite.
     Returns how many results were rewritten, for the caller's log line.
     """
     if gate is None or not gate.suppressed_by:
@@ -762,6 +844,14 @@ def _event_without_held_pods(
         "fail_share": round(gate.fail_share, 3),
         "unreachable_pods": held_pods,
     }
+    if event.what_we_saw.get("enforced") is True:
+        # DAH-2255: the check failed this cycle (score 0, verified job cleared) — that is not the
+        # rented halt, so the event keeps its reason, impact and pods; the gate's verdict rides
+        # along so the record says the zero fell in a cycle whose renter notice was held. The
+        # score and the job reset were applied before the gate ran, so the record keeps them.
+        return event.model_copy(
+            update={"what_we_saw": {**event.what_we_saw, PROBE_SUPPRESSED_FLEET: gate_verdict}}
+        )
     if already_reported_pods:
         # Mixed: one pod of this executor was reported in an earlier cycle, another is held now.
         # The event keeps its reason for the pod whose outage stands and stops naming the rest;
@@ -794,34 +884,40 @@ def _event_without_held_pods(
 async def _post_one(
     redis: RedisService, backend: BackendClient, pod_id: str, raw: str, extra: dict[str, object]
 ) -> bool:
-    """POST one queued report; True when the backend answered and the renter was told (or nothing
-    was due) — the streak is then marked reported. A ``notify_failed`` answer (lium-platform#429:
-    the mail was refused) leaves ``reported`` False so the next cycle posts again and the mail is
-    re-sent."""
+    """POST one queued report; True when the renter was told (or nothing was due).
+
+    A 200 marks the streak accepted (enforcement can proceed) and stores the faults that
+    accept named. A ``notify_failed`` answer (lium-platform#429: the mail was refused) leaves
+    ``reported`` False so the next cycle posts again and the mail is re-sent.
+    """
     report = DueReport.load(raw)
     if report is None:
         return False
     response = await _report_to_backend(backend, pod_id, report, extra)
     if response is None:
         return False
-    if response.delivery == SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED:
+    mail_failed = response.delivery == SSH_UNREACHABLE_DELIVERY_NOTIFY_FAILED
+    if mail_failed:
         logger.warning(
             _m(
                 "RENTED_POD_SSH_UNREACHABLE_NOTIFY_FAILED",
                 extra=get_extra_info({**extra, "pod_id": pod_id, "recorded": response.recorded}),
             )
         )
-        return False
-    # The backend answered 200 and the renter was told (or had the mail off): this outage is
-    # reported. A Redis error on this one write costs one duplicate POST next cycle, which the
-    # backend dedupes.
+    # Backend accepted (200). A Redis error on this write costs one duplicate POST next cycle,
+    # which the backend dedupes; ``backend_accepted`` then stays off until that retry lands.
     try:
         stored = await redis.get(_fail_key(pod_id))
         if stored is not None:
             streak = FailStreak.load(stored, now_iso=datetime.now(UTC).isoformat())
             await redis.set(
                 _fail_key(pod_id),
-                replace(streak, reported=True).dump(),
+                replace(
+                    streak,
+                    backend_accepted=True,
+                    backend_accepted_faults=list(report.faults),
+                    reported=not mail_failed,
+                ).dump(),
                 ex=settings.RENTED_POD_SSH_PROBE_STATE_TTL_SECONDS,
             )
     except REDIS_ERRORS:
@@ -832,7 +928,7 @@ async def _post_one(
             ),
             exc_info=True,
         )
-    return True
+    return not mail_failed
 
 
 async def _report_to_backend(
