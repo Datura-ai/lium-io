@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from typing import NamedTuple
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
@@ -18,6 +19,8 @@ MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
 INSPECTOR_EVENT_CHANNEL = "INSPECTOR_EVENT_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
+# DAH-3338: one message per PodStatesReport chunk, published right after the cycle's spec
+POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
@@ -114,6 +117,44 @@ class _PassThroughLock:
 
     def locked(self) -> bool:
         return False
+
+
+class RedisWrite(NamedTuple):
+    """One queued write of a `RedisWrites` batch."""
+
+    command: str
+    args: tuple[str | int, ...]
+    kwargs: dict[str, int | None]
+
+
+class RedisWrites:
+    """Writes that apply together or not at all: `RedisService.write_atomically` runs them as one
+    MULTI/EXEC. A state kept in several keys (a mark and a streak, a hash and its TTL) is moved in one
+    step, so a connection lost between two writes cannot leave half of it behind (DAH-2870: a
+    healthy SET followed by a failed DELETE kept the old streak next to a fresh ok mark).
+    Only the write commands the validator uses are offered; the methods chain."""
+
+    def __init__(self):
+        self.ops: list[RedisWrite] = []
+
+    def set(self, key: str, value: str, ex: int | None = None) -> "RedisWrites":
+        self.ops.append(RedisWrite("set", (key, value), {"ex": ex}))
+        return self
+
+    def delete(self, key: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("delete", (key,), {}))
+        return self
+
+    def hset(self, key: str, field: str, value: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("hset", (key, field, value), {}))
+        return self
+
+    def expire(self, key: str, seconds: int) -> "RedisWrites":
+        self.ops.append(RedisWrite("expire", (key, seconds), {}))
+        return self
+
+    def __len__(self) -> int:
+        return len(self.ops)
 
 
 class RedisService:
@@ -328,6 +369,11 @@ class RedisService:
         async with self.lock:
             await self.redis.delete(key)
 
+    async def expire(self, key: str, seconds: int):
+        """Set (or refresh) a key's time to live."""
+        async with self.lock:
+            await self.redis.expire(key, seconds)
+
     async def sadd(self, key: str, elem: str) -> int:
         """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""
         async with self.lock:
@@ -392,6 +438,22 @@ class RedisService:
     async def hdel(self, key: str, *fields: str):
         async with self.lock:
             await self.redis.hdel(key, *fields)
+
+    async def write_atomically(self, writes: RedisWrites) -> None:
+        """Apply every write in `writes` as one MULTI/EXEC, or none of them.
+
+        The server applies the queued commands at EXEC as one unit, so a connection lost before EXEC
+        reaches it applies nothing, and one lost after it applies all of it (the client raises either
+        way; the caller sees "this transition did not happen" or the whole transition). The server
+        refusing one command is a bug in the batch, not a Redis state.
+        """
+        if not writes.ops:
+            return
+        async with self.lock:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                for write in writes.ops:
+                    getattr(pipe, write.command)(*write.args, **write.kwargs)
+                await pipe.execute()
 
     async def clear_by_pattern(self, pattern: str):
         async with self.lock:

@@ -39,7 +39,7 @@ class BackendMessageType(enum.Enum):
     ForcedValidationCycleRequest = "ForcedValidationCycleRequest"
     # ask the validator for an exact rental estimate; it answers with EstimateResponse
     GetEstimateRequest = "GetEstimateRequest"
-    # 1.2.0: run one executor's checks now; answered by the ordinary ExecutorSpecRequest report
+    # 1.4.0: run one executor's checks now; answered by the ordinary ExecutorSpecRequest report
     RecheckExecutorRequest = "RecheckExecutorRequest"
 
 
@@ -313,7 +313,7 @@ class ForcedValidationCycleRequest(BackendMessage):
 
 @BACKEND_MESSAGES.register
 class RecheckExecutorRequest(ServerRequest):
-    """1.2.0: a rent on this executor just failed for the host's reasons and the backend has closed it
+    """1.4.0: a rent on this executor just failed for the host's reasons and the backend has closed it
     to new rentals; run its checks now. There is no reply message: the
     validator publishes the result as an ordinary spec report, and a passing one lifts the hold. A
     validator that does not know the type drops it, and the backend lifts the hold on its own."""
