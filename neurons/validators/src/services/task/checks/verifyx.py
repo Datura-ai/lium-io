@@ -330,22 +330,21 @@ def _is_cold_sample_below_gate(ctx: Context, result, prev_ema) -> bool:
     return speed is None or speed < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
-def verifyx_ema_hold_reason(ctx: Context, failed_check_id: str | None) -> str | None:
+def verifyx_ema_hold_reason(failed_check_id: str | None) -> str | None:
     """Why this cycle's VerifyX sample must not move the published EMA, or None.
 
-    A cycle that a check other than VerifyX failed, or that ran while the node's recommended image
-    was not on disk yet, measured the link of a node that is not in service; the executor's
-    mandatory pre-pull of that image, tens of GB, is a likely cause of both and shares the link.
-    With alpha 0.5 one such sample weighs half of the next cycle's verdict: a node seeded by a cycle
-    that failed the cached-image check read 86.7 against the 100 gate one batch later, and passed
-    the cycle after that. Holding the EMA leaves a never-measured node never-measured, so its next
-    cycle gets the DAH-2959 cold-sample retry and bootstraps from a sample taken in service. A cycle
-    that VerifyX itself failed still moves the EMA: that is the gate working.
+    A cycle that a check other than VerifyX failed measured the link of a node that is not in
+    service; the executor's mandatory pre-pull of the recommended image, tens of GB, is a likely
+    cause of both and shares the link. With alpha 0.5 one such sample weighs half of the next
+    cycle's verdict: a node seeded by a cycle that failed the cached-image check read 86.7 against
+    the 100 gate one batch later, and passed the cycle after that. Holding the EMA leaves a
+    never-measured node never-measured, so its next cycle gets the DAH-2959 cold-sample retry and
+    bootstraps from a sample taken in service. A cycle that VerifyX itself failed still moves the
+    EMA: that is the gate working. A cycle that passed always moves it, image cached or not: a
+    hold there would let a node keep passing the gate on an EMA its samples no longer support.
     """
     if failed_check_id and failed_check_id != VerifyXCheck.check_id:
         return f"cycle failed {failed_check_id}"
-    if ctx.state.recommended_image_cached is False:
-        return "recommended image not cached yet"
     return None
 
 

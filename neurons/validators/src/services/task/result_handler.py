@@ -160,7 +160,7 @@ class ResultHandler:
         failed_check_id = (
             validation_event.what_we_saw.get("steps_failed") if validation_event else None
         )
-        ema_hold_reason = verifyx_ema_hold_reason(context, failed_check_id)
+        ema_hold_reason = verifyx_ema_hold_reason(failed_check_id)
         if ema_hold_reason:
             held_specs = hold_verifyx_ema(context, specs)
             hold_enabled = settings.VERIFYX_EMA_HOLD_ENABLED

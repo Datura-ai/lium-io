@@ -3,12 +3,13 @@
 A node failed VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW (EMA 86.7 < 100) one batch after a cycle that
 failed the cached-image check had still run VerifyX and seeded the EMA (alpha 0.5), most likely
 while the executor's mandatory multi-GB image pull shared the link; it passed the cycle after that.
-Such a cycle, or one that ran while the recommended image was not on disk yet, now publishes the
-EMA the backend held before it, so a never-measured node stays never-measured and its next cycle
-gets the DAH-2959 cold-sample retry.
+Such a cycle now publishes the EMA the backend held before it, so a never-measured node stays
+never-measured and its next cycle gets the DAH-2959 cold-sample retry. A cycle that passed always
+publishes its sample, image cached or not.
 """
 
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -127,19 +128,20 @@ async def test_a_known_node_keeps_its_previous_ema_on_a_failed_cycle(context_fac
 
 
 @pytest.mark.asyncio
-async def test_a_cycle_with_the_image_not_cached_yet_holds_the_ema(context_factory):
-    # The cached-image check passed (it holds a fresh node as pending) but the image is not on disk:
-    # the executor's pull may still be sharing the link.
+async def test_a_passing_cycle_without_the_image_publishes_its_sample(context_factory):
+    # The cached-image check passed (advisory, or holding a fresh node as pending) but the image is
+    # not on disk: the cycle passed, so its sample moves the EMA.
     network = await _publish(
         context_factory,
-        specs=_measured_specs(120.0, 120.0, 40.0),
-        rented_data=_never_measured(),
+        specs=_measured_specs(20.0, 160.0, 40.0),
+        rented_data=_known(300.0),
         event=_event("pipeline.finalize", failed=False),
         success=True,
         image_cached=False,
     )
 
-    assert "ema_verifyx_download_speed" not in network
+    assert network["ema_verifyx_download_speed"] == 160.0
+    assert network["ema_verifyx_upload_speed"] == 40.0
 
 
 @pytest.mark.asyncio
@@ -216,19 +218,33 @@ class _ImageNotCachedCheck:
         return CheckResult(passed=False, event=_event(IMAGE_CHECK, failed=False))
 
 
+class _PassingUncachedCheck:
+    """The cached-image check passing without the image: advisory, or a fresh node held as pending."""
+
+    check_id = IMAGE_CHECK
+    fatal = True
+
+    async def run(self, ctx):
+        return CheckResult(
+            passed=True,
+            event=_event(IMAGE_CHECK, failed=False),
+            updates={"state": replace(ctx.state, recommended_image_cached=False)},
+        )
+
+
 class _Sink:
     async def emit(self, event):
         pass
 
 
-async def _cycle(context_factory, probes, rented_data, *, image_check: bool):
+async def _cycle(context_factory, probes, rented_data, *, image_check: bool, after=()):
     ctx = context_factory(
         services=build_services(verifyx=probes),
         config=build_context_config(verifyx_enabled=True),
         state=build_state(specs={"gpu": {"count": 1}}, rented_data=rented_data),
         ssh_pub_keys=[],
     )
-    checks = [VerifyXCheck()] + ([_ImageNotCachedCheck()] if image_check else [])
+    checks = [VerifyXCheck()] + ([_ImageNotCachedCheck()] if image_check else []) + list(after)
     ok, events, last = await Pipeline(checks, _Sink()).run(ctx)
     result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
         context=last,
@@ -395,3 +411,27 @@ async def test_a_held_node_moves_again_on_its_next_passing_cycle(context_factory
         image_cached=True,
     )
     assert moved["ema_verifyx_download_speed"] == 150.0
+
+
+@pytest.mark.asyncio
+async def test_a_passing_node_without_the_image_is_judged_on_its_samples(context_factory):
+    # Stored EMA 300, the node now measures 20 Mbps and keeps passing the cached-image check without
+    # the image. Each passing cycle publishes its sample, so the gate fails it on cycle 2 at 90.
+    rented_data, results = _known(300.0, 40.0), []
+    for _ in range(2):
+        ok, last_event, network = await _cycle(
+            context_factory,
+            _ProbeSequence(20.0),
+            rented_data,
+            image_check=False,
+            after=[_PassingUncachedCheck()],
+        )
+        results.append((ok, network["ema_verifyx_download_speed"], last_event.reason_code))
+        rented_data = _as_backend_would_store(network)
+
+    assert results[0][:2] == (True, pytest.approx(160.0))
+    assert results[1] == (
+        False,
+        pytest.approx(90.0),
+        Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason,
+    )

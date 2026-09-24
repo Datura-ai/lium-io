@@ -214,10 +214,10 @@ class Settings(BaseSettings):
     # single-stream CDN object) and passed the next cycle at 205–760 Mbps. The gate, the threshold
     # and known hosts (any prior EMA) are unchanged.
     VERIFYX_COLD_SAMPLE_RETRY_ENABLED: bool = Field(env="VERIFYX_COLD_SAMPLE_RETRY_ENABLED", default=False)
-    # A cycle that a check other than VerifyX failed, or that ran before the recommended image was
-    # cached, publishes the VerifyX EMA the backend held before it (none for a never-measured
-    # node) instead of one moved by its sample; see verifyx_ema_hold_reason. Off: the EMA moves
-    # as before and the would-be hold is only logged.
+    # A cycle that a check other than VerifyX failed publishes the VerifyX EMA the backend held
+    # before it (none for a never-measured node) instead of one moved by its sample; a passing
+    # cycle always publishes its sample. See verifyx_ema_hold_reason. Off: the EMA moves as
+    # before and the would-be hold is only logged.
     VERIFYX_EMA_HOLD_ENABLED: bool = Field(env="VERIFYX_EMA_HOLD_ENABLED", default=False)
     ENABLE_INSPECTOR: bool = True
     # DAH-2794: feed the obfuscated scrape to the executor's own interpreter over stdin
