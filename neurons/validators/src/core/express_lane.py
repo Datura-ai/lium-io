@@ -284,8 +284,8 @@ class ExpressLane:
 
         # Read the inputs again, after the last await: a cycle that started during the awaits
         # above replaced them and removed the earlier job-files directory (nothing held it yet).
-        # The validator's prep is synchronous and there is no await between here and the caller's
-        # holds, so the directory these inputs name is the current one and each hold keeps it
+        # The validator's prep is synchronous and each caller takes its hold before its next
+        # await, so the directory these inputs name is the current one and each hold keeps it
         # until its verification ends.
         inputs = self.cycle_inputs()
         if inputs is None:
@@ -361,18 +361,20 @@ class ExpressLane:
             executor_id = str(request.get("executor_id"))
             if not _free_for_recheck(in_flight.get(executor_id)):
                 continue
-            # claimed before the drop's await: a wave that reaches the node meanwhile then waits on the recheck
+            # Claimed and the job files held before the drop's await: a wave that reaches the node
+            # meanwhile waits on the recheck, and a cycle that starts meanwhile keeps its files.
             cycle_done_at = self.miner_service.claim_for_recheck(executor_id)
+            self._directories_in_use[directory] += 1
             outcome = asyncio.get_running_loop().create_future()
             self.miner_service.recheck_outcomes[executor_id] = outcome
             miner = miners.get(str(request.get("miner_hotkey")))
             try:
                 await self.redis_service.drop_recheck_requests([executor_id])
             except BaseException:
-                self._unclaim_recheck(executor_id, outcome, cycle_done_at)
+                self._unclaim_recheck(executor_id, outcome, cycle_done_at, directory)
                 raise
             if miner is None:
-                self._unclaim_recheck(executor_id, outcome, cycle_done_at)
+                self._unclaim_recheck(executor_id, outcome, cycle_done_at, directory)
                 logger.warning(
                     _m(
                         "[recheck] Miner is not among the serving opted-in miners; dropped",
@@ -380,7 +382,6 @@ class ExpressLane:
                     )
                 )
                 continue
-            self._directories_in_use[directory] += 1
             task = asyncio.create_task(
                 self._recheck(request, miner, inputs, rented_data, now, cycle_done_at)
             )
@@ -389,10 +390,18 @@ class ExpressLane:
             launched += 1
         return launched
 
-    def _unclaim_recheck(self, executor_id: str, outcome: asyncio.Future, cycle_done_at: int | None) -> None:
+    def _unclaim_recheck(
+        self, executor_id: str, outcome: asyncio.Future, cycle_done_at: int | None, directory: str
+    ) -> None:
         self.miner_service.recheck_outcomes.pop(executor_id, None)
         outcome.set_result(None)
         self.miner_service.release_recheck_claim(executor_id, cycle_done_at)
+        self._release_directory(directory)
+
+    def _release_directory(self, directory: str) -> None:
+        self._directories_in_use[directory] -= 1
+        if self._directories_in_use[directory] <= 0:
+            del self._directories_in_use[directory]
 
     @staticmethod
     def _recheck_extra(request: dict) -> dict[str, object]:
@@ -513,9 +522,7 @@ class ExpressLane:
             self.miner_service.recheck_outcomes.pop(executor_id, None)
             if not outcome.done():
                 outcome.set_result(result_for_cycle)
-            self._directories_in_use[directory] -= 1
-            if self._directories_in_use[directory] <= 0:
-                del self._directories_in_use[directory]
+            self._release_directory(directory)
 
     async def _verify(
         self,
@@ -595,9 +602,7 @@ class ExpressLane:
         finally:
             if self.miner_service.in_flight.get(executor_id) == EXPRESS_LANE:
                 del self.miner_service.in_flight[executor_id]
-            self._directories_in_use[directory] -= 1
-            if self._directories_in_use[directory] <= 0:
-                del self._directories_in_use[directory]
+            self._release_directory(directory)
 
     async def _publish(
         self,

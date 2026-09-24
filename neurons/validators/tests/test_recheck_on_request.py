@@ -28,10 +28,11 @@ from clients.compute_client import ComputeClient
 from core.express_lane import EXPRESS_PUBLISHED_EVENT, RECHECK_PUBLISHED_EVENT
 from core.validator import Validator
 from services.miner_service import CYCLE_DONE, CYCLE_LANE, EXPRESS_LANE, RECHECK_LANE
+from services.file_encrypt_service import FileEncryptService
 from services.redis_service import RECHECK_REQUESTS_HASH, RedisService
 from services.task.checks import rental_probe
 import test_express_lane
-from test_express_lane import _Harness, _job_result, _Neuron, _portal_executor, _request
+from test_express_lane import _cycle_inputs, _Harness, _job_result, _Neuron, _portal_executor, _request
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "lium_protocol") not in sys.path:
@@ -316,6 +317,43 @@ async def test_the_wave_claiming_during_the_queue_drop_waits_on_the_recheck(monk
 
 
 @pytest.mark.asyncio
+async def test_a_cycle_that_starts_during_the_queue_drop_keeps_the_rechecks_job_files(
+    monkeypatch, wallet
+):
+    """The lane holds the job files before it awaits the Redis drop: a cycle whose prep runs in that
+    await keeps the directory, and the recheck publishes instead of discarding its result."""
+    first = FileEncryptService.fresh_job_files_directory()
+    node = str(uuid4())
+    harness = _recheck_harness(monkeypatch)
+    harness.inputs = _cycle_inputs(tmp_directory=str(first))
+    await harness.redis_service.queue_recheck_request(_request_for(node))
+    parked, resume = asyncio.Event(), asyncio.Event()
+    drop = harness.redis_service.drop_recheck_requests
+
+    async def parked_drop(executor_ids):
+        parked.set()
+        await resume.wait()
+        await drop(executor_ids)
+
+    harness.redis_service.drop_recheck_requests = parked_drop
+    tick = asyncio.create_task(harness.lane.tick())
+    await asyncio.wait_for(parked.wait(), timeout=5)
+
+    assert harness.lane.directories_in_use() == {str(first)}
+    second = FileEncryptService.fresh_job_files_directory(keep=harness.lane.directories_in_use())
+    harness.inputs = _cycle_inputs(tmp_directory=str(second))
+    assert first.exists()
+
+    resume.set()
+    assert await tick == 1
+    await asyncio.gather(*harness.lane._tasks)
+    request = harness.miner_service.request_job_to_miner.await_args.kwargs
+    assert request["encrypted_files"].tmp_directory == str(first)
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert harness.lane.directories_in_use() == set()
+
+
+@pytest.mark.asyncio
 async def test_a_failed_queue_drop_releases_the_claim(monkeypatch, wallet):
     node = str(uuid4())
     harness = _recheck_harness(monkeypatch)
@@ -327,6 +365,7 @@ async def test_a_failed_queue_drop_releases_the_claim(monkeypatch, wallet):
 
     assert harness.miner_service.in_flight == {node: CYCLE_DONE}
     assert harness.miner_service.recheck_outcomes == {}
+    assert harness.lane.directories_in_use() == set()
 
 
 @pytest.mark.asyncio
@@ -346,6 +385,7 @@ async def test_an_expired_request_and_one_for_an_unknown_miner_are_dropped(
     assert "[recheck] Request expired before the node was free; dropped" in caplog.text
     assert "[recheck] Miner is not among the serving opted-in miners; dropped" in caplog.text
     assert harness.miner_service.in_flight == {} and harness.miner_service.recheck_outcomes == {}
+    assert harness.lane.directories_in_use() == set()
 
 
 @pytest.mark.asyncio
