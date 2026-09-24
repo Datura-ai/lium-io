@@ -492,7 +492,7 @@ async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_fa
 )
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("teardown_deferral_on")
-async def test_the_grace_window_ends_at_15_minutes_after_the_close(
+async def test_the_grace_window_runs_from_5_minutes_before_the_close_to_15_after(
     context_factory, minutes_ago, reason, rental_status
 ):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=minutes_ago))
