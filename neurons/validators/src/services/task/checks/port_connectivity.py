@@ -56,11 +56,16 @@ class PortConnectivityCheck:
                 "executor_uuid": ctx.executor.uuid,
                 "executor_ip": ctx.executor.address,
             },
+            probe_seed=f"{ctx.executor.uuid}:{ctx.config.job_batch_id}",
         )
         verified_port_count = len(result.successful_ports)
         extra_info: dict[str, object] = {
             "sysbox_runtime": result.sysbox_runtime,
             "verified_port_count": verified_port_count,
+            "probed_port_count": result.probed_port_count,
+            "declared_port_count": result.declared_port_count,
+            "estimated_usable_port_count": result.estimated_usable_port_count,
+            "port_selection": result.port_selection,
         }
         if result.dind_error:
             extra_info["dind_error"] = result.dind_error.text
@@ -73,6 +78,9 @@ class PortConnectivityCheck:
             },
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=verified_port_count,
+            probed_port_count=result.probed_port_count,
+            declared_port_count=result.declared_port_count,
+            estimated_usable_port_count=result.estimated_usable_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
         )
@@ -100,6 +108,8 @@ class PortConnectivityCheck:
         msg = (
             f"verification complete total_time={elapsed:.2f}s {pct:.0f}% available, "
             f"dind={dind_status} batch={batch_status} ok={len(result.successful_ports)}{ok_sample}"
+            f" probed={result.probed_port_count} of declared={result.declared_port_count}"
+            f" ({result.port_selection}) est_usable={result.estimated_usable_port_count}"
             f" port_range={ctx.executor.port_range}, port_mappings={ctx.executor.port_mappings}"
         )
         if result.failed_ports:
@@ -153,6 +163,8 @@ class PortConnectivityCheck:
                     "total_ports_tested": len(result.successful_ports) + len(result.failed_ports),
                     "successful_ports": len(result.successful_ports),
                     "failed_ports": len(result.failed_ports),
+                    "probed_port_count": result.probed_port_count,
+                    "declared_port_count": result.declared_port_count,
                     **rental_info,
                 },
                 extra=extra_info,

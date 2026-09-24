@@ -33,6 +33,7 @@ class ExecutorConnectivityService:
         rented_pod_names: list[str] | None = None,
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
+        probe_seed: str | None = None,
     ) -> PortVerificationResult:
         """Verify executor port connectivity and DinD capability."""
         log_ctx = log_ctx or {}
@@ -48,6 +49,7 @@ class ExecutorConnectivityService:
                 # customer rental — the sysbox fallback below reads it that way (DAH-2527)
                 unavailable_ports=(rented_ports or []) + (filler_ports or []),
                 log_ctx=log_ctx,
+                probe_seed=probe_seed,
             )
             sysbox_result = verification.sysbox_runtime
             if not sysbox_result and rented_ports and sysbox_runtime:
@@ -76,6 +78,10 @@ class ExecutorConnectivityService:
                 error=verification.error,
                 elapsed_sec=time.monotonic() - t1,
                 dind_error=verification.dind_error,
+                declared_port_count=verification.declared_port_count,
+                probed_port_count=verification.probed_port_count,
+                estimated_usable_port_count=verification.estimated_usable_port_count,
+                port_selection=verification.port_selection,
             )
 
             return result

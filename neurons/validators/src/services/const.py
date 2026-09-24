@@ -129,6 +129,11 @@ GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is 
 
 MIN_PORT_COUNT = 3
 BATCH_PORT_VERIFICATION_SIZE = 300
+# A range wider than BATCH_PORT_VERIFICATION_SIZE is probed on a sample spread over all of it. When the
+# sample verifies fewer than this, the lowest BATCH_PORT_VERIFICATION_SIZE free ports (the probe set before
+# sampling) are probed too, so the published count never falls below min(what they verify, this): a pod
+# takes up to 12 ports, and a split node's free remainder must keep enough after its first rentals.
+SAMPLED_PORTS_LOWEST_PASS_BELOW = BATCH_PORT_VERIFICATION_SIZE // 2
 BATCH_PORT_TIMEOUT = 40
 BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy

@@ -8,11 +8,21 @@ from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
+def _probe_counts(ctx: Context) -> dict[str, int | None]:
+    return {
+        "declared_port_count": ctx.state.declared_port_count,
+        "probed_port_count": ctx.state.probed_port_count,
+        "estimated_usable_port_count": ctx.state.estimated_usable_port_count,
+    }
+
+
 class PortCountCheck:
     """Verify minimum port availability and record port count for scoring.
 
     Reads the verified port count from ctx.state (set by PortConnectivityCheck)
-    instead of querying the database.
+    instead of querying the database. `available_port_count` is that verified count: ports that
+    answered this cycle, each one the backend may hand a renter. The estimate of usable ports is
+    reported alongside it and never replaces it.
     """
 
     check_id = "executor.validate.port_count"
@@ -48,6 +58,7 @@ class PortCountCheck:
                     "available_port_count": port_count,
                     "required": MIN_PORT_COUNT,
                     "held_by_orphaned_containers": orphaned,
+                    **_probe_counts(ctx),
                 },
                 remediation=(
                     f"Ports are held by orphaned rental container(s) {', '.join(orphaned)} that the validator "
@@ -66,7 +77,7 @@ class PortCountCheck:
             Msg.PORT_COUNT_RECORDED,
             ctx=ctx,
             check_id=self.check_id,
-            what={"available_port_count": port_count},
+            what={"available_port_count": port_count, **_probe_counts(ctx)},
         )
 
         return CheckResult(

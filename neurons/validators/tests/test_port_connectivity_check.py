@@ -86,6 +86,7 @@ class DummyConnectivityService:
         rented_pod_names: list[str] | None = None,
         filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
+        probe_seed: str | None = None,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
         # Track what parameters we were called with
@@ -95,6 +96,7 @@ class DummyConnectivityService:
             "sysbox_runtime": sysbox_runtime,
             "rented_ports": rented_ports,
             "filler_ports": filler_ports,
+            "probe_seed": probe_seed,
         }
 
         if self.verified_port_count:

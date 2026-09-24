@@ -121,3 +121,47 @@ async def test_verify_ports_merges_rented_and_filler_ports(
     passed = orchestrator.verify.call_args.kwargs
     assert set(passed["unavailable_ports"]) == {40001, 40003, 40100}
     assert "rented_ports" not in passed
+
+
+@pytest.mark.asyncio
+async def test_verify_ports_passes_the_seed_and_carries_the_probe_counts(
+    mock_ssh_client,
+    sample_executor_info,
+    mocker,
+):
+    successful = (PortPair(41000, 41000), PortPair(52000, 52000), PortPair(63000, 63000))
+    orchestrator = mocker.Mock()
+    orchestrator.verify = mocker.AsyncMock(
+        return_value=PortVerificationResult(
+            selected_ports=successful,
+            successful_ports=successful,
+            failed_ports=tuple(),
+            dind_port=successful[0],
+            dind_ok=True,
+            sysbox_runtime=True,
+            status="ok",
+            declared_port_count=25536,
+            probed_port_count=300,
+            estimated_usable_port_count=255,
+            port_selection="stratified",
+        )
+    )
+
+    result = await ExecutorConnectivityService(orchestrator=orchestrator).verify_ports(
+        mock_ssh_client,
+        "test_miner",
+        sample_executor_info,
+        rented_ports=[40001],
+        filler_ports=[40002],
+        probe_seed="executor:cycle",
+    )
+
+    kwargs = orchestrator.verify.call_args.kwargs
+    assert kwargs["probe_seed"] == "executor:cycle"
+    assert kwargs["unavailable_ports"] == [40001, 40002]
+    assert (
+        result.declared_port_count,
+        result.probed_port_count,
+        result.estimated_usable_port_count,
+        result.port_selection,
+    ) == (25536, 300, 255, "stratified")

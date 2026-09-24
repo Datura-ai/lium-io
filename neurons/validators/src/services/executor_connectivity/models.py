@@ -65,6 +65,19 @@ class PortVerificationResult:
     elapsed_sec: float | None = None
     # DAH-2856: DindProbeResult.error carried through, so the sysbox verdict can name the real cause.
     dind_error: DindLogCause | None = None
+    # Every port the executor declares (ssh port excluded); None when verification raised
+    # (a malformed port_range or port_mappings).
+    declared_port_count: int | None = None
+    # Distinct ports actually tested this cycle, the denominator of successful_ports. It is less than
+    # len(selected_ports) when only the published-port tiers ran (they test a prefix).
+    probed_port_count: int = 0
+    # The random sample's verified/probed scaled to the free declared ports, floored, never below
+    # len(successful_ports) and capped at the free ports. An estimate only: the published
+    # available_port_count stays len(successful_ports), each port proven this cycle.
+    estimated_usable_port_count: int | None = None
+    # port_selector.SELECTION_*: "all" (the free ports fit the probe budget), "stratified" (sampled),
+    # or "stratified+lowest" (the sample verified few, so the lowest free ports were probed too)
+    port_selection: str | None = None
 
 
 @dataclass(frozen=True)

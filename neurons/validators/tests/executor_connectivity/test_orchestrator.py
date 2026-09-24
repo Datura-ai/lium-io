@@ -4,7 +4,13 @@ from services.executor_connectivity.models import DindProbeResult, PortPair, Por
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.port_probe import PortProbe
-from services.executor_connectivity.port_selector import PortSelector
+from services.executor_connectivity.port_selector import SELECTION_ALL, PortSample, PortSelector
+
+
+def _sample(ports):
+    return PortSample(
+        list(ports), declared_count=len(ports), free_count=len(ports), selection=SELECTION_ALL
+    )
 
 
 @pytest.mark.asyncio
@@ -12,7 +18,7 @@ async def test_orchestrator_success(sample_executor_info, mock_ssh_client, mocke
     selected_ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
 
     port_selector = mocker.Mock(spec=PortSelector)
-    port_selector.select.return_value = selected_ports
+    port_selector.select.return_value = _sample(selected_ports)
 
     port_probe = mocker.Mock(spec=PortProbe)
     port_probe.probe = mocker.AsyncMock(
@@ -56,7 +62,7 @@ async def test_orchestrator_success(sample_executor_info, mock_ssh_client, mocke
 @pytest.mark.asyncio
 async def test_orchestrator_no_ports(sample_executor_info, mock_ssh_client, mocker):
     port_selector = mocker.Mock(spec=PortSelector)
-    port_selector.select.return_value = []
+    port_selector.select.return_value = _sample([])
 
     port_probe = mocker.Mock(spec=PortProbe)
     port_probe.probe = mocker.AsyncMock()
@@ -94,7 +100,7 @@ async def test_orchestrator_probe_fails_dind_ok(sample_executor_info, mock_ssh_c
     selected_ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
 
     port_selector = mocker.Mock(spec=PortSelector)
-    port_selector.select.return_value = selected_ports
+    port_selector.select.return_value = _sample(selected_ports)
 
     port_probe = mocker.Mock(spec=PortProbe)
     port_probe.probe = mocker.AsyncMock(
@@ -140,7 +146,7 @@ async def test_orchestrator_probe_ok_dind_fails(sample_executor_info, mock_ssh_c
     selected_ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
 
     port_selector = mocker.Mock(spec=PortSelector)
-    port_selector.select.return_value = selected_ports
+    port_selector.select.return_value = _sample(selected_ports)
 
     port_probe = mocker.Mock(spec=PortProbe)
     port_probe.probe = mocker.AsyncMock(

@@ -142,6 +142,14 @@ class ContextState:
     # non-empty = the kernel list above was withheld because it was read through them
     kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
     verified_port_count: int = 0
+    # verified_port_count is out of probed_port_count, the ports tested this cycle: the whole free range
+    # when it fits BATCH_PORT_VERIFICATION_SIZE, else a stratified sample of it (plus the lowest free
+    # ports when the sample verifies few, SAMPLED_PORTS_LOWEST_PASS_BELOW). estimated_usable_port_count scales the sample's
+    # verified/probed to the free declared ports; it is reported, never published as
+    # available_port_count. None until PortConnectivityCheck runs.
+    probed_port_count: int | None = None
+    declared_port_count: int | None = None
+    estimated_usable_port_count: int | None = None
     # DAH-2991: orphaned rental containers the stale cleanup could not remove this cycle; they still
     # hold their published ports, so PortCountCheck names them in INSUFFICIENT_PORTS.
     orphaned_containers: list[str] = field(default_factory=list)
