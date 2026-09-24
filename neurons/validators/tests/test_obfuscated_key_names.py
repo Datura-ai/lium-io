@@ -11,17 +11,22 @@ import re
 import string
 from pathlib import Path
 
+import pytest
 from neurons.validators.tests.helpers import dict_literal_keys
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 
-def test_a_repeated_random_name_is_drawn_again_so_every_key_survives_the_reverse_map(monkeypatch) -> None:
+def test_a_repeated_random_name_is_drawn_again_so_every_key_survives_the_reverse_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from services.file_encrypt_service import ORIGINAL_KEYS, FileEncryptService
     from services.task.checks.machine_spec_scrape import _deobfuscate
 
     # Arrange — the first two draws collide, every later draw is fresh
-    fresh = ("_Fresh" + "".join(pair) for pair in itertools.product(string.ascii_lowercase, repeat=2))
+    fresh = (
+        "_Fresh" + "".join(pair) for pair in itertools.product(string.ascii_lowercase, repeat=2)
+    )
     draws = itertools.chain(["_Same", "_Same"], fresh)
     service = FileEncryptService.__new__(FileEncryptService)
     monkeypatch.setattr(service, "generate_random_name", lambda: next(draws))
