@@ -381,7 +381,11 @@ class Validator:
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
                     executor_image_snapshot=executor_image_snapshot,
+                    job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
+                )
+                self.miner_service.start_awaiting_wave_lists(
+                    job_batch_id, [miner.hotkey for miner in miners]
                 )
 
                 task_info = {}
