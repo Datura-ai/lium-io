@@ -4,20 +4,32 @@ A node failed VERIFYX_FAILED_NETWORK_SPEED_TOO_SLOW (EMA 86.7 < 100) one batch a
 failed the cached-image check had still run VerifyX and seeded the EMA (alpha 0.5), most likely
 while the executor's mandatory multi-GB image pull shared the link; it passed the cycle after that.
 Such a cycle now publishes the EMA the backend held before it, so a never-measured node stays
-never-measured and its next cycle gets the DAH-2959 cold-sample retry. A cycle that passed always
-publishes its sample, image cached or not.
+never-measured and its next cycle gets the DAH-2959 cold-sample retry. A passing cycle without the
+image cached (the fresh-node grace's PENDING, lium-io#1461) does not seed a never-measured node
+either; a node with a stored EMA publishes its sample on every passing cycle.
 """
 
+import asyncio
+import json
 import logging
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fakeredis import FakeServer
+from fakeredis.aioredis import FakeRedis
 
 from core.config import Settings, settings
+from neurons.validators.src.services.task.checks.cached_template_verification import (
+    CachedTemplateVerificationCheck,
+)
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck, hold_verifyx_ema
+from neurons.validators.src.services.task.messages import CachedTemplateMessages
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
+from protocol.vc_protocol.compute_requests import DefaultDockerImage
+from services.redis_service import RedisService
 from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
@@ -142,6 +154,55 @@ async def test_a_passing_cycle_without_the_image_publishes_its_sample(context_fa
 
     assert network["ema_verifyx_download_speed"] == 160.0
     assert network["ema_verifyx_upload_speed"] == 40.0
+
+
+@pytest.mark.asyncio
+async def test_a_passing_cycle_without_the_image_does_not_seed_a_never_measured_node(
+    context_factory,
+):
+    network = await _publish(
+        context_factory,
+        specs=_measured_specs(120.0, 120.0, 40.0),
+        rented_data=_never_measured(),
+        event=_event("pipeline.finalize", failed=False),
+        success=True,
+        image_cached=False,
+    )
+
+    assert "ema_verifyx_download_speed" not in network
+    assert "ema_verifyx_upload_speed" not in network
+    assert network["verifyx_download_speed"] == 120.0
+
+
+@pytest.mark.asyncio
+async def test_a_never_measured_node_with_the_image_is_seeded_by_a_passing_cycle(context_factory):
+    network = await _publish(
+        context_factory,
+        specs=_measured_specs(120.0, 120.0, 40.0),
+        rented_data=_never_measured(),
+        event=_event("pipeline.finalize", failed=False),
+        success=True,
+        image_cached=True,
+    )
+
+    assert network["ema_verifyx_download_speed"] == 120.0
+
+
+@pytest.mark.asyncio
+async def test_without_the_backends_answer_a_passing_uncached_cycle_publishes_its_sample(
+    context_factory,
+):
+    # Every node looks never-measured without rented_data; a backend blip must not hold them all.
+    network = await _publish(
+        context_factory,
+        specs=_measured_specs(120.0, 120.0, 40.0),
+        rented_data=None,
+        event=_event("pipeline.finalize", failed=False),
+        success=True,
+        image_cached=False,
+    )
+
+    assert network["ema_verifyx_download_speed"] == 120.0
 
 
 @pytest.mark.asyncio
@@ -334,6 +395,26 @@ async def test_with_the_flag_off_a_failed_cycle_seeds_the_ema_as_before(
 
 
 @pytest.mark.asyncio
+async def test_with_the_flag_off_a_passing_uncached_cycle_seeds_the_ema_as_before(
+    monkeypatch, context_factory, caplog
+):
+    monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", False)
+
+    with caplog.at_level(logging.INFO):
+        network = await _publish(
+            context_factory,
+            specs=_measured_specs(120.0, 120.0, 40.0),
+            rented_data=_never_measured(),
+            event=_event("pipeline.finalize", failed=False),
+            success=True,
+            image_cached=False,
+        )
+
+    assert network["ema_verifyx_download_speed"] == 120.0
+    assert any("would not have moved it" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_with_the_flag_off_the_two_cycles_play_out_as_before(monkeypatch, context_factory):
     monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", False)
     monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
@@ -355,6 +436,155 @@ async def test_with_the_flag_off_the_two_cycles_play_out_as_before(monkeypatch, 
     assert last_event.what_we_saw["ema_verifyx_download_speed"] == pytest.approx(86.7)
 
 
+@pytest.mark.asyncio
+async def test_a_hold_that_changes_nothing_is_not_logged(monkeypatch, context_factory, caplog):
+    stored = {"ema_verifyx_download_speed": 200.0, "ema_verifyx_upload_speed": 50.0}
+    for enabled in (True, False):
+        monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", enabled)
+        with caplog.at_level(logging.INFO):
+            await _publish(
+                context_factory,
+                specs={"gpu": {"count": 1}, "network": dict(stored)},
+                rented_data=_known(200.0, 50.0),
+                event=_event(IMAGE_CHECK, failed=True),
+                success=False,
+            )
+
+    assert not any("VerifyX EMA hold" in r.getMessage() for r in caplog.records)
+    assert not any("VerifyX EMA held" in r.getMessage() for r in caplog.records)
+
+
+# --- the grace of lium-io#1461 and this hold, both on ---------------------------------------
+# The grace holds a fresh node without the image as a passing PENDING, so with it on the incident's
+# first cycle passes instead of failing the cached-image check. These run the real check and skip
+# on a tree without the grace.
+
+_IMAGE = DefaultDockerImage(
+    docker_image="daturaai/torch", docker_image_tag="2.4.0", docker_image_size=12_000_000_000
+)
+_IMAGE_REF = "daturaai/torch:2.4.0"
+_FIRST_SWEEP_RUNNING = json.dumps(
+    {
+        "schema_version": 1,
+        "sweep_count": 0,
+        "last_outcome": "pulling",
+        "outcome_counts": {},
+        "first_sweep_ok_at": None,
+        "images": {_IMAGE_REF: {"last_outcome": "pulling"}},
+    }
+)
+
+needs_the_grace = pytest.mark.skipif(
+    not hasattr(CachedTemplateMessages, "PENDING"),
+    reason="needs the fresh-node grace of lium-io#1461",
+)
+
+
+def _redis_service():
+    service = RedisService.__new__(RedisService)
+    service.redis = FakeRedis(server=FakeServer())
+    service.lock = asyncio.Lock()
+    return service
+
+
+async def _cycle_with_the_image_check(context_factory, probes, rented_data, redis, *, cached):
+    backend = Mock()
+    backend.get_default_docker_image = AsyncMock(return_value=[_IMAGE])
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(
+        side_effect=[Mock(exit_status=0, stdout="[]")]
+        if cached
+        else [Mock(exit_status=1, stdout=""), Mock(exit_status=0, stdout=_FIRST_SWEEP_RUNNING)]
+    )
+    ctx = context_factory(
+        services=build_services(verifyx=probes, backend=backend, redis=redis),
+        config=build_context_config(verifyx_enabled=True),
+        state=build_state(
+            gpu_model="NVIDIA H200",
+            specs={"gpu": {"count": 1, "driver": "580.95.05"}},
+            rented_data=rented_data,
+        ),
+        ssh=ssh,
+        ssh_pub_keys=[],
+    )
+    ok, events, last = await Pipeline(
+        [VerifyXCheck(), CachedTemplateVerificationCheck()], _Sink()
+    ).run(ctx)
+    result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
+        context=last,
+        miner_info=SimpleNamespace(miner_hotkey="miner-hotkey", job_batch_id="batch-1"),
+        executor_info=last.executor,
+        verified_job_info={},
+        log_text="x",
+        success=ok,
+        validation_event=events[-1],
+    )
+    return ok, events, result.spec["network"]
+
+
+@needs_the_grace
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("grace", "hold", "cycle_2_passes"),
+    [
+        (False, False, False),  # main
+        (True, False, False),  # the grace alone: cycle 1 passes as PENDING and seeds 120
+        (False, True, True),  # the hold alone: cycle 1 fails the image check and is held
+        (True, True, True),  # both: cycle 1 passes as PENDING and is held
+    ],
+)
+async def test_the_incident_with_the_fresh_node_grace(
+    monkeypatch, context_factory, grace, hold, cycle_2_passes
+):
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_CUTOFF", datetime.utcnow() - timedelta(days=1))
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", grace)
+    monkeypatch.setattr(settings, "VERIFYX_EMA_HOLD_ENABLED", hold)
+    monkeypatch.setattr(settings, "VERIFYX_COLD_SAMPLE_RETRY_ENABLED", True)
+    redis = _redis_service()
+
+    # Cycle 1: a fresh node, its executor's first pre-pull still running; VerifyX samples 120.
+    ok, events, network = await _cycle_with_the_image_check(
+        context_factory, _ProbeSequence(120.0), _never_measured(), redis, cached=False
+    )
+    assert ok is grace
+    assert (
+        events[-1].reason_code
+        == (CachedTemplateMessages.PENDING if grace else CachedTemplateMessages.NOT_CACHED).reason
+    )
+    assert ("ema_verifyx_download_speed" in network) is not hold
+
+    # Cycle 2: the image is on disk now; the first sample reads 53.4, a re-measure 238.
+    probes = _ProbeSequence(53.4, 238.0)
+    ok, events, network = await _cycle_with_the_image_check(
+        context_factory, probes, _as_backend_would_store(network), redis, cached=True
+    )
+    verifyx_event = events[0]
+    assert ok is cycle_2_passes
+    if cycle_2_passes:
+        assert probes.calls == 2
+        assert verifyx_event.what_we_saw["cold_sample_retry"]["used"] == "retry"
+        assert network["ema_verifyx_download_speed"] == pytest.approx(238.0)
+    else:
+        assert probes.calls == 1
+        assert verifyx_event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+        assert verifyx_event.what_we_saw["ema_verifyx_download_speed"] == pytest.approx(86.7)
+
+
+@needs_the_grace
+@pytest.mark.asyncio
+async def test_a_measured_node_held_as_pending_publishes_its_sample(monkeypatch, context_factory):
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_CUTOFF", datetime.utcnow() - timedelta(days=1))
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", True)
+
+    ok, events, network = await _cycle_with_the_image_check(
+        context_factory, _ProbeSequence(200.0), _known(300.0, 40.0), _redis_service(), cached=False
+    )
+
+    assert ok is True
+    assert events[-1].reason_code == CachedTemplateMessages.PENDING.reason
+    assert network["ema_verifyx_download_speed"] == pytest.approx(250.0)
+
+
 # --- composition with an upstream step that already keeps the previous EMA -----------------
 # With the scrape's own speed test removed (lium-io#1419), `network` holds only what VerifyX
 # adds, and VerifyX itself republishes the stored EMA on a probe fallback or a malformed
@@ -374,6 +604,14 @@ def test_holding_an_ema_already_kept_upstream_changes_nothing(context_factory):
     twice = _hold(context_factory, once, _known(200.0, 50.0))
 
     assert once["network"] == twice["network"] == specs["network"]
+
+
+def test_the_hold_touches_only_the_keys_this_cycle_wrote(context_factory):
+    specs = {"network": {"ema_verifyx_download_speed": 60.0}}
+
+    held = _hold(context_factory, specs, _known(200.0, 50.0))
+
+    assert held["network"] == {"ema_verifyx_download_speed": 200.0}
 
 
 @pytest.mark.asyncio
