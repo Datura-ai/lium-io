@@ -213,26 +213,31 @@ def test_config_load_reads_the_json_and_comma_forms_alike(designated, pool):
     assert s.is_designated_hotkey_first_pass(POOL_HOTKEY, first_pass=True) is False
 
 
+# (value, the refusal it gets)
+NOT_JSON = "starts with '\\[' but is not a valid JSON list"
+NOT_STRINGS = "must be a JSON list of strings"
+NOT_BARE = "quote, bracket or space inside"
 MALFORMED_HOTKEY_LISTS = [
-    f'["{POOL_HOTKEY}"',  # unclosed JSON list
-    f'["{POOL_HOTKEY}",]',  # trailing comma: not JSON
-    f"['{POOL_HOTKEY}']",  # Python repr, not JSON
-    f'[1, "{POOL_HOTKEY}"]',  # not all strings
-    f'{{"hotkeys": ["{POOL_HOTKEY}"]}}',  # JSON object
-    f'"{POOL_HOTKEY}"',  # a quoted string
-    f'"{POOL_HOTKEY}", "other-pool-hotkey-fixture"',  # a JSON list without its brackets
-    f"{POOL_HOTKEY} other-pool-hotkey-fixture",  # space-separated
+    (f'["{POOL_HOTKEY}"', NOT_JSON),  # unclosed JSON list
+    (f'["{POOL_HOTKEY}",]', NOT_JSON),  # trailing comma: not JSON
+    (f"['{POOL_HOTKEY}']", NOT_JSON),  # Python repr, not JSON
+    (f'[1, "{POOL_HOTKEY}"]', NOT_STRINGS),
+    (f'[["{POOL_HOTKEY}"]]', NOT_STRINGS),
+    (f'{{"hotkeys": ["{POOL_HOTKEY}"]}}', NOT_BARE),  # JSON object
+    (f'"{POOL_HOTKEY}"', NOT_BARE),  # a quoted string
+    (f'"{POOL_HOTKEY}", "other-pool-hotkey-fixture"', NOT_BARE),  # a JSON list without brackets
+    (f"{POOL_HOTKEY} other-pool-hotkey-fixture", NOT_BARE),  # space-separated
 ]
 
 
 @pytest.mark.parametrize("flag", [True, False])
-@pytest.mark.parametrize("pool", MALFORMED_HOTKEY_LISTS)
-def test_config_load_refuses_a_malformed_pool_mirror(flag, pool):
+@pytest.mark.parametrize(("pool", "refusal"), MALFORMED_HOTKEY_LISTS)
+def test_config_load_refuses_a_malformed_pool_mirror(flag, pool, refusal):
     from pydantic import ValidationError
 
     from core.config import Settings
 
-    with pytest.raises(ValidationError, match="LIUM_POOL_HOTKEYS (starts with|must be|has)"):
+    with pytest.raises(ValidationError, match=f"LIUM_POOL_HOTKEYS .*{refusal}"):
         Settings(
             _env_file=None,
             DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=flag,
@@ -241,13 +246,13 @@ def test_config_load_refuses_a_malformed_pool_mirror(flag, pool):
         )
 
 
-@pytest.mark.parametrize("designated", MALFORMED_HOTKEY_LISTS)
-def test_config_load_refuses_a_malformed_designated_list(designated):
+@pytest.mark.parametrize(("designated", "refusal"), MALFORMED_HOTKEY_LISTS)
+def test_config_load_refuses_a_malformed_designated_list(designated, refusal):
     from pydantic import ValidationError
 
     from core.config import Settings
 
-    with pytest.raises(ValidationError, match="DESIGNATED_MINER_HOTKEYS (starts with|must be|has)"):
+    with pytest.raises(ValidationError, match=f"DESIGNATED_MINER_HOTKEYS .*{refusal}"):
         Settings(
             _env_file=None,
             DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=True,
