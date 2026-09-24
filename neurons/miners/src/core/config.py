@@ -2,6 +2,12 @@ from typing import TYPE_CHECKING
 import pathlib
 
 import bittensor
+from datura.chain import (
+    DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS,
+    PUBLIC_NODE_SOURCE,
+    ChainEndpoint,
+    chain_endpoint_candidates,
+)
 from lium_core.shared_config import SharedConfigClient
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +40,12 @@ class Settings(BaseSettings):
     BITTENSOR_WALLET_HOTKEY_NAME: str = Field(env="BITTENSOR_WALLET_HOTKEY_NAME")
     BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID", default=51)
     BITTENSOR_CHAIN_ENDPOINT: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
+    # Ordered, comma-separated: our proxy first, the public node is always appended last.
+    BITTENSOR_CHAIN_ENDPOINTS: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINTS", default=None)
+    # A failed endpoint is not dialled again for this long; the next ones in the list serve meanwhile.
+    BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS: int = Field(
+        env="BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS", default=DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS
+    )
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK", default="finney")
     SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
 
@@ -92,10 +104,22 @@ class Settings(BaseSettings):
         if self.BITTENSOR_NETWORK:
             config.subtensor.network = self.BITTENSOR_NETWORK
 
-        if self.BITTENSOR_CHAIN_ENDPOINT:
-            config.subtensor.chain_endpoint = self.BITTENSOR_CHAIN_ENDPOINT
+        first_endpoint = self.get_chain_endpoints()[0]
+        if first_endpoint.source != PUBLIC_NODE_SOURCE:
+            config.subtensor.chain_endpoint = first_endpoint.value
 
         return config
+
+    def get_chain_endpoints(self) -> list[ChainEndpoint]:
+        """The ordered dial list: `BITTENSOR_CHAIN_ENDPOINTS` (comma-separated) or the single
+        `BITTENSOR_CHAIN_ENDPOINT`, then the public `BITTENSOR_NETWORK` node last. A connect or
+        read failure moves the client to the next entry; the failed entry is dialled again only
+        after `BITTENSOR_CHAIN_ENDPOINT_RETRY_AFTER_SECONDS`."""
+        return chain_endpoint_candidates(
+            chain_endpoints=self.BITTENSOR_CHAIN_ENDPOINTS,
+            chain_endpoint=self.BITTENSOR_CHAIN_ENDPOINT,
+            network=self.BITTENSOR_NETWORK,
+        )
 
 
 settings = Settings()
