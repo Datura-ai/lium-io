@@ -480,59 +480,50 @@ class Pipeline:
         return current_ctx.model_copy(update=updates)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
-        latest_ctx_holder: list[Context] = [ctx]
-        try:
-            return await self._run(ctx, latest_ctx_holder)
-        except BaseException:
-            # A run that raises leaves no check to consume the early collateral read.
-            cancel_pending_collateral_prefetch(latest_ctx_holder[0])
-            raise
-
-    async def _run(
-        self, ctx: Context, latest_ctx_holder: list[Context]
-    ) -> Tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()
         steps: list[tuple[str, int]] = []
         last_index = len(self.checks) - 1
 
-        for index, step in enumerate(self.checks):
-            parallel = isinstance(step, ParallelStage)
-            ran_checks = await self._run_step(step, current_ctx)
-            for ran in ran_checks:
-                ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
-                ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)
+        try:
+            for index, step in enumerate(self.checks):
+                parallel = isinstance(step, ParallelStage)
+                ran_checks = await self._run_step(step, current_ctx)
+                for ran in ran_checks:
+                    ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
+                    ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)
 
-            # A stage's wall time is its slowest lane's, whichever lane's event carries the summary.
-            stage_elapsed_ms = max(ran.result.event.context["elapsed_time_ms"] for ran in ran_checks)
-            for position, ran in enumerate(ran_checks):
-                chk, res = ran.check, ran.result
-                # Only emitted checks enter the summary: a sibling lane's checks completed before
-                # the cancel ran, but the run does not report them.
-                steps.append((chk.check_id, res.event.context["execution_time_ms"]))
-                elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
-                failed = not res.passed and getattr(chk, "fatal", False)
-                last_of_run = index == last_index and position == len(ran_checks) - 1
-                if failed or res.halt or last_of_run:
-                    res.event.what_we_saw.update(
-                        summarize_steps(
-                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                # A stage's wall time is its slowest lane's, whichever lane's event carries the summary.
+                stage_elapsed_ms = max(ran.result.event.context["elapsed_time_ms"] for ran in ran_checks)
+                for position, ran in enumerate(ran_checks):
+                    chk, res = ran.check, ran.result
+                    # Only emitted checks enter the summary: a sibling lane's checks completed before
+                    # the cancel ran, but the run does not report them.
+                    steps.append((chk.check_id, res.event.context["execution_time_ms"]))
+                    elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
+                    failed = not res.passed and getattr(chk, "fatal", False)
+                    last_of_run = index == last_index and position == len(ran_checks) - 1
+                    if failed or res.halt or last_of_run:
+                        res.event.what_we_saw.update(
+                            summarize_steps(
+                                steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                            )
                         )
-                    )
 
-                await self.sink.emit(res.event)
-                events.append(res.event)
+                    await self.sink.emit(res.event)
+                    events.append(res.event)
 
-                current_ctx = self._apply(current_ctx, ran, parallel)
-                latest_ctx_holder[0] = current_ctx
+                    current_ctx = self._apply(current_ctx, ran, parallel)
 
-                if failed:
-                    cancel_pending_collateral_prefetch(current_ctx)
-                    return False, events, current_ctx
+                    if failed:
+                        return False, events, current_ctx
 
-                if res.halt:
-                    cancel_pending_collateral_prefetch(current_ctx)
-                    return True, events, current_ctx
+                    if res.halt:
+                        return True, events, current_ctx
+        finally:
+            # A run that stops before CollateralCheck (fail, halt or exception) leaves the early
+            # collateral read unconsumed.
+            cancel_pending_collateral_prefetch(current_ctx)
 
         return True, events, current_ctx

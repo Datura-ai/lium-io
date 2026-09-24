@@ -130,6 +130,7 @@ def diagnose_dind_log(log_text: str | None) -> DindLogCause:
 # How long the removal of the probe container may take on the way out of a probe.
 REMOVE_TIMEOUT_SECONDS = 20
 
+
 class DindVerifier:
     """Verifies Docker-in-Docker capability."""
 
