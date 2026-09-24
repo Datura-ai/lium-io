@@ -608,17 +608,64 @@ def test_a_rental_container_still_being_created_counts_as_starting():
     assert rental_activity(_client(containers=[_container("pod_new", status="created")])) == "rental container pod_new"
 
 
-def test_filler_infra_and_exited_rental_containers_do_not_count():
+def test_filler_and_infra_containers_do_not_count():
     client = _client(
         containers=[
             _container("filler_abc"),
             _container("executor-1"),
             _container("autoheal"),
-            _container("pod_old", status="exited"),
         ]
     )
 
     assert rental_activity(client) is None
+
+
+@pytest.mark.parametrize("status", ["exited", "dead"])
+def test_a_stopped_rental_counts_until_its_container_is_removed(quiet_node, status):
+    # fresh read of 941e5ace: a stopped rental's container is `exited` and can start again
+    client = _client(containers=[_container("pod_stopped", status=status)])
+
+    assert rental_activity(client) == "rental container pod_stopped"
+    _sweep(PrePuller(client, state_path=None), [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+    assert quiet_node == []
+
+
+def _verifyx_ssh_cmdline() -> list[str]:
+    # the validator's SSH command (verifyx_validation_service), as the host's process table splits it
+    python, script = "/root/app/.venv/bin/python", "/root/app/src/verifyx_executor.py"
+    return f"{python} {script} --seed 42 --cipher_text abc".split()
+
+
+def _verifyx_local_cmdline() -> list[str]:
+    from services import local_verify_service
+
+    script = str(local_verify_service.VERIFYX_SCRIPT)
+    return ["/usr/bin/python3", script, "--seed", "42", "--cipher_text", "abc"]
+
+
+@pytest.mark.parametrize(
+    "cmdline", [_verifyx_ssh_cmdline, _verifyx_local_cmdline], ids=["ssh", "local-verify"]
+)
+def test_no_pull_while_the_validator_measures_bandwidth(quiet_node, monkeypatch, caplog, cmdline):
+    # fresh read of 941e5ace: its download sample feeds the 100 Mbps EMA gate; a pull sharing the link lowers it
+    procs = [_proc(["sshd: root"]), _proc(cmdline())]
+    monkeypatch.setattr(pre_pull_service.psutil, "process_iter", lambda *_: procs)
+
+    assert rental_activity(_client()) == "validator bandwidth test"
+    with caplog.at_level(logging.INFO):
+        _sweep(PrePuller(_client(), state_path=None), [_entry(REPO, CU128_TAG, DIGEST_CU128)])
+    assert quiet_node == []
+    assert any("node busy (validator bandwidth test)" in r.getMessage() for r in caplog.records)
+
+
+def test_other_python_processes_are_not_the_bandwidth_test(monkeypatch):
+    procs = [
+        _proc(["python", "/root/app/src/decrypt_challenge.py", "--seed", "1"]),
+        _proc(["python", "-m", "verifyx"]),
+    ]
+    monkeypatch.setattr(pre_pull_service.psutil, "process_iter", lambda *_: procs)
+
+    assert rental_activity(_client()) is None
 
 
 def test_rental_container_image_counts_as_used_for_lru(quiet_node):
@@ -670,9 +717,26 @@ def test_pull_is_cancelled_when_a_rental_starts_mid_pull(monkeypatch):
     client.images.get.assert_not_called()
 
 
+def test_a_bandwidth_test_starting_mid_pull_stops_it_within_seconds(monkeypatch):
+    # the full idle check (a docker call) runs every 10 s; the probe check alone every 2 s
+    too_early = lambda _: pytest.fail("full check before 10 s")  # noqa: E731
+    monkeypatch.setattr(pre_pull_service, "rental_activity", too_early)
+    probe = iter([None, "validator bandwidth test"])
+    monkeypatch.setattr(pre_pull_service, "host_activity", lambda: next(probe))
+    clock = iter([0.0, 1.0, 2.0, 4.5])  # start, then each event
+    monkeypatch.setattr(pre_pull_service.time, "monotonic", lambda: next(clock))
+    client, response = _pull_client([{"status": "Downloading"}] * 3)
+
+    outcome, detail = _pull_pinned(client, REPO, CU128_TAG, DIGEST_CU128, timeout_seconds=60)
+
+    assert (outcome, detail) == ("preempted", "validator bandwidth test")
+    response.close.assert_called_once()
+    client.images.get.assert_not_called()
+
+
 def test_pull_stops_at_the_per_image_timeout(monkeypatch):
     monkeypatch.setattr(pre_pull_service, "rental_activity", lambda _: None)
-    clock = iter([0.0, 0.0, 10.0, 100.0])  # deadline, next_check, then each event's check
+    clock = iter([0.0, 10.0, 100.0])  # start, then each event's check
     monkeypatch.setattr(pre_pull_service.time, "monotonic", lambda: next(clock))
     client, response = _pull_client([{"status": "Downloading"}] * 3)
 
@@ -806,6 +870,79 @@ def test_disk_guard_never_evicts_what_docker_refuses_to_remove(quiet_node, monke
 
     assert quiet_node == []
     assert "daturaai/b:1" in puller.state.images  # still there, still tracked
+
+
+class _Disk:
+    """A node whose free space moves with what is pulled and removed (on disk = 3 × compressed)."""
+
+    def __init__(self, monkeypatch, free_gib: float):
+        self.free = free_gib * GIB
+        self.present: dict[str, int] = {}  # digest -> bytes on disk
+        self.sizes: dict[str, int] = {}
+        self.pulls: list[str] = []
+        self.client = _client()
+        self.client.images.get.side_effect = self._get
+        self.client.images.remove.side_effect = self._remove
+        free = lambda _: MagicMock(free=self.free)  # noqa: E731
+        monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", free)
+        monkeypatch.setattr(pre_pull_service, "_pull_pinned", self._pull)
+
+    def entry(self, repo, tag, digest, size):
+        self.sizes[digest] = int(size * pre_pull_service.ON_DISK_MULTIPLIER)
+        return _entry(repo, tag, digest, size=size)
+
+    def _get(self, ref):
+        if ref.rpartition("@")[2] in self.present:
+            return MagicMock()
+        raise docker.errors.ImageNotFound(ref)
+
+    def _remove(self, ref):
+        if "@" in ref and ref.rpartition("@")[2] in self.present:
+            self.free += self.present.pop(ref.rpartition("@")[2])
+
+    def _pull(self, client, repo, tag, digest, timeout_seconds):
+        self.pulls.append(f"{repo}:{tag}")
+        self.present[digest] = self.sizes[digest]
+        self.free -= self.sizes[digest]
+        return "pull_ok", None
+
+
+def test_disk_guard_never_evicts_a_served_image_to_pull_another(quiet_node, monkeypatch, caplog):
+    # fresh read of 941e5ace: with today's top-N (6.5 GB + 4.0 GB compressed) a node at 222 GiB free
+    # fits either image above the 200 GiB floor but not both; evicting one served image to pull the
+    # other re-pulled the pair alternately every sweep (8 sweeps -> 8 pulls). The node keeps the
+    # first one and logs insufficient_disk for the second instead.
+    disk = _Disk(monkeypatch, free_gib=222)
+    served = [
+        disk.entry(REPO, LIUM1_CU128_TAG, DIGEST_LIUM1_CU128, 6_491_891_139),
+        disk.entry(CUDA_REPO, CUDA_TAG, DIGEST_CUDA, 3_961_262_240),
+    ]
+    puller = PrePuller(disk.client, state_path=None)
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(8):
+            _sweep(puller, served)
+
+    assert disk.pulls == [f"{REPO}:{LIUM1_CU128_TAG}"]
+    disk.client.images.remove.assert_not_called()
+    assert set(puller.state.images) == {f"{REPO}:{LIUM1_CU128_TAG}"}
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_pull image=")]
+    assert len(lines) == 8 and all("outcome=insufficient_disk" in line for line in lines[1:])
+
+
+def test_disk_guard_still_evicts_an_image_that_left_the_served_set(quiet_node, monkeypatch):
+    # the same node once the backend's top-N moved on: the old image is fair game again
+    disk = _Disk(monkeypatch, free_gib=222)
+    cu128 = disk.entry(REPO, LIUM1_CU128_TAG, DIGEST_LIUM1_CU128, 6_491_891_139)
+    cuda = disk.entry(CUDA_REPO, CUDA_TAG, DIGEST_CUDA, 3_961_262_240)
+    puller = PrePuller(disk.client, state_path=None)
+    _sweep(puller, [cu128, cuda])
+
+    _sweep(puller, [cuda])
+
+    assert disk.pulls == [f"{REPO}:{LIUM1_CU128_TAG}", f"{CUDA_REPO}:{CUDA_TAG}"]
+    assert set(puller.state.images) == {f"{CUDA_REPO}:{CUDA_TAG}"}
+    assert disk.free >= 200 * GIB
 
 
 def test_a_refreshed_tag_retires_its_superseded_digest_reference(quiet_node):
