@@ -630,177 +630,18 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         raise NVMLError(ret)
 
 
-def run_cmd_status(cmd):
-    """(returncode, stdout, stderr) of a shell command; never raises on a non-zero exit."""
+def run_cmd(cmd):
     # Strip LD_LIBRARY_PATH so PyInstaller's bundled libs don't leak into subprocesses
     # and conflict with system-linked shared libs (e.g. libssl vs libcrypto version mismatch).
     env = {**os.environ}
     env.pop("LD_LIBRARY_PATH", None)
     proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
-    return proc.returncode, proc.stdout, proc.stderr
-
-
-def run_cmd(cmd):
-    returncode, stdout, stderr = run_cmd_status(cmd)
-    if returncode != 0:
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"run_cmd error {cmd=!r} proc.returncode={returncode} proc.stdout={stdout!r} proc.stderr={stderr!r}"
+            f"run_cmd error {cmd=!r} {proc.returncode=} {proc.stdout=!r} {proc.stderr=!r}"
         )
-    return stdout
+    return proc.stdout
 
-
-def get_network_speed():
-    """Get upload and download speed of the machine."""
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd("speedtest-cli --json")
-        speedtest_data = json.loads(speedtest_cmd)
-        data["upload_speed"] = speedtest_data["upload"] / 1_000_000  # Convert to Mbps
-        data["download_speed"] = speedtest_data["download"] / 1_000_000  # Convert to Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-def speedcheck_output():
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd("/root/app/.venv/bin/speedcheck run --type ookla")
-        json_start = speedtest_cmd.find('{')
-        json_str = speedtest_cmd[json_start:]
-        speedtest_data = json.loads(json_str)
-        data["download_speed"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
-        data["upload_speed"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-def netmeasure_output():
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd(f"/root/app/.venv/bin/netmeasure speedtest_dotnet")
-        download_match = re.search(r'Download Rate: ([\d.]+) bit/s', speedtest_cmd)
-        upload_match = re.search(r'Upload Rate: ([\d.]+) bit/s', speedtest_cmd)
-
-        if download_match and upload_match:
-            download_speed = float(download_match.group(1))
-            upload_speed = float(upload_match.group(1))
-            
-            # Convert to Mbps
-            data["download_speed"] = download_speed / 1_000_000 # Convert to Mbps 
-            data["upload_speed"] = upload_speed / 1_000_000 # Convert to Mbps
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
-CLOUDFLARE_DOWN_BYTES = 50_000_000
-CLOUDFLARE_UP_BYTES = 25 * 1024 * 1024
-CLOUDFLARE_MAX_SECONDS = 15
-CURL_EXIT_OPERATION_TIMEDOUT = 28
-# __up answers once the whole body is in, so an upload cut at --max-time has no final status: 000, or
-# 100 where curl sent `Expect: 100-continue` (curl 8.5 against a slow reader)
-CLOUDFLARE_UP_CUT_STATUSES = ("200", "000", "100")
-
-
-def cloudflare_transfer_mbps(returncode, stdout, stderr, expected_bytes, cut_statuses=("200",)):
-    """Mbps from curl's `-w '%{http_code} <size> <speed>'`; raises when the answer is no measurement.
-
-    Cloudflare refuses what it will not serve with a tiny body (HTTP 403 and 1 byte for __down of
-    100 MB or more) and curl exits 0 on it, so reading the speed alone recorded a refusal as 0.0 Mbps.
-    A transfer cut at --max-time with a status in `cut_statuses` is a measurement (its average), not a
-    failure.
-    """
-    fields = stdout.split()
-    if returncode not in (0, CURL_EXIT_OPERATION_TIMEDOUT) or len(fields) != 3:
-        raise RuntimeError(f"curl exit {returncode}: {(stderr or stdout).strip()[-200:]}")
-    status, size, speed = fields
-    size = int(float(size))
-    cut = returncode == CURL_EXIT_OPERATION_TIMEDOUT
-    if status != "200" and not (cut and status in cut_statuses):
-        raise RuntimeError(f"HTTP {status}, {size} bytes")
-    if returncode == 0 and size < expected_bytes:
-        raise RuntimeError(f"{size} of {expected_bytes} bytes")
-    mbps = round(float(speed) * 8 / 1_000_000, 2)  # bytes/s → Mbps
-    if mbps <= 0:
-        raise RuntimeError(f"{size} bytes in {CLOUDFLARE_MAX_SECONDS} s")
-    return mbps
-
-
-def cloudflare_speed():
-    """Measure network speed using Cloudflare's speed endpoint via curl, each direction on its own."""
-    data = {"upload_speed": None, "download_speed": None}
-    errors = []
-    try:
-        data["download_speed"] = cloudflare_transfer_mbps(
-            *run_cmd_status(
-                "curl -o /dev/null -sS -w '%{http_code} %{size_download} %{speed_download}' "
-                f"--max-time {CLOUDFLARE_MAX_SECONDS} "
-                f"'https://speed.cloudflare.com/__down?bytes={CLOUDFLARE_DOWN_BYTES}'"
-            ),
-            CLOUDFLARE_DOWN_BYTES,
-        )
-    except Exception as exc:
-        errors.append(f"download: {exc!r}")
-    try:
-        # piped from dd, no temp file
-        data["upload_speed"] = cloudflare_transfer_mbps(
-            *run_cmd_status(
-                f"dd if=/dev/zero bs=1M count={CLOUDFLARE_UP_BYTES // (1024 * 1024)} 2>/dev/null | "
-                "curl -o /dev/null -sS -w '%{http_code} %{size_upload} %{speed_upload}' "
-                f"--max-time {CLOUDFLARE_MAX_SECONDS} -X POST -H 'Expect:' --data-binary @- "
-                "'https://speed.cloudflare.com/__up'"
-            ),
-            CLOUDFLARE_UP_BYTES,
-            CLOUDFLARE_UP_CUT_STATUSES,
-        )
-    except Exception as exc:
-        errors.append(f"upload: {exc!r}")
-    if errors:
-        data["network_speed_error"] = "; ".join(errors)
-    return data
-
-
-def benchmark_network_speed():
-    """Run network speed methods in fallback order, stopping once both metrics are satisfied.
-
-    Methods are tried in order: speedtest_cli → cloudflare → netmeasure → speedcheck.
-    Each method is only called if at least one metric (download or upload) is still missing.
-    All executed per-method raw results are stored under 'measurements' for logging.
-    """
-    order = [
-        ("speedtest_cli", get_network_speed),
-        ("cloudflare", cloudflare_speed),
-        ("netmeasure", netmeasure_output),
-        ("speedcheck", speedcheck_output),
-    ]
-
-    measurements = {}
-    download: float | None = None
-    upload: float | None = None
-    download_source: str | None = None
-    upload_source: str | None = None
-
-    for name, method in order:
-        if download is not None and upload is not None:
-            break
-
-        result = method()
-        measurements[name] = result
-
-        if download is None and result.get("download_speed"):
-            download = result["download_speed"]
-            download_source = name
-
-        if upload is None and result.get("upload_speed"):
-            upload = result["upload_speed"]
-            upload_source = name
-
-    return {
-        "download_speed": download,
-        "upload_speed": upload,
-        "download_source": download_source,
-        "upload_source": upload_source,
-        "measurements": measurements,
-    }
 
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 # /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
@@ -2142,7 +1983,7 @@ def get_machine_specs():
         data["kernel_scrape_error"] = repr(exc)
 
     
-    data["data_network"] = benchmark_network_speed()
+    data["data_network"] = {}
 
     data["data_md5_checksums"] = {
         "md5_checksums_nvidia_smi": f"{get_md5_checksum_from_file_content(nvidia_smi_content)}:{get_sha256_checksum_from_file_content(nvidia_smi_content)}",
