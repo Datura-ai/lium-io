@@ -52,6 +52,9 @@ FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
 # treats anything in the portal snapshot that is NOT here as never validated. Seeded by every
 # cycle's publish, so one completed cycle after deploy is enough to know the whole fleet.
 EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
+# Executor uuid -> the backend's pending RecheckExecutorRequest, written by the connector and
+# taken by the validator's express lane. One field per executor: a repeat request is one recheck.
+RECHECK_REQUESTS_HASH = "recheck_requests"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -258,6 +261,31 @@ class RedisService:
     async def get_validated_executors(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_VALIDATED_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def queue_recheck_request(self, request: dict) -> None:
+        async with self.lock:
+            await self.redis.hset(RECHECK_REQUESTS_HASH, request["executor_id"], json.dumps(request))
+
+    async def get_recheck_requests(self) -> dict[str, dict]:
+        """Pending recheck requests by executor uuid; an unreadable entry is dropped."""
+        async with self.lock:
+            raw = await self.redis.hgetall(RECHECK_REQUESTS_HASH)
+        requests: dict[str, dict] = {}
+        unreadable: list[str] = []
+        for key, value in raw.items():
+            executor_id = key.decode() if isinstance(key, bytes) else key
+            try:
+                requests[executor_id] = json.loads(value)
+            except (TypeError, ValueError):
+                unreadable.append(executor_id)
+        if unreadable:
+            await self.drop_recheck_requests(unreadable)
+        return requests
+
+    async def drop_recheck_requests(self, executor_ids: list[str]) -> None:
+        if executor_ids:
+            async with self.lock:
+                await self.redis.hdel(RECHECK_REQUESTS_HASH, *executor_ids)
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None

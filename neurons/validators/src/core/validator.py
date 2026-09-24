@@ -369,7 +369,7 @@ class Validator:
                 # still reads are kept (DAH-2958). The express lane uses the new one from here on.
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
                     keep_directories=(
-                        self.express_lane.directories_in_use() if settings.EXPRESS_LANE_ENABLED else ()
+                        self.express_lane.directories_in_use() if settings.express_lane_runs else ()
                     )
                 )
                 self.cycle_inputs = CycleInputs(
@@ -876,9 +876,9 @@ class Validator:
             await self.initiate_services()
             self.should_exit = False
 
-            if settings.EXPRESS_LANE_ENABLED and not settings.DRY_RUN:
+            if settings.express_lane_runs and not settings.DRY_RUN:
                 # DAH-2958: ticks beside the cycle on this loop; coordination through
-                # MinerService.in_flight. Flag off: the task is never created.
+                # MinerService.in_flight. Both flags off: the task is never created.
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )

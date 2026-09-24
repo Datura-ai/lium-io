@@ -583,6 +583,12 @@ async def _stamp_last_ok(ctx: Context) -> None:
         )
 
 
+async def forget_last_pass(redis_service, executor_uuid: str) -> None:
+    """Drop the executor's interval stamp so its next run probes even inside the interval: a rent on
+    it just failed, and the pass on record predates that. Raises when Redis cannot be written."""
+    await redis_service.delete(f"{_REDIS_LAST_OK_PREFIX}:{executor_uuid}")
+
+
 async def _clear_last_ok(ctx: Context) -> None:
     try:
         await ctx.services.redis.delete(f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}")

@@ -4,8 +4,8 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Iterator
-from typing import Annotated
+from collections.abc import Coroutine, Iterator
+from typing import Annotated, Any
 from uuid import UUID
 
 import aiohttp
@@ -213,6 +213,8 @@ MANUAL_RENTAL_FORCED_PASS_EVENT = "Executor force-passed as special manual renta
 # DAH-2958: who is verifying an executor right now (values of MinerService.in_flight).
 CYCLE_LANE = "cycle"
 EXPRESS_LANE = "express"
+# a node the backend asked to recheck after a host-side rent failure (core/express_lane.py)
+RECHECK_LANE = "recheck"
 # The wave verified it this cycle and its result is not yet in the validated set (the cycle
 # seeds that set once, after scoring and publishing — minutes after the miner's wave returned).
 # Kept in in_flight so the express lane does not run the same node a second time meanwhile.
@@ -236,6 +238,10 @@ class MinerService:
         # this one process, so a plain dict is the whole coordination: each lane skips what the
         # other holds. Stays empty with the flag off.
         self.in_flight: dict[str, str] = {}
+        # Executor uuid -> the result of the recheck running on it (None when it produced none),
+        # resolved when the recheck ends. A wave that reaches the node meanwhile takes that result
+        # as the node's own: one pipeline per node at a time, and the node keeps its scored cycle.
+        self.recheck_outcomes: dict[str, asyncio.Future] = {}
 
     def _claim_for_cycle(
         self, executors: list[ExecutorSSHInfo], default_extra: dict
@@ -243,10 +249,11 @@ class MinerService:
         """The wave takes every executor the miner returned, minus those the express lane is
         verifying at this moment, so a new node's hardware tests never run twice concurrently
         (DAH-2958). The lane holds only executors registered after the first cycle since start
-        that no cycle has published yet, so a long-known executor's scoring is untouched.
-        Flag off: list returned as is.
+        that no cycle has published yet, so a long-known executor's scoring is untouched. A node
+        under a recheck stays in the wave with the recheck's claim; its cycle result is the
+        recheck's (`_cycle_result`). Flags off: list returned as is.
         """
-        if not settings.EXPRESS_LANE_ENABLED:
+        if not settings.express_lane_runs:
             return executors
         claimed: list[ExecutorSSHInfo] = []
         for executor in executors:
@@ -258,7 +265,8 @@ class MinerService:
                     ),
                 )
                 continue
-            self.in_flight[executor.uuid] = CYCLE_LANE
+            if self.in_flight.get(executor.uuid) != RECHECK_LANE:
+                self.in_flight[executor.uuid] = CYCLE_LANE
             claimed.append(executor)
         return claimed
 
@@ -288,11 +296,40 @@ class MinerService:
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
         """The wave is done with these executors; they stay in in_flight as CYCLE_DONE until the
         cycle has seeded the validated set (forget_cycle_done), so the lane keeps skipping them."""
-        if not settings.EXPRESS_LANE_ENABLED:
+        if not settings.express_lane_runs:
             return
         for executor in executors:
             if self.in_flight.get(executor.uuid) == CYCLE_LANE:
                 self.in_flight[executor.uuid] = CYCLE_DONE
+
+    def _wave_or_lane_run(
+        self,
+        requested_executor_id: str | None,
+        executor_id: str,
+        job_batch_id: str,
+        pipeline: Coroutine[Any, Any, JobResult | None],
+    ) -> Coroutine[Any, Any, JobResult | None]:
+        # the express lane's own run (one requested executor) must never wait on its own recheck
+        if requested_executor_id is not None or not settings.RECHECK_ON_REQUEST_ENABLED:
+            return pipeline
+        return self._cycle_result(executor_id, job_batch_id, pipeline)
+
+    async def _cycle_result(
+        self, executor_id: str, job_batch_id: str, pipeline: Coroutine[Any, Any, JobResult | None]
+    ) -> JobResult | None:
+        """The wave's result for one executor: the result of the recheck running on it, when there is
+        one, stamped with this wave's batch id; otherwise the executor's own pipeline run."""
+        outcome = self.recheck_outcomes.get(executor_id)
+        if outcome is not None:
+            try:
+                rechecked: JobResult | None = await asyncio.shield(outcome)
+            except BaseException:
+                pipeline.close()
+                raise
+            if rechecked is not None:
+                pipeline.close()
+                return rechecked.model_copy(update={"job_batch_id": job_batch_id}, deep=True)
+        return await pipeline
 
     def forget_cycle_done(self) -> None:
         """Called by the cycle right after it recorded its published executors as validated."""
@@ -488,18 +525,23 @@ class MinerService:
                         tasks = [
                             asyncio.create_task(
                                 asyncio.wait_for(
-                                    self.task_service.create_task(
-                                        miner_info=payload,
-                                        executor_info=executor_info,
-                                        keypair=my_key,
-                                        private_key=private_key.decode("utf-8"),
-                                        public_key=public_key.decode("utf-8"),
-                                        encrypted_files=encrypted_files,
-                                        rented_data=rented_data,
-                                        default_docker_image_digests=default_docker_image_digests,
-                                        executor_image_snapshot=executor_image_snapshot,
-                                        attestation_nonce=attestation_nonce,
-                                        first_pass=first_pass,
+                                    self._wave_or_lane_run(
+                                        executor_id,
+                                        executor_info.uuid,
+                                        payload.job_batch_id,
+                                        self.task_service.create_task(
+                                            miner_info=payload,
+                                            executor_info=executor_info,
+                                            keypair=my_key,
+                                            private_key=private_key.decode("utf-8"),
+                                            public_key=public_key.decode("utf-8"),
+                                            encrypted_files=encrypted_files,
+                                            rented_data=rented_data,
+                                            default_docker_image_digests=default_docker_image_digests,
+                                            executor_image_snapshot=executor_image_snapshot,
+                                            attestation_nonce=attestation_nonce,
+                                            first_pass=first_pass,
+                                        ),
                                     ),
                                     timeout=settings.JOB_TIME_OUT - 120
                                 )
@@ -2281,18 +2323,23 @@ class MinerService:
                     tasks = [
                         asyncio.create_task(
                             asyncio.wait_for(
-                                self.task_service.create_task(
-                                    miner_info=payload,
-                                    executor_info=executor_info,
-                                    keypair=my_key,
-                                    private_key=private_key.decode("utf-8"),
-                                    public_key=public_key.decode("utf-8"),
-                                    encrypted_files=encrypted_files,
-                                    rented_data=rented_data,
-                                    default_docker_image_digests=default_docker_image_digests,
-                                    executor_image_snapshot=executor_image_snapshot,
-                                    attestation_nonce=attestation_nonce,
-                                    first_pass=first_pass,
+                                self._wave_or_lane_run(
+                                    executor_id,
+                                    executor_info.uuid,
+                                    payload.job_batch_id,
+                                    self.task_service.create_task(
+                                        miner_info=payload,
+                                        executor_info=executor_info,
+                                        keypair=my_key,
+                                        private_key=private_key.decode("utf-8"),
+                                        public_key=public_key.decode("utf-8"),
+                                        encrypted_files=encrypted_files,
+                                        rented_data=rented_data,
+                                        default_docker_image_digests=default_docker_image_digests,
+                                        executor_image_snapshot=executor_image_snapshot,
+                                        attestation_nonce=attestation_nonce,
+                                        first_pass=first_pass,
+                                    ),
                                 ),
                                 timeout=settings.JOB_TIME_OUT - 120
                             )

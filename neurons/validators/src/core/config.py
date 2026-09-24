@@ -558,6 +558,20 @@ class Settings(BaseSettings):
     EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )
+    # The backend hides a node after a rent failed on it for the host's reasons and sends
+    # RecheckExecutorRequest; with the flag on, the express lane runs that node's full pipeline
+    # (the rental probe included, its interval stamp dropped) and publishes the result spec-only,
+    # so a pass lists the node again within minutes. Off: the request is logged and dropped.
+    RECHECK_ON_REQUEST_ENABLED: bool = Field(env="RECHECK_ON_REQUEST_ENABLED", default=False)
+    RECHECK_MAX_IN_FLIGHT: int = Field(env="RECHECK_MAX_IN_FLIGHT", default=4, ge=1)
+    # The backend lifts its hold on its own after 10 minutes; a request older than that is moot.
+    RECHECK_REQUEST_MAX_AGE_SECONDS: int = Field(
+        env="RECHECK_REQUEST_MAX_AGE_SECONDS", default=600, gt=0
+    )
+
+    @property
+    def express_lane_runs(self) -> bool:
+        return self.EXPRESS_LANE_ENABLED or self.RECHECK_ON_REQUEST_ENABLED
 
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
