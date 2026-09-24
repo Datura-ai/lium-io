@@ -412,7 +412,9 @@ class PipelineFactory:
         - The rental probe, score and finalize follow as today.
         The list differs from build_checks only in where these checks sit; a node that would fail
         there fails here too. A node that would fail two checks can report the other one first:
-        the port checks now run after VerifyX, and a lane that stops first wins.
+        the port checks now run after VerifyX, and a lane that stops first wins. One read is not
+        shared: when the matmul fails and CapabilityCheck finds a Lium workload started during the
+        run, RentalVerificationCheck in the host lane still sees the cycle-start rented_data.
         """
         return cast(
             list[Check],
