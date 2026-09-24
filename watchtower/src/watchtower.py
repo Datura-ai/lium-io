@@ -266,12 +266,10 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
     """
     try:
         signing_data = f"{payload.digest}:{payload.timestamp}"
-        is_valid = False
-        for hotkey in trusted_validator_hotkeys():
-            keypair = bittensor.Keypair(ss58_address=hotkey)
-            if keypair.verify(signing_data, payload.signature):
-                is_valid = True
-                break
+        is_valid = any(
+            bittensor.Keypair(ss58_address=hotkey).verify(signing_data, payload.signature)
+            for hotkey in trusted_validator_hotkeys()
+        )
 
         # Verify that the timestamp is not too far in the future or past (e.g., within 5 minutes)
         now = int(datetime.now(UTC).timestamp())

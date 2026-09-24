@@ -380,13 +380,14 @@ def migrate_validator_hotkey(old_hotkey: str | None, new_hotkey: str | None, dry
     """Re-key this miner's executor rows from one validator hotkey to another (the validator hotkey rotation:
     run once per miner DB after the config pair swap; the central miner has no rows of its own)."""
     from core.db import get_db
+    from daos.executor import ExecutorDao
     from services.validator_service import migrate_validator_hotkey_rows
 
     old_hotkey = old_hotkey or settings.VALIDATOR_NEXT_HOTKEY
     new_hotkey = new_hotkey or settings.DEFAULT_VALIDATOR_HOTKEY
-    session = next(get_db())
+    executor_dao = ExecutorDao(session=next(get_db()))
     try:
-        result = migrate_validator_hotkey_rows(session, old_hotkey, new_hotkey, dry_run=dry_run)
+        result = migrate_validator_hotkey_rows(executor_dao, old_hotkey, new_hotkey, dry_run=dry_run)
     except ValueError as e:
         raise click.UsageError(str(e)) from e
 

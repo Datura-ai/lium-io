@@ -9,6 +9,7 @@ import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
 import core.config as core_config
+from daos.executor import ExecutorDao
 from models.executor import Executor
 from services.validator_service import ValidatorService, migrate_validator_hotkey_rows
 
@@ -97,6 +98,16 @@ def test_a_blank_next_hotkey_adds_no_signer(monkeypatch):
     assert built.accepted_validator_hotkeys == frozenset({CURRENT})
 
 
+def test_a_miner_serving_another_validator_does_not_accept_the_lium_next_hotkey(monkeypatch):
+    # regression: a staging or e2e miner that sets only DEFAULT_VALIDATOR_HOTKEY also accepts the prod
+    # validator's new hotkey (the executor and watchtower staging builds trust their own validator only)
+    monkeypatch.delenv("VALIDATOR_NEXT_HOTKEY", raising=False)
+    monkeypatch.setenv("DEFAULT_VALIDATOR_HOTKEY", STRANGER)
+    built = core_config.Settings(_env_file=None)
+
+    assert built.accepted_validator_hotkeys == frozenset({STRANGER})
+
+
 # --- cli.py migrate-validator-hotkey: the executor rows move with the flip ------------------------------------
 
 
@@ -118,7 +129,7 @@ def _validators(session) -> dict[str, str]:
 
 
 def test_the_dry_run_counts_the_rows_keyed_to_the_old_hotkey_and_moves_none(rows):
-    result = migrate_validator_hotkey_rows(rows, CURRENT, NEXT, dry_run=True)
+    result = migrate_validator_hotkey_rows(ExecutorDao(session=rows), CURRENT, NEXT, dry_run=True)
 
     assert result == (2, 0)
     assert _validators(rows) == {"10.0.0.1": CURRENT, "10.0.0.2": CURRENT, "10.0.0.3": STRANGER}
@@ -127,7 +138,7 @@ def test_the_dry_run_counts_the_rows_keyed_to_the_old_hotkey_and_moves_none(rows
 def test_the_migration_moves_exactly_the_rows_keyed_to_the_old_hotkey(rows):
     # regression: the command keys on a hard-coded previous-rotation address and moves 0 rows (the
     # miner's nodes stay listed under a validator that no longer asks), or re-keys every row
-    result = migrate_validator_hotkey_rows(rows, CURRENT, NEXT, dry_run=False)
+    result = migrate_validator_hotkey_rows(ExecutorDao(session=rows), CURRENT, NEXT, dry_run=False)
 
     assert result == (2, 2)
     assert _validators(rows) == {"10.0.0.1": NEXT, "10.0.0.2": NEXT, "10.0.0.3": STRANGER}
@@ -135,7 +146,7 @@ def test_the_migration_moves_exactly_the_rows_keyed_to_the_old_hotkey(rows):
 
 def test_the_migration_refuses_equal_or_blank_hotkeys_before_touching_the_rows(rows):
     with pytest.raises(ValueError, match="the same"):
-        migrate_validator_hotkey_rows(rows, NEXT, NEXT, dry_run=False)
+        migrate_validator_hotkey_rows(ExecutorDao(session=rows), NEXT, NEXT, dry_run=False)
     with pytest.raises(ValueError, match="required"):
-        migrate_validator_hotkey_rows(rows, CURRENT, " ", dry_run=False)
+        migrate_validator_hotkey_rows(ExecutorDao(session=rows), CURRENT, " ", dry_run=False)
     assert _validators(rows) == {"10.0.0.1": CURRENT, "10.0.0.2": CURRENT, "10.0.0.3": STRANGER}

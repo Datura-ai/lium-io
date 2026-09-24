@@ -3,7 +3,7 @@ import pathlib
 
 import bittensor
 from lium_core.shared_config import SharedConfigClient
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -73,16 +73,19 @@ class Settings(BaseSettings):
 
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
     MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")
-    # The Lium validator this miner serves: new executors are listed under it (cli add-executor) and
-    # only its sign-ins are accepted. The hotkey is being rotated (owner, 22 Sep 2026): both addresses
-    # below are accepted, DEFAULT_VALIDATOR_HOTKEY stays the current one until the chain swap, and the
-    # swap is one config edit, not a release — the pair swap DEFAULT_VALIDATOR_HOTKEY=<new>,
-    # VALIDATOR_NEXT_HOTKEY=<old>, so the old hotkey stays accepted while the chain settles. Setting
-    # only DEFAULT_VALIDATOR_HOTKEY=<new> would drop the old one at once. The old hotkey is dropped
-    # later by VALIDATOR_NEXT_HOTKEY="" (tests/test_validator_hotkey_rotation.py).
+    # Swap both at once (DEFAULT=<new>, NEXT=<old>): changing DEFAULT alone drops the old hotkey
+    # immediately. NEXT="" drops it later.
     DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default=LIUM_VALIDATOR_HOTKEY_CURRENT)
     VALIDATOR_NEXT_HOTKEY: str = Field(env="VALIDATOR_NEXT_HOTKEY", default=LIUM_VALIDATOR_HOTKEY_NEXT)
     CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)
+
+    @model_validator(mode="after")
+    def drop_the_lium_next_hotkey_for_another_validator(self) -> "Settings":
+        # a staging or e2e miner names its own validator and must not trust the prod one's new hotkey
+        is_next_hotkey_set = "VALIDATOR_NEXT_HOTKEY" in self.model_fields_set
+        if not is_next_hotkey_set and self.DEFAULT_VALIDATOR_HOTKEY != LIUM_VALIDATOR_HOTKEY_CURRENT:
+            self.VALIDATOR_NEXT_HOTKEY = ""
+        return self
 
     @property
     def accepted_validator_hotkeys(self) -> frozenset[str]:
