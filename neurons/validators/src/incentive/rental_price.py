@@ -531,40 +531,24 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _withhold_idle_pay_if_port_limited(self, job_result: JobResult) -> bool:
-        """Log a port-limited split remainder; True when the flag withholds its unrented incentive.
+    def _reasons_excluded_from_both_pools(self, job_result: JobResult) -> list[MinerLogLine]:
+        """Every reason the executor is excluded from BOTH incentive pools, in catalog order.
 
-        While ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER is off the shortfall is only logged.
+        The first entry is the one the old first-match evaluation reported. Empty when no hard
+        exclusion applies (the executor may still be gated later by a rental-pool-only gate).
         """
-        port_limited: PortLimitedRemainder | None = self._port_limited_remainder(job_result)
-        if port_limited is None:
-            return False
-        self._log_port_limited_remainder(job_result, port_limited)
-        if not settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER:
-            return False
-        job_result.record_incentive_log(
-            MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited)
-        )
-        return True
-
-    def _reason_excluded_from_both_pools(self, job_result: JobResult) -> MinerLogLine | None:
-        """First reason (if any) the executor is excluded from BOTH incentive pools.
-
-        Order matters: the first matching rule wins, mirroring the original sequential
-        checks. Returns None when no hard exclusion applies (executor may still be
-        gated later by the rental-pool-only soft price limit).
-        """
+        exclusions: list[MinerLogLine] = []
         if job_result.is_provider_banned:
-            return MinerLogLine.no_payout_because_banned_network_abuse(job_result)
+            exclusions.append(MinerLogLine.no_payout_because_banned_network_abuse(job_result))
         if job_result.is_spot:
-            return MinerLogLine.no_payout_because_spot_tier(job_result)
+            exclusions.append(MinerLogLine.no_payout_because_spot_tier(job_result))
         if is_missing_discord_after_cutoff(job_result):
-            return MinerLogLine.no_payout_because_discord_not_connected(job_result)
+            exclusions.append(MinerLogLine.no_payout_because_discord_not_connected(job_result))
         if job_result.is_new_rentals_paused and not job_result.is_rented:
-            return MinerLogLine.no_payout_because_paused_for_new_rentals(job_result)
+            exclusions.append(MinerLogLine.no_payout_because_paused_for_new_rentals(job_result))
         if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
-            return MinerLogLine.no_payout_because_running_own_default_job(job_result)
-        return None
+            exclusions.append(MinerLogLine.no_payout_because_running_own_default_job(job_result))
+        return exclusions
 
     @staticmethod
     def _resolve_bucket(result: JobResult, cap_spec: dict[int, int]) -> int:
@@ -947,17 +931,30 @@ class RentalPriceIncentive(DefaultIncentive):
     def _explain_zero_effective_rate(self, result: JobResult, bucket: int) -> None:
         """DAH-2327: an eligible unrented executor still finalizes at 0 when any factor of
         effective_rate collapses to 0 (no bucket capacity, driver below minimum, no sysbox).
-        Tell the miner which one, otherwise the "calculated successfully" report shows
+        Tell the miner every one that did, otherwise the "calculated successfully" report shows
         incentive 0 with no reason."""
         if result.unrented_cap_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_no_unrented_capacity_for_gpu_count(result, bucket)
             result.record_incentive_log(reason)
-        elif result.driver_multiplier == 0:
-            reason: MinerLogLine = MinerLogLine.no_payout_because_nvidia_driver_below_minimum(result)
-            result.record_incentive_log(reason)
-        elif result.sysbox_multiplier == 0:
-            reason: MinerLogLine = MinerLogLine.no_payout_because_sysbox_not_enabled(result)
-            result.record_incentive_log(reason)
+        self._explain_zero_node_rate_factors(result, result.driver_multiplier, result.sysbox_multiplier)
+
+    @staticmethod
+    def _explain_zero_node_rate_factors(
+        result: JobResult, driver_multiplier: float | None, sysbox_multiplier: float | None
+    ) -> None:
+        # the two effective_rate factors that are the node's own, not the cohort's
+        if driver_multiplier == 0:
+            result.record_incentive_log(
+                MinerLogLine.no_payout_because_nvidia_driver_below_minimum(result, driver_multiplier)
+            )
+        if sysbox_multiplier == 0:
+            result.record_incentive_log(MinerLogLine.no_payout_because_sysbox_not_enabled(result))
+
+    @staticmethod
+    def _gate_runs(idle_pool_candidate: bool, eligible: bool, enforced: bool) -> bool:
+        """An idle-pool gate runs while the node is still eligible, and on an already blocked
+        candidate only when the gate is enforced, so its reason is recorded as well."""
+        return eligible or (idle_pool_candidate and enforced)
 
     async def calculate_executor_score(
         self,
@@ -978,41 +975,58 @@ class RentalPriceIncentive(DefaultIncentive):
         Returns:
             Calculated score (0 for unrented eligible GPUs, normal score otherwise)
         """
-        if self._record_outdated_image_reason(job_result):
-            job_result.mining_score = 0
-            job_result.eligible_for_rental_share = False
-            return job_result
-
-        # Hard exclusions: reasons a validated executor earns 0 from BOTH pools.
-        # One evaluator so the internal log, the customer-facing incentive log, and the
-        # scoring decision all read from the same source and cannot drift (DAH-2327).
-        exclusion: MinerLogLine | None = self._reason_excluded_from_both_pools(job_result)
-        if exclusion is not None:
+        # Hard exclusions: reasons a validated executor earns 0 from BOTH pools. Every one is
+        # recorded, and the idle-pool gates below still run on an excluded node, so the miner
+        # learns every fix in one cycle instead of one per cycle. One evaluator per rule, so the
+        # internal log, the customer-facing incentive log, and the scoring decision all read from
+        # the same source and cannot drift (DAH-2327).
+        outdated_image: bool = self._record_outdated_image_reason(job_result)
+        exclusions: list[MinerLogLine] = self._reasons_excluded_from_both_pools(job_result)
+        for exclusion in exclusions:
             logger.info(exclusion.to_internal_log())
-            job_result.mining_score = 0
-            job_result.eligible_for_rental_share = False
             job_result.record_incentive_log(exclusion)
-            return job_result
+        excluded_from_both_pools: bool = outdated_image or bool(exclusions)
 
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
         base_model = self.get_base_model_for_gpu(job_result.gpu_model)
-        eligible_for_rental_share = (
+        idle_pool_candidate: bool = (
             not job_result.is_rented
             and (base_model in self.config.rental_incentive_gpu_types)
             and (job_result.score > 0 or job_result.job_score > 0)
         )
+        eligible_for_rental_share: bool = idle_pool_candidate and not excluded_from_both_pools
+
+        # Each gate below logs its structured line only while the node is still eligible, so the
+        # shadow numbers read as before: against the flags that were on that cycle. An enforced
+        # gate also runs on a node something else already blocks, to record its reason too.
 
         # DAH-3698: a split remainder under the marketplace port floor is capacity nobody can
         # rent, so it earns no idle pay; first in the chain so it never reaches the shadow numbers.
-        if eligible_for_rental_share and self._withhold_idle_pay_if_port_limited(job_result):
-            eligible_for_rental_share = False
+        port_floor_enforced: bool = settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER
+        port_limited: PortLimitedRemainder | None = (
+            self._port_limited_remainder(job_result)
+            if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, port_floor_enforced)
+            else None
+        )
+        if port_limited is not None:
+            if eligible_for_rental_share:
+                self._log_port_limited_remainder(job_result, port_limited)
+            if port_floor_enforced:
+                eligible_for_rental_share = False
+                job_result.record_incentive_log(
+                    MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited)
+                )
 
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays
         # active). While the flag is off we only log the would-be exclusion (shadow).
-        if eligible_for_rental_share and self._is_over_soft_price_limit(job_result):
-            self._log_soft_price_limit(job_result)
-            if settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT:
+        soft_price_enforced: bool = settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT
+        if self._gate_runs(
+            idle_pool_candidate, eligible_for_rental_share, soft_price_enforced
+        ) and self._is_over_soft_price_limit(job_result):
+            if eligible_for_rental_share:
+                self._log_soft_price_limit(job_result)
+            if soft_price_enforced:
                 eligible_for_rental_share = False
                 p90: float | None = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
                 reason: MinerLogLine = MinerLogLine.no_payout_because_price_above_market_soft_limit(
@@ -1023,10 +1037,16 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2520 disk/VRAM gate: an idle machine without the required disk margin over its
         # GPU VRAM is not realistically rentable, so it forfeits the unrented incentive (node
         # stays active). While the flag is off we only log the would-be exclusion (shadow).
-        insufficient_disk = self._insufficient_disk(job_result) if eligible_for_rental_share else None
+        disk_enforced: bool = settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT
+        insufficient_disk = (
+            self._insufficient_disk(job_result)
+            if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, disk_enforced)
+            else None
+        )
         if insufficient_disk is not None:
-            self._log_insufficient_disk(job_result, insufficient_disk)
-            if settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT:
+            if eligible_for_rental_share:
+                self._log_insufficient_disk(job_result, insufficient_disk)
+            if disk_enforced:
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
                     job_result, insufficient_disk
@@ -1034,14 +1054,16 @@ class RentalPriceIncentive(DefaultIncentive):
                 job_result.record_incentive_log(reason)
 
         # DAH-2546 flagship capability gate; shadow-only while the flag is off
+        flagship_enforced: bool = settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT
         missing_capability = (
             self._missing_flagship_capability(job_result, base_model)
-            if eligible_for_rental_share
+            if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, flagship_enforced)
             else None
         )
         if missing_capability is not None:
-            self._log_flagship_capability_limit(job_result, missing_capability)
-            if settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT:
+            if eligible_for_rental_share:
+                self._log_flagship_capability_limit(job_result, missing_capability)
+            if flagship_enforced:
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
                     job_result, missing_capability
@@ -1053,17 +1075,29 @@ class RentalPriceIncentive(DefaultIncentive):
         # (node stays active). While the flag is off we only log the would-be exclusion.
         # Last in the chain, so a node already excluded by an ENFORCED gate above is not
         # measured here - read the shadow numbers against the flags that were on that cycle.
+        power_cap_enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_LIMIT
         power_cap_incapable: PowerCapIncapable | None = (
-            self._power_cap_incapable(job_result) if eligible_for_rental_share else None
+            self._power_cap_incapable(job_result)
+            if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, power_cap_enforced)
+            else None
         )
         if power_cap_incapable is not None:
-            self._log_power_cap_limit(job_result, power_cap_incapable)
-            if settings.ENABLE_UNRENTED_POWER_CAP_LIMIT:
+            if eligible_for_rental_share:
+                self._log_power_cap_limit(job_result, power_cap_incapable)
+            if power_cap_enforced:
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_cannot_apply_gpu_power_cap(
                     job_result, power_cap_incapable
                 )
                 job_result.record_incentive_log(reason)
+
+        # an eligible node has these two factors checked after pricing (_explain_zero_effective_rate)
+        if idle_pool_candidate and not eligible_for_rental_share:
+            self._explain_zero_node_rate_factors(
+                job_result,
+                get_min_driver_multiplier(job_result.nvidia_driver_version),
+                1.0 if job_result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED,
+            )
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
@@ -1099,6 +1133,10 @@ class RentalPriceIncentive(DefaultIncentive):
             ):
                 reason: MinerLogLine = MinerLogLine.no_payout_because_gpu_model_not_in_unrented_program(job_result)
                 job_result.record_incentive_log(reason)
+            return job_result
+
+        if excluded_from_both_pools:
+            job_result.mining_score = 0
             return job_result
 
         # For rented or non-eligible GPUs, use parent's default scoring logic

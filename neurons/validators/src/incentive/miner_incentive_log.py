@@ -18,7 +18,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 
 1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
    because <reason>" (`MinerLogLine.no_payout_because_*` constructors):
-   Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
+   Group A — earns nothing in EITHER pool (built by `_reasons_excluded_from_both_pools`):
      spot tier, Discord not connected, paused for new rentals, running own default job
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
@@ -31,6 +31,9 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
        marketplace floor (nobody can rent it; the rented GPUs keep earning),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
+   Every reason that applies is recorded, in the order above: a node blocked by Discord
+   still learns that its 8x flagship gate blocks it too. The first entry is the one the
+   old first-match evaluation reported.
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
@@ -341,7 +344,12 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_nvidia_driver_below_minimum(result: JobResult) -> MinerLogLine:
+    def no_payout_because_nvidia_driver_below_minimum(
+        result: JobResult, driver_multiplier: float | None = None
+    ) -> MinerLogLine:
+        # a node blocked before pricing never gets result.driver_multiplier set; the caller passes it
+        if driver_multiplier is None:
+            driver_multiplier = result.driver_multiplier
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.NVIDIA_DRIVER_BELOW_MINIMUM,
@@ -352,7 +360,7 @@ class MinerLogLine(BaseModel):
             ),
             extra_fields={
                 "nvidia_driver_version": result.nvidia_driver_version,
-                "driver_multiplier": result.driver_multiplier,
+                "driver_multiplier": driver_multiplier,
             },
         )
 
