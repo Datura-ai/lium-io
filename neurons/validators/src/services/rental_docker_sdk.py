@@ -19,6 +19,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 # 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
 # A stuck pull looks like a slow pull, so only this deadline stops it.
 DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 60 * 60
+_REGISTRY_DIGEST_TIMEOUT_SECONDS = 10
 _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
 _DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
 _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
@@ -255,6 +256,30 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK inspect image failed", exc)
             ) from exc
         return True
+
+    async def local_image_is_current(
+        self, *, image: str, auth_config: dict[str, str] | None = None
+    ) -> bool:
+        """True when the local image has the digest that the registry has now for this tag."""
+        if "@sha256:" in image:
+            return True  # a digest reference cannot move
+        try:
+            local_image = await _in_docker_thread(self._api_client.inspect_image, image)
+            distribution = await asyncio.wait_for(
+                _in_docker_thread(
+                    self._api_client.inspect_distribution, image, auth_config=auth_config
+                ),
+                timeout=_REGISTRY_DIGEST_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK registry digest check failed", exc)
+            ) from exc
+        remote_digest = distribution["Descriptor"]["digest"]
+        return any(
+            repo_digest.endswith(f"@{remote_digest}")
+            for repo_digest in local_image.get("RepoDigests") or ()
+        )
 
     async def run_container(self, spec: ContainerRunSpec) -> None:
         try:
@@ -889,6 +914,10 @@ def _create_docker_api_client_with_rental_ssh_adapter(
         docker_api_client.SSHHTTPAdapter = original_adapter
 
 
+# The Docker SDK SSH session idles through a long build, so it needs a keepalive.
+RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC = 30
+
+
 def _build_rental_ssh_http_adapter_class(
     *,
     key_path: Path,
@@ -897,6 +926,12 @@ def _build_rental_ssh_http_adapter_class(
     from docker.transport.sshconn import SSHHTTPAdapter
 
     class RentalSSHHTTPAdapter(SSHHTTPAdapter):
+        def _connect(self) -> None:
+            super()._connect()
+            transport = self.ssh_client.get_transport() if self.ssh_client else None
+            if transport is not None:
+                transport.set_keepalive(RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC)
+
         def _create_paramiko_client(self, base_url):
             import logging
             import urllib.parse
