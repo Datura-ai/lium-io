@@ -117,15 +117,13 @@ class ContextConfig:
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
     # scored cycle; every other check is the same.
     first_pass: bool = False
-    # Designated-hotkey fast validation: True only for the FIRST, unscored verification of a node
-    # registered under a designated miner hotkey (settings.DESIGNATED_MINER_HOTKEYS —
-    # never the shared pool hotkey custodied provider accounts list under, see config.py) with
-    # DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED on (resolved in PipelineFactory.build_context). The
-    # collateral read and VerifyX are skipped, the matmul runs at the first-pass VRAM budget and
-    # the score calculator waives the two gates those checks feed (collateral, VerifyX EMA);
-    # every check that catches a broken node runs as on any other node. Independent of
-    # `first_pass` above: FIRST_PASS_FAST_PATH_ENABLED off leaves this profile whole.
+    # The express lane's first pass of a node under a DESIGNATED_MINER_HOTKEYS hotkey, flag on.
+    # Skips collateral and VerifyX; independent of FIRST_PASS_FAST_PATH_ENABLED.
     designated_hotkey_first_pass: bool = False
+
+    @property
+    def uses_first_pass_matmul_budget(self) -> bool:
+        return self.first_pass or self.designated_hotkey_first_pass
 
 
 @dataclass(frozen=True)

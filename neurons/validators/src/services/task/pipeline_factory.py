@@ -255,8 +255,7 @@ class PipelineFactory:
                 port_public_key=public_key,
                 job_batch_id=miner_info.job_batch_id,
                 first_pass=first_pass and settings.FIRST_PASS_FAST_PATH_ENABLED,
-                # Designated-hotkey profile: keyed on the miner hotkey the validator authenticated, never on a field
-                # the executor reports; the caller's first_pass keeps every scored cycle whole.
+                # Keyed on the authenticated miner hotkey, never on a field the executor reports.
                 designated_hotkey_first_pass=settings.is_designated_hotkey_first_pass(
                     miner_info.miner_hotkey, first_pass
                 ),

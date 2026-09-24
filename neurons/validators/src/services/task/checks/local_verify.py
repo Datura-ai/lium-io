@@ -103,22 +103,14 @@ def _matmul_ssh_reason(ctx: Context) -> str | None:
     """
     if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
         return "allcards_ssh"
-    if _verifyx_wanted(ctx) and not ctx.config.first_pass:
+    if _should_run_verifyx(ctx) and not ctx.config.first_pass:
         return "scored_ssh"
     return None
 
 
-def _verifyx_wanted(ctx: Context) -> bool:
-    """Whether VerifyX is part of this run at all. Designated-hotkey profile: on such a node's first
-    pass VerifyXCheck skips its run, so the one call must not carry the challenge either — otherwise
-    the round trip would hold the full-size VerifyX the profile exists to avoid."""
+def _should_run_verifyx(ctx: Context) -> bool:
+    """VerifyXCheck skips a designated-hotkey first pass, so the call must not carry VerifyX either."""
     return ctx.config.verifyx_enabled and not ctx.config.designated_hotkey_first_pass
-
-
-def _small_matmul(ctx: Context) -> bool:
-    """The matmul at the first-pass VRAM budget: DAH-3011's first pass, or the designated-hotkey
-    first pass (same sizing CapabilityCheck applies on the SSH path)."""
-    return ctx.config.first_pass or ctx.config.designated_hotkey_first_pass
 
 
 class _NothingToSend(Exception):
@@ -169,7 +161,7 @@ class LocalVerifyCheck:
             )
 
         matmul_ssh_reason = _matmul_ssh_reason(ctx)
-        if matmul_ssh_reason is not None and not _verifyx_wanted(ctx):
+        if matmul_ssh_reason is not None and not _should_run_verifyx(ctx):
             return self._fallback(
                 ctx, "call", matmul_ssh_reason, "matmul on SSH and VerifyX off: nothing to run"
             )
@@ -227,10 +219,10 @@ class LocalVerifyCheck:
                     specs,
                     ctx.default_extra,
                     vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB
-                    if _small_matmul(ctx)
+                    if ctx.config.uses_first_pass_matmul_budget
                     else None,
                 )
-            if _verifyx_wanted(ctx):
+            if _should_run_verifyx(ctx):
                 verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
                     specs,
                     ctx.default_extra,

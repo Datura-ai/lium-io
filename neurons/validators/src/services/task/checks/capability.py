@@ -52,13 +52,10 @@ class CapabilityCheck:
 
         # DAH-3011: a first, unscored verification sizes the matmul from a VRAM budget instead of
         # the whole card (same challenge/seal/UUID check). The keyword is only passed on that path
-        # so the scored call is byte-for-byte today's. A designated-hotkey node's first pass takes
-        # the same budget — the probe is KEPT (it is what proves the card computes and answers to
-        # its UUID), only the fill-the-card size, which exists to make a scored cycle expensive to
-        # fake, is dropped.
+        # so the scored call is byte-for-byte today's.
         sizing = (
             {"vram_budget_mb": settings.FIRST_PASS_MATMUL_VRAM_MB}
-            if ctx.config.first_pass or ctx.config.designated_hotkey_first_pass
+            if ctx.config.uses_first_pass_matmul_budget
             else {}
         )
 

@@ -32,6 +32,7 @@ from neurons.validators.src.services.task.messages import PortCountMessages as P
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as RentMsg
 from neurons.validators.src.services.task.messages import SysboxRequiredMessages as SysboxMsg
 from neurons.validators.src.services.task.messages import VerifyXMessages as VxMsg
+from neurons.validators.src.services.task.pipeline import Context
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 from neurons.validators.src.services.task.score_calculator import calculate_scores
 
@@ -171,8 +172,8 @@ def test_profile_needs_flag_listed_hotkey_and_first_pass(
 
 
 async def _build_context(
-    miner_hotkey: str, first_pass: bool, executor_overrides: dict | None = None
-):
+    miner_hotkey: str, first_pass: bool, executor_overrides: dict[str, object] | None = None
+) -> Context:
     """build_context with everything stubbed, capturing the ContextConfig the factory assembles."""
     redis = SimpleNamespace(
         get_verified_job_info=AsyncMock(return_value={}),
@@ -562,8 +563,13 @@ async def test_rental_verification_still_rents_the_probe_container_for_both(desi
 
 
 def _score_ctx(
-    designated: bool, specs: dict, *, price_per_gpu=None, collateral_deposited=False, **flags
-):
+    designated: bool,
+    specs: dict[str, object],
+    *,
+    price_per_gpu: float | None = None,
+    collateral_deposited: bool = False,
+    **flags: bool,
+) -> Context:
     executor = default_executor().model_copy(update={"price_per_gpu": price_per_gpu})
     return make_context(
         executor=executor,
