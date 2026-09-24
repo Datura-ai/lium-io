@@ -185,6 +185,8 @@ class ExecutorSpecRequest(ValidatorMessage):
     # DAH-2792: specs the validator scored for this miner in this job_batch_id; expected minus received
     # is what was lost on the socket
     batch_total: int | None = None
+    # 1.2.0: the answer to a RecheckExecutorRequest, run out of cycle; the backend credits no uptime for it
+    recheck: bool = False
 
 
 @VALIDATOR_MESSAGES.register

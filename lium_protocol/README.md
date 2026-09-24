@@ -45,7 +45,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 
 ## Versions
 
-- `1.2.0` — `RecheckExecutorRequest` (new backend message: run one executor's checks now, after a rent on it failed for the host's reasons; answered by the ordinary spec report).
+- `1.2.0` — `RecheckExecutorRequest` (new backend message: run one executor's checks now, after a rent on it failed for the host's reasons; answered by the ordinary spec report, which carries the new optional `ExecutorSpecRequest.recheck: true`).
 - `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed) and `FailedContainerRequest.step_detail` (optional; the Docker daemon's reason for a failed volume step, or the dead-transport hint).
 - `1.0.0` — first release.
 

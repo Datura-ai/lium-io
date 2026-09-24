@@ -2424,6 +2424,11 @@
           "default": null,
           "title": "Queue Depth"
         },
+        "recheck": {
+          "default": false,
+          "title": "Recheck",
+          "type": "boolean"
+        },
         "score": {
           "anyOf": [
             {
