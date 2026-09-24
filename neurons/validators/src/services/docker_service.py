@@ -6157,6 +6157,10 @@ class DockerService:
                         # The validator's own sshd install is best-effort and such rents reached RUNNING
                         # before the gate (Jupyter- or HTTP-only use): measure them, never fail them.
                         ssh_ready_mode = SshReadyMode.LOG
+                    if ssh_ready_mode is SshReadyMode.ENFORCE and payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+                        # No renter logs in to a filler, and a failed one costs the provider its filler
+                        # earnings while holding the create lock ahead of a paying renter: measure only.
+                        ssh_ready_mode = SshReadyMode.LOG
                     if ssh_ready_mode is not SshReadyMode.OFF and ssh_external_port is None:
                         logger.warning(
                             _m("SSH ready gate skipped: no port maps to 22", extra=get_extra_info(ssh_ready_extra))

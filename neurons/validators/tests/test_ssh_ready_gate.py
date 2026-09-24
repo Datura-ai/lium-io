@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import services.docker_service as ds_module
-from payload_models.payloads import ContainerCreated, FailedContainerRequest, ProfilerStepName
+from payload_models.payloads import ContainerCreated, FailedContainerRequest, ProfilerStepName, WorkloadKind
 from services.ssh_ready_gate import (
     SshNotReady,
     SshReadyMode,
@@ -574,3 +574,41 @@ async def test_the_rental_probes_create_writes_no_log_mode_line(svc, monkeypatch
     assert isinstance(result, ContainerCreated)
     assert not ds_module._SSH_READY_LOG_TASKS
     wait.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enforce_logs_instead_for_a_filler(svc, monkeypatch):
+    """No renter logs in to a filler: enforce measures it and never fails it."""
+    _patch_happy(svc, monkeypatch, _ssh_client())
+    _set_mode(monkeypatch, "enforce")
+    clock = _FakeClock()
+    _patch_wait(monkeypatch, _probe_ready_after(clock, float("inf")), clock)
+    mock_logger = Mock()
+    monkeypatch.setattr(ds_module, "logger", mock_logger)
+
+    result = await _run(svc, _payload(ships_sshd=True, workload_kind=WorkloadKind.FILLER))
+
+    assert isinstance(result, ContainerCreated)
+    assert ProfilerStepName.SSH_READY not in {p.name for p in result.profilers}
+    await asyncio.gather(*list(ds_module._SSH_READY_LOG_TASKS))
+    (line,) = _gate_lines(mock_logger, "warning")
+    assert line.extra["ssh_ready_mode"] == "log"
+    assert line.extra["workload_kind"] == "FILLER"
+
+
+@pytest.mark.asyncio
+async def test_enforce_still_waits_for_a_customer_rental(svc, monkeypatch):
+    _patch_happy(svc, monkeypatch, _ssh_client())
+    _set_mode(monkeypatch, "enforce")
+    clock = _FakeClock()
+    _patch_wait(monkeypatch, _probe_ready_after(clock, float("inf")), clock)
+    mock_logger = Mock()
+    monkeypatch.setattr(ds_module, "logger", mock_logger)
+
+    result = await _run(svc, _payload(ships_sshd=True, workload_kind=WorkloadKind.CUSTOMER_RENTAL))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "ssh_ready"
+    (line,) = _gate_lines(mock_logger, "warning")
+    assert line.extra["ssh_ready_mode"] == "enforce"
+    assert line.extra["workload_kind"] == "CUSTOMER_RENTAL"
