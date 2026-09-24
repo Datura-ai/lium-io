@@ -889,12 +889,17 @@ class GpuUsageMessages:
             "still shows a rental on the node, leave the container running and contact Lium support."
         ),
     )
+    ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION = (
+        "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
+        "node uses it: {rental_status}. Do not stop or remove it: contact Lium support with the "
+        "container name."
+    )
     TEARDOWN_IN_PROGRESS = MessageTemplate(
         event="Rental teardown in progress",
         reason="TEARDOWN_IN_PROGRESS",
         severity="info",
         category="runtime",
-        impact="GPU usage re-checked next cycle; score not set to 0",
+        impact="GPU usage re-checked next cycle",
         remediation=(
             "No action needed. A rental on this node has just ended and Lium is stopping its "
             "container; do not stop it yourself."
@@ -905,7 +910,7 @@ class GpuUsageMessages:
         reason="RENTAL_STARTED_DURING_RUN",
         severity="info",
         category="runtime",
-        impact="GPU usage re-checked next cycle; score not set to 0",
+        impact="GPU usage re-checked next cycle",
         remediation="No action needed. The GPU is held by a rental that started while this run was in progress.",
     )
     FOREIGN_PROCESS = MessageTemplate(

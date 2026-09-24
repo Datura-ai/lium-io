@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import UUID
@@ -35,7 +35,8 @@ from services.gpu_wedge import (
 
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import CheckResult, Context, ContextState
+from .verifyx import with_last_known_verifyx_ema
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,11 @@ class PodRentalState(str, Enum):
     ENDED_DURING_RUN = "ended_during_run"
     ENDED_RECENTLY = "ended_recently"
     LIVE = "live"
+    LIVE_ON_ANOTHER_NODE = "live_on_another_node"
     ORPHAN = "orphan"
+
+
+_ORPHAN_STATES = frozenset({PodRentalState.ORPHAN, PodRentalState.LIVE_ON_ANOTHER_NODE})
 
 
 @dataclass(frozen=True)
@@ -283,14 +288,21 @@ class GpuUsageCheck:
         rentals: list[PodContainerRental] = list(
             await asyncio.gather(*(_pod_container_rental(ctx, name) for name in pod_containers))
         )
-        orphans = [rental for rental in rentals if rental.state is PodRentalState.ORPHAN]
+        orphans = [rental for rental in rentals if rental.state in _ORPHAN_STATES]
         if orphans:
             orphan = orphans[0]
+            # This node's portal page shows no rental for a pod registered elsewhere, so the usual
+            # "confirm, then remove" advice would clear the removal of a live rental's container.
+            remediation_template: str = (
+                Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
+                if orphan.state is PodRentalState.LIVE_ON_ANOTHER_NODE
+                else Msg.ORPHANED_CONTAINER.remediation
+            )
             event = render_message(
                 Msg.ORPHANED_CONTAINER,
                 ctx=ctx,
                 check_id=self.check_id,
-                remediation=Msg.ORPHANED_CONTAINER.remediation.format(
+                remediation=remediation_template.format(
                     orphaned_container=orphan.container_name,
                     pod=f" (pod {orphan.pod_id})" if orphan.pod_id else "",
                     rental_status=orphan.rental_status,
@@ -311,11 +323,17 @@ class GpuUsageCheck:
 
         ended = any(rental.state is not PodRentalState.LIVE for rental in rentals)
         template = Msg.TEARDOWN_IN_PROGRESS if ended else Msg.RENTAL_STARTED_DURING_RUN
-        actual_score, job_score, warning_message = ctx.services.score_calculator(ctx, ctx.rented)
+        # VerifyXCheck writes the download-speed EMA an idle score needs, and it runs after this
+        # halt: without the last known value the calculator scores every deferred node 0.
+        state: ContextState = replace(ctx.state, specs=with_last_known_verifyx_ema(ctx))
+        actual_score, job_score, warning_message = ctx.services.score_calculator(
+            ctx.model_copy(update={"state": state}), ctx.rented
+        )
         event = render_message(
             template,
             ctx=ctx,
             check_id=self.check_id,
+            impact=f"{template.impact}; job score={job_score}, actual score={actual_score}",
             what={
                 **violation,
                 "pod_containers": rentals,
@@ -328,6 +346,7 @@ class GpuUsageCheck:
             passed=True,
             event=event,
             updates={
+                "state": state,
                 "score": actual_score,
                 "job_score": job_score,
                 "score_warning": warning_message or None,
@@ -569,20 +588,29 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
     pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
 
     if pod_rental is not None and not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
-        status = (
-            "its rental is live but registered to another node"
-            if pod_rental.active
-            else "its rental belongs to another node"
+        if pod_rental.active:
+            return PodContainerRental(
+                container_name,
+                pod_id,
+                PodRentalState.LIVE_ON_ANOTHER_NODE,
+                "its rental is live but registered to another node",
+            )
+        return PodContainerRental(
+            container_name, pod_id, PodRentalState.ORPHAN, "its rental belongs to another node"
         )
-        return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status)
     if pod_rental is not None and pod_rental.active:
         return PodContainerRental(container_name, pod_id, PodRentalState.LIVE, "its rental is live")
 
     closed_at: datetime | None = pod_rental.rental_closed_at if pod_rental else None
     if closed_at is not None:
-        minutes_closed = max(0, round(_time_since_the_rental_closed(closed_at).total_seconds() / 60))
-        status = f"its rental ended {minutes_closed} minutes ago"
-        if minutes_closed > RENTAL_TEARDOWN_GRACE_MINUTES:
+        since_closed: timedelta = _time_since_the_rental_closed(closed_at)
+        # A close time ahead of this clock is backend-validator skew on a rental that just ended.
+        status = (
+            f"its rental ended {round(since_closed.total_seconds() / 60)} minutes ago"
+            if since_closed >= timedelta(minutes=1)
+            else "its rental ended just now"
+        )
+        if since_closed >= timedelta(minutes=RENTAL_TEARDOWN_GRACE_MINUTES):
             return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
         state = PodRentalState.ENDED_DURING_RUN if rented_at_run_start else PodRentalState.ENDED_RECENTLY
         return PodContainerRental(container_name, pod_id, state, status, closed_at)

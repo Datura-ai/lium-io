@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
+    NetworkEMA,
     PodRentalActiveResponse,
     RentedExecutor,
     RentedExecutorsResponse,
@@ -16,6 +17,7 @@ from neurons.validators.src.services.task.checks.rented_machine import TenantEnf
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as TenantMsg
 from neurons.validators.src.services.task.pipeline import Pipeline
+from neurons.validators.src.services.task.score_calculator import calculate_scores
 
 from tests.helpers import build_context_config, build_services, build_state, default_executor
 
@@ -156,7 +158,14 @@ def _pod_process(container_name: str = TEARDOWN_POD, pid: int = 3217038) -> dict
     return {"pid": pid, "info": "0::/../docker-a.scope", "container_name": container_name}
 
 
-def _snapshot_with_pod(pod_id: str = TEARDOWN_POD_ID) -> RentedExecutorsResponse:
+def _snapshot_with_pod(
+    pod_id: str = TEARDOWN_POD_ID, *, last_verifyx_download_speed: float | None = None
+) -> RentedExecutorsResponse:
+    network_ema = (
+        {default_executor().uuid: NetworkEMA(ema_verifyx_download_speed=last_verifyx_download_speed)}
+        if last_verifyx_download_speed is not None
+        else {}
+    )
     return RentedExecutorsResponse(
         executors={
             default_executor().uuid: RentedExecutor(
@@ -165,7 +174,28 @@ def _snapshot_with_pod(pod_id: str = TEARDOWN_POD_ID) -> RentedExecutorsResponse
                 executor_ip_port="22",
                 pods=[RentedPod(pod_id=pod_id, container_name=f"{POD_CONTAINER_PREFIX}{pod_id}")],
             )
-        }
+        },
+        network_ema=network_ema,
+    )
+
+
+def _scored_ctx(context_factory, *, rented_data: RentedExecutorsResponse):
+    """An idle node scored by the real calculator, with the scrape's specs as they stand at this check:
+    VerifyXCheck, the only writer of the download-speed EMA, has not run yet."""
+    services = build_services(score_calculator=calculate_scores)
+    services.backend.get_pod_rental_active.return_value = _closed(minutes_ago=1)
+    state = build_state(
+        gpu_details=BUSY_GPU,
+        gpu_processes=[_pod_process()],
+        rented_data=rented_data,
+        specs={"network": {"download_speed": 900.0}},
+    )
+    return context_factory(
+        executor=default_executor().model_copy(update={"price_per_gpu": None}),
+        services=services,
+        config=build_context_config(),
+        state=state,
+        collateral_deposited=True,
     )
 
 
@@ -198,11 +228,7 @@ class _ListSink:
 
 @pytest.mark.asyncio
 async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(context_factory):
-    scores = _Scores(actual_score=1.0, job_score=1.0)
-    services = build_services(score_calculator=scores)
-    services.backend.get_pod_rental_active.return_value = _closed(minutes_ago=1)
-    state = build_state(gpu_details=BUSY_GPU, gpu_processes=[_pod_process()], rented_data=_snapshot_with_pod())
-    ctx = context_factory(services=services, config=build_context_config(), state=state)
+    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
     sink = _ListSink()
     rented_machine = "neurons.validators.src.services.task.checks.rented_machine"
 
@@ -218,14 +244,27 @@ async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(co
     ]
     teardown = events[-1]
     assert teardown.severity == "info"
-    assert "score not set to 0" in teardown.impact
+    assert teardown.impact == "GPU usage re-checked next cycle; job score=1.0, actual score=1.0"
     assert teardown.what_we_saw["pod_containers"][0].state is PodRentalState.ENDED_DURING_RUN
     assert ok is True
     assert final_ctx.rented is False
     assert final_ctx.score == 1.0
     assert final_ctx.success is True
-    assert scores.rented_flags == [False]
+    assert final_ctx.state.specs["network"]["ema_verifyx_download_speed"] == 800.0
     assert sink.events[-1].reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+
+
+@pytest.mark.asyncio
+async def test_teardown_on_a_node_with_no_download_speed_on_record_still_scores_0(context_factory):
+    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod())
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    assert result.updates["score"] == 0.0
+    assert result.updates["success"] is False
+    assert result.event.impact == "GPU usage re-checked next cycle; job score=0.0, actual score=0.0"
+    assert "EMA verifyx download speed unavailable" in result.updates["score_warning"]
 
 
 @pytest.mark.asyncio
@@ -330,6 +369,63 @@ async def test_a_recent_rental_of_another_node_buys_no_deferral(context_factory)
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
     assert result.event.what_we_saw["rental_status"] == "its rental belongs to another node"
+
+
+@pytest.mark.asyncio
+async def test_a_live_rental_of_another_node_is_an_orphan_the_provider_must_not_remove(context_factory):
+    ctx = _unrented_ctx(
+        context_factory, pod_rental=PodRentalActiveResponse(active=True, executor_id="another-executor")
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert result.event.what_we_saw["rental_status"] == "its rental is live but registered to another node"
+    assert "Do not stop or remove it: contact Lium support" in result.event.remediation
+    assert "docker rm" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_factory):
+    orphan_pod_id = "0b7c2f6e-9d41-4c8a-8e3f-5a6b7c8d9e0f"
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=None,
+        rented_data=_snapshot_with_pod(),
+        gpu_processes=[_pod_process(), _pod_process(f"{POD_CONTAINER_PREFIX}{orphan_pod_id}", pid=4242)],
+    )
+    rentals = {TEARDOWN_POD_ID: _closed(minutes_ago=1), orphan_pod_id: PodRentalActiveResponse(active=False)}
+    ctx.services.backend.get_pod_rental_active.side_effect = lambda pod_id: rentals[pod_id]
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert result.event.what_we_saw["rental_status"] == "Lium has no rental for it"
+    assert f"(pod {orphan_pod_id})" in result.event.remediation
+
+
+@pytest.mark.parametrize(
+    "minutes_ago,reason,rental_status",
+    [
+        (14 + 50 / 60, Msg.TEARDOWN_IN_PROGRESS.reason, "its rental ended 15 minutes ago"),
+        (15 + 10 / 60, Msg.ORPHANED_CONTAINER.reason, "its rental ended 15 minutes ago"),
+        (-2, Msg.TEARDOWN_IN_PROGRESS.reason, "its rental ended just now"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_grace_window_ends_at_15_minutes_after_the_close(
+    context_factory, minutes_ago, reason, rental_status
+):
+    ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=minutes_ago))
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == reason
+    rentals = result.event.what_we_saw.get("pod_containers")
+    observed_status = rentals[0].rental_status if rentals else result.event.what_we_saw["rental_status"]
+    assert observed_status == rental_status
 
 
 @pytest.mark.asyncio
