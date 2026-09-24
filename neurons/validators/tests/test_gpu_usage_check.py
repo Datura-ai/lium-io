@@ -6,11 +6,16 @@ import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
     PodRentalActiveResponse,
+    RentedExecutor,
     RentedExecutorsResponse,
+    RentedPod,
 )
 from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
-from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
+from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck, PodRentalState
+from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
+from neurons.validators.src.services.task.messages import TenantEnforcementMessages as TenantMsg
+from neurons.validators.src.services.task.pipeline import Pipeline
 
 from tests.helpers import build_context_config, build_services, build_state, default_executor
 
@@ -121,9 +126,264 @@ async def test_gpu_usage_orphaned_container(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
     assert result.event.what_we_saw.get("orphaned_container") == container_name
-    assert result.event.what_we_saw.get("rental_status") == "ended"
+    assert result.event.what_we_saw.get("rental_status") == "Lium has no rental for it"
     assert result.event.what_we_saw.get("container_status") == "still running"
-    assert f"docker stop {container_name}" in result.event.remediation
+    assert "Provider Portal must show no active rental" in result.event.remediation
+
+
+# --- A rental that ends while the run is inside it is teardown, not an orphan ---
+# The scrape reads the GPU processes at the start of the run. TenantEnforcementCheck then finds the
+# pod the snapshot listed no longer running, the backend calls its rental inactive, and the run goes
+# on as unrented, with the stopping pod container still in the process list.
+
+TEARDOWN_POD_ID = "5703f4c9-c2f4-4fae-a652-3dee4753030a"
+TEARDOWN_POD = f"{POD_CONTAINER_PREFIX}{TEARDOWN_POD_ID}"
+BUSY_GPU = [{"gpu_utilization": 100, "memory_utilization": 61}]
+
+
+class _Scores:
+    def __init__(self, actual_score: float = 1.0, job_score: float = 1.0):
+        self.actual_score = actual_score
+        self.job_score = job_score
+        self.rented_flags: list[bool] = []
+
+    def __call__(self, ctx, rented: bool):
+        self.rented_flags.append(rented)
+        return self.actual_score, self.job_score, ""
+
+
+def _pod_process(container_name: str = TEARDOWN_POD, pid: int = 3217038) -> dict:
+    return {"pid": pid, "info": "0::/../docker-a.scope", "container_name": container_name}
+
+
+def _snapshot_with_pod(pod_id: str = TEARDOWN_POD_ID) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            default_executor().uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=[RentedPod(pod_id=pod_id, container_name=f"{POD_CONTAINER_PREFIX}{pod_id}")],
+            )
+        }
+    )
+
+
+def _closed(minutes_ago: float) -> PodRentalActiveResponse:
+    return PodRentalActiveResponse(
+        active=False,
+        executor_id=default_executor().uuid,
+        rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+    )
+
+
+def _unrented_ctx(context_factory, *, pod_rental, rented_data=None, gpu_processes=None, scores=None):
+    services = build_services(score_calculator=scores or _Scores())
+    services.backend.get_pod_rental_active.return_value = pod_rental
+    state = build_state(
+        gpu_details=BUSY_GPU,
+        gpu_processes=gpu_processes or [_pod_process()],
+        rented_data=rented_data or RentedExecutorsResponse(executors={}),
+    )
+    return context_factory(services=services, config=build_context_config(), state=state, rented=False)
+
+
+class _ListSink:
+    def __init__(self):
+        self.events = []
+
+    async def emit(self, event) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(context_factory):
+    scores = _Scores(actual_score=1.0, job_score=1.0)
+    services = build_services(score_calculator=scores)
+    services.backend.get_pod_rental_active.return_value = _closed(minutes_ago=1)
+    state = build_state(gpu_details=BUSY_GPU, gpu_processes=[_pod_process()], rented_data=_snapshot_with_pod())
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+    sink = _ListSink()
+    rented_machine = "neurons.validators.src.services.task.checks.rented_machine"
+
+    with (
+        patch(f"{rented_machine}._check_pod_running", AsyncMock(return_value=(False, []))),
+        patch(f"{rented_machine}._collect_pod_diagnostics", AsyncMock(return_value={})),
+    ):
+        ok, events, final_ctx = await Pipeline([TenantEnforcementCheck(), GpuUsageCheck()], sink).run(ctx)
+
+    assert [event.reason_code for event in events] == [
+        TenantMsg.STALE_POD_NOT_RUNNING.reason,
+        Msg.TEARDOWN_IN_PROGRESS.reason,
+    ]
+    teardown = events[-1]
+    assert teardown.severity == "info"
+    assert "score not set to 0" in teardown.impact
+    assert teardown.what_we_saw["pod_containers"][0].state is PodRentalState.ENDED_DURING_RUN
+    assert ok is True
+    assert final_ctx.rented is False
+    assert final_ctx.score == 1.0
+    assert final_ctx.success is True
+    assert scores.rented_flags == [False]
+    assert sink.events[-1].reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+
+
+@pytest.mark.asyncio
+async def test_teardown_halts_the_run_so_nothing_after_it_loads_the_gpu(context_factory):
+    ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=1), rented_data=_snapshot_with_pod())
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.halt is True
+    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    assert "docker" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_a_pod_the_snapshot_listed_is_teardown_even_when_the_backend_is_unreachable(context_factory):
+    ctx = _unrented_ctx(context_factory, pod_rental=None, rented_data=_snapshot_with_pod())
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    assert result.event.what_we_saw["pod_containers"][0].rental_status == "its rental ended during this run"
+
+
+@pytest.mark.asyncio
+async def test_a_rental_that_ended_just_before_the_run_is_teardown(context_factory):
+    ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=10))
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    assert result.event.what_we_saw["pod_containers"][0].state is PodRentalState.ENDED_RECENTLY
+
+
+@pytest.mark.asyncio
+async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(context_factory):
+    ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=20))
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert result.event.impact == "Validation skipped; score set to 0"
+    assert result.event.what_we_saw["rental_status"] == "its rental ended 20 minutes ago"
+    remediation = result.event.remediation
+    assert remediation.startswith(
+        f"{TEARDOWN_POD} is named like a Lium pod container (pod {TEARDOWN_POD_ID}), and no live "
+        "rental on this node uses it: its rental ended 20 minutes ago."
+    )
+    assert "Provider Portal must show no active rental" in remediation
+    assert "docker stop" not in remediation
+    assert f"Only then remove it: docker rm -f {TEARDOWN_POD}" in remediation
+
+
+@pytest.mark.parametrize(
+    "pod_rental,rental_status",
+    [
+        (PodRentalActiveResponse(active=False), "Lium has no rental for it"),
+        (None, "Lium could not confirm a rental for it this cycle"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_container_that_was_never_rented_is_an_orphan(context_factory, pod_rental, rental_status):
+    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert result.event.what_we_saw["rental_status"] == rental_status
+
+
+@pytest.mark.asyncio
+async def test_a_pod_name_without_a_pod_id_is_an_orphan_without_asking(context_factory):
+    ctx = _unrented_ctx(
+        context_factory, pod_rental=_closed(minutes_ago=1), gpu_processes=[_pod_process("pod_whatever")]
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert "(pod " not in result.event.remediation
+    ctx.services.backend.get_pod_rental_active.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_recent_rental_of_another_node_buys_no_deferral(context_factory):
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=PodRentalActiveResponse(
+            active=False,
+            executor_id="another-executor",
+            rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        ),
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert result.event.what_we_saw["rental_status"] == "its rental belongs to another node"
+
+
+@pytest.mark.asyncio
+async def test_a_rental_that_started_mid_run_is_not_an_orphan(context_factory):
+    ctx = _unrented_ctx(
+        context_factory, pod_rental=PodRentalActiveResponse(active=True, executor_id=default_executor().uuid)
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.halt is True
+    assert result.event.reason_code == Msg.RENTAL_STARTED_DURING_RUN.reason
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_process_beside_a_tearing_down_pod_is_still_usage(context_factory):
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=_closed(minutes_ago=1),
+        rented_data=_snapshot_with_pod(),
+        gpu_processes=[_pod_process(), {"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+
+
+@pytest.mark.asyncio
+async def test_an_edit_parked_pod_container_is_judged_by_its_pod(context_factory):
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=_closed(minutes_ago=1),
+        gpu_processes=[_pod_process(f"{TEARDOWN_POD}__prev")],
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    ctx.services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
+
+
+@pytest.mark.asyncio
+async def test_teardown_event_payload_serializes_to_json(context_factory):
+    ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=1), rented_data=_snapshot_with_pod())
+
+    result = await GpuUsageCheck().run(ctx)
+
+    dumped = result.event.model_dump(mode="json")["what_we_saw"]
+    assert dumped["pod_containers"][0]["state"] == "ended_during_run"
+    assert dumped["pod_containers"][0]["pod_id"] == TEARDOWN_POD_ID
 
 
 @pytest.mark.asyncio

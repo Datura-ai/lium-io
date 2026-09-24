@@ -2,6 +2,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from uuid import UUID
 
 from core.config import settings
@@ -13,12 +14,14 @@ from protocol.vc_protocol.compute_requests import (
 )
 from services.const import (
     BROKEN_POD_CONTAINER_GRACE_MINUTES,
+    EDIT_PARKED_SUFFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     GPU_WEDGE_MEMORY_MAX,
     POD_CONTAINER_PREFIX,
+    RENTAL_TEARDOWN_GRACE_MINUTES,
 )
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
@@ -55,6 +58,23 @@ class WedgedGpu:
     gpu_uuid: str
     gpu_utilization: float | None
     memory_utilization: float | None
+
+
+class PodRentalState(str, Enum):
+    ENDED_DURING_RUN = "ended_during_run"
+    ENDED_RECENTLY = "ended_recently"
+    LIVE = "live"
+    ORPHAN = "orphan"
+
+
+@dataclass(frozen=True)
+class PodContainerRental:
+    container_name: str
+    pod_id: str | None
+    state: PodRentalState
+    # Provider-facing: completes "no live rental on this node uses it: ..." in the remediation.
+    rental_status: str
+    rental_closed_at: datetime | None = None
 
 
 class GpuUsageCheck:
@@ -219,24 +239,19 @@ class GpuUsageCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        # Check for orphaned rental containers
-        for process in gpu_processes:
-            container_name = process.get("container_name")
-            if container_name and container_name.startswith(POD_CONTAINER_PREFIX) and not ctx.rented:
-                # Found orphaned rental container - rental ended but container still running
-                event = render_message(
-                    Msg.ORPHANED_CONTAINER,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    remediation=Msg.ORPHANED_CONTAINER.remediation.format(orphaned_container=container_name),
-                    what={
-                        **violation,
-                        "orphaned_container": container_name,
-                        "rental_status": "ended",
-                        "container_status": "still running",
-                    },
-                )
-                return CheckResult(passed=False, event=event)
+        pod_containers: list[str] = sorted(
+            {
+                name
+                for process in gpu_processes
+                if (name := process.get("container_name")) and name.startswith(POD_CONTAINER_PREFIX)
+            }
+        )
+        if pod_containers and not ctx.rented:
+            pod_result = await self._judge_pod_containers_outside_a_rental(
+                ctx, violation, gpu_processes, pod_containers, filler_containers
+            )
+            if pod_result is not None:
+                return pod_result
 
         event = render_message(
             Msg.USAGE_HIGH,
@@ -245,6 +260,83 @@ class GpuUsageCheck:
             what=violation,
         )
         return CheckResult(passed=False, event=event)
+
+    async def _judge_pod_containers_outside_a_rental(
+        self,
+        ctx: Context,
+        violation: dict,
+        gpu_processes: list[dict],
+        pod_containers: list[str],
+        filler_containers: set[str],
+    ) -> CheckResult | None:
+        """A pod container on the GPU of a node this run judges as not rented.
+
+        The GPU processes are read at the start of the run and `ctx.rented` is settled later, from
+        the cycle's snapshot and the backend's answer about the pods in it. A renter who ends the
+        rental in between leaves the scrape holding a pod container that the unrent flow is still
+        stopping. That container, and one whose rental closed within RENTAL_TEARDOWN_GRACE_MINUTES,
+        is teardown: the run ends without a GPU verdict and the next cycle looks again. Only a
+        container with no rental, or whose rental closed longer ago, is an orphan. Returns None
+        when a process outside those containers and the node's fillers holds the GPU, leaving the
+        legacy verdict to the caller.
+        """
+        rentals: list[PodContainerRental] = list(
+            await asyncio.gather(*(_pod_container_rental(ctx, name) for name in pod_containers))
+        )
+        orphans = [rental for rental in rentals if rental.state is PodRentalState.ORPHAN]
+        if orphans:
+            orphan = orphans[0]
+            event = render_message(
+                Msg.ORPHANED_CONTAINER,
+                ctx=ctx,
+                check_id=self.check_id,
+                remediation=Msg.ORPHANED_CONTAINER.remediation.format(
+                    orphaned_container=orphan.container_name,
+                    pod=f" (pod {orphan.pod_id})" if orphan.pod_id else "",
+                    rental_status=orphan.rental_status,
+                ),
+                what={
+                    **violation,
+                    "orphaned_container": orphan.container_name,
+                    "rental_status": orphan.rental_status,
+                    "container_status": "still running",
+                    "pod_containers": rentals,
+                },
+            )
+            return CheckResult(passed=False, event=event)
+
+        expected_containers: set[str] = {rental.container_name for rental in rentals} | filler_containers
+        if any(process.get("container_name") not in expected_containers for process in gpu_processes):
+            return None
+
+        ended = any(rental.state is not PodRentalState.LIVE for rental in rentals)
+        template = Msg.TEARDOWN_IN_PROGRESS if ended else Msg.RENTAL_STARTED_DURING_RUN
+        actual_score, job_score, warning_message = ctx.services.score_calculator(ctx, ctx.rented)
+        event = render_message(
+            template,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                **violation,
+                "pod_containers": rentals,
+                "actual_score": actual_score,
+                "job_score": job_score,
+            },
+        )
+        # A halt, not a pass: the checks after this one load the GPU the pod still holds.
+        return CheckResult(
+            passed=True,
+            event=event,
+            updates={
+                "score": actual_score,
+                "job_score": job_score,
+                "score_warning": warning_message or None,
+                "success": actual_score > 0,
+                "log_status": "info",
+                "log_text": event.event,
+            },
+            halt=True,
+        )
 
     async def _detect_and_cure_ghost_gpus(
         self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
@@ -439,14 +531,68 @@ def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveRe
     """
     if pod_rental.status != BROKEN_POD_STATUS or pod_rental.rental_closed_at is None:
         return False
+    return _time_since_the_rental_closed(pod_rental.rental_closed_at) < timedelta(
+        minutes=BROKEN_POD_CONTAINER_GRACE_MINUTES
+    )
+
+
+def _time_since_the_rental_closed(rental_closed_at: datetime) -> timedelta:
     # The backend closes a rental with a naive UTC timestamp, but the field is a datetime parsed off
     # the wire: an offset in the JSON would make it aware, and mixing the two raises inside a fatal
     # check. Read a naive value as the UTC it is and compare in one frame.
-    closed_at: datetime = pod_rental.rental_closed_at
+    closed_at: datetime = rental_closed_at
     if closed_at.tzinfo is None:
         closed_at = closed_at.replace(tzinfo=timezone.utc)
-    time_since_the_rental_closed: timedelta = datetime.now(timezone.utc) - closed_at
-    return time_since_the_rental_closed < timedelta(minutes=BROKEN_POD_CONTAINER_GRACE_MINUTES)
+    return datetime.now(timezone.utc) - closed_at
+
+
+async def _pod_container_rental(ctx: Context, container_name: str) -> PodContainerRental:
+    """Where the rental behind a pod container stands now, re-read from the backend.
+
+    The cycle's snapshot says which pods were rented on this node when the run started; the
+    backend's close time says when the rental ended. A pod the snapshot listed ended during this
+    run, even when the backend cannot be reached now. A name the backend does not confirm stays an
+    orphan, as it always was: a container called pod_<any uuid> must not buy a deferral.
+    """
+    pod_id: str | None = _uuid_after_prefix(
+        container_name.removesuffix(EDIT_PARKED_SUFFIX), POD_CONTAINER_PREFIX
+    )
+    if pod_id is None:
+        return PodContainerRental(
+            container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
+        )
+
+    rented_executor = ctx.state.rented_data.executors.get(ctx.executor.uuid) if ctx.state.rented_data else None
+    rented_at_run_start: bool = rented_executor is not None and any(
+        pod.pod_id == pod_id for pod in rented_executor.pods
+    )
+    pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
+
+    if pod_rental is not None and not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
+        status = (
+            "its rental is live but registered to another node"
+            if pod_rental.active
+            else "its rental belongs to another node"
+        )
+        return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status)
+    if pod_rental is not None and pod_rental.active:
+        return PodContainerRental(container_name, pod_id, PodRentalState.LIVE, "its rental is live")
+
+    closed_at: datetime | None = pod_rental.rental_closed_at if pod_rental else None
+    if closed_at is not None:
+        minutes_closed = max(0, round(_time_since_the_rental_closed(closed_at).total_seconds() / 60))
+        status = f"its rental ended {minutes_closed} minutes ago"
+        if minutes_closed > RENTAL_TEARDOWN_GRACE_MINUTES:
+            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+        state = PodRentalState.ENDED_DURING_RUN if rented_at_run_start else PodRentalState.ENDED_RECENTLY
+        return PodContainerRental(container_name, pod_id, state, status, closed_at)
+
+    if rented_at_run_start:
+        return PodContainerRental(
+            container_name, pod_id, PodRentalState.ENDED_DURING_RUN, "its rental ended during this run"
+        )
+    status = "Lium could not confirm a rental for it this cycle" if pod_rental is None else "Lium has no rental for it"
+    return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status)
 
 
 def _uuid_after_prefix(container_name: str, prefix: str) -> str | None:

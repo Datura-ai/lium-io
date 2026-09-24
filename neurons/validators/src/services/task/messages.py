@@ -880,7 +880,33 @@ class GpuUsageMessages:
         severity="error",
         category="runtime",
         impact="Validation skipped; score set to 0",
-        remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
+        remediation=(
+            "{orphaned_container} is named like a Lium pod container{pod}, and no live rental on this "
+            "node uses it: {rental_status}. Lium stops a pod's container when its rental ends and the "
+            "validator removes leftovers, so this one should not be holding the GPU. Before you touch "
+            "it, confirm it is not a live rental: the node's page in the Provider Portal must show no "
+            "active rental. Only then remove it: docker rm -f {orphaned_container}. If the portal "
+            "still shows a rental on the node, leave the container running and contact Lium support."
+        ),
+    )
+    TEARDOWN_IN_PROGRESS = MessageTemplate(
+        event="Rental teardown in progress",
+        reason="TEARDOWN_IN_PROGRESS",
+        severity="info",
+        category="runtime",
+        impact="GPU usage re-checked next cycle; score not set to 0",
+        remediation=(
+            "No action needed. A rental on this node has just ended and Lium is stopping its "
+            "container; do not stop it yourself."
+        ),
+    )
+    RENTAL_STARTED_DURING_RUN = MessageTemplate(
+        event="Rental started during validation",
+        reason="RENTAL_STARTED_DURING_RUN",
+        severity="info",
+        category="runtime",
+        impact="GPU usage re-checked next cycle; score not set to 0",
+        remediation="No action needed. The GPU is held by a rental that started while this run was in progress.",
     )
     FOREIGN_PROCESS = MessageTemplate(
         event="Foreign GPU process on idle executor",

@@ -266,6 +266,11 @@ FILLER_CONTAINER_GRACE_MINUTES = 15
 # of margin. It must stay SHORT: the pod row itself survives 24 h, and an exemption that long would
 # let a provider reuse the name of their own broken pod for a foreign workload.
 BROKEN_POD_CONTAINER_GRACE_MINUTES = 2 * FILLER_CONTAINER_GRACE_MINUTES
+# How long after a rental closes its pod container still counts as the unrent flow's teardown rather
+# than an orphan: the GPU usage check defers to the next cycle instead of scoring 0. A run is shorter
+# than this, so a rental that ends while the run is inside it always lands here. It must stay short
+# for the same reason as the grace above: the pod's name must not shield a workload for long.
+RENTAL_TEARDOWN_GRACE_MINUTES = 15
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.
 FILLER_LIVENESS_GRACE_MINUTES = 10
