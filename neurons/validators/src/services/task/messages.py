@@ -1571,7 +1571,7 @@ class CachedTemplateMessages:
     PENDING = MessageTemplate(
         event="Recommended default image not cached yet on a newly seen executor",
         reason="RECOMMENDED_IMAGE_PENDING",
-        severity="warning",
+        severity="info",
         category="runtime",
         impact=(
             "None this cycle — a newly seen node is not failed on this check until its first "

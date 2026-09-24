@@ -625,7 +625,7 @@ async def test_fresh_node_is_pending_inside_the_grace(context_factory, monkeypat
 
     assert result.passed is True
     assert result.event.reason_code == Msg.PENDING.reason
-    assert result.event.severity == "warning"
+    assert result.event.severity == "info"
     grace = result.event.what_we_saw["fresh_node_grace"]
     assert grace["pending"] is True
     assert grace["first_sweep_completed"] is False
