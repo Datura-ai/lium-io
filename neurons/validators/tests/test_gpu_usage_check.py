@@ -14,7 +14,10 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
 from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 from neurons.validators.src.services.task.checks import gpu_usage
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck, PodRentalState
-from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
+from neurons.validators.src.services.task.checks.rented_machine import (
+    PodRunningAndAuthorizedKeys,
+    TenantEnforcementCheck,
+)
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as TenantMsg
 from neurons.validators.src.services.task.pipeline import Pipeline
@@ -237,7 +240,10 @@ async def _run_the_renter_ending_mid_run(ctx):
     sink = _ListSink()
     rented_machine = "neurons.validators.src.services.task.checks.rented_machine"
     with (
-        patch(f"{rented_machine}._check_pod_running", AsyncMock(return_value=(False, []))),
+        patch(
+            f"{rented_machine}._check_pod_running_and_read_authorized_keys",
+            AsyncMock(return_value=PodRunningAndAuthorizedKeys(running=False, authorized_keys=[])),
+        ),
         patch(f"{rented_machine}._collect_pod_diagnostics", AsyncMock(return_value={})),
     ):
         ok, events, final_ctx = await Pipeline([TenantEnforcementCheck(), GpuUsageCheck()], sink).run(ctx)
