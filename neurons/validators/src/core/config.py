@@ -568,6 +568,11 @@ class Settings(BaseSettings):
     RECHECK_REQUEST_MAX_AGE_SECONDS: int = Field(
         env="RECHECK_REQUEST_MAX_AGE_SECONDS", default=600, gt=0
     )
+    # The wave waits on a recheck running on its node only while this much of the executor's budget
+    # is still left for its own pass, so a recheck that ends late with nothing cannot zero the node.
+    RECHECK_WAVE_PIPELINE_ROOM_SECONDS: int = Field(
+        env="RECHECK_WAVE_PIPELINE_ROOM_SECONDS", default=480, gt=0
+    )
 
     @property
     def express_lane_runs(self) -> bool:

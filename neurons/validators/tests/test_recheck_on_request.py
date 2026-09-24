@@ -442,6 +442,42 @@ async def test_the_wave_runs_the_node_itself_when_the_recheck_produced_nothing(
 
 
 @pytest.mark.asyncio
+async def test_a_slow_recheck_leaves_the_wave_room_to_run_the_node_itself(
+    rest_miner_service, monkeypatch
+):
+    """The recheck outlasts the wave's wait and then produces nothing: the wave stops waiting at the
+    executor's budget minus the room a normal pass needs, runs the node's own pipeline, and leaves
+    the recheck running."""
+    from core.config import settings
+    from services.miner_service import executor_budget_seconds
+
+    monkeypatch.setattr(settings, "RECHECK_ON_REQUEST_ENABLED", True)
+    monkeypatch.setattr(settings, "JOB_TIME_OUT", 123)
+    monkeypatch.setattr(settings, "RECHECK_WAVE_PIPELINE_ROOM_SECONDS", 2)
+    assert executor_budget_seconds() == 3
+    node = str(uuid4())
+    outcome = asyncio.get_running_loop().create_future()
+    rest_miner_service.recheck_outcomes = {node: outcome}
+    rest_miner_service.in_flight[node] = RECHECK_LANE
+    rest_miner_service.miner_returns(node)
+
+    started = time.monotonic()
+    job = await asyncio.wait_for(_request(rest_miner_service), timeout=5)
+    waited = time.monotonic() - started
+
+    assert 1 <= waited < 3  # capped at 3 - 2 seconds, inside the 3-second budget
+    verified = [
+        c.kwargs["executor_info"].uuid
+        for c in rest_miner_service.task_service.create_task.call_args_list
+    ]
+    assert verified == [node]
+    assert [r.executor_info.uuid for r in job["results"]] == [node]
+    assert job["results"][0].job_batch_id == "2026-09-06 16:40:00"
+    assert not outcome.done()  # the recheck is not cancelled by the wave giving up
+    outcome.set_result(None)
+
+
+@pytest.mark.asyncio
 async def test_flags_off_the_wave_never_waits_on_a_recheck(rest_miner_service, monkeypatch):
     from core.config import settings
 

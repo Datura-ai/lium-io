@@ -221,6 +221,11 @@ RECHECK_LANE = "recheck"
 CYCLE_DONE = "cycle-done"
 
 
+def executor_budget_seconds() -> int:
+    """How long the wave gives one executor's run; the cycle waits JOB_TIME_OUT - 50 for every miner."""
+    return settings.JOB_TIME_OUT - 120
+
+
 class MinerService:
     def __init__(
         self,
@@ -318,11 +323,21 @@ class MinerService:
         self, executor_id: str, job_batch_id: str, pipeline: Coroutine[Any, Any, JobResult | None]
     ) -> JobResult | None:
         """The wave's result for one executor: the result of the recheck running on it, when there is
-        one, stamped with this wave's batch id; otherwise the executor's own pipeline run."""
+        one, stamped with this wave's batch id; otherwise the executor's own pipeline run. The wait is
+        capped so the pipeline still has RECHECK_WAVE_PIPELINE_ROOM_SECONDS of the executor's budget."""
         outcome = self.recheck_outcomes.get(executor_id)
         if outcome is not None:
+            wait_seconds = max(0, executor_budget_seconds() - settings.RECHECK_WAVE_PIPELINE_ROOM_SECONDS)
             try:
-                rechecked: JobResult | None = await asyncio.shield(outcome)
+                rechecked: JobResult | None = await asyncio.wait_for(asyncio.shield(outcome), timeout=wait_seconds)
+            except TimeoutError:
+                rechecked = None
+                logger.info(
+                    _m(
+                        "[recheck] Wave stopped waiting for the recheck; running the node itself",
+                        extra=get_extra_info({"executor_uuid": executor_id, "waited_s": wait_seconds}),
+                    )
+                )
             except BaseException:
                 pipeline.close()
                 raise
@@ -543,7 +558,7 @@ class MinerService:
                                             first_pass=first_pass,
                                         ),
                                     ),
-                                    timeout=settings.JOB_TIME_OUT - 120
+                                    timeout=executor_budget_seconds(),
                                 )
                             )
                             for executor_info in executors
@@ -2343,7 +2358,7 @@ class MinerService:
                                         first_pass=first_pass,
                                     ),
                                 ),
-                                timeout=settings.JOB_TIME_OUT - 120
+                                timeout=executor_budget_seconds(),
                             )
                         )
                         for executor_info in executors
