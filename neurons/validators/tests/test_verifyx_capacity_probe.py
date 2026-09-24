@@ -9,8 +9,8 @@ asserted is what reaches `specs.network` — the keys lium-platform's `best_down
 `effective_network_speeds` chain reads (`ema_verifyx_download_speed`, then `verifyx_download_speed`).
 
 Three properties:
-1. the capacity, not the single-stream figure, is published and gated (the B300 SXM6 PC hosts,
-   owner 22 Sep 2026: "show the accurate total bandwidth capacity of all the nodes");
+1. the capacity, not the single-stream figure, is published and gated (a large multi-GPU host's
+   single stream reads far under its link);
 2. a probe that could not reach Cloudflare falls back to the package download instead of
    feeding the EMA a zero, so an outage does not delist an honest host;
 3. the EMA handoff: a host whose stored EMA came from the single-stream era moves toward the
@@ -42,11 +42,11 @@ from tests.test_verifyx_check import DummyVerifyXService, _rented_data_with_ema
 
 SERVICE = "neurons.validators.src.services.verifyx_validation_service"
 
-# One 8× B300 SXM6 PC host (22 Sep 2026): a single HF object through one TCP stream reads far
+# One large multi-GPU host: a single HF object through one TCP stream reads far
 # under the link, the 3-stream Cloudflare probe reads what the link can carry.
-B300_PC_SINGLE_STREAM_MBPS = 180.0
-B300_PC_CAPACITY_MBPS = 2400.0
-B300_PC_UPLOAD_MBPS = 1900.0
+HOST_SINGLE_STREAM_MBPS = 180.0
+HOST_CAPACITY_MBPS = 2400.0
+HOST_UPLOAD_MBPS = 1900.0
 
 PACKAGE = {"pkg": "distilbert-base-uncased.tar", "size": 268_000_000, "hash": "sha256:abc"}
 
@@ -60,9 +60,9 @@ def _challenge_data() -> dict:
 
 def _probe_payload(
     *,
-    capacity_mbps: float = B300_PC_CAPACITY_MBPS,
-    upload_mbps: float = B300_PC_UPLOAD_MBPS,
-    single_stream_mbps: float = B300_PC_SINGLE_STREAM_MBPS,
+    capacity_mbps: float = HOST_CAPACITY_MBPS,
+    upload_mbps: float = HOST_UPLOAD_MBPS,
+    single_stream_mbps: float = HOST_SINGLE_STREAM_MBPS,
 ) -> dict:
     """`NetworkTestExecution` for a run where every direction finished (network.rs:99-107)."""
     return {
@@ -80,7 +80,7 @@ def _probe_payload(
     }
 
 
-def _cloudflare_unreachable_payload(single_stream_mbps: float = B300_PC_SINGLE_STREAM_MBPS) -> dict:
+def _cloudflare_unreachable_payload(single_stream_mbps: float = HOST_SINGLE_STREAM_MBPS) -> dict:
     """The package downloaded, then `execute_speedtest` could not reach speed.cloudflare.com:
     network.rs:632-641 reports both directions as 0.0 and the probe as failed."""
     return {
@@ -140,20 +140,20 @@ def test_service_reads_the_capacity_and_the_single_stream_figure_into_their_own_
 
     assert errors == []
     assert stats == {
-        "download_speed": B300_PC_CAPACITY_MBPS,
-        "upload_speed": B300_PC_UPLOAD_MBPS,
-        "package_download_speed": B300_PC_SINGLE_STREAM_MBPS,
-        "capacity_download_speed": B300_PC_CAPACITY_MBPS,
+        "download_speed": HOST_CAPACITY_MBPS,
+        "upload_speed": HOST_UPLOAD_MBPS,
+        "package_download_speed": HOST_SINGLE_STREAM_MBPS,
+        "capacity_download_speed": HOST_CAPACITY_MBPS,
         "success": True,
         "execution_time_ms": 24_300,
     }
 
 
 @pytest.mark.asyncio
-async def test_b300_pc_host_publishes_the_parallel_stream_capacity_not_the_single_stream_speed(
+async def test_large_host_publishes_the_parallel_stream_capacity_not_the_single_stream_speed(
     context_factory,
 ):
-    """A never-measured B300 PC host: the specs the platform lists carry 2400 (capacity), the
+    """A never-measured large multi-GPU host: the specs the platform lists carry 2400 (capacity), the
     EMA seeds from it and the gate passes; 180 (one stream) reaches no `specs.network` key."""
     verification = _judge(_probe_payload())
     assert verification["success"] is True
@@ -164,11 +164,11 @@ async def test_b300_pc_host_publishes_the_parallel_stream_capacity_not_the_singl
     assert result.passed is True
     assert result.event.reason_code == Msg.VERIFY_SUCCESS.reason
     net = result.updates["state"].specs["network"]
-    assert net["verifyx_download_speed"] == B300_PC_CAPACITY_MBPS
-    assert net["ema_verifyx_download_speed"] == B300_PC_CAPACITY_MBPS
-    assert net["verifyx_upload_speed"] == B300_PC_UPLOAD_MBPS
-    assert net["ema_verifyx_upload_speed"] == B300_PC_UPLOAD_MBPS
-    assert B300_PC_SINGLE_STREAM_MBPS not in net.values()
+    assert net["verifyx_download_speed"] == HOST_CAPACITY_MBPS
+    assert net["ema_verifyx_download_speed"] == HOST_CAPACITY_MBPS
+    assert net["verifyx_upload_speed"] == HOST_UPLOAD_MBPS
+    assert net["ema_verifyx_upload_speed"] == HOST_UPLOAD_MBPS
+    assert HOST_SINGLE_STREAM_MBPS not in net.values()
     assert set(net) == {
         "verifyx_download_speed",
         "ema_verifyx_download_speed",
@@ -181,7 +181,7 @@ async def test_b300_pc_host_publishes_the_parallel_stream_capacity_not_the_singl
 async def test_single_stream_speed_under_the_gate_does_not_fail_a_host_whose_capacity_clears_it(
     context_factory,
 ):
-    """The B300 PC symptom in the extreme: one stream reads 60 Mbps (under the 100 Mbps EMA gate,
+    """The large-host symptom in the extreme: one stream reads 60 Mbps (under the 100 Mbps EMA gate,
     above the 50 Mbps package floor), the parallel probe reads 2400. The gate reads 2400."""
     verification = _judge(_probe_payload(single_stream_mbps=60.0))
     assert verification["success"] is True
@@ -190,7 +190,7 @@ async def test_single_stream_speed_under_the_gate_does_not_fail_a_host_whose_cap
 
     assert result.passed is True
     net = result.updates["state"].specs["network"]
-    assert net["ema_verifyx_download_speed"] == B300_PC_CAPACITY_MBPS
+    assert net["ema_verifyx_download_speed"] == HOST_CAPACITY_MBPS
     assert net["ema_verifyx_download_speed"] >= MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 
 
@@ -220,7 +220,7 @@ def test_package_floor_reads_the_single_stream_figure_only():
         "Package download speed inadequate: 40.00 Mbps achieved, "
         f"{settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
     ]
-    assert verification["network"]["download_speed"] == B300_PC_CAPACITY_MBPS
+    assert verification["network"]["download_speed"] == HOST_CAPACITY_MBPS
 
 
 # 2. Cloudflare unreachable ---------------------------------------------------------------------
@@ -231,8 +231,8 @@ def test_cloudflare_unreachable_falls_back_to_the_package_reading():
         _challenge_data(), {"network_execution": _cloudflare_unreachable_payload()}
     )
 
-    assert stats["download_speed"] == B300_PC_SINGLE_STREAM_MBPS
-    assert stats["package_download_speed"] == B300_PC_SINGLE_STREAM_MBPS
+    assert stats["download_speed"] == HOST_SINGLE_STREAM_MBPS
+    assert stats["package_download_speed"] == HOST_SINGLE_STREAM_MBPS
     assert stats["capacity_download_speed"] is None
     assert stats["cloudflare_fallback"] is True
     assert stats["success"] is True
@@ -254,13 +254,13 @@ async def test_cloudflare_unreachable_uses_the_package_reading_and_does_not_feed
     assert verification["network"]["success"] is True
     assert verification["network"]["cloudflare_fallback"] is True
 
-    result = await _run_check(context_factory, verification, prev_ema=B300_PC_CAPACITY_MBPS)
+    result = await _run_check(context_factory, verification, prev_ema=HOST_CAPACITY_MBPS)
 
     assert result.passed is True
     net = result.updates["state"].specs["network"]
-    assert net["verifyx_download_speed"] == B300_PC_SINGLE_STREAM_MBPS
+    assert net["verifyx_download_speed"] == HOST_SINGLE_STREAM_MBPS
     assert net["ema_verifyx_download_speed"] == pytest.approx(
-        compute_ema(B300_PC_CAPACITY_MBPS, B300_PC_SINGLE_STREAM_MBPS)
+        compute_ema(HOST_CAPACITY_MBPS, HOST_SINGLE_STREAM_MBPS)
     )
     assert net["ema_verifyx_download_speed"] == pytest.approx(1290.0)
     assert net["ema_verifyx_download_speed"] > MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
@@ -271,7 +271,7 @@ async def test_cloudflare_unreachable_for_five_cycles_does_not_delist_an_honest_
     context_factory,
 ):
     """Five Cloudflare outages feed the package reading, not zeros. The host stays above the gate."""
-    ema = B300_PC_CAPACITY_MBPS
+    ema = HOST_CAPACITY_MBPS
     outcomes = []
     for _ in range(5):
         verification = _judge(_cloudflare_unreachable_payload())
@@ -293,11 +293,11 @@ async def test_cloudflare_unreachable_still_passes_when_the_network_flag_is_on(
     assert verification["success"] is True
     assert verification["network"]["cloudflare_fallback"] is True
 
-    result = await _run_check(context_factory, verification, prev_ema=B300_PC_CAPACITY_MBPS)
+    result = await _run_check(context_factory, verification, prev_ema=HOST_CAPACITY_MBPS)
 
     assert result.passed is True
     net = result.updates["state"].specs["network"]
-    assert net["verifyx_download_speed"] == B300_PC_SINGLE_STREAM_MBPS
+    assert net["verifyx_download_speed"] == HOST_SINGLE_STREAM_MBPS
 
 
 def _host_caused_probe_failure_payload() -> dict:
@@ -308,7 +308,7 @@ def _host_caused_probe_failure_payload() -> dict:
         "download": {
             **PACKAGE,
             "status": "success",
-            "speed_mbps": B300_PC_SINGLE_STREAM_MBPS,
+            "speed_mbps": HOST_SINGLE_STREAM_MBPS,
             "time_ms": 11_900,
             "error": None,
         },
@@ -353,7 +353,7 @@ async def test_first_capacity_sample_moves_a_single_stream_era_ema_toward_the_ca
 
     assert result.passed is True
     net = result.updates["state"].specs["network"]
-    assert net["verifyx_download_speed"] == B300_PC_CAPACITY_MBPS
+    assert net["verifyx_download_speed"] == HOST_CAPACITY_MBPS
     assert net["ema_verifyx_download_speed"] == pytest.approx(compute_ema(150.0, 2400.0))
     assert net["ema_verifyx_download_speed"] == pytest.approx(1275.0)
 
@@ -372,7 +372,7 @@ async def test_ema_converges_on_the_capacity_over_repeated_samples(context_facto
 
     assert trail[:2] == [pytest.approx(1275.0), pytest.approx(1837.5)]
     assert trail == sorted(trail)
-    assert abs(trail[-1] - B300_PC_CAPACITY_MBPS) / B300_PC_CAPACITY_MBPS < 0.02
+    assert abs(trail[-1] - HOST_CAPACITY_MBPS) / HOST_CAPACITY_MBPS < 0.02
 
 
 @pytest.mark.asyncio
