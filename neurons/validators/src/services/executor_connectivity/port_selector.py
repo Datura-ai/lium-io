@@ -80,7 +80,8 @@ class PortSelector:
     """Selects which ports to verify.
 
     Pass one (`select`) is the lowest `size` free declared ports, the check every host gets. Pass
-    two (`select_spread`) runs only when pass one verified fewer than MIN_PORT_COUNT: up to `size`
+    two (`select_spread`) runs only when pass one verified fewer than MIN_PORT_COUNT, counted after
+    the DinD probe has taken its port: up to `size`
     ports spread evenly over the free declared ports pass one did not test, always including the
     highest. On 40000-65535 pass two probes every 84th or 85th port from 40300 up, so a block
     forwarded at the top verifies 3 ports when it is 170 ports or wider (255 when the DinD probe on

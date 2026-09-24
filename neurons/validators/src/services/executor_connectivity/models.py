@@ -91,7 +91,7 @@ class PortRangeResult:
         }
 
 
-SECOND_PASS_NOT_NEEDED = "not_needed"  # pass one verified MIN_PORT_COUNT or more
+SECOND_PASS_NOT_NEEDED = "not_needed"  # pass one verified MIN_PORT_COUNT or more after DinD
 SECOND_PASS_SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never completed
 SECOND_PASS_NO_PORTS_LEFT = "no_ports_left"  # every free declared port was in pass one
 SECOND_PASS_RAN = "ran"

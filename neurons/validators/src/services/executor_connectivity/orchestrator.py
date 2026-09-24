@@ -12,6 +12,7 @@ from services.executor_connectivity.models import (
     SECOND_PASS_NOT_NEEDED,
     SECOND_PASS_RAN,
     SECOND_PASS_SKIPPED_BATCH_FAILED,
+    DindProbeResult,
     PortPair,
     PortVerificationResult,
 )
@@ -83,6 +84,21 @@ class ConnectivityOrchestrator:
 
         successful = list(probe_result.successful)
         failed = list(probe_result.failed)
+        container_check = {
+            "ssh_client": ssh_client,
+            "host": executor_info.address,
+            "container_name_prefix": f"container_{miner_hotkey}",
+            "sysbox_runtime": sysbox_runtime,
+            "log_ctx": log_ctx,
+        }
+
+        # The container check takes one answered port and gives it back only if it passes, so when pass
+        # one alone may be enough it runs first, on a pass-one port, and pass two is decided on what is
+        # left. Below MIN_PORT_COUNT pass two runs whatever the check says, so the check waits and can
+        # take a pass-two port.
+        dind = None
+        if len(successful) >= MIN_PORT_COUNT:
+            dind = await self._check_container(successful, failed, ports, **container_check)
 
         spread: list[PortPair] = []
         if len(successful) >= MIN_PORT_COUNT:
@@ -115,22 +131,10 @@ class ConnectivityOrchestrator:
                 )
             )
 
-        dind_port = successful.pop(0) if successful else random.choice(ports)
-        dind_result = await self.dind_probe.verify(
-            dind_port,
-            ssh_client=ssh_client,
-            host=executor_info.address,
-            container_name_prefix=f"container_{miner_hotkey}",
-            sysbox_runtime=sysbox_runtime,
-            log_ctx=log_ctx,
-        )
-
-        if dind_result.success:
-            successful.append(dind_port)
-            sysbox_runtime = dind_result.sysbox_runtime
-        else:
-            failed.append(dind_port)
-            sysbox_runtime = False
+        if dind is None:
+            dind = await self._check_container(successful, failed, ports, **container_check)
+        dind_port, dind_result = dind
+        sysbox_runtime = dind_result.sysbox_runtime if dind_result.success else False
 
         status = "ok" if successful else "no_working_ports"
         port_ranges = tally_port_ranges(declared, ports, successful)
@@ -148,3 +152,15 @@ class ConnectivityOrchestrator:
             port_ranges=port_ranges,
             second_pass=second_pass,
         )
+
+    async def _check_container(
+        self,
+        successful: list[PortPair],
+        failed: list[PortPair],
+        ports: list[PortPair],
+        **kwargs,
+    ) -> tuple[PortPair, DindProbeResult]:
+        dind_port = successful.pop(0) if successful else random.choice(ports)
+        dind_result = await self.dind_probe.verify(dind_port, **kwargs)
+        (successful if dind_result.success else failed).append(dind_port)
+        return dind_port, dind_result

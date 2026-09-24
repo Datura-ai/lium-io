@@ -290,7 +290,8 @@ async def test_two_pass_against_main(host, kwargs, rented, seed):
         assert new_host.containers == main_host.containers == []
         return
 
-    assert (main.pass_one >= MIN_PORT_COUNT) == (new.second_pass == SECOND_PASS_NOT_NEEDED)
+    # main's verified count is after the DinD probe has taken its port
+    assert (len(main.successful) >= MIN_PORT_COUNT) == (new.second_pass == SECOND_PASS_NOT_NEEDED)
     one_probes = [p for p in new_host.probes if p[1] != 2]
     two_probes = [p for p in new_host.probes if p[1] == 2]
     extra = len(new_host.containers) - len(main_host.containers)
@@ -310,7 +311,13 @@ async def test_two_pass_against_main(host, kwargs, rented, seed):
     assert one_probes == main_host.probes
     assert extra in (0, 1)
     assert (extra == 1) == (new.second_pass in (SECOND_PASS_RAN, SECOND_PASS_BATCH_FAILED))
-    if extra:
+    if main.pass_one >= MIN_PORT_COUNT:
+        # the DinD probe failed on one of exactly 3 answers: it ran as main's did, then pass two
+        assert new_host.containers[: len(main_host.containers)] == main_host.containers
+        assert new.dind_port == main.dind
+        if extra:
+            assert new_host.containers[-1][0] == "host"
+    elif extra:
         assert new_host.containers[-2][0] == "host"
     assert len(new.successful_ports) >= len(main.successful)
     if new.second_pass == SECOND_PASS_SKIPPED_BATCH_FAILED:
@@ -417,6 +424,71 @@ async def test_pass_two_is_skipped_when_pass_one_verifies_three():
     assert not [p for p in new_host.probes if p[1] == 2]
     assert new_host.containers == main_host.containers
     assert new.successful_ports == main.successful
+
+
+@pytest.mark.asyncio
+async def test_pass_two_runs_when_the_dind_probe_takes_one_of_exactly_three_answers():
+    info = _info(port_range="40000-65535")
+    host = Host(open_ports={40000, 40001, 40002} | set(range(60000, 65536)), dind_ok=False)
+
+    main, main_host, new, new_host = await _both(host, info)
+
+    assert main.pass_one == MIN_PORT_COUNT
+    assert len(main.successful) == MIN_PORT_COUNT - 1
+    assert new.second_pass == SECOND_PASS_RAN
+    assert len(new.successful_ports) >= MIN_PORT_COUNT
+    assert new.status == "ok"
+    # the probe ran once, on the same pass-one port as main's, before pass two
+    assert new.dind_port == main.dind == PortPair(40000, 40000)
+    assert not new.dind_ok
+    assert new.dind_port in new.failed_ports
+    assert new.dind_port not in new.successful_ports
+    assert [c for c in new_host.containers if c[0] == "dind"] == [("dind", 0)]
+    assert new_host.containers == main_host.containers + [new_host.containers[-1]]
+    assert new_host.containers[-1][0] == "host"
+    (two,) = (ports for _, p, ports in new_host.probes if p == 2)
+    one = {e for _, p, ports in new_host.probes if p != 2 for e in ports}
+    assert not one & set(two)
+    assert {40001, 40002} <= {p.external for p in new.successful_ports}
+    tallies = [r.as_dict() for r in new.port_ranges]
+    assert all(t["answered"] <= t["probed"] <= t["declared"] for t in tallies)
+    assert sum(t["answered"] for t in tallies) == len(new.successful_ports)
+
+
+@pytest.mark.asyncio
+async def test_pass_two_does_not_run_when_the_dind_probe_keeps_all_three_answers():
+    info = _info(port_range="40000-65535")
+    host = Host(open_ports={40000, 40001, 40002} | set(range(60000, 65536)))
+
+    main, main_host, new, new_host = await _both(host, info)
+
+    assert new.second_pass == SECOND_PASS_NOT_NEEDED
+    assert new.dind_ok
+    assert new.dind_port == main.dind == PortPair(40000, 40000)
+    assert not [p for p in new_host.probes if p[1] == 2]
+    assert new_host.containers == main_host.containers
+    assert new.successful_ports == main.successful
+    assert len(new.successful_ports) == MIN_PORT_COUNT
+
+
+@pytest.mark.asyncio
+async def test_pass_two_stays_skipped_when_pass_ones_batch_failed_and_the_dind_probe_takes_one_of_three():
+    info = _info(port_range="40000-65535")
+    # the batch container never starts, the published tier finds exactly 3, and the DinD probe fails
+    host = Host(
+        open_ports={40000, 40001, 40002} | set(range(60000, 65536)),
+        batch_start_fails=True,
+        dind_ok=False,
+    )
+
+    main, main_host, new, new_host = await _both(host, info)
+
+    assert main.pass_one == MIN_PORT_COUNT
+    assert new.second_pass == SECOND_PASS_SKIPPED_BATCH_FAILED
+    assert not [p for p in new_host.probes if p[1] == 2]
+    assert new_host.containers == main_host.containers
+    assert new.successful_ports == main.successful
+    assert len(new.successful_ports) == MIN_PORT_COUNT - 1
 
 
 @pytest.mark.asyncio
