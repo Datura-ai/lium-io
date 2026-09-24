@@ -408,7 +408,9 @@ def _verifyx_ctx(context_factory, designated: bool, service: DummyVerifyXService
 @pytest.mark.asyncio
 async def test_designated_hotkey_first_pass_still_runs_verifyx(context_factory):
     service = DummyVerifyXService(success=False, error_msg="probe failed")
-    result = await VerifyXCheck().run(_verifyx_ctx(context_factory, designated=True, service=service))
+    result = await VerifyXCheck().run(
+        _verifyx_ctx(context_factory, designated=True, service=service)
+    )
 
     assert result.passed is False
     assert service.called_with is not None
