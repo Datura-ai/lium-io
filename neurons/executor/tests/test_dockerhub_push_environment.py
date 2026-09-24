@@ -18,7 +18,8 @@ import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[3]
-WORKFLOWS = sorted((REPO / ".github" / "workflows").glob("*.yml"))
+WORKFLOWS_DIR = REPO / ".github" / "workflows"
+WORKFLOWS = sorted([*WORKFLOWS_DIR.glob("*.yml"), *WORKFLOWS_DIR.glob("*.yaml")])
 PUBLISH_SCRIPTS = sorted((REPO / "neurons").glob("*/docker*publish.sh"))
 RULESET = REPO / ".github" / "rulesets" / "release-tags.json"
 ENVIRONMENT = "dockerhub-push"
@@ -53,11 +54,10 @@ def jobs_reading_the_token_outside_the_environment(workflow_text: str) -> list[s
 
 
 def login_traced(script_text: str) -> bool:
-    """True when the script runs with xtrace on and the login line is not preceded by ``set +x``."""
-    if not re.search(r"^set .*x", script_text, re.MULTILINE):
-        return False
+    """True when the last ``set -x`` / ``set +x`` before the login line turns xtrace on."""
     before_login = script_text.split(LOGIN_LINE, 1)[0]
-    return "set +x" not in before_login
+    xtrace_switches = re.findall(r"\bset ([+-])[a-z]*x", before_login)
+    return bool(xtrace_switches) and xtrace_switches[-1] == "-"
 
 
 def test_the_checker_flags_a_job_that_reads_the_token_without_the_environment() -> None:
@@ -105,6 +105,8 @@ def test_the_checker_flags_a_traced_login() -> None:
     assert login_traced(traced)
     assert not login_traced(traced.replace(LOGIN_LINE, f"{{ set +x; }} 2>/dev/null\n{LOGIN_LINE}"))
     assert not login_traced(traced.replace("set -eux", "set -eu"))
+    retraced = traced.replace(LOGIN_LINE, f"{{ set +x; }} 2>/dev/null\nset -x\n{LOGIN_LINE}")
+    assert login_traced(retraced)
 
 
 @pytest.mark.parametrize("script", PUBLISH_SCRIPTS, ids=lambda p: f"{p.parent.name}/{p.name}")
