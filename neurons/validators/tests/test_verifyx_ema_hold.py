@@ -44,7 +44,9 @@ def _known(download: float, upload: float = 50.0) -> RentedExecutorsResponse:
         executors={},
         banned_guids=[],
         network_ema={
-            EXECUTOR: NetworkEMA(ema_verifyx_download_speed=download, ema_verifyx_upload_speed=upload)
+            EXECUTOR: NetworkEMA(
+                ema_verifyx_download_speed=download, ema_verifyx_upload_speed=upload
+            )
         },
     )
 
@@ -76,7 +78,9 @@ def _measured_specs(download: float, ema_download: float, ema_upload: float) -> 
 
 async def _publish(context_factory, *, specs, rented_data, event, success, image_cached=None):
     ctx = context_factory(
-        state=build_state(specs=specs, rented_data=rented_data, recommended_image_cached=image_cached),
+        state=build_state(
+            specs=specs, rented_data=rented_data, recommended_image_cached=image_cached
+        ),
         ssh_pub_keys=[],
     )
     result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
@@ -187,7 +191,9 @@ class _ProbeSequence:
         self._downloads = list(downloads)
         self.calls = 0
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec
+    ):
         self.calls += 1
         download = self._downloads.pop(0)
         return MockVerifyXResponse(
@@ -346,9 +352,7 @@ def _hold(context_factory, specs, rented_data):
 
 
 def test_holding_an_ema_already_kept_upstream_changes_nothing(context_factory):
-    specs = {
-        "network": {"ema_verifyx_download_speed": 200.0, "ema_verifyx_upload_speed": 50.0}
-    }
+    specs = {"network": {"ema_verifyx_download_speed": 200.0, "ema_verifyx_upload_speed": 50.0}}
 
     once = _hold(context_factory, specs, _known(200.0, 50.0))
     twice = _hold(context_factory, once, _known(200.0, 50.0))
