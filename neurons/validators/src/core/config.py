@@ -1,11 +1,11 @@
 import json
 import pathlib
-import re
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
+from bittensor.utils import is_valid_ss58_address
 from datura.chain import (
     DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS,
     PUBLIC_NODE_SOURCE,
@@ -21,9 +21,16 @@ if TYPE_CHECKING:
 from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 
-# A hotkey-list entry holding one of these is a mis-pasted list (JSON quotes or brackets, spaces
-# between hotkeys), not a hotkey; keeping it as one opaque entry would hide a pool-hotkey overlap.
-_NOT_A_BARE_HOTKEY = re.compile(r"[\s\"'\[\]{}]")
+# A hotkey-list entry that is not an ss58 hotkey is a mis-pasted list (another separator, quotes,
+# an invisible character), not a hotkey; keeping it as one opaque entry would hide a pool-hotkey
+# overlap. is_valid_ss58_address also accepts short index addresses, hence the length.
+_SS58_HOTKEY_LEN = 48
+
+
+def _is_ss58_hotkey(entry: object) -> bool:
+    return (
+        isinstance(entry, str) and len(entry) == _SS58_HOTKEY_LEN and is_valid_ss58_address(entry)
+    )
 
 
 class FeatureFlag(str, Enum):
@@ -799,8 +806,9 @@ class Settings(BaseSettings):
 
     @staticmethod
     def _parse_hotkey_set(name: str, raw: str) -> frozenset[str]:
-        """A JSON list of strings (the portal's env form) or a comma-separated list. Anything else
-        raises, so config load refuses it rather than keeping it as one entry no hotkey equals."""
+        """A JSON list of ss58 hotkeys (the portal's env form) or a comma-separated list of them.
+        Anything else raises, so config load refuses it rather than keeping it as one entry no
+        hotkey equals. The error names the entry's 0-based index, never its value."""
         text = raw.strip()
         if text.startswith("["):
             try:
@@ -809,18 +817,28 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"{name} starts with '[' but is not a valid JSON list: {exc.msg}"
                 ) from None
-            if not isinstance(entries, list) or not all(isinstance(h, str) for h in entries):
+            if not isinstance(entries, list):
                 raise ValueError(f"{name} must be a JSON list of strings or a comma-separated list")
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, str):
+                    raise ValueError(
+                        f"{name} entry {index} is not a string; {name} must be a JSON list of "
+                        "strings or a comma-separated list"
+                    )
         else:
             entries = text.split(",")
-        hotkeys = frozenset(h.strip() for h in entries if h.strip())
-        malformed = sum(1 for h in hotkeys if _NOT_A_BARE_HOTKEY.search(h))
-        if malformed:
-            raise ValueError(
-                f"{name} has {malformed} entry(ies) with a quote, bracket or space inside; give "
-                'a JSON list (["5...", "5..."]) or a comma-separated list (5...,5...)'
-            )
-        return hotkeys
+        hotkeys = set()
+        for index, entry in enumerate(entries):
+            hotkey = entry.strip()
+            if not hotkey:
+                continue
+            if not _is_ss58_hotkey(hotkey):
+                raise ValueError(
+                    f"{name} entry {index} is not an ss58 hotkey; give a JSON list "
+                    '(["5...", "5..."]) or a comma-separated list (5...,5...)'
+                )
+            hotkeys.add(hotkey)
+        return frozenset(hotkeys)
 
     def designated_miner_hotkeys(self) -> frozenset[str]:
         return self._parse_hotkey_set("DESIGNATED_MINER_HOTKEYS", self.DESIGNATED_MINER_HOTKEYS)

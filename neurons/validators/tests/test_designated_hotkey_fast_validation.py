@@ -61,10 +61,11 @@ needs_collateral = pytest.mark.skipif(
     not HAS_COLLATERAL, reason="the validator collateral check is removed"
 )
 
-# fixture names, not keys: the profile compares the authenticated miner hotkey string as-is
-DESIGNATED_HOTKEY = "designated-hotkey-fixture-1"
-OTHER_DESIGNATED_HOTKEY = "designated-hotkey-fixture-2"
-PROVIDER_HOTKEY = "provider-hotkey-fixture"
+# ss58 addresses of fixed byte patterns, not anyone's keys: the lists only take ss58 hotkeys, and
+# the profile compares the authenticated miner hotkey string as-is
+DESIGNATED_HOTKEY = "5C62Ck4UrFPiBtoCmeSrgF7x9yv9mn38446dhCpsi2mLHiFT"
+OTHER_DESIGNATED_HOTKEY = "5C7LYpP2ZH3tpKbvVvwiVe54AapxErdPBbvkYhe6y9ZBkqWt"
+PROVIDER_HOTKEY = "5C8etthaGJi5SkQeEDSaK32ABBjkhwDeK9ksQCTLEGM3EH14"
 
 
 @pytest.fixture
@@ -100,7 +101,9 @@ def test_hotkey_list_is_parsed_trimmed_and_ignores_blanks(profile_on, monkeypatc
 # first pass the profile, so config load refuses the overlap, and with the flag on it refuses an
 # empty pool mirror, where the overlap cannot be checked.
 
-POOL_HOTKEY = "lium-pool-hotkey-fixture"
+POOL_HOTKEY = "5C9yEy27yLNG5BDMxVwS8RyGBneZB1ouShazFhGZVP8thK5z"
+OTHER_POOL_HOTKEY = "5CBHb3LfgN2Shc25gnSHwpvNCPZMe6QAaFR77C5nkVvkAK1o"
+UNRELATED_POOL_HOTKEY = "5CCbw7fDPPgdL2poR4w9mDsUCzUA7AzRhoFDxgu21cibdUmW"
 
 
 @pytest.mark.parametrize("flag", [True, False])
@@ -114,7 +117,7 @@ def test_config_load_refuses_a_designated_hotkey_that_is_a_pool_hotkey(flag):
             _env_file=None,
             DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=flag,
             DESIGNATED_MINER_HOTKEYS=f"{DESIGNATED_HOTKEY}, {POOL_HOTKEY}",
-            LIUM_POOL_HOTKEYS=f"{POOL_HOTKEY},other-pool-hotkey-fixture",
+            LIUM_POOL_HOTKEYS=f"{POOL_HOTKEY},{OTHER_POOL_HOTKEY}",
         )
 
 
@@ -179,16 +182,16 @@ def test_config_load_refuses_a_pool_hotkey_given_in_the_portals_json_form(flag, 
             _env_file=None,
             DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=flag,
             DESIGNATED_MINER_HOTKEYS=designated,
-            LIUM_POOL_HOTKEYS=f'["{POOL_HOTKEY}", "other-pool-hotkey-fixture"]',
+            LIUM_POOL_HOTKEYS=f'["{POOL_HOTKEY}", "{OTHER_POOL_HOTKEY}"]',
         )
 
 
 @pytest.mark.parametrize(
     "pool",
     [
-        f'["{POOL_HOTKEY}", "other-pool-hotkey-fixture"]',
-        f'  [ " {POOL_HOTKEY} " , "", "other-pool-hotkey-fixture" ]  ',
-        f"{POOL_HOTKEY}, other-pool-hotkey-fixture",
+        f'["{POOL_HOTKEY}", "{OTHER_POOL_HOTKEY}"]',
+        f'  [ " {POOL_HOTKEY} " , "", "{OTHER_POOL_HOTKEY}" ]  ',
+        f"{POOL_HOTKEY}, {OTHER_POOL_HOTKEY}",
     ],
 )
 @pytest.mark.parametrize(
@@ -207,7 +210,7 @@ def test_config_load_reads_the_json_and_comma_forms_alike(designated, pool):
         DESIGNATED_MINER_HOTKEYS=designated,
         LIUM_POOL_HOTKEYS=pool,
     )
-    assert s.lium_pool_hotkeys() == frozenset({POOL_HOTKEY, "other-pool-hotkey-fixture"})
+    assert s.lium_pool_hotkeys() == frozenset({POOL_HOTKEY, OTHER_POOL_HOTKEY})
     assert s.designated_miner_hotkeys() == frozenset({DESIGNATED_HOTKEY, OTHER_DESIGNATED_HOTKEY})
     assert s.is_designated_hotkey_first_pass(DESIGNATED_HOTKEY, first_pass=True) is True
     assert s.is_designated_hotkey_first_pass(POOL_HOTKEY, first_pass=True) is False
@@ -215,18 +218,36 @@ def test_config_load_reads_the_json_and_comma_forms_alike(designated, pool):
 
 # (value, the refusal it gets)
 NOT_JSON = "starts with '\\[' but is not a valid JSON list"
-NOT_STRINGS = "must be a JSON list of strings"
-NOT_BARE = "quote, bracket or space inside"
+NOT_STRINGS = "entry \\d+ is not a string; .* must be a JSON list of strings"
+NOT_SS58 = "entry \\d+ is not an ss58 hotkey"
 MALFORMED_HOTKEY_LISTS = [
     (f'["{POOL_HOTKEY}"', NOT_JSON),  # unclosed JSON list
     (f'["{POOL_HOTKEY}",]', NOT_JSON),  # trailing comma: not JSON
     (f"['{POOL_HOTKEY}']", NOT_JSON),  # Python repr, not JSON
     (f'[1, "{POOL_HOTKEY}"]', NOT_STRINGS),
+    (f'["{POOL_HOTKEY}", null]', NOT_STRINGS),
     (f'[["{POOL_HOTKEY}"]]', NOT_STRINGS),
-    (f'{{"hotkeys": ["{POOL_HOTKEY}"]}}', NOT_BARE),  # JSON object
-    (f'"{POOL_HOTKEY}"', NOT_BARE),  # a quoted string
-    (f'"{POOL_HOTKEY}", "other-pool-hotkey-fixture"', NOT_BARE),  # a JSON list without brackets
-    (f"{POOL_HOTKEY} other-pool-hotkey-fixture", NOT_BARE),  # space-separated
+    (f'{{"hotkeys": ["{POOL_HOTKEY}"]}}', NOT_SS58),  # JSON object
+    (f'"{POOL_HOTKEY}"', NOT_SS58),  # a quoted string
+    (f'"{POOL_HOTKEY}", "{OTHER_POOL_HOTKEY}"', NOT_SS58),  # a JSON list without brackets
+    (f"{POOL_HOTKEY} {OTHER_POOL_HOTKEY}", NOT_SS58),  # space-separated
+    (f"{POOL_HOTKEY}\t{OTHER_POOL_HOTKEY}", NOT_SS58),  # tab-separated
+    (f"{POOL_HOTKEY};{OTHER_POOL_HOTKEY}", NOT_SS58),  # semicolon-separated
+    (f"{POOL_HOTKEY}|{OTHER_POOL_HOTKEY}", NOT_SS58),  # pipe-separated
+    (f'["{POOL_HOTKEY};{OTHER_POOL_HOTKEY}"]', NOT_SS58),
+    (f"{POOL_HOTKEY}\u200b,{OTHER_POOL_HOTKEY}", NOT_SS58),  # zero-width space: strip() keeps it
+    (f"\u200b{POOL_HOTKEY}", NOT_SS58),
+    (f'["{POOL_HOTKEY}\u200b"]', NOT_SS58),
+    ("lium-pool-hotkey", NOT_SS58),  # not an address
+    ("0x" + "ab" * 32, NOT_SS58),  # a hex public key
+    ("F7NZ", NOT_SS58),  # a valid ss58 index address, not a hotkey
+    (POOL_HOTKEY[:-1], NOT_SS58),  # one character short
+    (POOL_HOTKEY + "1", NOT_SS58),  # one character long
+    (POOL_HOTKEY[:5] + "0" + POOL_HOTKEY[6:], NOT_SS58),  # 0, O, I and l are not base58
+    (POOL_HOTKEY[:5] + "O" + POOL_HOTKEY[6:], NOT_SS58),
+    (POOL_HOTKEY[:5] + "I" + POOL_HOTKEY[6:], NOT_SS58),
+    (POOL_HOTKEY[:5] + "l" + POOL_HOTKEY[6:], NOT_SS58),
+    (POOL_HOTKEY[:-1] + "1", NOT_SS58),  # base58, right length, bad checksum
 ]
 
 
@@ -257,8 +278,34 @@ def test_config_load_refuses_a_malformed_designated_list(designated, refusal):
             _env_file=None,
             DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=True,
             DESIGNATED_MINER_HOTKEYS=designated,
-            LIUM_POOL_HOTKEYS="some-other-pool-hotkey-fixture",
+            LIUM_POOL_HOTKEYS=UNRELATED_POOL_HOTKEY,
         )
+
+
+@pytest.mark.parametrize("name", ["DESIGNATED_MINER_HOTKEYS", "LIUM_POOL_HOTKEYS"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        f"{DESIGNATED_HOTKEY},,{OTHER_DESIGNATED_HOTKEY[:-1]}",
+        f'["{DESIGNATED_HOTKEY}", "", "{OTHER_DESIGNATED_HOTKEY[:-1]}"]',
+    ],
+)
+def test_the_refusal_names_the_entry_index_not_its_value(name, value):
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    lists = {
+        "DESIGNATED_MINER_HOTKEYS": PROVIDER_HOTKEY,
+        "LIUM_POOL_HOTKEYS": UNRELATED_POOL_HOTKEY,
+        name: value,
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None, DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=True, **lists)
+    message = str(excinfo.value)
+    assert f"{name} entry 2 is not an ss58 hotkey" in message
+    assert OTHER_DESIGNATED_HOTKEY[:-1] not in message
+    assert DESIGNATED_HOTKEY not in message
 
 
 def test_config_load_reads_the_portals_json_mirror_from_the_environment(monkeypatch):
