@@ -85,13 +85,14 @@ class _Stop(BaseException):
     """Ends the loop from inside a patched sleep; the loop only catches Exception."""
 
 
-def _drive_loop(monkeypatch, ensure_outcomes: list, sleeps_before_stop: int, tmp_path):
+def _drive_loop(monkeypatch, ensure_outcomes: list, sleeps_before_stop: int, tmp_path, gpu=None):
     """Run the loop with one template until `sleeps_before_stop` sleeps; return the delays."""
     monkeypatch.setattr(cache_template_service.settings, "COMPUTE_REST_API_URL", "https://backend")
     monkeypatch.setattr(cache_template_service.settings, "CACHE_TEMPLATE_REFRESH_SECONDS", 900)
     monkeypatch.setattr(cache_template_service.settings, "PRE_PULL_TEMPLATES_ENABLED", False)
     monkeypatch.setattr(cache_template_service.docker, "from_env", MagicMock())
-    monkeypatch.setattr(cache_template_service, "_get_gpu_info", lambda: ("NVIDIA H100", "580", None))
+    gpu = gpu or (lambda: ("NVIDIA H100", "580", None))
+    monkeypatch.setattr(cache_template_service, "_get_gpu_info", gpu)
     monkeypatch.setattr(
         cache_template_service, "_fetch_templates", AsyncMock(return_value=([TEMPLATE], 200, None))
     )
@@ -135,6 +136,17 @@ def test_fast_retries_are_bounded(monkeypatch, tmp_path):
     assert delays == [15 + jitter, 30 + jitter, 60 + jitter, 120 + jitter, interval, interval]
     assert doc["first_sweep_ok_at"] is None
     assert doc["last_outcome"] == Outcome.LOOP_ERROR
+
+
+def test_an_unknown_gpu_at_boot_uses_none_of_the_fast_retries(monkeypatch, tmp_path):
+    answers = iter([("unknown", "unknown", "NVML not ready"), ("NVIDIA H100", "580", None)])
+    failure = PullStreamError(REGISTRY_ERROR)
+    delays, _ = _drive_loop(
+        monkeypatch, [failure], sleeps_before_stop=2, tmp_path=tmp_path, gpu=lambda: next(answers)
+    )
+
+    jitter = cache_template_service.FIRST_SWEEP_RETRY_JITTER_SECONDS
+    assert delays == [cache_template_service.ERROR_INTERVAL_SECONDS, 15 + jitter]
 
 
 def test_retry_jitter_stays_inside_its_bound():

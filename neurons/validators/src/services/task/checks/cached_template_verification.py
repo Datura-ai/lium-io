@@ -33,9 +33,9 @@ _QUOTED_ERROR_CHARS = 300
 _PULL_ERROR_NEXT_STEPS: tuple[tuple[tuple[str, ...], str], ...] = (
     (
         ("no such image",),
-        "The pull ended without the image and this executor release cannot say why: update the "
-        "executor (newer releases record the registry's own error), then run `docker pull {ref}` "
-        "on the host to see it.",
+        "The pull ended without the image and the registry's own error was not recorded (older "
+        "executor releases drop it): update the executor, then run `docker pull {ref}` on the "
+        "host to see it.",
     ),
     (
         ("toomanyrequests", "rate limit"),
@@ -140,7 +140,8 @@ def _remediation(state: dict | None, image_ref: str, pull_ref: str, cached: bool
         )
     record = (state.get("images") or {}).get(image_ref) or {}
     pull_error = record.get("last_pull_error")
-    if pull_error:
+    # A later sweep that found the image current does not clear the error of an earlier pull.
+    if pull_error and record.get("last_outcome") not in ("pull_ok", "up_to_date"):
         return (
             f"The executor's last pull of {image_ref} failed: {_quote(pull_error)}. "
             f"{_pull_error_next_step(str(pull_error), pull_ref)}"

@@ -771,6 +771,14 @@ def test_remediation_names_the_next_step_for_the_error(error, expected):
     assert expected in text
 
 
+def test_remediation_does_not_quote_an_error_a_later_sweep_moved_past():
+    state = {"last_outcome": "sweep_ok", "images": {_IMAGE_REF: {
+        "last_outcome": "up_to_date", "last_pull_error": _PULL_ERROR,
+    }}}
+
+    assert _remediation(state, _IMAGE_REF, _IMAGE_REF, cached=False) is None
+
+
 @pytest.mark.parametrize(
     ("state", "expected"),
     [

@@ -38,10 +38,11 @@ logger = get_logger(__name__)
 MIN_DISK_SPACE_MULTIPLIER = 3.0
 # Backoff used after errors / empty responses (never longer than the refresh).
 ERROR_INTERVAL_SECONDS = 5 * 60
-# Until the first sweep completes, an error is retried after 15, 30, 60 and 120 s (each plus up
-# to 15 s of jitter, so a fleet that boots together does not retry in step) before the loop falls
-# back to ERROR_INTERVAL_SECONDS: a new node is verified within minutes of being added, and the
-# default image is what that verification looks for.
+# Until the first sweep completes, a sweep that fails (the mandatory pull raising, most often) is
+# retried after 15, 30, 60 and 120 s, each plus up to 15 s of jitter so a fleet that boots together
+# does not retry in step, before the loop falls back to ERROR_INTERVAL_SECONDS: a new node is
+# verified within minutes of being added, and the default image is what that verification looks
+# for. An unknown GPU or an empty backend answer keeps ERROR_INTERVAL_SECONDS and uses none of them.
 FIRST_SWEEP_RETRY_BASE_SECONDS = 15
 FIRST_SWEEP_RETRY_JITTER_SECONDS = 15
 FIRST_SWEEP_FAST_RETRIES = 4
@@ -389,7 +390,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                         logger.warning("GPU not detected yet; retrying cache pre-pull shortly")
                         state.record_loop_outcome(Outcome.GPU_UNKNOWN, error=gpu_error)
                         state.flush()
-                        await asyncio.sleep(error_backoff())
+                        await asyncio.sleep(error_interval)
                         continue
                     logger.info(
                         f"Cache pre-pull resolved gpu_model={gpu_model} "
@@ -406,7 +407,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
                 if not templates:
                     state.record_loop_outcome(Outcome.BACKEND_NO_TEMPLATES, error=backend_error)
                     state.flush()
-                    await asyncio.sleep(error_backoff())
+                    await asyncio.sleep(error_interval)
                     continue
 
                 # Pre-pull entries are opportunistic and idle-only, so they never go
