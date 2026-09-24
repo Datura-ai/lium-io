@@ -15,7 +15,8 @@ class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
     # whether the batch tier started its container and tested the ports in at least one attempt;
-    # False when every attempt failed to start or timed out, so the forwarding test never ran
+    # False when every attempt failed to start, timed out or raised mid-test, so the forwarding
+    # test never completed
     batch_ran: bool = False
 
 
@@ -91,10 +92,10 @@ class PortRangeResult:
 
 
 SECOND_PASS_NOT_NEEDED = "not_needed"  # pass one verified MIN_PORT_COUNT or more
-SECOND_PASS_SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never ran
+SECOND_PASS_SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never completed
 SECOND_PASS_NO_PORTS_LEFT = "no_ports_left"  # every free declared port was in pass one
 SECOND_PASS_RAN = "ran"
-SECOND_PASS_BATCH_FAILED = "batch_failed"  # pass two's own batch container never ran
+SECOND_PASS_BATCH_FAILED = "batch_failed"  # pass two's own batch container didn't complete
 
 
 @dataclass(frozen=True)

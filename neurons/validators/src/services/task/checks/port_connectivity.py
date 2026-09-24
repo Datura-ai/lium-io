@@ -69,8 +69,8 @@ class PortConnectivityCheck:
         event_extra: dict[str, object] = {"port_ranges": port_ranges, "second_pass": result.second_pass}
         if result.second_pass == SECOND_PASS_SKIPPED_BATCH_FAILED:
             event_extra["second_pass_note"] = (
-                "second port pass skipped: the first pass's batch container never ran, "
-                "so the forwarding test could not run"
+                "second port pass skipped: the first pass's batch container didn't complete "
+                "(it failed to start, timed out or stopped mid-test), so the forwarding test could not run"
             )
         updated_state = replace(
             ctx.state,

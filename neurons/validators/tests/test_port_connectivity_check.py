@@ -510,7 +510,7 @@ async def test_port_connectivity_event_says_whether_the_second_pass_ran(context_
     assert result.event.context["second_pass"] == second_pass
     assert ("second_pass_note" in result.event.context) is noted
     if noted:
-        assert "batch container never ran" in result.event.context["second_pass_note"]
+        assert "batch container didn't complete" in result.event.context["second_pass_note"]
     assert "second_pass" not in result.updates["default_extra"]
     if not success:
         assert result.event.what_we_saw["second_pass"] == second_pass

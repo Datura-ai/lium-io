@@ -130,7 +130,8 @@ GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is 
 MIN_PORT_COUNT = 3
 BATCH_PORT_VERIFICATION_SIZE = 300
 # Declared ports are tallied per bucket of this width (by external port), so a wide range
-# forwarded only in part shows which part answered; at most 14 tallies over 1-65535.
+# forwarded only in part shows which part answered; at most 14 tallies over 1-65535 per pass
+# (28 per event, both passes). PORT_RANGE_MAX_ENTRIES is per pass too.
 PORT_RANGE_BUCKET_WIDTH = 5000
 PORT_RANGE_MAX_ENTRIES = 32
 BATCH_PORT_TIMEOUT = 40

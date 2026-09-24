@@ -382,6 +382,11 @@ async def test_pass_two_never_reprobes_a_pass_one_port():
     assert two[-1] == 65535
     # pass one's two answers are kept and pass two's are added
     assert {40001, 40002} <= {p.external for p in new.successful_ports}
+    # both passes' tallies see the combined answers, so each counts only answers among its own probes
+    tallies = [r.as_dict() for r in new.port_ranges]
+    assert all(t["answered"] <= t["probed"] <= t["declared"] for t in tallies)
+    assert sum(t["answered"] for t in tallies if t["pass"] == 1) == 2
+    assert [t["answered"] for t in tallies if t["pass"] == 1 and t["range"] == "65000-65535"] == [0]
 
 
 @pytest.mark.asyncio
@@ -549,7 +554,11 @@ async def test_partly_rented_host_probes_only_its_free_ports_and_counts_no_held_
     assert probed == {20008, 20009}
     assert {p.external for p in new.selected_ports} == {20008, 20009}
     assert new.failed_ports == ()
-    assert {p.external for p in new.successful_ports} == {p.external for p in main.successful} == {20008, 20009}
+    assert (
+        {p.external for p in new.successful_ports}
+        == {p.external for p in main.successful}
+        == {20008, 20009}
+    )
     assert new.second_pass == SECOND_PASS_NO_PORTS_LEFT
     assert [r.as_dict() for r in new.port_ranges] == [
         {"pass": 1, "range": "20000-20009", "declared": 10, "probed": 2, "answered": 2}
