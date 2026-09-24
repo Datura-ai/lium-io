@@ -1,4 +1,6 @@
+import json
 import pathlib
+import re
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
@@ -18,6 +20,10 @@ if TYPE_CHECKING:
 
 from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
+
+# A hotkey-list entry holding one of these is a mis-pasted list (JSON quotes or brackets, spaces
+# between hotkeys), not a hotkey; keeping it as one opaque entry would hide a pool-hotkey overlap.
+_NOT_A_BARE_HOTKEY = re.compile(r"[\s\"'\[\]{}]")
 
 
 class FeatureFlag(str, Enum):
@@ -639,9 +645,10 @@ class Settings(BaseSettings):
     DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED: bool = Field(
         env="DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED", default=False
     )
-    # Comma-separated ss58 hotkeys.
+    # ss58 hotkeys, comma-separated or a JSON list.
     DESIGNATED_MINER_HOTKEYS: str = Field(env="DESIGNATED_MINER_HOTKEYS", default="")
-    # Mirror of the portal's LIUM_POOL_HOTKEYS; only used to refuse an overlap with the list above.
+    # Mirror of the portal's LIUM_POOL_HOTKEYS (its env form is a JSON list; comma-separated also
+    # accepted); only used to refuse an overlap with the list above.
     LIUM_POOL_HOTKEYS: str = Field(env="LIUM_POOL_HOTKEYS", default="")
 
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
@@ -731,7 +738,8 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_designated_hotkeys(self) -> "Settings":
         """Refuse a designated hotkey that is also a pool hotkey, flag on or off, and refuse the flag
-        on with an empty pool mirror, where that overlap cannot be checked."""
+        on with an empty pool mirror, where that overlap cannot be checked. Either list not parsing
+        (see ``_parse_hotkey_set``) is refused too."""
         designated = self.designated_miner_hotkeys()
         pool = self.lium_pool_hotkeys()
         shared = designated & pool
@@ -790,14 +798,35 @@ class Settings(BaseSettings):
         return max(self.CONTRACT_VERSIONS.keys())
 
     @staticmethod
-    def _parse_hotkey_set(raw: str) -> frozenset[str]:
-        return frozenset(h.strip() for h in raw.split(",") if h.strip())
+    def _parse_hotkey_set(name: str, raw: str) -> frozenset[str]:
+        """A JSON list of strings (the portal's env form) or a comma-separated list. Anything else
+        raises, so config load refuses it rather than keeping it as one entry no hotkey equals."""
+        text = raw.strip()
+        if text.startswith("["):
+            try:
+                entries = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{name} starts with '[' but is not a valid JSON list: {exc.msg}"
+                ) from None
+            if not isinstance(entries, list) or not all(isinstance(h, str) for h in entries):
+                raise ValueError(f"{name} must be a JSON list of strings or a comma-separated list")
+        else:
+            entries = text.split(",")
+        hotkeys = frozenset(h.strip() for h in entries if h.strip())
+        malformed = sum(1 for h in hotkeys if _NOT_A_BARE_HOTKEY.search(h))
+        if malformed:
+            raise ValueError(
+                f"{name} has {malformed} entry(ies) with a quote, bracket or space inside; give "
+                'a JSON list (["5...", "5..."]) or a comma-separated list (5...,5...)'
+            )
+        return hotkeys
 
     def designated_miner_hotkeys(self) -> frozenset[str]:
-        return self._parse_hotkey_set(self.DESIGNATED_MINER_HOTKEYS)
+        return self._parse_hotkey_set("DESIGNATED_MINER_HOTKEYS", self.DESIGNATED_MINER_HOTKEYS)
 
     def lium_pool_hotkeys(self) -> frozenset[str]:
-        return self._parse_hotkey_set(self.LIUM_POOL_HOTKEYS)
+        return self._parse_hotkey_set("LIUM_POOL_HOTKEYS", self.LIUM_POOL_HOTKEYS)
 
     def is_designated_hotkey_first_pass(self, miner_hotkey: str | None, first_pass: bool) -> bool:
         """Only the express lane passes ``first_pass``, so a scored cycle never takes the profile."""

@@ -134,7 +134,7 @@ def test_config_load_accepts_dedicated_hotkeys_beside_a_filled_pool_mirror():
 
 
 @pytest.mark.parametrize("designated", [DESIGNATED_HOTKEY, ""])
-@pytest.mark.parametrize("pool", ["", " , "])
+@pytest.mark.parametrize("pool", ["", " , ", "[]", " [ ] ", '[""]', '[" ", ""]'])
 def test_config_load_refuses_the_flag_on_with_an_empty_pool_mirror(designated, pool):
     from pydantic import ValidationError
 
@@ -159,6 +159,113 @@ def test_config_load_accepts_an_empty_pool_mirror_with_the_flag_off():
         LIUM_POOL_HOTKEYS="",
     )
     assert s.lium_pool_hotkeys() == frozenset()
+
+
+# The portal's env form of LIUM_POOL_HOTKEYS is a JSON list; the mirror takes it verbatim.
+
+
+@pytest.mark.parametrize("flag", [True, False])
+@pytest.mark.parametrize(
+    "designated",
+    [f"{DESIGNATED_HOTKEY},{POOL_HOTKEY}", f'["{DESIGNATED_HOTKEY}", "{POOL_HOTKEY}"]'],
+)
+def test_config_load_refuses_a_pool_hotkey_given_in_the_portals_json_form(flag, designated):
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    with pytest.raises(ValidationError, match="dedicated hotkey"):
+        Settings(
+            _env_file=None,
+            DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=flag,
+            DESIGNATED_MINER_HOTKEYS=designated,
+            LIUM_POOL_HOTKEYS=f'["{POOL_HOTKEY}", "other-pool-hotkey-fixture"]',
+        )
+
+
+@pytest.mark.parametrize(
+    "pool",
+    [
+        f'["{POOL_HOTKEY}", "other-pool-hotkey-fixture"]',
+        f'  [ " {POOL_HOTKEY} " , "", "other-pool-hotkey-fixture" ]  ',
+        f"{POOL_HOTKEY}, other-pool-hotkey-fixture",
+    ],
+)
+@pytest.mark.parametrize(
+    "designated",
+    [
+        f"{DESIGNATED_HOTKEY},{OTHER_DESIGNATED_HOTKEY}",
+        f'["{DESIGNATED_HOTKEY}", "{OTHER_DESIGNATED_HOTKEY}"]',
+    ],
+)
+def test_config_load_reads_the_json_and_comma_forms_alike(designated, pool):
+    from core.config import Settings
+
+    s = Settings(
+        _env_file=None,
+        DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=True,
+        DESIGNATED_MINER_HOTKEYS=designated,
+        LIUM_POOL_HOTKEYS=pool,
+    )
+    assert s.lium_pool_hotkeys() == frozenset({POOL_HOTKEY, "other-pool-hotkey-fixture"})
+    assert s.designated_miner_hotkeys() == frozenset({DESIGNATED_HOTKEY, OTHER_DESIGNATED_HOTKEY})
+    assert s.is_designated_hotkey_first_pass(DESIGNATED_HOTKEY, first_pass=True) is True
+    assert s.is_designated_hotkey_first_pass(POOL_HOTKEY, first_pass=True) is False
+
+
+MALFORMED_HOTKEY_LISTS = [
+    f'["{POOL_HOTKEY}"',  # unclosed JSON list
+    f'["{POOL_HOTKEY}",]',  # trailing comma: not JSON
+    f"['{POOL_HOTKEY}']",  # Python repr, not JSON
+    f'[1, "{POOL_HOTKEY}"]',  # not all strings
+    f'{{"hotkeys": ["{POOL_HOTKEY}"]}}',  # JSON object
+    f'"{POOL_HOTKEY}"',  # a quoted string
+    f'"{POOL_HOTKEY}", "other-pool-hotkey-fixture"',  # a JSON list without its brackets
+    f"{POOL_HOTKEY} other-pool-hotkey-fixture",  # space-separated
+]
+
+
+@pytest.mark.parametrize("flag", [True, False])
+@pytest.mark.parametrize("pool", MALFORMED_HOTKEY_LISTS)
+def test_config_load_refuses_a_malformed_pool_mirror(flag, pool):
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    with pytest.raises(ValidationError, match="LIUM_POOL_HOTKEYS (starts with|must be|has)"):
+        Settings(
+            _env_file=None,
+            DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=flag,
+            DESIGNATED_MINER_HOTKEYS=POOL_HOTKEY,
+            LIUM_POOL_HOTKEYS=pool,
+        )
+
+
+@pytest.mark.parametrize("designated", MALFORMED_HOTKEY_LISTS)
+def test_config_load_refuses_a_malformed_designated_list(designated):
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    with pytest.raises(ValidationError, match="DESIGNATED_MINER_HOTKEYS (starts with|must be|has)"):
+        Settings(
+            _env_file=None,
+            DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED=True,
+            DESIGNATED_MINER_HOTKEYS=designated,
+            LIUM_POOL_HOTKEYS="some-other-pool-hotkey-fixture",
+        )
+
+
+def test_config_load_reads_the_portals_json_mirror_from_the_environment(monkeypatch):
+    from pydantic import ValidationError
+
+    from core.config import Settings
+
+    monkeypatch.setenv("DESIGNATED_HOTKEY_FAST_VALIDATION_ENABLED", "true")
+    monkeypatch.setenv("DESIGNATED_MINER_HOTKEYS", POOL_HOTKEY)
+    monkeypatch.setenv("LIUM_POOL_HOTKEYS", f'["{POOL_HOTKEY}"]')
+    with pytest.raises(ValidationError, match="dedicated hotkey"):
+        Settings(_env_file=None)
 
 
 @pytest.mark.parametrize(
