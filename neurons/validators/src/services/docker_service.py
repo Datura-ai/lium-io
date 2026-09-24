@@ -127,6 +127,7 @@ from services.ssh_connect_timing import connect_with_phase_timing
 from services.ssh_ready_gate import (
     SshNotReady,
     SshReadyMode,
+    SshReadyResult,
     ssh_ready_gate_mode,
     wait_for_ssh_banner,
 )
@@ -4915,21 +4916,22 @@ class DockerService:
                 return external_port
         return None
 
-    async def _check_ssh_ready(
+    async def _wait_ssh_ready(
         self,
         *,
         host: str,
         port: int,
         mode: SshReadyMode,
         log_extra: dict,
-    ) -> None:
-        """Wait for the pod's sshd banner and write one `SSH ready gate` line; raise SshNotReady in enforce."""
-        grace_seconds = settings.SSH_READY_GATE_GRACE_SECONDS
+        stop: Callable[[], bool] | None = None,
+    ) -> SshReadyResult:
+        """Wait for the pod's sshd banner and write one `SSH ready gate` line; the caller acts on the result."""
         result = await wait_for_ssh_banner(
             host,
             port,
-            grace_seconds=grace_seconds,
+            grace_seconds=settings.SSH_READY_GATE_GRACE_SECONDS,
             poll_seconds=settings.SSH_READY_GATE_POLL_SECONDS,
+            stop=stop,
         )
         log = logger.info if result.ready else logger.warning
         log(
@@ -4942,18 +4944,17 @@ class DockerService:
                     "ssh_ready": result.ready,
                     "ssh_ready_attempts": result.attempts,
                     "ssh_ready_duration_ms": result.elapsed_ms,
-                    "ssh_ready_grace_seconds": grace_seconds,
+                    "ssh_ready_grace_seconds": settings.SSH_READY_GATE_GRACE_SECONDS,
                     "ssh_external_port": port,
                 }),
             )
         )
-        if mode is SshReadyMode.ENFORCE and not result.ready:
-            raise SshNotReady(port, grace_seconds, result)
+        return result
 
     def _start_ssh_ready_log_probe(self, *, host: str, port: int, log_extra: dict) -> asyncio.Task:
         async def _probe() -> None:
             try:
-                await self._check_ssh_ready(host=host, port=port, mode=SshReadyMode.LOG, log_extra=log_extra)
+                await self._wait_ssh_ready(host=host, port=port, mode=SshReadyMode.LOG, log_extra=log_extra)
             except Exception as exc:
                 logger.warning(
                     _m(
@@ -6132,8 +6133,9 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
                     prev_timestamp = now_ms()
 
-                    # Runs before the delete checkpoint below: a delete that lands during the grace
-                    # period is still caught there.
+                    # A delete that lands during the grace period ends the wait at the next dial or sleep,
+                    # and the checkpoint below turns the create into `cancelled_by_delete`: the renter's
+                    # cancel is never reported as an `ssh_ready` failure.
                     ssh_ready_mode = ssh_ready_gate_mode(settings.SSH_READY_GATE_MODE)
                     ssh_external_port = self._ssh_external_port(port_maps)
                     ssh_ready_extra = {
@@ -6147,12 +6149,16 @@ class DockerService:
                         )
                     if ssh_ready_mode is SshReadyMode.ENFORCE and ssh_external_port is not None:
                         current_step = "ssh_ready"
-                        await self._check_ssh_ready(
+                        ssh_ready = await self._wait_ssh_ready(
                             host=executor_info.address,
                             port=ssh_external_port,
                             mode=ssh_ready_mode,
                             log_extra=ssh_ready_extra,
+                            stop=lambda: inflight_creates.is_cancelled(payload.pod_id),
                         )
+                        if not ssh_ready.ready:
+                            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                            raise SshNotReady(ssh_external_port, settings.SSH_READY_GATE_GRACE_SECONDS, ssh_ready)
                         profilers.append(ProfilerStep.since(ProfilerStepName.SSH_READY, prev_timestamp))
                         prev_timestamp = now_ms()
 

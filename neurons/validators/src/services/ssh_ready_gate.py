@@ -50,6 +50,7 @@ class SshReadyOutcome(str, enum.Enum):
     TIMED_OUT = "timed out"
     UNREACHABLE = "unreachable"
     NO_BANNER = "no banner"
+    CANCELLED = "cancelled by delete"
 
 
 @dataclass(frozen=True)
@@ -108,17 +109,23 @@ async def wait_for_ssh_banner(
     grace_seconds: float,
     poll_seconds: float,
     attempt_timeout_seconds: float = SSH_READY_ATTEMPT_TIMEOUT_SECONDS,
+    stop: Callable[[], bool] | None = None,
     probe: Callable[[str, int, float], Awaitable[SshReadyOutcome]] = probe_ssh_banner,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> SshReadyResult:
-    """Dial until the banner arrives or `grace_seconds` pass; the result carries the last outcome.
+    """Dial until the banner arrives, `grace_seconds` pass or `stop()` says the create was cancelled.
 
-    Each dial is capped at what is left of the grace period, so the whole wait never exceeds it."""
+    Each dial is capped at what is left of the grace period, so the whole wait never exceeds it. The
+    result carries the last outcome, or CANCELLED when `stop()` ended it (checked before every dial
+    and every sleep)."""
     started = clock()
     attempts = 0
     outcome = SshReadyOutcome.TIMED_OUT
     while True:
+        if stop is not None and stop():
+            outcome = SshReadyOutcome.CANCELLED
+            break
         remaining = grace_seconds - (clock() - started)
         if remaining <= 0:
             break
@@ -128,6 +135,9 @@ async def wait_for_ssh_banner(
             break
         remaining = grace_seconds - (clock() - started)
         if remaining <= 0:
+            break
+        if stop is not None and stop():
+            outcome = SshReadyOutcome.CANCELLED
             break
         await sleep(min(poll_seconds, remaining))
     return SshReadyResult(

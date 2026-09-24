@@ -225,6 +225,47 @@ async def test_wait_never_runs_past_the_grace_even_when_every_dial_uses_its_whol
     assert result.outcome is SshReadyOutcome.TIMED_OUT
 
 
+@pytest.mark.asyncio
+async def test_wait_stops_within_one_poll_of_a_cancel():
+    clock = _FakeClock()
+    cancelled_at = 9.0
+    probe = _probe_ready_after(clock, float("inf"))
+
+    result = await wait_for_ssh_banner(
+        "1.2.3.4",
+        2222,
+        grace_seconds=60,
+        poll_seconds=2,
+        stop=lambda: clock.now >= cancelled_at,
+        probe=probe,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.outcome is SshReadyOutcome.CANCELLED
+    assert not result.ready
+    assert cancelled_at <= clock.now <= cancelled_at + 2
+
+
+@pytest.mark.asyncio
+async def test_wait_cancelled_before_the_first_dial_dials_nothing():
+    clock = _FakeClock()
+    probe = _probe_ready_after(clock, 0)
+
+    result = await wait_for_ssh_banner(
+        "1.2.3.4",
+        2222,
+        grace_seconds=60,
+        poll_seconds=2,
+        stop=lambda: True,
+        probe=probe,
+        clock=clock,
+    )
+
+    assert result.outcome is SshReadyOutcome.CANCELLED and result.attempts == 0
+    assert probe.calls == []
+
+
 def test_not_ready_error_names_port_grace_and_outcome():
     result = SshReadyResult(outcome=SshReadyOutcome.REFUSED, attempts=31, elapsed_ms=60_000)
     assert str(SshNotReady(40022, 60.0, result)) == (
@@ -375,6 +416,32 @@ async def test_enforce_fails_when_port_accepts_but_sends_no_banner(svc, monkeypa
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "ssh_ready"
     assert "(no banner)" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_delete_during_the_grace_ends_the_create_as_cancelled_by_delete(svc, monkeypatch):
+    """Review (lium-io#1467): a renter's delete mid-grace must end the create as the renter's cancel, within
+    one poll, not as an `ssh_ready` failure the platform would count against the node."""
+    _patch_happy(svc, monkeypatch, _ssh_client())
+    _set_mode(monkeypatch, "enforce")
+    clock = _FakeClock()
+    payload = _payload(ships_sshd=True)
+    deleted_at = 9.0
+
+    async def _probe(host, port, timeout):
+        if clock.now >= deleted_at:
+            ds_module.inflight_creates.cancel(payload.pod_id)
+        return SshReadyOutcome.REFUSED
+
+    _patch_wait(monkeypatch, _probe, clock)
+
+    with ds_module.inflight_creates.track(payload.pod_id):
+        result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "cancelled_by_delete"
+    assert "did not answer with an SSH banner" not in (result.detail or "")
+    assert clock.now <= deleted_at + 2
 
 
 @pytest.mark.asyncio
