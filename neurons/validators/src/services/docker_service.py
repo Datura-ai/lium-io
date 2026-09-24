@@ -124,6 +124,12 @@ from services.rental_docker_sdk import (
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
+from services.ssh_ready_gate import (
+    SshNotReady,
+    SshReadyMode,
+    ssh_ready_gate_mode,
+    wait_for_ssh_banner,
+)
 from services.storage_operations import (
     start_storage_operation,
     supports_bootstrap_restore,
@@ -1127,6 +1133,10 @@ if ! {mount_check}; then
   gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
 fi
 """
+
+
+# The event loop keeps only weak references to tasks; log-mode SSH-ready probes outlive the create.
+_SSH_READY_LOG_TASKS: set[asyncio.Task] = set()
 
 
 class DockerService:
@@ -4897,6 +4907,66 @@ class DockerService:
             raise docker_outcome
         return ssh_outcome, docker_outcome
 
+    @staticmethod
+    def _ssh_external_port(port_maps: list[tuple[int, int, int]]) -> int | None:
+        """The executor's public port mapped to the pod's port 22 (the one renters dial)."""
+        for docker_port, _, external_port in port_maps:
+            if docker_port == 22:
+                return external_port
+        return None
+
+    async def _check_ssh_ready(
+        self,
+        *,
+        host: str,
+        port: int,
+        mode: SshReadyMode,
+        log_extra: dict,
+    ) -> None:
+        """Wait for the pod's sshd banner and write one `SSH ready gate` line; raise SshNotReady in enforce."""
+        grace_seconds = settings.SSH_READY_GATE_GRACE_SECONDS
+        result = await wait_for_ssh_banner(
+            host,
+            port,
+            grace_seconds=grace_seconds,
+            poll_seconds=settings.SSH_READY_GATE_POLL_SECONDS,
+        )
+        log = logger.info if result.ready else logger.warning
+        log(
+            _m(
+                "SSH ready gate",
+                extra=get_extra_info({
+                    **log_extra,
+                    "ssh_ready_mode": mode.value,
+                    "ssh_ready_result": result.outcome.value,
+                    "ssh_ready": result.ready,
+                    "ssh_ready_attempts": result.attempts,
+                    "ssh_ready_duration_ms": result.elapsed_ms,
+                    "ssh_ready_grace_seconds": grace_seconds,
+                    "ssh_external_port": port,
+                }),
+            )
+        )
+        if mode is SshReadyMode.ENFORCE and not result.ready:
+            raise SshNotReady(port, grace_seconds, result)
+
+    def _start_ssh_ready_log_probe(self, *, host: str, port: int, log_extra: dict) -> asyncio.Task:
+        async def _probe() -> None:
+            try:
+                await self._check_ssh_ready(host=host, port=port, mode=SshReadyMode.LOG, log_extra=log_extra)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "SSH ready gate probe errored",
+                        extra=get_extra_info({**log_extra, "error": str(exc)}),
+                    )
+                )
+
+        task = asyncio.create_task(_probe())
+        _SSH_READY_LOG_TASKS.add(task)
+        task.add_done_callback(_SSH_READY_LOG_TASKS.discard)
+        return task
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -6062,6 +6132,30 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
                     prev_timestamp = now_ms()
 
+                    # Runs before the delete checkpoint below: a delete that lands during the grace
+                    # period is still caught there.
+                    ssh_ready_mode = ssh_ready_gate_mode(settings.SSH_READY_GATE_MODE)
+                    ssh_external_port = self._ssh_external_port(port_maps)
+                    ssh_ready_extra = {
+                        **default_extra,
+                        "container_name": container_name,
+                        "image_manages_services": image_manages_services,
+                    }
+                    if ssh_ready_mode is not SshReadyMode.OFF and ssh_external_port is None:
+                        logger.warning(
+                            _m("SSH ready gate skipped: no port maps to 22", extra=get_extra_info(ssh_ready_extra))
+                        )
+                    if ssh_ready_mode is SshReadyMode.ENFORCE and ssh_external_port is not None:
+                        current_step = "ssh_ready"
+                        await self._check_ssh_ready(
+                            host=executor_info.address,
+                            port=ssh_external_port,
+                            mode=ssh_ready_mode,
+                            log_extra=ssh_ready_extra,
+                        )
+                        profilers.append(ProfilerStep.since(ProfilerStepName.SSH_READY, prev_timestamp))
+                        prev_timestamp = now_ms()
+
                     await self.finish_stream_logs()
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
@@ -6162,6 +6256,13 @@ class DockerService:
                         }),
                     )
                 )
+
+                if ssh_ready_mode is SshReadyMode.LOG and ssh_external_port is not None:
+                    self._start_ssh_ready_log_probe(
+                        host=executor_info.address,
+                        port=ssh_external_port,
+                        log_extra=ssh_ready_extra,
+                    )
 
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
