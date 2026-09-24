@@ -35,9 +35,9 @@ bypass list create, move or delete a `lium-core-v*` tag. The list is humans only
 release). A human creates each release tag; the loop's account (114649324, `surcyf123`) is not on the list and never
 creates, moves or deletes a release tag. Add a human by appending
 `{ "actor_id": <human-id>, "actor_type": "User", "bypass_mode": "always" }` (never 114649324) and re-applying with
-`gh api "repos/$R/rulesets/<id>" --method PUT --input .github/rulesets/lium-core-release-tags.json`. Today (read
-23 Sep 2026) no tag ruleset is applied to this repository, so any account with write access, the loop's account
-included, can create a `lium-core-v*` tag until an admin applies this file. Both guards are repository settings a
+`gh api "repos/$R/rulesets/<id>" --method PUT --input .github/rulesets/lium-core-release-tags.json`. Until an admin
+applies this file, any account with write access, the loop's account included, can create a `lium-core-v*` tag. Both
+guards are repository settings a
 repository admin applies once:
 
 ```bash
@@ -46,13 +46,13 @@ R=Datura-ai/lium-io
 # (`gh api users/<login> --jq .id`), in place of <human-id>. Never 114649324 (surcyf123, the loop's account): the
 # publish job refuses to run while it is listed. The PUT replaces the whole reviewers list. can_admins_bypass false:
 # the publish job refuses to run while admin bypass is on.
-# only lium-core-v* tags may enter it
 gh api -X PUT "repos/$R/environments/pypi" --input - <<'JSON'
 { "reviewers": [ { "type": "User", "id": <human-id> } ],
   "prevent_self_review": true,
   "can_admins_bypass": false,
   "deployment_branch_policy": { "protected_branches": false, "custom_branch_policies": true } }
 JSON
+# only lium-core-v* tags may enter it
 gh api -X POST "repos/$R/environments/pypi/deployment-branch-policies" -f name='lium-core-v*' -f type=tag
 # the tag ruleset (bypass list = GitHub user ids; `gh api users/<login> --jq .id`)
 gh api "repos/$R/rulesets" --method POST --input .github/rulesets/lium-core-release-tags.json
@@ -72,31 +72,29 @@ Self-approval is blocked (`prevent_self_review: true`): GitHub refuses an approv
 run. That is all it blocks: any one listed required reviewer other than the run's starter can approve. So the list
 holds humans only, at least one, and never 114649324 (`surcyf123`, the loop's account, which never approves a
 release). List people by user id, not teams: the publish job cannot read team membership, so it refuses a team
-reviewer. Today (23 Sep 2026) the `pypi` environment lists only `surcyf123`, so every publish job refuses until an
-admin re-runs the `PUT` above with human ids in place of 114649324.
+reviewer. The human who pushes the tag starts the run and so cannot approve it: list at least one reviewer who does
+not push release tags.
 
-Admin bypass: the environment reads `can_admins_bypass: true` today. With it, a repository admin can start a
-waiting publish job ("Start all waiting jobs") without a reviewer's approval. This repository has two admins today
-(read 23 Sep 2026): `surcyf123`, the loop's account, and `colin-002`. So the publish job refuses to run unless
+Admin bypass: with `can_admins_bypass: true`, a repository admin can start a waiting publish job ("Start all waiting
+jobs") without a reviewer's approval, and the loop's account is a repository admin. So the publish job refuses to run unless
 `can_admins_bypass` is `false` (a missing field counts as on), and the `PUT` above sets `"can_admins_bypass": false`.
-Leaving the field out of a `PUT` does not keep today's value: the API's documented default is `true`. The same switch
+Leaving the field out of a `PUT` does not keep the current value: the API's documented default is `true`. The same switch
 is Settings → Environments → `pypi` → "Allow administrators to bypass configured protection rules".
 
 **Order — it matters.** (1) Create the `pypi` environment with its reviewers (humans only, at least one, not
 114649324), self-approval blocked, admin bypass off and the policy, as above, **before the workflow change merges**: a workflow that
 names an environment that does not exist makes GitHub create it with no protection, and the first tagged run would
-publish with no click. The environment and its tag policy exist today; what step (1) still needs is the
-`PUT` with human ids and `"can_admins_bypass": false`.
+start the publish job with no click; only the guard step below stops it.
 (2) Register the `pypi` publisher on pypi.org
 (Manage → Publishing → Add a new publisher → GitHub: owner `Datura-ai`, repository `lium-io`, workflow
-`lium-core-release.yml`, environment `pypi`). (3) Merge. (4) Proof release: a human pushes the tag, and a human reviewer approves the publish job. (5) **Delete
+`lium-core-release.yml`, environment `pypi`). (3) Merge. (4) Apply the tag ruleset. (5) Proof release: a human pushes the tag, and a human reviewer approves the publish job. (6) **Delete
 the old publishers** on pypi.org: `Datura-ai/lium-io · lium-core-release.yml · release` and the archived
 `Datura-ai/lium-core · release.yml · release`. Until they are gone a branch whose edited `lium-core-release.yml`
-keeps `environment: release` (no reviewer, no branch policy), run by hand, still uploads — any of the 7 accounts
-with write access can do that today. (6) Apply the tag ruleset. The publish job checks step (1) itself: it reads
+keeps `environment: release` (no reviewer, no branch policy), run by hand, still uploads — any account
+with write access can do that. The publish job checks step (1) itself: it reads
 `repos/$R/environments/pypi` back and stops unless the environment has at least one required reviewer, 114649324
 is not among them, every reviewer is a user, `prevent_self_review` is `true`, and `can_admins_bypass` is `false` (an unauthenticated read for a
 public repository; the job holds `actions: read` for it). It cannot tell a human from another machine account; the
-admin lists humans. It cannot check step (5) — pypi.org's side is the owner's click. With no `pypi` publisher registered, PyPI rejects the `pypi`-environment
+admin lists humans. It cannot check step (6) — pypi.org's side is the owner's click. With no `pypi` publisher registered, PyPI rejects the `pypi`-environment
 token (the current publisher is bound to `release`), so if (3) runs before (2), a tag pushed after (3) and before (2)
 fails closed — that is the only state that does.
