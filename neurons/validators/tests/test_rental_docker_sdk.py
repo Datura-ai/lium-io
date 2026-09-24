@@ -31,6 +31,7 @@ from services.rental_docker_sdk import (
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
+    RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC,
     _build_rental_ssh_http_adapter_class,
 )
 
@@ -1400,3 +1401,90 @@ async def test_inspect_container_state_without_a_state_block_is_an_error():
 
     with pytest.raises(RentalDockerOperationError, match="did not include container State"):
         await client.inspect_container_state(container_name="pod_exec")
+
+
+def test_rental_ssh_adapter_sets_a_keepalive_on_its_transport(monkeypatch, tmp_path):
+    """The SDK's paramiko session idles through a long build, so the adapter arms its keepalive
+    right after every connect."""
+    import paramiko
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY\n")
+    keepalives = []
+
+    class FakeTransport:
+        def set_keepalive(self, interval):
+            keepalives.append(interval)
+
+    class FakeSSHClient:
+        def __init__(self):
+            self.connected_with = None
+            self._transport = None
+
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            self.connected_with = params
+            self._transport = FakeTransport()
+
+        def get_transport(self):
+            return self._transport
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    # Through docker-py's own constructor: SSHHTTPAdapter.__init__ is what calls _connect, so the
+    # hook the fix relies on is pinned here, not assumed.
+    adapter = adapter_class("ssh://root@127.0.0.1:2222")
+
+    assert adapter.ssh_client.connected_with["hostname"] == "127.0.0.1"
+    assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC]
+    assert 0 < RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC <= 60
+
+    # docker-py reconnects a closed transport through the same hook.
+    adapter._connect()
+    assert keepalives == [RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC] * 2
+
+
+def test_rental_ssh_adapter_connect_without_transport_does_not_fail(monkeypatch, tmp_path):
+    """A connect that leaves no transport (a stub client, or docker-py's shell-out mode) must not
+    turn into an AttributeError of our own."""
+    import paramiko
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY\n")
+
+    class FakeSSHClient:
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            pass
+
+        def get_transport(self):
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    adapter = adapter_class.__new__(adapter_class)
+    adapter._create_paramiko_client("ssh://root@127.0.0.1:2222")
+
+    adapter._connect()

@@ -188,6 +188,33 @@ class DummyRedisService:
     async def renting_in_progress(self, miner_hotkey: str, executor_uuid: str):
         return False  # Not renting in progress
 
+    # DAH-2870: the rented check keeps per-pod SSH-probe marks; a bare dict is enough here.
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key: str):
+        return self.store.get(key)
+
+    async def set(self, key: str, value: str, ex: int | None = None):
+        self.store[key] = value
+
+    async def delete(self, key: str):
+        self.store.pop(key, None)
+
+    # the per-cycle fleet and due hashes of the probe's cycle-end gate
+    async def hset(self, key: str, field: str, value: str):
+        self.store.setdefault(key, {})[field] = value
+
+    async def hgetall(self, key: str):
+        return dict(self.store.get(key) or {})
+
+    async def expire(self, key: str, seconds: int):
+        pass
+
+    async def write_atomically(self, writes):
+        for name, args, kwargs in writes.ops:
+            await getattr(self, name)(*args, **kwargs)
+
 
 class DummyValidationService:
     """Mock validation service for GPU capability checks."""

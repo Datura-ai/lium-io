@@ -954,7 +954,7 @@ async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
     credentials into it is a separate task."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None)))
+    monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None, None)))
 
     result = await _run(
         svc,

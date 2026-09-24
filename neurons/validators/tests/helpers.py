@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
+import redis.exceptions
 from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
@@ -107,6 +108,121 @@ class DummyScoreCalc:
         return 0.0, 0.0, ""
 
 
+class FakeRedis:
+    """Dict-backed stand-in for RedisService's get/set/delete and the hash calls (hset/hgetall/hdel/expire).
+
+    `ttl` records the `ex` of the last set per key (None when set without one), so a
+    test can assert that a mark carries an expiry. `failing` makes every call raise the client's
+    ConnectionError, the shape of a Redis outage seen through RedisService; `fail_next_set_of`
+    makes only the next `set` of those keys raise (one shot each; `fail_set_of_after[key] = n` skips n sets first), the shape of a blip that hits
+    one write in the middle of a cycle.
+    """
+
+    def __init__(self, *, failing: bool = False):
+        self.store: dict[str, str] = {}
+        # hset/hgetall/hdel: the per-cycle fleet and due hashes (DAH-2870), kept apart from the
+        # string keys so `store` still reads as the per-pod marks alone.
+        self.hashes: dict[str, dict[str, str]] = {}
+        self.ttl: dict[str, int | None] = {}
+        self.failing = failing
+        self.fail_next_set_of: set[str] = set()
+        # key -> how many `set`s of it to let through before the one that raises (one shot each)
+        self.fail_set_of_after: dict[str, int] = {}
+        # keys whose next DELETE fails (one shot each): a plain `delete`, or the whole batch when
+        # it sits inside write_atomically
+        self.fail_delete_of: set[str] = set()
+        self.calls = 0
+
+    def _touch(self):
+        self.calls += 1
+        if self.failing:
+            raise redis.exceptions.ConnectionError("Error 111 connecting to redis:6379")
+
+    async def get(self, key: str):
+        self._touch()
+        return self.store.get(key)
+
+    def _set_hook(self, key: str):
+        if key in self.fail_next_set_of:
+            self.fail_next_set_of.discard(key)
+            raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
+        if key in self.fail_set_of_after:
+            if self.fail_set_of_after[key] == 0:
+                del self.fail_set_of_after[key]
+                raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
+            self.fail_set_of_after[key] -= 1
+
+    async def set(self, key: str, value: str, ex: int | None = None):
+        self._touch()
+        self._set_hook(key)
+        self.store[key] = value
+        self.ttl[key] = ex
+
+    async def write_atomically(self, writes):
+        """`RedisService.write_atomically`: all of `writes` or none. `fail_delete_of` names keys whose
+        DELETE fails the whole batch (the shape of a connection lost mid-transaction); the set hooks
+        above apply to every SET in the batch. A failing batch applies nothing."""
+        self._touch()
+        for name, args, _kwargs in writes.ops:
+            if name == "set":
+                self._set_hook(args[0])
+            if name == "delete" and args[0] in self.fail_delete_of:
+                self.fail_delete_of.discard(args[0])
+                raise redis.exceptions.ConnectionError(f"Connection lost deleting {args[0]}")
+        # EXEC: applied without the hooks (they were consumed above) and as one round trip
+        for name, args, kwargs in writes.ops:
+            if name == "set":
+                key, value = args
+                self.store[key] = value
+                self.ttl[key] = kwargs.get("ex")
+            elif name == "delete":
+                (key,) = args
+                self.store.pop(key, None)
+                self.hashes.pop(key, None)
+                self.ttl.pop(key, None)
+            elif name == "hset":
+                key, field, value = args
+                self.hashes.setdefault(key, {})[field] = value
+            elif name == "expire":
+                key, seconds = args
+                if key in self.store or key in self.hashes:
+                    self.ttl[key] = seconds
+            else:
+                raise AssertionError(f"FakeRedis.write_atomically: unknown write {name}")
+
+    async def delete(self, key: str):
+        self._touch()
+        if key in self.fail_delete_of:
+            self.fail_delete_of.discard(key)
+            raise redis.exceptions.ConnectionError(f"Connection lost deleting {key}")
+        self.store.pop(key, None)
+        self.hashes.pop(key, None)
+        self.ttl.pop(key, None)
+
+    async def hset(self, key: str, field: str, value: str):
+        self._touch()
+        self.hashes.setdefault(key, {})[field] = value
+
+    async def hget(self, key: str, field: str):
+        self._touch()
+        return self.hashes.get(key, {}).get(field)
+
+    async def hgetall(self, key: str):
+        self._touch()
+        # redis-py returns bytes for both sides; the module must decode them
+        return {k.encode(): v.encode() for k, v in self.hashes.get(key, {}).items()}
+
+    async def hdel(self, key: str, *fields: str):
+        self._touch()
+        for field in fields:
+            self.hashes.get(key, {}).pop(field, None)
+
+    async def expire(self, key: str, seconds: int):
+        self._touch()
+        if key in self.store or key in self.hashes:
+            self.ttl[key] = seconds
+
+
 def default_executor() -> ExecutorSSHInfo:
     return ExecutorSSHInfo(
         uuid="executor-123",
@@ -155,7 +271,8 @@ def build_services(**overrides) -> ContextServices:
     backend.get_rented_executors_now.return_value = None
     base = dict(
         ssh=None,
-        redis=None,
+        # DAH-2870: the rented check keeps per-pod marks in Redis on every rented cycle.
+        redis=FakeRedis(),
         validation=None,
         verifyx=None,
         inspector=None,

@@ -2,11 +2,11 @@
 
 The validator↔backend wire, once. Pydantic v2 models for:
 
-- `lium_protocol.validator_to_backend` — every message the validator sends the backend over its WebSocket (`ValidatorMessageType`, 26 types: cycle results and scores, and the answers to container requests).
+- `lium_protocol.validator_to_backend` — every message the validator sends the backend over its WebSocket (`ValidatorMessageType`, 27 types: cycle results and scores, the per-cycle pod-states report, and the answers to container requests).
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 16 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
-- `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 9 bodies).
+- `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.0.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`1.3.0`) is semver over the wire.
 
 ## Using it
 
@@ -38,10 +38,17 @@ Field types are what a receiver must accept: a field one peer sends and the othe
 
 Compatibility rules for a change:
 
-- add an optional field or an enum member → minor version bump (`1.1.0`);
+- add an optional field or an enum member → minor version bump (`1.0.0` → `1.1.0`, as `FailedContainerRequest.build_log_tail` did);
 - make a field required, remove or rename one, change a type → major version bump and a new `snapshots/lium_protocol.v2.json`.
 
-Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The plan for lium-platform (its pull request for DAH-3247): vendor the tree — models, snapshot and recordings — under `apps/lium/backend/apps/server/src/lium_protocol/`, with a `PROTOCOL_PIN.json` naming the tag, the commit and the tree's sha256, and a CI check that compares the vendored copy with that commit.
+Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The plan for lium-platform: vendor the tree — models, snapshot and recordings — under `apps/lium/backend/apps/server/src/lium_protocol/`, with a `PROTOCOL_PIN.json` naming the tag, the commit and the tree's sha256, and a CI check that compares the vendored copy with that commit.
+
+## Versions
+
+- `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed) and `FailedContainerRequest.step_detail` (optional; the Docker daemon's reason for a failed volume step, or the dead-transport hint).
+- `1.2.0` — `PodStatesReport`, `ExecutorSpecRequest.pod_states` and `FailedContainerErrorCodes.ExecutorUnreachable` (per-cycle pod container states, and "unreachable" told apart from "unknown id").
+- `1.3.0` — `RentedPod.ssh_port` and `RentedPod.status` (optional), and the `PodSshUnreachableResponse` HTTP body (the renter-side SSH probe's report).
+- `1.0.0` — first release.
 
 ## Tests
 

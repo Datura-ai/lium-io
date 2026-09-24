@@ -16,7 +16,9 @@ from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 
-DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
+# 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
+# A stuck pull looks like a slow pull, so only this deadline stops it.
+DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 60 * 60
 _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
 _DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
 _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
@@ -883,6 +885,10 @@ def _create_docker_api_client_with_rental_ssh_adapter(
         docker_api_client.SSHHTTPAdapter = original_adapter
 
 
+# The Docker SDK SSH session idles through a long build, so it needs a keepalive.
+RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC = 30
+
+
 def _build_rental_ssh_http_adapter_class(
     *,
     key_path: Path,
@@ -891,6 +897,12 @@ def _build_rental_ssh_http_adapter_class(
     from docker.transport.sshconn import SSHHTTPAdapter
 
     class RentalSSHHTTPAdapter(SSHHTTPAdapter):
+        def _connect(self) -> None:
+            super()._connect()
+            transport = self.ssh_client.get_transport() if self.ssh_client else None
+            if transport is not None:
+                transport.set_keepalive(RENTAL_DOCKER_SSH_KEEPALIVE_INTERVAL_SEC)
+
         def _create_paramiko_client(self, base_url):
             import logging
             import urllib.parse

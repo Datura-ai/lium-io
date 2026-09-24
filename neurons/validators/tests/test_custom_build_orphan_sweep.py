@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from services.task.checks.custom_build_orphan_sweep import (
+    BUILD_DIND_PREFIX,
     CustomBuildOrphanSweepCheck,
+    dind_container_pod_id,
 )
 
 
@@ -97,6 +99,57 @@ async def test_sweep_removes_orphan_dind_container():
     dind_rm_calls = [c for c in calls if "docker rm -fv lium-dind-build-" in c]
     assert any("lium-dind-build-POD-DEAD" in c for c in dind_rm_calls)
     assert not any("lium-dind-build-POD-ALIVE" in c for c in dind_rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_the_firewall_helpers_of_an_active_build():
+    """Regression: `docker ps --filter name=lium-dind-build-` lists a build's
+    firewall helpers (`<dind>-fw-apply`, `<dind>-fw-remove`) with the DinD, and
+    the sweep read `<pod_id>-fw-apply` as the pod id. No pod has that id, so a
+    helper of an ACTIVE build was removed while it was inserting the build's
+    egress rules. The suffix is stripped before the active-pod check; a helper
+    whose pod is gone is still an orphan and goes."""
+    check = CustomBuildOrphanSweepCheck(interval_seconds=0)
+
+    ssh = AsyncMock()
+    calls: list[str] = []
+
+    async def _run(cmd, **kw):
+        calls.append(cmd)
+        if "docker ps -a" in cmd:
+            return _result(
+                stdout=(
+                    "lium-dind-build-POD-ALIVE\n"
+                    "lium-dind-build-POD-ALIVE-fw-apply\n"
+                    "lium-dind-build-POD-DEAD\n"
+                    "lium-dind-build-POD-DEAD-fw-remove\n"
+                )
+            )
+        return _result()
+
+    ssh.run = _run
+    ctx = _make_ctx(executor_uuid="exec-1", active_pod_ids={"POD-ALIVE"}, ssh=ssh)
+
+    result = await check.run(ctx)
+    assert result.passed is True
+
+    removed = [c.split()[3] for c in calls if c.startswith("/usr/bin/docker rm -fv ")]
+    assert removed == ["lium-dind-build-POD-DEAD", "lium-dind-build-POD-DEAD-fw-remove"], calls
+    assert result.event.what_we_saw["removed_dind_containers"] == removed
+
+
+def test_dind_container_pod_id_agrees_with_the_names_docker_service_gives():
+    """The sweep's suffixes are a copy of `DockerService._dind_firewall_helper_names`;
+    this keeps the two from drifting apart."""
+    from services.docker_service import DockerService
+
+    dind = DockerService._dind_container_name("POD-1")
+    assert dind.startswith(BUILD_DIND_PREFIX)
+    assert dind_container_pod_id(dind) == "POD-1"
+    for helper in DockerService._dind_firewall_helper_names(dind):
+        assert dind_container_pod_id(helper) == "POD-1", helper
+    assert dind_container_pod_id("pod_renter") is None
+    assert dind_container_pod_id(BUILD_DIND_PREFIX) is None
 
 
 @pytest.mark.asyncio
