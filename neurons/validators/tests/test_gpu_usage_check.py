@@ -332,6 +332,22 @@ async def test_teardown_on_a_node_with_no_download_speed_on_record_still_scores_
     assert "No action needed" not in result.event.remediation
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
+async def test_a_rental_started_mid_run_that_scores_0_without_a_warning_still_says_to_address_it(context_factory):
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=PodRentalActiveResponse(active=True, executor_id=default_executor().uuid),
+        scores=_Scores(actual_score=0.0, job_score=0.0),
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.RENTAL_STARTED_DURING_RUN.reason
+    assert result.event.severity == "warning"
+    assert result.event.remediation == f"Address issues. {Msg.RENTAL_STARTED_DURING_RUN.remediation}"
+
+
 @pytest.mark.parametrize(
     "last_download_speed,score,warning",
     [
