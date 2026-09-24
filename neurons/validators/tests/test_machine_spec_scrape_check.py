@@ -14,7 +14,6 @@ from neurons.validators.src.services.task.messages import MachineSpecMessages as
 from neurons.validators.src.services.task.messages import (
     SCRAPE_HOST_SIDE_FAILURE_REASONS,
     SCRAPE_UNDETERMINED_FAILURE_REASONS,
-    SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS,
 )
 from neurons.validators.src.services.task.runner import NO_EXIT_STATUS, SSHCommandResult
 
@@ -795,7 +794,7 @@ async def test_machine_spec_scrape_no_gpu_on_stdin_keeps_its_host_side_code(cont
     assert len(runner.calls) == 1
 
 
-def test_the_scrape_codes_split_into_host_undetermined_and_no_validator_side():
+def test_the_scrape_codes_split_into_host_side_and_undetermined():
     # A code is validator-side only if no host fault can produce it; every code without an exit
     # status from the host can come from the host's link, sshd, disk or a hung GPU query.
     assert SCRAPE_HOST_SIDE_FAILURE_REASONS == {
@@ -804,4 +803,3 @@ def test_the_scrape_codes_split_into_host_undetermined_and_no_validator_side():
         "SCRAPE_FAILED_ON_HOST",
     }
     assert SCRAPE_UNDETERMINED_FAILURE_REASONS == {"SCRAPE_TIMEOUT", "SCRAPE_TRANSPORT_FAILED"}
-    assert SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS == frozenset()

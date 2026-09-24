@@ -121,36 +121,55 @@ def _scrape_reported_its_own_failure(stdout: str) -> bool:
     return _scrape_error_report(stdout) is not None
 
 
-def _is_no_gpu_details(error: Any, obfuscation_keys: dict[str, str] | None) -> bool:
+def _is_no_gpu_details_error(error: Any, obfuscation_keys: dict[str, str] | None) -> bool:
     # the key substitution that renames `gpu_details` in the shipped scrape (file_encrypt_service)
     # is a plain text replace, so it renames it inside this string literal too
-    obfuscated = (obfuscation_keys or {}).get("gpu_details", "gpu_details")
-    return error in {"no_gpu_details", f"no_{obfuscated}"}
+    obfuscated_gpu_details_key = (obfuscation_keys or {}).get("gpu_details", "gpu_details")
+    return error in {"no_gpu_details", f"no_{obfuscated_gpu_details_key}"}
 
 
-def _scrape_failure(
+@dataclass(frozen=True)
+class ScrapeFailure:
+    """The reason code a failed scrape run gets, plus the cause fields its event carries."""
+
+    template: MessageTemplate
+    error_type: str | None = None
+    scrape_error: str | None = None
+    gpu_scrape_error: str | None = None
+
+    def cause_event_fields(self) -> dict[str, str]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if field.name != "template" and getattr(self, field.name) is not None
+        }
+
+
+def _classify_scrape_failure(
     scrape_run: SSHCommandResult, obfuscation_keys: dict[str, str] | None
-) -> tuple[MessageTemplate, dict[str, Any]]:
+) -> ScrapeFailure:
     # which side failed, from what came back: the runner sets error_type exactly when no exit status
     # came back from the host (timed out, raised, or the channel closed without one). Those stay
     # undetermined; only an exit status the host sent puts the failure on the host.
     if scrape_run.error_type == "timeout":
-        return Msg.SCRAPE_TIMEOUT, {"error_type": scrape_run.error_type}
+        return ScrapeFailure(Msg.SCRAPE_TIMEOUT, error_type=scrape_run.error_type)
     if scrape_run.error_type is not None:
-        return Msg.SCRAPE_TRANSPORT_FAILED, {"error_type": scrape_run.error_type}
+        return ScrapeFailure(Msg.SCRAPE_TRANSPORT_FAILED, error_type=scrape_run.error_type)
 
     report = _scrape_error_report(scrape_run.stdout)
-    if report is not None and _is_no_gpu_details(report.get("error"), obfuscation_keys):
-        data = report.get("data")
-        data = _deobfuscate(data, obfuscation_keys) if isinstance(data, dict) else {}
-        gpu_scrape_error = data.get("gpu_scrape_error")
-        if gpu_scrape_error:
-            return Msg.SCRAPE_FAILED_DRIVER, {
-                "scrape_error": "no_gpu_details",
-                "gpu_scrape_error": str(gpu_scrape_error)[:200],
-            }
-        return Msg.SCRAPE_FAILED_NO_GPU, {"scrape_error": "no_gpu_details"}
-    return Msg.SCRAPE_FAILED_ON_HOST, {}
+    if report is None or not _is_no_gpu_details_error(report.get("error"), obfuscation_keys):
+        return ScrapeFailure(Msg.SCRAPE_FAILED_ON_HOST)
+
+    report_data = report.get("data")
+    report_data = _deobfuscate(report_data, obfuscation_keys) if isinstance(report_data, dict) else {}
+    gpu_scrape_error = report_data.get("gpu_scrape_error")
+    if gpu_scrape_error:
+        return ScrapeFailure(
+            Msg.SCRAPE_FAILED_DRIVER,
+            scrape_error="no_gpu_details",
+            gpu_scrape_error=str(gpu_scrape_error)[:200],
+        )
+    return ScrapeFailure(Msg.SCRAPE_FAILED_NO_GPU, scrape_error="no_gpu_details")
 
 
 @dataclass(frozen=True)
@@ -326,9 +345,9 @@ class MachineSpecScrapeCheck:
             what["fallback_from"] = fallback_from.as_event_field()
 
         if not scrape_run.success or not scrape_run.stdout.strip():
-            template, cause = _scrape_failure(scrape_run, ctx.config.obfuscation_keys)
+            failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
             event = render_message(
-                template,
+                failure.template,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
@@ -337,7 +356,7 @@ class MachineSpecScrapeCheck:
                     "exit_code": scrape_run.exit_code,
                     "duration_ms": scrape_run.duration_ms,
                     "stderr_tail": scrape_run.stderr[-400:],
-                    **cause,
+                    **failure.cause_event_fields(),
                 },
             )
             return CheckResult(passed=False, event=event)

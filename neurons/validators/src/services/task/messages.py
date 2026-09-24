@@ -253,10 +253,8 @@ SCRAPE_HOST_SIDE_FAILURE_REASONS = frozenset(
         MachineSpecMessages.SCRAPE_FAILED_ON_HOST.reason,
     }
 )
-# A code belongs here only if no host fault can produce it. None of the split codes qualifies: each
-# one without an exit status can come from the host's link, sshd, disk or a hung GPU query as much
-# as from the validator.
-SCRAPE_VALIDATOR_SIDE_FAILURE_REASONS: frozenset[str] = frozenset()
+# No split code is validator-side: each one without an exit status can come from the host's link,
+# sshd, disk or a hung GPU query as much as from the validator.
 SCRAPE_UNDETERMINED_FAILURE_REASONS = frozenset(
     {
         MachineSpecMessages.SCRAPE_TIMEOUT.reason,
