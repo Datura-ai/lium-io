@@ -26,6 +26,7 @@ from fakeredis.aioredis import FakeRedis
 
 from clients.compute_client import ComputeClient
 from core.express_lane import EXPRESS_PUBLISHED_EVENT, RECHECK_PUBLISHED_EVENT
+from core.validator import Validator
 from services.miner_service import CYCLE_DONE, CYCLE_LANE, EXPRESS_LANE, RECHECK_LANE
 from services.redis_service import RECHECK_REQUESTS_HASH, RedisService
 from services.task.checks import rental_probe
@@ -320,6 +321,49 @@ async def test_rechecks_and_new_nodes_share_a_tick_under_their_own_caps(monkeypa
     }
     assert asked == {rechecked: None, new_node: True}
     assert await harness.redis_service.get_validated_executors() == {new_node}
+
+
+def _validator(harness: _Harness) -> Validator:
+    validator = Validator.__new__(Validator)
+    validator.redis_service = harness.redis_service
+    validator.miner_service = harness.miner_service
+    validator.default_extra = {}
+    return validator
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("express", [False, True])
+async def test_the_cycle_frees_the_waves_nodes_for_a_queued_recheck(monkeypatch, wallet, express):
+    """Recheck on, express lane off is the config the recheck flag gives on its own: the wave still
+    leaves its nodes CYCLE_DONE, so the cycle must drop them or every queued recheck waits until it
+    expires and in_flight keeps every node the wave ever verified."""
+    node = str(uuid4())
+    harness = _recheck_harness(monkeypatch, express=express)
+    harness.miner_service.in_flight[node] = CYCLE_DONE
+    await harness.redis_service.queue_recheck_request(_request_for(node))
+    assert await harness.tick_and_settle() == 0
+
+    await _validator(harness).release_cycle_claims([node])
+
+    assert harness.miner_service.in_flight == {}
+    # only the express lane reads the validated set
+    assert await harness.redis_service.get_validated_executors() == ({node} if express else set())
+    assert await harness.tick_and_settle() == 1
+    assert harness.miner_service.request_job_to_miner.await_args.kwargs["executor_id"] == node
+    assert await harness.redis_service.get_recheck_requests() == {}
+
+
+@pytest.mark.asyncio
+async def test_flags_off_the_cycle_close_touches_nothing(monkeypatch, wallet):
+    node = str(uuid4())
+    harness = _recheck_harness(monkeypatch)
+    monkeypatch.setattr(harness.settings, "RECHECK_ON_REQUEST_ENABLED", False)
+    harness.miner_service.in_flight[node] = CYCLE_DONE
+
+    await _validator(harness).release_cycle_claims([node])
+
+    assert harness.miner_service.in_flight == {node: CYCLE_DONE}
+    assert await harness.redis_service.get_validated_executors() == set()
 
 
 # --- the wave meets a node under a recheck ------------------------------------------------------

@@ -194,6 +194,27 @@ class Validator:
             return None
         return self.cycle_inputs
 
+    async def release_cycle_claims(self, published_executor_ids: list[str]) -> None:
+        """The wave left every executor it verified as CYCLE_DONE whenever either lane flag is on
+        (`settings.express_lane_runs`); the lanes skip those until the cycle drops them here, so the
+        drop runs under either flag. Only the express lane reads the validated set (DAH-2958):
+        everything a cycle published is "validated", and only what the portal lists beyond it is new.
+        A Redis blip never ends the cycle: the next cycle seeds again, and the CYCLE_DONE claims keep
+        the express lane off those executors until then."""
+        if not settings.express_lane_runs:
+            return
+        try:
+            if settings.EXPRESS_LANE_ENABLED:
+                await self.redis_service.mark_executors_validated(published_executor_ids)
+            self.miner_service.forget_cycle_done()
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[sync] Failed to record validated executors for the express lane",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                ),
+            )
+
     async def an_operator_asked_for_a_cycle_now(self) -> bool:
         """Whether an operator asked for a cycle. Reads only -- the request stays pending.
 
@@ -655,21 +676,7 @@ class Validator:
                         withheld.result.executor_info.uuid for withheld in withheld_results
                     )
 
-                    if settings.EXPRESS_LANE_ENABLED:
-                        # DAH-2958: everything published by a cycle is "validated" for the
-                        # express lane; only what the portal lists beyond this set is new.
-                        # Never lets a Redis blip end the cycle: the next cycle seeds again, and
-                        # the wave's CYCLE_DONE claims keep the lane off those executors until then.
-                        try:
-                            await self.redis_service.mark_executors_validated(published_executor_ids)
-                            self.miner_service.forget_cycle_done()
-                        except Exception as exc:
-                            logger.error(
-                                _m(
-                                    "[sync] Failed to record validated executors for the express lane",
-                                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
-                                ),
-                            )
+                    await self.release_cycle_claims(published_executor_ids)
 
                     self.completed_cycles_since_start += 1
 
