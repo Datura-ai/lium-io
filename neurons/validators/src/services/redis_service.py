@@ -18,6 +18,8 @@ MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
 INSPECTOR_EVENT_CHANNEL = "INSPECTOR_EVENT_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
+# DAH-3338: one message per PodStatesReport chunk, published right after the cycle's spec
+POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
@@ -299,6 +301,11 @@ class RedisService:
         """Remove a key from Redis."""
         async with self.lock:
             await self.redis.delete(key)
+
+    async def expire(self, key: str, seconds: int):
+        """Set (or refresh) a key's time to live."""
+        async with self.lock:
+            await self.redis.expire(key, seconds)
 
     async def sadd(self, key: str, elem: str) -> int:
         """Add an element to a set in Redis. Returns 1 when it was not there yet, 0 when it was."""

@@ -273,6 +273,14 @@ class Settings(BaseSettings):
     # whether a fabric must be measured before it is sold, so the feature has one switch across both
     # services. On by default: a fabric nobody measured is one nobody should be selling.
     ROCE_LINK_PROBE_ENABLED: bool = Field(env="ROCE_LINK_PROBE_ENABLED", default=True)
+    # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
+    # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
+    # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the
+    # backend accepts the message (lium-platform#312); a backend without it logs and drops each
+    # report. Off: the spec is the only carrier, with a floor of REAPED_POD_STATES_FLOOR slots for
+    # reaped ids; on a node with more than 224 rented pods the last rented pods' states are cut
+    # until the queue drains.
+    POD_STATES_REPORT_ENABLED: bool = Field(env="POD_STATES_REPORT_ENABLED", default=False)
     # ISSUE-050 filler liveness. CHECK_ENABLED is the master switch: shadow mode runs the SSH
     # probe + backend re-check and logs the verdict, but never withholds incentive; switching it
     # off disables the probe entirely. ENFORCEMENT (only effective while CHECK_ENABLED is on)
