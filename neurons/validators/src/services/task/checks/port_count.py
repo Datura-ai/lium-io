@@ -26,8 +26,9 @@ class PortCountCheck:
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
         # Only the pass/fail floor reads this; `available_port_count` below stays the answered count.
+        # Held ports prove no inbound reachability, so they count only once at least one port answered.
         background_job_port_count = (
-            0 if is_rented else self._ports_held_by_platform_background_jobs(ctx)
+            0 if is_rented or port_count == 0 else self._ports_held_by_platform_background_jobs(ctx)
         )
 
         updated_state = replace(

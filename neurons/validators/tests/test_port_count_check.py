@@ -126,14 +126,38 @@ async def test_background_job_ports_lift_an_unrented_host_to_the_floor(context_f
 
 
 @pytest.mark.asyncio
-async def test_background_job_ports_below_the_floor_still_fail(context_factory):
-    ctx = context_factory(state=_state(_background_job_data(), pairs=[]))
+async def test_background_job_ports_alone_never_pass_a_host_where_no_port_answered(context_factory):
+    held = [40010, 40011, 40012]
+    ctx = context_factory(state=_state(_background_job_data(filler_ports=held), pairs=[]))
 
     result = await PortCountCheck().run(ctx)
 
+    assert len(held) >= MIN_PORT_COUNT
     assert result.passed is False
     assert result.event.reason_code == Msg.INSUFFICIENT_PORTS.reason
-    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == len(BACKGROUND_JOB_PORTS)
+    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == 0
+    assert result.updates["port_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("held", "passed"),
+    [
+        pytest.param([40010, 40011], True, id="1-answered-plus-2-held-is-exactly-the-floor"),
+        pytest.param([40010], False, id="1-answered-plus-1-held-is-one-short"),
+    ],
+)
+async def test_the_floor_boundary_with_one_answered_port(context_factory, held, passed):
+    pairs = ANSWERED_PAIRS[:1]
+    ctx = context_factory(state=_state(_background_job_data(filler_ports=held), pairs=pairs))
+
+    result = await PortCountCheck().run(ctx)
+
+    assert len(pairs) + len(held) in (MIN_PORT_COUNT, MIN_PORT_COUNT - 1)
+    assert result.passed is passed
+    assert result.event.what_we_saw["held_by_preemptible_background_jobs"] == len(held)
+    assert result.updates["port_count"] == len(pairs)
+    assert result.updates["state"].specs["available_port_count"] == len(pairs)
 
 
 @pytest.mark.asyncio
