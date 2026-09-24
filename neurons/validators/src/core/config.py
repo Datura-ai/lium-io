@@ -389,15 +389,12 @@ class Settings(BaseSettings):
     # per-node phase (RETRY_MINUTES after a failed pull, so the confirming pull comes soon). A Docker Hub
     # 429 is no verdict. Two failed pulls in a row (timeout, DNS error, unreachable, manifest unknown) are
     # the finding: logged as REGISTRY_PULL_FAILED_OBSERVED, or with ENFORCEMENT a fail
-    # (REGISTRY_PULL_FAILED, score 0). A failed pull does not count while the validator itself cannot
-    # reach Docker Hub, or while the fleet breaker is open: it opens when more than FLEET_BREAKER_SHARE of
-    # this validator's scheduled pulls in the last hour failed, from 3 or more miners (or past the share
-    # without the largest), in an hour of at least FLEET_BREAKER_MIN_PULLS pulls or 10% of the idle nodes
-    # seen, if more; it closes only when such an hour is back under the share. A streak is confirmed only
-    # after that many other nodes pulled since it began, and not by an incident the breaker opened for.
-    # Fleet size: pulls spread over INTERVAL_HOURS put about a sixth of the idle fleet in each hour, so
-    # the breaker can open only on a validator that sees about 30 idle nodes or more (6 x the floor of
-    # 5); below that only the Docker Hub control guards against an outage.
+    # (REGISTRY_PULL_FAILED, score 0). A failed pull counts only if the validator itself reaches Docker
+    # Hub. The second one also counts only if at most FLEET_SHARE of the latest `required` scheduled
+    # pulls of other providers' idle nodes failed (outside the node's own miner and the other miner with
+    # the most failed pulls; `required` is FLEET_MIN_PULLS, or 10% of the idle nodes seen if more), and,
+    # on a validator seeing 30 or more idle nodes (FLEET_MIN_PULLS x 6 h of phases), only once those
+    # pulls all landed after the streak began; on a smaller one the 30-minute retry confirms.
     # Enforcement is off by default: it goes on after a 48 h log-only window with the OBSERVED rows
     # reviewed. Decider: taiberium; backup jam6099 (Muhammad) from 28 Sep 2026.
     REGISTRY_PULL_CHECK_ENABLED: bool = Field(env="REGISTRY_PULL_CHECK_ENABLED", default=True)
@@ -408,12 +405,8 @@ class Settings(BaseSettings):
     REGISTRY_PULL_PROBE_RETRY_MINUTES: float = Field(
         env="REGISTRY_PULL_PROBE_RETRY_MINUTES", default=30.0, gt=0
     )
-    REGISTRY_PULL_FLEET_BREAKER_SHARE: float = Field(
-        env="REGISTRY_PULL_FLEET_BREAKER_SHARE", default=0.3, gt=0, le=1
-    )
-    REGISTRY_PULL_FLEET_BREAKER_MIN_PULLS: int = Field(
-        env="REGISTRY_PULL_FLEET_BREAKER_MIN_PULLS", default=5, ge=1
-    )
+    REGISTRY_PULL_FLEET_SHARE: float = Field(env="REGISTRY_PULL_FLEET_SHARE", default=0.3, gt=0, le=1)
+    REGISTRY_PULL_FLEET_MIN_PULLS: int = Field(env="REGISTRY_PULL_FLEET_MIN_PULLS", default=5, ge=1)
     # DAH-3558: a rented node missing from the miner's answer to the wave gets no pipeline, so the
     # wave writes nothing about it: no report row, no availability error, no evidence for the
     # backend's staleness sweep. On, the wave writes one failed result per rented executor of that

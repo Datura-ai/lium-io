@@ -1084,8 +1084,8 @@ class RegistryPullMessages:
         category="runtime",
         impact="Proceed",
     )
-    # the pull failed while the fleet breaker was open (RegistryPullCheck: more than
-    # REGISTRY_PULL_FLEET_BREAKER_SHARE of the hour's scheduled pulls failed, across miners)
+    # the pull failed while more than REGISTRY_PULL_FLEET_SHARE of the latest scheduled pulls of other
+    # providers' idle nodes failed too (RegistryPullCheck, fleet_reading)
     REGISTRY_PULL_NO_VERDICT_FLEET = MessageTemplate(
         event="Docker Hub image pull failed while pulls fail across the fleet; no verdict",
         reason="REGISTRY_PULL_NO_VERDICT_FLEET",
