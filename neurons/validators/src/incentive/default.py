@@ -8,7 +8,8 @@ from datetime import UTC, datetime
 
 import bittensor
 from clients.referral_feed_client import ReferralFeedClient
-from services.task.messages import ExecutorImageMessages, FinalizeMessages, TenantEnforcementMessages
+from services.executor_rollout import RUN_ENDED_WITHOUT_FAILING
+from services.task.messages import ExecutorImageMessages
 from services.task_service import JobResult
 
 from core.config import get_total_burn_emission, settings
@@ -17,12 +18,6 @@ from incentive.base import BaseIncentive
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 
 logger = get_logger(__name__)
-
-# The two ways a run ends without a failed check (the same pair executor_rollout keeps): finalize
-# of a run the score gate zeroed, and the rented node's halt. Neither code names a check to fix.
-RUN_ENDED_WITHOUT_FAILING: frozenset[str] = frozenset(
-    {FinalizeMessages.COMPLETED.reason, TenantEnforcementMessages.ALREADY_RENTED.reason}
-)
 
 
 def _parse_driver_version(value: str) -> tuple[int, ...] | None:

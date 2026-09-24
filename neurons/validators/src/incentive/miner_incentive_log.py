@@ -355,12 +355,7 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_nvidia_driver_below_minimum(
-        result: JobResult, driver_multiplier: float | None = None
-    ) -> MinerLogLine:
-        # a node blocked before pricing never gets result.driver_multiplier set; the caller passes it
-        if driver_multiplier is None:
-            driver_multiplier = result.driver_multiplier
+    def no_payout_because_nvidia_driver_below_minimum(result: JobResult) -> MinerLogLine:
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.NVIDIA_DRIVER_BELOW_MINIMUM,
@@ -371,7 +366,8 @@ class MinerLogLine(BaseModel):
             ),
             extra_fields={
                 "nvidia_driver_version": result.nvidia_driver_version,
-                "driver_multiplier": driver_multiplier,
+                # recorded only at multiplier 0; a node blocked before pricing never gets it set
+                "driver_multiplier": 0.0,
             },
         )
 

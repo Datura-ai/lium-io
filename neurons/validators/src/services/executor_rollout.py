@@ -83,7 +83,7 @@ _OUTDATED = ExecutorImageMessages.OUTDATED.reason
 # The two ways a run ends with score 0 and the OUTDATED report attached instead of failing at the
 # image check: a rented executor's image check passes and the tenant-enforcement halt ends the run
 # (RENTED); a run that reaches finalize ends on VALIDATION_COMPLETED.
-_RUN_ENDED_WITHOUT_FAILING = frozenset(
+RUN_ENDED_WITHOUT_FAILING = frozenset(
     {FinalizeMessages.COMPLETED.reason, TenantEnforcementMessages.ALREADY_RENTED.reason}
 )
 
@@ -384,7 +384,7 @@ def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: in
         return None
     reason = result.failure_reason_code
     if reason not in ROLLOUT_FAILURE_REASONS:
-        ended_without_failing = reason in _RUN_ENDED_WITHOUT_FAILING
+        ended_without_failing = reason in RUN_ENDED_WITHOUT_FAILING
         outdated = (
             settings.EXECUTOR_IMAGE_CHECK_ENFORCE
             and (result.executor_image_report or {}).get("status") == ImageVerdict.OUTDATED.value

@@ -299,9 +299,9 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _insufficient_disk(self, result: JobResult, log_unmeasured: bool = True) -> InsufficientDisk | None:
+    def _insufficient_disk(self, result: JobResult, log_if_cannot_measure: bool = True) -> InsufficientDisk | None:
         # machine whose disk is below the required margin over its GPU VRAM; None when it
-        # clears the margin or the scrape is unusable. log_unmeasured is False for a node that
+        # clears the margin or the scrape is unusable. log_if_cannot_measure is False for a node that
         # is already excluded: "unrented incentive kept" would be false for it
         spec = result.spec
         if not spec:
@@ -316,12 +316,12 @@ class RentalPriceIncentive(DefaultIncentive):
         except (AttributeError, TypeError, ValueError) as exc:
             # the scrape is produced on the miner's machine, and calculate_mining_scores has no
             # per-result guard: raising here would cost EVERY miner this cycle's weights
-            if log_unmeasured:
+            if log_if_cannot_measure:
                 self._log_insufficient_disk_unmeasured(result, f"unreadable scrape: {exc!r}")
             return None
         if vram_gb <= 0 or disk_gb <= 0:
             # either number missing or zeroed: fail open, nobody loses incentive over telemetry
-            if log_unmeasured:
+            if log_if_cannot_measure:
                 self._log_insufficient_disk_unmeasured(result, "vram or disk missing from the scrape")
             return None
         # round before comparing, so the numbers the miner is shown are the ones that were compared
@@ -433,10 +433,10 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _power_cap_incapable(self, result: JobResult, log_unmeasured: bool = True) -> PowerCapIncapable | None:
+    def _power_cap_incapable(self, result: JobResult, log_if_cannot_measure: bool = True) -> PowerCapIncapable | None:
         # None whenever the scrape does not PROVE the container cannot cap: a missing or
         # unreadable probe (validator older than DAH-2705, probe error) must never cost a
-        # miner the incentive, so every unknown fails open. log_unmeasured as in _insufficient_disk
+        # miner the incentive, so every unknown fails open. log_if_cannot_measure as in _insufficient_disk
         if result.spec is None:
             # no scrape at all: a synthetic or estimated job result, nothing to measure
             return None
@@ -446,13 +446,13 @@ class RentalPriceIncentive(DefaultIncentive):
         # reading, not a breach. bool is excluded explicitly - it passes isinstance(int)
         # and would otherwise read as uid 1, i.e. "not root", i.e. a penalty.
         if not isinstance(cap_eff, str) or not isinstance(owner_uid, int) or isinstance(owner_uid, bool):
-            if log_unmeasured:
+            if log_if_cannot_measure:
                 self._log_power_cap_unmeasured(result, "cap_eff or nvidiactl owner missing from the scrape")
             return None
         try:
             capability_mask: int = int(cap_eff, 16)
         except ValueError:
-            if log_unmeasured:
+            if log_if_cannot_measure:
                 self._log_power_cap_unmeasured(result, f"unreadable capability mask: {cap_eff!r}")
             return None
         has_sys_admin: bool = bool(capability_mask >> CAP_SYS_ADMIN_BIT & 1)
@@ -942,22 +942,22 @@ class RentalPriceIncentive(DefaultIncentive):
         if result.unrented_cap_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_no_unrented_capacity_for_gpu_count(result, bucket)
             result.record_incentive_log(reason)
-        self._explain_zero_node_rate_factors(result, result.driver_multiplier, result.sysbox_multiplier)
+        self._record_zero_driver_and_sysbox_reasons(result, result.driver_multiplier, result.sysbox_multiplier)
 
     @staticmethod
-    def _explain_zero_node_rate_factors(
+    def _record_zero_driver_and_sysbox_reasons(
         result: JobResult, driver_multiplier: float | None, sysbox_multiplier: float | None
     ) -> None:
         # the two effective_rate factors that are the node's own, not the cohort's
         if driver_multiplier == 0:
             result.record_incentive_log(
-                MinerLogLine.no_payout_because_nvidia_driver_below_minimum(result, driver_multiplier)
+                MinerLogLine.no_payout_because_nvidia_driver_below_minimum(result)
             )
         if sysbox_multiplier == 0:
             result.record_incentive_log(MinerLogLine.no_payout_because_sysbox_not_enabled(result))
 
     @staticmethod
-    def _gate_runs(idle_pool_candidate: bool, eligible: bool, enforced: bool) -> bool:
+    def _should_run_idle_pool_gate(idle_pool_candidate: bool, eligible: bool, enforced: bool) -> bool:
         """An idle-pool gate runs while the node is still eligible, and on an already blocked
         candidate only when the gate is enforced, so its reason is recorded as well."""
         return eligible or (idle_pool_candidate and enforced)
@@ -986,12 +986,12 @@ class RentalPriceIncentive(DefaultIncentive):
         # learns every fix in one cycle instead of one per cycle. One evaluator per rule, so the
         # internal log, the customer-facing incentive log, and the scoring decision all read from
         # the same source and cannot drift (DAH-2327).
-        outdated_image: bool = self._record_outdated_image_reason(job_result)
+        excluded_for_outdated_image: bool = self._record_outdated_image_reason(job_result)
         exclusions: list[MinerLogLine] = self._reasons_excluded_from_both_pools(job_result)
         for exclusion in exclusions:
             logger.info(exclusion.to_internal_log())
             job_result.record_incentive_log(exclusion)
-        excluded_from_both_pools: bool = outdated_image or bool(exclusions)
+        excluded_from_both_pools: bool = excluded_for_outdated_image or bool(exclusions)
         if excluded_from_both_pools and job_result.gpu_model not in BASE_GPU_MAP:
             # get_base_model_for_gpu raises on a model it does not know, and nothing above this
             # guards it: an excluded node keeps its reasons and scores 0 instead of stopping the cycle
@@ -1016,25 +1016,25 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-3698: a split remainder under the marketplace port floor is capacity nobody can
         # rent, so it earns no idle pay; first in the chain so it never reaches the shadow numbers.
         port_floor_enforced: bool = settings.ENABLE_UNRENTED_PORT_FLOOR_FOR_SPLIT_REMAINDER
-        port_limited: PortLimitedRemainder | None = (
+        port_limited_remainder: PortLimitedRemainder | None = (
             self._port_limited_remainder(job_result)
-            if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, port_floor_enforced)
+            if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, port_floor_enforced)
             else None
         )
-        if port_limited is not None:
+        if port_limited_remainder is not None:
             if eligible_for_rental_share:
-                self._log_port_limited_remainder(job_result, port_limited)
+                self._log_port_limited_remainder(job_result, port_limited_remainder)
             if port_floor_enforced:
                 eligible_for_rental_share = False
                 job_result.record_incentive_log(
-                    MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited)
+                    MinerLogLine.no_payout_because_port_limited_remainder(job_result, port_limited_remainder)
                 )
 
         # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
         # above the market p90 ceiling forfeits the unrented incentive (node stays
         # active). While the flag is off we only log the would-be exclusion (shadow).
         soft_price_enforced: bool = settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT
-        if self._gate_runs(
+        if self._should_run_idle_pool_gate(
             idle_pool_candidate, eligible_for_rental_share, soft_price_enforced
         ) and self._is_over_soft_price_limit(job_result):
             if eligible_for_rental_share:
@@ -1052,8 +1052,8 @@ class RentalPriceIncentive(DefaultIncentive):
         # stays active). While the flag is off we only log the would-be exclusion (shadow).
         disk_enforced: bool = settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT
         insufficient_disk = (
-            self._insufficient_disk(job_result, log_unmeasured=eligible_for_rental_share)
-            if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, disk_enforced)
+            self._insufficient_disk(job_result, log_if_cannot_measure=eligible_for_rental_share)
+            if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, disk_enforced)
             else None
         )
         if insufficient_disk is not None:
@@ -1070,7 +1070,7 @@ class RentalPriceIncentive(DefaultIncentive):
         flagship_enforced: bool = settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT
         missing_capability = (
             self._missing_flagship_capability(job_result, base_model)
-            if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, flagship_enforced)
+            if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, flagship_enforced)
             else None
         )
         if missing_capability is not None:
@@ -1090,8 +1090,8 @@ class RentalPriceIncentive(DefaultIncentive):
         # logged here - read the shadow numbers against the flags that were on that cycle.
         power_cap_enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_LIMIT
         power_cap_incapable: PowerCapIncapable | None = (
-            self._power_cap_incapable(job_result, log_unmeasured=eligible_for_rental_share)
-            if self._gate_runs(idle_pool_candidate, eligible_for_rental_share, power_cap_enforced)
+            self._power_cap_incapable(job_result, log_if_cannot_measure=eligible_for_rental_share)
+            if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, power_cap_enforced)
             else None
         )
         if power_cap_incapable is not None:
@@ -1106,7 +1106,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
         # an eligible node has these two factors checked after pricing (_explain_zero_effective_rate)
         if idle_pool_candidate and not eligible_for_rental_share:
-            self._explain_zero_node_rate_factors(
+            self._record_zero_driver_and_sysbox_reasons(
                 job_result,
                 get_min_driver_multiplier(job_result.nvidia_driver_version),
                 1.0 if job_result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED,
