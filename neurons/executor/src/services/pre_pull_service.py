@@ -260,7 +260,8 @@ class PrePuller:
         for image_ref in protected & self.state.images.keys():
             self.state.forget(image_ref)
             logger.info(f"pre-pull: {image_ref} is now a mandatory image; no longer tracked for eviction")
-        await self._evict_unlisted(entries, protected)
+        served = {f"{data.get('docker_image')}:{data.get('docker_image_tag')}" for data in entries}
+        await self._evict_unlisted(served, protected)
         if not entries:
             self.state.flush()
             return
@@ -310,7 +311,6 @@ class PrePuller:
                 break
 
             started = time.monotonic()
-            served = {f"{e.get('docker_image')}:{e.get('docker_image_tag')}" for e in entries}
             room, detail = await self._make_room(image_ref, int(size * ON_DISK_MULTIPLIER), served)
             # The budget is measured after eviction, which takes time of its own: the pull's
             # clock starts below, so this is what cuts it at the deadline.
@@ -350,39 +350,33 @@ class PrePuller:
 
         self.state.flush()
 
-    async def _evict_unlisted(self, entries: list[dict], protected: frozenset[str]) -> None:
+    async def _evict_unlisted(self, served: set[str], protected: frozenset[str]) -> None:
         """Remove a pre-pulled image once the backend has stopped serving it for
         ``PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS`` (0 keeps it until the disk floor needs the room).
 
         The clock starts at the first sweep that no longer lists it and resets if it comes back,
         so a template that drifts in and out at the edge of the top-N is not pulled and removed
-        in turn. Only images this puller pulled are candidates; docker refuses to remove one a
-        container still uses, and that image stays tracked for the next sweep."""
+        in turn. Only images this puller pulled are candidates, and only on an idle node: a rental
+        may be starting on the image. An image docker refuses to remove stays tracked for the next sweep."""
         after = settings.PRE_PULL_EVICT_UNLISTED_AFTER_SECONDS
-        served = {
-            f"{data['docker_image']}:{data['docker_image_tag']}"
-            for data in entries
-            if data.get("docker_image") and data.get("docker_image_tag")
-        }
         now = time.time()
-        for image_ref in list(self.state.images):
-            record = self.state.images[image_ref]
+        due: list[str] = []
+        for image_ref, record in self.state.images.items():
             if image_ref in served or image_ref in protected or image_ref in self.protected:
                 record.pop("unlisted_since", None)
                 continue
             since = record.setdefault("unlisted_since", now)
-            if after <= 0 or now - since < after:
-                continue
-            removed = await asyncio.to_thread(_remove_ref, self.client, image_ref)
-            digest = record.get("digest")
-            if digest:
-                digest_ref = f"{image_ref.rpartition(':')[0]}@{digest}"
-                removed = await asyncio.to_thread(_remove_ref, self.client, digest_ref) and removed
-            if removed:
-                self.state.forget(image_ref)
+            if after > 0 and now - since >= after:
+                due.append(image_ref)
+        if not due or await asyncio.to_thread(rental_activity, self.client):
+            return
+        for image_ref in due:
+            record = self.state.images[image_ref]
+            hours_unlisted = (now - record["unlisted_since"]) / 3600
+            if await self._remove_tracked_image(image_ref):
                 logger.info(
-                    f"pre_pull image={image_ref} digest={digest} outcome=evicted_unlisted "
-                    f"detail=not served for {(now - since) / 3600:.1f}h"
+                    f"pre_pull image={image_ref} digest={record.get('digest')} outcome=evicted_unlisted "
+                    f"detail=not served for {hours_unlisted:.1f}h"
                 )
 
     async def _retire_superseded(self, image_ref: str, repo: str, digest: str) -> None:
@@ -416,11 +410,16 @@ class PrePuller:
                     f"free {free / GIB:.0f} GiB < need {need_bytes / GIB:.0f} GiB + floor {floor / GIB:.0f} GiB"
                 )
             skip.add(victim)
-            digest = self.state.images[victim].get("digest")
-            removed = await asyncio.to_thread(_remove_ref, self.client, victim)
-            if digest:
-                digest_ref = f"{victim.rpartition(':')[0]}@{digest}"
-                removed = await asyncio.to_thread(_remove_ref, self.client, digest_ref) and removed
-            if removed:
+            if await self._remove_tracked_image(victim):
                 logger.info(f"pre-pull: evicted {victim} (least recently used) to keep disk headroom")
-                self.state.forget(victim)
+
+    async def _remove_tracked_image(self, image_ref: str) -> bool:
+        """Remove a tracked image's tag and pinned digest, and stop tracking it; False if docker refused."""
+        digest = self.state.images[image_ref].get("digest")
+        removed = await asyncio.to_thread(_remove_ref, self.client, image_ref)
+        if digest:
+            digest_ref = f"{image_ref.rpartition(':')[0]}@{digest}"
+            removed = await asyncio.to_thread(_remove_ref, self.client, digest_ref) and removed
+        if removed:
+            self.state.forget(image_ref)
+        return removed

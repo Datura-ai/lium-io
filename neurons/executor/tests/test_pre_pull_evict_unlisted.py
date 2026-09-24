@@ -55,7 +55,7 @@ def clock(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def quiet_node(monkeypatch):
+def idle_node_with_room(monkeypatch):
     monkeypatch.setattr(pre_pull_service.psutil, "process_iter", lambda *_: [])
     monkeypatch.setattr(pre_pull_service.psutil, "disk_usage", lambda _: MagicMock(free=1000 * GIB))
     monkeypatch.setattr(pre_pull_service.settings, "PRE_PULL_START_JITTER_SECONDS", 0)
@@ -158,7 +158,8 @@ def test_mandatory_image_is_never_evicted(tmp_path, clock):
 
 
 def test_image_in_use_stays_tracked(tmp_path, clock):
-    client = _client(refuse={OLD_REF})
+    """Docker untags an image in use but refuses its last reference, the pinned digest."""
+    client = _client(refuse={f"{REPO}@{DIGEST_OLD}"})
     puller = _puller(tmp_path, client, {OLD_REF: DIGEST_OLD})
 
     _sweep(puller, [])
@@ -166,7 +167,25 @@ def test_image_in_use_stays_tracked(tmp_path, clock):
     _sweep(puller, [])
 
     assert OLD_REF in puller.state.images
-    assert OLD_REF not in client.removed
+
+
+def test_busy_node_keeps_the_image_until_idle(tmp_path, clock):
+    """A rental may be starting on the unlisted image: removal waits for an idle node."""
+    client = _client()
+    puller = _puller(tmp_path, client, {OLD_REF: DIGEST_OLD})
+    rental = MagicMock(status="running")
+    rental.name = "pod_abc"
+
+    _sweep(puller, [])
+    clock.now += DAY
+    client.containers.list.return_value = [rental]
+    _sweep(puller, [])
+    assert client.removed == []
+    assert OLD_REF in puller.state.images
+
+    client.containers.list.return_value = []
+    _sweep(puller, [])
+    assert client.removed == [OLD_REF, f"{REPO}@{DIGEST_OLD}"]
 
 
 def test_zero_disables_eviction(tmp_path, clock, monkeypatch):
@@ -187,7 +206,7 @@ def test_untracked_images_are_never_touched(tmp_path, clock):
     client = _client()
     puller = _puller(tmp_path, client, {})
 
-    _sweep(puller, [_entry(CU128_REF, DIGEST_CU128)])
+    _sweep(puller, [])
     clock.now += 2 * DAY
     _sweep(puller, [])
 
