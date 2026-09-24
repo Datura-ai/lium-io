@@ -396,7 +396,8 @@ async def test_a_pod_the_snapshot_listed_is_teardown_even_when_the_backend_is_un
 
     assert result.passed is True
     assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
-    assert result.event.what_we_saw["pod_containers"][0].rental_status == "its rental ended during this run"
+    rental = result.event.what_we_saw["pod_containers"][0]
+    assert rental.provider_facing_rental_status == "its rental ended during this run"
 
 
 @pytest.mark.asyncio
@@ -487,6 +488,24 @@ async def test_a_recent_rental_of_another_node_buys_no_deferral(context_factory)
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("teardown_deferral_on")
+async def test_a_recent_close_with_no_owner_buys_no_deferral_outside_the_snapshot(context_factory):
+    # The backend deletes the pod row when it closes the rental, so it sends no executor_id.
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=PodRentalActiveResponse(
+            active=False, rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=1)
+        ),
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert result.event.what_we_saw["pod_containers"][0].state is PodRentalState.ORPHAN
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_live_rental_of_another_node_is_an_orphan_the_provider_must_not_remove(context_factory):
     ctx = _unrented_ctx(
         context_factory, pod_rental=PodRentalActiveResponse(active=True, executor_id="another-executor")
@@ -550,7 +569,9 @@ async def test_the_grace_window_runs_from_5_minutes_before_the_close_to_15_after
 
     assert result.event.reason_code == reason
     rentals = result.event.what_we_saw.get("pod_containers")
-    observed_status = rentals[0].rental_status if rentals else result.event.what_we_saw["rental_status"]
+    observed_status = (
+        rentals[0].provider_facing_rental_status if rentals else result.event.what_we_saw["rental_status"]
+    )
     assert observed_status == rental_status
 
 
@@ -634,6 +655,25 @@ async def test_teardown_event_payload_serializes_to_json(context_factory):
     dumped = result.event.model_dump(mode="json")["what_we_saw"]
     assert dumped["pod_containers"][0]["state"] == "ended_during_run"
     assert dumped["pod_containers"][0]["pod_id"] == TEARDOWN_POD_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("teardown_deferral_on")
+async def test_the_nodes_filler_beside_a_tearing_down_pod_is_still_teardown(context_factory):
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    ctx = _unrented_ctx(
+        context_factory,
+        pod_rental=_closed(minutes_ago=1),
+        rented_data=RentedExecutorsResponse(
+            executors={}, all_filler_containers_by_executor={default_executor().uuid: [filler_container]}
+        ),
+        gpu_processes=[_pod_process(), _pod_process(filler_container, pid=4242)],
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
 
 
 @pytest.mark.asyncio

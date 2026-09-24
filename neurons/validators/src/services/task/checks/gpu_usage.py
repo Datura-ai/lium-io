@@ -37,7 +37,7 @@ from services.gpu_wedge import (
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context, ContextState
-from .verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS, with_last_known_verifyx_ema
+from .verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS, specs_with_last_known_verifyx_ema
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +78,8 @@ class PodContainerRental:
     container_name: str
     pod_id: str | None
     state: PodRentalState
-    # Provider-facing: completes "no live rental on this node uses it: ..." in the remediation.
-    rental_status: str
+    # Completes "no live rental on this node uses it: ..." in the remediation.
+    provider_facing_rental_status: str
     rental_closed_at: datetime | None = None
 
 
@@ -293,62 +293,80 @@ class GpuUsageCheck:
         )
         orphans = [rental for rental in rentals if rental.state in _ORPHAN_STATES]
         if orphans or not settings.RENTAL_TEARDOWN_DEFERRAL_ENABLED:
-            orphan = orphans[0] if orphans else rentals[0]
-            remediation_template: str
-            if orphan.state is PodRentalState.ORPHAN:
-                remediation_template = Msg.ORPHANED_CONTAINER.remediation
-            elif orphan.state is PodRentalState.LIVE_ON_ANOTHER_NODE:
-                # This node's portal page shows no rental for a pod registered elsewhere, so the usual
-                # "confirm, then remove" advice would clear the removal of a live rental's container.
-                remediation_template = Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
-            else:
-                remediation_template = Msg.ORPHANED_CONTAINER_OF_A_CHANGING_RENTAL_REMEDIATION
-            event = render_message(
-                Msg.ORPHANED_CONTAINER,
-                ctx=ctx,
-                check_id=self.check_id,
-                remediation=remediation_template.format(
-                    orphaned_container=orphan.container_name,
-                    pod=f" (pod {orphan.pod_id})" if orphan.pod_id else "",
-                    rental_status=orphan.rental_status,
-                ),
-                what={
-                    **violation,
-                    "orphaned_container": orphan.container_name,
-                    "rental_status": orphan.rental_status,
-                    "container_status": "still running",
-                    "pod_containers": rentals,
-                },
-            )
-            return CheckResult(passed=False, event=event)
+            return self._orphaned_container_failure(ctx, violation, rentals, orphans[0] if orphans else rentals[0])
 
         expected_containers: set[str] = {rental.container_name for rental in rentals} | filler_containers
         outside_processes: list[dict] = [
             process for process in gpu_processes if process.get("container_name") not in expected_containers
         ]
         if outside_processes:
-            event = render_message(
-                Msg.USAGE_HIGH,
-                ctx=ctx,
-                check_id=self.check_id,
-                remediation=Msg.USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION.format(
-                    outside_processes=", ".join(_describe_process(process) for process in outside_processes),
-                    pod_containers=", ".join(rental.container_name for rental in rentals),
-                ),
-                what={
-                    **violation,
-                    "process_count": len(outside_processes),
-                    "gpu_processes": outside_processes,
-                    "pod_containers": rentals,
-                },
-            )
-            return CheckResult(passed=False, event=event)
+            return self._usage_high_beside_a_rental_failure(ctx, violation, rentals, outside_processes)
 
-        ended = any(rental.state is not PodRentalState.LIVE for rental in rentals)
-        template = Msg.TEARDOWN_IN_PROGRESS if ended else Msg.RENTAL_STARTED_DURING_RUN
+        return self._halt_scored_as_idle_while_the_rental_changes(ctx, violation, rentals)
+
+    def _orphaned_container_failure(
+        self, ctx: Context, violation: dict, rentals: list[PodContainerRental], orphan: PodContainerRental
+    ) -> CheckResult:
+        remediation_template: str
+        if orphan.state is PodRentalState.ORPHAN:
+            remediation_template = Msg.ORPHANED_CONTAINER.remediation
+        elif orphan.state is PodRentalState.LIVE_ON_ANOTHER_NODE:
+            # This node's portal page shows no rental for a pod registered elsewhere, so the usual
+            # "confirm, then remove" advice would clear the removal of a live rental's container.
+            remediation_template = Msg.ORPHANED_CONTAINER_OF_A_LIVE_RENTAL_REMEDIATION
+        else:
+            remediation_template = Msg.ORPHANED_CONTAINER_OF_A_CHANGING_RENTAL_REMEDIATION
+        event = render_message(
+            Msg.ORPHANED_CONTAINER,
+            ctx=ctx,
+            check_id=self.check_id,
+            remediation=remediation_template.format(
+                orphaned_container=orphan.container_name,
+                pod=f" (pod {orphan.pod_id})" if orphan.pod_id else "",
+                rental_status=orphan.provider_facing_rental_status,
+            ),
+            what={
+                **violation,
+                "orphaned_container": orphan.container_name,
+                "rental_status": orphan.provider_facing_rental_status,
+                "container_status": "still running",
+                "pod_containers": rentals,
+            },
+        )
+        return CheckResult(passed=False, event=event)
+
+    def _usage_high_beside_a_rental_failure(
+        self,
+        ctx: Context,
+        violation: dict,
+        rentals: list[PodContainerRental],
+        outside_processes: list[dict],
+    ) -> CheckResult:
+        event = render_message(
+            Msg.USAGE_HIGH,
+            ctx=ctx,
+            check_id=self.check_id,
+            remediation=Msg.USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION.format(
+                outside_processes=", ".join(_describe_process(process) for process in outside_processes),
+                pod_containers=", ".join(rental.container_name for rental in rentals),
+            ),
+            what={
+                **violation,
+                "process_count": len(outside_processes),
+                "gpu_processes": outside_processes,
+                "pod_containers": rentals,
+            },
+        )
+        return CheckResult(passed=False, event=event)
+
+    def _halt_scored_as_idle_while_the_rental_changes(
+        self, ctx: Context, violation: dict, rentals: list[PodContainerRental]
+    ) -> CheckResult:
+        any_rental_ended: bool = any(rental.state is not PodRentalState.LIVE for rental in rentals)
+        template = Msg.TEARDOWN_IN_PROGRESS if any_rental_ended else Msg.RENTAL_STARTED_DURING_RUN
         # VerifyXCheck writes the download-speed EMA an idle score needs, and it runs after this
         # halt: without the last known value the calculator scores every deferred node 0.
-        state: ContextState = replace(ctx.state, specs=with_last_known_verifyx_ema(ctx))
+        state: ContextState = replace(ctx.state, specs=specs_with_last_known_verifyx_ema(ctx))
         actual_score, job_score, warning_message = ctx.services.score_calculator(
             ctx.model_copy(update={"state": state}), ctx.rented
         )
@@ -668,8 +686,13 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
         )
         if since_closed >= timedelta(minutes=RENTAL_TEARDOWN_GRACE_MINUTES):
             return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
-        state = PodRentalState.ENDED_DURING_RUN if rented_at_run_start else PodRentalState.ENDED_RECENTLY
-        return PodContainerRental(container_name, pod_id, state, status, closed_at)
+        if rented_at_run_start:
+            return PodContainerRental(container_name, pod_id, PodRentalState.ENDED_DURING_RUN, status, closed_at)
+        # The backend deletes the pod row as it closes the rental, so a closed rental usually comes
+        # without an executor_id: then nothing proves it ran on this node.
+        if pod_rental.executor_id is None:
+            return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, status, closed_at)
+        return PodContainerRental(container_name, pod_id, PodRentalState.ENDED_RECENTLY, status, closed_at)
 
     if rented_at_run_start:
         return PodContainerRental(

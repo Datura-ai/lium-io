@@ -66,7 +66,7 @@ class VerifyXCheck:
 
         filler_container = _get_filler_only_container(ctx)
         if filler_container:
-            updated_specs = with_last_known_verifyx_ema(ctx)
+            updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -340,7 +340,7 @@ def _get_filler_only_container(ctx: Context) -> str | None:
     return filler_container if filler_container and not has_customer_rental else None
 
 
-def with_last_known_verifyx_ema(ctx: Context) -> dict:
+def specs_with_last_known_verifyx_ema(ctx: Context) -> dict:
     specs = dict(ctx.state.specs or {})
     rented_data = ctx.state.rented_data
     network_ema = rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
