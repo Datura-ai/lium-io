@@ -222,7 +222,7 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
 
 @pytest.mark.asyncio
 async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_completed(context_factory):
-    """The d9888aff shape: 2 ports, a pod in the batch-start rented list that has since ended."""
+    """A wide-range host shape: 2 ports, a pod in the batch-start rented list that has since ended."""
     batch = HostNetworkBatch(reachable=2)
     ctx = run_context(
         context_factory,
