@@ -24,6 +24,7 @@ from services.interactive_shell_service import InteractiveShellService
 from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.validator_requests import PodContainerState
 from .models import CollateralPrefetch, ValidationEvent
 from .runner import SSHCommandRunner
 
@@ -156,6 +157,10 @@ class ContextState:
     # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
     # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause.
     dind_probe_error: DindLogCause | None = None
+    # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
+    # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
+    # ExecutorSpecRequest.pod_states.
+    pod_states: list[PodContainerState] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None
@@ -189,6 +194,9 @@ class CheckResult(BaseModel):
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
+    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # the executor task's timeout from here.
+    started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
     miner_hotkey: str
     miner_coldkey: str | None = None

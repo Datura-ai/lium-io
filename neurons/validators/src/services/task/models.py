@@ -8,6 +8,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import IncentiveReason
 from protocol.vc_protocol.validator_requests import (
     AVAILABILITY_CATEGORY as AVAILABILITY_CATEGORY,
+    PodContainerState,
     ValidationEvent,
 )
 from pydantic import BaseModel, Field, PrivateAttr
@@ -72,6 +73,9 @@ class JobResult(BaseModel):
     # G1 — NVIDIA CC GPU attestation outcome (None = not performed)
     gpu_attestation_passed: bool | None = None
     executor_image_report: dict[str, Any] | None = None
+    # DAH-3338: container state per rented pod plus reaped orphans; None = the cycle never
+    # observed any (not reached the rented-state check, nothing reaped).
+    pod_states: list[PodContainerState] | None = None
 
     inspector_outcome: str = "SKIPPED"
 

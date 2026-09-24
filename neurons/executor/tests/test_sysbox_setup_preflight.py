@@ -41,6 +41,7 @@ STUBS = {
         case "$1 $2" in
             "version --format") echo "${STUB_DOCKER_VERSION:-28.5.2}" ;;
             "ps ") exit 0 ;;
+            "ps -a") echo "${STUB_STOPPED_POD:-}" ;;   # every container, stopped ones too
             "ps --filter") echo "${STUB_PORT_CONTAINER:-executor-1}" ;;
             "info ") echo " Runtimes: io.containerd.runc.v2 nvidia runc sysbox-runc" ;;   # the "already working?" probe of install mode
             "info --format")
@@ -64,7 +65,7 @@ STUBS = {
     ),
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
-    "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t0.6.6\\n\\tcommit:\\tabc123\\n"\n',
+    "sysbox-runc": '#!/bin/bash\nprintf "sysbox-runc\\n\\tversion:\\t${STUB_SYSBOX_VERSION:-0.7.1}\\n\\tcommit:\\tabc123\\n"\n',
     "ss": textwrap.dedent(
         """\
         #!/bin/bash
@@ -546,7 +547,22 @@ def test_env_file_in_the_working_directory_is_ignored_when_piped_from_curl(tmp_p
 def test_sysbox_installed_registered_and_running_passes(tmp_path):
     rc, out, _ = run_check(tmp_path, "check_sysbox")
     assert rc == 0
-    assert "PASS sysbox-runc 0.6.6 runs a container." in out
+    assert "PASS sysbox-runc 0.7.1 runs a container." in out
+
+
+def test_sysbox_older_than_the_pinned_version_is_a_fix(tmp_path):
+    # DAH-3833: 0.6.6 still runs small containers, so without this --check stays green on a node that fails 44+ layer images
+    rc, out, fixes = run_check(tmp_path, "check_sysbox", env={"STUB_SYSBOX_VERSION": "0.6.6"})
+    assert rc == 1
+    assert fixes == 1
+    assert "FIX  sysbox-runc 0.6.6 is older than 0.7.1" in out
+    assert "nvidia_docker_sysbox_setup.sh" in out
+
+
+def test_sysbox_newer_than_the_pinned_version_passes(tmp_path):
+    rc, out, _ = run_check(tmp_path, "check_sysbox", env={"STUB_SYSBOX_VERSION": "0.7.2"})
+    assert rc == 0
+    assert "PASS sysbox-runc 0.7.2 runs a container." in out
 
 
 def test_sysbox_missing_points_at_the_installer(tmp_path):
@@ -623,6 +639,33 @@ def test_install_mode_on_a_good_host_reaches_the_install_steps(tmp_path):
     assert "Nothing was installed." not in proc.stdout
     assert "Sysbox is already working. Nothing to do." in proc.stdout
     assert "FIX line(s) at the top" not in proc.stdout
+
+
+@pytest.mark.parametrize("installed", ["0.6.6", "0.6.7"])
+def test_install_mode_upgrades_an_older_working_sysbox(tmp_path, installed):
+    # DAH-3833: an older sysbox still runs small images, but 0.6.6 cannot start one with 44+ layers and
+    # both miss the runc container-escape fixes of 0.7.0; a re-run must upgrade it
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": installed})
+    assert f"Sysbox {installed} is installed; upgrading to 0.7.1." in proc.stdout
+    assert "Sysbox is already working. Nothing to do." not in proc.stdout
+    assert "Checking running containers" in proc.stdout
+
+
+def test_install_mode_stops_on_a_stopped_rental(tmp_path):
+    # a renter's stopped pod is still a rental; the upgrade path removes every stopped container
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_STOPPED_POD": "pod_abc123"})
+    assert proc.returncode == 1
+    assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
+    assert "docker ps -a --filter name=pod_" in proc.stdout
+    assert "pod_abc123" in proc.stdout
+    assert "Removing stopped containers" not in proc.stdout
+
+
+def test_install_mode_keeps_a_newer_sysbox(tmp_path):
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.7.2"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Sysbox is already working. Nothing to do." in proc.stdout
+    assert "upgrading" not in proc.stdout
 
 
 @pytest.mark.parametrize(
@@ -743,7 +786,7 @@ def test_diagnostics_print_the_sysbox_runc_version_not_its_name(tmp_path):
     """Regression: `sysbox-runc --version | head -1` is the line "sysbox-runc"; the version is on a later line."""
     rc, out, _ = run_check(tmp_path, "failure_diagnostics")
     assert rc == 0
-    assert "sysbox-runc:         0.6.6" in out
+    assert "sysbox-runc:         0.7.1" in out
     assert "sysbox-runc:         sysbox-runc" not in out
 
 
