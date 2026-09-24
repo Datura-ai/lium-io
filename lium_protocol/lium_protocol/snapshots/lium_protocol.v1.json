@@ -4210,6 +4210,32 @@
       "title": "PodRentalActiveResponse",
       "type": "object"
     },
+    "PodSshUnreachableResponse": {
+      "description": "`POST \u2026/ssh-unreachable`: ``recorded`` False when the backend already holds this outage.",
+      "properties": {
+        "delivery": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delivery"
+        },
+        "recorded": {
+          "title": "Recorded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recorded"
+      ],
+      "title": "PodSshUnreachableResponse",
+      "type": "object"
+    },
     "PodStatesReport": {
       "description": "DAH-3338: one chunk of the container states one cycle saw on one node, sent after that cycle's\n`ExecutorSpecRequest` when the validator's POD_STATES_REPORT_ENABLED is on. The backend writes the\nstates onto the rental rows and nothing else (no cycle row, no validation report); the write is\nidempotent. `job_batch_id` is the cycle; `chunk_index` counts from 0 up to `chunk_total - 1`.",
       "properties": {
@@ -4767,6 +4793,30 @@
           },
           "title": "Rented Ports",
           "type": "array"
+        },
+        "ssh_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ssh Port"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
         }
       },
       "required": [
@@ -5440,11 +5490,14 @@
     "PodRentalActiveResponse": {
       "$ref": "#/$defs/PodRentalActiveResponse"
     },
+    "PodSshUnreachableResponse": {
+      "$ref": "#/$defs/PodSshUnreachableResponse"
+    },
     "RentedExecutorsResponse": {
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "1.2.0",
+  "protocol_version": "1.3.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
