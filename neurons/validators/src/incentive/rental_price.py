@@ -992,6 +992,12 @@ class RentalPriceIncentive(DefaultIncentive):
             logger.info(exclusion.to_internal_log())
             job_result.record_incentive_log(exclusion)
         excluded_from_both_pools: bool = outdated_image or bool(exclusions)
+        if excluded_from_both_pools and job_result.gpu_model not in BASE_GPU_MAP:
+            # get_base_model_for_gpu raises on a model it does not know, and nothing above this
+            # guards it: an excluded node keeps its reasons and scores 0 instead of stopping the cycle
+            job_result.eligible_for_rental_share = False
+            job_result.mining_score = 0
+            return job_result
 
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
         base_model = self.get_base_model_for_gpu(job_result.gpu_model)

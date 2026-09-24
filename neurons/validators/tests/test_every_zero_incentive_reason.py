@@ -373,3 +373,32 @@ async def test_an_outdated_image_is_one_reason_for_one_cause(monkeypatch, engine
 
     assert _codes(result) == ["outdated_executor_image"]
 
+
+# ── excluded nodes: scored 0, never an exception ──────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exclusion", [{"is_spot": True}, {"is_provider_banned": True}], ids=["spot", "banned"])
+async def test_a_rented_excluded_node_scores_zero(exclusion):
+    rented_healthy = _idle_flagship(gpu_count=4, spec=None, is_rented=True)
+    redis = AsyncMock(get_portion_per_gpu_type=AsyncMock(return_value=0.3))
+    incentive = RentalPriceIncentive(IncentiveConfig(), redis, {"hk": [rented_healthy]}, {H200: 4})
+    assert (await incentive.calculate_executor_score(rented_healthy)).mining_score > 0
+
+    result = await incentive.calculate_executor_score(
+        _idle_flagship(gpu_count=4, spec=None, is_rented=True, **exclusion)
+    )
+
+    assert result.mining_score == 0
+    assert result.eligible_for_rental_share is False
+    assert len(_codes(result)) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_excluded_node_with_a_model_the_validator_does_not_know_scores_zero():
+    # get_base_model_for_gpu raises on an unknown model; the exclusion is its reason, not a crash
+    result = await _incentive().calculate_executor_score(_idle_flagship(gpu_model="NVIDIA FAKE 9000", is_spot=True))
+
+    assert _codes(result) == ["spot_tier"]
+    assert result.mining_score == 0
+    assert result.eligible_for_rental_share is False
