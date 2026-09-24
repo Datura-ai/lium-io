@@ -24,7 +24,7 @@ from core.config import settings
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .port_count import hidden_from_renters_text, listing_port_shortfall, port_floor_what
+from .port_count import hidden_from_renters_text, port_count_below_listing_floor, port_floor_what
 from .rented_pod_ssh import (
     RentedPodSshVerdict,
     enforce_after_cycles,
@@ -231,9 +231,9 @@ class TenantEnforcementCheck:
                     # list named a pod; the node goes on as unrented with a count the backend will not list.
                     # The floor is enforced only when every listed pod is stale: a live rental on the same
                     # node is a real exemption, and this loop returns before it would reach later pods.
-                    shortfall = listing_port_shortfall(ctx.state)
+                    port_count_below_floor = port_count_below_listing_floor(ctx.state)
                     if (
-                        shortfall is not None
+                        port_count_below_floor is not None
                         and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
                         and await _every_listed_pod_stale(ctx, rented_pods, pod_index)
                     ):
@@ -241,7 +241,7 @@ class TenantEnforcementCheck:
                             PortCountMessages.INSUFFICIENT_PORTS,
                             ctx=ctx,
                             check_id=self.check_id,
-                            what={**port_floor_what(ctx.state, shortfall), "stale_pod": stale_what},
+                            what={**port_floor_what(ctx.state, port_count_below_floor), "stale_pod": stale_what},
                             extra=extra,
                         )
                         return with_pod_states(
@@ -252,14 +252,17 @@ class TenantEnforcementCheck:
                             )
                         )
                     impact = None
-                    if shortfall is not None:
-                        stale_what["port_floor"] = port_floor_what(ctx.state, shortfall)
-                        impact = f"{hidden_from_renters_text(shortfall)}; the port floor applied only while the pod was listed"
+                    if port_count_below_floor is not None:
+                        stale_what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
+                        impact = (
+                            f"{hidden_from_renters_text(port_count_below_floor)}; "
+                            "the port floor applied only while the pod was listed"
+                        )
                     event = render_message(
                         Msg.STALE_POD_NOT_RUNNING,
                         ctx=ctx,
                         check_id=self.check_id,
-                        severity="warning" if shortfall is not None else None,
+                        severity="warning" if port_count_below_floor is not None else None,
                         impact=impact,
                         what=stale_what,
                         extra=extra,
@@ -701,14 +704,14 @@ async def _recover_pod_after_stale_vloopback_mount(
         return False
 
 
-async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_index: int) -> bool:
+async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:
     """True only when every listed pod is not running and its rental is closed.
 
-    `rented_pods[stale_index]` is already known stale. The loop only gets past a pod that is running
+    `rented_pods[stale_pod_index]` is already known stale. The loop only gets past a pod that is running
     (or was recovered), so any pod before it is live. Anything unknown (no rental record, a dead SSH
     transport) counts as live, so the floor is never enforced on a guess.
     """
-    if stale_index > 0:
+    if stale_pod_index > 0:
         return False
     for other in rented_pods[1:]:
         try:

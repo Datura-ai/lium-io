@@ -429,6 +429,49 @@ async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced
 
 
 @pytest.mark.asyncio
+async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enforced(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods("pod-stale", "pod-running"),
+        ssh=PerPodSSHClient(running={"container_pod-running"}),
+        backend=PerPodBackendClient(active=set()),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_a_stale_pod_beside_a_down_pod_without_a_rental_record_is_not_enforced(context_factory, monkeypatch):
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+
+    class NoRecordForSecondPod(PerPodBackendClient):
+        async def get_pod_rental_active(self, pod_id: str):
+            return None if pod_id == "pod-unknown" else await super().get_pod_rental_active(pod_id)
+
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_pods("pod-stale", "pod-unknown"),
+        ssh=PerPodSSHClient(running=set()),
+        backend=NoRecordForSecondPod(active=set()),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
 async def test_a_malformed_port_range_is_a_non_fatal_verify_failure_on_an_unrented_node(context_factory):
     """Flags off, `40000:65535` (a colon, not a dash): main's verdicts, never an exception out of the check."""
     ctx = run_context(
