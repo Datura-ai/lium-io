@@ -7,7 +7,11 @@ from services.const import BATCH_PORT_VERIFICATION_SIZE
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
-from services.executor_connectivity.port_selector import PortSelector, declared_ports, tally_port_ranges
+from services.executor_connectivity.port_selector import (
+    PortSelector,
+    declared_ports,
+    tally_port_ranges,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +44,13 @@ class ConnectivityOrchestrator:
             "executor_uuid": executor_info.uuid,
             "executor_ip": executor_info.address,
         }
-        ports = self.port_selector.select(
-            executor_info, BATCH_PORT_VERIFICATION_SIZE, set(unavailable_ports or [])
-        )
         declared = declared_ports(executor_info)
+        ports = self.port_selector.select(
+            executor_info,
+            BATCH_PORT_VERIFICATION_SIZE,
+            set(unavailable_ports or []),
+            declared=declared,
+        )
 
         if not ports:
             return PortVerificationResult(

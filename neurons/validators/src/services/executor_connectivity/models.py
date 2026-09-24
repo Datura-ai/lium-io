@@ -62,9 +62,13 @@ class PortRangeResult:
     declared: int
     probed: int
     answered: int
+    # the buckets past PORT_RANGE_MAX_ENTRIES, summed into one
+    other: bool = False
 
     def as_dict(self) -> dict[str, object]:
         label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
+        if self.other:
+            label = f"other {label}"
         return {"range": label, "declared": self.declared, "probed": self.probed, "answered": self.answered}
 
 

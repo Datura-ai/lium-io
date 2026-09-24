@@ -1,7 +1,8 @@
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
+from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT, PORT_RANGE_MAX_ENTRIES
+from services.executor_connectivity import port_selector as port_selector_module
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import (
     DindProbeResult,
@@ -94,7 +95,7 @@ def _available(info, unavailable=frozenset()):
     ]
 
 
-def test_reston_regression_wide_range_open_only_high():
+def test_wide_range_open_only_high_regression():
     """Declared 40000-65535, only ports above 60000 forwarded: the lowest-300 cut verified none of
     them and the host was hidden from the listing though it passed everything else."""
     info = _executor_info(port_range="40000-65535")
@@ -110,7 +111,7 @@ def test_reston_regression_wide_range_open_only_high():
 
 
 @pytest.mark.asyncio
-async def test_reston_regression_orchestrator_verifies_high_ports(mocker):
+async def test_wide_range_open_only_high_orchestrator_verifies_high_ports(mocker):
     info = _executor_info(port_range="40000-65535")
     open_ports = set(range(60001, 65536))
 
@@ -240,18 +241,19 @@ def test_tally_small_range_is_one_entry():
 
 
 def test_tally_wide_range_splits_at_bucket_boundaries_by_external_port():
-    declared = [PortPair(8000 + i, 38000 + i) for i in range(12001)]
+    # the offset is not a multiple of the bucket width, so bucketing by internal port gives other bounds
+    declared = [PortPair(8000 + i, 38017 + i) for i in range(12001)]
 
     tallies = tally_port_ranges(declared, declared[-2:], declared[-1:])
 
     assert [(t.first, t.last, t.declared) for t in tallies] == [
-        (38000, 39999, 2000),
+        (38017, 39999, 1983),
         (40000, 44999, 5000),
         (45000, 49999, 5000),
-        (50000, 50000, 1),
+        (50000, 50017, 18),
     ]
-    assert [(t.probed, t.answered) for t in tallies] == [(0, 0), (0, 0), (1, 0), (1, 1)]
-    assert tallies[-1].as_dict() == {"range": "50000", "declared": 1, "probed": 1, "answered": 1}
+    assert [(t.probed, t.answered) for t in tallies] == [(0, 0), (0, 0), (0, 0), (2, 1)]
+    assert tallies[-1].as_dict() == {"range": "50000-50017", "declared": 18, "probed": 2, "answered": 1}
 
 
 def test_tally_nothing_declared():
@@ -274,3 +276,104 @@ async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker):
 
     assert result.status == "no_ports"
     assert result.port_ranges == (PortRangeResult(first=9000, last=9001, declared=2, probed=0, answered=0),)
+
+
+def test_select_calls_sample_ports(monkeypatch):
+    """Production's selection is sample_ports: a select() that inlines its own copy fails here."""
+    calls = []
+
+    def spy(ports, size):
+        calls.append((list(ports), size))
+        return sample_ports(ports, size)
+
+    monkeypatch.setattr(port_selector_module, "sample_ports", spy)
+    info = _executor_info(port_range="40000-65535")
+
+    result = PortSelector().select(info, BATCH_PORT_VERIFICATION_SIZE, {40001})
+
+    assert calls == [(_available(info, {40001}), BATCH_PORT_VERIFICATION_SIZE)]
+    assert result == sample_ports(_available(info, {40001}), BATCH_PORT_VERIFICATION_SIZE)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_parses_the_declaration_once(monkeypatch, mocker):
+    parsed = []
+
+    def counting_get_all_ports(*args):
+        parsed.append(args)
+        return get_all_ports(*args)
+
+    monkeypatch.setattr(port_selector_module, "get_all_ports", counting_get_all_ports)
+    port_probe = mocker.Mock(spec=PortProbe)
+    port_probe.probe = mocker.AsyncMock(return_value=PortProbeResult(successful=(), failed=()))
+    dind_probe = mocker.Mock(spec=DindProbe)
+    dind_probe.verify = mocker.AsyncMock(
+        return_value=DindProbeResult(success=False, sysbox_runtime=False, port=None)
+    )
+
+    await ConnectivityOrchestrator(PortSelector(), port_probe, dind_probe).verify(
+        executor_info=_executor_info(port_range="40000-65535"),
+        miner_hotkey="miner",
+        sysbox_runtime=False,
+        unavailable_ports=[],
+        ssh_client=mocker.Mock(),
+    )
+
+    assert len(parsed) == 1
+
+
+def _answering(info, open_ports):
+    return sum(p.external in open_ports for p in PortSelector().select(info, BATCH_PORT_VERIFICATION_SIZE, set()))
+
+
+@pytest.mark.parametrize("block, verified", [(342, 3), (341, 2), (513, 4)])
+def test_limit_top_block_needs_about_342_ports_on_40000_65535(block, verified):
+    info = _executor_info(port_range="40000-65535")
+
+    assert _answering(info, set(range(65536 - block, 65536))) == verified
+
+
+def test_limit_block_at_positions_151_to_300_of_a_wide_range_is_newly_hidden():
+    info = _executor_info(port_range="40000-65535")
+    open_ports = set(range(40150, 40300))
+
+    old = _available(info)[:BATCH_PORT_VERIFICATION_SIZE]
+    assert sum(p.external in open_ports for p in old) == 150
+    assert _answering(info, open_ports) < MIN_PORT_COUNT
+
+
+def test_limit_low_block_of_300_verifies_151():
+    info = _executor_info(port_range="40000-65535")
+
+    assert _answering(info, set(range(40000, 40300))) == 151
+
+
+def test_tally_counts_duplicate_ports_and_shared_externals_once():
+    declared = [PortPair(9000, 40000), PortPair(9001, 40000), PortPair(9002, 40001), PortPair(9002, 40001)]
+
+    (tally,) = tally_port_ranges(declared, declared, declared[:2])
+
+    assert (tally.declared, tally.probed, tally.answered) == (2, 2, 1)
+
+
+def test_tally_drops_ports_outside_1_65535():
+    declared = [PortPair(1, 0), PortPair(2, 70000), PortPair(3, -5), PortPair(4, 9000)]
+
+    assert tally_port_ranges(declared, declared, declared) == (
+        PortRangeResult(first=9000, last=9000, declared=1, probed=1, answered=1),
+    )
+
+
+def test_tally_caps_entries_with_an_other_bucket(monkeypatch):
+    monkeypatch.setattr(port_selector_module, "PORT_RANGE_BUCKET_WIDTH", 10)
+    declared = [PortPair(p, p) for p in range(10000, 10000 + 10 * 40, 10)]
+
+    tallies = tally_port_ranges(declared, declared[-3:], declared[-1:])
+
+    assert len(tallies) == PORT_RANGE_MAX_ENTRIES
+    assert not any(t.other for t in tallies[:-1])
+    other = tallies[-1]
+    assert (other.other, other.first, other.last, other.declared) == (True, 10310, 10390, 9)
+    assert (other.probed, other.answered) == (3, 1)
+    assert other.as_dict()["range"] == "other 10310-10390"
+    assert sum(t.declared for t in tallies) == len(declared)
