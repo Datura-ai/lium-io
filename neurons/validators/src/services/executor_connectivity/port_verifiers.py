@@ -28,24 +28,12 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
-    ) -> tuple[list[PortPair], list[PortPair]]:
-        """Verify ports with retries."""
-        result = await self.run(ports, ssh_client=ssh_client, host=host, log_ctx=log_ctx)
-        return result.successful, result.failed
-
-    async def run(
-        self,
-        ports: list[PortPair],
-        *,
-        ssh_client,
-        host: str,
-        log_ctx: dict | None = None,
         max_attempts: int = 2,
     ) -> BatchResult:
         """Verify ports with retries, and say whether any attempt got as far as testing them."""
         log_ctx = log_ctx or {}
         timeout_sec = 60
-        ran = False
+        completed = False
 
         for attempt in range(1, max_attempts + 1):
             token = uuid.uuid4().hex
@@ -59,17 +47,20 @@ class BatchVerifier:
             )
 
             try:
-                successful, failed, tested = await asyncio.wait_for(
+                attempt_result = await asyncio.wait_for(
                     self._attempt(ports, token, container_name, ssh_client, host, log_ctx),
                     timeout=timeout_sec
                 )
-                ran = ran or tested
+                completed = completed or attempt_result.completed
 
-                if successful:
+                if attempt_result.successful:
                     logger.info(
-                        _m(f"complete: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
+                        _m(
+                            f"complete: {len(attempt_result.successful)}/{len(ports)} verified",
+                            extra=get_extra_info(log_ctx),
+                        )
                     )
-                    return BatchResult(successful, failed, ran)
+                    return BatchResult(attempt_result.successful, attempt_result.failed, completed)
 
                 if attempt < max_attempts:
                     logger.warning(
@@ -95,7 +86,7 @@ class BatchVerifier:
                     await asyncio.sleep(2)
 
         logger.error(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(log_ctx)))
-        return BatchResult([], ports, ran)
+        return BatchResult([], ports, completed)
 
     async def _attempt(
         self,
@@ -105,8 +96,8 @@ class BatchVerifier:
         ssh_client,
         host: str,
         log_ctx: dict | None = None,
-    ) -> tuple[list[PortPair], list[PortPair], bool]:
-        """Single verification attempt; the flag is whether the ports were tested at all."""
+    ) -> BatchResult:
+        """Single verification attempt."""
         log_ctx = log_ctx or {}
         script = NetcatScript.batch(ports, token, 0)
         start_result = await self.runner.run(ssh_client, name, script, "host", 60)
@@ -117,7 +108,7 @@ class BatchVerifier:
                     extra=get_extra_info(log_ctx),
                 )
             )
-            return [], ports, False
+            return BatchResult([], ports, completed=False)
 
         try:
             async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as session:
@@ -128,7 +119,7 @@ class BatchVerifier:
         finally:
             await self.runner.cleanup(ssh_client, name)
 
-        return successful, failed, True
+        return BatchResult(successful, failed, completed=True)
 
 
 class FallbackVerifier:

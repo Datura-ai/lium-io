@@ -25,7 +25,7 @@ def tally_port_ranges(
     probed: Iterable[PortPair],
     answered: Iterable[PortPair],
     pass_number: int = 1,
-    counted: bool = True,
+    answers_counted: bool = True,
 ) -> tuple[PortRangeResult, ...]:
     """Declared, probed and answered counts per declared range for one pass, ascending.
 
@@ -46,20 +46,20 @@ def tally_port_ranges(
     kept = groups if len(groups) <= PORT_RANGE_MAX_ENTRIES else groups[: PORT_RANGE_MAX_ENTRIES - 1]
     overflow = [e for ports in groups[len(kept) :] for e in ports]
 
-    def tally(ports: list[int], other: bool = False) -> PortRangeResult:
+    def tally(ports: list[int], is_overflow: bool = False) -> PortRangeResult:
         return PortRangeResult(
             first=ports[0],
             last=ports[-1],
             declared=len(ports),
             probed=sum(e in probed_ext for e in ports),
             answered=sum(e in answered_ext for e in ports),
-            other=other,
+            is_overflow=is_overflow,
             pass_number=pass_number,
-            counted=counted,
+            answers_counted=answers_counted,
         )
 
     return tuple(tally(ports) for ports in kept) + (
-        (tally(overflow, other=True),) if overflow else ()
+        (tally(overflow, is_overflow=True),) if overflow else ()
     )
 
 
@@ -111,13 +111,13 @@ class PortSelector:
         declared: list[PortPair],
         size: int,
         unavailable_ports: set[int],
-        tested: Iterable[PortPair],
+        pass_one_ports: Iterable[PortPair],
     ) -> list[PortPair]:
         """Pass two: up to `size` free declared ports that pass one did not test, spread evenly."""
-        tested_ext = {p.external for p in tested}
-        remaining = [
+        pass_one_external = {p.external for p in pass_one_ports}
+        untested_free_ports = [
             p
             for p in declared
-            if p.external not in unavailable_ports and p.external not in tested_ext
+            if p.external not in unavailable_ports and p.external not in pass_one_external
         ]
-        return spread_ports(remaining, size)
+        return spread_ports(untested_free_ports, size)

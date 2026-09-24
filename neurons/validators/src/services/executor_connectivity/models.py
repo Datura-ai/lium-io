@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 
 
 @dataclass(frozen=True)
@@ -15,17 +16,15 @@ class PortPair:
 class PortProbeResult:
     successful: tuple[PortPair, ...]
     failed: tuple[PortPair, ...]
-    # whether the batch tier started its container and tested the ports in at least one attempt;
-    # False when every attempt failed to start, timed out or raised mid-test, so the forwarding
-    # test never completed
-    batch_ran: bool = False
+    # False when every batch attempt failed to start, timed out or raised mid-test
+    batch_completed: bool = False
 
 
 @dataclass(frozen=True)
 class BatchResult:
     successful: list[PortPair]
     failed: list[PortPair]
-    ran: bool
+    completed: bool
 
 
 @dataclass(frozen=True)
@@ -75,16 +74,15 @@ class PortRangeResult:
     probed: int
     answered: int
     # the buckets past PORT_RANGE_MAX_ENTRIES, summed into one
-    other: bool = False
+    is_overflow: bool = False
     # 1: the lowest-300 pass every host gets; 2: the spread pass run only when pass one verified < 3
     pass_number: int = 1
-    # False: probed and tallied, but none of these answers is a verified port (the container check
-    # on one of them failed)
-    counted: bool = True
+    # False: the container check on one of these answers failed, so none is a verified port
+    answers_counted: bool = True
 
     def as_dict(self) -> dict[str, object]:
         label = str(self.first) if self.first == self.last else f"{self.first}-{self.last}"
-        if self.other:
+        if self.is_overflow:
             label = f"other {label}"
         entry: dict[str, object] = {
             "pass": self.pass_number,
@@ -93,23 +91,37 @@ class PortRangeResult:
             "probed": self.probed,
             "answered": self.answered,
         }
-        if not self.counted:
+        if not self.answers_counted:
             entry["counted"] = False
         return entry
 
 
-# Pass two restores the port count only: after a failed container (DinD) check the result is the
-# one-pass check's, so pass two never lists a host whose container check failed.
-SECOND_PASS_NOT_NEEDED = "not_needed"  # pass one verified MIN_PORT_COUNT or more after DinD
-# the container check failed on a pass-one port, so pass two did not run
-SECOND_PASS_SKIPPED_CONTAINER_FAILED = "skipped_container_failed"
-SECOND_PASS_SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never completed
-SECOND_PASS_NO_PORTS_LEFT = "no_ports_left"  # every free declared port was in pass one
-SECOND_PASS_RAN = "ran"
-SECOND_PASS_BATCH_FAILED = "batch_failed"  # pass two's own batch container didn't complete
-# pass one had no answer, pass two had some, and the container check on one of them failed, so
-# none of pass two's answers count (tallied with counted=False)
-SECOND_PASS_DISCARDED_CONTAINER_FAILED = "discarded_container_failed"
+class SecondPass(StrEnum):
+    """Why pass two did or did not run. It restores the port count only: after a failed container
+    (DinD) check the result is the one-pass check's."""
+
+    NOT_NEEDED = "not_needed"  # pass one verified MIN_PORT_COUNT or more after DinD
+    SKIPPED_CONTAINER_FAILED = "skipped_container_failed"  # DinD failed on a pass-one port
+    SKIPPED_BATCH_FAILED = "skipped_batch_failed"  # pass one's batch tier never completed
+    NO_PORTS_LEFT = "no_ports_left"  # every free declared port was in pass one
+    RAN = "ran"
+    BATCH_FAILED = "batch_failed"  # pass two's own batch container didn't complete
+    # pass one had no answer and DinD failed on a pass-two answer, so none of pass two's answers count
+    DISCARDED_CONTAINER_FAILED = "discarded_container_failed"
+
+
+@dataclass(frozen=True)
+class SecondPassRun:
+    outcome: SecondPass
+    probed: list[PortPair] = field(default_factory=list)
+    answered: list[PortPair] = field(default_factory=list)
+    failed: list[PortPair] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DindCheck:
+    port: PortPair
+    result: DindProbeResult
 
 
 @dataclass(frozen=True)
@@ -128,8 +140,7 @@ class PortVerificationResult:
     # One tally per declared range (split at PORT_RANGE_BUCKET_WIDTH boundaries), ascending: pass
     # one's tallies, then pass two's when it ran.
     port_ranges: tuple[PortRangeResult, ...] = ()
-    # Why the spread pass did or did not run: one of the SECOND_PASS_* values.
-    second_pass: str | None = None
+    second_pass: SecondPass | None = None
 
 
 @dataclass(frozen=True)

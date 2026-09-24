@@ -226,9 +226,9 @@ def test_tally_caps_entries_with_an_other_bucket(monkeypatch):
     tallies = tally_port_ranges(declared, declared[-3:], declared[-1:])
 
     assert len(tallies) == PORT_RANGE_MAX_ENTRIES
-    assert not any(t.other for t in tallies[:-1])
+    assert not any(t.is_overflow for t in tallies[:-1])
     other = tallies[-1]
-    assert (other.other, other.first, other.last, other.declared) == (True, 10310, 10390, 9)
+    assert (other.is_overflow, other.first, other.last, other.declared) == (True, 10310, 10390, 9)
     assert (other.probed, other.answered) == (3, 1)
     assert other.as_dict()["range"] == "other 10310-10390"
     assert sum(t.declared for t in tallies) == len(declared)
@@ -283,7 +283,7 @@ def test_pass_two_spread_excludes_pass_one_and_rented_ports_and_includes_the_hig
     declared = _available(info)
     one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, rented)
 
-    two = selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, rented, tested=one)
+    two = selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, rented, pass_one_ports=one)
 
     assert len(two) == BATCH_PORT_VERIFICATION_SIZE
     assert not {p.external for p in two} & ({p.external for p in one} | rented)
@@ -298,11 +298,11 @@ def test_pass_two_is_deterministic_for_the_same_declaration_and_rental_set():
     selector = PortSelector()
     declared = _available(info)
     one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, rented)
-    first = selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, rented, tested=one)
+    first = selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, rented, pass_one_ports=one)
 
     for _ in range(5):
         again_one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, rented)
-        assert selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, rented, tested=again_one) == first
+        assert selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, rented, pass_one_ports=again_one) == first
 
 
 @pytest.mark.parametrize("n", [1, 2, 299, 300, 301, 302, 450, 600, 25236, 45236])

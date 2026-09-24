@@ -17,17 +17,11 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 from services.executor_connectivity import port_verifiers
 from services.executor_connectivity.models import (
-    SECOND_PASS_BATCH_FAILED,
-    SECOND_PASS_DISCARDED_CONTAINER_FAILED,
-    SECOND_PASS_NO_PORTS_LEFT,
-    SECOND_PASS_NOT_NEEDED,
-    SECOND_PASS_RAN,
-    SECOND_PASS_SKIPPED_BATCH_FAILED,
-    SECOND_PASS_SKIPPED_CONTAINER_FAILED,
     ContainerStartResult,
     DindProbeResult,
     PortPair,
     PortRangeResult,
+    SecondPass,
 )
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
@@ -154,7 +148,8 @@ async def _main_verify(host: Host, info: ExecutorSSHInfo, unavailable: set[int],
         )
 
     kw = {"ssh_client": None, "host": info.address, "log_ctx": {}}
-    successful, failed = await BatchVerifier(host, host).verify(ports, **kw)
+    batch = await BatchVerifier(host, host).verify(ports, **kw)
+    successful, failed = batch.successful, batch.failed
     if not successful:
         successful, failed = await SemiBatchVerifier(host, host).verify(ports, max_ports=50, **kw)
     if not successful:
@@ -294,12 +289,12 @@ async def test_two_pass_against_main(host, kwargs, rented, seed):
         return
 
     # main's verified count is after the DinD probe has taken its port
-    assert (len(main.successful) >= MIN_PORT_COUNT) == (new.second_pass == SECOND_PASS_NOT_NEEDED)
+    assert (len(main.successful) >= MIN_PORT_COUNT) == (new.second_pass == SecondPass.NOT_NEEDED)
     one_probes = [p for p in new_host.probes if p[1] != 2]
     two_probes = [p for p in new_host.probes if p[1] == 2]
     extra = len(new_host.containers) - len(main_host.containers)
 
-    if new.second_pass == SECOND_PASS_NOT_NEEDED:
+    if new.second_pass == SecondPass.NOT_NEEDED:
         # pass one is main's check: same containers, same probes, same published result
         assert new_host.containers == main_host.containers
         assert new_host.probes == main_host.probes
@@ -315,7 +310,7 @@ async def test_two_pass_against_main(host, kwargs, rented, seed):
     assert extra in (0, 1)
     assert (extra == 1) == (
         new.second_pass
-        in (SECOND_PASS_RAN, SECOND_PASS_BATCH_FAILED, SECOND_PASS_DISCARDED_CONTAINER_FAILED)
+        in (SecondPass.RAN, SecondPass.BATCH_FAILED, SecondPass.DISCARDED_CONTAINER_FAILED)
     )
     assert [c for c in new_host.containers if c[0] == "dind"] == [("dind", 0)]
     main_dind_ok = main.dind in main.successful
@@ -336,18 +331,18 @@ async def test_two_pass_against_main(host, kwargs, rented, seed):
             assert new.successful_ports == main.successful
             assert new.status == main.status
         if main.pass_one:
-            assert new.second_pass == SECOND_PASS_SKIPPED_CONTAINER_FAILED
+            assert new.second_pass == SecondPass.SKIPPED_CONTAINER_FAILED
             assert extra == 0
             assert new_host.containers == main_host.containers
             assert new_host.probes == main_host.probes
             assert new.failed_ports == main.failed
-        if new.second_pass == SECOND_PASS_DISCARDED_CONTAINER_FAILED:
+        if new.second_pass == SecondPass.DISCARDED_CONTAINER_FAILED:
             assert new.successful_ports == ()
             assert new.dind_port.external in {e for _, _, ports in two_probes for e in ports}
-            assert all(not t.counted for t in new.port_ranges if t.pass_number == 2)
+            assert all(not t.answers_counted for t in new.port_ranges if t.pass_number == 2)
     else:
         assert len(new.successful_ports) >= len(main.successful)
-    if new.second_pass == SECOND_PASS_SKIPPED_BATCH_FAILED:
+    if new.second_pass == SecondPass.SKIPPED_BATCH_FAILED:
         assert not any(mode == "host" for mode, _, _ in main_host.probes)
     tested_one = {e for _, _, ports in one_probes for e in ports}
     for _, _, ports in two_probes:
@@ -365,13 +360,13 @@ async def test_the_shapes_cover_every_outcome():
         new = await _new_verify(_host_copy(host), _info(**kwargs), set(rented), seed)
         outcomes.add(new.second_pass)
     assert outcomes >= {
-        SECOND_PASS_NOT_NEEDED,
-        SECOND_PASS_SKIPPED_CONTAINER_FAILED,
-        SECOND_PASS_SKIPPED_BATCH_FAILED,
-        SECOND_PASS_NO_PORTS_LEFT,
-        SECOND_PASS_RAN,
-        SECOND_PASS_BATCH_FAILED,
-        SECOND_PASS_DISCARDED_CONTAINER_FAILED,
+        SecondPass.NOT_NEEDED,
+        SecondPass.SKIPPED_CONTAINER_FAILED,
+        SecondPass.SKIPPED_BATCH_FAILED,
+        SecondPass.NO_PORTS_LEFT,
+        SecondPass.RAN,
+        SecondPass.BATCH_FAILED,
+        SecondPass.DISCARDED_CONTAINER_FAILED,
     }
 
 
@@ -383,7 +378,7 @@ async def test_wide_range_open_only_above_60000_goes_from_zero_to_three():
     main, _, new, new_host = await _both(host, info)
 
     assert len(main.successful) == 0
-    assert new.second_pass == SECOND_PASS_RAN
+    assert new.second_pass == SecondPass.RAN
     assert len(new.successful_ports) >= MIN_PORT_COUNT
     assert all(p.external > 60000 for p in new.successful_ports)
     assert new.status == "ok"
@@ -416,7 +411,7 @@ async def test_pass_two_never_reprobes_a_pass_one_port():
 
     _, _, new, new_host = await _both(host, info)
 
-    assert new.second_pass == SECOND_PASS_RAN
+    assert new.second_pass == SecondPass.RAN
     (two,) = [ports for _, p, ports in new_host.probes if p == 2]
     one = {e for _, p, ports in new_host.probes if p != 2 for e in ports}
     assert one == set(range(40000, 40300))
@@ -455,7 +450,7 @@ async def test_pass_two_is_skipped_when_pass_one_verifies_three():
 
     main, main_host, new, new_host = await _both(host, info)
 
-    assert new.second_pass == SECOND_PASS_NOT_NEEDED
+    assert new.second_pass == SecondPass.NOT_NEEDED
     assert not [p for p in new_host.probes if p[1] == 2]
     assert new_host.containers == main_host.containers
     assert new.successful_ports == main.successful
@@ -505,7 +500,7 @@ async def test_a_failed_container_check_on_a_pass_one_port_keeps_mains_result(pa
 
     assert main.pass_one == pass_one
     assert len(main.successful) == pass_one - 1
-    assert new.second_pass == SECOND_PASS_SKIPPED_CONTAINER_FAILED
+    assert new.second_pass == SecondPass.SKIPPED_CONTAINER_FAILED
     # pass two did not run: main's containers, main's probes, main's result
     assert not [p for p in new_host.probes if p[1] == 2]
     assert new_host.containers == main_host.containers
@@ -533,7 +528,7 @@ async def test_pass_two_does_not_run_when_the_dind_probe_keeps_all_three_answers
 
     main, main_host, new, new_host = await _both(host, info)
 
-    assert new.second_pass == SECOND_PASS_NOT_NEEDED
+    assert new.second_pass == SecondPass.NOT_NEEDED
     assert new.dind_ok
     assert new.dind_port == main.dind == PortPair(40000, 40000)
     assert not [p for p in new_host.probes if p[1] == 2]
@@ -551,7 +546,7 @@ async def test_a_passing_container_check_on_a_pass_one_port_lets_pass_two_count(
     main, main_host, new, new_host = await _both(host, info)
 
     assert main.pass_one == len(main.successful) == pass_one
-    assert new.second_pass == SECOND_PASS_RAN
+    assert new.second_pass == SecondPass.RAN
     # the check ran first, on main's pass-one port, then pass two's one batch container
     assert new.dind_ok
     assert new.dind_port == main.dind == PortPair(40000, 40000)
@@ -560,7 +555,7 @@ async def test_a_passing_container_check_on_a_pass_one_port_lets_pass_two_count(
     assert set(main.successful) <= set(new.successful_ports)
     assert len(new.successful_ports) >= MIN_PORT_COUNT
     assert new.status == "ok"
-    assert all(t.counted for t in new.port_ranges)
+    assert all(t.answers_counted for t in new.port_ranges)
     assert (await _published(new))[1:] == (True, True, True)
 
 
@@ -573,7 +568,7 @@ async def test_no_pass_one_answer_and_a_failed_check_on_a_pass_two_port_is_mains
 
     assert main.pass_one == 0
     assert main.successful == ()
-    assert new.second_pass == SECOND_PASS_DISCARDED_CONTAINER_FAILED
+    assert new.second_pass == SecondPass.DISCARDED_CONTAINER_FAILED
     (two,) = [ports for _, p, ports in new_host.probes if p == 2]
     assert new.dind_port.external in two
     assert new.dind_port.external in host.open_ports
@@ -589,9 +584,9 @@ async def test_no_pass_one_answer_and_a_failed_check_on_a_pass_two_port_is_mains
     pass_two = [t for t in new.port_ranges if t.pass_number == 2]
     assert sum(t.probed for t in pass_two) == BATCH_PORT_VERIFICATION_SIZE
     assert sum(t.answered for t in pass_two) > MIN_PORT_COUNT
-    assert all(not t.counted and t.as_dict()["counted"] is False for t in pass_two)
+    assert all(not t.answers_counted and t.as_dict()["counted"] is False for t in pass_two)
     assert all(
-        t.counted and "counted" not in t.as_dict() for t in new.port_ranges if t.pass_number == 1
+        t.answers_counted and "counted" not in t.as_dict() for t in new.port_ranges if t.pass_number == 1
     )
     assert all(t.answered <= t.probed <= t.declared for t in new.port_ranges)
 
@@ -609,7 +604,7 @@ async def test_a_failed_container_check_is_the_skip_reason_even_when_pass_ones_b
     main, main_host, new, new_host = await _both(host, info)
 
     assert main.pass_one == MIN_PORT_COUNT
-    assert new.second_pass == SECOND_PASS_SKIPPED_CONTAINER_FAILED
+    assert new.second_pass == SecondPass.SKIPPED_CONTAINER_FAILED
     assert not [p for p in new_host.probes if p[1] == 2]
     assert new_host.containers == main_host.containers
     assert new.successful_ports == main.successful
@@ -623,7 +618,7 @@ async def test_pass_two_is_skipped_when_pass_ones_batch_container_never_ran():
 
     main, main_host, new, new_host = await _both(host, info)
 
-    assert new.second_pass == SECOND_PASS_SKIPPED_BATCH_FAILED
+    assert new.second_pass == SecondPass.SKIPPED_BATCH_FAILED
     assert new_host.containers == main_host.containers
     assert not [p for p in new_host.probes if p[1] == 2]
     assert new.selected_ports == main.selected
@@ -638,7 +633,7 @@ async def test_pass_two_start_failure_costs_one_container_and_says_so():
 
     main, main_host, new, new_host = await _both(host, info)
 
-    assert new.second_pass == SECOND_PASS_BATCH_FAILED
+    assert new.second_pass == SecondPass.BATCH_FAILED
     assert len(new_host.containers) == len(main_host.containers) + 1
     assert len(new.successful_ports) == len(main.successful) == 0
 
@@ -650,7 +645,7 @@ async def test_no_ports_left_for_pass_two():
 
     main, main_host, new, new_host = await _both(host, info)
 
-    assert new.second_pass == SECOND_PASS_NO_PORTS_LEFT
+    assert new.second_pass == SecondPass.NO_PORTS_LEFT
     assert new_host.containers == main_host.containers
     assert new.successful_ports == main.successful
 
@@ -662,7 +657,7 @@ def _top_block_count(port_range: str, width: int, top: int = 65535) -> int:
     ]
     selector = PortSelector()
     one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, set(), declared=declared)
-    two = selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, set(), tested=one)
+    two = selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, set(), pass_one_ports=one)
     return sum(p.external > top - width for p in two)
 
 
@@ -689,7 +684,7 @@ async def test_pass_two_limit_for_a_block_forwarded_at_the_top(
 
     # a failed container check on a pass-two port counts none of pass two, however wide the block
     assert new.second_pass == (
-        SECOND_PASS_RAN if dind_ok else SECOND_PASS_DISCARDED_CONTAINER_FAILED
+        SecondPass.RAN if dind_ok else SecondPass.DISCARDED_CONTAINER_FAILED
     )
     assert len(new.successful_ports) == verified
 
@@ -703,7 +698,7 @@ def test_pass_two_stride_on_40000_65535():
     one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, set(), declared=declared)
     two = [
         p.external
-        for p in selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, set(), tested=one)
+        for p in selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, set(), pass_one_ports=one)
     ]
 
     assert (two[0], two[-1], len(two)) == (40300, 65535, 300)
@@ -726,7 +721,7 @@ def test_pass_two_block_anywhere_above_pass_one(port_range, picks, width):
     one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, set(), declared=declared)
     two = [
         p.external
-        for p in selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, set(), tested=one)
+        for p in selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, set(), pass_one_ports=one)
     ]
     lo = max(p.external for p in one) + 1
 
@@ -758,7 +753,7 @@ async def test_partly_rented_host_probes_only_its_free_ports_and_counts_no_held_
         == {p.external for p in main.successful}
         == {20008, 20009}
     )
-    assert new.second_pass == SECOND_PASS_NO_PORTS_LEFT
+    assert new.second_pass == SecondPass.NO_PORTS_LEFT
     assert [r.as_dict() for r in new.port_ranges] == [
         {"pass": 1, "range": "20000-20009", "declared": 10, "probed": 2, "answered": 2}
     ]
@@ -773,7 +768,7 @@ async def test_partly_rented_wide_range_never_probes_a_held_port_in_either_pass(
     probed = {e for _, _, ports in new_host.probes for e in ports}
     assert not probed & held
     assert min(p.external for p in new.selected_ports) == 40300
-    assert new.second_pass == SECOND_PASS_RAN
+    assert new.second_pass == SecondPass.RAN
     assert len(main.successful) == 0
     assert len(new.successful_ports) >= MIN_PORT_COUNT
     assert not {p.external for p in new.successful_ports + new.failed_ports} & held

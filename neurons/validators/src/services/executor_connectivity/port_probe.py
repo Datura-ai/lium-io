@@ -29,7 +29,7 @@ class PortProbe:
         log_ctx: dict | None = None,
     ) -> PortProbeResult:
         log_ctx = log_ctx or {}
-        batch = await self.batch_verifier.run(
+        batch = await self.batch_verifier.verify(
             ports,
             ssh_client=ssh_client,
             host=host,
@@ -61,7 +61,7 @@ class PortProbe:
                 log_ctx=log_ctx,
             )
 
-        return PortProbeResult(tuple(successful), tuple(failed), batch_ran=batch.ran)
+        return PortProbeResult(tuple(successful), tuple(failed), batch_completed=batch.completed)
 
     async def probe_spread(
         self,
@@ -72,11 +72,11 @@ class PortProbe:
         log_ctx: dict | None = None,
     ) -> PortProbeResult:
         """The second pass: the batch tier only, one attempt, so it costs at most one container."""
-        batch = await self.batch_verifier.run(
+        batch = await self.batch_verifier.verify(
             ports,
             ssh_client=ssh_client,
             host=host,
             log_ctx={**(log_ctx or {}), "port_pass": 2},
             max_attempts=1,
         )
-        return PortProbeResult(tuple(batch.successful), tuple(batch.failed), batch_ran=batch.ran)
+        return PortProbeResult(tuple(batch.successful), tuple(batch.failed), batch_completed=batch.completed)
